@@ -1,0 +1,10 @@
+# Local Beads Rust state. The JSONL/config/policy/metadata files are versioned.
+beads.db
+beads.db-shm
+beads.db-wal
+beads.db-*
+*.lock
+.sync.lock
+history/
+last_touched
+.last_touched
