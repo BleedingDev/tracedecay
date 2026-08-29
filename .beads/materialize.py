@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Materialize and verify the versioned Beads Rust backlog.
 
-The canonical plan payload is committed in chunked bzip2+base64 form so the
-large JSONL can be produced deterministically by GitHub Actions and local
-coding agents without depending on a prebuilt Beads database.
+The authored plan payload is committed in chunked bzip2+base64 form. This
+script expands it into the canonical ``.beads/issues.jsonl`` collaboration
+surface, materializing the relation defaults persisted by Beads Rust 0.5.7.
 """
 
 from __future__ import annotations
@@ -23,7 +23,8 @@ OUTPUT = BEADS_DIR / "issues.jsonl"
 
 EXPECTED_PARTS = 8
 EXPECTED_ISSUES = 131
-EXPECTED_SHA256 = "d13c78427f49e2c070e14482d856062514a55ffe51acd79591266fd37ccb4666"
+EXPECTED_SOURCE_SHA256 = "d13c78427f49e2c070e14482d856062514a55ffe51acd79591266fd37ccb4666"
+EXPECTED_OUTPUT_SHA256 = "a7f4d181a7e7f566c0ca7c057292f87f00e5e32cd7cdf30f72ceffb681722e62"
 EXPECTED_ROOT_ID = "tdmem-0000"
 
 
@@ -46,16 +47,20 @@ def load_payload() -> bytes:
     encoded = "".join(part.read_text(encoding="ascii").strip() for part in parts)
     try:
         compressed = base64.b64decode(encoded, validate=True)
-        return bz2.decompress(compressed)
+        raw = bz2.decompress(compressed)
     except (ValueError, OSError) as error:
         fail(f"payload decode failed: {error}")
 
-
-def validate_jsonl(raw: bytes) -> list[dict[str, Any]]:
     digest = hashlib.sha256(raw).hexdigest()
-    if digest != EXPECTED_SHA256:
-        fail(f"SHA-256 mismatch: expected {EXPECTED_SHA256}, got {digest}")
+    if digest != EXPECTED_SOURCE_SHA256:
+        fail(
+            "source payload SHA-256 mismatch: "
+            f"expected {EXPECTED_SOURCE_SHA256}, got {digest}"
+        )
+    return raw
 
+
+def parse_issues(raw: bytes) -> list[dict[str, Any]]:
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -74,7 +79,46 @@ def validate_jsonl(raw: bytes) -> list[dict[str, Any]]:
         if not isinstance(issue, dict):
             fail(f"line {line_number} is not a JSON object")
         issues.append(issue)
+    return issues
 
+
+def materialize_beads_defaults(issues: list[dict[str, Any]]) -> None:
+    """Apply defaults that Beads Rust persists for imported relationships.
+
+    Beads Rust 0.5.7 verifies an import by comparing the rehydrated issue with
+    the normalized JSONL payload. Relationship rows persist explicit defaults
+    for ``created_by``, ``metadata``, and ``thread_id``. Writing those defaults
+    here makes the versioned JSONL round-trip exactly through ``br sync``.
+    """
+
+    for issue in issues:
+        dependencies = issue.get("dependencies", [])
+        if not isinstance(dependencies, list):
+            fail(f"{issue.get('id', '<unknown>')}: dependencies must be a list")
+        for dependency in dependencies:
+            if not isinstance(dependency, dict):
+                fail(f"{issue.get('id', '<unknown>')}: dependency must be an object")
+            dependency.setdefault("created_by", "import")
+            dependency.setdefault("metadata", "{}")
+            dependency.setdefault("thread_id", "")
+
+
+def serialize_issues(issues: list[dict[str, Any]]) -> bytes:
+    text = "".join(
+        json.dumps(issue, ensure_ascii=False, separators=(",", ":")) + "\n"
+        for issue in issues
+    )
+    raw = text.encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != EXPECTED_OUTPUT_SHA256:
+        fail(
+            "canonical output SHA-256 mismatch: "
+            f"expected {EXPECTED_OUTPUT_SHA256}, got {digest}"
+        )
+    return raw
+
+
+def validate_graph(issues: list[dict[str, Any]]) -> None:
     ids = [issue.get("id") for issue in issues]
     if any(not isinstance(issue_id, str) or not issue_id for issue_id in ids):
         fail("every issue must have a non-empty string id")
@@ -87,12 +131,7 @@ def validate_jsonl(raw: bytes) -> list[dict[str, Any]]:
     adjacency: dict[str, list[str]] = {issue_id: [] for issue_id in ids}
     for issue in issues:
         issue_id = issue["id"]
-        dependencies = issue.get("dependencies", [])
-        if not isinstance(dependencies, list):
-            fail(f"{issue_id}: dependencies must be a list")
-        for dependency in dependencies:
-            if not isinstance(dependency, dict):
-                fail(f"{issue_id}: dependency must be an object")
+        for dependency in issue.get("dependencies", []):
             source = dependency.get("issue_id")
             target = dependency.get("depends_on_id")
             if source != issue_id:
@@ -104,7 +143,6 @@ def validate_jsonl(raw: bytes) -> list[dict[str, Any]]:
                 fail(f"{issue_id}: unresolved dependency {target!r}")
             adjacency[issue_id].append(target)
 
-    # A dependency cycle makes br ready/blocked semantics unreliable.
     visiting: set[str] = set()
     visited: set[str] = set()
 
@@ -124,8 +162,6 @@ def validate_jsonl(raw: bytes) -> list[dict[str, Any]]:
 
     for issue_id in ids:
         visit(issue_id, [])
-
-    return issues
 
 
 def atomic_write(raw: bytes) -> None:
@@ -147,15 +183,18 @@ def atomic_write(raw: bytes) -> None:
 
 
 def main() -> None:
-    raw = load_payload()
-    issues = validate_jsonl(raw)
+    issues = parse_issues(load_payload())
+    materialize_beads_defaults(issues)
+    validate_graph(issues)
+    raw = serialize_issues(issues)
     atomic_write(raw)
+
     epic_count = sum(issue.get("issue_type") == "epic" for issue in issues)
     deferred_count = sum(issue.get("status") == "deferred" for issue in issues)
     print(
         "materialize-beads: wrote "
         f"{OUTPUT} ({len(issues)} issues, {epic_count} epics, "
-        f"{deferred_count} deferred, sha256={EXPECTED_SHA256})"
+        f"{deferred_count} deferred, sha256={EXPECTED_OUTPUT_SHA256})"
     )
 
 
