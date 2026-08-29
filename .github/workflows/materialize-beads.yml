@@ -7,6 +7,9 @@ on:
     paths:
       - .beads/plan/**
       - .beads/materialize.py
+      - .beads/config.yaml
+      - .beads/policy.yaml
+      - .beads/metadata.json
       - .github/workflows/materialize-beads.yml
   workflow_dispatch:
 
@@ -21,7 +24,10 @@ jobs:
   materialize:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    env:
+      BR_VERSION: 0.5.7
+      BR_ARCHIVE_SHA256: 634aaacd0aac256b2be7250af9fe1e863e8a0316875c20959a6a1c2da75bf843
     steps:
       - name: Check out the exact branch
         uses: actions/checkout@v4
@@ -47,6 +53,46 @@ jobs:
           assert len({record['id'] for record in records}) == 131
           assert sum(record.get('issue_type') == 'epic' for record in records) == 15
           assert sum(record.get('status') == 'deferred' for record in records) == 6
+          PY
+
+      - name: Install pinned Beads Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/br-${BR_VERSION}-linux_amd64.tar.gz"
+          extract_dir="${RUNNER_TEMP}/br-${BR_VERSION}"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            "https://github.com/Dicklesworthstone/beads_rust/releases/download/v${BR_VERSION}/br-${BR_VERSION}-linux_amd64.tar.gz"
+          echo "${BR_ARCHIVE_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$extract_dir" "${HOME}/.local/bin"
+          tar -xzf "$archive" -C "$extract_dir"
+          binary="$(find "$extract_dir" -type f -name br -perm -111 -print -quit)"
+          test -n "$binary"
+          install -m 0755 "$binary" "${HOME}/.local/bin/br"
+          echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+          "${HOME}/.local/bin/br" --version
+
+      - name: Rebuild and validate the Beads database
+        shell: bash
+        run: |
+          set -euo pipefail
+          br sync --import-only --rebuild
+          br doctor
+          br dep cycles --json | tee "${RUNNER_TEMP}/beads-cycles.json"
+          br ready --json | tee "${RUNNER_TEMP}/beads-ready.json"
+          br show tdmem-0000 --json > "${RUNNER_TEMP}/beads-root.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = json.loads((Path(os.environ['RUNNER_TEMP']) / 'beads-root.json').read_text())
+          payload = root.get('data', root) if isinstance(root, dict) else root
+          if isinstance(payload, list):
+              assert any(item.get('id') == 'tdmem-0000' for item in payload)
+          else:
+              assert payload.get('id') == 'tdmem-0000'
           PY
 
       - name: Commit the generated collaboration surface
