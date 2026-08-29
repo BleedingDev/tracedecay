@@ -10,6 +10,7 @@ on:
       - .beads/config.yaml
       - .beads/policy.yaml
       - .beads/metadata.json
+      - .beads/.gitignore
       - .github/workflows/materialize-beads.yml
   workflow_dispatch:
 
@@ -80,7 +81,26 @@ jobs:
         run: |
           set -euo pipefail
           br sync --import-only --rebuild
-          br doctor
+
+          doctor_status=0
+          br doctor | tee "${RUNNER_TEMP}/beads-doctor.txt" || doctor_status=$?
+          if [[ "$doctor_status" -gt 1 ]]; then
+            echo "br doctor failed with status ${doctor_status}" >&2
+            exit "$doctor_status"
+          fi
+          grep -q '^HEALTH workspace: healthy$' "${RUNNER_TEMP}/beads-doctor.txt"
+          if grep -q '^ERROR ' "${RUNNER_TEMP}/beads-doctor.txt"; then
+            echo 'br doctor reported an error' >&2
+            exit 1
+          fi
+          unexpected_warnings="$({ grep '^WARN ' "${RUNNER_TEMP}/beads-doctor.txt" || true; } \
+            | grep -v '^WARN db\.recovery_artifacts:' || true)"
+          if [[ -n "$unexpected_warnings" ]]; then
+            echo 'br doctor reported an unexpected warning:' >&2
+            printf '%s\n' "$unexpected_warnings" >&2
+            exit 1
+          fi
+
           br dep cycles --json | tee "${RUNNER_TEMP}/beads-cycles.json"
           br ready --json | tee "${RUNNER_TEMP}/beads-ready.json"
           br show tdmem-0000 --json > "${RUNNER_TEMP}/beads-root.json"
@@ -89,7 +109,17 @@ jobs:
           import os
           from pathlib import Path
 
-          root = json.loads((Path(os.environ['RUNNER_TEMP']) / 'beads-root.json').read_text())
+          temp = Path(os.environ['RUNNER_TEMP'])
+          cycles = json.loads((temp / 'beads-cycles.json').read_text())
+          if isinstance(cycles, dict):
+              cycle_payload = cycles.get('data', cycles.get('cycles', cycles))
+              if isinstance(cycle_payload, dict):
+                  cycle_payload = cycle_payload.get('cycles', [])
+          else:
+              cycle_payload = cycles
+          assert cycle_payload in ([], None), cycle_payload
+
+          root = json.loads((temp / 'beads-root.json').read_text())
           payload = root.get('data', root) if isinstance(root, dict) else root
           if isinstance(payload, list):
               assert any(item.get('id') == 'tdmem-0000' for item in payload)
