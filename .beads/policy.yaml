@@ -1,0 +1,17 @@
+# Strict workflow discipline for coding agents.
+# Acceptance criteria are Markdown checklists and must be completed before closure.
+workflow:
+  strict: true
+  required_fields:
+    "open -> in_progress":
+      - acceptance_criteria
+      - transition_comment
+    "deferred -> in_progress":
+      - acceptance_criteria
+      - transition_comment
+    "draft -> in_progress":
+      - acceptance_criteria
+      - transition_comment
+    "in_progress -> closed":
+      - acceptance_criteria
+      - transition_comment
