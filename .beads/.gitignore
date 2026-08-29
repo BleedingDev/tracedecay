@@ -8,3 +8,8 @@ beads.db-*
 history/
 last_touched
 .last_touched
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
+*.vacuum-wal-cert*
+*.fsqlite-migration-state
+*.tmp
