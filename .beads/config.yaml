@@ -1,0 +1,8 @@
+# Project-local Beads Rust configuration for the pluggable-memory program.
+# The SQLite database stays local; issues.jsonl is the versioned collaboration surface.
+
+id:
+  prefix: tdmem
+
+inherited_context:
+  enabled: true
