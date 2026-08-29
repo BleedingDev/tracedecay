@@ -1,0 +1,66 @@
+name: Materialize Beads issue plan
+
+on:
+  push:
+    branches:
+      - feat/pluggable-memory-providers-v2
+    paths:
+      - .beads/plan/**
+      - .beads/materialize.py
+      - .github/workflows/materialize-beads.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: materialize-beads-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  materialize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the exact branch
+        uses: actions/checkout@v4
+        with:
+          ref: feat/pluggable-memory-providers-v2
+          fetch-depth: 0
+
+      - name: Materialize and validate issues.jsonl
+        run: python3 .beads/materialize.py
+
+      - name: Verify Beads JSONL contract
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          path = Path('.beads/issues.jsonl')
+          raw = path.read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == 'd13c78427f49e2c070e14482d856062514a55ffe51acd79591266fd37ccb4666'
+          records = [json.loads(line) for line in raw.decode('utf-8').splitlines() if line.strip()]
+          assert len(records) == 131
+          assert len({record['id'] for record in records}) == 131
+          assert sum(record.get('issue_type') == 'epic' for record in records) == 15
+          assert sum(record.get('status') == 'deferred' for record in records) == 6
+          PY
+
+      - name: Commit the generated collaboration surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-files --error-unmatch .beads/issues.jsonl >/dev/null 2>&1 \
+             && git diff --quiet -- .beads/issues.jsonl; then
+            echo 'issues.jsonl is already current'
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .beads/issues.jsonl
+          git commit -m 'chore(beads): materialize versioned issue plan'
+          git push origin HEAD:feat/pluggable-memory-providers-v2
