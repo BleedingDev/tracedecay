@@ -1,0 +1,244 @@
+{
+  "schema_version": 1,
+  "contract_id": "tracedecay.memory.provider.registry.v1",
+  "bead_id": "tdmem-0201",
+  "title": "Memory provider identity, capability catalog, registration, and resolution contract",
+  "status": "accepted",
+  "authority": "TraceDecay provider registry composition root",
+  "scope": "coding_agents_only",
+  "provider_identity": {
+    "type_name": "MemoryProviderIdV1",
+    "encoding": "utf-8",
+    "canonical_pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+    "minimum_bytes": 1,
+    "maximum_bytes": 64,
+    "case_sensitive": true,
+    "stable_across_restarts": true,
+    "stable_across_adapter_upgrades": true,
+    "display_name_is_not_identity": true,
+    "forbidden_sources": [
+      "display_name",
+      "process_id",
+      "socket_path",
+      "database_path",
+      "provider_state_digest",
+      "runtime_order",
+      "configuration_position"
+    ]
+  },
+  "capability_identity": {
+    "type_name": "MemoryProviderCapabilityIdV1",
+    "canonical_pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\\.v[1-9][0-9]*$",
+    "maximum_bytes": 96,
+    "version_is_part_of_identity": true,
+    "unknown_capability_policy": "reject",
+    "duplicate_capability_policy": "reject"
+  },
+  "capability_catalog": [
+    {
+      "id": "observation.accept.v1",
+      "class": "provider_local_mutation",
+      "advisory_only": true,
+      "detailed_contract_bead": "tdmem-0203",
+      "may_mutate_tracedecay_authority": false
+    },
+    {
+      "id": "recall.query.v1",
+      "class": "advisory_read",
+      "advisory_only": true,
+      "detailed_contract_bead": "tdmem-0204",
+      "may_mutate_tracedecay_authority": false
+    },
+    {
+      "id": "feedback.record.v1",
+      "class": "provider_local_mutation",
+      "advisory_only": true,
+      "detailed_contract_bead": "tdmem-0205",
+      "may_mutate_tracedecay_authority": false
+    },
+    {
+      "id": "maintenance.run.v1",
+      "class": "provider_local_mutation",
+      "advisory_only": true,
+      "detailed_contract_bead": "tdmem-0205",
+      "may_mutate_tracedecay_authority": false
+    },
+    {
+      "id": "inspection.read.v1",
+      "class": "provider_local_read",
+      "advisory_only": true,
+      "detailed_contract_bead": "tdmem-0205",
+      "may_mutate_tracedecay_authority": false
+    },
+    {
+      "id": "correction.apply.v1",
+      "class": "provider_local_mutation",
+      "advisory_only": true,
+      "detailed_contract_bead": "tdmem-0205",
+      "may_mutate_tracedecay_authority": false
+    },
+    {
+      "id": "forget.by_source.v1",
+      "class": "provider_local_mutation",
+      "advisory_only": true,
+      "detailed_contract_bead": "tdmem-0205",
+      "may_mutate_tracedecay_authority": false
+    },
+    {
+      "id": "snapshot.export.v1",
+      "class": "provider_local_read",
+      "advisory_only": true,
+      "detailed_contract_bead": "tdmem-0205",
+      "may_mutate_tracedecay_authority": false
+    },
+    {
+      "id": "snapshot.restore.v1",
+      "class": "provider_local_mutation",
+      "advisory_only": true,
+      "detailed_contract_bead": "tdmem-0205",
+      "may_mutate_tracedecay_authority": false
+    }
+  ],
+  "registration_contract": {
+    "type_name": "MemoryProviderRegistrationV1",
+    "registry_writer": "TraceDecay provider registry composition root",
+    "provider_self_registration": false,
+    "required_fields": [
+      "provider_id",
+      "adapter_contract_version",
+      "registration_state",
+      "capability_declaration_state",
+      "declared_capabilities",
+      "implementation_identity",
+      "registration_revision"
+    ],
+    "registration_states": [
+      "registered",
+      "disabled",
+      "reserved",
+      "retiring"
+    ],
+    "capability_declaration_states": [
+      "declared",
+      "deferred_until_compatible_handshake",
+      "unavailable_without_versioned_specification"
+    ],
+    "immutable_after_registration": [
+      "provider_id",
+      "implementation_identity"
+    ],
+    "revision_rule": "Every accepted registry mutation increments registration_revision exactly once.",
+    "duplicate_provider_id_policy": "reject_ambiguous_registration",
+    "unknown_provider_policy": "reject_unknown_provider",
+    "adapter_construction_boundary": "Only the provider registry/composition layer may branch on provider_id to construct an adapter.",
+    "public_surface_provider_branching": false
+  },
+  "selection_contract": {
+    "type_name": "MemoryProviderSelectionRequestV1",
+    "required_request_fields": [
+      "provider_id",
+      "required_capabilities",
+      "exact_scope_identity",
+      "configuration_revision",
+      "request_identity",
+      "deadline",
+      "cancellation"
+    ],
+    "required_capability_semantics": "all",
+    "maximum_required_capabilities": 32,
+    "duplicate_required_capability_policy": "reject_non_canonical_request",
+    "active_provider_cardinality_per_exact_scope": "zero_or_one",
+    "resolution_states": [
+      "resolved",
+      "provider_unknown",
+      "provider_disabled",
+      "provider_reserved",
+      "provider_retiring",
+      "adapter_unavailable",
+      "capability_declaration_deferred",
+      "capability_unsupported",
+      "protocol_incompatible",
+      "scope_unavailable",
+      "configuration_revision_conflict",
+      "deadline_exceeded",
+      "cancelled",
+      "ambiguous_registration"
+    ],
+    "resolved_requires": [
+      "exact_provider_id_match",
+      "accepted_registration_revision",
+      "compatible_adapter_contract_version",
+      "all_required_capabilities_declared",
+      "exact_scope_admission",
+      "live_deadline",
+      "live_cancellation"
+    ],
+    "silent_fallback": false,
+    "fallback_provider": null,
+    "successful_empty_resolution": false
+  },
+  "bootstrap_slots": [
+    {
+      "provider_id": "tracedecay.native",
+      "display_name": "TraceDecay Native",
+      "slot_state": "declared",
+      "specification_state": "versioned_native_application_ports",
+      "capability_declaration_state": "deferred_until_compatible_handshake",
+      "implementation_gate_beads": [
+        "tdmem-0401",
+        "tdmem-0402",
+        "tdmem-0403",
+        "tdmem-0404"
+      ],
+      "counts_as_implemented": false
+    },
+    {
+      "provider_id": "ncm",
+      "display_name": "NCM",
+      "slot_state": "reserved",
+      "specification_state": "licensed_surface_audit_required",
+      "capability_declaration_state": "deferred_until_compatible_handshake",
+      "implementation_gate_beads": [
+        "tdmem-0701",
+        "tdmem-0702",
+        "tdmem-0703"
+      ],
+      "counts_as_implemented": false
+    },
+    {
+      "provider_id": "ocean",
+      "display_name": "OCEAN",
+      "slot_state": "reserved",
+      "specification_state": "versioned_specification_unavailable",
+      "capability_declaration_state": "unavailable_without_versioned_specification",
+      "implementation_gate_beads": [],
+      "counts_as_implemented": false
+    }
+  ],
+  "invariants": [
+    "A provider ID is stable identity, never a display label or runtime location.",
+    "Capability IDs are versioned behavior identities and are never inferred from provider names.",
+    "Only the registry/composition boundary may branch on provider_id to construct a concrete adapter.",
+    "Transport, CLI, MCP, SDK, dashboard, context, and storage surfaces remain provider-neutral.",
+    "Every resolved provider has one exact registration revision and all requested capabilities.",
+    "Unknown, disabled, reserved, retiring, unavailable, incompatible, ambiguous, cancelled, and timed-out resolutions are distinct typed states.",
+    "Resolution never silently falls back to TraceDecay Native or another provider.",
+    "All provider capabilities are advisory with respect to TraceDecay canonical authorities.",
+    "No provider capability directly mutates current code, exact scope identity, sessions, accepted Native facts, curated rules, tools, approvals, or final context.",
+    "The NCM slot does not select an execution topology before tdmem-0701 and tdmem-0702.",
+    "The OCEAN slot reserves identity only and cannot count as implemented without a versioned specification."
+  ],
+  "verification_beads": [
+    "tdmem-0202",
+    "tdmem-0203",
+    "tdmem-0204",
+    "tdmem-0205",
+    "tdmem-0206",
+    "tdmem-0209",
+    "tdmem-0303",
+    "tdmem-0306",
+    "tdmem-0403",
+    "tdmem-0701",
+    "tdmem-0702"
+  ]
+}
