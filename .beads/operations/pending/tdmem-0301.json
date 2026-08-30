@@ -1,47 +1,19 @@
 {
   "schema_version": 1,
-  "attempt": 2,
+  "attempt": 3,
   "issue_id": "tdmem-0301",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Creating the first product-owned workspace crate as the only provider-neutral Rust runtime boundary over the generated M1 authority, with no TraceDecay internal or concrete-provider dependency.",
-  "retry_note": "The first materialization correctly discovered that the dependency-free path package does not change Cargo.lock. The retry removes the no-op lockfile manifest entry and records only the real Cargo.toml convergence touch.",
+  "retry_note": "The previous run reached the evidence gates and correctly rejected non-canonical rustfmt output. This retry formats the materialized crate before committing it and replaces one invalid Result equality assertion with an equivalent matches assertion; no contract or production behavior was weakened.",
   "checks": [
-    {
-      "name": "provider API workspace metadata",
-      "argv": ["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps"],
-      "timeout_seconds": 180
-    },
-    {
-      "name": "provider API formatting",
-      "argv": ["cargo", "fmt", "--package", "tracedecay-memory-provider-api", "--", "--check"],
-      "timeout_seconds": 180
-    },
-    {
-      "name": "provider API strict Clippy",
-      "argv": ["cargo", "clippy", "--package", "tracedecay-memory-provider-api", "--all-targets", "--locked", "--", "-D", "warnings"],
-      "timeout_seconds": 900
-    },
-    {
-      "name": "provider API tests",
-      "argv": ["cargo", "test", "--package", "tracedecay-memory-provider-api", "--locked"],
-      "timeout_seconds": 900
-    },
-    {
-      "name": "canonical M1 Rust binding drift",
-      "argv": ["python3", "scripts/product/generate-memory-provider-rust.py", "--repo", ".", "--check"],
-      "timeout_seconds": 180
-    },
-    {
-      "name": "upstream patch footprint and dependency directions",
-      "argv": ["python3", "scripts/product/check-patch-footprint-policy.py", "--repo", ".", "--policy", "product/upstream/patch-footprint-policy.json", "--map", "product/upstream/convergence-map.json"],
-      "timeout_seconds": 240
-    },
-    {
-      "name": "provider API contains no forbidden direct dependency",
-      "argv": ["python3", "-c", "import json,subprocess; data=json.loads(subprocess.check_output(['cargo','metadata','--locked','--format-version','1','--no-deps'], text=True)); pkg=next(p for p in data['packages'] if p['name']=='tracedecay-memory-provider-api'); deps={d['name'] for d in pkg['dependencies']}; forbidden={d for d in deps if d.startswith('tracedecay-')}; assert not forbidden, forbidden"],
-      "timeout_seconds": 180
-    }
+    {"name":"provider API workspace metadata","argv":["cargo","metadata","--locked","--format-version","1","--no-deps"],"timeout_seconds":180},
+    {"name":"provider API formatting","argv":["cargo","fmt","--package","tracedecay-memory-provider-api","--","--check"],"timeout_seconds":180},
+    {"name":"provider API strict Clippy","argv":["cargo","clippy","--package","tracedecay-memory-provider-api","--all-targets","--locked","--","-D","warnings"],"timeout_seconds":900},
+    {"name":"provider API tests","argv":["cargo","test","--package","tracedecay-memory-provider-api","--locked"],"timeout_seconds":900},
+    {"name":"canonical M1 Rust binding drift","argv":["python3","scripts/product/generate-memory-provider-rust.py","--repo",".","--check"],"timeout_seconds":180},
+    {"name":"upstream patch footprint and dependency directions","argv":["python3","scripts/product/check-patch-footprint-policy.py","--repo",".","--policy","product/upstream/patch-footprint-policy.json","--map","product/upstream/convergence-map.json"],"timeout_seconds":240},
+    {"name":"provider API contains no forbidden direct dependency","argv":["python3","-c","import json,subprocess; data=json.loads(subprocess.check_output(['cargo','metadata','--locked','--format-version','1','--no-deps'], text=True)); pkg=next(p for p in data['packages'] if p['name']=='tracedecay-memory-provider-api'); deps={d['name'] for d in pkg['dependencies']}; forbidden={d for d in deps if d.startswith('tracedecay-')}; assert not forbidden, forbidden"],"timeout_seconds":180}
   ],
   "acceptance_criteria": [
     "The tracedecay-memory-provider-api crate compiles and tests independently inside the existing Rust workspace under the pinned toolchain and strict lint policy.",
