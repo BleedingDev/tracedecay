@@ -57,7 +57,8 @@ gate_expect_status "branch mismatch" 1
 gate_output_contains "branch mismatch" "checked-out branch mismatch"
 
 git -C "$FIXTURE" switch -q --orphan unrelated
-git -C "$FIXTURE" rm -q -rf .
+git -C "$FIXTURE" rm -q -rf --ignore-unmatch .
+git -C "$FIXTURE" clean -q -fdx
 printf 'unrelated\n' >"$FIXTURE/unrelated.txt"
 git -C "$FIXTURE" add unrelated.txt
 git -C "$FIXTURE" commit -q -m unrelated

@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "attempt": 2,
   "issue_id": "tdmem-0101",
   "mode": "complete",
   "actor": "assistant",
