@@ -113,6 +113,12 @@ if source.count(undocumented_tests) != 1:
     raise SystemExit("could not locate the undocumented NCM integration test crate")
 source = source.replace(undocumented_tests, documented_tests, 1)
 
+stale_parts_set = "        .collect::<BTreeSet<_>>(),\n"
+fixed_parts_vec = "        .collect::<Vec<_>>(),\n"
+if source.count(stale_parts_set) != 2:
+    raise SystemExit("could not locate the two stale provider-call builder sets")
+source = source.replace(stale_parts_set, fixed_parts_vec)
+
 BODY.write_text(source, encoding="utf-8")
 subprocess.run(["python3", str(BODY)], cwd=ROOT, check=True)
 HERE.unlink()
