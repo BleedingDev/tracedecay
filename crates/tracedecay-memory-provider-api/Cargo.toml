@@ -1,0 +1,25 @@
+[package]
+name = "tracedecay-memory-provider-api"
+version.workspace = true
+edition.workspace = true
+publish = false
+license = "MIT"
+description = "Provider-neutral runtime API for TraceDecay cognitive memory providers"
+repository = "https://github.com/BleedingDev/tracedecay"
+
+[dependencies]
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+warnings = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
