@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 5,
+  "attempt": 6,
   "issue_id": "tdmem-0209",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Closing M1 implementability only after a standalone deterministic Rust provider passes mandatory health/observe/recall conformance, duplicate/conflict semantics, real cancellation/deadline preflight, exact scope, deterministic snapshot/restart, explicit unsupported lifecycle calls, strict linting, and product-owned evidence validation.",
-  "retry_note": "Attempt 4 passed evidence validation and reached strict Clippy, which correctly rejected one nested snapshot-identity branch under deny(warnings). The restore path now uses an equivalent let-chain, preserving no-overwrite and idempotent-restore semantics while satisfying the pinned Rust 1.97.1 lint set.",
+  "retry_note": "Attempt 5 passed the library lint surface and exposed that the integration-test crate itself lacked crate-level documentation under the inherited deny(missing_docs) policy. The conformance test target now has a focused crate document; no runtime or contract semantics changed.",
   "checks": [
     {
       "name": "dummy-provider evidence mutation tests",
