@@ -27,6 +27,11 @@ new = '''        if entry is None:\n            if upstream_path == "Cargo.lock"
 if source.count(old) != 1:
     raise SystemExit("could not locate the reviewed convergence-entry guard")
 source = source.replace(old, new, 1)
+unused_import = "    ApiError, HandshakeRequest, HandshakeResponse, MemoryProvider, ProviderCall,\n"
+fixed_import = "    HandshakeRequest, HandshakeResponse, MemoryProvider, ProviderCall,\n"
+if source.count(unused_import) != 1:
+    raise SystemExit("could not locate the unused Native adapter ApiError import")
+source = source.replace(unused_import, fixed_import, 1)
 marker = "update_convergence_map()\n\nmanifest = ["
 replacement = '''subprocess.run(
     ["cargo", "check", "-p", "tracedecay-memory-provider-native", "--all-targets"],
