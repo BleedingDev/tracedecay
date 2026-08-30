@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 8,
+  "attempt": 9,
   "issue_id": "tdmem-0303",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Closing the Native adapter crate only after it compiles inside the root workspace, depends solely on the provider API, validates the stable Native identity, routes mandatory and declared optional operations without payload or scope transformation, delegates authoritative terminals to a mockable application port, and leaves Native persistence entirely outside the crate.",
-  "retry_note": "The all-target check now includes crate-level documentation for the Native adapter integration test after fixing the descriptor borrow lifetime. Production behavior, lockfile generation, formatting, strict Clippy, focused tests, and closure evidence remain unchanged.",
+  "retry_note": "Strict all-target Clippy now keeps production lint policy intact while explicitly allowing ergonomic expect assertions only inside the integration-test crate. The adapter implementation itself remains deny-warnings, deny-expect, and unchanged.",
   "checks": [
     {
       "name": "workspace resolves with the Native adapter",
