@@ -1,10 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 1,
+  "attempt": 2,
   "issue_id": "tdmem-0209",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Closing M1 implementability only after a standalone deterministic Rust provider passes mandatory health/observe/recall conformance, duplicate/conflict semantics, real cancellation/deadline preflight, exact scope, deterministic snapshot/restart, explicit unsupported lifecycle calls, strict linting, and product-owned evidence validation.",
+  "retry_note": "The first run correctly exposed three evidence-checker bugs rather than provider failures: the accepted registry stores mandatory/optional capabilities as object arrays, the standalone root package must be exempt from its own forbidden dependency prefix, and helper functions must not be counted as #[test] journeys. The checker now follows the canonical registry shape, parses Cargo.lock structurally, and matches only attributed tests.",
   "checks": [
     {
       "name": "dummy-provider evidence mutation tests",
