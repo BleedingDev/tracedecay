@@ -334,12 +334,11 @@ fn trait_object_executes_typed_handshake_and_call() -> Result<(), ApiError> {
     })?;
     let response = provider.handshake(&handshake);
     assert_eq!(response.terminal.terminal_code, TerminalCode::Success);
-    match response.descriptor.as_ref() {
-        Some(ready_descriptor) => {
-            assert_eq!(ready_descriptor.provider_id.as_str(), "test.provider");
-        }
-        None => assert!(false, "ready handshake must include a descriptor"),
-    }
+    let ready_descriptor = match response.descriptor.as_ref() {
+        Some(value) => value,
+        None => return Err(ApiError::EmptyField("ready_descriptor")),
+    };
+    assert_eq!(ready_descriptor.provider_id.as_str(), "test.provider");
 
     let call = ProviderCall::new(ProviderCallParts {
         operation: ProviderOperation::Recall,
