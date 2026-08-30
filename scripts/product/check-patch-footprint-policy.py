@@ -37,6 +37,7 @@ EXPECTED_PRODUCT_PATTERNS = {
     ".github/workflows/materialize-beads.yml",
     ".github/workflows/product-*.yml",
     "crates/tracedecay-memory-provider-api/**",
+    "crates/tracedecay-memory-fabric/**",
     "crates/tracedecay-memory-provider-registry/**",
     "crates/tracedecay-memory-provider-native/**",
     "crates/tracedecay-memory-provider-ncm/**",
