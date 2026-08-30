@@ -1,0 +1,229 @@
+{
+  "schema_version": 1,
+  "bead_id": "tdmem-0106",
+  "title": "Foundational ADR set for pluggable cognitive memory",
+  "status": "accepted",
+  "date": "2026-08-30",
+  "decision_scope": "Binding architecture decisions required before the M0 go/no-go gate and implementation milestones M1 through M6.",
+  "source_authorities": [
+    "product/architecture/native-memory-surface-map.json",
+    "product/architecture/coding-memory-authority-matrix.json",
+    "product/upstream/patch-footprint-policy.json",
+    "product/upstream/convergence-map.json",
+    "product/baseline/tracedecay-v2-pr707-linux.json"
+  ],
+  "required_sections": [
+    "Context",
+    "Decision",
+    "Consequences",
+    "Rejected alternatives",
+    "Invariants",
+    "Verification",
+    "Review triggers"
+  ],
+  "decisions": [
+    {
+      "id": "ADR-0001",
+      "topic": "provider_boundary",
+      "title": "Place the capability-based provider boundary above Native fact-store contracts",
+      "path": "product/architecture/adr/ADR-0001-provider-boundary.md",
+      "status": "accepted",
+      "decision_summary": "Providers implement versioned capabilities above TraceDecay application ports. TraceDecay Native remains the explicit-fact authority; cognitive providers return advisory recall and receive observations/outcomes without implementing ProjectMemoryFactStore.",
+      "required_rejections": [
+        "direct ProjectMemoryFactStore implementation",
+        "provider-name branching"
+      ],
+      "verification_beads": [
+        "tdmem-0201",
+        "tdmem-0209",
+        "tdmem-0303",
+        "tdmem-0403"
+      ],
+      "depends_on_adrs": []
+    },
+    {
+      "id": "ADR-0002",
+      "topic": "authority_and_advisory_semantics",
+      "title": "Keep TraceDecay authorities canonical and provider memory advisory",
+      "path": "product/architecture/adr/ADR-0002-authority-and-advisory-semantics.md",
+      "status": "accepted",
+      "decision_summary": "Current code, exact scope identity, sessions, accepted Native facts, curated rules, and final context assembly remain TraceDecay-owned. Provider candidates are labelled, scope-bound, provenance-bearing advisory evidence with no implicit promotion.",
+      "required_rejections": [
+        "provider recall as canonical truth",
+        "implicit promotion into Native facts"
+      ],
+      "verification_beads": [
+        "tdmem-0401",
+        "tdmem-0402",
+        "tdmem-0603",
+        "tdmem-0807"
+      ],
+      "depends_on_adrs": [
+        "ADR-0001"
+      ]
+    },
+    {
+      "id": "ADR-0003",
+      "topic": "monorepo_layout_and_dependency_direction",
+      "title": "Isolate provider contracts, fabric, adapters, context, and conformance in product-owned crates",
+      "path": "product/architecture/adr/ADR-0003-monorepo-layout.md",
+      "status": "accepted",
+      "decision_summary": "Use additive product-owned crates with inward provider contracts, provider-neutral orchestration/context, isolated Native and NCM adapters, and mechanical dependency guards. Only the narrow registry/composition layer constructs concrete adapters.",
+      "required_rejections": [
+        "provider logic in the root crate",
+        "provider-name branching"
+      ],
+      "verification_beads": [
+        "tdmem-0301",
+        "tdmem-0302",
+        "tdmem-0303",
+        "tdmem-0304",
+        "tdmem-0305",
+        "tdmem-0306",
+        "tdmem-0307",
+        "tdmem-0308"
+      ],
+      "depends_on_adrs": [
+        "ADR-0001",
+        "ADR-0002"
+      ]
+    },
+    {
+      "id": "ADR-0004",
+      "topic": "provider_execution_topology_decision_gate",
+      "title": "Keep provider contracts topology-neutral and defer the first NCM topology decision",
+      "path": "product/architecture/adr/ADR-0004-provider-execution-topology-gate.md",
+      "status": "accepted_decision_gate",
+      "decision_summary": "The provider protocol supports in-process and isolated local-process adapters behind one lifecycle contract. Native starts in-process. NCM topology remains deliberately undecided until the licensed surface audit and an ADR-backed selection evaluate crash isolation, latency, cancellation, state ownership, and reuse.",
+      "ncm_topology": {
+        "state": "deferred",
+        "decision_gate_beads": [
+          "tdmem-0701",
+          "tdmem-0702"
+        ],
+        "allowed_candidates": [
+          "in_process_crate",
+          "isolated_local_process",
+          "another bounded topology proved by the surface audit"
+        ]
+      },
+      "required_rejections": [
+        "premature NCM transport choice",
+        "one topology for every provider"
+      ],
+      "verification_beads": [
+        "tdmem-0202",
+        "tdmem-0304",
+        "tdmem-0504",
+        "tdmem-0701",
+        "tdmem-0702"
+      ],
+      "depends_on_adrs": [
+        "ADR-0001",
+        "ADR-0003"
+      ]
+    },
+    {
+      "id": "ADR-0005",
+      "topic": "persistence_idempotency_and_recovery",
+      "title": "Use separate provider state plus a bounded durable observation outbox",
+      "path": "product/architecture/adr/ADR-0005-persistence-and-observation-delivery.md",
+      "status": "accepted",
+      "decision_summary": "TraceDecay owns a durable bounded observation journal and delivery receipts; each provider instance owns only its internal state. Delivery is at-least-once with stable idempotency, typed partial effects, bounded retries/backpressure, replay, and explicit privacy/retention.",
+      "required_rejections": [
+        "unbounded in-memory queue",
+        "provider state in Native fact tables"
+      ],
+      "verification_beads": [
+        "tdmem-0203",
+        "tdmem-0205",
+        "tdmem-0206",
+        "tdmem-0502",
+        "tdmem-0503",
+        "tdmem-0506"
+      ],
+      "depends_on_adrs": [
+        "ADR-0001",
+        "ADR-0002"
+      ]
+    },
+    {
+      "id": "ADR-0006",
+      "topic": "context_compilation",
+      "title": "Compile final coding context in TraceDecay from separately admitted authority lanes",
+      "path": "product/architecture/adr/ADR-0006-context-compilation.md",
+      "status": "accepted",
+      "decision_summary": "TraceDecay alone assembles final request-scoped context. Current code, policy, Native facts, session evidence, and provider candidates remain separate lanes with exact scope, provenance, freshness, deterministic normalization, budgets, and typed per-lane degradation.",
+      "required_rejections": [
+        "provider-built final context",
+        "raw score comparison across providers"
+      ],
+      "verification_beads": [
+        "tdmem-0204",
+        "tdmem-0601",
+        "tdmem-0602",
+        "tdmem-0603",
+        "tdmem-0604",
+        "tdmem-0605",
+        "tdmem-0606",
+        "tdmem-0607",
+        "tdmem-0608",
+        "tdmem-0609"
+      ],
+      "depends_on_adrs": [
+        "ADR-0001",
+        "ADR-0002"
+      ]
+    },
+    {
+      "id": "ADR-0007",
+      "topic": "observer_isolation_and_activation",
+      "title": "Make observer mode mechanically non-influential and active mode explicitly gated",
+      "path": "product/architecture/adr/ADR-0007-observer-isolation-and-activation.md",
+      "status": "accepted",
+      "decision_summary": "Observer providers receive post-commit observations and may emit inspection/evaluation traces, but no value reachable from observer execution can affect prompts, canonical state, tools, approvals, or externally visible actions. Active recall requires explicit configuration and conformance/evaluation gates.",
+      "required_rejections": [
+        "best-effort isolation by convention",
+        "implicit provider activation"
+      ],
+      "verification_beads": [
+        "tdmem-0305",
+        "tdmem-0404",
+        "tdmem-0505",
+        "tdmem-0703",
+        "tdmem-0706",
+        "tdmem-0903"
+      ],
+      "depends_on_adrs": [
+        "ADR-0002",
+        "ADR-0005",
+        "ADR-0006"
+      ]
+    },
+    {
+      "id": "ADR-0008",
+      "topic": "upstream_convergence",
+      "title": "Converge with upstream through additive product ownership, mapped exceptions, and isolated sync trains",
+      "path": "product/architecture/adr/ADR-0008-upstream-convergence.md",
+      "status": "accepted",
+      "decision_summary": "The immutable product floor advances only through isolated, reviewable sync trains. Product-owned crates and artifacts stay additive; every existing upstream-file edit is budgeted and mapped with semantic invariants, tests, rationale, and a removal/rebase plan. Exceptions require an ADR before the edit.",
+      "required_rejections": [
+        "continuous unreviewed rebases",
+        "unmapped upstream-owned edits"
+      ],
+      "verification_beads": [
+        "tdmem-0308",
+        "tdmem-1201",
+        "tdmem-1202",
+        "tdmem-1203",
+        "tdmem-1204",
+        "tdmem-1205",
+        "tdmem-1206",
+        "tdmem-1208"
+      ],
+      "depends_on_adrs": [
+        "ADR-0003"
+      ]
+    }
+  ]
+}
