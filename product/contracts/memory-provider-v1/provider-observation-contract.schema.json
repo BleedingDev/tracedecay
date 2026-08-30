@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/schemas/memory-provider-v1/provider-observation-contract.schema.json",
+  "title": "TraceDecay memory provider observation contract V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "bead_id",
+    "title",
+    "status",
+    "authority",
+    "scope",
+    "depends_on_contracts",
+    "observation_envelope",
+    "source_identity",
+    "observation_kinds",
+    "normalization",
+    "idempotency",
+    "provenance",
+    "privacy",
+    "ordering",
+    "batch_contract",
+    "admission_order",
+    "provider_acceptance_outcomes",
+    "delivery_receipt",
+    "observer_non_interference",
+    "invariants",
+    "verification_beads"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "contract_id": { "const": "tracedecay.memory.provider.observation.v1" },
+    "bead_id": { "const": "tdmem-0203" },
+    "title": { "type": "string", "minLength": 1 },
+    "status": { "const": "accepted" },
+    "authority": { "const": "TraceDecay observation admission and dispatch fabric" },
+    "scope": { "const": "coding_agents_only" },
+    "depends_on_contracts": {
+      "type": "array",
+      "const": [
+        "tracedecay.memory.provider.registry.v1",
+        "tracedecay.memory.provider.handshake.v1"
+      ]
+    },
+    "observation_envelope": { "$ref": "#/$defs/object" },
+    "source_identity": { "$ref": "#/$defs/object" },
+    "observation_kinds": {
+      "type": "array",
+      "minItems": 9,
+      "maxItems": 9,
+      "items": { "$ref": "#/$defs/observationKind" }
+    },
+    "normalization": { "$ref": "#/$defs/object" },
+    "idempotency": { "$ref": "#/$defs/object" },
+    "provenance": { "$ref": "#/$defs/object" },
+    "privacy": { "$ref": "#/$defs/object" },
+    "ordering": { "$ref": "#/$defs/object" },
+    "batch_contract": { "$ref": "#/$defs/object" },
+    "admission_order": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 20 }
+    },
+    "provider_acceptance_outcomes": {
+      "type": "array",
+      "minItems": 13,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+    },
+    "delivery_receipt": { "$ref": "#/$defs/object" },
+    "observer_non_interference": { "$ref": "#/$defs/object" },
+    "invariants": {
+      "type": "array",
+      "minItems": 13,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 20 }
+    },
+    "verification_beads": {
+      "type": "array",
+      "minItems": 8,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/beadId" }
+    }
+  },
+  "$defs": {
+    "beadId": {
+      "type": "string",
+      "pattern": "^tdmem-[0-9]{4}$"
+    },
+    "object": {
+      "type": "object",
+      "minProperties": 1
+    },
+    "observationKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "source_authority", "payload_contract"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\\.v[1-9][0-9]*$"
+        },
+        "source_authority": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "payload_contract": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\\.v[1-9][0-9]*$"
+        }
+      }
+    }
+  }
+}
