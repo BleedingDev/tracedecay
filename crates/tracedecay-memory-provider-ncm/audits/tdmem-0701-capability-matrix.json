@@ -1,0 +1,1070 @@
+{
+  "schema_version": 1,
+  "bead_id": "tdmem-0701",
+  "audit_subject": {
+    "name": "Biomem/NCM licensed surface",
+    "repository": "https://github.com/bleedingDev/biomem",
+    "revision": "500847ff65b5d9548b3826fa29bf3ccf8d221147",
+    "implementation_version": "0.0.2",
+    "license_identity": "MIT",
+    "platform": {
+      "system": "Darwin",
+      "machine": "arm64",
+      "python": "3.12.8"
+    }
+  },
+  "contract": {
+    "provider_api_path": "crates/tracedecay-memory-provider-api/src/lib.rs",
+    "contract_root": "product/contracts/memory-provider-v1",
+    "mandatory_capabilities": [
+      "provider.health.v1",
+      "observation.accept.v1",
+      "recall.query.v1"
+    ],
+    "classification_values": [
+      "supported",
+      "adaptable",
+      "blocking",
+      "unsupported"
+    ],
+    "classification_semantics": {
+      "supported": "The licensed surface already meets the provider contract without semantic repair.",
+      "adaptable": "A real licensed primitive exists and can retain its semantics behind the provider mapping. Production admission may still require licensed-surface augmentation for safety evidence the primitive cannot currently expose; ncm_change_required records that distinction.",
+      "blocking": "A related primitive exists, but using it for this capability would violate a mandatory semantic guarantee until the licensed implementation or topology changes.",
+      "unsupported": "No callable primitive implements the capability; it must not be declared."
+    }
+  },
+  "mandatory_operations": [
+    {
+      "operation": "health",
+      "capability_id": "provider.health.v1",
+      "mandatory": true,
+      "classification": "adaptable",
+      "licensed_primitive": "GET /api/health through LocalDaemonClient.health and CommandHandler._handle_status",
+      "conformance_gaps": [
+        "ready is derived from a successful status command rather than verified loaded-state, persistence, recovery, capacity, privacy, or exact-scope checks",
+        "the response has product, package version, HTTP protocol version, transport, and process state but no immutable build identity, configuration identity, provider instance identity, state identity, generation, or scope digest",
+        "TextMemory load errors are logged and swallowed, so a corrupt or incompatible file can leave fresh in-memory state while health still reports ready"
+      ],
+      "adapter_requirements": [
+        "fail closed until loaded-state, immutable build identity, effective configuration identity, state schema, generation, namespace, and exact-scope identity are verified",
+        "map status and transport failures to typed provider health terminals",
+        "negotiate finite provider limits and issue readiness only after all requested checks pass"
+      ],
+      "ncm_change_required": true,
+      "classification_note": "adaptable identifies the genuine HTTP identity/status primitive; it does not permit production readiness until Biomem exposes loaded-state and build/config/state identity evidence",
+      "evidence_ids": [
+        "contract-health",
+        "biomem-health",
+        "biomem-load",
+        "probe-surface"
+      ]
+    },
+    {
+      "operation": "observe",
+      "capability_id": "observation.accept.v1",
+      "mandatory": true,
+      "classification": "blocking",
+      "licensed_primitive": "store_record accepts a bounded key/value, optional caller memory_id, and limited provenance, then mutates memory and saves",
+      "conformance_gaps": [
+        "same memory_id and key is a reinforcement, not a duplicate acknowledgement, and changes intensity/value state on every retry",
+        "there is no persisted idempotency-key ledger, canonical payload conflict check, observation/source sequence, or durable delivery outcome",
+        "save failure happens after in-memory mutation and is returned without committed-effect reconciliation; a client deadline or disconnect can leave an unknown effect",
+        "the daemon accepts no exact scope, deadline, cancellation token, privacy contract, immutable observation envelope, or typed partial/effect-unknown terminal",
+        "save writes the final state file non-atomically"
+      ],
+      "adapter_requirements": [
+        "preserve and validate the complete canonical observation envelope",
+        "derive a deterministic provider-local key only after exact-scope admission",
+        "return typed applied, duplicate, conflict, partial, and unknown-effect outcomes"
+      ],
+      "ncm_change_required": true,
+      "blockers": [
+        {
+          "owner_boundary": "biomem",
+          "reason": "persisted idempotency, effect reconciliation, server cancellation, and crash-safe commit are absent"
+        },
+        {
+          "owner_boundary": "adapter",
+          "reason": "the complete TraceDecay observation, scope, privacy, provenance, and terminal mapping is not implemented"
+        }
+      ],
+      "evidence_ids": [
+        "contract-observation",
+        "biomem-store-handler",
+        "biomem-store-core",
+        "biomem-memory-id",
+        "biomem-persistence",
+        "biomem-daemon-client",
+        "probe-surface"
+      ]
+    },
+    {
+      "operation": "recall",
+      "capability_id": "recall.query.v1",
+      "mandatory": true,
+      "classification": "adaptable",
+      "licensed_primitive": "search, not retrieve: bounded semantic search returning stable memory_id, content, native similarity, layer, provenance, age, usage, and intensity without recall-stat mutation",
+      "conformance_gaps": [
+        "the request has no exact scope, readiness binding, objective, temporal mode, exclusions, total-byte budget, policy revision, deadline, or live cancellation",
+        "results lack request-scoped candidate IDs, canonical content digests, contract validity, source revisions, explicit provenance state, coverage counts, terminal outcome, and deterministic score-tie rule",
+        "search cannot prove full-scope isolation while the daemon owns one shared state file",
+        "retrieve is unsuitable because it writes session cache and increments recall statistics/usage"
+      ],
+      "adapter_requirements": [
+        "route recall only to side-effect-free search",
+        "enforce an already-admitted opaque exact-scope namespace before dispatch",
+        "add validity, provenance-state, exclusions, coverage, ordering tie-break, byte budgets, typed terminals, deadline mapping, and bounded warnings",
+        "exclude unknown, revoked, superseded, or scope-unproven candidates by policy"
+      ],
+      "ncm_change_required": false,
+      "evidence_ids": [
+        "contract-recall",
+        "biomem-search-handler",
+        "biomem-search-core",
+        "biomem-retrieve",
+        "biomem-retrieve-usage",
+        "biomem-mcp-surface"
+      ]
+    }
+  ],
+  "capability_matrix": [
+    {
+      "capability_id": "provider.health.v1",
+      "requirement": "mandatory",
+      "classification": "adaptable",
+      "evidence_ids": ["contract-health", "biomem-health", "biomem-load"],
+      "adapter_requirements": ["fail closed until loaded-state, build/config, state, and scope identity are verified"],
+      "ncm_change_required": true
+    },
+    {
+      "capability_id": "observation.accept.v1",
+      "requirement": "mandatory",
+      "classification": "blocking",
+      "evidence_ids": ["contract-observation", "biomem-store-handler", "biomem-memory-id", "biomem-persistence"],
+      "adapter_requirements": ["map the canonical observation envelope and typed effect outcomes"],
+      "ncm_change_required": true,
+      "blockers": [
+        {"owner_boundary": "biomem", "reason": "durable dedupe/effect reconciliation and crash-safe commit are absent"},
+        {"owner_boundary": "adapter", "reason": "canonical envelope and exact-scope mapping are absent"}
+      ]
+    },
+    {
+      "capability_id": "recall.query.v1",
+      "requirement": "mandatory",
+      "classification": "adaptable",
+      "evidence_ids": ["contract-recall", "biomem-search-handler", "biomem-search-core", "biomem-retrieve", "biomem-retrieve-usage"],
+      "adapter_requirements": ["use search and add exact scope, validity, provenance state, coverage, exclusions, terminal, and deadline mapping"],
+      "ncm_change_required": false
+    },
+    {
+      "capability_id": "feedback.record.v1",
+      "requirement": "optional",
+      "classification": "unsupported",
+      "evidence_ids": ["biomem-command-catalog", "biomem-mcp-surface"],
+      "adapter_requirements": [],
+      "ncm_change_required": true
+    },
+    {
+      "capability_id": "maintenance.run.v1",
+      "requirement": "optional",
+      "classification": "blocking",
+      "evidence_ids": ["biomem-maintenance", "contract-lifecycle"],
+      "adapter_requirements": ["map only finite tasks after progress, resume, deadline, cancellation, generation, and receipt semantics exist"],
+      "ncm_change_required": true,
+      "blockers": [{"owner_boundary": "biomem", "reason": "maintenance loops are not deadline/cancellation aware and do not expose partial resume state"}]
+    },
+    {
+      "capability_id": "recall.temporal.v1",
+      "requirement": "optional",
+      "classification": "unsupported",
+      "evidence_ids": ["biomem-search-core", "biomem-command-catalog"],
+      "adapter_requirements": [],
+      "ncm_change_required": true
+    },
+    {
+      "capability_id": "recall.associative.v1",
+      "requirement": "optional",
+      "classification": "adaptable",
+      "evidence_ids": ["biomem-search-core", "biomem-search-handler"],
+      "adapter_requirements": ["bind the native similarity domain and deterministic ordering to a scoped recall response"],
+      "ncm_change_required": false
+    },
+    {
+      "capability_id": "facts.explicit.v1",
+      "requirement": "optional",
+      "classification": "unsupported",
+      "evidence_ids": ["biomem-command-catalog", "biomem-store-core"],
+      "adapter_requirements": [],
+      "ncm_change_required": true
+    },
+    {
+      "capability_id": "explain.trace.v1",
+      "requirement": "optional",
+      "classification": "unsupported",
+      "evidence_ids": ["biomem-search-core", "biomem-command-catalog"],
+      "adapter_requirements": [],
+      "ncm_change_required": true
+    },
+    {
+      "capability_id": "correction.apply.v1",
+      "requirement": "optional",
+      "classification": "blocking",
+      "evidence_ids": ["biomem-correction-delete", "contract-lifecycle"],
+      "adapter_requirements": ["replace index/text matching with stable-ref, expected-revision, idempotent scoped correction"],
+      "ncm_change_required": true,
+      "blockers": [{"owner_boundary": "biomem", "reason": "current edit/update operations have no revision, scope, or idempotency semantics"}]
+    },
+    {
+      "capability_id": "deletion.by_source.v1",
+      "requirement": "optional",
+      "classification": "blocking",
+      "evidence_ids": ["biomem-correction-delete", "contract-lifecycle"],
+      "adapter_requirements": ["add admitted source-key deletion and verified remaining-influence/snapshot postconditions"],
+      "ncm_change_required": true,
+      "blockers": [{"owner_boundary": "biomem", "reason": "current deletion is by text/index and cannot verify source influence or snapshots"}]
+    },
+    {
+      "capability_id": "snapshot.export.v1",
+      "requirement": "optional",
+      "classification": "blocking",
+      "evidence_ids": ["biomem-persistence", "biomem-admin-surface", "contract-lifecycle"],
+      "adapter_requirements": ["add consistent-generation, provider/build/schema/scope identity, size bound, and digest envelope"],
+      "ncm_change_required": true,
+      "blockers": [{"owner_boundary": "biomem", "reason": "save/export is not a locked consistent-generation snapshot and writes non-atomically"}]
+    },
+    {
+      "capability_id": "snapshot.restore.v1",
+      "requirement": "optional",
+      "classification": "blocking",
+      "evidence_ids": ["biomem-load", "biomem-admin-surface", "contract-lifecycle"],
+      "adapter_requirements": ["validate exact provider/build/schema/scope/digest and expected generation before mutation"],
+      "ncm_change_required": true,
+      "blockers": [{"owner_boundary": "biomem", "reason": "load/restore swallows incompatibility and lacks fail-closed identity checks"}]
+    },
+    {
+      "capability_id": "replay.apply.v1",
+      "requirement": "optional",
+      "classification": "blocking",
+      "evidence_ids": ["biomem-replay-import", "contract-lifecycle"],
+      "adapter_requirements": ["replace best-effort batch import with monotonic receipt-backed idempotent replay and partial progress"],
+      "ncm_change_required": true,
+      "blockers": [{"owner_boundary": "biomem", "reason": "batch import has no sequence/dedupe/gap/cancellation semantics and reports success after save failure"}]
+    },
+    {
+      "capability_id": "inspection.read.v1",
+      "requirement": "optional",
+      "classification": "blocking",
+      "evidence_ids": ["biomem-inspection", "contract-lifecycle"],
+      "adapter_requirements": ["add scoped views, redaction policy, byte/item bounds, stable cursors, coverage, and generation"],
+      "ncm_change_required": true,
+      "blockers": [{"owner_boundary": "biomem", "reason": "available status/list/graph primitives do not cover required views and list materializes an effectively unbounded scan"}]
+    }
+  ],
+  "callable_surface": [
+    {
+      "layer": "MCP stdio",
+      "operations": ["biomem_status", "biomem_store", "biomem_retrieve", "biomem_search", "biomem_list", "biomem_graph"],
+      "mutation": "biomem_store only",
+      "bounds": "tool inputs are schema-bounded; search top_k <= 50, list limit <= 100, graph max_nodes <= 250",
+      "notes": "stateless facade over one loopback daemon; store is explicitly marked non-idempotent",
+      "evidence_ids": ["biomem-mcp-surface"]
+    },
+    {
+      "layer": "loopback HTTP v1",
+      "operations": ["GET /api/health", "GET /api/status", "POST /api"],
+      "mutation": "POST command-dependent",
+      "bounds": "1 MiB server request body; client request 1 MiB and response 4 MiB; 2 second connect and 30 second read timeouts",
+      "notes": "loopback-only, threaded accept layer, command execution submitted to the daemon event loop",
+      "evidence_ids": ["biomem-health", "biomem-daemon-client", "biomem-http-threading", "probe-surface"]
+    },
+    {
+      "layer": "CommandHandler",
+      "operations": ["retrieve", "store", "store_record", "search", "list_memories", "ollama_chat", "backup", "restore", "activate", "deactivate", "suspend_timed", "force_resume", "clear_stm", "clear_ltm", "set_mem_thresholds", "status", "get_dendrogram", "get_temporal_evolution_map", "get_memory_graph", "get_center", "update_center", "delete_center", "batch_import", "export_product", "generate_cognitive_report", "refactor_memory"],
+      "mutation": "mixed",
+      "bounds": "selected inputs are bounded, but maintenance/import/list internals do not implement provider deadlines or complete work bounds",
+      "notes": "memory store/search/list use one asyncio lock; update/delete dispatch to worker threads outside that lock",
+      "evidence_ids": ["biomem-command-catalog", "biomem-store-handler", "biomem-search-handler", "biomem-admin-surface"]
+    },
+    {
+      "layer": "TextMemory core",
+      "operations": ["store", "store_record", "recall", "search", "edit", "forget", "step", "maybe_consolidate", "consolidate", "save", "load", "reset", "migrate_state", "get_stats", "list_memories", "backup", "restore", "list_backups", "refactor"],
+      "mutation": "mixed",
+      "bounds": "fixed configured center capacities; caller top_k/limit where present",
+      "notes": "uses a process-local RLock; direct save is not protected by that lock",
+      "evidence_ids": ["biomem-store-core", "biomem-search-core", "biomem-persistence", "biomem-maintenance"]
+    }
+  ],
+  "persistence": {
+    "classification": "blocking_for_production",
+    "state_identity": {
+      "observed": "TextMemory.STATE_VERSION=1.0 plus a configured state-file path",
+      "missing": ["provider owner", "opaque exact-scope namespace", "scope digest", "immutable build/config identity", "monotonic state generation"]
+    },
+    "formats": [
+      ".bdbm: BDBMZIP01 plus ZIP containing vectors.pt and metadata.json",
+      ".pt: legacy PyTorch state",
+      "BDBMENC01: legacy machine-fingerprint encrypted container accepted for compatibility",
+      "raw ZIP without magic: accepted with a warning"
+    ],
+    "compatibility": [
+      "new .bdbm output is portable between machines",
+      "legacy encrypted .bdbm requires the originating machine fingerprint",
+      "legacy .pt load rewrites its version marker to 1.0 and attempts a best-effort pre-migration backup",
+      ".bdbm load does not run migrate_state or reject an incompatible state version"
+    ],
+    "observed_outcomes": [
+      {
+        "outcome": "missing state file leaves initialized empty memory",
+        "evidence_ids": ["biomem-load"]
+      },
+      {
+        "outcome": "unknown/corrupt container raises in BDBMContainer.load but TextMemory._load_impl catches and logs it, leaving initialized state",
+        "evidence_ids": ["biomem-load"]
+      },
+      {
+        "outcome": "missing sections in a decoded state are applied selectively rather than rejected as an incompatible whole",
+        "evidence_ids": ["biomem-load"]
+      },
+      {
+        "outcome": "store_record mutates RAM before save; save failure returns an error without describing whether the provider effect remains in memory",
+        "evidence_ids": ["biomem-store-handler", "biomem-persistence"]
+      },
+      {
+        "outcome": "shutdown save failure is logged and shutdown continues",
+        "evidence_ids": ["biomem-server-lifecycle", "biomem-persistence"]
+      }
+    ],
+    "load_failure_policy": "fail_closed is required; the observed log-and-continue behavior is nonconformant and blocks readiness",
+    "required_load_failure_behavior": "reject_readiness",
+    "implicit_reset_allowed": false,
+    "crash_safety": "blocking: Path.write_bytes replaces the final state directly with no temporary sibling, atomic rename, file fsync, or directory fsync",
+    "scope_isolation": "blocking: one process resolves one shared state file; no exact TraceDecay scope is represented in the file or health surface",
+    "privacy_note": "portable metadata.json contains key/value text, stable IDs, and provenance inside an unencrypted ZIP; provider admission must enforce the TraceDecay privacy contract before use",
+    "evidence_ids": ["biomem-persistence", "biomem-load", "biomem-main-state", "biomem-store-handler"]
+  },
+  "lifecycle": {
+    "startup": "TextMemory construction attempts auto-load; the server forces lazy embedder model access before marking its server task running",
+    "readiness": "HTTP health returns ready when status returns success, independently of a verified load result or state/config/build/scope identity",
+    "readiness_verification": "unverified_loaded_state_identity",
+    "shutdown": "WebSocket connections and HTTP listener are stopped, then memory.save is attempted; failure is logged",
+    "topology": "one BDBMServer owns one TextMemory, one CommandHandler, one session cache, WebSocket transport, and HTTP fallback",
+    "recovery": "backup/restore primitives exist, but restore catches load failure internally and can return success after no compatible state was applied",
+    "evidence_ids": ["biomem-main-state", "biomem-server-lifecycle", "biomem-health", "biomem-load", "biomem-admin-surface"]
+  },
+  "threading_and_cancellation": {
+    "classification": "blocking_for_mutations_and_bounded_stop",
+    "core_threading_evidence": "measured",
+    "core_cancellation_evidence": "measured",
+    "threading_observations": [
+      {
+        "evidence_kind": "measured_probe",
+        "claim_scope": "actual_biomem_http_transport_with_bounded_synthetic_handler",
+        "outcome": "the actual HTTP transport overlapped bounded synthetic handler coroutines at probe levels 1, 2, 4, and 8; this establishes transport overlap only, not model, persistence, CPU, or internal provider parallelism",
+        "evidence_ids": ["probe-surface"]
+      },
+      {
+        "evidence_kind": "pinned_source_inference",
+        "claim_scope": "pinned_biomem_http_bridge",
+        "outcome": "production HTTP requests are submitted from HTTP worker threads to one daemon asyncio loop",
+        "evidence_ids": ["biomem-http-threading"]
+      },
+      {
+        "evidence_kind": "pinned_source_inference",
+        "claim_scope": "pinned_biomem_command_handler",
+        "outcome": "store_record/search/list and several maintenance commands serialize through one CommandHandler asyncio lock",
+        "evidence_ids": ["biomem-command-catalog", "biomem-store-handler", "biomem-search-handler"]
+      },
+      {
+        "evidence_kind": "pinned_source_inference",
+        "claim_scope": "pinned_biomem_text_memory_core",
+        "outcome": "TextMemory public mutation/read methods generally use a process-local RLock",
+        "evidence_ids": ["biomem-store-core", "biomem-search-core"]
+      },
+      {
+        "evidence_kind": "pinned_source_inference",
+        "claim_scope": "pinned_biomem_admin_mutations",
+        "outcome": "update_center/delete_center dispatch direct center access with asyncio.to_thread outside CommandHandler.lock and TextMemory._lock; update targets absent singular text attributes, while delete changes active/intensity without clearing the actual plural text arrays",
+        "evidence_ids": ["biomem-threaded-admin-mutation", "biomem-center-layout"]
+      }
+    ],
+    "cancellation_observations": [
+      {
+        "evidence_kind": "measured_probe",
+        "claim_scope": "actual_biomem_http_transport_with_bounded_synthetic_handler",
+        "outcome": "the client timed out; the bounded synthetic handler later took its normal-return branch and no CancelledError was observed; this proves non-cancellation only for this synthetic transport request, not real TextMemory/model/persistence work or mutation-effect certainty",
+        "evidence_ids": ["probe-surface"]
+      },
+      {
+        "evidence_kind": "pinned_source_inference",
+        "claim_scope": "pinned_biomem_http_bridge",
+        "outcome": "HTTPFallbackServer._submit_command waits on run_coroutine_threadsafe(...).result() and has no socket-disconnect path to future.cancel or a provider cancellation signal",
+        "evidence_ids": ["biomem-http-threading"]
+      },
+      {
+        "evidence_kind": "pinned_source_inference",
+        "claim_scope": "pinned_biomem_local_daemon_client",
+        "outcome": "LocalDaemonClient maps its own HTTP timeout to DEADLINE_EXCEEDED but transmits neither an absolute deadline nor a live cancellation token",
+        "evidence_ids": ["biomem-daemon-client"]
+      },
+      {
+        "evidence_kind": "pinned_source_inference",
+        "claim_scope": "pinned_biomem_local_daemon_client",
+        "outcome": "the 2 second connect and 30 second read budgets apply independently to the health preflight and command request, not to one end-to-end provider operation",
+        "evidence_ids": ["biomem-daemon-client"]
+      },
+      {
+        "evidence_kind": "pinned_source_inference",
+        "claim_scope": "pinned_biomem_protocol",
+        "outcome": "there is no server operation identity or effect query with which to reconcile a timed-out mutation",
+        "evidence_ids": ["biomem-daemon-client", "biomem-store-handler"]
+      }
+    ],
+    "observed_results": {
+      "transport_concurrency": {
+        "concurrency_levels": [1, 2, 4, 8],
+        "matrix": [
+          {"attempted": 1, "completed": 1, "elapsed_ms": 81, "errors": 0, "max_active": 1, "parallel_requests": 1},
+          {"attempted": 2, "completed": 2, "elapsed_ms": 79, "errors": 0, "max_active": 2, "parallel_requests": 2},
+          {"attempted": 4, "completed": 4, "elapsed_ms": 81, "errors": 0, "max_active": 4, "parallel_requests": 4},
+          {"attempted": 8, "completed": 8, "elapsed_ms": 83, "errors": 0, "max_active": 8, "parallel_requests": 8}
+        ],
+        "real_memory_backend_used": false
+      },
+      "client_disconnect": {
+        "timeout_seen": true,
+        "elapsed_ms": 31,
+        "server_completed_after_disconnect": true,
+        "server_observed_cancellation": false,
+        "server_completion_wait_ms": 170,
+        "handler_started": 1,
+        "handler_completed": 1,
+        "handler_cancelled": 0
+      }
+    },
+    "evidence_ids": ["probe-surface", "biomem-http-threading", "biomem-command-catalog", "biomem-daemon-client", "biomem-store-core", "biomem-threaded-admin-mutation", "biomem-center-layout"]
+  },
+  "errors_and_inspectability": {
+    "errors": [
+      "CommandHandler returns stable string codes for validation and known command failures, while unexpected exceptions collapse to INTERNAL_ERROR",
+      "HTTP command-level errors normally retain HTTP 200 and a JSON status=error envelope",
+      "LocalDaemonClient exposes only a small safe code set; SAVE_FAILED, WRITE_ERROR, DUPLICATE_MEMORY_ID, and INVALID_PARAMS are collapsed to INTERNAL_ERROR",
+      "no mutation response reports committed none/applied/partial/unknown state, provider generation, or a queryable operation identity"
+    ],
+    "inspectability": [
+      "status exposes security state, active session count, and best-effort memory stats",
+      "search exposes bounded stable-ID semantic results without center indices",
+      "list_memories exposes stable-ID pages but first materializes up to 1,000,000 records and has no byte budget or generation-bound cursor",
+      "graph exposes up to 250 selected nodes with explicit truncation",
+      "there is no delivery-outcome, source-influence, state-generation, recovery, snapshot-metadata, or capability-status inspection view"
+    ],
+    "evidence_ids": ["biomem-errors", "biomem-daemon-client", "biomem-http-threading", "biomem-status", "biomem-search-handler", "biomem-inspection"]
+  },
+  "platform": {
+    "declared": {
+      "python": ">=3.10",
+      "operating_systems": ["MacOS", "Windows", "POSIX/Linux"],
+      "python_classifiers": ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    },
+    "observed": {
+      "system": "Darwin 25.6.0",
+      "machine": "arm64",
+      "python": "3.12.8",
+      "src_python_files_syntax_checked": 33,
+      "syntax_errors": 0,
+      "http_health_status": 200,
+      "http_identity": {"product": "biomem", "version": "0.0.2", "protocol_version": 1, "transport": "http", "ready": true},
+      "http_identity_handler_status_was_synthetic": true,
+      "loaded_state_identity_fields_present": []
+    },
+    "verification_scope": "all 33 .py files under the exact revision's src/ tree plus the actual HTTPFallbackServer transport with bounded synthetic handlers; no real memory backend, model download, full daemon startup, persistence mutation, or Cargo/build was performed",
+    "evidence_ids": ["biomem-platform", "probe-revision-platform", "probe-surface"]
+  },
+  "production_gate": {
+    "status": "blocked",
+    "fake_readiness_allowed": false,
+    "state_identity_required": true,
+    "blockers": [
+      {
+        "id": "state-readiness",
+        "title": "Fail-closed loaded-state, build/config, schema, generation, and recovery readiness",
+        "owner_boundary": "biomem",
+        "evidence_ids": ["contract-health", "biomem-health", "biomem-load", "biomem-status"]
+      },
+      {
+        "id": "exact-scope-isolation",
+        "title": "Exact profile/project/repository/worktree/branch/session scope must select an isolated namespace and bind the TraceDecay-owned provider envelope",
+        "owner_boundary": "adapter",
+        "evidence_ids": ["contract-health", "contract-recall", "contract-observation", "biomem-main-state", "biomem-mcp-surface"]
+      },
+      {
+        "id": "server-cancellation-effect-reconciliation",
+        "title": "Durable observation idempotency/dedupe, server-side bounded cancellation, and mutation effect reconciliation",
+        "owner_boundary": "biomem",
+        "evidence_ids": ["contract-observation", "biomem-daemon-client", "biomem-http-threading", "biomem-store-handler", "biomem-memory-id", "probe-surface"]
+      },
+      {
+        "id": "crash-safe-persistence",
+        "title": "Atomic crash-safe state commit and incompatible/corrupt load rejection",
+        "owner_boundary": "biomem",
+        "evidence_ids": ["biomem-persistence", "biomem-load"]
+      }
+    ]
+  },
+  "authority_boundary": {
+    "ncm_role": "provider-local advisory cognitive memory only",
+    "tracedecay_role": "sole authority for current code, exact repository/worktree/scope identity, sessions, admitted observations, canonical facts, tools, approvals, provider admission, and final context assembly",
+    "exclusions": {
+      "git_and_repository_resolution": false,
+      "codebase_navigation": false,
+      "tracedecay_storage": false,
+      "canonical_tracedecay_authority": false
+    },
+    "provider_output_can_mutate_canonical_state": false,
+    "provider_output_can_inject_final_context": false,
+    "evidence_ids": ["contract-observation", "contract-recall", "biomem-mcp-surface"]
+  },
+  "evidence": [
+    {
+      "id": "contract-health",
+      "kind": "source_symbol",
+      "repository": "tracedecay worktree",
+      "path": "product/contracts/memory-provider-v1/provider-lifecycle-contract.json",
+      "symbol": "/health and /invariants",
+      "lines": "107-148, 501-513"
+    },
+    {
+      "id": "contract-observation",
+      "kind": "source_symbol",
+      "repository": "tracedecay worktree",
+      "path": "product/contracts/memory-provider-v1/provider-observation-contract.json",
+      "symbol": "/observation_envelope, /idempotency, /delivery_receipt, /invariants"
+    },
+    {
+      "id": "contract-recall",
+      "kind": "source_symbol",
+      "repository": "tracedecay worktree",
+      "path": "product/contracts/memory-provider-v1/provider-recall-contract.json",
+      "symbol": "/recall_request, /provider_candidate, /recall_response, /coverage, /validity, /provenance, /invariants"
+    },
+    {
+      "id": "contract-lifecycle",
+      "kind": "source_symbol",
+      "repository": "tracedecay worktree",
+      "path": "product/contracts/memory-provider-v1/provider-lifecycle-contract.json",
+      "symbol": "/capability_gating, /maintenance, /inspection, /correction, /deletion_by_source, /snapshot, /replay"
+    },
+    {
+      "id": "biomem-mcp-surface",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/mcp_server.py",
+      "symbol": "create_server",
+      "lines": "1-186"
+    },
+    {
+      "id": "biomem-health",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/http_fallback.py",
+      "symbol": "BDBMHTTPHandler._status_payload, _handle_quick_status, do_GET",
+      "lines": "227-271"
+    },
+    {
+      "id": "biomem-daemon-client",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/local_daemon_client.py",
+      "symbol": "LocalDaemonClient.health, command, _request, _raise_daemon_error",
+      "lines": "18-263"
+    },
+    {
+      "id": "biomem-http-threading",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/http_fallback.py",
+      "symbol": "request limits, loopback checks, HTTPFallbackServer.start, BDBMHTTPHandler._submit_command, do_POST, ThreadingHTTPServer",
+      "lines": "33-76, 110-123, 213-225, 344-395"
+    },
+    {
+      "id": "biomem-command-catalog",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/protocol.py",
+      "symbol": "CommandHandler.__init__, CommandHandler.handle",
+      "lines": "160-264"
+    },
+    {
+      "id": "biomem-store-handler",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/protocol.py",
+      "symbol": "CommandHandler._handle_store, CommandHandler._handle_store_record",
+      "lines": "507-684"
+    },
+    {
+      "id": "biomem-search-handler",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/protocol.py",
+      "symbol": "CommandHandler._normalise_record, _handle_search, _handle_list_memories",
+      "lines": "428-465, 686-779"
+    },
+    {
+      "id": "biomem-retrieve",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/protocol.py",
+      "symbol": "CommandHandler._handle_retrieve, _retrieve_memories",
+      "lines": "471-505, 1131-1169"
+    },
+    {
+      "id": "biomem-retrieve-usage",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/memory_centers.py",
+      "symbol": "MemoryCenters.read_compound, read_compound_records",
+      "lines": "304-440"
+    },
+    {
+      "id": "biomem-status",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/protocol.py",
+      "symbol": "CommandHandler._handle_status",
+      "lines": "1243-1261"
+    },
+    {
+      "id": "biomem-errors",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/protocol.py",
+      "symbol": "error-code constants, CommandHandler.handle, _error_response",
+      "lines": "60-82, 209-278"
+    },
+    {
+      "id": "biomem-store-core",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/text_memory.py",
+      "symbol": "TextMemory.__init__ RLock, store, store_record, _store_impl",
+      "lines": "186-187, 221-396"
+    },
+    {
+      "id": "biomem-search-core",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/text_memory.py",
+      "symbol": "TextMemory.recall, _recall_impl, search",
+      "lines": "437-573"
+    },
+    {
+      "id": "biomem-memory-id",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/memory_centers.py",
+      "symbol": "MemoryCenters.write",
+      "lines": "445-634"
+    },
+    {
+      "id": "biomem-persistence",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/bdbm_container.py",
+      "symbol": "BDBMContainer.save, load, _extract_metadata, _extract_vectors, _merge_state",
+      "lines": "32-254"
+    },
+    {
+      "id": "biomem-load",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/text_memory.py",
+      "symbol": "TextMemory.STATE_VERSION, __init__, save, load, _load_impl, _apply_state, migrate_state, restore",
+      "lines": "67-196, 693-788, 878-908, 986-999"
+    },
+    {
+      "id": "biomem-main-state",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/main.py",
+      "symbol": "_resolve_state_file, _run_background_server, _run_headless",
+      "lines": "136-276, 399-466"
+    },
+    {
+      "id": "biomem-server-lifecycle",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/ws_server.py",
+      "symbol": "BDBMServer.__init__, start, stop",
+      "lines": "82-229"
+    },
+    {
+      "id": "biomem-maintenance",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/text_memory.py",
+      "symbol": "TextMemory.step, consolidate, refactor",
+      "lines": "651-688, 1033-1089"
+    },
+    {
+      "id": "biomem-admin-surface",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/protocol.py",
+      "symbol": "CommandHandler._handle_backup, _handle_restore, _handle_export_product, _handle_refactor_memory",
+      "lines": "1373-1459"
+    },
+    {
+      "id": "biomem-correction-delete",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/text_memory.py",
+      "symbol": "TextMemory.edit, forget",
+      "lines": "575-640"
+    },
+    {
+      "id": "biomem-threaded-admin-mutation",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/protocol.py",
+      "symbol": "CommandHandler._handle_update_center, _handle_delete_center",
+      "lines": "1510-1565"
+    },
+    {
+      "id": "biomem-center-layout",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/memory_centers.py",
+      "symbol": "MemoryCenters tensor buffers and plural text/identity/provenance arrays",
+      "lines": "91-117"
+    },
+    {
+      "id": "biomem-replay-import",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/protocol.py",
+      "symbol": "CommandHandler._handle_batch_import",
+      "lines": "1795-1875"
+    },
+    {
+      "id": "biomem-inspection",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/memory_module/protocol.py",
+      "symbol": "CommandHandler._handle_status, _handle_list_memories, _handle_get_memory_graph",
+      "lines": "717-779, 1243-1261, 1696-1789"
+    },
+    {
+      "id": "biomem-platform",
+      "kind": "source_symbol",
+      "repository": "bleedingDev/biomem@500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "path": "src/pyproject.toml",
+      "symbol": "project metadata and dependencies",
+      "lines": "5-57"
+    },
+    {
+      "id": "probe-revision-platform",
+      "kind": "measured_probe",
+      "probe_id": "tdmem-0701.revision-platform.v1",
+      "command": "git -C <exact-revision-biomem-checkout> rev-parse HEAD; uname -srm; python3 --version",
+      "observed": {
+        "revision": "500847ff65b5d9548b3826fa29bf3ccf8d221147",
+        "system_release_machine": "Darwin 25.6.0 arm64",
+        "python": "3.12.8"
+      }
+    },
+    {
+      "id": "probe-surface",
+      "kind": "measured_probe",
+      "probe_id": "tracedecay.ncm.surface-probe.v2",
+      "measurement_ids": [
+        "python_syntax",
+        "callable_surface_inventory",
+        "http_health_identity",
+        "http_parallel_requests",
+        "client_disconnect",
+        "health_load_state_identity",
+        "observation_retry_effects",
+        "bounded_recall",
+        "core_parallel_operations",
+        "cancellation_deadline_observation",
+        "cross_scope_leakage",
+        "restart_equivalence",
+        "interrupted_save_restore_incompatibility"
+      ],
+      "command": "<selected-model-venv-python> -s scripts/product/probe-ncm-surface.py --source <exact-revision-biomem-checkout> --expected-revision 500847ff65b5d9548b3826fa29bf3ccf8d221147 --core-mode auto --model-cache <caller-model-cache> --json",
+      "observed": {
+        "schema_version": 2,
+        "probe_id": "tracedecay.ncm.surface-probe.v2",
+        "input": {
+          "expected_revision": "500847ff65b5d9548b3826fa29bf3ccf8d221147",
+          "core_mode": "auto",
+          "concurrency_levels": [1, 2, 4, 8]
+        },
+        "measurements": [
+          {
+            "probe_id": "python_syntax",
+            "availability": "measured",
+            "claim_scope": "immutable_biomem_python_source",
+            "expectation": "Every Python source file compiles without writing bytecode.",
+            "observed": {"files_checked": 33, "errors": [], "error_count": 0},
+            "diagnostic": null,
+            "elapsed_ms": 469
+          },
+          {
+            "probe_id": "callable_surface_inventory",
+            "availability": "measured",
+            "claim_scope": "immutable_biomem_source_signatures",
+            "expectation": "Required probe entrypoints are inventoried without treating presence as support.",
+            "observed": {
+              "inventory_kind": "declared_methods_only",
+              "text_memory_parse_diagnostic": null,
+              "http_parse_diagnostic": null,
+              "text_memory_methods": {
+                "get_stats": {"present": true, "parameters": ["self"]},
+                "list_memories": {"present": true, "parameters": ["self", "source", "limit"]},
+                "load": {"present": true, "parameters": ["self", "path"]},
+                "restore": {"present": true, "parameters": ["self", "path"]},
+                "save": {"present": true, "parameters": ["self", "path"]},
+                "search": {"present": true, "parameters": ["self", "query", "top_k", "source"]},
+                "store_record": {"present": true, "parameters": ["self", "key", "value", "emotion", "intensity", "surprise", "age", "memory_id", "provenance"]}
+              },
+              "http_methods": {
+                "_handle_quick_status": {"present": true, "parameters": ["self"]},
+                "_submit_command": {"present": true, "parameters": ["self", "message"]},
+                "do_GET": {"present": true, "parameters": ["self"]},
+                "do_POST": {"present": true, "parameters": ["self"]}
+              },
+              "cancellation_parameter_present": false,
+              "deadline_parameter_present": false
+            },
+            "diagnostic": null,
+            "elapsed_ms": null
+          },
+          {
+            "probe_id": "http_health_identity",
+            "availability": "measured",
+            "claim_scope": "actual_biomem_http_transport_with_synthetic_status_handler",
+            "expectation": "HTTP health must distinguish product liveness from loaded-state readiness and expose build/config/state identity before claiming ready.",
+            "observed": {
+              "http_status": 200,
+              "status": "success",
+              "product": "biomem",
+              "version": "0.0.2",
+              "protocol_version": 1,
+              "transport": "http",
+              "ready": true,
+              "loaded_state_identity_fields_present": [],
+              "loaded_state_identity_complete": false,
+              "ready_without_loaded_state_identity": true,
+              "handler_status_was_synthetic": true
+            },
+            "diagnostic": null,
+            "elapsed_ms": 37
+          },
+          {
+            "probe_id": "http_parallel_requests",
+            "availability": "measured",
+            "claim_scope": "actual_biomem_http_transport_with_bounded_synthetic_handler",
+            "expectation": "Measure transport-level concurrency without inferring that the real model or persistence layer executes concurrently.",
+            "observed": {
+              "matrix": [
+                {"parallel_requests": 1, "attempted": 1, "completed": 1, "errors": 0, "elapsed_ms": 81, "max_active": 1},
+                {"parallel_requests": 2, "attempted": 2, "completed": 2, "errors": 0, "elapsed_ms": 79, "max_active": 2},
+                {"parallel_requests": 4, "attempted": 4, "completed": 4, "errors": 0, "elapsed_ms": 81, "max_active": 4},
+                {"parallel_requests": 8, "attempted": 8, "completed": 8, "errors": 0, "elapsed_ms": 83, "max_active": 8}
+              ],
+              "concurrency_levels": [1, 2, 4, 8],
+              "real_memory_backend_used": false
+            },
+            "diagnostic": null,
+            "elapsed_ms": 324
+          },
+          {
+            "probe_id": "client_disconnect",
+            "availability": "measured",
+            "claim_scope": "actual_biomem_http_transport_with_bounded_synthetic_handler",
+            "expectation": "A client timeout must not be reported as server-side cancellation; completion after disconnect remains an unknown-effect risk for mutations.",
+            "observed": {
+              "timeout_seen": true,
+              "elapsed_ms": 31,
+              "server_completed_after_disconnect": true,
+              "server_observed_cancellation": false,
+              "server_completion_wait_ms": 170,
+              "handler_started": 1,
+              "handler_completed": 1,
+              "handler_cancelled": 0
+            },
+            "diagnostic": null,
+            "elapsed_ms": 201
+          },
+          {
+            "probe_id": "health_load_state_identity",
+            "availability": "measured",
+            "claim_scope": "actual_biomem_text_memory",
+            "expectation": "Health/load evidence exposes actual loaded-state, build, config, schema, and generation identity.",
+            "observed": {
+              "device": "cpu",
+              "identity_fields_present": [],
+              "load_invoked": true,
+              "load_result_type": "NoneType",
+              "loaded_state_identity_complete": false,
+              "state_existed_before_load": false,
+              "stats_keys": ["consolidations", "device", "fatigue", "ltm_active", "ltm_texts", "ltm_total", "reads", "steps", "stm_active", "stm_texts", "stm_total", "writes"]
+            },
+            "diagnostic": null,
+            "elapsed_ms": 2
+          },
+          {
+            "probe_id": "observation_retry_effects",
+            "availability": "measured",
+            "claim_scope": "actual_biomem_text_memory",
+            "expectation": "An identical observation retry is measured for effect count and reinforcement, not assumed idempotent.",
+            "observed": {
+              "attempted": 2,
+              "completed": 2,
+              "first_index": 0,
+              "matching_memory_count": 1,
+              "provider_receipt_or_idempotency_fields_present": [],
+              "retry_index": 0,
+              "writes_after_first": 1,
+              "writes_after_retry": 2,
+              "writes_before": 0
+            },
+            "diagnostic": null,
+            "elapsed_ms": 51193
+          },
+          {
+            "probe_id": "bounded_recall",
+            "availability": "measured",
+            "claim_scope": "actual_biomem_text_memory",
+            "expectation": "Side-effect-free search returns no more than the explicit result bound with stable IDs and provenance.",
+            "observed": {
+              "bounded": true,
+              "memory_ids_present": 1,
+              "native_scores_present": 1,
+              "provenance_present": 1,
+              "requested_top_k": 8,
+              "returned": 1
+            },
+            "diagnostic": null,
+            "elapsed_ms": 31
+          },
+          {
+            "probe_id": "core_parallel_operations",
+            "availability": "measured",
+            "claim_scope": "actual_biomem_text_memory",
+            "expectation": "Actual TextMemory reads and writes are measured at 1, 2, 4, and 8 concurrent callers.",
+            "observed": {
+              "concurrency_levels": [1, 2, 4, 8],
+              "read_matrix": [
+                {"attempted": 1, "completed": 1, "elapsed_ms": 23, "error_types": [], "errors": 0, "max_callers_inflight": 1, "parallel_callers": 1},
+                {"attempted": 2, "completed": 2, "elapsed_ms": 228, "error_types": [], "errors": 0, "max_callers_inflight": 2, "parallel_callers": 2},
+                {"attempted": 4, "completed": 4, "elapsed_ms": 145, "error_types": [], "errors": 0, "max_callers_inflight": 3, "parallel_callers": 4},
+                {"attempted": 8, "completed": 8, "elapsed_ms": 150, "error_types": [], "errors": 0, "max_callers_inflight": 8, "parallel_callers": 8}
+              ],
+              "write_matrix": [
+                {"attempted": 1, "completed": 1, "elapsed_ms": 29, "error_types": [], "errors": 0, "max_callers_inflight": 1, "parallel_callers": 1},
+                {"attempted": 2, "completed": 2, "elapsed_ms": 182, "error_types": [], "errors": 0, "max_callers_inflight": 2, "parallel_callers": 2},
+                {"attempted": 4, "completed": 4, "elapsed_ms": 153, "error_types": [], "errors": 0, "max_callers_inflight": 4, "parallel_callers": 4},
+                {"attempted": 8, "completed": 8, "elapsed_ms": 384, "error_types": [], "errors": 0, "max_callers_inflight": 8, "parallel_callers": 8}
+              ]
+            },
+            "diagnostic": null,
+            "elapsed_ms": 1294
+          },
+          {
+            "probe_id": "cancellation_deadline_observation",
+            "availability": "measured",
+            "claim_scope": "actual_biomem_text_memory",
+            "expectation": "Client timeout/cancel outcome is separated from server completion and committed-effect certainty.",
+            "observed": {
+              "call_outcome": {"returned": 5},
+              "caller_wait_timeout_seen": true,
+              "cancellation_parameter_present": false,
+              "committed_effect": null,
+              "deadline_parameter_present": false,
+              "elapsed_ms": 36,
+              "error_observed": false,
+              "normal_return_observed": true,
+              "operation_kind": "read_only",
+              "operation_settled_after_caller_timeout": true,
+              "operation_still_running_after_followup_wait": false,
+              "provider_cancellation_observed": null
+            },
+            "diagnostic": null,
+            "elapsed_ms": 36
+          },
+          {
+            "probe_id": "cross_scope_leakage",
+            "availability": "measured",
+            "claim_scope": "actual_biomem_text_memory",
+            "expectation": "Two explicit isolated state paths do not expose each other's admitted memory IDs.",
+            "observed": {
+              "isolated_state_paths_used": true,
+              "leaked_identity_count": 0,
+              "scope_a_count": 5,
+              "scope_a_identity_present": true,
+              "scope_b_count": 0
+            },
+            "diagnostic": null,
+            "elapsed_ms": 48
+          },
+          {
+            "probe_id": "restart_equivalence",
+            "availability": "measured",
+            "claim_scope": "actual_biomem_text_memory",
+            "expectation": "A save/restart cycle preserves the admitted memory identity and bounded recall product.",
+            "observed": {
+              "after_count": 5,
+              "before_count": 5,
+              "bounded_recall_after": [
+                {"key": "ncm probe retry key", "memory_id": "tdmem-probe-retry", "source": "stm", "value": "ncm probe retry value"},
+                {"key": "parallel write 8 4", "memory_id": "tdmem-probe-parallel-4-1", "source": "stm", "value": "parallel value 8 4"},
+                {"key": "parallel write 8 5", "memory_id": "tdmem-probe-parallel-1-0", "source": "stm", "value": "parallel value 8 5"},
+                {"key": "parallel write 8 7", "memory_id": "tdmem-probe-parallel-8-6", "source": "stm", "value": "parallel value 8 7"},
+                {"key": "scope a private key", "memory_id": "tdmem-probe-scope-a-only", "source": "stm", "value": "scope a private value"}
+              ],
+              "bounded_recall_before": [
+                {"key": "ncm probe retry key", "memory_id": "tdmem-probe-retry", "source": "stm", "value": "ncm probe retry value"},
+                {"key": "parallel write 8 4", "memory_id": "tdmem-probe-parallel-4-1", "source": "stm", "value": "parallel value 8 4"},
+                {"key": "parallel write 8 5", "memory_id": "tdmem-probe-parallel-1-0", "source": "stm", "value": "parallel value 8 5"},
+                {"key": "parallel write 8 7", "memory_id": "tdmem-probe-parallel-8-6", "source": "stm", "value": "parallel value 8 7"},
+                {"key": "scope a private key", "memory_id": "tdmem-probe-scope-a-only", "source": "stm", "value": "scope a private value"}
+              ],
+              "missing_after_restart": [],
+              "same_bounded_recall_product": true,
+              "same_memory_ids": true,
+              "unexpected_after_restart": []
+            },
+            "diagnostic": null,
+            "elapsed_ms": 6058
+          },
+          {
+            "probe_id": "interrupted_save_restore_incompatibility",
+            "availability": "measured",
+            "claim_scope": "actual_biomem_text_memory",
+            "expectation": "Interrupted publication and incompatible restore fail explicitly without silent reset or false success.",
+            "observed": {
+              "incompatible_restore": {
+                "after_count": 5,
+                "availability": "measured",
+                "before_count": 5,
+                "error_type": null,
+                "raised": false,
+                "state_unchanged": true
+              },
+              "interrupted_save": {
+                "availability": "blocked",
+                "diagnostic": "no deterministic interruption hook exists; process-kill injection was not fabricated"
+              }
+            },
+            "diagnostic": null,
+            "elapsed_ms": 222
+          }
+        ],
+        "summary": {"blocked": 0, "measured": 13, "unsupported": 0, "total": 13}
+      }
+    }
+  ]
+}
