@@ -271,8 +271,12 @@ def validate_evidence(repo: Path, document: dict[str, Any], errors: list[str]) -
         "foundational ADR manifest",
         errors,
     )
-    if adrs.get("status") != "accepted" or len(adrs.get("decisions", [])) != 8:
-        errors.append("foundational ADR manifest must contain eight accepted decisions")
+    # ADR-0009 (ncm_execution_topology, "Run each NCM exact scope in a
+    # supervised isolated local process") was added in commit 35e5e5fb2
+    # ("docs(memory): select isolated NCM topology"), bringing the
+    # foundational decision count from eight to nine.
+    if adrs.get("status") != "accepted" or len(adrs.get("decisions", [])) != 9:
+        errors.append("foundational ADR manifest must contain nine accepted decisions")
     try:
         topology = next(
             row for row in adrs["decisions"] if row.get("id") == "ADR-0004"
