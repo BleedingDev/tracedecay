@@ -29,7 +29,6 @@ jobs:
     env:
       BR_VERSION: 0.5.7
       BR_ARCHIVE_SHA256: 634aaacd0aac256b2be7250af9fe1e863e8a0316875c20959a6a1c2da75bf843
-      BEADS_JSONL_SHA256: a7f4d181a7e7f566c0ca7c057292f87f00e5e32cd7cdf30f72ceffb681722e62
     steps:
       - name: Check out the exact branch
         uses: actions/checkout@v4
@@ -45,12 +44,21 @@ jobs:
           python3 - <<'PY'
           import hashlib
           import json
-          import os
+          import re
           from pathlib import Path
+
+          materializer = Path('.beads/materialize.py').read_text(encoding='utf-8')
+          match = re.search(
+              r'^EXPECTED_OUTPUT_SHA256 = "([0-9a-f]{64})"$',
+              materializer,
+              re.MULTILINE,
+          )
+          assert match is not None
+          expected_sha256 = match.group(1)
 
           path = Path('.beads/issues.jsonl')
           raw = path.read_bytes()
-          assert hashlib.sha256(raw).hexdigest() == os.environ['BEADS_JSONL_SHA256']
+          assert hashlib.sha256(raw).hexdigest() == expected_sha256
           records = [json.loads(line) for line in raw.decode('utf-8').splitlines() if line.strip()]
           assert len(records) == 131
           assert len({record['id'] for record in records}) == 131

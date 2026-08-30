@@ -49,12 +49,6 @@ def pack_plan() -> dict[str, object]:
             engine.MATERIALIZER,
             constant,
         )
-    engine.replace_exact(
-        r"^\s*BEADS_JSONL_SHA256: [0-9a-f]{64}$",
-        f"      BEADS_JSONL_SHA256: {digest}",
-        engine.MATERIALIZE_WORKFLOW,
-        "BEADS_JSONL_SHA256",
-    )
     engine.run(
         "verify packed plan",
         ["python3", str(engine.MATERIALIZER.relative_to(engine.ROOT))],

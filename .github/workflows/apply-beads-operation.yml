@@ -62,10 +62,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          issue_id="$(basename .beads/operations/applied/*.json .json)"
+          mapfile -t receipt_paths < <(
+            git status --porcelain --untracked-files=all -- .beads/receipts \
+              | awk '{print $2}'
+          )
+          if [[ ${#receipt_paths[@]} -ne 1 ]]; then
+            printf 'expected one changed receipt, found %s\n' "${#receipt_paths[@]}" >&2
+            printf '%s\n' "${receipt_paths[@]}" >&2
+            exit 1
+          fi
+          issue_id="$(basename "${receipt_paths[0]}" .json)"
+
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add .beads .github/workflows/materialize-beads.yml
+          git add \
+            .beads/issues.jsonl \
+            .beads/materialize.py \
+            .beads/plan \
+            .beads/operations \
+            .beads/receipts
           git diff --cached --quiet && {
             echo 'operation produced no versioned changes' >&2
             exit 1
