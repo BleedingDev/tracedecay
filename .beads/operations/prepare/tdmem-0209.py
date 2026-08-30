@@ -33,6 +33,62 @@ replace_once(
 )
 
 checker = REPO / "scripts/product/check-dummy-provider-conformance.py"
+replace_once(
+    checker,
+    'TEST_RE = re.compile(r"(?m)^fn\\s+([a-z][a-z0-9_]*)\\s*\\(")',
+    'TEST_RE = re.compile(r"(?m)^#\\[test\\]\\nfn\\s+([a-z][a-z0-9_]*)\\s*\\(")',
+)
+old_registry = '''    rows = registry.get("capability_registry")
+    if not isinstance(rows, list):
+        errors.append("provider registry capability authority is missing")
+    else:
+        registry_mandatory: set[str] = set()
+        registry_optional: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            capability_id = row.get("capability_id")
+            requirement = row.get("requirement")
+            if isinstance(capability_id, str):
+                if requirement == "mandatory":
+                    registry_mandatory.add(capability_id)
+                elif requirement == "optional":
+                    registry_optional.add(capability_id)
+        if mandatory != registry_mandatory:
+            errors.append("dummy mandatory capabilities do not match registry authority")
+        if implemented | unsupported != registry_optional:
+            errors.append("dummy optional capability partition does not match registry authority")
+'''
+new_registry = '''    registry_authority = registry.get("capability_registry")
+    if not isinstance(registry_authority, dict):
+        errors.append("provider registry capability authority is missing")
+    else:
+        registry_mandatory: set[str] = set()
+        registry_optional: set[str] = set()
+        for requirement, target in (
+            ("mandatory", registry_mandatory),
+            ("optional", registry_optional),
+        ):
+            rows = registry_authority.get(requirement)
+            if not isinstance(rows, list):
+                errors.append(
+                    f"provider registry capability_registry.{requirement} is missing"
+                )
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                capability_id = row.get("id")
+                row_requirement = row.get("requirement")
+                if isinstance(capability_id, str) and row_requirement == requirement:
+                    target.add(capability_id)
+        if mandatory != registry_mandatory:
+            errors.append("dummy mandatory capabilities do not match registry authority")
+        if implemented | unsupported != registry_optional:
+            errors.append("dummy optional capability partition does not match registry authority")
+'''
+replace_once(checker, old_registry, new_registry)
+
 checker_anchor = '''    sources = require_list(manifest.get("source_paths"), "source_paths", errors)
 '''
 checker_insert = '''    state_model = require_object(manifest.get("state_model"), "state_model", errors)
@@ -111,6 +167,44 @@ checker_insert = '''    state_model = require_object(manifest.get("state_model")
     sources = require_list(manifest.get("source_paths"), "source_paths", errors)
 '''
 replace_once(checker, checker_anchor, checker_insert)
+
+old_lock = '''    else:
+        lock_text = lock_path.read_text(encoding="utf-8")
+        if 'name = "tracedecay-memory-dummy-provider"' not in lock_text:
+            errors.append("dummy Cargo.lock lacks the root package")
+        if 'name = "sha2"' not in lock_text:
+            errors.append("dummy Cargo.lock lacks sha2")
+        for prefix in FORBIDDEN_DEP_PREFIXES:
+            if re.search(rf'(?m)^name = "{re.escape(prefix)}[^\\"]*"$', lock_text):
+                errors.append(f"dummy Cargo.lock contains forbidden package prefix {prefix!r}")
+'''
+new_lock = '''    else:
+        try:
+            lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            errors.append(f"could not parse dummy Cargo.lock: {exc}")
+        else:
+            packages = lock.get("package")
+            if not isinstance(packages, list):
+                errors.append("dummy Cargo.lock package list is missing")
+                packages = []
+            names = {
+                row.get("name")
+                for row in packages
+                if isinstance(row, dict) and isinstance(row.get("name"), str)
+            }
+            root_name = "tracedecay-memory-dummy-provider"
+            if root_name not in names:
+                errors.append("dummy Cargo.lock lacks the root package")
+            if "sha2" not in names:
+                errors.append("dummy Cargo.lock lacks sha2")
+            for name in sorted(value for value in names if isinstance(value, str)):
+                if name == root_name:
+                    continue
+                if name.startswith(FORBIDDEN_DEP_PREFIXES):
+                    errors.append(f"dummy Cargo.lock contains forbidden package {name!r}")
+'''
+replace_once(checker, old_lock, new_lock)
 
 mutation_tests = REPO / "tests/product_dummy_provider_conformance_test.py"
 replace_once(
