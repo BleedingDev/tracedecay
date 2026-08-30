@@ -70,6 +70,14 @@ Forbidden: concrete provider types or names in public contracts, silent fallback
 
 Allowed roots include project composition, retained-owner/runtime ports, and invocation state. They may construct and retain capability registries and provider-neutral lifecycle ports.
 
+The default-off M2 provider-host mount is limited to these additional exact
+files:
+
+- `crates/tracedecay/Cargo.toml`
+- `crates/tracedecay/src/daemon/tests/ownership.rs`
+- `crates/tracedecay/src/mcp/server.rs`
+- `crates/tracedecay/src/mcp/server/construction.rs`
+
 Provider logic, global mutable provider singletons, unbounded workers, or authority over source/session/Native/configuration state are prohibited.
 
 ### Normalized observation mount
@@ -118,13 +126,52 @@ Provider work must not weaken or silently reshape the supported toolchain or ups
 
 ## Dependency directions
 
-1. `tracedecay-memory-provider-api` is inward. It cannot depend on the root binary, runtime/store/DB internals, code index, or concrete adapters.
-2. `tracedecay-memory-context` depends on capability contracts and TraceDecay application ports, never concrete NCM/Native/OCEAN crates.
-3. Native and NCM adapters do not depend on one another. Neither depends on the root `tracedecay` crate.
-4. NCM never imports Native persistence crates or implements `ProjectMemoryFactStore`.
-5. CLI, MCP, dashboard API, and SDK remain adapter-blind.
-6. Only the root composition/registry and conformance assembly may construct concrete adapters.
-7. OCEAN remains a reserved capability slot; no speculative implementation dependency is allowed before a versioned specification exists.
+1. `tracedecay-memory-provider-api` is the inward-most memory crate. It cannot depend on fabric, registry, observation, context, conformance, any concrete adapter, the root binary, or TraceDecay runtime/store/DB/code-index/query/semantic internals.
+2. `tracedecay-memory-fabric` orchestrates capability contracts only. It cannot import any present or future concrete provider, including Biomem/NCM/OCEAN adapters or SDKs. Its only structural exception to the generic provider-package prohibition is `tracedecay-memory-provider-api`.
+3. `tracedecay-memory-context` depends on capability contracts and TraceDecay application ports, never concrete Biomem/NCM/Native/OCEAN crates or SDKs. The same exact provider-API allowance applies.
+4. Concrete provider adapters stay below fabric and cannot reach the root crate, raw `rusqlite`/`grafeo-*`/`libsql*`/private-filesystem engines, or TraceDecay runtime, storage, database, code-index, extraction, query, or semantic internals. The provider registry is a composition layer, not a concrete adapter, and may depend on fabric to register implementations.
+5. Native and NCM adapters do not depend on one another. NCM may use its licensed Biomem SDK/transport, but never a separate NCM/OCEAN adapter SDK, Native persistence, or TraceDecay runtime/storage internals.
+6. CLI, MCP, dashboard API, and SDK remain adapter-blind.
+7. Only the root composition/registry and conformance assembly may construct concrete adapters.
+8. OCEAN remains a reserved capability slot; no speculative implementation dependency is allowed before a versioned specification exists.
+
+The machine-readable rule bodies are canonical, not user-adjustable bypasses: the checker rejects a retained rule ID whose source, exclusion, target allowance, or forbidden-dependency patterns have been weakened or broadened. Provider-neutral rules use the generic `tracedecay-memory-provider-*`, `biomem*`, `ncm*`, and `ocean*` prohibitions; `allowed_dependencies` pins the only target-side structural allowance to the provider API. It scans every declared workspace member and every in-tree path dependency Cargo would add automatically, while honoring `[workspace].exclude`. Escaped or absolute member declarations fail and are scanned only when they resolve safely inside the repository. Normal, development, build, and target-specific dependency tables are checked; obsolete `[project]`, `[dev_dependencies]`, `[build_dependencies]`, and `[workspace_dependencies]` spellings fail explicitly and cannot hide edges. Renamed dependencies are checked by their resolved `package` name, including aliases inherited from `[workspace.dependencies]`. Protected `crates/tracedecay-memory-*` boundary manifests must retain their path-derived canonical package names, so renaming a source or target package cannot evade a rule. A failure names the rule and exact `source -> dependency` edge, with its manifest and declaration section.
+
+### Dependency-direction exceptions
+
+An unavoidable forbidden edge requires one entry in `dependency_direction_exceptions` with exactly these fields:
+
+```json
+{
+  "rule": "literal-rule-id",
+  "source": "literal-source-package",
+  "dependency": "literal-dependency-package",
+  "adr": "product/architecture/adr/NNNN-decision.md",
+  "rationale": "Why this exact edge is unavoidable"
+}
+```
+
+Rule, source, and dependency are literal names; globs are forbidden. The ADR must be an existing Markdown file that resolves inside `product/architecture/adr/`. The source must be a current workspace package, the rule must select that source and forbid that dependency, and the exact dependency edge must currently exist. Duplicate, unknown, nonmatching, missing-ADR, out-of-tree, and stale/unused entries fail. An exception authorizes only its named rule and edge; it cannot waive a package, pattern, dependency section, or another overlapping rule.
+
+The referenced ADR must bind its content to that exact edge; file existence or a heading alone grants no authority. It contains exactly one visible instance of each section below; headings hidden in Markdown fences, indented code, or HTML comments do not count. The binding values must exactly equal the exception entry, Decision must explicitly and affirmatively authorize the edge, and Decision and Rationale must contain substantive prose rather than placeholders.
+
+```markdown
+# ADR NNNN: Narrow dependency exception
+
+## Dependency-direction exception
+
+- Rule: `literal-rule-id`
+- Source: `literal-source-package`
+- Dependency: `literal-dependency-package`
+
+## Decision
+
+Permit this exact edge, including its bounded consequences and limits.
+
+## Rationale
+
+Explain why the normal boundary cannot satisfy this specific case.
+```
 
 ## Convergence-map contract
 

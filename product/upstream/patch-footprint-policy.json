@@ -66,12 +66,16 @@
       "max_changed_lines": 260,
       "max_files": 3,
       "paths": [
+        "crates/tracedecay/Cargo.toml",
         "crates/tracedecay/src/daemon/project_composition.rs",
         "crates/tracedecay/src/daemon/project_open_owners.rs",
         "crates/tracedecay/src/daemon/retained_owner.rs",
         "crates/tracedecay/src/daemon/service/project_runtime.rs",
         "crates/tracedecay/src/daemon/invocation_state.rs",
-        "crates/tracedecay/src/runtime_ports.rs"
+        "crates/tracedecay/src/runtime_ports.rs",
+        "crates/tracedecay/src/daemon/tests/ownership.rs",
+        "crates/tracedecay/src/mcp/server.rs",
+        "crates/tracedecay/src/mcp/server/construction.rs"
       ],
       "required_verification": [
         "daemon composition/restart tests",
@@ -229,23 +233,51 @@
     {
       "forbidden_dependencies": [
         "tracedecay",
+        "tracedecay-*",
         "tracedecay-runtime-core",
-        "tracedecay-store",
-        "tracedecay-global-db",
-        "tracedecay-code-index*",
-        "tracedecay-memory-provider-native",
-        "tracedecay-memory-provider-ncm"
+        "tracedecay-runtime*",
+        "tracedecay-automation*",
+        "tracedecay-*store*",
+        "tracedecay-storage*",
+        "tracedecay-*-db",
+        "tracedecay-rusqlite-runtime",
+        "tracedecay-code-*",
+        "tracedecay-*query*",
+        "tracedecay-semantic*",
+        "rusqlite",
+        "grafeo*",
+        "libsql*",
+        "private-fs*"
       ],
       "from_packages": [
         "tracedecay-memory-provider-api"
       ],
       "id": "provider_api_is_inward",
-      "reason": "The capability contract cannot depend on a concrete provider, root composition, or persistence implementation."
+      "reason": "The capability contract cannot depend on fabric, any upper memory layer, root composition, or TraceDecay persistence, code-index, query, or semantic internals."
     },
     {
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
       "forbidden_dependencies": [
-        "tracedecay-memory-provider-native",
-        "tracedecay-memory-provider-ncm",
+        "tracedecay-memory-provider-*",
+        "biomem*",
+        "ncm*",
+        "ocean*"
+      ],
+      "from_packages": [
+        "tracedecay-memory-fabric"
+      ],
+      "id": "memory_fabric_is_provider_neutral",
+      "reason": "Fabric orchestrates capability contracts and cannot import or name a concrete provider implementation or SDK."
+    },
+    {
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-*",
+        "biomem*",
         "ncm*",
         "ocean*"
       ],
@@ -256,8 +288,13 @@
       "reason": "Final context assembly depends only on provider API/capability registry and TraceDecay application ports."
     },
     {
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
       "forbidden_dependencies": [
-        "tracedecay-memory-provider-ncm",
+        "tracedecay-memory-provider-*",
+        "tracedecay-memory-fabric",
+        "biomem*",
         "ncm*",
         "ocean*",
         "tracedecay"
@@ -266,27 +303,75 @@
         "tracedecay-memory-provider-native"
       ],
       "id": "adapters_do_not_depend_on_each_other",
-      "reason": "The Native adapter cannot know external providers or the root binary crate."
+      "reason": "The Native adapter stays below fabric and cannot know external providers or the root binary crate."
     },
     {
+      "except_packages": [
+        "tracedecay-memory-provider-api",
+        "tracedecay-memory-provider-registry"
+      ],
       "forbidden_dependencies": [
-        "tracedecay-memory-provider-native",
-        "tracedecay-runtime-core",
-        "tracedecay-store",
-        "tracedecay-global-db",
         "tracedecay",
+        "tracedecay-memory-fabric",
+        "tracedecay-runtime-core",
+        "tracedecay-runtime*",
+        "tracedecay-automation*",
+        "tracedecay-*store*",
+        "tracedecay-storage*",
+        "tracedecay-*-db",
+        "tracedecay-rusqlite-runtime",
+        "tracedecay-code-*",
+        "tracedecay-*query*",
+        "tracedecay-semantic*",
+        "rusqlite",
+        "grafeo*",
+        "libsql*",
+        "private-fs*"
+      ],
+      "from_packages": [
+        "tracedecay-memory-provider-*"
+      ],
+      "id": "concrete_adapters_do_not_reach_tracedecay_internals",
+      "reason": "Concrete adapters depend on the provider API and narrow application ports, never fabric, root composition, storage, database, code-index, query, or semantic internals; the provider registry is an explicit composition-layer exception."
+    },
+    {
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-*",
+        "tracedecay-memory-fabric",
+        "tracedecay",
+        "ncm*",
+        "tracedecay-runtime-core",
+        "tracedecay-runtime*",
+        "tracedecay-automation*",
+        "tracedecay-*store*",
+        "tracedecay-storage*",
+        "tracedecay-*-db",
+        "tracedecay-rusqlite-runtime",
+        "tracedecay-code-*",
+        "tracedecay-*query*",
+        "tracedecay-semantic*",
+        "rusqlite",
+        "grafeo*",
+        "libsql*",
+        "private-fs*",
         "ocean*"
       ],
       "from_packages": [
         "tracedecay-memory-provider-ncm"
       ],
       "id": "ncm_adapter_does_not_reach_native_store",
-      "reason": "NCM uses provider contracts and its own SDK/transport, never Native persistence or root internals."
+      "reason": "NCM uses provider contracts and its licensed Biomem SDK/transport, never Native persistence, raw storage/private-filesystem engines, TraceDecay runtime internals, or a separate NCM/OCEAN adapter SDK."
     },
     {
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
       "forbidden_dependencies": [
-        "tracedecay-memory-provider-native",
-        "tracedecay-memory-provider-ncm",
+        "tracedecay-memory-provider-*",
+        "biomem*",
         "ncm*",
         "ocean*"
       ],
@@ -300,6 +385,9 @@
       "reason": "Public transports expose provider-neutral application contracts."
     },
     {
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
       "except_packages": [
         "tracedecay",
         "tracedecay-memory-provider-registry",
@@ -308,8 +396,8 @@
         "tracedecay-memory-conformance"
       ],
       "forbidden_dependencies": [
-        "tracedecay-memory-provider-native",
-        "tracedecay-memory-provider-ncm",
+        "tracedecay-memory-provider-*",
+        "biomem*",
         "ncm*",
         "ocean*"
       ],
@@ -320,6 +408,7 @@
       "reason": "Only the narrow composition/registry layer may construct concrete adapters."
     }
   ],
+  "dependency_direction_exceptions": [],
   "exception_zones": [
     {
       "default_policy": "forbidden",

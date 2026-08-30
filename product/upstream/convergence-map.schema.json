@@ -1,0 +1,388 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TraceDecay product/upstream ownership registry",
+  "description": "Schema v2 for classifying product-owned M2 surfaces and exact upstream convergence entries.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "bead_id",
+    "policy_revision",
+    "upstream_floor_sha",
+    "owners",
+    "classification_contract",
+    "areas",
+    "entries",
+    "entry_contract"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "product/upstream/convergence-map.schema.json"
+    },
+    "schema_version": {
+      "const": 2
+    },
+    "bead_id": {
+      "const": "tdmem-0308"
+    },
+    "policy_revision": {
+      "type": "string",
+      "minLength": 1
+    },
+    "upstream_floor_sha": {
+      "$ref": "#/$defs/sha"
+    },
+    "owners": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "product",
+        "upstream"
+      ],
+      "properties": {
+        "product": {
+          "$ref": "#/$defs/owner"
+        },
+        "upstream": {
+          "$ref": "#/$defs/owner"
+        }
+      }
+    },
+    "classification_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path_format",
+        "precedence",
+        "ambiguous_match",
+        "unclassified_path"
+      ],
+      "properties": {
+        "path_format": {
+          "const": "repo-relative-posix"
+        },
+        "precedence": {
+          "const": [
+            "active_upstream_entry_exact_path",
+            "product_area_path_pattern",
+            "policy_touch_point_path"
+          ]
+        },
+        "ambiguous_match": {
+          "const": "error"
+        },
+        "unclassified_path": {
+          "const": "error"
+        }
+      }
+    },
+    "areas": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/area"
+      }
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/entry"
+      }
+    },
+    "entry_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rules",
+        "area_status_values",
+        "entry_status_values"
+      ],
+      "properties": {
+        "rules": {
+          "const": [
+            "Product paths resolve through exactly one active ownership area.",
+            "Upstream paths require one exact active entry before authorization.",
+            "Retired rows preserve history without granting current execution authority."
+          ]
+        },
+        "area_status_values": {
+          "const": [
+            "active",
+            "planned",
+            "retired"
+          ]
+        },
+        "entry_status_values": {
+          "const": [
+            "active",
+            "retired"
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "bead_id": {
+      "type": "string",
+      "pattern": "^tdmem-[0-9]{4}$"
+    },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?![A-Za-z]:/)(?!\\./)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\/$).+$"
+    },
+    "exact_path": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/relative_path"
+        },
+        {
+          "pattern": "^[^*?\\[]+$"
+        }
+      ]
+    },
+    "non_empty_unique_strings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "repository"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "repository": {
+          "type": "string",
+          "pattern": "^[^/\\s]+/[^/\\s]+$"
+        }
+      }
+    },
+    "upstreamability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "rationale"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "product_only",
+            "upstream_candidate",
+            "minimal_mount",
+            "generated_resolution"
+          ]
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 20
+        }
+      }
+    },
+    "area": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "status",
+        "owner",
+        "ownership_class",
+        "feature",
+        "path_patterns",
+        "touch_points",
+        "bead_ids",
+        "rationale",
+        "semantic_invariants",
+        "tests",
+        "last_verified_upstream_sha",
+        "upstreamability"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"
+        },
+        "status": {
+          "enum": [
+            "active",
+            "planned",
+            "retired"
+          ]
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ownership_class": {
+          "enum": [
+            "product_owned",
+            "upstream_owned"
+          ]
+        },
+        "feature": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]*$"
+        },
+        "path_patterns": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/relative_path"
+          }
+        },
+        "touch_points": {
+          "$ref": "#/$defs/non_empty_unique_strings"
+        },
+        "bead_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/bead_id"
+          }
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 20
+        },
+        "semantic_invariants": {
+          "$ref": "#/$defs/non_empty_unique_strings"
+        },
+        "tests": {
+          "$ref": "#/$defs/non_empty_unique_strings"
+        },
+        "last_verified_upstream_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "upstreamability": {
+          "$ref": "#/$defs/upstreamability"
+        }
+      }
+    },
+    "generated": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generator_path",
+        "reproduction",
+        "zero_drift_check"
+      ],
+      "properties": {
+        "generator_path": {
+          "$ref": "#/$defs/exact_path"
+        },
+        "reproduction": {
+          "type": "string",
+          "minLength": 1
+        },
+        "zero_drift_check": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "area_id",
+        "owner",
+        "upstream_owner",
+        "touch_point",
+        "rationale",
+        "semantic_invariants",
+        "verification",
+        "tests",
+        "bead_ids",
+        "line_budget",
+        "rebase_or_removal_plan",
+        "status",
+        "last_verified_upstream_sha",
+        "upstreamability"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/exact_path"
+        },
+        "area_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "upstream_owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "touch_point": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 20
+        },
+        "semantic_invariants": {
+          "$ref": "#/$defs/non_empty_unique_strings"
+        },
+        "verification": {
+          "$ref": "#/$defs/non_empty_unique_strings"
+        },
+        "tests": {
+          "$ref": "#/$defs/non_empty_unique_strings"
+        },
+        "bead_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/bead_id"
+          }
+        },
+        "line_budget": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rebase_or_removal_plan": {
+          "type": "string",
+          "minLength": 20
+        },
+        "status": {
+          "enum": [
+            "active",
+            "retired"
+          ]
+        },
+        "last_verified_upstream_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "upstreamability": {
+          "$ref": "#/$defs/upstreamability"
+        },
+        "generated": {
+          "$ref": "#/$defs/generated"
+        }
+      }
+    }
+  }
+}

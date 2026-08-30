@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": 1,
+  "authority": "product-owned",
+  "ownership": {
+    "sync_owner": "BleedingDev",
+    "review_owner": "ScriptedAlchemy",
+    "product_patch_owners": [
+      "BleedingDev"
+    ]
+  },
+  "remotes": {
+    "product": {
+      "name": "origin",
+      "repository": "BleedingDev/tracedecay"
+    },
+    "upstream": {
+      "name": "upstream",
+      "repository": "ScriptedAlchemy/tracedecay"
+    }
+  },
+  "refs": {
+    "product_branch": "refs/heads/feat/pluggable-memory-providers-v2",
+    "sync_branch_prefix": "refs/heads/sync/upstream/",
+    "upstream_discovery": [
+      "refs/remotes/upstream/master",
+      "refs/remotes/upstream/pr/707-current"
+    ]
+  },
+  "floor": {
+    "metadata": "product/upstream/tracedecay-v2-pr707.json",
+    "pull_request": 707,
+    "sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403"
+  },
+  "preflight": {
+    "requires_clean_worktree": true,
+    "requires_floor_ancestor": true,
+    "forbidden_direct_targets": [
+      "refs/heads/main",
+      "refs/heads/master",
+      "refs/remotes/origin/main",
+      "refs/remotes/origin/master"
+    ]
+  }
+}
