@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0209",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Closing M1 implementability only after a standalone deterministic Rust provider passes mandatory health/observe/recall conformance, duplicate/conflict semantics, real cancellation/deadline preflight, exact scope, deterministic snapshot/restart, explicit unsupported lifecycle calls, strict linting, and product-owned evidence validation.",
+  "checks": [
+    {
+      "name": "dummy-provider evidence mutation tests",
+      "argv": ["python3", "tests/product_dummy_provider_conformance_test.py"],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "dummy-provider repository and contract validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-dummy-provider-conformance.py",
+        "--repo",
+        ".",
+        "--manifest",
+        "product/conformance/dummy-provider/conformance-manifest.json",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 240
+    },
+    {
+      "name": "dummy-provider Cargo metadata is locked",
+      "argv": [
+        "cargo",
+        "metadata",
+        "--manifest-path",
+        "product/conformance/dummy-provider/Cargo.toml",
+        "--locked",
+        "--format-version",
+        "1",
+        "--no-deps"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "dummy-provider formatting",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--manifest-path",
+        "product/conformance/dummy-provider/Cargo.toml",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "dummy-provider strict clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--manifest-path",
+        "product/conformance/dummy-provider/Cargo.toml",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "dummy-provider mandatory conformance and restart journeys",
+      "argv": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "product/conformance/dummy-provider/Cargo.toml",
+        "--locked"
+      ],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "canonical contract goldens and generated Rust remain exact",
+      "argv": [
+        "bash",
+        "-lc",
+        "set -euo pipefail; python3 scripts/product/generate-memory-provider-goldens.py --repo . --check; python3 scripts/product/check-memory-provider-contract-set.py --repo .; python3 scripts/product/generate-memory-provider-rust.py --repo . --check; python3 scripts/product/check-memory-provider-rust-bindings.py --repo ."
+      ],
+      "timeout_seconds": 480
+    },
+    {
+      "name": "provider contract drift CI authority remains mounted",
+      "argv": [
+        "bash",
+        "-lc",
+        "cmp -s product/contracts/memory-provider-v1/product-memory-contracts.workflow.yml .github/workflows/product-memory-contracts.yml"
+      ],
+      "timeout_seconds": 60
+    },
+    {
+      "name": "upstream patch-footprint remains within policy",
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "acceptance_criteria": [
+    "Mandatory conformance passes.",
+    "Duplicate observations are idempotent.",
+    "Cancellation and deadlines are exercised.",
+    "Snapshot/restart behavior is deterministic.",
+    "Unsupported optional calls are explicit."
+  ],
+  "close_reason": "Accepted the deterministic standalone Rust dummy provider as executable proof that the complete M1 contract is implementable with mandatory conformance, exact idempotency, real request control, deterministic recovery, and explicit unsupported behavior.",
+  "close_comment": "Evidence: product/conformance/dummy-provider is an isolated Rust 2024 / Rust 1.97.1 crate with only sha2 as a direct dependency, no TraceDecay/NCM/OCEAN/path/workspace dependency, forbid(unsafe_code), deny(warnings/missing_docs), and denied unwrap/expect/panic/todo/unimplemented/dbg/stdout/stderr. It directly includes the generated provider-neutral M1 bindings and implements read-only compatible handshake/health, exact-scope idempotent observation acceptance, deterministic advisory recall with typed zero results, deterministic canonical snapshot/restore, and typed unsupported optional operations. Twenty-three named Rust journeys prove read-only identity/health, cancellation distinct from timeout, scope/generation/sequence failures, single application and duplicate acknowledgement, same-key/different-payload conflict, optional opaque extension round-trip, required extension rejection before effect, deterministic recall, deterministic snapshot bytes, restart restore, idempotent identical restore, nonempty overwrite conflict, corrupt/cross-scope snapshot rejection, and explicit unsupported feedback/maintenance. The conformance manifest partitions every accepted registry capability, the Python checker validates authority/dependency/source/test/lock/lint evidence, mutation tests reject weakened claims, and strict cargo metadata/fmt/clippy/test plus canonical contract/golden/generated-Rust drift checks pass under the pinned toolchain."
+}
