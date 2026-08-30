@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0303",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Closing the Native adapter crate only after it compiles inside the root workspace, depends solely on the provider API, validates the stable Native identity, routes mandatory and declared optional operations without payload or scope transformation, delegates authoritative terminals to a mockable application port, and leaves Native persistence entirely outside the crate.",
+  "checks": [
+    {
+      "name": "workspace resolves with the Native adapter",
+      "argv": ["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps"],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "Native adapter formatting",
+      "argv": ["cargo", "fmt", "--package", "tracedecay-memory-provider-native", "--", "--check"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "Native adapter strict Clippy",
+      "argv": ["cargo", "clippy", "-p", "tracedecay-memory-provider-native", "--all-targets", "--locked", "--", "-D", "warnings"],
+      "timeout_seconds": 900
+    },
+    {
+      "name": "Native adapter focused tests",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-provider-native", "--locked"],
+      "timeout_seconds": 900
+    },
+    {
+      "name": "provider API remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-provider-api", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "fabric remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-fabric", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "canonical provider Rust bindings remain generated",
+      "argv": ["python3", "scripts/product/generate-memory-provider-rust.py", "--repo", ".", "--check"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "upstream patch footprint and dependency rules remain valid",
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "working tree has no whitespace damage",
+      "argv": ["git", "diff", "--check"],
+      "timeout_seconds": 60
+    }
+  ],
+  "acceptance_criteria": [
+    "No second Native fact store, index, score, curation, graph, privacy, or persistence implementation is created.",
+    "The crate depends only on the provider-neutral API and exposes a narrow mockable Native application port rather than TraceDecay database or code-index internals.",
+    "Mandatory health, observation, and recall plus declared optional lifecycle operations preserve the complete ProviderCall without payload, scope, deadline, cancellation, or identity transformation.",
+    "Stable Native provider identity is enforced, undeclared optional operations fail explicitly through the Native terminal authority, and focused positive/negative routing tests pass."
+  ],
+  "close_reason": "Added the isolated TraceDecay Native provider adapter crate with stable identity enforcement, mockable application ports, capability-gated routing, unchanged canonical calls, and no duplicate Native state or algorithm.",
+  "close_comment": "Evidence: crates/tracedecay-memory-provider-native is a strict Rust 2024 workspace crate whose only dependency is tracedecay-memory-provider-api. NativeProvider accepts only a NativeMemoryApplicationPort declaring tracedecay.native, delegates descriptor and handshake, routes health/observe/recall to distinct narrow port methods, routes only declared optional lifecycle capabilities, rejects wrong targets and undeclared operations through the port's typed Native terminal authority, and owns no database, index, scoring, curation, graph, privacy, transport, or persistence state. The application port retains authoritative exact-scope digests, provenance, receipts, temporal/trust semantics, and rejection diagnostics, so the adapter cannot fabricate them. Focused tests prove wrong-ID construction failure, exact handshake scope, byte-identical payload and request-control propagation, mandatory routing, declared lifecycle routing, explicit unsupported behavior without invoking lifecycle, wrong-target and handshake misuse rejection, deterministic capability reporting, and absence of adapter-owned mutable memory. Root workspace and lock wiring are convergence-mapped and all API/fabric/binding/patch gates remain green."
+}
