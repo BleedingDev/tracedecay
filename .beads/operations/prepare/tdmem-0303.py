@@ -37,6 +37,14 @@ owned_descriptor = '''    let descriptor = provider.descriptor();\n    let capab
 if source.count(temporary_descriptor) != 1:
     raise SystemExit("could not locate the borrowed temporary Native descriptor")
 source = source.replace(temporary_descriptor, owned_descriptor, 1)
+undocumented_tests = "TESTS = r'''use std::collections::BTreeSet;\n"
+documented_tests = (
+    "TESTS = r'''//! Integration journeys for the Native provider adapter boundary.\n\n"
+    "use std::collections::BTreeSet;\n"
+)
+if source.count(undocumented_tests) != 1:
+    raise SystemExit("could not locate the undocumented Native integration test crate")
+source = source.replace(undocumented_tests, documented_tests, 1)
 marker = "update_convergence_map()\n\nmanifest = ["
 replacement = '''subprocess.run(
     ["cargo", "check", "-p", "tracedecay-memory-provider-native", "--all-targets"],
