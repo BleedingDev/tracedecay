@@ -7,7 +7,8 @@ import json
 import subprocess
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[3]
+SCRIPT = Path(__file__).resolve()
+REPO = SCRIPT.parents[3]
 
 subprocess.run(
     [
@@ -32,3 +33,7 @@ marker_path.write_text(
     json.dumps(manifest, indent=2, sort_keys=True) + "\n",
     encoding="utf-8",
 )
+
+# The workflow requires one-shot materializers to retire themselves so a
+# subsequent operation cannot accidentally regenerate stale product artifacts.
+SCRIPT.unlink()
