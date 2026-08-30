@@ -28,6 +28,11 @@ if source.count(old) != 1:
     raise SystemExit("could not locate the reviewed convergence-entry guard")
 BODY.write_text(source.replace(old, new, 1), encoding="utf-8")
 subprocess.run(["python3", str(BODY)], cwd=ROOT, check=True)
+subprocess.run(
+    ["cargo", "fmt", "--package", "tracedecay-memory-provider-native"],
+    cwd=ROOT,
+    check=True,
+)
 
 rows = json.loads(MANIFEST.read_text(encoding="utf-8"))
 filtered: list[dict[str, str]] = []
