@@ -1,0 +1,422 @@
+{
+  "schema_version": 1,
+  "contract_id": "tracedecay.memory.provider.terminal.v1",
+  "bead_id": "tdmem-0206",
+  "title": "Memory provider typed terminal, degradation, retry, fallback, cancellation, timeout, and committed-effect contract",
+  "status": "accepted",
+  "authority": "TraceDecay provider protocol terminal envelope",
+  "scope": "coding_agents_only",
+  "depends_on_contracts": [
+    "tracedecay.memory.provider.registry.v1",
+    "tracedecay.memory.provider.handshake.v1",
+    "tracedecay.memory.provider.observation.v1",
+    "tracedecay.memory.provider.recall.v1",
+    "tracedecay.memory.provider.lifecycle.v1"
+  ],
+  "terminal_envelope": {
+    "type_name": "MemoryProviderTerminalEnvelopeV1",
+    "contract_id": "tracedecay.memory.provider.terminal-envelope.v1",
+    "required_fields": [
+      "operation_kind",
+      "operation_id",
+      "request_identity",
+      "provider_id",
+      "provider_instance_id",
+      "registration_revision",
+      "ready_receipt_digest",
+      "exact_scope_digest",
+      "started_at",
+      "finished_at",
+      "terminal_code",
+      "domain_detail",
+      "result_contract_id",
+      "result_payload",
+      "result_sha256",
+      "coverage",
+      "retry",
+      "fallback",
+      "committed_effect",
+      "diagnostic_id",
+      "warnings"
+    ],
+    "operation_kinds": [
+      "handshake",
+      "health",
+      "observe",
+      "recall",
+      "feedback",
+      "maintenance",
+      "inspection",
+      "correction",
+      "deletion_by_source",
+      "snapshot_export",
+      "snapshot_restore",
+      "replay",
+      "explicit_fact_projection",
+      "explain_trace"
+    ],
+    "unknown_field_policy": "reject_contract_violation",
+    "maximum_warnings": 32,
+    "diagnostic_id_required_for_failure": true,
+    "provider_may_omit_terminal_envelope": false,
+    "empty_response_allowed": false
+  },
+  "terminal_codes": [
+    {
+      "code": "success",
+      "class": "success",
+      "effect_expectation": "operation_specific",
+      "retry_class": "never",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "success_zero_results",
+      "class": "success",
+      "effect_expectation": "none",
+      "retry_class": "never",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "partial",
+      "class": "degraded_success",
+      "effect_expectation": "none_or_operation_specific",
+      "retry_class": "resume_or_new_request",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "invalid_request",
+      "class": "caller_failure",
+      "effect_expectation": "none",
+      "retry_class": "after_request_change",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "unauthorized",
+      "class": "policy_failure",
+      "effect_expectation": "none",
+      "retry_class": "after_authorization_change",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "capability_unsupported",
+      "class": "compatibility_failure",
+      "effect_expectation": "none",
+      "retry_class": "after_provider_or_configuration_change",
+      "fallback_eligibility": "explicit_policy_only"
+    },
+    {
+      "code": "scope_unavailable",
+      "class": "identity_failure",
+      "effect_expectation": "none",
+      "retry_class": "after_scope_admission",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "scope_mismatch",
+      "class": "identity_failure",
+      "effect_expectation": "none",
+      "retry_class": "after_request_change",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "stale_identity",
+      "class": "identity_failure",
+      "effect_expectation": "none",
+      "retry_class": "after_identity_refresh",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "conflict",
+      "class": "state_failure",
+      "effect_expectation": "none",
+      "retry_class": "after_state_refresh_or_request_change",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "capacity_exceeded",
+      "class": "resource_failure",
+      "effect_expectation": "none",
+      "retry_class": "after_backoff_or_capacity_change",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "deadline_exceeded",
+      "class": "request_control_failure",
+      "effect_expectation": "none_partial_or_unknown",
+      "retry_class": "new_request_only_after_effect_reconciliation",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "cancelled",
+      "class": "request_control_failure",
+      "effect_expectation": "none_partial_or_unknown",
+      "retry_class": "new_request_only_after_effect_reconciliation",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "provider_unavailable",
+      "class": "availability_failure",
+      "effect_expectation": "none_or_unknown",
+      "retry_class": "after_bounded_backoff_and_health",
+      "fallback_eligibility": "explicit_policy_only"
+    },
+    {
+      "code": "reset_required",
+      "class": "operator_failure",
+      "effect_expectation": "none",
+      "retry_class": "after_operator_reset_or_migration",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "state_incompatible",
+      "class": "compatibility_failure",
+      "effect_expectation": "none",
+      "retry_class": "after_migration_or_compatible_state",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "partial_effect",
+      "class": "effect_failure",
+      "effect_expectation": "partial",
+      "retry_class": "resume_or_reconcile_before_retry",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "effect_unknown",
+      "class": "effect_failure",
+      "effect_expectation": "unknown",
+      "retry_class": "reconcile_before_any_retry",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "contract_violation",
+      "class": "protocol_failure",
+      "effect_expectation": "none_partial_or_unknown",
+      "retry_class": "after_implementation_fix_and_effect_reconciliation",
+      "fallback_eligibility": "forbidden"
+    },
+    {
+      "code": "internal_failure",
+      "class": "provider_failure",
+      "effect_expectation": "none_partial_or_unknown",
+      "retry_class": "after_bounded_backoff_or_fix_and_effect_reconciliation",
+      "fallback_eligibility": "forbidden"
+    }
+  ],
+  "domain_detail": {
+    "type_name": "MemoryProviderDomainDetailV1",
+    "required_fields": [
+      "detail_id",
+      "detail_version",
+      "canonical_payload",
+      "payload_sha256"
+    ],
+    "detail_id_pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+    "detail_version_minimum": 1,
+    "maximum_payload_bytes": 131072,
+    "detail_may_change_terminal_semantics": false,
+    "detail_may_change_retry_or_fallback": false,
+    "unknown_optional_detail_policy": "preserve_opaque_inert_round_trip",
+    "unknown_required_detail_policy": "reject_contract_violation"
+  },
+  "result_payload": {
+    "type_name": "MemoryProviderResultPayloadV1",
+    "success_requires_result_contract_unless_operation_defines_empty_success": true,
+    "failure_result_payload_allowed": false,
+    "result_contract_id_required_when_payload_present": true,
+    "result_sha256_required_when_payload_present": true,
+    "canonical_encoding": "rfc8785_json",
+    "maximum_payload_bytes_source": "effective_limit.response_bytes",
+    "unknown_result_contract_policy": "reject_contract_violation"
+  },
+  "coverage": {
+    "type_name": "MemoryProviderTerminalCoverageV1",
+    "required_fields": [
+      "state",
+      "completed_units",
+      "total_units",
+      "excluded_units",
+      "truncated_units",
+      "resume_cursor",
+      "reasons"
+    ],
+    "states": [
+      "not_applicable",
+      "complete",
+      "partial",
+      "zero_results"
+    ],
+    "partial_requires_reason": true,
+    "success_zero_results_requires_zero_results_coverage": true,
+    "partial_terminal_requires_partial_coverage": true,
+    "failure_cannot_claim_complete_coverage": true,
+    "resume_cursor_is_scope_request_and_state_bound": true
+  },
+  "retry": {
+    "type_name": "MemoryProviderRetryDirectiveV1",
+    "required_fields": [
+      "class",
+      "automatic_retry_allowed",
+      "minimum_backoff_millis",
+      "maximum_attempts_remaining",
+      "requires_identity_refresh",
+      "requires_state_reconciliation",
+      "requires_operator_action",
+      "resume_cursor"
+    ],
+    "classes": [
+      "never",
+      "after_request_change",
+      "after_authorization_change",
+      "after_provider_or_configuration_change",
+      "after_scope_admission",
+      "after_identity_refresh",
+      "after_state_refresh_or_request_change",
+      "after_backoff_or_capacity_change",
+      "new_request_only_after_effect_reconciliation",
+      "after_bounded_backoff_and_health",
+      "after_operator_reset_or_migration",
+      "after_migration_or_compatible_state",
+      "resume_or_new_request",
+      "resume_or_reconcile_before_retry",
+      "reconcile_before_any_retry",
+      "after_implementation_fix_and_effect_reconciliation",
+      "after_bounded_backoff_or_fix_and_effect_reconciliation"
+    ],
+    "automatic_retry_default": false,
+    "automatic_retry_requires_explicit_policy_and_positive_budget": true,
+    "minimum_backoff_millis_minimum": 0,
+    "maximum_attempts_remaining_minimum": 0,
+    "unbounded_attempts_allowed": false,
+    "retry_may_reuse_new_idempotency_key_for_same_mutation": false,
+    "retry_may_begin_before_unknown_or_partial_effect_reconciliation": false
+  },
+  "fallback": {
+    "type_name": "MemoryProviderFallbackDirectiveV1",
+    "required_fields": [
+      "eligibility",
+      "policy_id",
+      "policy_revision",
+      "target_provider_id",
+      "reason"
+    ],
+    "eligibility_values": [
+      "forbidden",
+      "explicit_policy_only"
+    ],
+    "default_eligibility": "forbidden",
+    "fallback_may_be_inferred_from_empty_result": false,
+    "fallback_may_be_inferred_from_provider_unavailable": false,
+    "fallback_requires_pinned_policy": true,
+    "fallback_requires_explicit_target_provider": true,
+    "fallback_requires_new_handshake_and_scope_admission": true,
+    "fallback_may_reuse_provider_specific_state_identity": false,
+    "current_product_policy": "no_automatic_fallback"
+  },
+  "committed_effect": {
+    "type_name": "MemoryProviderCommittedEffectV1",
+    "required_fields": [
+      "state",
+      "committed_boundary",
+      "state_generation_before",
+      "state_generation_after",
+      "committed_item_refs",
+      "uncommitted_item_refs",
+      "provider_receipt_digest",
+      "reconciliation_action",
+      "verification_digest"
+    ],
+    "states": [
+      "none",
+      "committed",
+      "partial",
+      "unknown"
+    ],
+    "read_only_operation_requires_none": true,
+    "success_mutation_requires_committed_or_none_if_no_effect": true,
+    "partial_effect_terminal_requires_partial": true,
+    "effect_unknown_terminal_requires_unknown": true,
+    "deadline_or_cancelled_may_report_none_partial_or_unknown": true,
+    "partial_requires_committed_boundary": true,
+    "partial_requires_committed_and_uncommitted_item_sets": true,
+    "unknown_requires_reconciliation_action": true,
+    "effect_receipt_required_when_state_not_none": true,
+    "same_mutation_retry_requires_same_idempotency_key": true
+  },
+  "request_control_precedence": {
+    "already_cancelled_before_dispatch": "cancelled_without_provider_call",
+    "expired_deadline_before_dispatch": "deadline_exceeded_without_provider_call",
+    "both_terminal_before_dispatch": "earliest_monotonic_terminal_event_wins",
+    "during_provider_operation": "first_observed_terminal_event_wins_but_committed_effect_is_independently_reported",
+    "cancellation_may_be_reported_as_timeout": false,
+    "timeout_may_be_reported_as_cancellation": false,
+    "request_control_may_be_reported_as_success": false
+  },
+  "mandatory_operation_mapping": [
+    {
+      "capability_id": "provider.health.v1",
+      "operation_kind": "health",
+      "result_contract_id": "tracedecay.memory.provider.health.v1"
+    },
+    {
+      "capability_id": "observation.accept.v1",
+      "operation_kind": "observe",
+      "result_contract_id": "tracedecay.memory.provider.observation.v1"
+    },
+    {
+      "capability_id": "recall.query.v1",
+      "operation_kind": "recall",
+      "result_contract_id": "tracedecay.memory.recall.query.outcome.v1"
+    }
+  ],
+  "mandatory_operation_rules": {
+    "every_call_returns_terminal_envelope": true,
+    "missing_envelope_is_contract_violation": true,
+    "empty_transport_response_is_contract_violation": true,
+    "operation_specific_payload_is_nested_under_terminal_envelope": true,
+    "operation_specific_failure_may_bypass_terminal_envelope": false
+  },
+  "terminal_validation_order": [
+    "Validate terminal envelope contract identity and required fields.",
+    "Validate provider, registration, ready receipt, exact scope, operation, and request identity.",
+    "Validate terminal code against the closed terminal-code table.",
+    "Validate result payload presence, contract identity, canonical digest, and size against terminal semantics.",
+    "Validate coverage state against success, zero-results, partial, and failure semantics.",
+    "Validate retry directive exactly matches the selected terminal-code policy and bounded retry budget.",
+    "Validate fallback directive exactly matches terminal eligibility and the current no-automatic-fallback product policy.",
+    "Validate committed-effect state against operation mutability, terminal code, generations, item sets, and receipt.",
+    "Validate cancellation and timeout are distinct and their monotonic precedence is preserved.",
+    "Reject the entire response as contract_violation if any semantic relation is inconsistent."
+  ],
+  "invariants": [
+    "Every mandatory provider operation returns one MemoryProviderTerminalEnvelopeV1; missing or empty responses are contract violations.",
+    "The terminal-code table is closed and domain detail cannot alter terminal, retry, fallback, or authority semantics.",
+    "Cancellation and deadline_exceeded are distinct, preserve monotonic event precedence, and can never be converted into success.",
+    "Read-only operations report committed-effect state none; mutating operations report none, committed, partial, or unknown truthfully.",
+    "Partial effects identify the exact committed boundary, before/after generations, committed and uncommitted item sets, receipt, and reconciliation action.",
+    "Unknown effects require reconciliation before any retry or fallback and never reuse a new idempotency key for the same mutation.",
+    "Retryability is an explicit bounded directive and is never inferred from a provider error class, empty payload, or missing response.",
+    "Automatic retry is disabled by default and requires explicit policy, positive attempt budget, bounded backoff, and satisfied identity/effect prerequisites.",
+    "Fallback eligibility is explicit, defaults to forbidden, is never inferred from empty results or provider unavailability, and current product policy performs no automatic fallback.",
+    "Any permitted future fallback requires a pinned policy, explicit target provider, new handshake, exact scope admission, and no reuse of provider-specific state identity.",
+    "Successful zero results is a typed complete outcome with zero-results coverage, not a failure or fallback signal.",
+    "Partial read coverage and partial committed mutation effects are distinct terminal semantics.",
+    "Result payloads are canonical, typed, bounded, digested, and absent on failures unless a future version explicitly defines a diagnostic payload contract.",
+    "Provider, registration, readiness, request, operation, and exact-scope identities are retained in every terminal envelope.",
+    "Contract violations cannot be silently repaired, reclassified as internal failure, or hidden behind an operation-specific payload."
+  ],
+  "verification_beads": [
+    "tdmem-0207",
+    "tdmem-0208",
+    "tdmem-0209",
+    "tdmem-0304",
+    "tdmem-0403",
+    "tdmem-0503",
+    "tdmem-0504",
+    "tdmem-0506",
+    "tdmem-0601",
+    "tdmem-0703",
+    "tdmem-0903",
+    "tdmem-1006"
+  ]
+}
