@@ -4,8 +4,10 @@
   "title": "M0 go/no-go decision for pluggable cognitive memory providers",
   "date": "2026-08-30",
   "verdict": "go",
+  "status": "accepted",
   "decision": "Proceed with a capability-based provider boundary above existing TraceDecay Native application ports. Do not replace TraceDecay authorities, Native fact-store contracts, repository/worktree identity, session evidence, host integration, or final context ownership.",
   "next_executable_bead": "tdmem-0201",
+  "m1_release_condition": "M1 remains blocked until tdmem-0107 is closed by the automated Beads operation after the report contract tests and repository validator pass.",
   "conditions": {
     "provider_boundary_viable_without_authority_replacement": true,
     "native_explicit_fact_authority_preserved": true,
@@ -63,6 +65,148 @@
       "finding": "Eight binding decisions cover provider boundaries, authority, crate layout, execution topology gate, persistence/recovery, context compilation, observer isolation, and upstream convergence."
     }
   ],
+  "selected_insertion_points": [
+    {
+      "id": "provider_contract",
+      "phase": "M1",
+      "policy_touch_point": "application_contract_mount",
+      "product_owned_paths": [
+        "product/contracts/memory-provider/**",
+        "scripts/product/check-memory-provider-*.py",
+        "tests/product_memory_provider_*"
+      ],
+      "upstream_mount_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-application/src/lib.rs",
+        "crates/tracedecay/src/application_surface.rs"
+      ],
+      "symbols": [
+        "tracedecay_usecases::memory::MemoryApplication",
+        "tracedecay_application retained provider-neutral ports"
+      ],
+      "selection": "Define the provider-neutral protocol and capability vocabulary before any concrete adapter. Mount only typed provider-neutral application ports later; never implement ProjectMemoryFactStore for an external provider.",
+      "earliest_mount_bead": "tdmem-0306"
+    },
+    {
+      "id": "daemon_registry",
+      "phase": "M2",
+      "policy_touch_point": "daemon_composition_mount",
+      "product_owned_paths": [
+        "crates/tracedecay-memory-provider-registry/**"
+      ],
+      "upstream_mount_paths": [
+        "crates/tracedecay/src/daemon/project_composition.rs",
+        "crates/tracedecay/src/daemon/project_open_owners.rs",
+        "crates/tracedecay/src/runtime_ports.rs"
+      ],
+      "symbols": [
+        "project composition root",
+        "retained exact-project runtime ports"
+      ],
+      "selection": "Construct one capability-driven registry at project startup, bind exact project, worktree, provider-instance and mode identity once, and inject provider-neutral lifecycle ports. Concrete provider logic remains outside the composition root.",
+      "earliest_mount_bead": "tdmem-0304"
+    },
+    {
+      "id": "normalized_observation",
+      "phase": "M4",
+      "policy_touch_point": "normalized_observation_mount",
+      "product_owned_paths": [
+        "crates/tracedecay-memory-observation/**"
+      ],
+      "upstream_mount_paths": [
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
+        "crates/tracedecay/src/mcp/server/hook_writes.rs",
+        "crates/tracedecay/src/daemon/service/invocation/observability_producer.rs"
+      ],
+      "symbols": [
+        "post-admission normalized observation",
+        "post-settlement stable operation identity"
+      ],
+      "selection": "Fan out only after canonical host-neutral admission or settlement into a bounded durable product-owned dispatcher. Observer latency and failure cannot affect the canonical result.",
+      "earliest_mount_bead": "tdmem-0504"
+    },
+    {
+      "id": "advisory_recall_context",
+      "phase": "M5",
+      "policy_touch_point": "recall_context_mount",
+      "product_owned_paths": [
+        "crates/tracedecay-memory-context/**"
+      ],
+      "upstream_mount_paths": [
+        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
+        "crates/tracedecay/src/daemon/session_retrieval/contract.rs",
+        "crates/tracedecay-usecases/src/context/mod.rs",
+        "crates/tracedecay-usecases/src/context/read_modes.rs"
+      ],
+      "symbols": [
+        "admitted session retrieval",
+        "TraceDecay-owned final context compiler"
+      ],
+      "selection": "Request bounded advisory candidates through capability ports, then apply exact-scope, freshness, provenance, privacy, deadline, cancellation and deterministic budget admission before TraceDecay assembles final context.",
+      "earliest_mount_bead": "tdmem-0603"
+    },
+    {
+      "id": "post_settlement_feedback",
+      "phase": "M7",
+      "policy_touch_point": "post_settlement_feedback_mount",
+      "product_owned_paths": [
+        "crates/tracedecay-memory-observation/**"
+      ],
+      "upstream_mount_paths": [
+        "crates/tracedecay/src/daemon/service/invocation/feedback.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory_tracking.rs",
+        "crates/tracedecay/src/daemon/scheduler/automation_observation.rs"
+      ],
+      "symbols": [
+        "post-settlement feedback/outcome observation",
+        "typed provider dispatch receipt"
+      ],
+      "selection": "Emit idempotent provider feedback only after canonical settlement. Provider failure must remain an isolated typed dispatch outcome and cannot rewrite Native trust or the settled operation.",
+      "earliest_mount_bead": "tdmem-0801"
+    }
+  ],
+  "first_slice": {
+    "issue_id": "tdmem-0201",
+    "title": "Provider capability registry contract",
+    "goal": "Define stable provider-neutral mandatory and optional capability identifiers, operation semantics, typed failure classes, compatibility rules, and unknown-capability round-trip behavior without creating or selecting a concrete provider adapter.",
+    "bounded_files": {
+      "max_product_owned_files": 3,
+      "max_existing_upstream_files": 0,
+      "planned_files": [
+        "product/contracts/memory-provider/capabilities.v1.json",
+        "scripts/product/check-memory-provider-capabilities.py",
+        "tests/product_memory_provider_capabilities_test.py"
+      ]
+    },
+    "crates": {
+      "created": [],
+      "modified": [],
+      "deferred_to": "tdmem-0301",
+      "reason": "M1 fixes the transport-neutral contract authority first; M2 creates and wires the Rust crates after the contract is executable-validated."
+    },
+    "acceptance_tests": [
+      [
+        "python3",
+        "tests/product_memory_provider_capabilities_test.py"
+      ],
+      [
+        "python3",
+        "scripts/product/check-memory-provider-capabilities.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider/capabilities.v1.json",
+        "--issues",
+        ".beads/issues.jsonl"
+      ]
+    ],
+    "acceptance": [
+      "Mandatory and optional capabilities are separate and capability identifiers never encode implementation names.",
+      "Every capability declares operations, inputs, outputs, typed failure modes and compatibility behavior.",
+      "Unknown well-formed capabilities round-trip as inactive opaque declarations and cannot activate behavior.",
+      "The first slice changes no existing upstream-owned file and creates no concrete provider adapter."
+    ]
+  },
   "go_reasons": [
     "The provider boundary can be mounted above existing application/use-case ports rather than replacing ProjectMemoryFactStore or DatabaseFactStore.",
     "TraceDecay already exposes exact owner/scope, deadlines, cancellation, provenance, typed terminal outcomes, idempotent commands, durable receipts, and recovery seams that can constrain provider adapters.",
@@ -76,49 +220,84 @@
       "severity": "high",
       "risk": "Native fact-store semantics could leak into the provider API and exclude cognitive providers.",
       "mitigation": "Define capability-oriented contracts and prove them with dummy-provider conformance before concrete adapters.",
-      "blocking_beads": ["tdmem-0201", "tdmem-0209", "tdmem-0306"]
+      "blocking_beads": [
+        "tdmem-0201",
+        "tdmem-0209",
+        "tdmem-0306"
+      ]
     },
     {
       "id": "native_parity_drift",
       "severity": "critical",
       "risk": "Routing Native through the new boundary could change outputs, receipts, errors, or recovery behavior.",
       "mitigation": "Keep the direct path as the oracle and require golden parity before default cutover.",
-      "blocking_beads": ["tdmem-0401", "tdmem-0402", "tdmem-0403", "tdmem-0404"]
+      "blocking_beads": [
+        "tdmem-0401",
+        "tdmem-0402",
+        "tdmem-0403",
+        "tdmem-0404"
+      ]
     },
     {
       "id": "partial_provider_effects",
       "severity": "critical",
       "risk": "Crashes around provider commit/acknowledgement could duplicate or lose observations.",
       "mitigation": "Use stable idempotency, durable bounded journal state, typed partial effects, receipts, replay, and crash injection.",
-      "blocking_beads": ["tdmem-0203", "tdmem-0206", "tdmem-0502", "tdmem-0503", "tdmem-0506"]
+      "blocking_beads": [
+        "tdmem-0203",
+        "tdmem-0206",
+        "tdmem-0502",
+        "tdmem-0503",
+        "tdmem-0506"
+      ]
     },
     {
       "id": "unsafe_recall_admission",
       "severity": "critical",
       "risk": "Stale, cross-worktree, revoked, sensitive, or injection-like provider content could enter an agent context.",
       "mitigation": "Keep TraceDecay-owned exact-scope admission, temporal/revocation checks, deterministic budgets, evidence formatting, and explain traces.",
-      "blocking_beads": ["tdmem-0204", "tdmem-0603", "tdmem-0604", "tdmem-0608", "tdmem-0609"]
+      "blocking_beads": [
+        "tdmem-0204",
+        "tdmem-0603",
+        "tdmem-0604",
+        "tdmem-0608",
+        "tdmem-0609"
+      ]
     },
     {
       "id": "observer_influence",
       "severity": "critical",
       "risk": "Observer output, latency, or failures could accidentally alter prompts or canonical outcomes.",
       "mitigation": "Use a result-unreachable observer route and compare output/state hashes across healthy and failing observers.",
-      "blocking_beads": ["tdmem-0305", "tdmem-0505", "tdmem-0703", "tdmem-0903"]
+      "blocking_beads": [
+        "tdmem-0305",
+        "tdmem-0505",
+        "tdmem-0703",
+        "tdmem-0903"
+      ]
     },
     {
       "id": "ncm_surface_and_topology_unknown",
       "severity": "high",
       "risk": "The licensed NCM implementation may not support the assumed API, lifecycle, persistence, or deployment topology.",
       "mitigation": "Audit the licensed surface first and select topology only through the explicit decision-gate ADR.",
-      "blocking_beads": ["tdmem-0701", "tdmem-0702"]
+      "blocking_beads": [
+        "tdmem-0701",
+        "tdmem-0702"
+      ]
     },
     {
       "id": "upstream_convergence_cost",
       "severity": "high",
       "risk": "Provider mounts could make future PR #707 successor syncs conflict-heavy or semantically unsafe.",
       "mitigation": "Enforce additive ownership, convergence entries, hard caps, isolated sync trains, conflict receipts, and parity gates.",
-      "blocking_beads": ["tdmem-0308", "tdmem-1203", "tdmem-1205", "tdmem-1206", "tdmem-1208"]
+      "blocking_beads": [
+        "tdmem-0308",
+        "tdmem-1203",
+        "tdmem-1205",
+        "tdmem-1206",
+        "tdmem-1208"
+      ]
     }
   ],
   "deferred_decisions": [
@@ -126,7 +305,10 @@
       "id": "ncm_execution_topology",
       "state": "deferred",
       "reason": "The licensed surface has not yet been audited.",
-      "decision_gate": ["tdmem-0701", "tdmem-0702"]
+      "decision_gate": [
+        "tdmem-0701",
+        "tdmem-0702"
+      ]
     },
     {
       "id": "ocean_implementation",
@@ -148,7 +330,15 @@
       "name": "Provider-neutral contracts and conformance model",
       "entry_bead": "tdmem-0201",
       "exit_bead": "tdmem-0209",
-      "required_before_next": ["tdmem-0201", "tdmem-0202", "tdmem-0203", "tdmem-0204", "tdmem-0205", "tdmem-0206", "tdmem-0209"]
+      "required_before_next": [
+        "tdmem-0201",
+        "tdmem-0202",
+        "tdmem-0203",
+        "tdmem-0204",
+        "tdmem-0205",
+        "tdmem-0206",
+        "tdmem-0209"
+      ]
     },
     {
       "order": 2,
@@ -156,7 +346,15 @@
       "name": "Product-owned crate skeletons, dependency guards, and composition mount",
       "entry_bead": "tdmem-0301",
       "exit_bead": "tdmem-0308",
-      "required_before_next": ["tdmem-0301", "tdmem-0303", "tdmem-0304", "tdmem-0305", "tdmem-0306", "tdmem-0307", "tdmem-0308"]
+      "required_before_next": [
+        "tdmem-0301",
+        "tdmem-0303",
+        "tdmem-0304",
+        "tdmem-0305",
+        "tdmem-0306",
+        "tdmem-0307",
+        "tdmem-0308"
+      ]
     },
     {
       "order": 3,
@@ -164,7 +362,12 @@
       "name": "TraceDecay Native adapter and parity",
       "entry_bead": "tdmem-0401",
       "exit_bead": "tdmem-0404",
-      "required_before_next": ["tdmem-0401", "tdmem-0402", "tdmem-0403", "tdmem-0404"]
+      "required_before_next": [
+        "tdmem-0401",
+        "tdmem-0402",
+        "tdmem-0403",
+        "tdmem-0404"
+      ]
     },
     {
       "order": 4,
@@ -172,7 +375,13 @@
       "name": "Durable observation dispatch and provider lifecycle",
       "entry_bead": "tdmem-0502",
       "exit_bead": "tdmem-0506",
-      "required_before_next": ["tdmem-0502", "tdmem-0503", "tdmem-0504", "tdmem-0505", "tdmem-0506"]
+      "required_before_next": [
+        "tdmem-0502",
+        "tdmem-0503",
+        "tdmem-0504",
+        "tdmem-0505",
+        "tdmem-0506"
+      ]
     },
     {
       "order": 5,
@@ -180,7 +389,14 @@
       "name": "Provider recall admission and TraceDecay-owned context compiler",
       "entry_bead": "tdmem-0601",
       "exit_bead": "tdmem-0609",
-      "required_before_next": ["tdmem-0601", "tdmem-0602", "tdmem-0603", "tdmem-0604", "tdmem-0608", "tdmem-0609"]
+      "required_before_next": [
+        "tdmem-0601",
+        "tdmem-0602",
+        "tdmem-0603",
+        "tdmem-0604",
+        "tdmem-0608",
+        "tdmem-0609"
+      ]
     },
     {
       "order": 6,
@@ -188,7 +404,12 @@
       "name": "Licensed NCM audit, topology decision, observer integration, then guarded active mode",
       "entry_bead": "tdmem-0701",
       "exit_bead": "tdmem-0706",
-      "required_before_next": ["tdmem-0701", "tdmem-0702", "tdmem-0703", "tdmem-0706"]
+      "required_before_next": [
+        "tdmem-0701",
+        "tdmem-0702",
+        "tdmem-0703",
+        "tdmem-0706"
+      ]
     },
     {
       "order": 7,
@@ -196,7 +417,9 @@
       "name": "Feedback, correction, promotion, maintenance, and inspection workflows",
       "entry_bead": "tdmem-0807",
       "exit_bead": "tdmem-0807",
-      "required_before_next": ["tdmem-0807"]
+      "required_before_next": [
+        "tdmem-0807"
+      ]
     },
     {
       "order": 8,
@@ -204,7 +427,9 @@
       "name": "Safety, conformance, evaluation, and observer-isolation gates",
       "entry_bead": "tdmem-0903",
       "exit_bead": "tdmem-0903",
-      "required_before_next": ["tdmem-0903"]
+      "required_before_next": [
+        "tdmem-0903"
+      ]
     },
     {
       "order": 9,
@@ -212,7 +437,10 @@
       "name": "SDK, host integrations, packaging, and coding-agent journeys",
       "entry_bead": "tdmem-1001",
       "exit_bead": "tdmem-1101",
-      "required_before_next": ["tdmem-1001", "tdmem-1101"]
+      "required_before_next": [
+        "tdmem-1001",
+        "tdmem-1101"
+      ]
     },
     {
       "order": 10,
@@ -220,7 +448,15 @@
       "name": "Repeatable upstream convergence train",
       "entry_bead": "tdmem-1201",
       "exit_bead": "tdmem-1208",
-      "required_before_next": ["tdmem-1201", "tdmem-1202", "tdmem-1203", "tdmem-1204", "tdmem-1205", "tdmem-1206", "tdmem-1208"]
+      "required_before_next": [
+        "tdmem-1201",
+        "tdmem-1202",
+        "tdmem-1203",
+        "tdmem-1204",
+        "tdmem-1205",
+        "tdmem-1206",
+        "tdmem-1208"
+      ]
     }
   ],
   "hard_gates": [
@@ -261,7 +497,7 @@
   "sign_off": {
     "decision_owner": "product-planning",
     "evidence_owner": "assistant",
-    "state": "ready_for_m1_after_tdmemory_0106_is_closed",
-    "first_action": "Implement tdmem-0201 and commit provider identity/capability registry contracts before any concrete provider adapter."
+    "state": "accepted_for_m1_after_tdmem_0107_closes",
+    "first_action": "Implement tdmem-0201 and commit the provider capability registry contract before creating any concrete provider adapter."
   }
 }
