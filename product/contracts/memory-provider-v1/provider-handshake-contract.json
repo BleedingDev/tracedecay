@@ -1,0 +1,308 @@
+{
+  "schema_version": 1,
+  "contract_id": "tracedecay.memory.provider.handshake.v1",
+  "bead_id": "tdmem-0202",
+  "title": "Memory provider handshake, compatibility, identity, scope, limits, deadline, and cancellation contract",
+  "status": "accepted",
+  "authority": "TraceDecay provider registry composition root",
+  "scope": "coding_agents_only",
+  "depends_on_contracts": [
+    "tracedecay.memory.provider.registry.v1"
+  ],
+  "protocol_identity": {
+    "type_name": "MemoryProviderProtocolVersionV1",
+    "current_major": 1,
+    "current_minor": 0,
+    "major_compatibility": "exact_intersection_required",
+    "minor_selection": "highest_mutually_supported_minor_within_selected_major",
+    "implicit_downgrade": false,
+    "unknown_major_policy": "reject_protocol_incompatible",
+    "empty_intersection_policy": "reject_protocol_incompatible"
+  },
+  "handshake_request": {
+    "type_name": "MemoryProviderHandshakeRequestV1",
+    "required_fields": [
+      "provider_id",
+      "registration_revision",
+      "adapter_contract_version",
+      "host_implementation_identity",
+      "supported_protocol_ranges",
+      "required_capabilities",
+      "host_limit_ceiling",
+      "exact_scope_identity",
+      "request_identity",
+      "deadline",
+      "cancellation",
+      "challenge_nonce"
+    ],
+    "provider_id_source": "accepted_registry_selection",
+    "registration_revision_source": "accepted_registry_selection",
+    "exact_scope_source": "TraceDecay scope authority",
+    "challenge_nonce_bytes": 32,
+    "maximum_supported_protocol_ranges": 8,
+    "maximum_required_capabilities": 32,
+    "duplicate_protocol_range_policy": "reject_non_canonical_request",
+    "duplicate_required_capability_policy": "reject_non_canonical_request"
+  },
+  "handshake_response": {
+    "type_name": "MemoryProviderHandshakeResponseV1",
+    "required_fields": [
+      "provider_id",
+      "provider_instance_id",
+      "implementation_identity",
+      "selected_protocol_version",
+      "state_identity",
+      "declared_capabilities",
+      "provider_limit_ceiling",
+      "accepted_scope_identity",
+      "challenge_response",
+      "readiness_state",
+      "warnings"
+    ],
+    "provider_instance_id_semantics": "opaque_runtime_instance_identity_not_provider_identity",
+    "challenge_response": "sha256_over_canonical_request_challenge_and_response_identity",
+    "maximum_warnings": 32,
+    "unknown_response_field_policy": "reject_contract_violation"
+  },
+  "implementation_identity": {
+    "type_name": "MemoryProviderImplementationIdentityV1",
+    "required_fields": [
+      "implementation_name",
+      "implementation_version",
+      "build_identity",
+      "artifact_sha256",
+      "license_identity",
+      "source_provenance",
+      "adapter_contract_version",
+      "state_schema_version"
+    ],
+    "artifact_sha256_encoding": "lowercase_hex_64",
+    "build_identity_maximum_bytes": 256,
+    "source_provenance_maximum_bytes": 1024,
+    "license_identity_maximum_bytes": 128,
+    "runtime_location_is_identity": false,
+    "process_id_is_identity": false,
+    "socket_path_is_identity": false,
+    "database_path_is_identity": false
+  },
+  "state_identity": {
+    "type_name": "MemoryProviderStateIdentityV1",
+    "required_fields": [
+      "provider_id",
+      "state_namespace",
+      "state_schema_version",
+      "scope_digest",
+      "state_generation"
+    ],
+    "state_namespace_maximum_bytes": 128,
+    "scope_digest_encoding": "lowercase_hex_64",
+    "state_generation_minimum": 0,
+    "path_is_authority": false,
+    "owner_match_required": true,
+    "scope_match_required": true,
+    "schema_compatibility_required": true
+  },
+  "exact_scope_identity": {
+    "type_name": "MemoryProviderExactScopeIdentityV1",
+    "required_fields": [
+      "profile_id",
+      "project_id",
+      "repository_identity",
+      "worktree_identity",
+      "branch_identity",
+      "agent_session_id",
+      "scope_revision"
+    ],
+    "wildcards_allowed": false,
+    "missing_identity_policy": "reject_scope_unavailable",
+    "mismatch_policy": "reject_scope_mismatch",
+    "provider_path_inference_allowed": false,
+    "cwd_inference_allowed": false
+  },
+  "limit_catalog": [
+    {
+      "id": "request_bytes",
+      "minimum": 1,
+      "maximum": 16777216,
+      "unit": "bytes"
+    },
+    {
+      "id": "response_bytes",
+      "minimum": 1,
+      "maximum": 33554432,
+      "unit": "bytes"
+    },
+    {
+      "id": "observation_batch_items",
+      "minimum": 1,
+      "maximum": 4096,
+      "unit": "items"
+    },
+    {
+      "id": "recall_candidates",
+      "minimum": 1,
+      "maximum": 10000,
+      "unit": "items"
+    },
+    {
+      "id": "concurrent_operations",
+      "minimum": 1,
+      "maximum": 1024,
+      "unit": "operations"
+    },
+    {
+      "id": "operation_millis",
+      "minimum": 1,
+      "maximum": 3600000,
+      "unit": "milliseconds"
+    },
+    {
+      "id": "snapshot_bytes",
+      "minimum": 1,
+      "maximum": 1073741824,
+      "unit": "bytes"
+    },
+    {
+      "id": "inspection_items",
+      "minimum": 1,
+      "maximum": 100000,
+      "unit": "items"
+    }
+  ],
+  "limit_negotiation": {
+    "type_name": "MemoryProviderEffectiveLimitsV1",
+    "required_limit_ids": [
+      "request_bytes",
+      "response_bytes",
+      "observation_batch_items",
+      "recall_candidates",
+      "concurrent_operations",
+      "operation_millis",
+      "snapshot_bytes",
+      "inspection_items"
+    ],
+    "algorithm": "effective_limit_is_minimum_of_host_and_provider_ceiling_for_every_limit_id",
+    "host_may_clamp_further_per_request": true,
+    "provider_may_exceed_effective_limit": false,
+    "unbounded_value_allowed": false,
+    "zero_value_allowed": false,
+    "missing_limit_policy": "reject_limit_negotiation_failed",
+    "unknown_limit_policy": "reject_contract_violation",
+    "overflow_policy": "reject_contract_violation"
+  },
+  "request_control": {
+    "deadline": {
+      "type_name": "MemoryProviderDeadlineV1",
+      "representation": "absolute_utc_micros_plus_monotonic_remaining_budget_at_dispatch",
+      "deadline_required": true,
+      "expired_before_dispatch_policy": "deadline_exceeded_without_provider_call",
+      "provider_must_receive_remaining_budget": true,
+      "provider_operation_must_stop_after_deadline": true,
+      "deadline_extension_allowed": false
+    },
+    "cancellation": {
+      "type_name": "MemoryProviderCancellationV1",
+      "live_token_required": true,
+      "already_cancelled_policy": "cancelled_without_provider_call",
+      "provider_must_observe_token": true,
+      "bounded_stop_required": true,
+      "cancellation_as_success_allowed": false
+    }
+  },
+  "compatibility_algorithm": [
+    "Resolve exactly one accepted registry registration by provider_id and registration_revision.",
+    "Reject before provider contact when the request deadline is expired or cancellation is already terminal.",
+    "Call the selected adapter handshake with exact scope, request identity, challenge, required capabilities, and host ceilings.",
+    "Require exact provider_id echo and a valid challenge response.",
+    "Require adapter contract compatibility and a mutually supported provider protocol major/minor.",
+    "Require provider state owner, namespace, schema, and exact scope to match the selected provider and request.",
+    "Require every requested capability to be declared by both accepted registration and handshake response.",
+    "Negotiate every effective limit by taking the lower host/provider ceiling and reject missing, zero, unknown, or overflowed limits.",
+    "Publish ready only after all checks pass and retain a canonical handshake receipt digest.",
+    "Return the first deterministic typed non-ready state without fallback or fake readiness."
+  ],
+  "readiness_states": [
+    "ready",
+    "provider_unknown",
+    "provider_disabled",
+    "provider_reserved",
+    "provider_retiring",
+    "adapter_unavailable",
+    "provider_unavailable",
+    "provider_id_mismatch",
+    "registration_revision_conflict",
+    "adapter_contract_incompatible",
+    "protocol_incompatible",
+    "implementation_identity_invalid",
+    "challenge_failed",
+    "state_schema_incompatible",
+    "state_owner_mismatch",
+    "scope_unavailable",
+    "scope_mismatch",
+    "required_capability_missing",
+    "limit_negotiation_failed",
+    "deadline_exceeded",
+    "cancelled",
+    "contract_violation"
+  ],
+  "ready_receipt": {
+    "type_name": "MemoryProviderReadyReceiptV1",
+    "required_fields": [
+      "provider_id",
+      "provider_instance_id",
+      "registration_revision",
+      "implementation_identity_digest",
+      "selected_protocol_version",
+      "state_identity_digest",
+      "scope_digest",
+      "declared_capabilities_digest",
+      "effective_limits_digest",
+      "handshake_transcript_digest",
+      "issued_at",
+      "expires_at"
+    ],
+    "digest_algorithm": "sha256_over_canonical_json",
+    "portable_across_provider_restart": false,
+    "portable_across_registration_revision": false,
+    "portable_across_scope_revision": false,
+    "required_before_provider_mutation": true,
+    "required_before_provider_recall": true
+  },
+  "side_effect_contract": {
+    "handshake_is_read_only": true,
+    "provider_state_mutation_allowed": false,
+    "tracedecay_state_mutation_allowed": false,
+    "canonical_fact_mutation_allowed": false,
+    "context_injection_allowed": false,
+    "ready_from_process_existence_allowed": false,
+    "ready_from_open_socket_allowed": false,
+    "ready_from_nonempty_state_allowed": false
+  },
+  "invariants": [
+    "A compatible handshake is required before every retained provider instance may observe, recall, mutate provider-local state, or report readiness.",
+    "Provider ID, registration revision, protocol version, implementation identity, state identity, exact scope, capabilities, and limits are independently verified.",
+    "Process existence, an open socket, a database path, or non-empty state never proves readiness.",
+    "Provider runtime location is diagnostic metadata and never provider or state authority.",
+    "Exact scope contains profile, project, repository, worktree, branch, agent session, and scope revision with no wildcards or CWD inference.",
+    "Provider state owner, schema, namespace, and scope must match the selected provider registration and request.",
+    "Protocol major compatibility requires an exact intersection; minor selection is deterministic and cannot silently downgrade across majors.",
+    "Every effective limit is finite, positive, known, and no larger than either host or provider ceiling.",
+    "Expired deadlines and already-cancelled requests never call the provider.",
+    "Live deadline and cancellation reach the actual provider operation and cannot be converted into success.",
+    "Handshake is read-only and cannot mutate provider state, TraceDecay state, Native facts, or final context.",
+    "Readiness is an expiring scoped receipt bound to provider instance, registration revision, state generation, capabilities, and limits.",
+    "Every non-ready state is typed and no failure silently falls back to another provider."
+  ],
+  "verification_beads": [
+    "tdmem-0206",
+    "tdmem-0209",
+    "tdmem-0304",
+    "tdmem-0403",
+    "tdmem-0503",
+    "tdmem-0504",
+    "tdmem-0506",
+    "tdmem-0701",
+    "tdmem-0702",
+    "tdmem-0903"
+  ]
+}
