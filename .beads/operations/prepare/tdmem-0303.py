@@ -32,6 +32,11 @@ fixed_import = "    HandshakeRequest, HandshakeResponse, MemoryProvider, Provide
 if source.count(unused_import) != 1:
     raise SystemExit("could not locate the unused Native adapter ApiError import")
 source = source.replace(unused_import, fixed_import, 1)
+temporary_descriptor = '''    let capabilities = provider\n        .descriptor()\n        .capabilities\n'''
+owned_descriptor = '''    let descriptor = provider.descriptor();\n    let capabilities = descriptor\n        .capabilities\n'''
+if source.count(temporary_descriptor) != 1:
+    raise SystemExit("could not locate the borrowed temporary Native descriptor")
+source = source.replace(temporary_descriptor, owned_descriptor, 1)
 marker = "update_convergence_map()\n\nmanifest = ["
 replacement = '''subprocess.run(
     ["cargo", "check", "-p", "tracedecay-memory-provider-native", "--all-targets"],
