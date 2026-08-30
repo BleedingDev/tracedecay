@@ -39,7 +39,8 @@ if source.count(temporary_descriptor) != 1:
 source = source.replace(temporary_descriptor, owned_descriptor, 1)
 undocumented_tests = "TESTS = r'''use std::collections::BTreeSet;\n"
 documented_tests = (
-    "TESTS = r'''//! Integration journeys for the Native provider adapter boundary.\n\n"
+    "TESTS = r'''//! Integration journeys for the Native provider adapter boundary.\n"
+    "#![allow(clippy::expect_used)]\n\n"
     "use std::collections::BTreeSet;\n"
 )
 if source.count(undocumented_tests) != 1:
