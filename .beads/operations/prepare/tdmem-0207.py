@@ -21,10 +21,14 @@ subprocess.run(
     check=True,
 )
 
-marker = {
-    "schema_version": 1,
-    "paths": ["product/contracts/memory-provider-v1/goldens"],
-    "commit_message": "test(contract): materialize canonical M1 golden fixtures (tdmem-0207)",
-}
+manifest = [
+    {
+        "path": "product/contracts/memory-provider-v1/goldens",
+        "message": "test(contract): materialize canonical M1 golden fixtures (tdmem-0207)",
+    }
+]
 marker_path = REPO / ".beads/operations/prepared-files.json"
-marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+marker_path.write_text(
+    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
