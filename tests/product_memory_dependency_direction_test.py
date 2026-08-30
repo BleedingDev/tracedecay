@@ -43,7 +43,7 @@ def package(name: str, dependencies: list[str]) -> dict[str, Any]:
 def valid_metadata() -> dict[str, Any]:
     return {
         "packages": [
-            package("tracedecay-memory-provider-api", []),
+            package("tracedecay-memory-provider-api", ["sha2"]),
             package(
                 "tracedecay-memory-fabric",
                 ["tracedecay-memory-provider-api"],
@@ -54,11 +54,19 @@ def valid_metadata() -> dict[str, Any]:
             ),
             package(
                 "tracedecay-memory-provider-ncm",
-                ["sha2", "tracedecay-memory-provider-api"],
+                ["serde_json", "sha2", "tracedecay-memory-provider-api"],
             ),
             package(
                 "tracedecay-memory-conformance",
                 ["tracedecay-memory-provider-api"],
+            ),
+            package(
+                "tracedecay-memory-provider-registry",
+                [
+                    "tracedecay-memory-fabric",
+                    "tracedecay-memory-provider-api",
+                    "tracedecay-memory-provider-native",
+                ],
             ),
             package("tracedecay-cli", []),
             package("tracedecay-dashboard-api", []),

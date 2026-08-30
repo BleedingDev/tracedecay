@@ -13,9 +13,13 @@
   "package_contracts": [
     {
       "package": "tracedecay-memory-provider-api",
-      "allowed_direct_dependencies": [],
-      "required_direct_dependencies": [],
-      "reason": "The canonical provider boundary is the inward dependency root."
+      "allowed_direct_dependencies": [
+        "sha2"
+      ],
+      "required_direct_dependencies": [
+        "sha2"
+      ],
+      "reason": "The canonical provider boundary is the inward dependency root; sha2 is its only external crate, for canonical payload and receipt digest validation."
     },
     {
       "package": "tracedecay-memory-fabric",
@@ -40,24 +44,27 @@
     {
       "package": "tracedecay-memory-provider-ncm",
       "allowed_direct_dependencies": [
+        "serde_json",
         "sha2",
         "tracedecay-memory-provider-api"
       ],
       "required_direct_dependencies": [
+        "serde_json",
         "sha2",
         "tracedecay-memory-provider-api"
       ],
-      "reason": "The NCM boundary may hash an opaque exact-scope namespace but cannot import TraceDecay internals."
+      "reason": "The NCM boundary may hash an opaque exact-scope namespace and validate canonical JSON payloads but cannot import TraceDecay internals."
     },
     {
       "package": "tracedecay-memory-conformance",
       "allowed_direct_dependencies": [
+        "sha2",
         "tracedecay-memory-provider-api"
       ],
       "required_direct_dependencies": [
         "tracedecay-memory-provider-api"
       ],
-      "reason": "Conformance remains provider-neutral and dashboard-independent."
+      "reason": "Conformance remains provider-neutral and dashboard-independent; sha2 is a dev-dependency for fixture identity digests."
     },
     {
       "package": "tracedecay-memory-provider-registry",
