@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/schemas/memory-provider-v1/contract-set.schema.json",
+  "title": "TraceDecay Memory Provider V1 contract-set authority",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_set_id",
+    "bead_id",
+    "title",
+    "status",
+    "canonical_encoding",
+    "digest_algorithm",
+    "contract_order_is_authoritative",
+    "contracts",
+    "compatibility_rules",
+    "goldens",
+    "verification"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "contract_set_id": { "const": "tracedecay.memory.provider.contract-set.v1" },
+    "bead_id": { "const": "tdmem-0207" },
+    "title": { "type": "string", "minLength": 1 },
+    "status": { "const": "accepted" },
+    "canonical_encoding": { "const": "utf8_rfc8785_json_without_bom_with_lf" },
+    "digest_algorithm": { "const": "sha256" },
+    "contract_order_is_authoritative": { "const": true },
+    "contracts": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": { "$ref": "#/$defs/contractEntry" }
+    },
+    "compatibility_rules": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/compatibilityRule" }
+    },
+    "goldens": { "$ref": "#/$defs/object" },
+    "verification": { "$ref": "#/$defs/object" }
+  },
+  "$defs": {
+    "beadId": {
+      "type": "string",
+      "pattern": "^tdmem-[0-9]{4}$"
+    },
+    "object": {
+      "type": "object",
+      "minProperties": 1
+    },
+    "contractEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "order",
+        "contract_id",
+        "bead_id",
+        "contract_path",
+        "schema_path",
+        "documentation_path",
+        "checker_path",
+        "test_path",
+        "required_status"
+      ],
+      "properties": {
+        "order": { "type": "integer", "minimum": 1, "maximum": 6 },
+        "contract_id": {
+          "type": "string",
+          "pattern": "^tracedecay\\.memory\\.provider\\.[a-z-]+\\.v1$"
+        },
+        "bead_id": { "$ref": "#/$defs/beadId" },
+        "contract_path": { "type": "string", "minLength": 1 },
+        "schema_path": { "type": "string", "minLength": 1 },
+        "documentation_path": { "type": "string", "minLength": 1 },
+        "checker_path": { "type": "string", "minLength": 1 },
+        "test_path": { "type": "string", "minLength": 1 },
+        "required_status": { "const": "accepted" }
+      }
+    },
+    "compatibilityRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "rule"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+        "rule": { "type": "string", "minLength": 20 }
+      }
+    }
+  }
+}
