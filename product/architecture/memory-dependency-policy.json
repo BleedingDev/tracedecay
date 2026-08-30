@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "bead_id": "tdmem-0306",
+  "purpose": "Keep the provider API below orchestration and adapters, keep concrete adapters isolated, and require reviewed evidence for every exceptional edge.",
+  "metadata_command": [
+    "cargo",
+    "metadata",
+    "--locked",
+    "--format-version",
+    "1",
+    "--no-deps"
+  ],
+  "package_contracts": [
+    {
+      "package": "tracedecay-memory-provider-api",
+      "allowed_direct_dependencies": [],
+      "required_direct_dependencies": [],
+      "reason": "The canonical provider boundary is the inward dependency root."
+    },
+    {
+      "package": "tracedecay-memory-fabric",
+      "allowed_direct_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "required_direct_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "reason": "The fabric coordinates provider-neutral contracts only."
+    },
+    {
+      "package": "tracedecay-memory-provider-native",
+      "allowed_direct_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "required_direct_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "reason": "The Native adapter exposes a narrow application port and owns no TraceDecay internals."
+    },
+    {
+      "package": "tracedecay-memory-provider-ncm",
+      "allowed_direct_dependencies": [
+        "sha2",
+        "tracedecay-memory-provider-api"
+      ],
+      "required_direct_dependencies": [
+        "sha2",
+        "tracedecay-memory-provider-api"
+      ],
+      "reason": "The NCM boundary may hash an opaque exact-scope namespace but cannot import TraceDecay internals."
+    },
+    {
+      "package": "tracedecay-memory-conformance",
+      "allowed_direct_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "required_direct_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "reason": "Conformance remains provider-neutral and dashboard-independent."
+    }
+  ],
+  "rules": [
+    {
+      "id": "provider-api-is-inward",
+      "from_packages": [
+        "tracedecay-memory-provider-api"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-*"
+      ],
+      "allowed_dependencies": [],
+      "reason": "The provider API can never depend on orchestration, adapters, the root crate, storage, or code-index packages."
+    },
+    {
+      "id": "fabric-is-provider-neutral",
+      "from_packages": [
+        "tracedecay-memory-fabric"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-*"
+      ],
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "reason": "Provider implementations and upstream internals stay outside the fabric."
+    },
+    {
+      "id": "native-adapter-is-isolated",
+      "from_packages": [
+        "tracedecay-memory-provider-native"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-*",
+        "ncm*",
+        "ocean*"
+      ],
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "reason": "The Native adapter cannot import another provider, root composition, persistence, or code-index internals."
+    },
+    {
+      "id": "ncm-adapter-cannot-reach-tracedecay-internals",
+      "from_packages": [
+        "tracedecay-memory-provider-ncm"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-*",
+        "ocean*"
+      ],
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "reason": "The licensed NCM boundary receives only provider-neutral values and an opaque namespace."
+    },
+    {
+      "id": "conformance-is-provider-neutral",
+      "from_packages": [
+        "tracedecay-memory-conformance"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-*",
+        "ncm*",
+        "ocean*"
+      ],
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "reason": "The same harness must run every provider without importing a concrete adapter or product surface."
+    },
+    {
+      "id": "public-transports-are-adapter-blind",
+      "from_packages": [
+        "tracedecay-cli",
+        "tracedecay-dashboard-api",
+        "tracedecay-mcp",
+        "tracedecay-sdk"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-native",
+        "tracedecay-memory-provider-ncm",
+        "ncm*",
+        "ocean*"
+      ],
+      "allowed_dependencies": [],
+      "reason": "Public transports expose provider-neutral application contracts and never construct concrete providers."
+    }
+  ],
+  "exception_contract": {
+    "default": "forbidden",
+    "required_fields": [
+      "id",
+      "rule_id",
+      "from_package",
+      "to_package",
+      "adr",
+      "rationale",
+      "owner",
+      "verification",
+      "review_after"
+    ],
+    "rules": [
+      "Exceptions authorize one exact direct edge and one exact rule only.",
+      "The ADR must exist under product/architecture/adr and reject provider-neutral alternatives.",
+      "Rationale, accountable owner, focused verification, and a dated review are mandatory.",
+      "Unused, duplicate, wildcard, or malformed exceptions fail validation."
+    ]
+  },
+  "exceptions": []
+}
