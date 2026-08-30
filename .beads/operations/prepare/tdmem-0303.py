@@ -26,7 +26,19 @@ old = '''        if entry is None:\n            raise SystemExit(f"missing conve
 new = '''        if entry is None:\n            if upstream_path == "Cargo.lock" and not git_changed("Cargo.lock"):\n                continue\n            raise SystemExit(f"missing convergence entry for {upstream_path}")\n'''
 if source.count(old) != 1:
     raise SystemExit("could not locate the reviewed convergence-entry guard")
-BODY.write_text(source.replace(old, new, 1), encoding="utf-8")
+source = source.replace(old, new, 1)
+marker = "update_convergence_map()\n\nmanifest = ["
+replacement = '''subprocess.run(
+    ["cargo", "check", "-p", "tracedecay-memory-provider-native", "--all-targets"],
+    cwd=ROOT,
+    check=True,
+)
+update_convergence_map()
+
+manifest = ['''
+if source.count(marker) != 1:
+    raise SystemExit("could not locate the convergence-map materialization point")
+BODY.write_text(source.replace(marker, replacement, 1), encoding="utf-8")
 subprocess.run(["python3", str(BODY)], cwd=ROOT, check=True)
 subprocess.run(
     ["cargo", "fmt", "--package", "tracedecay-memory-provider-native"],
