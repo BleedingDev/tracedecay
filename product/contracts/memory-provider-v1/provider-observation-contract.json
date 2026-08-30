@@ -1,0 +1,330 @@
+{
+  "schema_version": 1,
+  "contract_id": "tracedecay.memory.provider.observation.v1",
+  "bead_id": "tdmem-0203",
+  "title": "Memory provider observation envelope, normalization, idempotency, batching, provenance, privacy, and receipt contract",
+  "status": "accepted",
+  "authority": "TraceDecay observation admission and dispatch fabric",
+  "scope": "coding_agents_only",
+  "depends_on_contracts": [
+    "tracedecay.memory.provider.registry.v1",
+    "tracedecay.memory.provider.handshake.v1"
+  ],
+  "observation_envelope": {
+    "type_name": "MemoryProviderObservationEnvelopeV1",
+    "required_fields": [
+      "observation_id",
+      "idempotency_key",
+      "provider_id",
+      "registration_revision",
+      "ready_receipt_digest",
+      "exact_scope_identity",
+      "source_identity",
+      "observation_kind",
+      "payload_contract",
+      "canonical_payload",
+      "payload_sha256",
+      "provenance",
+      "privacy",
+      "occurred_at",
+      "admitted_at",
+      "source_sequence",
+      "request_identity",
+      "deadline",
+      "cancellation"
+    ],
+    "observation_id_type": "uuid_v7_lowercase",
+    "maximum_envelope_bytes": 4194304,
+    "maximum_payload_bytes": 3145728,
+    "unknown_field_policy": "reject_contract_violation",
+    "empty_payload_allowed": false
+  },
+  "source_identity": {
+    "type_name": "MemoryProviderObservationSourceIdentityV1",
+    "required_fields": [
+      "source_authority",
+      "source_event_id",
+      "source_event_revision",
+      "source_event_sha256",
+      "canonical_settlement_receipt"
+    ],
+    "source_authorities": [
+      "host_session",
+      "tool_execution",
+      "source_edit",
+      "test_execution",
+      "diagnostic_broker",
+      "git_evidence",
+      "native_fact_promotion",
+      "feedback_outcome",
+      "automation_outcome"
+    ],
+    "source_event_id_maximum_bytes": 256,
+    "source_event_revision_minimum": 0,
+    "canonical_settlement_receipt_required": true,
+    "unsettled_source_policy": "reject_not_canonically_settled",
+    "path_is_source_identity": false
+  },
+  "observation_kinds": [
+    {
+      "id": "session.message_committed.v1",
+      "source_authority": "host_session",
+      "payload_contract": "tracedecay.memory.observation.session-message.v1"
+    },
+    {
+      "id": "tool.execution_settled.v1",
+      "source_authority": "tool_execution",
+      "payload_contract": "tracedecay.memory.observation.tool-execution.v1"
+    },
+    {
+      "id": "source.edit_settled.v1",
+      "source_authority": "source_edit",
+      "payload_contract": "tracedecay.memory.observation.source-edit.v1"
+    },
+    {
+      "id": "test.execution_settled.v1",
+      "source_authority": "test_execution",
+      "payload_contract": "tracedecay.memory.observation.test-execution.v1"
+    },
+    {
+      "id": "diagnostic.observed.v1",
+      "source_authority": "diagnostic_broker",
+      "payload_contract": "tracedecay.memory.observation.diagnostic.v1"
+    },
+    {
+      "id": "git.evidence_observed.v1",
+      "source_authority": "git_evidence",
+      "payload_contract": "tracedecay.memory.observation.git-evidence.v1"
+    },
+    {
+      "id": "native.fact_promoted.v1",
+      "source_authority": "native_fact_promotion",
+      "payload_contract": "tracedecay.memory.observation.native-fact-promotion.v1"
+    },
+    {
+      "id": "feedback.outcome_settled.v1",
+      "source_authority": "feedback_outcome",
+      "payload_contract": "tracedecay.memory.observation.feedback-outcome.v1"
+    },
+    {
+      "id": "automation.outcome_settled.v1",
+      "source_authority": "automation_outcome",
+      "payload_contract": "tracedecay.memory.observation.automation-outcome.v1"
+    }
+  ],
+  "normalization": {
+    "canonical_encoding": "rfc8785_json",
+    "unicode_normalization": "nfc",
+    "object_key_order": "lexicographic_utf8",
+    "floating_point_values_allowed": false,
+    "non_finite_numbers_allowed": false,
+    "duplicate_object_keys_allowed": false,
+    "unknown_payload_contract_policy": "reject_contract_violation",
+    "payload_digest": "sha256_over_canonical_payload",
+    "envelope_digest": "sha256_over_canonical_envelope_without_transport_metadata",
+    "transport_metadata_in_digest": false,
+    "provider_specific_payload_shape_allowed": false
+  },
+  "idempotency": {
+    "type_name": "MemoryProviderObservationIdempotencyKeyV1",
+    "encoding": "lowercase_hex_64",
+    "derivation": "sha256_over_contract_provider_registration_scope_source_authority_source_event_id_source_event_revision_observation_kind_payload_contract",
+    "stable_across_delivery_retries": true,
+    "stable_across_dispatch_process_restart": true,
+    "stable_across_provider_restart": true,
+    "stable_across_transport_topology": true,
+    "provider_must_persist_deduplication": true,
+    "same_key_same_payload_outcome": "duplicate_acknowledged",
+    "same_key_different_payload_outcome": "idempotency_conflict",
+    "same_source_new_revision_requires_new_key": true,
+    "random_retry_key_allowed": false,
+    "timestamp_only_key_allowed": false
+  },
+  "provenance": {
+    "type_name": "MemoryProviderObservationProvenanceV1",
+    "required_fields": [
+      "origin_kind",
+      "origin_identity",
+      "actor_identity",
+      "host_identity",
+      "evidence_anchors",
+      "transform_chain"
+    ],
+    "origin_kinds": [
+      "user",
+      "agent",
+      "tool",
+      "repository",
+      "tracedecay_native",
+      "automation"
+    ],
+    "maximum_evidence_anchors": 64,
+    "maximum_transform_steps": 32,
+    "missing_provenance_policy": "reject_provenance_unavailable",
+    "provider_may_rewrite_origin": false,
+    "provider_may_drop_transform_chain": false
+  },
+  "privacy": {
+    "type_name": "MemoryProviderObservationPrivacyV1",
+    "required_fields": [
+      "classification",
+      "retention_class",
+      "redaction_revision",
+      "content_policy_revision",
+      "forget_source_key",
+      "expires_at"
+    ],
+    "classifications": [
+      "public",
+      "internal",
+      "sensitive",
+      "restricted"
+    ],
+    "retention_classes": [
+      "ephemeral",
+      "session",
+      "project",
+      "profile"
+    ],
+    "raw_secret_material_allowed": false,
+    "unadmitted_personal_data_allowed": false,
+    "forget_source_key_required": true,
+    "provider_may_extend_expiry": false,
+    "missing_privacy_metadata_policy": "reject_privacy_metadata_unavailable"
+  },
+  "ordering": {
+    "source_sequence_type": "unsigned_64",
+    "source_sequence_scope": "source_authority_plus_exact_scope_plus_source_stream",
+    "source_sequence_monotonic_required": true,
+    "delivery_order_guaranteed": false,
+    "provider_must_tolerate_out_of_order_delivery": true,
+    "provider_must_tolerate_duplicate_delivery": true,
+    "occurred_at_is_order_authority": false,
+    "admitted_at_is_order_authority": false,
+    "missing_predecessor_policy": "accept_with_gap_warning_unless_payload_contract_requires_predecessor"
+  },
+  "batch_contract": {
+    "type_name": "MemoryProviderObservationBatchV1",
+    "required_fields": [
+      "batch_id",
+      "provider_id",
+      "registration_revision",
+      "ready_receipt_digest",
+      "exact_scope_identity",
+      "observations",
+      "request_identity",
+      "deadline",
+      "cancellation"
+    ],
+    "homogeneous_fields": [
+      "provider_id",
+      "registration_revision",
+      "ready_receipt_digest",
+      "exact_scope_identity"
+    ],
+    "minimum_items": 1,
+    "maximum_items_source": "effective_limit.observation_batch_items",
+    "maximum_bytes_source": "effective_limit.request_bytes",
+    "duplicate_idempotency_keys_in_batch_policy": "reject_non_canonical_batch",
+    "partial_batch_commit_must_be_reported": true,
+    "atomic_batch_required": false
+  },
+  "admission_order": [
+    "Require a canonically settled source receipt before creating an observation.",
+    "Resolve exact provider registration and current readiness receipt for the same exact scope.",
+    "Reject expired deadline or already-cancelled request before journal append.",
+    "Validate source identity, observation kind, payload contract, provenance, privacy, and bounds.",
+    "Canonicalize payload and derive payload digest, observation ID, idempotency key, and envelope digest.",
+    "Append the admitted immutable envelope to the durable bounded observation journal.",
+    "Dispatch at least once subject to effective batch, byte, concurrency, deadline, and cancellation limits.",
+    "Require the provider to deduplicate by idempotency key and compare payload digest.",
+    "Persist a delivery receipt for every acknowledged, duplicate, rejected, partial, cancelled, timed-out, or unknown-effect attempt.",
+    "Never alter the already-settled canonical source outcome because provider admission or delivery failed."
+  ],
+  "provider_acceptance_outcomes": [
+    "applied",
+    "duplicate_acknowledged",
+    "rejected_contract_violation",
+    "rejected_scope_mismatch",
+    "rejected_provenance_unavailable",
+    "rejected_privacy_policy",
+    "rejected_payload_too_large",
+    "idempotency_conflict",
+    "provider_unavailable",
+    "deadline_exceeded",
+    "cancelled",
+    "partial_effect",
+    "effect_unknown"
+  ],
+  "delivery_receipt": {
+    "type_name": "MemoryProviderObservationDeliveryReceiptV1",
+    "required_fields": [
+      "receipt_id",
+      "observation_id",
+      "idempotency_key",
+      "payload_sha256",
+      "provider_id",
+      "provider_instance_id",
+      "registration_revision",
+      "state_generation_before",
+      "state_generation_after",
+      "attempt_number",
+      "outcome",
+      "committed_effect",
+      "provider_receipt_digest",
+      "started_at",
+      "finished_at",
+      "warnings"
+    ],
+    "attempt_number_minimum": 1,
+    "committed_effect_states": [
+      "none",
+      "applied",
+      "duplicate",
+      "partial",
+      "unknown"
+    ],
+    "provider_receipt_digest_required_for": [
+      "applied",
+      "duplicate_acknowledged",
+      "partial_effect"
+    ],
+    "receipt_is_immutable": true,
+    "success_without_provider_acknowledgement_allowed": false
+  },
+  "observer_non_interference": {
+    "canonical_source_settlement_precedes_observation": true,
+    "provider_failure_may_change_source_outcome": false,
+    "provider_latency_may_delay_source_settlement": false,
+    "provider_output_may_enter_context_in_observer_mode": false,
+    "provider_output_may_trigger_tools_or_external_actions_in_observer_mode": false,
+    "provider_output_may_mutate_native_facts_in_observer_mode": false
+  },
+  "invariants": [
+    "An observation is created only from a canonically settled TraceDecay source event and never participates in that source transaction.",
+    "Every envelope is immutable, exact-scope, provider-targeted, registration-pinned, readiness-pinned, bounded, provenance-bearing, privacy-bearing, and request-controlled.",
+    "Canonical payload bytes and SHA-256 are deterministic across process restart and transport topology.",
+    "Idempotency keys are deterministic across retries and crashes and never depend only on timestamps or random retry values.",
+    "The same idempotency key with the same payload is a duplicate acknowledgement; the same key with different payload is an explicit conflict.",
+    "Providers persist deduplication state strongly enough to survive acknowledgement loss and provider restart.",
+    "Delivery is at least once, may be out of order, and always carries source sequence and immutable occurrence/admission times.",
+    "Unknown payload contracts, missing provenance/privacy, unadmitted secrets, oversize payloads, scope mismatch, and malformed canonical JSON fail closed.",
+    "Provider-local application never mutates current code, exact scope identity, sessions, accepted Native facts, curated rules, tools, approvals, or final context.",
+    "Observer admission, dispatch, latency, failure, duplicate, conflict, partial effect, or unknown effect cannot alter the canonical source outcome.",
+    "Every delivery attempt has an immutable typed receipt and success is impossible without provider acknowledgement.",
+    "Batch limits come from the compatible readiness receipt and partial commits are represented honestly rather than retried as whole-batch success.",
+    "Forget-source identity and expiry are admitted before dispatch and a provider may not extend retention."
+  ],
+  "verification_beads": [
+    "tdmem-0205",
+    "tdmem-0206",
+    "tdmem-0209",
+    "tdmem-0305",
+    "tdmem-0502",
+    "tdmem-0503",
+    "tdmem-0505",
+    "tdmem-0506",
+    "tdmem-0703",
+    "tdmem-0903"
+  ]
+}
