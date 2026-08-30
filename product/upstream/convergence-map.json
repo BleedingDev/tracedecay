@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "bead_id": "tdmem-0105",
+  "policy_revision": "patch-footprint.v1",
+  "upstream_floor_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+  "purpose": "One reviewed record for every intentional edit to an upstream-owned existing file, preserving rationale, semantic invariants, verification, and the path back to upstream convergence.",
+  "snapshot": {
+    "upstream_existing_production_files": 0,
+    "upstream_existing_test_or_fixture_files": 0,
+    "total_upstream_changed_lines": 0,
+    "composition_root_files": 0,
+    "exception_zone_files": 0,
+    "observed_state": "No Zack-owned existing file has been edited by the product program through tdmem-0105; all current changes are additive under product-owned paths."
+  },
+  "entry_contract": {
+    "status_values": [
+      "active",
+      "retired"
+    ],
+    "touch_point_values": [
+      "workspace_wiring",
+      "application_contract_mount",
+      "daemon_composition_mount",
+      "normalized_observation_mount",
+      "recall_context_mount",
+      "post_settlement_feedback_mount",
+      "configuration_registry_mount",
+      "exception"
+    ],
+    "rules": [
+      "An active entry must correspond to an actual diff against the immutable upstream floor.",
+      "Every actual upstream-owned existing-file diff must have exactly one active entry.",
+      "A retired entry remains historical evidence but cannot authorize a current diff.",
+      "An exception entry must name one exception zone, one versioned ADR, rejected alternatives, policy revision, and rollback plan.",
+      "The entry line budget may be lower than the global per-file cap but never higher without a policy revision."
+    ]
+  },
+  "entries": []
+}
