@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "contract_set_id": "tracedecay.memory.provider.contract-set.v1",
+  "bead_id": "tdmem-0207",
+  "title": "Canonical TraceDecay Memory Provider V1 contract and golden-fixture authority",
+  "status": "accepted",
+  "canonical_encoding": "utf8_rfc8785_json_without_bom_with_lf",
+  "digest_algorithm": "sha256",
+  "contract_order_is_authoritative": true,
+  "contracts": [
+    {
+      "order": 1,
+      "contract_id": "tracedecay.memory.provider.registry.v1",
+      "bead_id": "tdmem-0201",
+      "contract_path": "product/contracts/memory-provider-v1/provider-registry-contract.json",
+      "schema_path": "product/contracts/memory-provider-v1/provider-registry-contract.schema.json",
+      "documentation_path": "product/contracts/memory-provider-v1/README.md",
+      "checker_path": "scripts/product/check-provider-registry-contract.py",
+      "test_path": "tests/product_provider_registry_contract_test.py",
+      "required_status": "accepted"
+    },
+    {
+      "order": 2,
+      "contract_id": "tracedecay.memory.provider.handshake.v1",
+      "bead_id": "tdmem-0202",
+      "contract_path": "product/contracts/memory-provider-v1/provider-handshake-contract.json",
+      "schema_path": "product/contracts/memory-provider-v1/provider-handshake-contract.schema.json",
+      "documentation_path": "product/contracts/memory-provider-v1/provider-handshake-contract.md",
+      "checker_path": "scripts/product/check-provider-handshake-contract.py",
+      "test_path": "tests/product_provider_handshake_contract_test.py",
+      "required_status": "accepted"
+    },
+    {
+      "order": 3,
+      "contract_id": "tracedecay.memory.provider.observation.v1",
+      "bead_id": "tdmem-0203",
+      "contract_path": "product/contracts/memory-provider-v1/provider-observation-contract.json",
+      "schema_path": "product/contracts/memory-provider-v1/provider-observation-contract.schema.json",
+      "documentation_path": "product/contracts/memory-provider-v1/provider-observation-contract.md",
+      "checker_path": "scripts/product/check-provider-observation-contract.py",
+      "test_path": "tests/product_provider_observation_contract_test.py",
+      "required_status": "accepted"
+    },
+    {
+      "order": 4,
+      "contract_id": "tracedecay.memory.provider.recall.v1",
+      "bead_id": "tdmem-0204",
+      "contract_path": "product/contracts/memory-provider-v1/provider-recall-contract.json",
+      "schema_path": "product/contracts/memory-provider-v1/provider-recall-contract.schema.json",
+      "documentation_path": "product/contracts/memory-provider-v1/provider-recall-contract.md",
+      "checker_path": "scripts/product/check-provider-recall-contract.py",
+      "test_path": "tests/product_provider_recall_contract_test.py",
+      "required_status": "accepted"
+    },
+    {
+      "order": 5,
+      "contract_id": "tracedecay.memory.provider.lifecycle.v1",
+      "bead_id": "tdmem-0205",
+      "contract_path": "product/contracts/memory-provider-v1/provider-lifecycle-contract.json",
+      "schema_path": "product/contracts/memory-provider-v1/provider-lifecycle-contract.schema.json",
+      "documentation_path": "product/contracts/memory-provider-v1/provider-lifecycle-contract.md",
+      "checker_path": "scripts/product/check-provider-lifecycle-contract.py",
+      "test_path": "tests/product_provider_lifecycle_contract_test.py",
+      "required_status": "accepted"
+    },
+    {
+      "order": 6,
+      "contract_id": "tracedecay.memory.provider.terminal.v1",
+      "bead_id": "tdmem-0206",
+      "contract_path": "product/contracts/memory-provider-v1/provider-terminal-contract.json",
+      "schema_path": "product/contracts/memory-provider-v1/provider-terminal-contract.schema.json",
+      "documentation_path": "product/contracts/memory-provider-v1/provider-terminal-contract.md",
+      "checker_path": "scripts/product/check-provider-terminal-contract.py",
+      "test_path": "tests/product_provider_terminal_contract_test.py",
+      "required_status": "accepted"
+    }
+  ],
+  "compatibility_rules": [
+    {
+      "id": "contract-major-exact",
+      "rule": "A different provider protocol or contract major is incompatible before state mutation."
+    },
+    {
+      "id": "required-fields-closed",
+      "rule": "Missing required fields and unknown top-level fields are contract violations."
+    },
+    {
+      "id": "unknown-enum-closed",
+      "rule": "Unknown closed-enum values are contract violations unless the owning contract declares an extension point."
+    },
+    {
+      "id": "unknown-optional-extension-roundtrip",
+      "rule": "Unknown optional extensions are preserved as opaque inert canonical payloads across decode and encode."
+    },
+    {
+      "id": "unknown-required-extension-reject",
+      "rule": "Unknown required extensions fail explicitly and never activate behavior."
+    },
+    {
+      "id": "same-major-addition-only-at-extension-points",
+      "rule": "Forward-compatible same-major additions are allowed only through declared optional extension points."
+    },
+    {
+      "id": "terminal-envelope-mandatory",
+      "rule": "Every mandatory operation returns the canonical terminal envelope; empty responses are contract violations."
+    },
+    {
+      "id": "canonical-roundtrip",
+      "rule": "A decode and encode without semantic changes reproduces identical canonical bytes and SHA-256."
+    }
+  ],
+  "goldens": {
+    "scenario_source_path": "product/contracts/memory-provider-v1/golden-scenarios.json",
+    "scenario_schema_path": "product/contracts/memory-provider-v1/golden-scenarios.schema.json",
+    "generator_path": "scripts/product/generate-memory-provider-goldens.py",
+    "fixtures_path": "product/contracts/memory-provider-v1/goldens/fixtures.jsonl",
+    "manifest_path": "product/contracts/memory-provider-v1/goldens/manifest.json",
+    "minimum_fixture_count": 24,
+    "required_categories": [
+      "success",
+      "zero_results",
+      "degradation",
+      "cancellation",
+      "timeout",
+      "incompatibility",
+      "stale_scope",
+      "malformed",
+      "unknown_optional_roundtrip",
+      "unknown_required_rejection",
+      "idempotent_duplicate",
+      "idempotency_conflict",
+      "partial_effect",
+      "effect_unknown"
+    ],
+    "fixture_order": "fixture_id_lexicographic_utf8",
+    "line_encoding": "one_rfc8785_json_object_per_lf_terminated_line",
+    "generated_files_are_hand_editable": false
+  },
+  "verification": {
+    "checker_path": "scripts/product/check-memory-provider-contract-set.py",
+    "test_path": "tests/product_memory_provider_contract_set_test.py",
+    "generator_check_command": "python3 scripts/product/generate-memory-provider-goldens.py --repo . --check",
+    "all_contract_checkers_must_pass": true,
+    "working_tree_must_remain_clean_after_check": true
+  }
+}
