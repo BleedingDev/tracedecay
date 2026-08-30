@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0208",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Closing generated Rust bindings only after deterministic regeneration, strict rustc compilation and runtime probes, no forbidden constructs, no duplicate hand-maintained wire types, and a checked-in CI lane that fails on contract or generated drift.",
+  "checks": [
+    {
+      "name": "generated Rust binding mutation and architecture tests",
+      "argv": ["python3", "tests/product_memory_provider_rust_bindings_test.py"],
+      "timeout_seconds": 360
+    },
+    {
+      "name": "generated Rust binding repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-memory-provider-rust-bindings.py",
+        "--repo",
+        ".",
+        "--generated",
+        "product/contracts/memory-provider-v1/generated/rust/memory_provider_v1.rs",
+        "--manifest",
+        "product/contracts/memory-provider-v1/generated/rust/manifest.json"
+      ],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "deterministic Rust generation has zero drift",
+      "argv": [
+        "python3",
+        "scripts/product/generate-memory-provider-rust.py",
+        "--repo",
+        ".",
+        "--check"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "canonical goldens and contract set remain valid",
+      "argv": [
+        "bash",
+        "-lc",
+        "python3 scripts/product/generate-memory-provider-goldens.py --repo . --check && python3 scripts/product/check-memory-provider-contract-set.py --repo ."
+      ],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "checked-in contract CI matches its product-owned authority",
+      "argv": [
+        "bash",
+        "-lc",
+        "cmp -s product/contracts/memory-provider-v1/product-memory-contracts.workflow.yml .github/workflows/product-memory-contracts.yml"
+      ],
+      "timeout_seconds": 60
+    },
+    {
+      "name": "all provider contract mutation suites remain green",
+      "argv": [
+        "bash",
+        "-lc",
+        "set -euo pipefail; for test_file in tests/product_provider_registry_contract_test.py tests/product_provider_handshake_contract_test.py tests/product_provider_observation_contract_test.py tests/product_provider_recall_contract_test.py tests/product_provider_lifecycle_contract_test.py tests/product_provider_terminal_contract_test.py tests/product_memory_provider_contract_set_test.py; do python3 \"$test_file\"; done"
+      ],
+      "timeout_seconds": 480
+    },
+    {
+      "name": "upstream patch-footprint remains within policy",
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "acceptance_criteria": [
+    "Generation is deterministic.",
+    "CI fails on stale generated bindings.",
+    "No duplicate hand-maintained wire structs exist in provider crates."
+  ],
+  "close_reason": "Accepted deterministic dependency-free Rust bindings generated from the canonical M1 contracts, with strict compilation/runtime probes, duplicate-wire-type guards, and a checked-in zero-drift CI lane.",
+  "close_comment": "Evidence: generate-memory-provider-rust.py reads only the accepted contract-set and six canonical contracts, emits one dependency-free generated Rust authority plus a source/generator/output digest manifest, and supports exact --write/--check regeneration. The generated module forbids unsafe code and denies warnings, missing docs, unwrap, expect, panic, todo, unimplemented, dbg, and print macros; it contains contract/capability specs, canonical required-field constants, closed wire enums, validated provider/capability identities, exact scope, request control, opaque extensions, and terminal summaries without transport or concrete-provider logic. check-memory-provider-rust-bindings.py verifies every digest/count/path, zero generator drift, required types/constants, forbidden constructs, rustc 2024 library compilation, a runtime identity/enum probe, and duplicate declarations across future product crates. Mutation tests corrupt headers, source, lints, required types/constants, manifests, digests, and duplicate scan roots. product-memory-contracts.yml mirrors its product-owned template and runs every contract test/checker, canonical golden drift, generated Rust drift/compile, patch policy, and clean-tree proof on push and PR."
+}
