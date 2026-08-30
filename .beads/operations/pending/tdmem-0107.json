@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
-  "attempt": 1,
+  "attempt": 2,
   "issue_id": "tdmem-0107",
   "mode": "complete",
   "actor": "assistant",
-  "claim_comment": "Consolidating the clean baseline, Native seam audit, authority matrix, patch-footprint policy, convergence map, and foundational ADRs into a machine-checked M0 GO/NO-GO decision with hard gates and dependency-aware implementation order.",
+  "claim_comment": "Accepting the M0 provider-seam decision after binding five concrete insertion points, a zero-upstream-file tdmem-0201 first slice, explicit risks and kill conditions, and the M1 dependency gate.",
   "checks": [
     {
       "name": "M0 GO/NO-GO contract tests",
@@ -57,11 +57,11 @@
     }
   ],
   "acceptance_criteria": [
-    "The report explicitly says GO or NO-GO for implementing the provider boundary on this pinned V2 floor.",
-    "The decision cites the clean baseline, seam map, authority matrix, patch budget, convergence map, and foundational ADRs.",
-    "Residual risks, blockers, no-go triggers, and deferred decisions are explicit.",
-    "A GO decision locks a dependency-aware implementation order beginning with provider-neutral contracts and conformance."
+    "The report selects concrete insertion points.",
+    "The first slice has bounded files/crates and acceptance tests.",
+    "Risks and kill conditions are explicit.",
+    "M1 remains blocked until the report is accepted."
   ],
-  "close_reason": "Recorded a machine-checked M0 GO decision: the provider boundary is viable above existing TraceDecay application ports without replacing canonical authorities, with explicit hard gates, risks, deferred NCM/OCEAN decisions, and implementation order beginning at tdmem-0201.",
-  "close_comment": "Evidence: product/architecture/m0-go-no-go.json and .md consolidate the immutable upstream floor, successful clean baseline receipt, complete Native memory surface map, accepted authority matrix, enforced patch-footprint/convergence policy, and eight foundational ADRs. The verdict is GO only above existing application/use-case seams; current code, exact repository/worktree/branch/session identity, accepted Native facts, curated rules, host integration, and final context remain TraceDecay-owned. Provider recall stays advisory, observer output is result-unreachable, writes require bounded durable idempotent recovery, Native stays direct until parity, NCM topology remains deferred to tdmem-0701/0702, and OCEAN remains a reserved slot. scripts/product/check-m0-go-no-go.py validates all evidence, authority conditions, seven residual risk classes, deferred decisions, contiguous dependency-aware implementation train, six hard gates, and NO-GO triggers against real Beads IDs; tests/product_m0_go_no_go_test.py rejects authority weakening, missing evidence/risks, unknown blockers, premature NCM/OCEAN decisions, skipped M1 contracts, wrong topology order, removed hard gates, and collapsed stop conditions."
+  "close_reason": "Accepted the machine-checked M0 GO decision with concrete provider-neutral mounts, a bounded first implementation slice, explicit kill conditions, and M1 gated on this decision.",
+  "close_comment": "Evidence: product/architecture/m0-go-no-go.json selects provider-contract, daemon-registry, normalized-observation, advisory-recall/context, and post-settlement-feedback insertion points and ties each upstream path to an allowed patch-policy category. The first executable slice is tdmem-0201 and is fixed to three product-owned contract/validator/test files, zero existing upstream files, no Rust crate changes, and two executable acceptance commands; crate work remains deferred to tdmem-0301. Seven residual risk classes, six hard gates, seven NO-GO triggers, Native parity/rollback, observer non-interference, exact-scope admission, deferred NCM topology, deferred OCEAN, and no-unmapped-upstream-edits are explicit. product/upstream/pr707-floor.json is a compact derived receipt that points to the canonical product/upstream/tracedecay-v2-pr707.json authority. scripts/product/check-m0-go-no-go.py and tests/product_m0_go_no_go_test.py validate the decision against real M0 evidence and Beads IDs, while the patch-footprint and foundational ADR validators enforce the inherited architecture constraints."
 }
