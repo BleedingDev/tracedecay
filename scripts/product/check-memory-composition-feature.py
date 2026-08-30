@@ -45,13 +45,19 @@ def check_repository(repo: Path) -> list[str]:
         errors.append(
             f"feature {FEATURE} must contain only {REGISTRY_DEP_FEATURE}, found {feature_values!r}"
         )
-    for baseline in ("default", "production"):
-        values = features.get(baseline)
-        if not isinstance(values, list):
-            errors.append(f"feature {baseline} must be an array")
-            continue
-        if FEATURE in values or REGISTRY_DEP_FEATURE in values or REGISTRY_PACKAGE in values:
-            errors.append(f"feature {baseline} must not enable {FEATURE}")
+    if features.get("default") != ["production"]:
+        errors.append(
+            f"default features must remain exactly ['production'], found {features.get('default')!r}"
+        )
+    production = features.get("production")
+    if not isinstance(production, list):
+        errors.append("feature production must be an array")
+    elif (
+        FEATURE in production
+        or REGISTRY_DEP_FEATURE in production
+        or REGISTRY_PACKAGE in production
+    ):
+        errors.append(f"feature production must not enable {FEATURE}")
 
     dependency = dependencies.get(REGISTRY_PACKAGE)
     if not isinstance(dependency, dict):
