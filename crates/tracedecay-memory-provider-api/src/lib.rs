@@ -1222,6 +1222,27 @@ impl CommittedEffectEvidence {
     /// reconciliation receipt digest and the API-owned canonical action.
     #[must_use]
     pub fn unknown_from_reconciliation_digest(provider_receipt_sha256: [u8; 32]) -> Self {
+        Self::unknown_from_reconciliation_digest_action(
+            provider_receipt_sha256,
+            UNKNOWN_EFFECT_RECONCILIATION_ACTION,
+        )
+    }
+
+    /// Creates statically valid unknown-effect evidence from a typed adapter
+    /// reconciliation receipt digest and an adapter-owned reconciliation
+    /// action naming the exact recovery procedure. An empty, unnormalized,
+    /// or oversized action degrades to the API-owned canonical action; the
+    /// receipt digest is bound either way.
+    #[must_use]
+    pub fn unknown_from_reconciliation_digest_action(
+        provider_receipt_sha256: [u8; 32],
+        reconciliation_action: &str,
+    ) -> Self {
+        let reconciliation_action = normalized_terminal_text(
+            reconciliation_action,
+            contract::TERMINAL_RECONCILIATION_ACTION_MAX_BYTES,
+            UNKNOWN_EFFECT_RECONCILIATION_ACTION,
+        );
         Self {
             state: CommittedEffectState::Unknown,
             committed_boundary: None,
@@ -1230,7 +1251,7 @@ impl CommittedEffectEvidence {
             committed_item_refs: Vec::new(),
             uncommitted_item_refs: Vec::new(),
             provider_receipt_sha256: Some(lowercase_sha256_hex(provider_receipt_sha256)),
-            reconciliation_action: Some(UNKNOWN_EFFECT_RECONCILIATION_ACTION.to_owned()),
+            reconciliation_action: Some(reconciliation_action),
             verification_sha256: None,
         }
     }
@@ -1803,6 +1824,27 @@ impl TerminalRecord {
         reconciliation_receipt_sha256: [u8; 32],
         diagnostic_id: impl AsRef<str>,
     ) -> Self {
+        Self::effect_unknown_for_call_with_action(
+            call,
+            reconciliation_receipt_sha256,
+            UNKNOWN_EFFECT_RECONCILIATION_ACTION,
+            diagnostic_id,
+        )
+    }
+
+    /// Creates a canonical unknown-effect terminal for a mutating call after
+    /// provider dispatch, carrying an adapter-owned reconciliation action.
+    ///
+    /// Behaves exactly like [`Self::effect_unknown_for_call`] except that the
+    /// reconciliation action names the adapter's recovery procedure instead
+    /// of the API-owned canonical action.
+    #[must_use]
+    pub fn effect_unknown_for_call_with_action(
+        call: &ProviderCall,
+        reconciliation_receipt_sha256: [u8; 32],
+        reconciliation_action: &str,
+        diagnostic_id: impl AsRef<str>,
+    ) -> Self {
         let valid_mutating_call = call.operation.mutates_provider_state()
             && call.exact_scope.validate().is_ok()
             && require_bounded_canonical_text(
@@ -1834,8 +1876,9 @@ impl TerminalRecord {
             operation: call.operation,
             provider_id: call.provider_id.clone(),
             terminal_code: TerminalCode::EffectUnknown,
-            committed_effect: CommittedEffectEvidence::unknown_from_reconciliation_digest(
+            committed_effect: CommittedEffectEvidence::unknown_from_reconciliation_digest_action(
                 reconciliation_receipt_sha256,
+                reconciliation_action,
             ),
             fallback: FallbackDirective::forbidden(),
             operation_id: call.operation_id.clone(),

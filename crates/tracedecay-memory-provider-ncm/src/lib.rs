@@ -44,6 +44,9 @@ const CHALLENGE_DOMAIN: &[u8] = b"tracedecay.ncm.handshake-proof.v1\0";
 const OPAQUE_ID_DOMAIN: &[u8] = b"tracedecay.ncm.opaque-id.v1\0";
 const READY_RECEIPT_DOMAIN: &[u8] = b"tracedecay.ncm.adapter-ready-receipt.v1\0";
 const UNKNOWN_EFFECT_RECEIPT_DOMAIN: &[u8] = b"tracedecay.ncm.adapter-unknown-effect-receipt.v1\0";
+/// Adapter-owned reconciliation procedure for a surface dispatch whose
+/// returned envelope cannot be trusted; the suffix binds the witness receipt.
+const RECONCILE_SURFACE_DISPATCH_ACTION: &str = "ncm.adapter.reconcile-surface-dispatch.v1";
 const MAX_WARNINGS: usize = 32;
 const MAX_OBSERVATION_TOTAL_EXTENSION_BYTES: u64 = 524_288;
 
@@ -717,9 +720,14 @@ impl NcmProviderAdapter {
     ) -> ProviderReply {
         let terminal = if call.operation.mutates_provider_state() {
             let receipt = adapter_unknown_effect_receipt(call, surface_call, reply);
-            TerminalRecord::effect_unknown_for_call(
+            let action = format!(
+                "{RECONCILE_SURFACE_DISPATCH_ACTION}:{}",
+                hex_digest(&receipt)
+            );
+            TerminalRecord::effect_unknown_for_call_with_action(
                 call,
                 receipt,
+                &action,
                 "ncm.adapter_unknown_effect_reconciliation_required",
             )
         } else {
