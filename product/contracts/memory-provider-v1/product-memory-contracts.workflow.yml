@@ -1,0 +1,127 @@
+name: Product Memory Contracts
+
+on:
+  pull_request:
+    paths:
+      - ".beads/issues.jsonl"
+      - ".github/workflows/product-memory-contracts.yml"
+      - "product/contracts/memory-provider-v1/**"
+      - "scripts/product/**"
+      - "tests/product_memory_provider_*"
+      - "tests/product_provider_*"
+  push:
+    paths:
+      - ".beads/issues.jsonl"
+      - ".github/workflows/product-memory-contracts.yml"
+      - "product/contracts/memory-provider-v1/**"
+      - "scripts/product/**"
+      - "tests/product_memory_provider_*"
+      - "tests/product_provider_*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: product-memory-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract-drift:
+    name: Contract, golden, and generated Rust drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show pinned Rust toolchain
+        run: rustc --version --verbose
+
+      - name: Run provider contract mutation suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test_file in \
+            tests/product_provider_registry_contract_test.py \
+            tests/product_provider_handshake_contract_test.py \
+            tests/product_provider_observation_contract_test.py \
+            tests/product_provider_recall_contract_test.py \
+            tests/product_provider_lifecycle_contract_test.py \
+            tests/product_provider_terminal_contract_test.py \
+            tests/product_memory_provider_contract_set_test.py \
+            tests/product_memory_provider_rust_bindings_test.py
+          do
+            python3 "$test_file"
+          done
+
+      - name: Validate every canonical provider contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/product/check-provider-registry-contract.py \
+            --repo . \
+            --contract product/contracts/memory-provider-v1/provider-registry-contract.json \
+            --schema product/contracts/memory-provider-v1/provider-registry-contract.schema.json \
+            --readme product/contracts/memory-provider-v1/README.md \
+            --issues .beads/issues.jsonl
+          python3 scripts/product/check-provider-handshake-contract.py \
+            --repo . \
+            --contract product/contracts/memory-provider-v1/provider-handshake-contract.json \
+            --schema product/contracts/memory-provider-v1/provider-handshake-contract.schema.json \
+            --doc product/contracts/memory-provider-v1/provider-handshake-contract.md \
+            --issues .beads/issues.jsonl
+          python3 scripts/product/check-provider-observation-contract.py \
+            --repo . \
+            --contract product/contracts/memory-provider-v1/provider-observation-contract.json \
+            --schema product/contracts/memory-provider-v1/provider-observation-contract.schema.json \
+            --doc product/contracts/memory-provider-v1/provider-observation-contract.md \
+            --issues .beads/issues.jsonl
+          python3 scripts/product/check-provider-recall-contract.py \
+            --repo . \
+            --contract product/contracts/memory-provider-v1/provider-recall-contract.json \
+            --schema product/contracts/memory-provider-v1/provider-recall-contract.schema.json \
+            --doc product/contracts/memory-provider-v1/provider-recall-contract.md \
+            --issues .beads/issues.jsonl
+          python3 scripts/product/check-provider-lifecycle-contract.py \
+            --repo . \
+            --contract product/contracts/memory-provider-v1/provider-lifecycle-contract.json \
+            --schema product/contracts/memory-provider-v1/provider-lifecycle-contract.schema.json \
+            --doc product/contracts/memory-provider-v1/provider-lifecycle-contract.md \
+            --issues .beads/issues.jsonl
+          python3 scripts/product/check-provider-terminal-contract.py \
+            --repo . \
+            --contract product/contracts/memory-provider-v1/provider-terminal-contract.json \
+            --schema product/contracts/memory-provider-v1/provider-terminal-contract.schema.json \
+            --doc product/contracts/memory-provider-v1/provider-terminal-contract.md \
+            --issues .beads/issues.jsonl
+
+      - name: Verify canonical goldens and generated Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/product/generate-memory-provider-goldens.py --repo . --check
+          python3 scripts/product/check-memory-provider-contract-set.py --repo .
+          python3 scripts/product/generate-memory-provider-rust.py --repo . --check
+          python3 scripts/product/check-memory-provider-rust-bindings.py --repo .
+
+      - name: Verify upstream patch footprint
+        run: >-
+          python3 scripts/product/check-patch-footprint-policy.py
+          --repo .
+          --policy product/upstream/patch-footprint-policy.json
+          --map product/upstream/convergence-map.json
+
+      - name: Prove checks do not mutate the checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
