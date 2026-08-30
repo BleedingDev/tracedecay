@@ -9,150 +9,255 @@
 #![deny(clippy::todo)]
 #![deny(clippy::unimplemented)]
 #![deny(clippy::unwrap_used)]
-//! Narrow, default-off composition for TraceDecay memory providers.
+//! Product-owned composition for configured memory providers.
 //!
-//! The registry owns no provider behavior. It constructs one bounded
-//! [`MemoryFabric`], wraps the existing Native application port in the Native
-//! adapter, and registers that provider at one explicit revision and mode.
-//! Concrete adapter types stay inside this crate and never reach public
-//! transports or host-specific integration crates.
+//! This crate is the narrow layer allowed to construct concrete adapters. It
+//! accepts an existing Native application port explicitly, derives the stable
+//! Native identity internally, and registers the adapter in a bounded fabric.
+//! The resulting registry exposes only provider-neutral status and call
+//! operations; registration and mode mutation remain inside composition.
+//! Handshake and active-call replies preserve the complete provider-neutral
+//! terminal record. Observation delivery strips provider payloads, opaque
+//! extensions, and warning text while retaining the same structured
+//! committed-effect and fallback evidence in its observer receipt. Terminal
+//! provider and operation identities stay bound to the selected route. The
+//! registry never interprets a fallback directive as authority to dispatch
+//! another provider.
+//! Disabled composition carries no config or port and therefore creates no
+//! fabric, provider adapter, storage, background work, or provider
+//! registration.
 
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-pub use tracedecay_memory_fabric::{FabricConfig, MemoryFabric, ProviderMode, ProviderStatus};
-use tracedecay_memory_fabric::FabricError;
-use tracedecay_memory_provider_api::{ApiError, MemoryProvider, OwnedProviderId};
-pub use tracedecay_memory_provider_native::NativeMemoryApplicationPort;
+use tracedecay_memory_fabric::MemoryFabric;
+pub use tracedecay_memory_fabric::{
+    FabricConfig, FabricError, ObserverReceipt, ProviderMode, ProviderStatus,
+};
+use tracedecay_memory_provider_api::{
+    ApiError, HandshakeRequest, HandshakeResponse, OwnedProviderId, ProviderCall, ProviderReply,
+};
 use tracedecay_memory_provider_native::{
-    NATIVE_PROVIDER_ID, NativeAdapterError, NativeProvider,
+    NATIVE_PROVIDER_ID, NativeAdapterError, NativeMemoryApplicationPort, NativeProvider,
 };
 
-/// Construction failure before a composed Native fabric can be retained.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CompositionError {
-    /// The requested registration revision was zero.
-    InvalidRegistrationRevision,
-    /// A provider-neutral identity was malformed.
-    Api(ApiError),
-    /// The bounded fabric rejected construction or registration.
-    Fabric(FabricError),
-    /// The supplied Native application port declared an incompatible identity.
-    Native(NativeAdapterError),
+/// A non-disabled Native participation mode.
+///
+/// Keeping `Disabled` out of this type prevents an enabled adapter from being
+/// constructed only to receive a disabled fabric registration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnabledProviderMode {
+    /// Receive admitted observations without contributing active output.
+    Observer,
+    /// Receive admitted observations and explicitly routed active calls.
+    Active,
 }
 
-impl fmt::Display for CompositionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl EnabledProviderMode {
+    fn fabric_mode(self) -> ProviderMode {
         match self {
-            Self::InvalidRegistrationRevision => {
-                formatter.write_str("Native registration revision must be positive")
-            }
-            Self::Api(error) => write!(formatter, "provider API error: {error}"),
-            Self::Fabric(error) => write!(formatter, "memory fabric error: {error}"),
-            Self::Native(error) => write!(formatter, "Native adapter error: {error}"),
+            Self::Observer => ProviderMode::Observer,
+            Self::Active => ProviderMode::Active,
         }
     }
 }
 
-impl Error for CompositionError {}
+/// Explicit Native provider selection for one product composition.
+pub enum NativeProviderActivation {
+    /// Do not construct any provider or fabric infrastructure.
+    Disabled,
+    /// Construct Native from the injected application port and register it.
+    Enabled {
+        /// Finite fabric limits used only by enabled composition.
+        fabric_config: FabricConfig,
+        /// Existing TraceDecay Native application authority.
+        port: Arc<dyn NativeMemoryApplicationPort>,
+        /// Positive product-owned registration revision.
+        registration_revision: u64,
+        /// Enabled observer or active participation.
+        mode: EnabledProviderMode,
+    },
+}
 
-impl From<ApiError> for CompositionError {
+/// Explicit result of configured product provider composition.
+pub enum ProjectMemoryProviderComposition {
+    /// Provider infrastructure is absent.
+    Disabled,
+    /// Provider infrastructure was explicitly enabled and constructed.
+    Enabled(ProjectMemoryProviderRegistry),
+}
+
+impl ProjectMemoryProviderComposition {
+    /// Applies the explicit activation without constructing disabled
+    /// infrastructure.
+    pub fn compose(native: NativeProviderActivation) -> Result<Self, RegistryError> {
+        match native {
+            NativeProviderActivation::Disabled => Ok(Self::Disabled),
+            NativeProviderActivation::Enabled {
+                fabric_config,
+                port,
+                registration_revision,
+                mode,
+            } => Ok(Self::Enabled(
+                ProjectMemoryProviderRegistry::compose_native(
+                    fabric_config,
+                    port,
+                    registration_revision,
+                    mode,
+                )?,
+            )),
+        }
+    }
+
+    /// Borrows the enabled registry, or returns `None` when disabled.
+    #[must_use]
+    pub fn registry(&self) -> Option<&ProjectMemoryProviderRegistry> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled(registry) => Some(registry),
+        }
+    }
+}
+
+/// Failure while composing or registering product-owned providers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegistryError {
+    /// The product-owned stable provider identity was invalid.
+    Api(ApiError),
+    /// The injected Native application port could not construct an adapter.
+    NativeAdapter(NativeAdapterError),
+    /// The bounded fabric rejected construction or registration.
+    Fabric(FabricError),
+}
+
+impl fmt::Display for RegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Api(error) => write!(formatter, "provider registry API error: {error}"),
+            Self::NativeAdapter(error) => {
+                write!(formatter, "Native provider construction failed: {error}")
+            }
+            Self::Fabric(error) => write!(formatter, "memory fabric error: {error}"),
+        }
+    }
+}
+
+impl Error for RegistryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Api(error) => Some(error),
+            Self::NativeAdapter(error) => Some(error),
+            Self::Fabric(error) => Some(error),
+        }
+    }
+}
+
+impl From<ApiError> for RegistryError {
     fn from(value: ApiError) -> Self {
         Self::Api(value)
     }
 }
 
-impl From<FabricError> for CompositionError {
+impl From<NativeAdapterError> for RegistryError {
+    fn from(value: NativeAdapterError) -> Self {
+        Self::NativeAdapter(value)
+    }
+}
+
+impl From<FabricError> for RegistryError {
     fn from(value: FabricError) -> Self {
         Self::Fabric(value)
     }
 }
 
-impl From<NativeAdapterError> for CompositionError {
-    fn from(value: NativeAdapterError) -> Self {
-        Self::Native(value)
-    }
-}
-
-/// Explicit finite settings for one Native provider registration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NativeCompositionConfig {
-    /// Bounded provider registry and concurrent-call limits.
-    pub fabric: FabricConfig,
-    /// Positive revision used by every request routed to this registration.
-    pub registration_revision: u64,
-    /// Disabled, observer-only, or active participation selected by TraceDecay.
-    pub mode: ProviderMode,
-}
-
-impl NativeCompositionConfig {
-    /// Creates explicit settings without consulting environment or global state.
-    pub fn new(
-        fabric: FabricConfig,
-        registration_revision: u64,
-        mode: ProviderMode,
-    ) -> Result<Self, CompositionError> {
-        if registration_revision == 0 {
-            return Err(CompositionError::InvalidRegistrationRevision);
-        }
-        Ok(Self {
-            fabric,
-            registration_revision,
-            mode,
-        })
-    }
-}
-
-/// Retained result of the single Native memory composition path.
-pub struct NativeMemoryComposition {
-    fabric: MemoryFabric,
-    native_provider_id: OwnedProviderId,
-    registration_revision: u64,
-}
-
-impl NativeMemoryComposition {
-    /// Returns the bounded provider-neutral fabric.
-    #[must_use]
-    pub const fn fabric(&self) -> &MemoryFabric {
-        &self.fabric
-    }
-
-    /// Returns the stable Native provider identity registered in the fabric.
-    #[must_use]
-    pub const fn native_provider_id(&self) -> &OwnedProviderId {
-        &self.native_provider_id
-    }
-
-    /// Returns the accepted Native registration revision.
-    #[must_use]
-    pub const fn registration_revision(&self) -> u64 {
-        self.registration_revision
-    }
-}
-
-/// Constructs the bounded fabric and registers exactly one Native adapter.
+/// Retained product-owned provider composition.
 ///
-/// The function starts no worker, opens no database, reads no ambient
-/// configuration, and performs no provider handshake. The existing Native
-/// application owner remains authoritative behind `port`.
-pub fn compose_native_memory(
-    port: Arc<dyn NativeMemoryApplicationPort>,
-    config: NativeCompositionConfig,
-) -> Result<NativeMemoryComposition, CompositionError> {
-    let native = NativeProvider::new(port)?;
-    let provider_id = OwnedProviderId::new(NATIVE_PROVIDER_ID)?;
-    let fabric = MemoryFabric::new(config.fabric)?;
-    let provider: Arc<dyn MemoryProvider> = Arc::new(native);
-    fabric.register(
-        provider_id.clone(),
-        config.registration_revision,
-        config.mode,
-        provider,
-    )?;
-    Ok(NativeMemoryComposition {
-        fabric,
-        native_provider_id: provider_id,
-        registration_revision: config.registration_revision,
-    })
+/// Values can only be produced through
+/// [`ProjectMemoryProviderComposition::compose`]. Concrete adapter
+/// registration and the mutable fabric surface are intentionally private.
+///
+/// ```compile_fail,E0624
+/// use tracedecay_memory_provider_registry::ProjectMemoryProviderRegistry;
+///
+/// let _private_constructor = ProjectMemoryProviderRegistry::compose_native;
+/// ```
+///
+/// ```compile_fail,E0624
+/// use tracedecay_memory_provider_registry::ProjectMemoryProviderRegistry;
+///
+/// let _private_registration = ProjectMemoryProviderRegistry::register_native;
+/// ```
+///
+/// ```compile_fail,E0599
+/// use tracedecay_memory_provider_registry::ProjectMemoryProviderRegistry;
+///
+/// fn cannot_escape_fabric(registry: &ProjectMemoryProviderRegistry) {
+///     let _ = registry.fabric();
+/// }
+/// ```
+pub struct ProjectMemoryProviderRegistry {
+    fabric: Arc<MemoryFabric>,
+}
+
+impl ProjectMemoryProviderRegistry {
+    fn compose_native(
+        fabric_config: FabricConfig,
+        port: Arc<dyn NativeMemoryApplicationPort>,
+        registration_revision: u64,
+        mode: EnabledProviderMode,
+    ) -> Result<Self, RegistryError> {
+        let registry = Self {
+            fabric: Arc::new(MemoryFabric::new(fabric_config)?),
+        };
+        registry.register_native(port, registration_revision, mode)?;
+        Ok(registry)
+    }
+
+    /// Returns deterministic status for every configured provider in
+    /// canonical provider-ID order.
+    pub fn statuses(&self) -> Result<Vec<ProviderStatus>, FabricError> {
+        self.fabric.statuses()
+    }
+
+    /// Performs a bounded provider-neutral readiness handshake, preserving
+    /// its complete structured terminal evidence.
+    pub fn handshake(&self, request: &HandshakeRequest) -> Result<HandshakeResponse, FabricError> {
+        self.fabric.handshake(request)
+    }
+
+    /// Invokes one operation admitted to influence active product flow.
+    ///
+    /// The provider-neutral reply, including committed-effect and fallback
+    /// evidence and provider/operation identity, is returned unchanged after
+    /// fabric validation.
+    pub fn invoke_active(&self, call: &ProviderCall) -> Result<ProviderReply, FabricError> {
+        self.fabric.invoke_active(call)
+    }
+
+    /// Delivers an observation while structurally stripping provider output.
+    ///
+    /// The observer receipt retains the complete validated terminal record,
+    /// including its provider and observation-operation binding; it cannot
+    /// carry a provider result payload, opaque extensions, or warning text.
+    pub fn deliver_observation(&self, call: &ProviderCall) -> Result<ObserverReceipt, FabricError> {
+        self.fabric.deliver_observation(call)
+    }
+
+    fn register_native(
+        &self,
+        port: Arc<dyn NativeMemoryApplicationPort>,
+        registration_revision: u64,
+        mode: EnabledProviderMode,
+    ) -> Result<(), RegistryError> {
+        let provider_id = OwnedProviderId::new(NATIVE_PROVIDER_ID)?;
+        let provider = Arc::new(NativeProvider::new(port)?);
+        self.fabric.register(
+            provider_id,
+            registration_revision,
+            mode.fabric_mode(),
+            provider,
+        )?;
+        Ok(())
+    }
 }

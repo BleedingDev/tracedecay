@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -89,6 +90,18 @@ SCOPE_FIELDS = [
     "agent_session_id",
     "scope_revision",
 ]
+SCOPE_STRING_FIELDS = SCOPE_FIELDS[:-1]
+EXACT_SCOPE_DIGEST_DOMAIN = b"tracedecay.memory-provider.exact-scope.v1\0"
+EXACT_SCOPE_GOLDEN_VECTOR: dict[str, str | int] = {
+    "profile_id": "profile-1",
+    "project_id": "project-1",
+    "repository_identity": "repo-1",
+    "worktree_identity": "worktree-1",
+    "branch_identity": "refs/heads/main",
+    "agent_session_id": "session-1",
+    "scope_revision": 7,
+    "digest": "aa2f1ac9c33a448fb824abf783a6d40ab52050d91bcc580d907e6b0a3303938e",
+}
 LIMITS = {
     "request_bytes": (1, 16777216, "bytes"),
     "response_bytes": (1, 33554432, "bytes"),
@@ -173,8 +186,12 @@ REQUIRED_DOC_PHRASES = [
     "Handshake cannot mutate provider state",
     "failure never silently falls back",
     "does not select an NCM transport",
+    "tracedecay.memory-provider.exact-scope.v1",
+    "UTF-8 byte length",
+    "64 lowercase hexadecimal characters",
 ]
 BEAD_RE = re.compile(r"^tdmem-[0-9]{4}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -474,6 +491,7 @@ def validate_identities(contract: dict[str, Any], errors: list[str]) -> None:
         "mismatch_policy",
         "provider_path_inference_allowed",
         "cwd_inference_allowed",
+        "digest",
     }
     exact_keys(scope, scope_keys, "exact_scope_identity", errors)
     if scope.get("type_name") != "MemoryProviderExactScopeIdentityV1":
@@ -487,6 +505,83 @@ def validate_identities(contract: dict[str, Any], errors: list[str]) -> None:
         errors.append("missing exact scope must reject scope_unavailable")
     if scope.get("mismatch_policy") != "reject_scope_mismatch":
         errors.append("mismatched exact scope must reject scope_mismatch")
+
+    digest = obj(scope.get("digest"), "exact_scope_identity.digest", errors)
+    exact_keys(
+        digest,
+        {
+            "algorithm",
+            "domain_ascii",
+            "domain_suffix_byte_hex",
+            "string_field_order",
+            "string_field_encoding",
+            "scope_revision_encoding",
+            "output_encoding",
+            "golden_vector",
+        },
+        "exact_scope_identity.digest",
+        errors,
+    )
+    if digest.get("algorithm") != "sha256":
+        errors.append("exact scope digest algorithm must be SHA-256")
+    if digest.get("domain_ascii") != "tracedecay.memory-provider.exact-scope.v1":
+        errors.append("exact scope digest ASCII domain drifted")
+    if digest.get("domain_suffix_byte_hex") != "00":
+        errors.append("exact scope digest domain must end with one NUL byte")
+    if digest.get("string_field_order") != SCOPE_STRING_FIELDS:
+        errors.append("exact scope digest string field order drifted")
+    if digest.get("string_field_encoding") != (
+        "u64_big_endian_byte_length_then_utf8_bytes"
+    ):
+        errors.append("exact scope digest string boundary encoding drifted")
+    if digest.get("scope_revision_encoding") != "u64_big_endian":
+        errors.append("exact scope digest revision encoding drifted")
+    if digest.get("output_encoding") != "lowercase_hex_64":
+        errors.append("exact scope digest output must be lowercase SHA-256 hex")
+
+    golden = obj(
+        digest.get("golden_vector"),
+        "exact_scope_identity.digest.golden_vector",
+        errors,
+    )
+    exact_keys(
+        golden,
+        set(SCOPE_FIELDS) | {"digest"},
+        "exact_scope_identity.digest.golden_vector",
+        errors,
+    )
+    if golden != EXACT_SCOPE_GOLDEN_VECTOR:
+        errors.append("exact scope digest fixed golden vector drifted")
+
+    canonical = bytearray(EXACT_SCOPE_DIGEST_DOMAIN)
+    canonical_input_valid = True
+    for field in SCOPE_STRING_FIELDS:
+        value = golden.get(field)
+        if not isinstance(value, str):
+            errors.append(f"exact scope digest golden {field} must be a string")
+            canonical_input_valid = False
+            continue
+        encoded = value.encode("utf-8")
+        canonical.extend(len(encoded).to_bytes(8, "big"))
+        canonical.extend(encoded)
+    revision = golden.get("scope_revision")
+    if (
+        not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or not 0 <= revision <= (2**64 - 1)
+    ):
+        errors.append("exact scope digest golden scope_revision must be a u64")
+        canonical_input_valid = False
+    else:
+        canonical.extend(revision.to_bytes(8, "big"))
+    golden_digest = golden.get("digest")
+    if not isinstance(golden_digest, str) or SHA256_RE.fullmatch(golden_digest) is None:
+        errors.append("exact scope digest golden output must be lowercase SHA-256 hex")
+    elif (
+        canonical_input_valid
+        and hashlib.sha256(canonical).hexdigest() != golden_digest
+    ):
+        errors.append("exact scope digest golden vector does not match canonical bytes")
 
 
 def validate_limits(contract: dict[str, Any], errors: list[str]) -> None:

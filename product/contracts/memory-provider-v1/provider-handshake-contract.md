@@ -47,6 +47,16 @@ Protocol major compatibility needs an exact intersection. Minor selection choose
 
 The scope contains profile, project, repository, worktree, branch, agent session, and scope revision. Wildcards, CWD inference, provider path inference, and “closest project” routing are forbidden. A missing authority is `scope_unavailable`; a different authority is `scope_mismatch`.
 
+The canonical exact-scope digest is SHA-256 over this byte sequence, without separators or any additional canonicalization:
+
+1. the ASCII bytes of `tracedecay.memory-provider.exact-scope.v1` followed by one NUL byte (`0x00`);
+2. `profile_id`, `project_id`, `repository_identity`, `worktree_identity`, `branch_identity`, and `agent_session_id`, in that order, each encoded as its UTF-8 byte length in one unsigned 64-bit big-endian integer followed immediately by those UTF-8 bytes; and
+3. `scope_revision` as one unsigned 64-bit big-endian integer.
+
+The digest output is exactly 64 lowercase hexadecimal characters. Lengths count UTF-8 bytes, not Unicode scalar values or characters. No field may be omitted, reordered, normalized, NUL-terminated, or concatenated without its length prefix.
+
+The fixed golden vector is `profile-1`, `project-1`, `repo-1`, `worktree-1`, `refs/heads/main`, `session-1`, revision `7`; its digest is `aa2f1ac9c33a448fb824abf783a6d40ab52050d91bcc580d907e6b0a3303938e`.
+
 ## Limits
 
 Every handshake negotiates finite positive ceilings for request bytes, response bytes, observation batch items, recall candidates, concurrent operations, operation duration, snapshot bytes, and inspection items. The host may clamp further per request; a provider may never exceed the effective value.

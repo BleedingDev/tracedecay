@@ -42,6 +42,12 @@ pub(crate) type RetainedProjectServerFuture = Pin<
 pub(crate) type RetainedProjectServerResolver =
     Arc<dyn Fn(RetainedProjectGraphRequest) -> RetainedProjectServerFuture + Send + Sync + 'static>;
 
+/// Product provider composition retained for exactly one project-server
+/// lifetime. The concrete type stays behind the opt-in host feature.
+#[cfg(feature = "memory-provider-host")]
+pub(crate) type MemoryProviderHostMount =
+    Arc<tracedecay_memory_provider_registry::ProjectMemoryProviderComposition>;
+
 /// Dashboard admission erases the concrete graph only at its consumer
 /// boundary.
 pub(crate) fn dashboard_retained_project_graph_resolver(
@@ -140,6 +146,8 @@ pub(crate) struct McpServerConstructionContext {
         Option<Arc<tracedecay_usecases::observability::DeliverySettlementAuthorityV1>>,
     pub(crate) delivery_settlement_recorder:
         Option<Arc<tracedecay_usecases::observability::BoundedDeliverySettlementRecorderV1>>,
+    #[cfg(feature = "memory-provider-host")]
+    pub(crate) memory_provider_host_mount: Option<MemoryProviderHostMount>,
     pub(crate) project_server_live: Option<Arc<AtomicBool>>,
     #[cfg(any(test, feature = "test-transport"))]
     pub(crate) host_admission_test_runtime:
@@ -246,6 +254,8 @@ impl McpServerConstructionContext {
             daemon_invocation_service: None,
             delivery_settlement_authority: None,
             delivery_settlement_recorder: None,
+            #[cfg(feature = "memory-provider-host")]
+            memory_provider_host_mount: None,
             project_server_live: None,
             #[cfg(any(test, feature = "test-transport"))]
             host_admission_test_runtime: None,
@@ -344,6 +354,8 @@ impl McpServerConstructionContext {
             daemon_invocation_service: None,
             delivery_settlement_authority: Some(delivery_settlement_authority),
             delivery_settlement_recorder: Some(delivery_settlement_recorder),
+            #[cfg(feature = "memory-provider-host")]
+            memory_provider_host_mount: None,
             project_server_live: None,
             #[cfg(any(test, feature = "test-transport"))]
             host_admission_test_runtime: None,
@@ -408,6 +420,8 @@ impl McpServerConstructionContext {
             daemon_invocation_service: None,
             delivery_settlement_authority: None,
             delivery_settlement_recorder: None,
+            #[cfg(feature = "memory-provider-host")]
+            memory_provider_host_mount: None,
             project_server_live: None,
             #[cfg(any(test, feature = "test-transport"))]
             host_admission_test_runtime: None,
@@ -582,6 +596,15 @@ impl McpServerConstructionContext {
         >,
     ) -> Self {
         self.diagnostics_lsp = Some(diagnostics_lsp);
+        self
+    }
+
+    #[cfg(feature = "memory-provider-host")]
+    pub(crate) fn with_memory_provider_host_mount(
+        mut self,
+        mount: MemoryProviderHostMount,
+    ) -> Self {
+        self.memory_provider_host_mount = Some(mount);
         self
     }
 

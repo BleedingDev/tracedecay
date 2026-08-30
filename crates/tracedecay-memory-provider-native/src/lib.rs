@@ -17,7 +17,7 @@
 //! application port. The adapter validates the stable Native provider identity,
 //! routes provider operations to narrow port methods, preserves canonical call
 //! bytes and exact scope unchanged, and rejects undeclared optional operations
-//! through the Native port's typed terminal authority.
+//! locally before contacting Native operation authority.
 
 use std::error::Error;
 use std::fmt;
@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
-    HandshakeRequest, HandshakeResponse, MemoryProvider, ProviderCall, ProviderDescriptor,
-    ProviderOperation, ProviderReply,
+    HandshakeRequest, HandshakeResponse, MemoryProvider, OwnedProviderId, OwnedVersionedId,
+    ProviderCall, ProviderDescriptor, ProviderOperation, ProviderReply, TerminalRecord,
 };
 
 /// Stable logical provider identity for TraceDecay Native memory.
@@ -61,8 +61,10 @@ impl Error for NativeAdapterError {}
 /// memory composition in M3.
 ///
 /// The port owns Native authority and therefore constructs all Native terminal
-/// records, provenance, receipts, and exact-scope digests. The adapter never
-/// fabricates these values and never opens or mutates Native persistence.
+/// records, provenance, receipts, and exact-scope digests after dispatch. The
+/// adapter constructs only typed pre-dispatch rejections, with unknown effect
+/// generation and no fallback authority, and never opens or mutates Native
+/// persistence.
 pub trait NativeMemoryApplicationPort: Send + Sync + 'static {
     /// Returns the current real Native descriptor and capability set.
     fn descriptor(&self) -> ProviderDescriptor;
@@ -99,6 +101,8 @@ pub trait NativeMemoryApplicationPort: Send + Sync + 'static {
 /// port.
 pub struct NativeProvider {
     port: Arc<dyn NativeMemoryApplicationPort>,
+    provider_id: OwnedProviderId,
+    declared_capabilities: Vec<OwnedVersionedId>,
 }
 
 impl NativeProvider {
@@ -112,7 +116,11 @@ impl NativeProvider {
                 declared: descriptor.provider_id.as_str().to_owned(),
             });
         }
-        Ok(Self { port })
+        Ok(Self {
+            port,
+            provider_id: descriptor.provider_id,
+            declared_capabilities: descriptor.capabilities.into_iter().collect(),
+        })
     }
 
     fn reject(
@@ -121,7 +129,28 @@ impl NativeProvider {
         terminal_code: TerminalCode,
         diagnostic_id: &'static str,
     ) -> ProviderReply {
-        self.port.reject(call, terminal_code, diagnostic_id)
+        let terminal = TerminalRecord::failure_before_dispatch(
+            call.operation,
+            self.provider_id.clone(),
+            terminal_code,
+            if call.operation_id.is_empty() {
+                "native.invalid-operation-id"
+            } else {
+                call.operation_id.as_str()
+            },
+            call.exact_scope.exact_scope_sha256(),
+            None,
+            diagnostic_id,
+        );
+        ProviderReply {
+            terminal,
+            payload: None,
+            warnings: Vec::new(),
+            extensions: Vec::new(),
+            // ProviderReply still requires a scalar even when structured
+            // evidence truthfully records that no generation was observed.
+            state_generation: call.expected_state_generation,
+        }
     }
 }
 
@@ -135,7 +164,7 @@ impl MemoryProvider for NativeProvider {
     }
 
     fn invoke(&self, call: &ProviderCall) -> ProviderReply {
-        if call.provider_id.as_str() != NATIVE_PROVIDER_ID {
+        if call.provider_id.as_str() != self.provider_id.as_str() {
             return self.reject(
                 call,
                 TerminalCode::InvalidRequest,
@@ -149,8 +178,11 @@ impl MemoryProvider for NativeProvider {
                 "native.handshake_requires_handshake_port",
             );
         }
-        let descriptor = self.port.descriptor();
-        if !descriptor.supports(call.operation.capability_id()) {
+        if !self
+            .declared_capabilities
+            .iter()
+            .any(|capability| capability.as_str() == call.operation.capability_id())
+        {
             return self.reject(
                 call,
                 TerminalCode::CapabilityUnsupported,

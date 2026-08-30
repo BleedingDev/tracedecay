@@ -29,6 +29,27 @@ EXPECTED_CONTRACT_IDS = [
     "tracedecay.memory.provider.terminal.v1",
 ]
 
+EXPECTED_PROVIDER_LIMIT_IDENTITIES = [
+    ("request_bytes", 1, "bytes"),
+    ("response_bytes", 1, "bytes"),
+    ("observation_batch_items", 1, "items"),
+    ("recall_candidates", 1, "items"),
+    ("concurrent_operations", 1, "operations"),
+    ("operation_millis", 1, "milliseconds"),
+    ("snapshot_bytes", 1, "bytes"),
+    ("inspection_items", 1, "items"),
+]
+
+EXPECTED_TERMINAL_TEXT_LIMITS = [
+    ("operation_id", "TERMINAL_OPERATION_ID_MAX_BYTES", 256),
+    ("committed_boundary", "TERMINAL_COMMITTED_BOUNDARY_MAX_BYTES", 256),
+    ("effect_item_ref", "TERMINAL_EFFECT_ITEM_REF_MAX_BYTES", 256),
+    ("reconciliation_action", "TERMINAL_RECONCILIATION_ACTION_MAX_BYTES", 512),
+    ("fallback_policy_id", "TERMINAL_FALLBACK_POLICY_ID_MAX_BYTES", 128),
+    ("fallback_reason", "TERMINAL_FALLBACK_REASON_MAX_BYTES", 512),
+    ("diagnostic_id", "TERMINAL_DIAGNOSTIC_ID_MAX_BYTES", 128),
+]
+
 
 class GenerationError(RuntimeError):
     """Raised when a source contract cannot produce deterministic Rust bindings."""
@@ -293,6 +314,20 @@ def enum_sources(contracts: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
     handshake = contracts["tracedecay.memory.provider.handshake.v1"]
     recall = contracts["tracedecay.memory.provider.recall.v1"]
     terminal = contracts["tracedecay.memory.provider.terminal.v1"]
+    terminal_rows = terminal.get("terminal_codes")
+    if not isinstance(terminal_rows, list) or not terminal_rows:
+        raise GenerationError("terminal code table must be a non-empty array")
+    effect_expectations: list[str] = []
+    for index, row in enumerate(terminal_rows):
+        if not isinstance(row, dict):
+            raise GenerationError(f"terminal code row {index} must be an object")
+        expectation = row.get("effect_expectation")
+        if not isinstance(expectation, str) or not expectation:
+            raise GenerationError(
+                f"terminal code row {index} has no effect expectation"
+            )
+        if expectation not in effect_expectations:
+            effect_expectations.append(expectation)
     return {
         "ProviderResolutionState": list_strings(
             registry.get("selection_contract", {}).get("resolution_states"),
@@ -309,9 +344,10 @@ def enum_sources(contracts: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
         ),
         "TerminalCode": [
             row["code"]
-            for row in terminal.get("terminal_codes", [])
+            for row in terminal_rows
             if isinstance(row, dict) and isinstance(row.get("code"), str)
         ],
+        "CommittedEffectExpectation": effect_expectations,
         "RetryClass": list_strings(
             terminal.get("retry", {}).get("classes"), "retry classes"
         ),
@@ -324,6 +360,48 @@ def enum_sources(contracts: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
             "committed effect states",
         ),
     }
+
+
+def terminal_code_policies(
+    terminal: dict[str, Any],
+    terminal_codes: list[str],
+    effect_expectations: list[str],
+    fallback_values: list[str],
+) -> list[dict[str, str]]:
+    """Validate and retain the semantic cross-field policy for every terminal code."""
+    rows = terminal.get("terminal_codes")
+    if not isinstance(rows, list) or len(rows) != len(terminal_codes):
+        raise GenerationError("terminal code policy table shape drifted")
+    expected_fields = {
+        "code",
+        "class",
+        "effect_expectation",
+        "retry_class",
+        "fallback_eligibility",
+    }
+    policies: list[dict[str, str]] = []
+    for index, (row, expected_code) in enumerate(zip(rows, terminal_codes)):
+        if not isinstance(row, dict) or set(row) != expected_fields:
+            raise GenerationError(
+                f"terminal code row {index} fields must be exactly {sorted(expected_fields)}"
+            )
+        code = row.get("code")
+        expectation = row.get("effect_expectation")
+        fallback = row.get("fallback_eligibility")
+        if code != expected_code:
+            raise GenerationError("terminal code policy order drifted")
+        if expectation not in effect_expectations:
+            raise GenerationError(f"terminal code {code} has unknown effect expectation")
+        if fallback not in fallback_values:
+            raise GenerationError(f"terminal code {code} has unknown fallback eligibility")
+        policies.append(
+            {
+                "code": str(code),
+                "effect_expectation": str(expectation),
+                "fallback_eligibility": str(fallback),
+            }
+        )
+    return policies
 
 
 def render_string_slice(name: str, values: list[str], doc: str) -> list[str]:
@@ -387,6 +465,134 @@ def render_rust(
     contracts: dict[str, dict[str, Any]],
     generator_sha256: str,
 ) -> tuple[bytes, dict[str, Any]]:
+    handshake = contracts["tracedecay.memory.provider.handshake.v1"]
+    exact_scope = handshake.get("exact_scope_identity")
+    if not isinstance(exact_scope, dict):
+        raise GenerationError("handshake contract has no exact-scope identity")
+    digest_spec = exact_scope.get("digest")
+    if not isinstance(digest_spec, dict):
+        raise GenerationError("handshake contract has no exact-scope digest contract")
+    expected_digest_fields = {
+        "algorithm",
+        "domain_ascii",
+        "domain_suffix_byte_hex",
+        "string_field_order",
+        "string_field_encoding",
+        "scope_revision_encoding",
+        "output_encoding",
+        "golden_vector",
+    }
+    if set(digest_spec) != expected_digest_fields:
+        raise GenerationError("exact-scope digest contract fields drifted")
+    digest_string_fields = list_strings(
+        digest_spec.get("string_field_order"),
+        "exact-scope digest string fields",
+    )
+    if digest_string_fields != [
+        "profile_id",
+        "project_id",
+        "repository_identity",
+        "worktree_identity",
+        "branch_identity",
+        "agent_session_id",
+    ]:
+        raise GenerationError("exact-scope digest string field order drifted")
+    if digest_spec.get("algorithm") != "sha256":
+        raise GenerationError("exact-scope digest algorithm must be SHA-256")
+    digest_domain = digest_spec.get("domain_ascii")
+    if digest_domain != "tracedecay.memory-provider.exact-scope.v1":
+        raise GenerationError("exact-scope digest ASCII domain drifted")
+    if digest_spec.get("domain_suffix_byte_hex") != "00":
+        raise GenerationError("exact-scope digest domain must end with NUL")
+    if digest_spec.get("string_field_encoding") != (
+        "u64_big_endian_byte_length_then_utf8_bytes"
+    ):
+        raise GenerationError("exact-scope digest string boundary encoding drifted")
+    if digest_spec.get("scope_revision_encoding") != "u64_big_endian":
+        raise GenerationError("exact-scope digest scope revision encoding drifted")
+    if digest_spec.get("output_encoding") != "lowercase_hex_64":
+        raise GenerationError("exact-scope digest output encoding drifted")
+
+    golden = digest_spec.get("golden_vector")
+    if not isinstance(golden, dict) or set(golden) != set(digest_string_fields) | {
+        "scope_revision",
+        "digest",
+    }:
+        raise GenerationError("exact-scope digest golden vector fields drifted")
+    golden_strings: list[str] = []
+    golden_bytes = bytearray(digest_domain.encode("ascii"))
+    golden_bytes.extend(bytes.fromhex(str(digest_spec["domain_suffix_byte_hex"])))
+    for field in digest_string_fields:
+        value = golden.get(field)
+        if not isinstance(value, str):
+            raise GenerationError(f"exact-scope digest golden {field} must be a string")
+        golden_strings.append(value)
+        encoded = value.encode("utf-8")
+        golden_bytes.extend(len(encoded).to_bytes(8, "big"))
+        golden_bytes.extend(encoded)
+    golden_revision = golden.get("scope_revision")
+    if (
+        not isinstance(golden_revision, int)
+        or isinstance(golden_revision, bool)
+        or not 0 <= golden_revision <= (2**64 - 1)
+    ):
+        raise GenerationError("exact-scope digest golden revision must be a u64")
+    golden_bytes.extend(golden_revision.to_bytes(8, "big"))
+    golden_digest = golden.get("digest")
+    if (
+        not isinstance(golden_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", golden_digest) is None
+        or sha256_bytes(golden_bytes) != golden_digest
+    ):
+        raise GenerationError("exact-scope digest golden output is invalid")
+    rust_digest_domain = rust_string(digest_domain + "\0").replace("\\u0000", "\\0")
+
+    limit_catalog = handshake.get("limit_catalog")
+    if not isinstance(limit_catalog, list):
+        raise GenerationError("handshake contract has no provider limit catalog")
+    provider_limits: list[tuple[str, int, int, str]] = []
+    for index, row in enumerate(limit_catalog):
+        if not isinstance(row, dict):
+            raise GenerationError(f"provider limit {index} must be an object")
+        if set(row) != {"id", "minimum", "maximum", "unit"}:
+            raise GenerationError(
+                f"provider limit {index} fields must be id, minimum, maximum, and unit"
+            )
+        limit_id = row.get("id")
+        minimum = row.get("minimum")
+        maximum = row.get("maximum")
+        unit = row.get("unit")
+        if not isinstance(limit_id, str) or not limit_id:
+            raise GenerationError(f"provider limit {index} has no ID")
+        if (
+            not isinstance(minimum, int)
+            or isinstance(minimum, bool)
+            or not 1 <= minimum <= (2**64 - 1)
+        ):
+            raise GenerationError(
+                f"provider limit {limit_id} minimum must be a positive u64"
+            )
+        if (
+            not isinstance(maximum, int)
+            or isinstance(maximum, bool)
+            or not 1 <= maximum <= (2**64 - 1)
+        ):
+            raise GenerationError(
+                f"provider limit {limit_id} maximum must be a positive u64"
+            )
+        if minimum > maximum:
+            raise GenerationError(
+                f"provider limit {limit_id} minimum exceeds maximum"
+            )
+        if not isinstance(unit, str) or not unit:
+            raise GenerationError(f"provider limit {limit_id} unit must be a string")
+        provider_limits.append((limit_id, minimum, maximum, unit))
+    if [
+        (limit_id, minimum, unit)
+        for limit_id, minimum, _maximum, unit in provider_limits
+    ] != EXPECTED_PROVIDER_LIMIT_IDENTITIES:
+        raise GenerationError("provider limit catalog order, minimum, or unit drifted")
+
     capabilities = registry_capabilities(
         contracts["tracedecay.memory.provider.registry.v1"]
     )
@@ -395,6 +601,12 @@ def render_rust(
     for enum_name, values in enums.items():
         if not values or len(values) != len(set(values)):
             raise GenerationError(f"{enum_name} values are empty or duplicate")
+    terminal_policies = terminal_code_policies(
+        contracts["tracedecay.memory.provider.terminal.v1"],
+        enums["TerminalCode"],
+        enums["CommittedEffectExpectation"],
+        enums["FallbackEligibility"],
+    )
 
     contract_set_sha256 = canonical_sha(contract_set)
     lines: list[str] = [
@@ -424,6 +636,88 @@ def render_rust(
         f"pub const CONTRACT_SET_SHA256: &str = {rust_string(contract_set_sha256)};",
         "/// SHA-256 of the generator that emitted this file.",
         f"pub const GENERATOR_SHA256: &str = {rust_string(generator_sha256)};",
+        "",
+        "/// Canonical exact-scope digest algorithm.",
+        f"pub const EXACT_SCOPE_DIGEST_ALGORITHM: &str = {rust_string(str(digest_spec['algorithm']))};",
+        "/// Canonical exact-scope digest domain, including its trailing NUL.",
+        f"pub const EXACT_SCOPE_DIGEST_DOMAIN: &[u8] = b{rust_digest_domain};",
+        "/// Canonical exact-scope string field order.",
+        "pub const EXACT_SCOPE_DIGEST_STRING_FIELDS: &[&str] = &[",
+        *[f"    {rust_string(value)}," for value in digest_string_fields],
+        "];",
+        "/// Canonical framing for every exact-scope string field.",
+        f"pub const EXACT_SCOPE_DIGEST_STRING_FIELD_ENCODING: &str = {rust_string(str(digest_spec['string_field_encoding']))};",
+        "/// Canonical exact-scope revision encoding.",
+        f"pub const EXACT_SCOPE_DIGEST_SCOPE_REVISION_ENCODING: &str = {rust_string(str(digest_spec['scope_revision_encoding']))};",
+        "/// Canonical exact-scope digest output encoding.",
+        f"pub const EXACT_SCOPE_DIGEST_OUTPUT_ENCODING: &str = {rust_string(str(digest_spec['output_encoding']))};",
+        "/// Canonical string values for the fixed exact-scope digest golden vector.",
+        "pub const EXACT_SCOPE_DIGEST_GOLDEN_STRINGS: &[&str] = &[",
+        *[f"    {rust_string(value)}," for value in golden_strings],
+        "];",
+        "/// Scope revision for the fixed exact-scope digest golden vector.",
+        f"pub const EXACT_SCOPE_DIGEST_GOLDEN_SCOPE_REVISION: u64 = {golden_revision};",
+        "/// Expected lowercase SHA-256 for the fixed exact-scope digest golden vector.",
+        f"pub const EXACT_SCOPE_DIGEST_GOLDEN_SHA256: &str = {rust_string(golden_digest)};",
+        "",
+        "/// One canonical finite provider limit used during handshake negotiation.",
+        "#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]",
+        "pub struct ProviderLimitSpec {",
+        "    /// Stable limit identity.",
+        "    pub limit_id: &'static str,",
+        "    /// Canonical inclusive minimum.",
+        "    pub minimum: u64,",
+        "    /// Canonical inclusive maximum.",
+        "    pub maximum: u64,",
+        "    /// Canonical measurement unit.",
+        "    pub unit: &'static str,",
+        "}",
+        "",
+        "/// Canonical provider-limit catalog in handshake negotiation order.",
+        "pub const PROVIDER_LIMITS: &[ProviderLimitSpec] = &[",
+        *[
+            "    ProviderLimitSpec {\n"
+            f"        limit_id: {rust_string(limit_id)},\n"
+            f"        minimum: {minimum},\n"
+            f"        maximum: {maximum},\n"
+            f"        unit: {rust_string(unit)},\n"
+            "    },"
+            for limit_id, minimum, maximum, unit in provider_limits
+        ],
+        "];",
+        "",
+        "/// Canonical provider-limit maxima retained for source compatibility.",
+        "pub const PROVIDER_LIMIT_MAXIMA: &[(&str, u64)] = &[",
+        *[
+            f"    ({rust_string(limit_id)}, {maximum}),"
+            for limit_id, _minimum, maximum, _unit in provider_limits
+        ],
+        "];",
+        "",
+        "/// One conservative API-only terminal text bound.",
+        "#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]",
+        "pub struct TerminalTextLimitSpec {",
+        "    /// Terminal field identity.",
+        "    pub field: &'static str,",
+        "    /// Maximum UTF-8 bytes retained by the owned runtime API.",
+        "    pub maximum_bytes: usize,",
+        "}",
+        "",
+        *[
+            f"/// Conservative API-only UTF-8 byte bound for `{field}`.\n"
+            f"pub const {constant}: usize = {maximum};"
+            for field, constant, maximum in EXPECTED_TERMINAL_TEXT_LIMITS
+        ],
+        "",
+        "/// Conservative API-only terminal text bounds in field order.",
+        "pub const TERMINAL_TEXT_LIMITS: &[TerminalTextLimitSpec] = &[",
+        *[
+            "    TerminalTextLimitSpec { "
+            f"field: {rust_string(field)}, maximum_bytes: {constant} "
+            "},"
+            for field, constant, _maximum in EXPECTED_TERMINAL_TEXT_LIMITS
+        ],
+        "];",
         "",
         "/// One canonical contract in the M1 authority set.",
         "#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]",
@@ -517,6 +811,39 @@ def render_rust(
 
     for name, values in enums.items():
         lines.extend(render_wire_enum(name, values))
+
+    lines.extend(
+        [
+            "/// Canonical semantic policy for one closed terminal code.",
+            "#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]",
+            "pub struct TerminalCodePolicy {",
+            "    /// Closed terminal code.",
+            "    pub terminal_code: TerminalCode,",
+            "    /// Maximum committed-effect shapes admitted by this code.",
+            "    pub effect_expectation: CommittedEffectExpectation,",
+            "    /// Maximum fallback eligibility; hosts may safely narrow it to forbidden.",
+            "    pub maximum_fallback_eligibility: FallbackEligibility,",
+            "}",
+            "",
+            "/// Canonical terminal-code semantic table in contract order.",
+            "pub const TERMINAL_CODE_POLICIES: &[TerminalCodePolicy] = &[",
+        ]
+    )
+    for policy in terminal_policies:
+        lines.extend(
+            [
+                "    TerminalCodePolicy {",
+                "        terminal_code: "
+                f"TerminalCode::{rust_identifier(policy['code'])},",
+                "        effect_expectation: "
+                "CommittedEffectExpectation::"
+                f"{rust_identifier(policy['effect_expectation'])},",
+                "        maximum_fallback_eligibility: "
+                f"FallbackEligibility::{rust_identifier(policy['fallback_eligibility'])},",
+                "    },",
+            ]
+        )
+    lines.extend(["];", ""])
 
     lines.extend(
         [
@@ -670,21 +997,70 @@ def render_rust(
             "    pub canonical_payload: &'a [u8],",
             "}",
             "",
+            "/// Borrowed committed-effect semantic projection; not a complete wire envelope.",
+            "#[derive(Clone, Copy, Debug, Eq, PartialEq)]",
+            "pub struct CommittedEffectEvidence<'a> {",
+            "    /// Truthful committed-effect state.",
+            "    pub state: CommittedEffectState,",
+            "    /// Exact committed boundary for a partial effect.",
+            "    pub committed_boundary: Option<&'a str>,",
+            "    /// Provider-local state generation before the operation.",
+            "    pub state_generation_before: Option<u64>,",
+            "    /// Provider-local state generation after settlement or reconciliation.",
+            "    pub state_generation_after: Option<u64>,",
+            "    /// Provider-local item references known to have committed.",
+            "    pub committed_item_refs: &'a [String],",
+            "    /// Provider-local item references known not to have committed.",
+            "    pub uncommitted_item_refs: &'a [String],",
+            "    /// Provider receipt proving or anchoring effect reconciliation.",
+            "    pub provider_receipt_digest: Option<&'a str>,",
+            "    /// Explicit reconciliation or resume action.",
+            "    pub reconciliation_action: Option<&'a str>,",
+            "    /// Digest that verifies the known committed partition.",
+            "    pub verification_digest: Option<&'a str>,",
+            "}",
+            "",
+            "/// Borrowed host policy pin required before any fallback is eligible.",
+            "#[derive(Clone, Copy, Debug, Eq, PartialEq)]",
+            "pub struct PinnedFallbackPolicy<'a> {",
+            "    /// Stable host policy identity.",
+            "    pub policy_id: &'a str,",
+            "    /// Positive pinned host policy revision.",
+            "    pub policy_revision: u64,",
+            "    /// Explicit alternate provider selected by the policy.",
+            "    pub target_provider_id: &'a str,",
+            "}",
+            "",
+            "/// Borrowed fallback semantic projection; not the flat V1 wire shape.",
+            "#[derive(Clone, Copy, Debug, Eq, PartialEq)]",
+            "pub struct FallbackDirective<'a> {",
+            "    /// Explicit fallback eligibility.",
+            "    pub eligibility: FallbackEligibility,",
+            "    /// Complete host policy pin when eligibility is explicit-policy-only.",
+            "    pub policy: Option<PinnedFallbackPolicy<'a>>,",
+            "    /// Non-empty policy decision reason when eligibility is explicit-policy-only.",
+            "    pub reason: Option<&'a str>,",
+            "}",
+            "",
             "/// Provider-neutral terminal summary retained by TraceDecay.",
             "#[derive(Clone, Copy, Debug, Eq, PartialEq)]",
             "pub struct TerminalSummary<'a> {",
+            "    /// Canonical provider operation kind.",
+            "    pub operation_kind: &'a str,",
+            "    /// Provider that produced this terminal.",
+            "    pub provider_id: &'a str,",
             "    /// Typed terminal outcome.",
             "    pub terminal_code: TerminalCode,",
-            "    /// Truthful committed-effect state.",
-            "    pub committed_effect: CommittedEffectState,",
-            "    /// Explicit fallback eligibility.",
-            "    pub fallback: FallbackEligibility,",
+            "    /// Structured committed-effect evidence.",
+            "    pub committed_effect: CommittedEffectEvidence<'a>,",
+            "    /// Structured fallback policy decision.",
+            "    pub fallback: FallbackDirective<'a>,",
             "    /// Stable operation identity.",
             "    pub operation_id: &'a str,",
             "    /// Exact scope digest.",
             "    pub exact_scope_digest: &'a str,",
-            "    /// Optional provider receipt digest when an effect may have committed.",
-            "    pub provider_receipt_digest: Option<&'a str>,",
+            "    /// Optional stable diagnostic identity.",
+            "    pub diagnostic_id: Option<&'a str>,",
             "}",
         ]
     )

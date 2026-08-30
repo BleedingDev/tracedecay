@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 publish = false
 license = "MIT"
-description = "Default-off provider composition root for TraceDecay memory"
+description = "Product-owned composition for configured TraceDecay memory providers"
 repository = "https://github.com/BleedingDev/tracedecay"
 
 [dependencies]

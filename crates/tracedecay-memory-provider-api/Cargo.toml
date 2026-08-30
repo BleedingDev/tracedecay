@@ -8,6 +8,7 @@ description = "Provider-neutral runtime API for TraceDecay cognitive memory prov
 repository = "https://github.com/BleedingDev/tracedecay"
 
 [dependencies]
+sha2 = "0.11"
 
 [lints.rust]
 missing_docs = "deny"

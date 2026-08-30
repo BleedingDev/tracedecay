@@ -5928,6 +5928,7 @@ dependencies = [
  "tracedecay-lsp",
  "tracedecay-maintenance",
  "tracedecay-mcp",
+ "tracedecay-memory-provider-registry",
  "tracedecay-policy",
  "tracedecay-private-fs",
  "tracedecay-query",
@@ -6520,6 +6521,7 @@ dependencies = [
 name = "tracedecay-memory-conformance"
 version = "0.1.0-beta.37"
 dependencies = [
+ "sha2 0.11.0",
  "tracedecay-memory-provider-api",
 ]
 
@@ -6533,6 +6535,9 @@ dependencies = [
 [[package]]
 name = "tracedecay-memory-provider-api"
 version = "0.1.0-beta.37"
+dependencies = [
+ "sha2 0.11.0",
+]
 
 [[package]]
 name = "tracedecay-memory-provider-native"
@@ -6545,8 +6550,18 @@ dependencies = [
 name = "tracedecay-memory-provider-ncm"
 version = "0.1.0-beta.37"
 dependencies = [
+ "serde_json",
  "sha2 0.11.0",
  "tracedecay-memory-provider-api",
+]
+
+[[package]]
+name = "tracedecay-memory-provider-registry"
+version = "0.1.0-beta.37"
+dependencies = [
+ "tracedecay-memory-fabric",
+ "tracedecay-memory-provider-api",
+ "tracedecay-memory-provider-native",
 ]
 
 [[package]]

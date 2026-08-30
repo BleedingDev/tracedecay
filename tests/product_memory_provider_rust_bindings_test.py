@@ -19,7 +19,22 @@ GENERATED = (
 MANIFEST = REPO / "product/contracts/memory-provider-v1/generated/rust/manifest.json"
 GENERATOR = REPO / "scripts/product/generate-memory-provider-rust.py"
 CHECKER = REPO / "scripts/product/check-memory-provider-rust-bindings.py"
+HANDSHAKE_CONTRACT = (
+    REPO / "product/contracts/memory-provider-v1/provider-handshake-contract.json"
+)
+CONTRACT_SET = REPO / "product/contracts/memory-provider-v1/contract-set.json"
 TEMP_ROOT = REPO / ".beads" / "rust-bindings-test-tmp"
+
+LIMIT_ROWS = [
+    ("request_bytes", 16_777_216, "bytes", "items"),
+    ("response_bytes", 33_554_432, "bytes", "items"),
+    ("observation_batch_items", 4_096, "items", "bytes"),
+    ("recall_candidates", 10_000, "items", "bytes"),
+    ("concurrent_operations", 1_024, "operations", "items"),
+    ("operation_millis", 3_600_000, "milliseconds", "operations"),
+    ("snapshot_bytes", 1_073_741_824, "bytes", "items"),
+    ("inspection_items", 100_000, "items", "bytes"),
+]
 
 
 class MemoryProviderRustBindingsTest(unittest.TestCase):
@@ -115,6 +130,71 @@ class MemoryProviderRustBindingsTest(unittest.TestCase):
         self.assertFalse(receipt["ok"])
         self.assertIn(marker, "\n".join(receipt["errors"]))
 
+    def mutate_generated_limit(
+        self,
+        source: str,
+        limit_id: str,
+        field: str,
+        old_value: str,
+        new_value: str,
+    ) -> str:
+        start = source.index(f'        limit_id: "{limit_id}",')
+        end = source.index("    },", start)
+        row = source[start:end]
+        old = f"        {field}: {old_value},"
+        self.assertEqual(row.count(old), 1)
+        changed = row.replace(old, f"        {field}: {new_value},", 1)
+        return source[:start] + changed + source[end:]
+
+    def run_generator_with_limit_mutation(
+        self, limit_id: str, field: str, value: object
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as temp_dir:
+            root = Path(temp_dir)
+            handshake = json.loads(HANDSHAKE_CONTRACT.read_text(encoding="utf-8"))
+            rows = handshake["limit_catalog"]
+            row = next(item for item in rows if item["id"] == limit_id)
+            row[field] = value
+            handshake_path = root / "provider-handshake-contract.json"
+            handshake_path.write_text(
+                json.dumps(handshake, separators=(",", ":"), sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            contract_set = json.loads(CONTRACT_SET.read_text(encoding="utf-8"))
+            contract_set["contracts"][1]["contract_path"] = str(
+                handshake_path.relative_to(REPO)
+            )
+            contract_set_path = root / "contract-set.json"
+            contract_set_path.write_text(
+                json.dumps(contract_set, separators=(",", ":"), sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            return subprocess.run(
+                [
+                    "python3",
+                    str(GENERATOR),
+                    "--repo",
+                    str(REPO),
+                    "--contract-set",
+                    str(contract_set_path.relative_to(REPO)),
+                    "--output-dir",
+                    str((root / "generated").relative_to(REPO)),
+                    "--check",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+    def assert_generator_rejected_limit_mutation(
+        self, limit_id: str, field: str, value: object, marker: str
+    ) -> None:
+        result = self.run_generator_with_limit_mutation(limit_id, field, value)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipt = json.loads(result.stdout)
+        self.assertFalse(receipt["ok"])
+        self.assertIn(marker, receipt["error"])
+
     def test_real_generated_bindings_compile_and_validate(self) -> None:
         result = self.run_checker()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -195,6 +275,50 @@ class MemoryProviderRustBindingsTest(unittest.TestCase):
             ),
         )
 
+    def test_structured_terminal_wire_type_cannot_disappear(self) -> None:
+        self.assert_rejected(
+            "generated Rust source is missing types",
+            mutate_source=lambda source: source.replace(
+                "pub struct CommittedEffectEvidence<'a>",
+                "struct CommittedEffectEvidence<'a>",
+                1,
+            ),
+        )
+
+    def test_terminal_policy_constant_cannot_disappear(self) -> None:
+        self.assert_rejected(
+            "generated Rust source is missing constants",
+            mutate_source=lambda source: source.replace(
+                "pub const TERMINAL_CODE_POLICIES",
+                "const TERMINAL_CODE_POLICIES",
+                1,
+            ),
+        )
+
+    def test_terminal_policy_semantic_drift_fails_compile_probe(self) -> None:
+        anchor = """        terminal_code: TerminalCode::Success,
+        effect_expectation: CommittedEffectExpectation::OperationSpecific,
+        maximum_fallback_eligibility: FallbackEligibility::Forbidden,"""
+        replacement = anchor.replace(
+            "FallbackEligibility::Forbidden",
+            "FallbackEligibility::ExplicitPolicyOnly",
+        )
+        self.assert_rejected(
+            "terminal code policy table drifted",
+            mutate_source=lambda source: source.replace(anchor, replacement, 1),
+        )
+
+    def test_terminal_text_limit_semantic_drift_fails_compile_probe(self) -> None:
+        anchor = "pub const TERMINAL_DIAGNOSTIC_ID_MAX_BYTES: usize = 128;"
+        self.assert_rejected(
+            "terminal text limit catalog drifted",
+            mutate_source=lambda source: source.replace(
+                anchor,
+                "pub const TERMINAL_DIAGNOSTIC_ID_MAX_BYTES: usize = 129;",
+                1,
+            ),
+        )
+
     def test_required_field_constant_cannot_disappear(self) -> None:
         self.assert_rejected(
             "generated Rust source is missing constants",
@@ -204,6 +328,94 @@ class MemoryProviderRustBindingsTest(unittest.TestCase):
                 1,
             ),
         )
+
+    def test_exact_scope_digest_constant_cannot_disappear(self) -> None:
+        self.assert_rejected(
+            "generated Rust source is missing constants",
+            mutate_source=lambda source: source.replace(
+                "pub const EXACT_SCOPE_DIGEST_DOMAIN",
+                "const EXACT_SCOPE_DIGEST_DOMAIN",
+                1,
+            ),
+        )
+
+    def test_each_provider_limit_minimum_drift_fails_compile_probe(self) -> None:
+        for limit_id, _maximum, _unit, _alternate_unit in LIMIT_ROWS:
+            with self.subTest(limit_id=limit_id):
+                self.assert_rejected(
+                    "provider limit catalog drifted",
+                    mutate_source=lambda source, current=limit_id: (
+                        self.mutate_generated_limit(
+                            source, current, "minimum", "1", "2"
+                        )
+                    ),
+                )
+
+    def test_each_provider_limit_unit_drift_fails_compile_probe(self) -> None:
+        for limit_id, _maximum, unit, alternate_unit in LIMIT_ROWS:
+            with self.subTest(limit_id=limit_id):
+                self.assert_rejected(
+                    "provider limit catalog drifted",
+                    mutate_source=lambda source, current=limit_id, old=unit, new=alternate_unit: (
+                        self.mutate_generated_limit(
+                            source,
+                            current,
+                            "unit",
+                            json.dumps(old),
+                            json.dumps(new),
+                        )
+                    ),
+                )
+
+    def test_each_provider_limit_maximum_drift_fails_compile_probe(self) -> None:
+        for limit_id, maximum, _unit, _alternate_unit in LIMIT_ROWS:
+            with self.subTest(limit_id=limit_id):
+                self.assert_rejected(
+                    "provider limit catalog drifted",
+                    mutate_source=lambda source, current=limit_id, old=maximum: (
+                        self.mutate_generated_limit(
+                            source,
+                            current,
+                            "maximum",
+                            str(old),
+                            str(old - 1),
+                        )
+                    ),
+                )
+
+    def test_generator_rejects_each_schema_valid_limit_identity_drift(self) -> None:
+        for limit_id, _maximum, _unit, alternate_unit in LIMIT_ROWS:
+            with self.subTest(limit_id=limit_id, field="minimum"):
+                self.assert_generator_rejected_limit_mutation(
+                    limit_id,
+                    "minimum",
+                    2,
+                    "provider limit catalog order, minimum, or unit drifted",
+                )
+            with self.subTest(limit_id=limit_id, field="unit"):
+                self.assert_generator_rejected_limit_mutation(
+                    limit_id,
+                    "unit",
+                    alternate_unit,
+                    "provider limit catalog order, minimum, or unit drifted",
+                )
+
+    def test_generator_rejects_zero_for_each_limit_bound(self) -> None:
+        for limit_id, _maximum, _unit, _alternate_unit in LIMIT_ROWS:
+            with self.subTest(limit_id=limit_id, field="minimum"):
+                self.assert_generator_rejected_limit_mutation(
+                    limit_id,
+                    "minimum",
+                    0,
+                    f"provider limit {limit_id} minimum must be a positive u64",
+                )
+            with self.subTest(limit_id=limit_id, field="maximum"):
+                self.assert_generator_rejected_limit_mutation(
+                    limit_id,
+                    "maximum",
+                    0,
+                    f"provider limit {limit_id} maximum must be a positive u64",
+                )
 
     def test_manifest_output_digest_is_verified(self) -> None:
         def mutate(manifest: dict[str, object]) -> None:

@@ -22,10 +22,11 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-use tracedecay_memory_provider_api::contract::{CommittedEffectState, TerminalCode};
+use tracedecay_memory_provider_api::contract::{FallbackEligibility, TerminalCode};
 use tracedecay_memory_provider_api::{
-    ApiError, HandshakeRequest, HandshakeResponse, MemoryProvider, OwnedProviderId, ProviderCall,
-    ProviderDescriptor, ProviderReply,
+    ApiError, FallbackDirective, HandshakeRequest, HandshakeResponse, MemoryProvider,
+    OwnedExactScope, OwnedProviderId, ProviderCall, ProviderDescriptor, ProviderOperation,
+    ProviderReply, TerminalRecord,
 };
 
 /// Provider participation mode selected by TraceDecay configuration.
@@ -116,6 +117,34 @@ pub enum FabricError {
         /// Returned operation identity.
         returned: String,
     },
+    /// A provider returned a terminal record for another operation kind.
+    ResponseOperationKindMismatch {
+        /// Expected provider operation.
+        expected: ProviderOperation,
+        /// Returned provider operation.
+        returned: ProviderOperation,
+    },
+    /// A provider returned a terminal record attributed to another provider.
+    ResponseProviderMismatch {
+        /// Registry-selected provider ID.
+        expected: String,
+        /// Terminal-attributed provider ID.
+        returned: String,
+    },
+    /// A provider returned a terminal record for another exact scope.
+    ResponseScopeMismatch {
+        /// Expected TraceDecay-owned exact-scope digest.
+        expected: String,
+        /// Returned exact-scope digest.
+        returned: String,
+    },
+    /// A provider reply generation contradicted its committed-effect evidence.
+    ResponseStateGenerationMismatch {
+        /// Generation retained by the committed-effect evidence.
+        evidence: u64,
+        /// Generation reported by the provider reply or descriptor.
+        reported: u64,
+    },
     /// A successful handshake omitted its compatible descriptor.
     SuccessfulHandshakeMissingDescriptor,
     /// A successful handshake returned another provider identity.
@@ -171,6 +200,24 @@ impl fmt::Display for FabricError {
             Self::ResponseOperationMismatch { expected, returned } => write!(
                 formatter,
                 "provider response operation mismatch: expected {expected}, returned {returned}"
+            ),
+            Self::ResponseOperationKindMismatch { expected, returned } => write!(
+                formatter,
+                "provider response operation-kind mismatch: expected {}, returned {}",
+                expected.as_wire(),
+                returned.as_wire()
+            ),
+            Self::ResponseProviderMismatch { expected, returned } => write!(
+                formatter,
+                "provider response identity mismatch: expected {expected}, returned {returned}"
+            ),
+            Self::ResponseScopeMismatch { expected, returned } => write!(
+                formatter,
+                "provider response exact-scope mismatch: expected {expected}, returned {returned}"
+            ),
+            Self::ResponseStateGenerationMismatch { evidence, reported } => write!(
+                formatter,
+                "provider response state-generation mismatch: effect evidence {evidence}, reported {reported}"
             ),
             Self::SuccessfulHandshakeMissingDescriptor => {
                 formatter.write_str("successful handshake omitted provider descriptor")
@@ -266,18 +313,8 @@ pub struct ObserverReceipt {
     pub provider_id: OwnedProviderId,
     /// Accepted registration revision.
     pub registration_revision: u64,
-    /// Stable operation identity.
-    pub operation_id: String,
-    /// Typed terminal result.
-    pub terminal_code: TerminalCode,
-    /// Truthful provider-local committed effect.
-    pub committed_effect: CommittedEffectState,
-    /// Optional provider receipt digest.
-    pub provider_receipt_sha256: Option<String>,
-    /// Provider-local state generation after delivery.
-    pub state_generation: u64,
-    /// Bounded diagnostics that cannot affect product output.
-    pub warnings: Vec<String>,
+    /// Validated terminal result, including complete effect and fallback evidence.
+    pub terminal: TerminalRecord,
 }
 
 /// Capability-driven provider registry and bounded call router.
@@ -400,8 +437,15 @@ impl MemoryFabric {
         Self::preflight(&request.control)?;
         let _permit = self.permits.try_acquire()?;
         let response = registration.provider.handshake(request);
-        Self::validate_operation_id(&request.request_id, &response.terminal.operation_id)?;
-        if response.terminal.terminal_code == TerminalCode::Success {
+        Self::validate_terminal(
+            ProviderOperation::Handshake,
+            &request.provider_id,
+            &request.request_id,
+            &request.exact_scope,
+            &response.terminal,
+            None,
+        )?;
+        if response.terminal.terminal_code() == TerminalCode::Success {
             let descriptor = response
                 .descriptor
                 .as_ref()
@@ -412,6 +456,7 @@ impl MemoryFabric {
             if response.accepted_scope.as_ref() != Some(&request.exact_scope) {
                 return Err(FabricError::SuccessfulHandshakeScopeMismatch);
             }
+            Self::validate_state_generation(&response.terminal, Some(descriptor.state_generation))?;
         }
         Ok(response)
     }
@@ -437,7 +482,14 @@ impl MemoryFabric {
         Self::preflight(&call.control)?;
         let _permit = self.permits.try_acquire()?;
         let reply = registration.provider.invoke(call);
-        Self::validate_operation_id(&call.operation_id, &reply.terminal.operation_id)?;
+        Self::validate_terminal(
+            call.operation,
+            &call.provider_id,
+            &call.operation_id,
+            &call.exact_scope,
+            &reply.terminal,
+            Some(reply.state_generation),
+        )?;
         Ok(reply)
     }
 
@@ -456,16 +508,18 @@ impl MemoryFabric {
         Self::preflight(&call.control)?;
         let _permit = self.permits.try_acquire()?;
         let reply = registration.provider.invoke(call);
-        Self::validate_operation_id(&call.operation_id, &reply.terminal.operation_id)?;
+        Self::validate_terminal(
+            call.operation,
+            &call.provider_id,
+            &call.operation_id,
+            &call.exact_scope,
+            &reply.terminal,
+            Some(reply.state_generation),
+        )?;
         Ok(ObserverReceipt {
             provider_id: call.provider_id.clone(),
             registration_revision: call.registration_revision,
-            operation_id: reply.terminal.operation_id,
-            terminal_code: reply.terminal.terminal_code,
-            committed_effect: reply.terminal.committed_effect,
-            provider_receipt_sha256: reply.terminal.provider_receipt_sha256,
-            state_generation: reply.state_generation,
-            warnings: reply.warnings,
+            terminal: reply.terminal,
         })
     }
 
@@ -556,6 +610,78 @@ impl MemoryFabric {
                 expected: expected.to_owned(),
                 returned: returned.to_owned(),
             })
+        }
+    }
+
+    fn validate_terminal(
+        expected_operation: ProviderOperation,
+        provider_id: &OwnedProviderId,
+        expected_operation_id: &str,
+        exact_scope: &OwnedExactScope,
+        terminal: &TerminalRecord,
+        reported_state_generation: Option<u64>,
+    ) -> Result<(), FabricError> {
+        if terminal.operation() != expected_operation {
+            return Err(FabricError::ResponseOperationKindMismatch {
+                expected: expected_operation,
+                returned: terminal.operation(),
+            });
+        }
+        if terminal.provider_id() != provider_id {
+            return Err(FabricError::ResponseProviderMismatch {
+                expected: provider_id.as_str().to_owned(),
+                returned: terminal.provider_id().as_str().to_owned(),
+            });
+        }
+        Self::validate_operation_id(expected_operation_id, terminal.operation_id())?;
+        let expected_scope_sha256 = exact_scope.exact_scope_sha256();
+        if terminal.exact_scope_sha256() != expected_scope_sha256.as_str() {
+            return Err(FabricError::ResponseScopeMismatch {
+                expected: expected_scope_sha256,
+                returned: terminal.exact_scope_sha256().to_owned(),
+            });
+        }
+
+        let fallback = match terminal.fallback().eligibility() {
+            FallbackEligibility::Forbidden => FallbackDirective::forbidden(),
+            FallbackEligibility::ExplicitPolicyOnly => {
+                let policy = terminal
+                    .fallback()
+                    .policy()
+                    .ok_or(ApiError::EmptyField("fallback_policy"))?
+                    .clone();
+                let reason = terminal
+                    .fallback()
+                    .reason()
+                    .ok_or(ApiError::EmptyField("fallback_reason"))?;
+                FallbackDirective::explicit_policy_only(provider_id, policy, reason)?
+            }
+        };
+        let _validated = TerminalRecord::new(
+            terminal.operation(),
+            terminal.provider_id().clone(),
+            terminal.terminal_code(),
+            terminal.committed_effect().clone(),
+            fallback,
+            terminal.operation_id(),
+            terminal.exact_scope_sha256(),
+            terminal.diagnostic_id().map(str::to_owned),
+        )?;
+        Self::validate_state_generation(terminal, reported_state_generation)
+    }
+
+    fn validate_state_generation(
+        terminal: &TerminalRecord,
+        reported_state_generation: Option<u64>,
+    ) -> Result<(), FabricError> {
+        match (
+            terminal.committed_effect().state_generation_after(),
+            reported_state_generation,
+        ) {
+            (Some(evidence), Some(reported)) if evidence != reported => {
+                Err(FabricError::ResponseStateGenerationMismatch { evidence, reported })
+            }
+            _ => Ok(()),
         }
     }
 }

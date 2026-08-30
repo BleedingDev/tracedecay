@@ -14,28 +14,38 @@
 //! This crate does not implement NCM, select an in-process or local-process
 //! topology, open NCM state, or modify licensed behavior. It translates the
 //! provider-neutral runtime contract into an opaque NCM surface contract. Raw
-//! coding identities never cross that surface: TraceDecay derives one stable
-//! namespace digest from the exact admitted scope, while the adapter retains
-//! responsibility for reattaching the original scope to public responses.
+//! coding and caller identities never cross that surface: TraceDecay derives
+//! one stable namespace digest from the exact admitted scope, projects payloads
+//! conservatively, and retains responsibility for reattaching public identity
+//! and inert extensions to validated responses.
 
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracedecay_memory_provider_api::contract::{
-    CommittedEffectState, FallbackEligibility, TerminalCode,
+    CAPABILITIES, CommittedEffectState, FallbackEligibility, RequestControl, TerminalCode,
 };
 use tracedecay_memory_provider_api::{
-    CanonicalPayload, HandshakeRequest, HandshakeResponse, MemoryProvider, OperationControl,
-    OwnedExactScope, OwnedOpaqueExtension, OwnedVersionedId, ProviderCall, ProviderDescriptor,
-    ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
+    CanonicalPayload, CommittedEffectEvidence, FallbackDirective, HandshakeRequest,
+    HandshakeResponse, MemoryProvider, OperationControl, OwnedExactScope, OwnedOpaqueExtension,
+    OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderDescriptor, ProviderLimits,
+    ProviderOperation, ProviderReply, TerminalRecord,
 };
 
 /// Stable logical provider identity reserved for NCM.
 pub const NCM_PROVIDER_ID: &str = "ncm";
 const NAMESPACE_DOMAIN: &[u8] = b"tracedecay.ncm.scope.v1\0";
+const CHALLENGE_DOMAIN: &[u8] = b"tracedecay.ncm.handshake-proof.v1\0";
+const OPAQUE_ID_DOMAIN: &[u8] = b"tracedecay.ncm.opaque-id.v1\0";
+const READY_RECEIPT_DOMAIN: &[u8] = b"tracedecay.ncm.adapter-ready-receipt.v1\0";
+const UNKNOWN_EFFECT_RECEIPT_DOMAIN: &[u8] = b"tracedecay.ncm.adapter-unknown-effect-receipt.v1\0";
+const MAX_WARNINGS: usize = 32;
+const MAX_OBSERVATION_TOTAL_EXTENSION_BYTES: u64 = 524_288;
 
 /// Construction failure before an NCM surface can be registered.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,6 +106,25 @@ impl NcmNamespace {
     }
 }
 
+struct OpaqueCallerIds {
+    request_id: String,
+    operation_id: String,
+    idempotency_key: Option<String>,
+}
+
+impl OpaqueCallerIds {
+    fn from_call(namespace: &NcmNamespace, call: &ProviderCall) -> Self {
+        Self {
+            request_id: opaque_surface_id(namespace, b"request-id", &call.request_id),
+            operation_id: opaque_surface_id(namespace, b"operation-id", &call.operation_id),
+            idempotency_key: call
+                .idempotency_key
+                .as_deref()
+                .map(|value| opaque_surface_id(namespace, b"idempotency-key", value)),
+        }
+    }
+}
+
 /// Handshake request visible to the licensed NCM surface.
 #[derive(Clone, Debug)]
 pub struct NcmSurfaceHandshakeRequest {
@@ -103,7 +132,7 @@ pub struct NcmSurfaceHandshakeRequest {
     pub registration_revision: u64,
     /// Opaque provider-local state namespace.
     pub namespace: NcmNamespace,
-    /// Stable request identity.
+    /// Namespace-bound opaque request identity.
     pub request_id: String,
     /// Required provider-neutral capabilities.
     pub required_capabilities: BTreeSet<OwnedVersionedId>,
@@ -113,6 +142,60 @@ pub struct NcmSurfaceHandshakeRequest {
     pub control: OperationControl,
     /// Challenge nonce for this handshake.
     pub challenge_nonce: [u8; 32],
+}
+
+impl NcmSurfaceHandshakeRequest {
+    /// Derives the proof the surface must return to bind readiness to this
+    /// challenge, namespace, implementation, and receipt.
+    #[must_use]
+    pub fn expected_challenge_response_sha256(
+        &self,
+        descriptor: &ProviderDescriptor,
+        provider_instance_id: &str,
+        ready_receipt_sha256: &str,
+    ) -> String {
+        let mut digest = Sha256::new();
+        digest.update(CHALLENGE_DOMAIN);
+        digest_field(&mut digest, self.namespace.as_str().as_bytes());
+        digest_field(&mut digest, self.request_id.as_bytes());
+        digest.update(self.registration_revision.to_be_bytes());
+        digest.update(self.challenge_nonce);
+        digest.update(self.control.deadline_utc_micros().to_be_bytes());
+        digest.update(self.control.remaining_millis().to_be_bytes());
+        // Handshake reaches the surface only after a live preflight snapshot.
+        digest.update([0]);
+        digest.update(
+            u64::try_from(self.required_capabilities.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for capability in &self.required_capabilities {
+            digest_field(&mut digest, capability.as_str().as_bytes());
+        }
+        digest_limits(&mut digest, self.host_limits);
+        digest_field(&mut digest, descriptor.provider_id.as_str().as_bytes());
+        digest_field(&mut digest, provider_instance_id.as_bytes());
+        digest_field(
+            &mut digest,
+            descriptor.implementation_identity_sha256.as_bytes(),
+        );
+        digest_field(&mut digest, descriptor.state_schema_version.as_bytes());
+        digest.update(descriptor.state_generation.to_be_bytes());
+        digest.update(descriptor.protocol_major.to_be_bytes());
+        digest.update(descriptor.protocol_minor.to_be_bytes());
+        digest.update(
+            u64::try_from(descriptor.capabilities.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for capability in &descriptor.capabilities {
+            digest_field(&mut digest, capability.as_str().as_bytes());
+        }
+        digest_limits(&mut digest, descriptor.limits);
+        digest_limits(&mut digest, self.host_limits.minimum(descriptor.limits));
+        digest_field(&mut digest, ready_receipt_sha256.as_bytes());
+        hex_digest(&digest.finalize())
+    }
 }
 
 /// Handshake response returned by the licensed NCM surface without raw coding
@@ -131,6 +214,8 @@ pub struct NcmSurfaceHandshakeResponse {
     pub effective_limits: Option<ProviderLimits>,
     /// Scoped readiness receipt digest.
     pub ready_receipt_sha256: Option<String>,
+    /// Proof bound to the request challenge and accepted ready identity.
+    pub challenge_response_sha256: Option<String>,
     /// Bounded non-secret warnings.
     pub warnings: Vec<String>,
 }
@@ -146,39 +231,47 @@ pub struct NcmSurfaceCall {
     pub registration_revision: u64,
     /// Compatible readiness receipt digest.
     pub ready_receipt_sha256: String,
-    /// Stable request identity.
+    /// Namespace-bound opaque request identity.
     pub request_id: String,
-    /// Stable effect identity.
+    /// Namespace-bound opaque effect identity.
     pub operation_id: String,
     /// Provider state generation expected by the caller.
     pub expected_state_generation: u64,
-    /// Deterministic key for mutating operations.
+    /// Namespace-bound opaque deterministic key for mutating operations.
     pub idempotency_key: Option<String>,
     /// Deadline and live cancellation.
     pub control: OperationControl,
-    /// Canonical provider-neutral payload.
+    /// Scope-safe JSON projection of the canonical provider-neutral payload.
     pub payload: CanonicalPayload,
     /// Required capabilities for this call.
     pub required_capabilities: BTreeSet<OwnedVersionedId>,
-    /// Opaque optional extensions.
+    /// Extensions visible to the surface. The adapter always leaves this empty
+    /// because opaque extensions remain adapter-side.
     pub extensions: Vec<OwnedOpaqueExtension>,
 }
 
 impl NcmSurfaceCall {
-    fn from_provider_call(call: &ProviderCall) -> Self {
+    fn from_provider_call(
+        call: &ProviderCall,
+        payload: CanonicalPayload,
+        control: OperationControl,
+        surface_ready_receipt_sha256: &str,
+    ) -> Self {
+        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+        let opaque_ids = OpaqueCallerIds::from_call(&namespace, call);
         Self {
             operation: call.operation,
-            namespace: NcmNamespace::from_exact_scope(&call.exact_scope),
+            request_id: opaque_ids.request_id,
+            operation_id: opaque_ids.operation_id,
+            idempotency_key: opaque_ids.idempotency_key,
+            namespace,
             registration_revision: call.registration_revision,
-            ready_receipt_sha256: call.ready_receipt_sha256.clone(),
-            request_id: call.request_id.clone(),
-            operation_id: call.operation_id.clone(),
+            ready_receipt_sha256: surface_ready_receipt_sha256.to_owned(),
             expected_state_generation: call.expected_state_generation,
-            idempotency_key: call.idempotency_key.clone(),
-            control: call.control.clone(),
-            payload: call.payload.clone(),
+            control,
+            payload,
             required_capabilities: call.required_capabilities.clone(),
-            extensions: call.extensions.clone(),
+            extensions: Vec::new(),
         }
     }
 }
@@ -196,14 +289,67 @@ pub trait NcmCognitiveSurface: Send + Sync + 'static {
     /// Performs a read-only compatibility handshake for one opaque namespace.
     fn handshake(&self, request: &NcmSurfaceHandshakeRequest) -> NcmSurfaceHandshakeResponse;
 
-    /// Executes one provider-local operation using canonical provider-neutral
-    /// bytes and no raw coding identities.
+    /// Executes one provider-local operation using a scope-safe JSON projection
+    /// and no raw coding, caller, or extension identities.
     fn invoke(&self, call: &NcmSurfaceCall) -> ProviderReply;
+}
+
+struct AcceptedReadiness {
+    registration_revision: u64,
+    exact_scope: OwnedExactScope,
+    public_ready_receipt_sha256: String,
+    surface_ready_receipt_sha256: String,
+    provider_instance_id: String,
+    descriptor: ProviderDescriptor,
+    effective_limits: ProviderLimits,
+    active_operations: AtomicU64,
+}
+
+impl AcceptedReadiness {
+    fn matches_call(&self, call: &ProviderCall, descriptor: &ProviderDescriptor) -> bool {
+        self.registration_revision == call.registration_revision
+            && self.exact_scope == call.exact_scope
+            && self.public_ready_receipt_sha256 == call.ready_receipt_sha256
+            && !self.provider_instance_id.is_empty()
+            && self.descriptor == *descriptor
+    }
+}
+
+#[derive(Default)]
+struct ReadinessState {
+    epoch: u64,
+    accepted: Option<AcceptedReadiness>,
+}
+
+struct OperationAdmission<'a> {
+    active_operations: &'a AtomicU64,
+}
+
+impl OperationAdmission<'_> {
+    fn try_acquire<'a>(readiness: &'a AcceptedReadiness) -> Option<OperationAdmission<'a>> {
+        readiness
+            .active_operations
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < readiness.effective_limits.concurrent_operations)
+                    .then(|| active.saturating_add(1))
+            })
+            .ok()
+            .map(|_| OperationAdmission {
+                active_operations: &readiness.active_operations,
+            })
+    }
+}
+
+impl Drop for OperationAdmission<'_> {
+    fn drop(&mut self) {
+        self.active_operations.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Provider-neutral adapter over one audited licensed NCM surface.
 pub struct NcmProviderAdapter {
     surface: Arc<dyn NcmCognitiveSurface>,
+    readiness: RwLock<ReadinessState>,
 }
 
 impl NcmProviderAdapter {
@@ -217,7 +363,302 @@ impl NcmProviderAdapter {
                 declared: descriptor.provider_id.as_str().to_owned(),
             });
         }
-        Ok(Self { surface })
+        Ok(Self {
+            surface,
+            readiness: RwLock::new(ReadinessState::default()),
+        })
+    }
+
+    fn supports_required_capabilities(
+        descriptor: &ProviderDescriptor,
+        required: &BTreeSet<OwnedVersionedId>,
+    ) -> bool {
+        required.iter().all(|capability| {
+            CAPABILITIES
+                .iter()
+                .any(|known| known.capability_id == capability.as_str())
+                && descriptor.supports(capability.as_str())
+        })
+    }
+
+    fn valid_sha256(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    fn valid_payload(payload: &CanonicalPayload, response_bytes: u64) -> bool {
+        u64::try_from(payload.bytes.len()).unwrap_or(u64::MAX) <= response_bytes
+            && payload.sha256 == hex_digest(&Sha256::digest(&payload.bytes))
+    }
+
+    fn capped_control(
+        control: &OperationControl,
+        limits: ProviderLimits,
+    ) -> Result<(RequestControl, OperationControl), TerminalCode> {
+        let snapshot = control.snapshot()?;
+        let remaining_millis = snapshot.remaining_millis.min(limits.operation_millis);
+        if remaining_millis == 0 {
+            return Err(TerminalCode::DeadlineExceeded);
+        }
+        let surface_control = if control.remaining_millis() <= limits.operation_millis {
+            control.clone()
+        } else {
+            OperationControl::new(
+                snapshot.deadline_utc_micros,
+                remaining_millis,
+                control.cancellation(),
+            )
+        };
+        Ok((snapshot, surface_control))
+    }
+
+    fn operation_contract_id(operation: ProviderOperation) -> Option<&'static str> {
+        match operation {
+            ProviderOperation::Handshake => None,
+            ProviderOperation::Health => Some("tracedecay.memory.provider.health.v1"),
+            ProviderOperation::Observe => Some("tracedecay.memory.provider.observation.v1"),
+            ProviderOperation::Recall => Some("tracedecay.memory.provider.recall.v1"),
+            ProviderOperation::Feedback => Some("tracedecay.memory.provider.feedback.v1"),
+            ProviderOperation::Maintenance => Some("tracedecay.memory.provider.maintenance.v1"),
+            ProviderOperation::Inspection => Some("tracedecay.memory.provider.inspection.v1"),
+            ProviderOperation::Correction => Some("tracedecay.memory.provider.correction.v1"),
+            ProviderOperation::DeleteBySource => {
+                Some("tracedecay.memory.provider.deletion-by-source.v1")
+            }
+            ProviderOperation::SnapshotExport => {
+                Some("tracedecay.memory.provider.snapshot-export.v1")
+            }
+            ProviderOperation::SnapshotRestore => {
+                Some("tracedecay.memory.provider.snapshot-restore.v1")
+            }
+            ProviderOperation::Replay => Some("tracedecay.memory.provider.replay.v1"),
+        }
+    }
+
+    fn surface_payload(call: &ProviderCall) -> Option<CanonicalPayload> {
+        if Self::operation_contract_id(call.operation) != Some(call.payload.contract_id.as_str()) {
+            return None;
+        }
+        let mut value = serde_json::from_slice::<Value>(&call.payload.bytes).ok()?;
+        if !value.is_object() {
+            return None;
+        }
+        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+        let opaque_ids = OpaqueCallerIds::from_call(&namespace, call);
+        remove_exact_scope_identity(&mut value);
+        if !rewrite_caller_identity_fields(&mut value, call, &opaque_ids)
+            || json_contains_scope_component(&value, &call.exact_scope)
+            || json_contains_public_caller_id(&value, call)
+        {
+            return None;
+        }
+        let bytes = serde_json::to_vec(&value).ok()?;
+        if serialized_contains_scope_component(&bytes, &call.exact_scope)
+            || serialized_contains_public_caller_id(&bytes, call)
+        {
+            return None;
+        }
+        let digest = hex_digest(&Sha256::digest(&bytes));
+        CanonicalPayload::new(call.payload.contract_id.clone(), bytes, digest).ok()
+    }
+
+    fn maximum_extensions(operation: ProviderOperation) -> usize {
+        if operation == ProviderOperation::Recall {
+            16
+        } else {
+            32
+        }
+    }
+
+    fn maximum_extension_bytes(operation: ProviderOperation) -> u64 {
+        if operation == ProviderOperation::Recall {
+            131_072
+        } else {
+            262_144
+        }
+    }
+
+    fn valid_request(call: &ProviderCall, control: RequestControl, limits: ProviderLimits) -> bool {
+        let extension_bytes = call.extensions.iter().fold(0_u64, |total, extension| {
+            total.saturating_add(
+                u64::try_from(extension.canonical_payload.len()).unwrap_or(u64::MAX),
+            )
+        });
+        call.exact_scope.validate().is_ok()
+            && !call.request_id.is_empty()
+            && !call.operation_id.is_empty()
+            && (!call.operation.mutates_provider_state()
+                || call
+                    .idempotency_key
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty()))
+            && call
+                .required_capabilities
+                .iter()
+                .any(|capability| capability.as_str() == call.operation.capability_id())
+            && Self::valid_sha256(&call.ready_receipt_sha256)
+            && Self::valid_payload(&call.payload, limits.request_bytes)
+            && call.extensions.len() <= Self::maximum_extensions(call.operation)
+            && (call.operation != ProviderOperation::Observe
+                || extension_bytes <= MAX_OBSERVATION_TOTAL_EXTENSION_BYTES)
+            && u64::try_from(call.payload.bytes.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(extension_bytes)
+                <= limits.request_bytes
+            && call.extensions.iter().all(|extension| {
+                !extension.required
+                    && extension.extension_version > 0
+                    && !extension.canonical_payload.is_empty()
+                    && u64::try_from(extension.canonical_payload.len()).unwrap_or(u64::MAX)
+                        <= Self::maximum_extension_bytes(call.operation)
+                    && extension.payload_sha256
+                        == hex_digest(&Sha256::digest(&extension.canonical_payload))
+            })
+            && encoded_request_bytes(call, control) <= limits.request_bytes
+    }
+
+    fn success_terminal(code: TerminalCode) -> bool {
+        matches!(
+            code,
+            TerminalCode::Success | TerminalCode::SuccessZeroResults | TerminalCode::Partial
+        )
+    }
+
+    fn valid_terminal_semantics(call: &ProviderCall, reply: &ProviderReply) -> bool {
+        let terminal = &reply.terminal;
+        let terminal_code = terminal.terminal_code();
+        let committed_effect = terminal.committed_effect();
+        let success = Self::success_terminal(terminal_code);
+        if committed_effect
+            .state_generation_before()
+            .is_some_and(|generation| generation != call.expected_state_generation)
+            || committed_effect
+                .state_generation_after()
+                .is_some_and(|generation| generation != reply.state_generation)
+        {
+            return false;
+        }
+        if !success
+            && (reply.payload.is_some() || terminal.diagnostic_id().is_none_or(str::is_empty))
+        {
+            return false;
+        }
+        if !call.operation.mutates_provider_state() {
+            return committed_effect.state() == CommittedEffectState::None
+                && committed_effect.provider_receipt_sha256().is_none()
+                && !matches!(
+                    terminal_code,
+                    TerminalCode::PartialEffect | TerminalCode::EffectUnknown
+                );
+        }
+        if matches!(
+            terminal_code,
+            TerminalCode::SuccessZeroResults | TerminalCode::Partial
+        ) {
+            return false;
+        }
+        match committed_effect.state() {
+            CommittedEffectState::None => {
+                committed_effect.provider_receipt_sha256().is_none()
+                    && !matches!(
+                        terminal_code,
+                        TerminalCode::PartialEffect | TerminalCode::EffectUnknown
+                    )
+            }
+            CommittedEffectState::Committed => {
+                terminal_code == TerminalCode::Success
+                    && committed_effect
+                        .provider_receipt_sha256()
+                        .is_some_and(Self::valid_sha256)
+            }
+            CommittedEffectState::Partial => {
+                matches!(
+                    terminal_code,
+                    TerminalCode::PartialEffect
+                        | TerminalCode::Cancelled
+                        | TerminalCode::DeadlineExceeded
+                ) && committed_effect
+                    .provider_receipt_sha256()
+                    .is_some_and(Self::valid_sha256)
+                    && reply.payload.is_none()
+            }
+            CommittedEffectState::Unknown => {
+                matches!(
+                    terminal_code,
+                    TerminalCode::EffectUnknown
+                        | TerminalCode::Cancelled
+                        | TerminalCode::DeadlineExceeded
+                ) && committed_effect
+                    .provider_receipt_sha256()
+                    .is_some_and(Self::valid_sha256)
+                    && reply.payload.is_none()
+            }
+        }
+    }
+
+    fn surface_metadata_is_scope_safe(
+        call: &ProviderCall,
+        surface_call: &NcmSurfaceCall,
+        reply: &ProviderReply,
+    ) -> bool {
+        let effect = reply.terminal.committed_effect();
+        let public_scope_digest = call.exact_scope.exact_scope_sha256();
+        let mut forbidden = surface_forbidden_identities(call, surface_call);
+        forbidden.push(public_scope_digest.as_str());
+        effect
+            .committed_boundary()
+            .is_none_or(|value| !text_contains_any(value, &forbidden))
+            && effect
+                .committed_item_refs()
+                .iter()
+                .all(|value| !text_contains_any(value, &forbidden))
+            && effect
+                .uncommitted_item_refs()
+                .iter()
+                .all(|value| !text_contains_any(value, &forbidden))
+            && effect
+                .reconciliation_action()
+                .is_none_or(|value| !text_contains_any(value, &forbidden))
+            && reply
+                .terminal
+                .diagnostic_id()
+                .is_none_or(|value| !text_contains_any(value, &forbidden))
+            && reply
+                .warnings
+                .iter()
+                .all(|value| !text_contains_any(value, &forbidden))
+            && reply
+                .terminal
+                .fallback()
+                .source_provider_id()
+                .is_none_or(|provider_id| !text_contains_any(provider_id.as_str(), &forbidden))
+            && reply
+                .terminal
+                .fallback()
+                .reason()
+                .is_none_or(|value| !text_contains_any(value, &forbidden))
+            && reply.terminal.fallback().policy().is_none_or(|policy| {
+                !text_contains_any(policy.policy_id(), &forbidden)
+                    && !text_contains_any(policy.target_provider_id().as_str(), &forbidden)
+            })
+    }
+
+    fn rebind_terminal(
+        terminal: &TerminalRecord,
+        operation: ProviderOperation,
+        provider_id: OwnedProviderId,
+        operation_id: impl Into<String>,
+        exact_scope_sha256: impl Into<String>,
+    ) -> Option<TerminalRecord> {
+        if terminal.operation() != operation || terminal.provider_id() != &provider_id {
+            return None;
+        }
+        terminal
+            .clone()
+            .try_with_identity(operation_id, exact_scope_sha256)
+            .ok()
     }
 
     fn handshake_failure(
@@ -225,45 +666,15 @@ impl NcmProviderAdapter {
         code: TerminalCode,
         diagnostic_id: &'static str,
     ) -> HandshakeResponse {
-        let scope = NcmNamespace::from_exact_scope(&request.exact_scope);
-        let terminal = TerminalRecord::new(
+        let terminal = TerminalRecord::failure_before_dispatch(
+            ProviderOperation::Handshake,
+            request.provider_id.clone(),
             code,
-            CommittedEffectState::None,
-            FallbackEligibility::Forbidden,
-            request.request_id.clone(),
-            scope.as_str(),
+            &request.request_id,
+            request.exact_scope.exact_scope_sha256(),
             None,
-            Some(diagnostic_id.to_owned()),
+            diagnostic_id,
         );
-        let terminal = match terminal {
-            Ok(value) => value,
-            Err(_) => return Self::unreachable_handshake_failure(request, scope),
-        };
-        HandshakeResponse {
-            terminal,
-            descriptor: None,
-            provider_instance_id: None,
-            state_namespace: None,
-            accepted_scope: None,
-            effective_limits: None,
-            ready_receipt_sha256: None,
-            warnings: Vec::new(),
-        }
-    }
-
-    fn unreachable_handshake_failure(
-        request: &HandshakeRequest,
-        scope: NcmNamespace,
-    ) -> HandshakeResponse {
-        let terminal = TerminalRecord {
-            terminal_code: TerminalCode::InternalFailure,
-            committed_effect: CommittedEffectState::None,
-            fallback: FallbackEligibility::Forbidden,
-            operation_id: request.request_id.clone(),
-            exact_scope_sha256: scope.0,
-            provider_receipt_sha256: None,
-            diagnostic_id: Some("ncm.adapter_terminal_construction_failed".to_owned()),
-        };
         HandshakeResponse {
             terminal,
             descriptor: None,
@@ -281,27 +692,15 @@ impl NcmProviderAdapter {
         code: TerminalCode,
         diagnostic_id: &'static str,
     ) -> ProviderReply {
-        let scope = NcmNamespace::from_exact_scope(&call.exact_scope);
-        let terminal = match TerminalRecord::new(
+        let terminal = TerminalRecord::failure_before_dispatch(
+            call.operation,
+            call.provider_id.clone(),
             code,
-            CommittedEffectState::None,
-            FallbackEligibility::Forbidden,
-            call.operation_id.clone(),
-            scope.as_str(),
+            &call.operation_id,
+            call.exact_scope.exact_scope_sha256(),
             None,
-            Some(diagnostic_id.to_owned()),
-        ) {
-            Ok(value) => value,
-            Err(_) => TerminalRecord {
-                terminal_code: TerminalCode::InternalFailure,
-                committed_effect: CommittedEffectState::None,
-                fallback: FallbackEligibility::Forbidden,
-                operation_id: call.operation_id.clone(),
-                exact_scope_sha256: scope.0,
-                provider_receipt_sha256: None,
-                diagnostic_id: Some("ncm.adapter_terminal_construction_failed".to_owned()),
-            },
-        };
+            diagnostic_id,
+        );
         ProviderReply {
             terminal,
             payload: None,
@@ -311,52 +710,67 @@ impl NcmProviderAdapter {
         }
     }
 
-    fn surface_contract_failure(call: &ProviderCall, reply: &ProviderReply) -> ProviderReply {
+    fn surface_contract_failure(
+        call: &ProviderCall,
+        surface_call: &NcmSurfaceCall,
+        reply: &ProviderReply,
+    ) -> ProviderReply {
         let terminal = if call.operation.mutates_provider_state() {
-            TerminalRecord::new(
-                TerminalCode::EffectUnknown,
-                CommittedEffectState::Unknown,
-                FallbackEligibility::Forbidden,
-                call.operation_id.clone(),
-                NcmNamespace::from_exact_scope(&call.exact_scope).as_str(),
-                reply.terminal.provider_receipt_sha256.clone(),
-                Some("ncm.surface_contract_violation_after_effect".to_owned()),
+            let receipt = adapter_unknown_effect_receipt(call, surface_call, reply);
+            TerminalRecord::effect_unknown_for_call(
+                call,
+                receipt,
+                "ncm.adapter_unknown_effect_reconciliation_required",
             )
         } else {
-            TerminalRecord::new(
+            TerminalRecord::failure_before_dispatch(
+                call.operation,
+                call.provider_id.clone(),
                 TerminalCode::ContractViolation,
-                CommittedEffectState::None,
-                FallbackEligibility::Forbidden,
-                call.operation_id.clone(),
-                NcmNamespace::from_exact_scope(&call.exact_scope).as_str(),
+                &call.operation_id,
+                call.exact_scope.exact_scope_sha256(),
                 None,
-                Some("ncm.surface_contract_violation".to_owned()),
+                "ncm.surface_contract_violation",
             )
-        };
-        let terminal = match terminal {
-            Ok(value) => value,
-            Err(_) => {
-                return Self::invoke_failure(
-                    call,
-                    TerminalCode::InternalFailure,
-                    "ncm.adapter_terminal_construction_failed",
-                );
-            }
         };
         ProviderReply {
             terminal,
             payload: None,
             warnings: Vec::new(),
             extensions: Vec::new(),
-            state_generation: reply.state_generation,
+            state_generation: call
+                .expected_state_generation
+                .max(reply.state_generation),
         }
     }
 
-    fn valid_surface_reply(call: &ProviderCall, reply: &ProviderReply) -> bool {
-        reply.terminal.operation_id == call.operation_id
-            && reply.terminal.exact_scope_sha256
-                == NcmNamespace::from_exact_scope(&call.exact_scope).as_str()
-            && reply.terminal.fallback == FallbackEligibility::Forbidden
+    fn valid_surface_reply(
+        call: &ProviderCall,
+        surface_call: &NcmSurfaceCall,
+        reply: &ProviderReply,
+        limits: ProviderLimits,
+    ) -> bool {
+        reply.terminal.operation() == call.operation
+            && reply.terminal.provider_id().as_str() == NCM_PROVIDER_ID
+            && reply.terminal.operation_id() == surface_call.operation_id
+            && reply.terminal.exact_scope_sha256() == surface_call.namespace.as_str()
+            && reply.terminal.fallback().eligibility() == FallbackEligibility::Forbidden
+            && reply.warnings.len() <= MAX_WARNINGS
+            && encoded_response_bytes(call, reply) <= limits.response_bytes
+            && reply.state_generation >= call.expected_state_generation
+            && reply.extensions.is_empty()
+            && Self::surface_metadata_is_scope_safe(call, surface_call, reply)
+            && reply.payload.as_ref().is_none_or(|payload| {
+                Self::valid_payload(payload, limits.response_bytes)
+                    && payload.contract_id == surface_call.payload.contract_id
+                    && serde_json::from_slice::<Value>(&payload.bytes).is_ok_and(|value| {
+                        value.is_object()
+                            && !json_has_exact_scope_identity(&value)
+                            && !json_contains_scope_component(&value, &call.exact_scope)
+                            && !json_contains_public_caller_id(&value, call)
+                    })
+            })
+            && Self::valid_terminal_semantics(call, reply)
     }
 }
 
@@ -366,6 +780,25 @@ impl MemoryProvider for NcmProviderAdapter {
     }
 
     fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        let mut readiness = match self.readiness.write() {
+            Ok(readiness) => readiness,
+            Err(_) => {
+                return Self::handshake_failure(
+                    request,
+                    TerminalCode::ProviderUnavailable,
+                    "ncm.ready_session_unavailable",
+                );
+            }
+        };
+        readiness.accepted = None;
+        let Some(epoch) = readiness.epoch.checked_add(1) else {
+            return Self::handshake_failure(
+                request,
+                TerminalCode::ProviderUnavailable,
+                "ncm.ready_epoch_exhausted",
+            );
+        };
+        readiness.epoch = epoch;
         if request.provider_id.as_str() != NCM_PROVIDER_ID {
             return Self::handshake_failure(
                 request,
@@ -373,35 +806,76 @@ impl MemoryProvider for NcmProviderAdapter {
                 "ncm.provider_id_mismatch",
             );
         }
-        if let Err(code) = request.control.snapshot() {
-            return Self::handshake_failure(request, code, "ncm.request_control_terminal");
+        if request.exact_scope.validate().is_err()
+            || request.host_limits.validate().is_err()
+            || request.request_id.is_empty()
+        {
+            return Self::handshake_failure(
+                request,
+                TerminalCode::InvalidRequest,
+                "ncm.handshake_request_invalid",
+            );
         }
         let descriptor = self.surface.descriptor();
-        if request
-            .required_capabilities
-            .iter()
-            .any(|capability| !descriptor.supports(capability.as_str()))
-        {
+        if descriptor.validate().is_err() {
+            return Self::handshake_failure(
+                request,
+                TerminalCode::ContractViolation,
+                "ncm.surface_descriptor_invalid",
+            );
+        }
+        if descriptor.provider_id.as_str() != NCM_PROVIDER_ID {
+            return Self::handshake_failure(
+                request,
+                TerminalCode::StaleIdentity,
+                "ncm.surface_identity_changed",
+            );
+        }
+        if !Self::supports_required_capabilities(&descriptor, &request.required_capabilities) {
             return Self::handshake_failure(
                 request,
                 TerminalCode::CapabilityUnsupported,
                 "ncm.required_capability_missing",
             );
         }
+        let effective_limits = request.host_limits.minimum(descriptor.limits);
+        if effective_limits.validate().is_err() {
+            return Self::handshake_failure(
+                request,
+                TerminalCode::ContractViolation,
+                "ncm.effective_limits_invalid",
+            );
+        }
+        let surface_control = match Self::capped_control(&request.control, effective_limits) {
+            Ok((_, control)) => control,
+            Err(code) => {
+                return Self::handshake_failure(request, code, "ncm.request_control_terminal");
+            }
+        };
         let namespace = NcmNamespace::from_exact_scope(&request.exact_scope);
         let surface_request = NcmSurfaceHandshakeRequest {
             registration_revision: request.registration_revision,
             namespace: namespace.clone(),
-            request_id: request.request_id.clone(),
+            request_id: opaque_surface_id(&namespace, b"handshake-request-id", &request.request_id),
             required_capabilities: request.required_capabilities.clone(),
             host_limits: request.host_limits,
-            control: request.control.clone(),
+            control: surface_control,
             challenge_nonce: request.challenge_nonce,
         };
-        let surface_response = self.surface.handshake(&surface_request);
-        if surface_response.terminal.operation_id != request.request_id
-            || surface_response.terminal.exact_scope_sha256 != namespace.as_str()
-            || surface_response.terminal.fallback != FallbackEligibility::Forbidden
+        let mut surface_response = self.surface.handshake(&surface_request);
+        if surface_response.terminal.operation() != ProviderOperation::Handshake
+            || surface_response.terminal.provider_id().as_str() != NCM_PROVIDER_ID
+            || surface_response.terminal.operation_id() != surface_request.request_id
+            || surface_response.terminal.exact_scope_sha256() != namespace.as_str()
+            || surface_response.terminal.fallback().eligibility() != FallbackEligibility::Forbidden
+            || surface_response.terminal.committed_effect().state() != CommittedEffectState::None
+            || surface_response
+                .terminal
+                .committed_effect()
+                .provider_receipt_sha256()
+                .is_some()
+            || surface_response.warnings.len() > MAX_WARNINGS
+            || !handshake_metadata_is_scope_safe(request, &surface_request, &surface_response)
         {
             return Self::handshake_failure(
                 request,
@@ -409,7 +883,50 @@ impl MemoryProvider for NcmProviderAdapter {
                 "ncm.surface_handshake_contract_violation",
             );
         }
-        if surface_response.terminal.terminal_code != TerminalCode::Success {
+        let surface_success = surface_response.terminal.terminal_code() == TerminalCode::Success;
+        if matches!(
+            surface_response.terminal.terminal_code(),
+            TerminalCode::SuccessZeroResults | TerminalCode::Partial
+        ) {
+            return Self::handshake_failure(
+                request,
+                TerminalCode::ContractViolation,
+                "ncm.surface_invalid_ready_terminal",
+            );
+        }
+        if !surface_success
+            && (surface_response.descriptor.is_some()
+                || surface_response.provider_instance_id.is_some()
+                || surface_response.namespace.is_some()
+                || surface_response.effective_limits.is_some()
+                || surface_response.ready_receipt_sha256.is_some()
+                || surface_response.challenge_response_sha256.is_some()
+                || surface_response
+                    .terminal
+                    .diagnostic_id()
+                    .is_none_or(str::is_empty))
+        {
+            return Self::handshake_failure(
+                request,
+                TerminalCode::ContractViolation,
+                "ncm.surface_failure_contract_violation",
+            );
+        }
+        let Some(public_terminal) = Self::rebind_terminal(
+            &surface_response.terminal,
+            ProviderOperation::Handshake,
+            request.provider_id.clone(),
+            request.request_id.clone(),
+            request.exact_scope.exact_scope_sha256(),
+        ) else {
+            return Self::handshake_failure(
+                request,
+                TerminalCode::ContractViolation,
+                "ncm.surface_terminal_rebind_failed",
+            );
+        };
+        surface_response.terminal = public_terminal;
+        if !surface_success {
             return HandshakeResponse {
                 terminal: surface_response.terminal,
                 descriptor: None,
@@ -428,11 +945,37 @@ impl MemoryProvider for NcmProviderAdapter {
                 "ncm.surface_missing_descriptor",
             );
         };
-        if response_descriptor.provider_id.as_str() != NCM_PROVIDER_ID
+        let Some(surface_ready_receipt_sha256) = surface_response.ready_receipt_sha256.as_deref()
+        else {
+            return Self::handshake_failure(
+                request,
+                TerminalCode::ContractViolation,
+                "ncm.surface_missing_ready_receipt",
+            );
+        };
+        let Some(provider_instance_id) = surface_response.provider_instance_id.as_deref() else {
+            return Self::handshake_failure(
+                request,
+                TerminalCode::ContractViolation,
+                "ncm.surface_missing_instance_identity",
+            );
+        };
+        let expected_challenge = surface_request.expected_challenge_response_sha256(
+            &response_descriptor,
+            provider_instance_id,
+            surface_ready_receipt_sha256,
+        );
+        if response_descriptor.validate().is_err()
+            || response_descriptor != descriptor
             || surface_response.namespace.as_ref() != Some(&namespace)
-            || surface_response.provider_instance_id.is_none()
-            || surface_response.effective_limits.is_none()
-            || surface_response.ready_receipt_sha256.is_none()
+            || provider_instance_id.trim().is_empty()
+            || surface_response
+                .effective_limits
+                .is_none_or(|limits| limits.validate().is_err())
+            || surface_response.effective_limits != Some(effective_limits)
+            || !Self::valid_sha256(surface_ready_receipt_sha256)
+            || surface_response.challenge_response_sha256.as_deref()
+                != Some(expected_challenge.as_str())
         {
             return Self::handshake_failure(
                 request,
@@ -440,6 +983,25 @@ impl MemoryProvider for NcmProviderAdapter {
                 "ncm.surface_incomplete_ready_response",
             );
         }
+        let public_ready_receipt_sha256 = adapter_ready_receipt(
+            epoch,
+            request.registration_revision,
+            &namespace,
+            surface_ready_receipt_sha256,
+            request.challenge_nonce,
+        );
+        let accepted_readiness = AcceptedReadiness {
+            registration_revision: request.registration_revision,
+            exact_scope: request.exact_scope.clone(),
+            public_ready_receipt_sha256: public_ready_receipt_sha256.clone(),
+            surface_ready_receipt_sha256: surface_ready_receipt_sha256.to_owned(),
+            provider_instance_id: provider_instance_id.to_owned(),
+            descriptor: response_descriptor.clone(),
+            effective_limits,
+            active_operations: AtomicU64::new(0),
+        };
+        surface_response.ready_receipt_sha256 = Some(public_ready_receipt_sha256);
+        readiness.accepted = Some(accepted_readiness);
         HandshakeResponse {
             terminal: surface_response.terminal,
             descriptor: Some(response_descriptor),
@@ -467,24 +1029,700 @@ impl MemoryProvider for NcmProviderAdapter {
                 "ncm.handshake_requires_handshake_port",
             );
         }
-        if let Err(code) = call.control.snapshot() {
-            return Self::invoke_failure(call, code, "ncm.request_control_terminal");
+        if call.exact_scope.validate().is_err() {
+            return Self::invoke_failure(
+                call,
+                TerminalCode::InvalidRequest,
+                "ncm.exact_scope_invalid",
+            );
         }
+        let readiness_state = match self.readiness.read() {
+            Ok(readiness) => readiness,
+            Err(_) => {
+                return Self::invoke_failure(
+                    call,
+                    TerminalCode::ProviderUnavailable,
+                    "ncm.ready_session_unavailable",
+                );
+            }
+        };
+        let Some(readiness) = readiness_state.accepted.as_ref() else {
+            return Self::invoke_failure(
+                call,
+                TerminalCode::ProviderUnavailable,
+                "ncm.ready_session_missing",
+            );
+        };
         let descriptor = self.surface.descriptor();
-        if !descriptor.supports(call.operation.capability_id()) {
+        if descriptor.validate().is_err()
+            || readiness.descriptor.validate().is_err()
+            || readiness.effective_limits.validate().is_err()
+        {
+            return Self::invoke_failure(
+                call,
+                TerminalCode::ContractViolation,
+                "ncm.surface_descriptor_or_limits_invalid",
+            );
+        }
+        if descriptor.provider_id.as_str() != NCM_PROVIDER_ID || descriptor != readiness.descriptor
+        {
+            return Self::invoke_failure(
+                call,
+                TerminalCode::StaleIdentity,
+                "ncm.surface_identity_changed",
+            );
+        }
+        if !readiness.matches_call(call, &descriptor) {
+            return Self::invoke_failure(
+                call,
+                TerminalCode::StaleIdentity,
+                "ncm.ready_session_mismatch",
+            );
+        }
+        if !Self::supports_required_capabilities(&descriptor, &call.required_capabilities) {
             return Self::invoke_failure(
                 call,
                 TerminalCode::CapabilityUnsupported,
-                "ncm.capability_unsupported",
+                "ncm.required_capability_missing",
             );
         }
-        let surface_call = NcmSurfaceCall::from_provider_call(call);
-        let reply = self.surface.invoke(&surface_call);
-        if Self::valid_surface_reply(call, &reply) {
+        let (control_snapshot, surface_control) =
+            match Self::capped_control(&call.control, readiness.effective_limits) {
+                Ok(control) => control,
+                Err(code) => {
+                    return Self::invoke_failure(call, code, "ncm.request_control_terminal");
+                }
+            };
+        if !Self::valid_request(call, control_snapshot, readiness.effective_limits) {
+            return Self::invoke_failure(
+                call,
+                TerminalCode::InvalidRequest,
+                "ncm.request_payload_or_extension_invalid",
+            );
+        }
+        let Some(surface_payload) = Self::surface_payload(call) else {
+            return Self::invoke_failure(
+                call,
+                TerminalCode::InvalidRequest,
+                "ncm.request_contract_or_scope_projection_invalid",
+            );
+        };
+        let Some(_admission) = OperationAdmission::try_acquire(readiness) else {
+            return Self::invoke_failure(
+                call,
+                TerminalCode::ProviderUnavailable,
+                "ncm.concurrent_operation_limit",
+            );
+        };
+        let surface_call = NcmSurfaceCall::from_provider_call(
+            call,
+            surface_payload,
+            surface_control,
+            &readiness.surface_ready_receipt_sha256,
+        );
+        let mut reply = self.surface.invoke(&surface_call);
+        if Self::valid_surface_reply(call, &surface_call, &reply, readiness.effective_limits) {
+            let Some(public_terminal) = Self::rebind_terminal(
+                &reply.terminal,
+                call.operation,
+                call.provider_id.clone(),
+                call.operation_id.clone(),
+                call.exact_scope.exact_scope_sha256(),
+            ) else {
+                return Self::surface_contract_failure(call, &surface_call, &reply);
+            };
+            reply.terminal = public_terminal;
+            reply.extensions.clone_from(&call.extensions);
             reply
         } else {
-            Self::surface_contract_failure(call, &reply)
+            Self::surface_contract_failure(call, &surface_call, &reply)
         }
+    }
+}
+
+fn adapter_ready_receipt(
+    epoch: u64,
+    registration_revision: u64,
+    namespace: &NcmNamespace,
+    surface_ready_receipt_sha256: &str,
+    challenge_nonce: [u8; 32],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(READY_RECEIPT_DOMAIN);
+    digest.update(epoch.to_be_bytes());
+    digest.update(registration_revision.to_be_bytes());
+    digest_field(&mut digest, namespace.as_str().as_bytes());
+    digest_field(&mut digest, surface_ready_receipt_sha256.as_bytes());
+    digest.update(challenge_nonce);
+    hex_digest(&digest.finalize())
+}
+
+/// Issues an adapter reconciliation receipt for an invoked mutation whose
+/// returned surface envelope cannot be trusted as a provider terminal. The
+/// digest proves the exact opaque dispatch and observed reply; it deliberately
+/// does not claim that any provider effect committed.
+fn adapter_unknown_effect_receipt(
+    call: &ProviderCall,
+    surface_call: &NcmSurfaceCall,
+    reply: &ProviderReply,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(UNKNOWN_EFFECT_RECEIPT_DOMAIN);
+    digest_public_call(&mut digest, call);
+    digest_field(&mut digest, NCM_PROVIDER_ID.as_bytes());
+    digest_field(
+        &mut digest,
+        surface_call.operation.capability_id().as_bytes(),
+    );
+    digest_field(&mut digest, surface_call.namespace.as_str().as_bytes());
+    digest.update(surface_call.registration_revision.to_be_bytes());
+    digest_field(&mut digest, surface_call.ready_receipt_sha256.as_bytes());
+    digest_field(&mut digest, surface_call.request_id.as_bytes());
+    digest_field(&mut digest, surface_call.operation_id.as_bytes());
+    digest_optional_str(&mut digest, surface_call.idempotency_key.as_deref());
+    digest.update(surface_call.expected_state_generation.to_be_bytes());
+    digest.update(surface_call.control.deadline_utc_micros().to_be_bytes());
+    digest.update(surface_call.control.remaining_millis().to_be_bytes());
+    // Every surface dispatch passed a live preflight snapshot. The receipt
+    // binds that dispatched state, not later cooperative cancellation.
+    digest.update([0]);
+    digest_payload(&mut digest, &surface_call.payload);
+    digest.update(
+        u64::try_from(surface_call.required_capabilities.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for capability in &surface_call.required_capabilities {
+        digest_field(&mut digest, capability.as_str().as_bytes());
+    }
+    digest.update(
+        u64::try_from(surface_call.extensions.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for extension in &surface_call.extensions {
+        digest_extension(&mut digest, extension);
+    }
+    digest_reply(&mut digest, reply);
+    digest.finalize().into()
+}
+
+fn encoded_request_bytes(call: &ProviderCall, control: RequestControl) -> u64 {
+    // The runtime envelope has no serde wire type. Count its canonical binary
+    // framing explicitly: fixed-width scalars at their wire width and every
+    // variable field as an unsigned 64-bit length followed by its bytes.
+    let mut total = framed_str_bytes(call.operation.capability_id());
+    total = total.saturating_add(framed_str_bytes(call.provider_id.as_str()));
+    total = total.saturating_add(8);
+    total = total.saturating_add(framed_str_bytes(&call.ready_receipt_sha256));
+    total = total.saturating_add(encoded_scope_bytes(&call.exact_scope));
+    total = total.saturating_add(framed_str_bytes(&call.request_id));
+    total = total.saturating_add(framed_str_bytes(&call.operation_id));
+    total = total.saturating_add(8);
+    total = total.saturating_add(encoded_optional_str_bytes(call.idempotency_key.as_deref()));
+    total = total.saturating_add(8);
+    total = total.saturating_add(8);
+    total = total.saturating_add(match control.cancellation {
+        tracedecay_memory_provider_api::contract::CancellationState::Live => {
+            framed_str_bytes("live")
+        }
+        tracedecay_memory_provider_api::contract::CancellationState::Cancelled => {
+            framed_str_bytes("cancelled")
+        }
+    });
+    total = total.saturating_add(encoded_payload_bytes(&call.payload));
+    total = total.saturating_add(8);
+    for capability in &call.required_capabilities {
+        total = total.saturating_add(framed_str_bytes(capability.as_str()));
+    }
+    total = total.saturating_add(8);
+    for extension in &call.extensions {
+        total = total.saturating_add(encoded_extension_bytes(extension));
+    }
+    total
+}
+
+fn encoded_response_bytes(call: &ProviderCall, reply: &ProviderReply) -> u64 {
+    // Account for the eventual public reply after identity and adapter-side
+    // extensions are reattached, not only for the licensed-surface body.
+    let mut total = framed_str_bytes(reply.terminal.operation().as_wire());
+    total = total.saturating_add(framed_str_bytes(reply.terminal.provider_id().as_str()));
+    total = total.saturating_add(framed_str_bytes(reply.terminal.terminal_code().as_wire()));
+    total = total.saturating_add(encoded_committed_effect_bytes(
+        reply.terminal.committed_effect(),
+    ));
+    total = total.saturating_add(encoded_fallback_bytes(reply.terminal.fallback()));
+    total = total.saturating_add(framed_str_bytes(&call.operation_id));
+    total = total.saturating_add(framed_str_bytes(&call.exact_scope.exact_scope_sha256()));
+    total = total.saturating_add(encoded_optional_str_bytes(reply.terminal.diagnostic_id()));
+    total = total.saturating_add(1);
+    if let Some(payload) = &reply.payload {
+        total = total.saturating_add(encoded_payload_bytes(payload));
+    }
+    total = total.saturating_add(8);
+    for warning in &reply.warnings {
+        total = total.saturating_add(framed_str_bytes(warning));
+    }
+    total = total.saturating_add(8);
+    for extension in &call.extensions {
+        total = total.saturating_add(encoded_extension_bytes(extension));
+    }
+    total.saturating_add(8)
+}
+
+fn encoded_committed_effect_bytes(effect: &CommittedEffectEvidence) -> u64 {
+    let mut total = framed_str_bytes(effect.state().as_wire());
+    total = total.saturating_add(encoded_optional_str_bytes(effect.committed_boundary()));
+    total = total.saturating_add(encoded_optional_u64_bytes(effect.state_generation_before()));
+    total = total.saturating_add(encoded_optional_u64_bytes(effect.state_generation_after()));
+    total = total.saturating_add(encoded_string_vector_bytes(effect.committed_item_refs()));
+    total = total.saturating_add(encoded_string_vector_bytes(effect.uncommitted_item_refs()));
+    total = total.saturating_add(encoded_optional_str_bytes(effect.provider_receipt_sha256()));
+    total = total.saturating_add(encoded_optional_str_bytes(effect.reconciliation_action()));
+    total.saturating_add(encoded_optional_str_bytes(effect.verification_sha256()))
+}
+
+fn encoded_fallback_bytes(fallback: &FallbackDirective) -> u64 {
+    let mut total = framed_str_bytes(fallback.eligibility().as_wire());
+    total = total.saturating_add(encoded_optional_str_bytes(
+        fallback.source_provider_id().map(OwnedProviderId::as_str),
+    ));
+    total = total.saturating_add(1);
+    if let Some(policy) = fallback.policy() {
+        total = total.saturating_add(framed_str_bytes(policy.policy_id()));
+        total = total.saturating_add(8);
+        total = total.saturating_add(framed_str_bytes(policy.target_provider_id().as_str()));
+    }
+    total.saturating_add(encoded_optional_str_bytes(fallback.reason()))
+}
+
+fn encoded_optional_u64_bytes(value: Option<u64>) -> u64 {
+    1_u64.saturating_add(value.map_or(0, |_| 8))
+}
+
+fn encoded_string_vector_bytes(values: &[String]) -> u64 {
+    values.iter().fold(8_u64, |total, value| {
+        total.saturating_add(framed_str_bytes(value))
+    })
+}
+
+fn encoded_scope_bytes(scope: &OwnedExactScope) -> u64 {
+    let mut total = 8_u64;
+    for value in [
+        &scope.profile_id,
+        &scope.project_id,
+        &scope.repository_identity,
+        &scope.worktree_identity,
+        &scope.branch_identity,
+        &scope.agent_session_id,
+    ] {
+        total = total.saturating_add(framed_str_bytes(value));
+    }
+    total
+}
+
+fn encoded_payload_bytes(payload: &CanonicalPayload) -> u64 {
+    framed_str_bytes(payload.contract_id.as_str())
+        .saturating_add(framed_slice_bytes(&payload.bytes))
+        .saturating_add(framed_str_bytes(&payload.sha256))
+}
+
+fn encoded_extension_bytes(extension: &OwnedOpaqueExtension) -> u64 {
+    framed_str_bytes(extension.extension_id.as_str())
+        .saturating_add(4)
+        .saturating_add(1)
+        .saturating_add(framed_str_bytes(&extension.payload_sha256))
+        .saturating_add(framed_slice_bytes(&extension.canonical_payload))
+}
+
+fn encoded_optional_str_bytes(value: Option<&str>) -> u64 {
+    1_u64.saturating_add(value.map_or(0, framed_str_bytes))
+}
+
+fn framed_str_bytes(value: &str) -> u64 {
+    framed_slice_bytes(value.as_bytes())
+}
+
+fn framed_slice_bytes(value: &[u8]) -> u64 {
+    8_u64.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
+}
+
+fn opaque_surface_id(namespace: &NcmNamespace, kind: &[u8], public_value: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(OPAQUE_ID_DOMAIN);
+    digest_field(&mut digest, namespace.as_str().as_bytes());
+    digest_field(&mut digest, kind);
+    digest_field(&mut digest, public_value.as_bytes());
+    hex_digest(&digest.finalize())
+}
+
+fn remove_exact_scope_identity(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                remove_exact_scope_identity(value);
+            }
+        }
+        Value::Object(values) => {
+            values.remove("exact_scope_identity");
+            for value in values.values_mut() {
+                remove_exact_scope_identity(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_caller_identity_fields(
+    value: &mut Value,
+    call: &ProviderCall,
+    opaque: &OpaqueCallerIds,
+) -> bool {
+    match value {
+        Value::Array(values) => values
+            .iter_mut()
+            .all(|value| rewrite_caller_identity_fields(value, call, opaque)),
+        Value::Object(values) => values.iter_mut().all(|(key, value)| match key.as_str() {
+            "request_id" | "request_identity" => {
+                replace_identity_value(value, &call.request_id, &opaque.request_id)
+            }
+            "operation_id" => {
+                replace_identity_value(value, &call.operation_id, &opaque.operation_id)
+            }
+            "idempotency_key" => match (&call.idempotency_key, &opaque.idempotency_key) {
+                (Some(public), Some(opaque)) => replace_identity_value(value, public, opaque),
+                (None, None) => value.is_null(),
+                _ => false,
+            },
+            _ => rewrite_caller_identity_fields(value, call, opaque),
+        }),
+        _ => true,
+    }
+}
+
+fn replace_identity_value(value: &mut Value, public: &str, opaque: &str) -> bool {
+    let Value::String(current) = value else {
+        return false;
+    };
+    if current != public {
+        return false;
+    }
+    current.clear();
+    current.push_str(opaque);
+    true
+}
+
+fn json_has_exact_scope_identity(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(json_has_exact_scope_identity),
+        Value::Object(values) => {
+            values.contains_key("exact_scope_identity")
+                || values.values().any(json_has_exact_scope_identity)
+        }
+        _ => false,
+    }
+}
+
+fn json_contains_scope_component(value: &Value, scope: &OwnedExactScope) -> bool {
+    let components = [
+        scope.profile_id.as_str(),
+        scope.project_id.as_str(),
+        scope.repository_identity.as_str(),
+        scope.worktree_identity.as_str(),
+        scope.branch_identity.as_str(),
+        scope.agent_session_id.as_str(),
+    ];
+    json_contains_any(value, &components)
+}
+
+fn json_contains_public_caller_id(value: &Value, call: &ProviderCall) -> bool {
+    if let Some(idempotency_key) = call.idempotency_key.as_deref() {
+        json_contains_any(
+            value,
+            &[&call.request_id, &call.operation_id, idempotency_key],
+        )
+    } else {
+        json_contains_any(value, &[&call.request_id, &call.operation_id])
+    }
+}
+
+fn serialized_contains_scope_component(bytes: &[u8], scope: &OwnedExactScope) -> bool {
+    [
+        scope.profile_id.as_bytes(),
+        scope.project_id.as_bytes(),
+        scope.repository_identity.as_bytes(),
+        scope.worktree_identity.as_bytes(),
+        scope.branch_identity.as_bytes(),
+        scope.agent_session_id.as_bytes(),
+    ]
+    .into_iter()
+    .any(|component| {
+        bytes
+            .windows(component.len())
+            .any(|window| window == component)
+    })
+}
+
+fn serialized_contains_public_caller_id(bytes: &[u8], call: &ProviderCall) -> bool {
+    let contains = |value: &str| {
+        bytes
+            .windows(value.len())
+            .any(|window| window == value.as_bytes())
+    };
+    contains(&call.request_id)
+        || contains(&call.operation_id)
+        || call.idempotency_key.as_deref().is_some_and(contains)
+}
+
+fn json_contains_any(value: &Value, forbidden: &[&str]) -> bool {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_any(value, forbidden)),
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            forbidden.iter().any(|item| key.contains(item)) || json_contains_any(value, forbidden)
+        }),
+        Value::String(value) => forbidden.iter().any(|item| value.contains(item)),
+        _ => false,
+    }
+}
+
+fn surface_forbidden_identities<'a>(
+    call: &'a ProviderCall,
+    surface_call: &'a NcmSurfaceCall,
+) -> Vec<&'a str> {
+    let mut forbidden = vec![
+        call.exact_scope.profile_id.as_str(),
+        call.exact_scope.project_id.as_str(),
+        call.exact_scope.repository_identity.as_str(),
+        call.exact_scope.worktree_identity.as_str(),
+        call.exact_scope.branch_identity.as_str(),
+        call.exact_scope.agent_session_id.as_str(),
+        call.request_id.as_str(),
+        call.operation_id.as_str(),
+        call.ready_receipt_sha256.as_str(),
+        surface_call.namespace.as_str(),
+        surface_call.request_id.as_str(),
+        surface_call.operation_id.as_str(),
+        surface_call.ready_receipt_sha256.as_str(),
+    ];
+    if let Some(value) = call.idempotency_key.as_deref() {
+        forbidden.push(value);
+    }
+    if let Some(value) = surface_call.idempotency_key.as_deref() {
+        forbidden.push(value);
+    }
+    forbidden
+}
+
+fn handshake_metadata_is_scope_safe(
+    request: &HandshakeRequest,
+    surface_request: &NcmSurfaceHandshakeRequest,
+    response: &NcmSurfaceHandshakeResponse,
+) -> bool {
+    let public_scope_digest = request.exact_scope.exact_scope_sha256();
+    let forbidden = [
+        request.exact_scope.profile_id.as_str(),
+        request.exact_scope.project_id.as_str(),
+        request.exact_scope.repository_identity.as_str(),
+        request.exact_scope.worktree_identity.as_str(),
+        request.exact_scope.branch_identity.as_str(),
+        request.exact_scope.agent_session_id.as_str(),
+        request.request_id.as_str(),
+        public_scope_digest.as_str(),
+        surface_request.namespace.as_str(),
+        surface_request.request_id.as_str(),
+    ];
+    response
+        .terminal
+        .diagnostic_id()
+        .is_none_or(|value| !text_contains_any(value, &forbidden))
+        && response
+            .warnings
+            .iter()
+            .all(|value| !text_contains_any(value, &forbidden))
+}
+
+fn text_contains_any(value: &str, forbidden: &[&str]) -> bool {
+    forbidden
+        .iter()
+        .any(|identity| !identity.is_empty() && value.contains(identity))
+}
+
+fn digest_public_call(digest: &mut Sha256, call: &ProviderCall) {
+    digest_field(digest, call.operation.as_wire().as_bytes());
+    digest_field(digest, call.provider_id.as_str().as_bytes());
+    digest.update(call.registration_revision.to_be_bytes());
+    digest_field(digest, call.ready_receipt_sha256.as_bytes());
+    for component in [
+        &call.exact_scope.profile_id,
+        &call.exact_scope.project_id,
+        &call.exact_scope.repository_identity,
+        &call.exact_scope.worktree_identity,
+        &call.exact_scope.branch_identity,
+        &call.exact_scope.agent_session_id,
+    ] {
+        digest_field(digest, component.as_bytes());
+    }
+    digest.update(call.exact_scope.scope_revision.to_be_bytes());
+    digest_field(digest, call.exact_scope.exact_scope_sha256().as_bytes());
+    digest_field(digest, call.request_id.as_bytes());
+    digest_field(digest, call.operation_id.as_bytes());
+    digest.update(call.expected_state_generation.to_be_bytes());
+    digest_optional_str(digest, call.idempotency_key.as_deref());
+    digest.update(call.control.deadline_utc_micros().to_be_bytes());
+    digest.update(call.control.remaining_millis().to_be_bytes());
+    // The adapter snapshots a live control immediately before dispatch.
+    digest.update([0]);
+    digest_payload(digest, &call.payload);
+    digest.update(
+        u64::try_from(call.required_capabilities.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for capability in &call.required_capabilities {
+        digest_field(digest, capability.as_str().as_bytes());
+    }
+    digest.update(
+        u64::try_from(call.extensions.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for extension in &call.extensions {
+        digest_extension(digest, extension);
+    }
+}
+
+fn digest_optional_str(digest: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            digest_field(digest, value.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+}
+
+fn digest_optional_u64(digest: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+}
+
+fn digest_payload(digest: &mut Sha256, payload: &CanonicalPayload) {
+    digest_field(digest, payload.contract_id.as_str().as_bytes());
+    digest_field(digest, &payload.bytes);
+    digest_field(digest, payload.sha256.as_bytes());
+}
+
+fn digest_extension(digest: &mut Sha256, extension: &OwnedOpaqueExtension) {
+    digest_field(digest, extension.extension_id.as_str().as_bytes());
+    digest.update(extension.extension_version.to_be_bytes());
+    digest.update([u8::from(extension.required)]);
+    digest_field(digest, extension.payload_sha256.as_bytes());
+    digest_field(digest, &extension.canonical_payload);
+}
+
+fn digest_effect(digest: &mut Sha256, effect: &CommittedEffectEvidence) {
+    digest_field(digest, effect.state().as_wire().as_bytes());
+    digest_optional_str(digest, effect.committed_boundary());
+    digest_optional_u64(digest, effect.state_generation_before());
+    digest_optional_u64(digest, effect.state_generation_after());
+    digest.update(
+        u64::try_from(effect.committed_item_refs().len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for item_ref in effect.committed_item_refs() {
+        digest_field(digest, item_ref.as_bytes());
+    }
+    digest.update(
+        u64::try_from(effect.uncommitted_item_refs().len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for item_ref in effect.uncommitted_item_refs() {
+        digest_field(digest, item_ref.as_bytes());
+    }
+    digest_optional_str(digest, effect.provider_receipt_sha256());
+    digest_optional_str(digest, effect.reconciliation_action());
+    digest_optional_str(digest, effect.verification_sha256());
+}
+
+fn digest_fallback(digest: &mut Sha256, fallback: &FallbackDirective) {
+    digest_field(digest, fallback.eligibility().as_wire().as_bytes());
+    digest_optional_str(
+        digest,
+        fallback.source_provider_id().map(OwnedProviderId::as_str),
+    );
+    match fallback.policy() {
+        Some(policy) => {
+            digest.update([1]);
+            digest_field(digest, policy.policy_id().as_bytes());
+            digest.update(policy.policy_revision().to_be_bytes());
+            digest_field(digest, policy.target_provider_id().as_str().as_bytes());
+        }
+        None => digest.update([0]),
+    }
+    digest_optional_str(digest, fallback.reason());
+}
+
+fn digest_reply(digest: &mut Sha256, reply: &ProviderReply) {
+    digest_field(digest, reply.terminal.operation().as_wire().as_bytes());
+    digest_field(digest, reply.terminal.provider_id().as_str().as_bytes());
+    digest_field(digest, reply.terminal.terminal_code().as_wire().as_bytes());
+    digest_effect(digest, reply.terminal.committed_effect());
+    digest_fallback(digest, reply.terminal.fallback());
+    digest_field(digest, reply.terminal.operation_id().as_bytes());
+    digest_field(digest, reply.terminal.exact_scope_sha256().as_bytes());
+    digest_optional_str(digest, reply.terminal.diagnostic_id());
+    match &reply.payload {
+        Some(payload) => {
+            digest.update([1]);
+            digest_payload(digest, payload);
+        }
+        None => digest.update([0]),
+    }
+    digest.update(
+        u64::try_from(reply.warnings.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for warning in &reply.warnings {
+        digest_field(digest, warning.as_bytes());
+    }
+    digest.update(
+        u64::try_from(reply.extensions.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for extension in &reply.extensions {
+        digest_extension(digest, extension);
+    }
+    digest.update(reply.state_generation.to_be_bytes());
+}
+
+fn digest_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.update(value);
+}
+
+fn digest_limits(digest: &mut Sha256, limits: ProviderLimits) {
+    for limit in [
+        limits.request_bytes,
+        limits.response_bytes,
+        limits.observation_batch_items,
+        limits.recall_candidates,
+        limits.concurrent_operations,
+        limits.operation_millis,
+        limits.snapshot_bytes,
+        limits.inspection_items,
+    ] {
+        digest.update(limit.to_be_bytes());
     }
 }
 

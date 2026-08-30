@@ -304,6 +304,15 @@ async fn project_server_cache_hit_skips_open_and_singleflights_first_miss() {
     let direct_server = direct_server.expect("direct project server");
     let alias_server = alias_server.expect("aliased project server");
     assert!(std::sync::Arc::ptr_eq(&direct_server, &alias_server));
+    #[cfg(feature = "memory-provider-host")]
+    let retained_memory_provider_host = {
+        let mount = direct_server.memory_provider_host_mount_for_test();
+        assert!(
+            mount.registry().is_none(),
+            "the production host mount must stay inert until an application port is supplied"
+        );
+        Arc::clone(mount)
+    };
     assert_eq!(
         engine
             .project_open_attempts
@@ -333,6 +342,11 @@ async fn project_server_cache_hit_skips_open_and_singleflights_first_miss() {
         .expect("cached project server");
     eprintln!("[cache-test] phase=cached-open done");
     assert!(std::sync::Arc::ptr_eq(&direct_server, &cached));
+    #[cfg(feature = "memory-provider-host")]
+    assert!(Arc::ptr_eq(
+        &retained_memory_provider_host,
+        cached.memory_provider_host_mount_for_test(),
+    ));
     assert_eq!(
         engine
             .project_open_attempts
@@ -373,6 +387,10 @@ async fn project_server_cache_hit_skips_open_and_singleflights_first_miss() {
     eprintln!(
         "same_worktree_live_engine_proxy clients={PARALLEL_CLIENT_IDENTITIES} open_attempts=1 retained_servers={retained_servers} cache_hits={PARALLEL_CLIENT_IDENTITIES}"
     );
+    #[cfg(feature = "memory-provider-host")]
+    let released_memory_provider_host = Arc::downgrade(&retained_memory_provider_host);
+    #[cfg(feature = "memory-provider-host")]
+    drop(retained_memory_provider_host);
     let released_server = Arc::downgrade(&direct_server);
     drop(cached);
     drop(alias_server);
@@ -384,6 +402,11 @@ async fn project_server_cache_hit_skips_open_and_singleflights_first_miss() {
     assert!(
         released_server.upgrade().is_none(),
         "shutdown must break the server-to-administration ownership cycle"
+    );
+    #[cfg(feature = "memory-provider-host")]
+    assert!(
+        released_memory_provider_host.upgrade().is_none(),
+        "the memory-provider host mount must retire with its exact cached project server"
     );
     eprintln!("[cache-test] phase=shutdown done");
 }

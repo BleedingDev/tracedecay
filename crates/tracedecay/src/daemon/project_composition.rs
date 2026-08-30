@@ -29,6 +29,23 @@ pub(super) struct ProductionProjectComposition {
     pub(super) semantic_auto_download_enabled: Option<bool>,
 }
 
+/// Typed product activation seam for a project-scoped provider host.
+///
+/// Production intentionally supplies `Disabled` today. A future enabled
+/// caller cannot omit the Native application port because that authority is a
+/// required field of the `NativeProviderActivation::Enabled` variant.
+#[cfg(feature = "memory-provider-host")]
+fn mount_project_memory_provider_host(
+    activation: tracedecay_memory_provider_registry::NativeProviderActivation,
+) -> Result<crate::mcp::server::MemoryProviderHostMount> {
+    let composition =
+        tracedecay_memory_provider_registry::ProjectMemoryProviderComposition::compose(activation)
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("could not compose project memory-provider host: {error}"),
+            })?;
+    Ok(Arc::new(composition))
+}
+
 pub(super) fn project_server_response_lifecycle_has_in_flight(
     lifecycle: &crate::mcp::server::ProjectServerResponseLifecycle,
 ) -> bool {
@@ -367,6 +384,14 @@ async fn production_project_server_inner(
         ));
     }
 
+    // Mount only after every cache lookup has missed, and before either MCP
+    // candidate can be published. Disabled composition creates no fabric,
+    // provider adapter, storage, or background work.
+    #[cfg(feature = "memory-provider-host")]
+    let memory_provider_host_mount = mount_project_memory_provider_host(
+        tracedecay_memory_provider_registry::NativeProviderActivation::Disabled,
+    )?;
+
     let current_key = Arc::new(tokio::sync::Mutex::new(key.clone()));
     let current_project_path = Arc::new(tokio::sync::Mutex::new(
         canonical_project_path.to_path_buf(),
@@ -555,6 +580,11 @@ async fn production_project_server_inner(
     .with_application_invocation_executor(Arc::clone(&application_invocation_executor))
     .with_daemon_invocation_service(invocation.service.clone())
     .with_retained_project_server_resolver(Arc::clone(&retained_server_resolver));
+    #[cfg(feature = "memory-provider-host")]
+    {
+        core_context =
+            core_context.with_memory_provider_host_mount(Arc::clone(&memory_provider_host_mount));
+    }
     if let Some(reconciler) = automation_scheduler_reconciler.as_ref() {
         core_context = core_context.with_automation_scheduler_reconciler(Arc::clone(reconciler));
     }
@@ -937,6 +967,11 @@ async fn production_project_server_inner(
             .with_daemon_invocation_service(invocation.service.clone())
             .with_startup_catch_up_enabled(runtime.startup_catch_up())
             .with_retained_project_server_resolver(retained_server_resolver);
+            #[cfg(feature = "memory-provider-host")]
+            {
+                full_context = full_context
+                    .with_memory_provider_host_mount(Arc::clone(&memory_provider_host_mount));
+            }
             if let Some(reconciler) = automation_scheduler_reconciler {
                 full_context = full_context.with_automation_scheduler_reconciler(reconciler);
             }

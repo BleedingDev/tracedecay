@@ -446,6 +446,10 @@ pub struct McpServer {
         Option<Arc<tracedecay_usecases::observability::DeliverySettlementAuthorityV1>>,
     delivery_settlement_recorder:
         Option<Arc<tracedecay_usecases::observability::BoundedDeliverySettlementRecorderV1>>,
+    /// Retains the product provider composition for exactly this cached
+    /// project-server lifetime. Disabled composition is an inert enum value.
+    #[cfg(feature = "memory-provider-host")]
+    _memory_provider_host_mount: Option<MemoryProviderHostMount>,
     /// Daemon-owned route liveness. A failed post-open health check revokes
     /// every tool on retained transports before cache retirement can await.
     project_server_live: Option<Arc<AtomicBool>>,
@@ -783,6 +787,8 @@ impl McpServer {
             daemon_invocation_service,
             delivery_settlement_authority,
             delivery_settlement_recorder,
+            #[cfg(feature = "memory-provider-host")]
+            memory_provider_host_mount,
             project_server_live,
             #[cfg(any(test, feature = "test-transport"))]
             host_admission_test_runtime,
@@ -1063,6 +1069,8 @@ impl McpServer {
             daemon_invocation_service,
             delivery_settlement_authority,
             delivery_settlement_recorder,
+            #[cfg(feature = "memory-provider-host")]
+            _memory_provider_host_mount: memory_provider_host_mount,
             project_server_live,
             project_server_lifecycle: ProjectServerResponseLifecycle::default(),
             dispatch_authority: RetainedDispatchAuthority::new(dispatch_server.clone()),
@@ -1126,6 +1134,13 @@ impl McpServer {
     /// Returns the active scope prefix, if the server was launched from a subdirectory.
     pub fn scope_prefix(&self) -> Option<&str> {
         self.scope_prefix.as_deref()
+    }
+
+    #[cfg(all(test, feature = "memory-provider-host"))]
+    pub(crate) fn memory_provider_host_mount_for_test(&self) -> &MemoryProviderHostMount {
+        self._memory_provider_host_mount
+            .as_ref()
+            .expect("production project server must retain its provider host mount")
     }
 
     pub(crate) async fn reconcile_automation_scheduler(
