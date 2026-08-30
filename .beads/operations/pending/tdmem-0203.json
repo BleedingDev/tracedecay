@@ -1,10 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 1,
+  "attempt": 2,
   "issue_id": "tdmem-0203",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Closing the observation contract only after proving retry-safe idempotency, mandatory exact coding scope, explicit unknown-extension handling, and a strict separation between admitted observations and provider-internal memory effects.",
+  "retry_note": "The first evidence run rejected only a documentation phrase split by Markdown emphasis. The documentation now contains the exact canonical settlement wording; contract semantics and tests are unchanged.",
   "checks": [
     {
       "name": "provider observation contract tests",
