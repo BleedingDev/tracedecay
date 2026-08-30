@@ -8,13 +8,11 @@
 
 use std::sync::Arc;
 
-pub use tracedecay_memory_fabric::{FabricError, MemoryFabric, ProviderMode, ProviderStatus};
 use tracedecay_memory_fabric::FabricConfig;
+pub use tracedecay_memory_fabric::{FabricError, MemoryFabric, ProviderMode, ProviderStatus};
 use tracedecay_memory_provider_api::OwnedProviderId;
 pub use tracedecay_memory_provider_native::NativeMemoryApplicationPort;
-use tracedecay_memory_provider_native::{
-    NATIVE_PROVIDER_ID, NativeAdapterError, NativeProvider,
-};
+use tracedecay_memory_provider_native::{NATIVE_PROVIDER_ID, NativeAdapterError, NativeProvider};
 
 /// Enabled Native-provider participation selected by the composition root.
 ///

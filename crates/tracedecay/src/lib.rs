@@ -87,6 +87,14 @@ pub mod monitor;
 pub mod profile_registry_maintenance;
 pub mod project_registry;
 pub mod resolution;
+#[cfg(feature = "memory-provider-fabric")]
+mod memory_provider_composition;
+#[cfg(feature = "memory-provider-fabric")]
+pub use memory_provider_composition::{
+    FabricError, MemoryFabric, NativeMemoryApplicationPort, NativeMemoryFabricConfig,
+    NativeMemoryFabricMount, NativeMemoryMode, NativeMemoryMountError, ProviderMode,
+    ProviderStatus, compose_native_memory_fabric,
+};
 mod runtime_ports;
 pub use runtime_ports::register_runtime_ports;
 #[cfg(test)]

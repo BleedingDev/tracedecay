@@ -70,6 +70,14 @@ include = [
 # `--all-features` is test-only because it includes `test-transport`.
 default = ["production"]
 
+# Product-owned Memory Fabric composition. Default-off: neither `default` nor
+# `production` includes it, and feature enablement alone performs no runtime mount.
+memory-provider-fabric = [
+    "dep:tracedecay-memory-fabric",
+    "dep:tracedecay-memory-provider-api",
+    "dep:tracedecay-memory-provider-native",
+]
+
 # Opt-in profiling. Never in `default` and never in `production`: with no
 # profiling feature selected every hotpath macro expands to a no-op, so the
 # instrumented call sites below compile identically in both modes.
@@ -348,6 +356,11 @@ semantic-gpu-cuda = [
     "tracedecay-usecases/semantic-gpu-cuda",
 ]
 
+[[test]]
+name = "memory_provider_composition"
+path = "tests/product_memory_provider/composition.rs"
+required-features = ["memory-provider-fabric"]
+
 [lib]
 name = "tracedecay"
 
@@ -425,6 +438,9 @@ tracedecay-host-admission = { path = "../tracedecay-host-admission", version = "
 tracedecay-mcp = { path = "../tracedecay-mcp", version = "0.1.0" }
 tracedecay-lsp = { path = "../tracedecay-lsp", version = "0.1.0" }
 tracedecay-maintenance = { path = "../tracedecay-maintenance", version = "0.1.0" }
+tracedecay-memory-fabric = { path = "../tracedecay-memory-fabric", version = "0.1.0", optional = true }
+tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api", version = "0.1.0", optional = true }
+tracedecay-memory-provider-native = { path = "../tracedecay-memory-provider-native", version = "0.1.0", optional = true }
 tracedecay-global-db = { path = "../tracedecay-global-db", version = "0.1.0" }
 tracedecay-graph-db = { path = "../tracedecay-graph-db", version = "0.1.0" }
 tracedecay-policy = { path = "../tracedecay-policy", version = "0.1.0" }

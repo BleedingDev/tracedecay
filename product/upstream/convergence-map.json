@@ -7,7 +7,8 @@
         "tdmem-0302",
         "tdmem-0303",
         "tdmem-0304",
-        "tdmem-0305"
+        "tdmem-0305",
+        "tdmem-0307"
       ],
       "generated": {
         "generator_path": "rust-toolchain.toml",
@@ -35,7 +36,10 @@
         "cargo clippy -p tracedecay-memory-provider-ncm --all-targets --locked -- -D warnings",
         "cargo test -p tracedecay-memory-provider-ncm --locked",
         "cargo clippy -p tracedecay-memory-conformance --all-targets --locked -- -D warnings",
-        "cargo test -p tracedecay-memory-conformance --locked"
+        "cargo test -p tracedecay-memory-conformance --locked",
+        "cargo check -p tracedecay --no-default-features --lib --locked",
+        "cargo check -p tracedecay --no-default-features --features memory-provider-fabric --lib --locked",
+        "cargo test -p tracedecay --no-default-features --features memory-provider-fabric --test memory_provider_composition --locked"
       ]
     },
     {
@@ -70,6 +74,70 @@
         "cargo clippy -p tracedecay-memory-conformance --all-targets --locked -- -D warnings",
         "cargo test -p tracedecay-memory-conformance --locked"
       ]
+    },
+    {
+      "bead_ids": [
+        "tdmem-0307"
+      ],
+      "line_budget": 48,
+      "path": "crates/tracedecay/Cargo.toml",
+      "rationale": "Declare one opt-in root feature and optional product-owned dependencies so ordinary and production builds cannot construct Memory Fabric infrastructure.",
+      "rebase_or_removal_plan": "Remove the feature, optional dependency declarations, and dedicated integration-test target without changing an existing production feature.",
+      "semantic_invariants": [
+        "The default and production feature sets exclude memory-provider-fabric.",
+        "All Memory Fabric dependencies are optional and activated only by the explicit feature.",
+        "The root package remains the only composition layer permitted to know the concrete Native adapter."
+      ],
+      "status": "active",
+      "touch_point": "daemon_composition_mount",
+      "verification": [
+        "python3 tests/product_memory_composition_feature_test.py",
+        "cargo tree -p tracedecay --no-default-features -e normal --prefix none --locked",
+        "cargo check -p tracedecay --no-default-features --features memory-provider-fabric --lib --locked"
+      ]
+    },
+    {
+      "bead_ids": [
+        "tdmem-0307"
+      ],
+      "line_budget": 24,
+      "path": "crates/tracedecay/src/lib.rs",
+      "rationale": "Expose the explicit feature-gated mount while leaving the existing register_runtime_ports path independent of Memory Fabric.",
+      "rebase_or_removal_plan": "Delete only the cfg-gated module declaration and re-export block.",
+      "semantic_invariants": [
+        "No default runtime registration calls the Memory Fabric composition function.",
+        "The module and its public seam do not exist when memory-provider-fabric is disabled.",
+        "Existing public modules and runtime-port registration remain unchanged."
+      ],
+      "status": "active",
+      "touch_point": "daemon_composition_mount",
+      "verification": [
+        "python3 tests/product_memory_composition_feature_test.py",
+        "cargo check -p tracedecay --no-default-features --lib --locked",
+        "cargo check -p tracedecay --no-default-features --features memory-provider-fabric --lib --locked"
+      ]
+    },
+    {
+      "bead_ids": [
+        "tdmem-0307"
+      ],
+      "line_budget": 180,
+      "path": "crates/tracedecay/src/memory_provider_composition.rs",
+      "rationale": "Construct one finite provider-neutral fabric and one Native adapter only after an explicit caller supplies the existing Native application authority.",
+      "rebase_or_removal_plan": "Delete the isolated module; no provider state, migration, host route, or public transport schema remains.",
+      "semantic_invariants": [
+        "Feature enablement alone starts no thread, queue, global registration, catalog mutation, context contribution, or state creation.",
+        "Disabled behavior is represented by absence of the feature and mount call, so no disabled configuration can instantiate provider infrastructure.",
+        "The concrete NativeProvider remains private to the composition module and host routes receive only provider-neutral fabric types.",
+        "Invalid revision or resource limits fail before the Native authority is inspected."
+      ],
+      "status": "active",
+      "touch_point": "daemon_composition_mount",
+      "verification": [
+        "cargo clippy -p tracedecay --no-default-features --features memory-provider-fabric --lib --test memory_provider_composition --locked -- -D warnings",
+        "cargo test -p tracedecay --no-default-features --features memory-provider-fabric --test memory_provider_composition --locked",
+        "python3 tests/product_memory_composition_feature_test.py"
+      ]
     }
   ],
   "entry_contract": {
@@ -99,11 +167,11 @@
   "purpose": "One reviewed record for every intentional edit to an upstream-owned existing file, preserving rationale, semantic invariants, verification, and the path back to upstream convergence.",
   "schema_version": 1,
   "snapshot": {
-    "composition_root_files": 0,
+    "composition_root_files": 3,
     "exception_zone_files": 0,
-    "observed_state": "The product branch changes only additive workspace membership and generated path-package lock entries; provider API, fabric, Native adapter, topology-neutral NCM boundary, and provider-neutral conformance harness remain product-owned.",
-    "total_upstream_changed_lines": 38,
-    "upstream_existing_production_files": 2,
+    "observed_state": "M2 adds one default-off, explicit root composition seam. Ordinary and production builds retain no Memory Fabric dependencies or runtime mount; the opt-in path constructs one bounded fabric and keeps the concrete Native adapter private.",
+    "total_upstream_changed_lines": 212,
+    "upstream_existing_production_files": 5,
     "upstream_existing_test_or_fixture_files": 0
   },
   "upstream_floor_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403"

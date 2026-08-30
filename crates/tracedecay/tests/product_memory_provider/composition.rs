@@ -1,8 +1,8 @@
 //! Default-off Native Memory Fabric composition journeys.
 
 use std::error::Error;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tracedecay::{
     FabricError, NativeMemoryApplicationPort, NativeMemoryFabricConfig, NativeMemoryMode,
@@ -72,11 +72,7 @@ impl MockNativePort {
                 CommittedEffectState::None
             };
         ProviderReply {
-            terminal: Self::terminal(
-                call.operation_id.clone(),
-                terminal_code,
-                committed_effect,
-            ),
+            terminal: Self::terminal(call.operation_id.clone(), terminal_code, committed_effect),
             payload: (terminal_code == TerminalCode::Success).then(|| call.payload.clone()),
             warnings: Vec::new(),
             extensions: Vec::new(),
