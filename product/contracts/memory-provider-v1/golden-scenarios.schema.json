@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/schemas/memory-provider-v1/golden-scenarios.schema.json",
+  "title": "TraceDecay Memory Provider V1 golden scenarios",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "scenario_set_id",
+    "bead_id",
+    "canonical_encoding",
+    "fixtures"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "scenario_set_id": {
+      "const": "tracedecay.memory.provider.golden-scenarios.v1"
+    },
+    "bead_id": { "const": "tdmem-0207" },
+    "canonical_encoding": {
+      "const": "utf8_rfc8785_json_without_bom_with_lf"
+    },
+    "fixtures": {
+      "type": "array",
+      "minItems": 24,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/fixture" }
+    }
+  },
+  "$defs": {
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixture_id",
+        "category",
+        "contract_id",
+        "operation",
+        "input",
+        "expected"
+      ],
+      "properties": {
+        "fixture_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+        },
+        "category": {
+          "enum": [
+            "success",
+            "zero_results",
+            "degradation",
+            "cancellation",
+            "timeout",
+            "incompatibility",
+            "stale_scope",
+            "malformed",
+            "unknown_optional_roundtrip",
+            "unknown_required_rejection",
+            "idempotent_duplicate",
+            "idempotency_conflict",
+            "partial_effect",
+            "effect_unknown"
+          ]
+        },
+        "contract_id": {
+          "type": "string",
+          "pattern": "^tracedecay\\.memory\\.provider\\.[a-z-]+\\.v1$"
+        },
+        "operation": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "input": { "type": "object" },
+        "expected": { "type": "object" }
+      }
+    }
+  }
+}
