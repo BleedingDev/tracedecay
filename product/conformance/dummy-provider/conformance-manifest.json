@@ -9,7 +9,7 @@
     "package_name": "tracedecay-memory-dummy-provider",
     "package_version": "0.0.0",
     "edition": "2024",
-    "minimum_rust_version": "1.85",
+    "minimum_rust_version": "1.97.1",
     "publish": false,
     "license": "MIT",
     "state_schema_version": "dummy.state.v1",
@@ -35,16 +35,14 @@
     "explicitly_unsupported_optional": [
       "feedback.record.v1",
       "maintenance.run.v1",
-      "inspection.read.v1",
+      "recall.temporal.v1",
+      "recall.associative.v1",
+      "facts.explicit.v1",
+      "explain.trace.v1",
       "correction.apply.v1",
       "deletion.by_source.v1",
       "replay.apply.v1",
-      "facts.explicit.v1",
-      "explain.trace.v1",
-      "recall.temporal.v1",
-      "activation.associative.v1",
-      "state.deterministic-replay.v1",
-      "observation.experience.v1"
+      "inspection.read.v1"
     ],
     "provider_name_implies_capability": false,
     "unsupported_outcome": "capability_unsupported",
@@ -98,6 +96,7 @@
   },
   "source_paths": [
     "product/conformance/dummy-provider/Cargo.toml",
+    "product/conformance/dummy-provider/Cargo.lock",
     "product/conformance/dummy-provider/src/lib.rs",
     "product/conformance/dummy-provider/tests/conformance.rs",
     "product/conformance/dummy-provider/README.md"
