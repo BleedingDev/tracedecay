@@ -1,0 +1,37 @@
+name: Validate tdmem-0304 NCM scaffold
+
+on:
+  push:
+    branches:
+      - agent/tdmem-0304-ncm-scaffold
+    paths:
+      - crates/tracedecay-memory-provider-ncm/**
+      - .github/workflows/tdmem-0304-scratch.yml
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Register scratch workspace member
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("Cargo.toml")
+          text = path.read_text(encoding="utf-8")
+          marker = '    "crates/tracedecay-memory-fabric",\n'
+          member = '    "crates/tracedecay-memory-provider-ncm",\n'
+          if member not in text:
+              if marker not in text:
+                  raise SystemExit("workspace marker missing")
+              path.write_text(text.replace(marker, marker + member, 1), encoding="utf-8")
+          PY
+      - name: Format
+        run: cargo fmt --package tracedecay-memory-provider-ncm -- --check
+      - name: Strict Clippy
+        run: cargo clippy -p tracedecay-memory-provider-ncm --all-targets -- -D warnings
+      - name: Focused tests
+        run: cargo test -p tracedecay-memory-provider-ncm
