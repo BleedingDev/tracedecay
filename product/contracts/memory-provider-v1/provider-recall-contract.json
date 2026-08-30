@@ -1,0 +1,429 @@
+{
+  "schema_version": 1,
+  "contract_id": "tracedecay.memory.provider.recall.v1",
+  "bead_id": "tdmem-0204",
+  "title": "Memory provider recall request, candidate, score, scope, temporal, provenance, and coverage contract",
+  "status": "accepted",
+  "authority": "TraceDecay recall admission and context compiler",
+  "scope": "coding_agents_only",
+  "depends_on_contracts": [
+    "tracedecay.memory.provider.registry.v1",
+    "tracedecay.memory.provider.handshake.v1"
+  ],
+  "recall_request": {
+    "type_name": "MemoryProviderRecallRequestV1",
+    "contract_id": "tracedecay.memory.recall.query.request.v1",
+    "required_fields": [
+      "provider_id",
+      "registration_revision",
+      "ready_receipt_digest",
+      "exact_scope_identity",
+      "request_identity",
+      "objective",
+      "query",
+      "temporal_query",
+      "budgets",
+      "exclusions",
+      "required_capabilities",
+      "policy_revision",
+      "extensions",
+      "deadline",
+      "cancellation"
+    ],
+    "objective_minimum_bytes": 1,
+    "objective_maximum_bytes": 8192,
+    "query_minimum_bytes": 1,
+    "query_maximum_bytes": 32768,
+    "required_capabilities": [
+      "recall.query.v1"
+    ],
+    "unknown_field_policy": "reject_contract_violation",
+    "empty_query_allowed": false,
+    "provider_may_widen_scope": false,
+    "provider_may_extend_deadline": false
+  },
+  "exact_scope_semantics": {
+    "type_name": "MemoryProviderRecallExactScopeV1",
+    "required_fields": [
+      "profile_id",
+      "project_id",
+      "repository_identity",
+      "worktree_identity",
+      "branch_identity",
+      "agent_session_id",
+      "scope_revision"
+    ],
+    "match_semantics": "all_required_identity_fields_must_match_exactly",
+    "wildcards_allowed": false,
+    "provider_path_inference_allowed": false,
+    "cwd_inference_allowed": false,
+    "repository_only_match_allowed": false,
+    "cross_worktree_recall_allowed": false,
+    "cross_branch_recall_allowed": false,
+    "cross_session_recall_allowed": false,
+    "cross_scope_candidate_policy": "reject_scope_mismatch"
+  },
+  "temporal_query": {
+    "type_name": "MemoryProviderRecallTemporalQueryV1",
+    "required_fields": [
+      "mode",
+      "evaluation_time",
+      "as_of",
+      "interval_start",
+      "interval_end",
+      "include_superseded",
+      "include_revoked",
+      "unknown_validity_policy"
+    ],
+    "modes": [
+      "current",
+      "as_of",
+      "interval",
+      "history"
+    ],
+    "time_representation": "utc_rfc3339_nanos",
+    "current_semantics": "candidate_must_be_valid_at_evaluation_time",
+    "as_of_semantics": "candidate_must_be_valid_at_as_of",
+    "interval_semantics": "candidate_validity_must_overlap_closed_interval_start_open_interval_end",
+    "history_semantics": "candidate_may_be_historical_but_must_retain_validity_and_supersession_metadata",
+    "as_of_required_for_mode": "as_of",
+    "interval_bounds_required_for_mode": "interval",
+    "invalid_interval_policy": "reject_invalid_request",
+    "future_evaluation_time_policy": "reject_invalid_request",
+    "default_include_superseded": false,
+    "default_include_revoked": false,
+    "unknown_validity_policies": [
+      "exclude",
+      "degrade",
+      "allow_with_warning"
+    ],
+    "default_unknown_validity_policy": "exclude"
+  },
+  "budgets": {
+    "type_name": "MemoryProviderRecallBudgetsV1",
+    "required_fields": [
+      "maximum_candidates",
+      "maximum_candidate_content_bytes",
+      "maximum_total_content_bytes",
+      "maximum_source_refs_per_candidate",
+      "maximum_trace_refs_per_candidate",
+      "maximum_warnings",
+      "maximum_extensions_per_candidate"
+    ],
+    "maximum_candidates_source": "min(request, effective_limit.recall_candidates)",
+    "maximum_total_content_bytes_source": "min(request, effective_limit.response_bytes)",
+    "all_values_positive_and_finite": true,
+    "provider_may_exceed_budget": false,
+    "zero_budget_policy": "reject_invalid_request",
+    "missing_budget_policy": "reject_invalid_request",
+    "truncation_policy": "return_partial_coverage_with_explicit_truncation"
+  },
+  "exclusions": {
+    "type_name": "MemoryProviderRecallExclusionsV1",
+    "required_fields": [
+      "stable_memory_refs",
+      "candidate_ids",
+      "source_refs",
+      "trace_refs",
+      "observation_ids",
+      "content_sha256"
+    ],
+    "maximum_entries_per_class": 1024,
+    "duplicate_entry_policy": "reject_non_canonical_request",
+    "provider_must_honor_exclusions": true,
+    "ignored_exclusion_policy": "contract_violation"
+  },
+  "extension_contract": {
+    "type_name": "MemoryProviderRecallExtensionV1",
+    "required_fields": [
+      "extension_id",
+      "extension_version",
+      "criticality",
+      "canonical_payload",
+      "payload_sha256"
+    ],
+    "maximum_request_extensions": 16,
+    "maximum_candidate_extensions": 16,
+    "maximum_extension_bytes": 131072,
+    "unknown_optional_extension_policy": "preserve_opaque_inert_round_trip",
+    "unknown_required_extension_policy": "reject_extension_unsupported",
+    "unknown_extension_may_change_scope": false,
+    "unknown_extension_may_change_authority": false,
+    "unknown_extension_may_activate_behavior": false
+  },
+  "provider_candidate": {
+    "type_name": "MemoryProviderRecallCandidateV1",
+    "required_fields": [
+      "candidate_id",
+      "stable_memory_ref",
+      "content",
+      "content_ref",
+      "content_sha256",
+      "native_score",
+      "exact_scope_identity",
+      "validity",
+      "provenance",
+      "explanation",
+      "source_refs",
+      "trace_refs",
+      "sensitivity",
+      "memory_class",
+      "warnings",
+      "extensions"
+    ],
+    "candidate_id_semantics": "request_scoped_provider_candidate_identity",
+    "candidate_id_stable_across_requests": false,
+    "stable_memory_ref_required": false,
+    "stable_memory_ref_null_allowed": true,
+    "content_selection_rule": "exactly_one_of_content_or_content_ref",
+    "content_digest_required": true,
+    "maximum_candidate_bytes_source": "request.budgets.maximum_candidate_content_bytes",
+    "provider_candidate_is_advisory": true,
+    "provider_candidate_may_mutate_context": false,
+    "provider_candidate_may_mutate_tracedecay_authority": false
+  },
+  "content_reference": {
+    "type_name": "MemoryProviderRecallContentReferenceV1",
+    "required_fields": [
+      "reference_kind",
+      "reference_identity",
+      "reference_revision",
+      "content_sha256",
+      "hydration_authority"
+    ],
+    "reference_kinds": [
+      "provider_local",
+      "tracedecay_source",
+      "tracedecay_session",
+      "tracedecay_native_fact"
+    ],
+    "provider_local_reference_is_authority": false,
+    "hydration_requires_scope_revalidation": true,
+    "hydration_failure_policy": "exclude_or_degrade_with_explicit_warning"
+  },
+  "native_score": {
+    "type_name": "MemoryProviderNativeScoreV1",
+    "required_fields": [
+      "score_domain_id",
+      "score_domain_version",
+      "raw_value",
+      "direction",
+      "declared_minimum",
+      "declared_maximum",
+      "calibration_state",
+      "semantics",
+      "components"
+    ],
+    "raw_value_representation": "canonical_decimal_string",
+    "directions": [
+      "higher_is_better",
+      "lower_is_better"
+    ],
+    "calibration_states": [
+      "uncalibrated",
+      "provider_calibrated",
+      "externally_calibrated"
+    ],
+    "provider_native_scores_cross_provider_comparable": false,
+    "provider_native_scores_cross_domain_comparable": false,
+    "missing_score_policy": "reject_contract_violation",
+    "non_finite_score_allowed": false,
+    "score_components_maximum": 32
+  },
+  "host_normalized_score": {
+    "type_name": "MemoryProviderHostNormalizedScoreV1",
+    "owner": "TraceDecay context compiler",
+    "required_fields": [
+      "normalization_policy_id",
+      "normalization_policy_revision",
+      "normalized_value",
+      "input_native_score_digest",
+      "calibration_evidence",
+      "warnings"
+    ],
+    "value_range": "closed_0_to_1_canonical_decimal_string",
+    "provider_may_supply_normalized_score": false,
+    "provider_response_field": null,
+    "normalization_required_before_cross_provider_comparison": true,
+    "normalization_may_change_native_score": false,
+    "unavailable_normalization_policy": "retain_native_score_but_forbid_cross_provider_ordering"
+  },
+  "validity": {
+    "type_name": "MemoryProviderRecallValidityV1",
+    "required_fields": [
+      "observed_at",
+      "valid_from",
+      "valid_until",
+      "superseded_at",
+      "superseded_by",
+      "revoked_at",
+      "source_revision",
+      "temporal_state"
+    ],
+    "temporal_states": [
+      "current",
+      "future",
+      "expired",
+      "superseded",
+      "revoked",
+      "unknown"
+    ],
+    "time_representation": "utc_rfc3339_nanos",
+    "valid_until_semantics": "exclusive",
+    "revoked_candidate_default_policy": "exclude",
+    "superseded_candidate_default_policy": "exclude",
+    "unknown_candidate_default_policy": "exclude",
+    "provider_may_omit_source_revision": false
+  },
+  "provenance": {
+    "type_name": "MemoryProviderRecallProvenanceV1",
+    "required_fields": [
+      "state",
+      "origin_refs",
+      "observation_refs",
+      "source_refs",
+      "transform_chain",
+      "provider_trace_refs",
+      "redaction_reason"
+    ],
+    "states": [
+      "available",
+      "redacted",
+      "unavailable"
+    ],
+    "maximum_refs_per_class": 64,
+    "maximum_transform_steps": 32,
+    "missing_provenance_is_explicit": true,
+    "provider_may_fabricate_provenance": false,
+    "provider_may_drop_known_provenance": false,
+    "policy_actions": [
+      "exclude",
+      "degrade_allow",
+      "audit_only"
+    ],
+    "default_unavailable_policy_action": "exclude",
+    "default_redacted_policy_action": "degrade_allow"
+  },
+  "explanation": {
+    "type_name": "MemoryProviderRecallExplanationV1",
+    "required_fields": [
+      "summary",
+      "matched_features",
+      "activation_trace_refs",
+      "limitations"
+    ],
+    "summary_maximum_bytes": 8192,
+    "maximum_matched_features": 64,
+    "maximum_activation_trace_refs": 64,
+    "maximum_limitations": 32,
+    "explanation_is_proof": false,
+    "missing_explanation_policy": "allow_with_warning_if_provenance_policy_allows_candidate"
+  },
+  "recall_response": {
+    "type_name": "MemoryProviderRecallOutcomeV1",
+    "contract_id": "tracedecay.memory.recall.query.outcome.v1",
+    "required_fields": [
+      "provider_id",
+      "provider_instance_id",
+      "registration_revision",
+      "ready_receipt_digest",
+      "request_identity",
+      "exact_scope_identity",
+      "provider_state_generation",
+      "candidates",
+      "coverage",
+      "ordering",
+      "terminal",
+      "warnings"
+    ],
+    "candidate_count_source": "request.budgets.maximum_candidates",
+    "successful_zero_results_is_explicit": true,
+    "empty_candidate_list_is_not_failure_or_fallback_signal": true,
+    "provider_may_inject_context": false,
+    "provider_may_select_final_context": false
+  },
+  "coverage": {
+    "type_name": "MemoryProviderRecallCoverageV1",
+    "required_fields": [
+      "state",
+      "searched_scope_digest",
+      "searched_temporal_digest",
+      "scanned_items",
+      "matched_items",
+      "returned_items",
+      "excluded_items",
+      "truncated_items",
+      "next_cursor",
+      "reasons"
+    ],
+    "states": [
+      "complete",
+      "partial",
+      "zero_results"
+    ],
+    "zero_results_requires_successful_complete_search": true,
+    "partial_requires_reason": true,
+    "cursor_is_provider_opaque": true,
+    "cursor_scope_bound": true,
+    "cursor_request_contract_bound": true
+  },
+  "ordering": {
+    "provider_order": "deterministic_native_score_then_candidate_id_within_one_score_domain",
+    "tie_breaker": "candidate_id_lexicographic_utf8",
+    "host_may_reorder_after_admission": true,
+    "host_reorder_requires_normalization_and_explain_trace": true,
+    "provider_order_cross_provider_authority": false,
+    "fixed_request_state_must_produce_deterministic_order": true
+  },
+  "recall_specific_terminal_states": [
+    "success",
+    "success_zero_results",
+    "partial",
+    "invalid_request",
+    "capability_unsupported",
+    "scope_unavailable",
+    "scope_mismatch",
+    "stale_scope",
+    "extension_unsupported",
+    "provenance_policy_rejected_all",
+    "budget_exhausted",
+    "deadline_exceeded",
+    "cancelled",
+    "provider_unavailable",
+    "state_incompatible",
+    "contract_violation",
+    "internal_failure"
+  ],
+  "invariants": [
+    "Recall is a bounded advisory read and never mutates provider state, TraceDecay state, Native facts, tools, approvals, or final context.",
+    "Every request is pinned to one provider registration, compatible readiness receipt, exact profile/project/repository/worktree/branch/session scope, policy revision, deadline, and cancellation token.",
+    "Stable provider memory references are optional; request-scoped candidate IDs never imply stable provider row identity.",
+    "Each candidate contains exactly one of inline content or a content reference and always carries a canonical content digest.",
+    "Provider-native score domains remain provider-defined and cannot be compared across providers or domains without a TraceDecay-owned normalization policy.",
+    "A provider cannot supply the host-normalized score or alter its native score after normalization evidence is recorded.",
+    "Temporal mode, evaluation time, interval boundaries, validity, supersession, revocation, and unknown-validity policy are explicit and deterministic.",
+    "Candidate scope must exactly match the admitted request; repository-only, cross-worktree, cross-branch, cross-session, wildcard, path, and CWD matching are forbidden.",
+    "Missing provenance is an explicit available/redacted/unavailable state with a policy action; it is never represented as an empty successful field.",
+    "Provider explanations are bounded evidence summaries, not proof and not executable instruction authority.",
+    "Unknown optional extensions round-trip inertly; unknown required extensions fail explicitly and never change scope or authority.",
+    "Budgets are positive, finite, handshake-clamped, and cannot be exceeded by the provider.",
+    "Exclusions are mandatory, scope-bound, canonical, and ignored exclusions are contract violations.",
+    "Successful zero results means a complete successful search returned no candidates; an empty list never signals provider failure or fallback eligibility.",
+    "Fixed request, provider state, policy, and limits produce deterministic provider ordering and coverage.",
+    "TraceDecay alone admits, normalizes, deduplicates, budgets, explains, and assembles provider candidates into final coding context."
+  ],
+  "verification_beads": [
+    "tdmem-0206",
+    "tdmem-0207",
+    "tdmem-0209",
+    "tdmem-0402",
+    "tdmem-0403",
+    "tdmem-0601",
+    "tdmem-0602",
+    "tdmem-0603",
+    "tdmem-0604",
+    "tdmem-0608",
+    "tdmem-0609",
+    "tdmem-0903"
+  ]
+}
