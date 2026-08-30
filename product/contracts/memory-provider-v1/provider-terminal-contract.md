@@ -37,15 +37,13 @@ Neither can become success. A mutating operation may have no, partial, or unknow
 
 `MemoryProviderCommittedEffectV1` states are none, committed, partial, and unknown.
 
-Read-only operations require none. A successful mutation reports committed, or none only for an explicit no-effect success. `partial_effect` requires:
+Read-only operations require none. A successful mutation reports committed, or none only for an explicit no-effect success.
 
-- exact committed boundary;
-- state generation before and after;
-- committed and uncommitted item sets;
-- provider receipt;
-- reconciliation/resume action.
+Partial effects identify the exact committed boundary, before/after state generations, committed and uncommitted item sets, provider receipt, and reconciliation or resume action.
 
-`effect_unknown` requires an explicit reconciliation action and forbids retry until reconciliation. A retry of the same mutation retains the same idempotency key; it never invents a fresh key to conceal an uncertain effect.
+Unknown effects require reconciliation before any retry. `effect_unknown` carries a reconciliation action and forbids retry until that action resolves the committed boundary.
+
+A retry of the same mutation retains the same idempotency key; it never invents a fresh key to conceal a partial or uncertain effect.
 
 ## Retry
 
