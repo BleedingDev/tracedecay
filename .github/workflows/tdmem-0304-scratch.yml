@@ -9,13 +9,44 @@ on:
       - .github/workflows/tdmem-0304-scratch.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Normalize scaffold
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          test = Path("crates/tracedecay-memory-provider-ncm/tests/ncm_adapter.rs")
+          text = test.read_text(encoding="utf-8")
+          old = '        Ok(_) => assert!(false, "identity mismatch unexpectedly succeeded"),\n'
+          new = '        Ok(_) => return Err(std::io::Error::other("identity mismatch unexpectedly succeeded").into()),\n'
+          if old in text:
+              test.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("Cargo.toml")
+          text = path.read_text(encoding="utf-8")
+          marker = '    "crates/tracedecay-memory-fabric",\n'
+          member = '    "crates/tracedecay-memory-provider-ncm",\n'
+          if member not in text:
+              if marker not in text:
+                  raise SystemExit("workspace marker missing")
+              path.write_text(text.replace(marker, marker + member, 1), encoding="utf-8")
+          PY
+          cargo fmt --package tracedecay-memory-provider-ncm
+          git checkout -- Cargo.toml
+          if ! git diff --quiet -- crates/tracedecay-memory-provider-ncm; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add crates/tracedecay-memory-provider-ncm
+            git commit -m 'style(memory): normalize NCM adapter scaffold'
+            git push origin HEAD:agent/tdmem-0304-ncm-scaffold
+          fi
       - name: Register scratch workspace member
         run: |
           python3 - <<'PY'
