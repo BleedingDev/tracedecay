@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 2,
+  "attempt": 3,
   "issue_id": "tdmem-0304",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Closing the NCM boundary only after it compiles independently in the monorepo, depends solely on the provider API plus SHA-256, exposes no raw coding identity to the licensed surface, preserves every provider-neutral request control and payload, selects no execution topology, and fails malformed or unsupported surface behavior closed.",
-  "retry_note": "The first materialization reached the NCM crate and exposed stale draft assumptions. Failure replies now use the accepted TerminalRecord and ProviderReply shapes, exact-scope digests use the deterministic NCM namespace, Result handling is explicit, and the unused provider-ID import is removed.",
+  "retry_note": "The second materialization confirmed production API alignment. This retry also uses the accepted Vec builder inputs in tests and removes an unnecessary mutable binding in cancellation coverage; topology-neutral behavior is unchanged.",
   "checks": [
     {
       "name": "workspace resolves with the NCM boundary",
