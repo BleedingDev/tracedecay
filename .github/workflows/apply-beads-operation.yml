@@ -7,6 +7,7 @@ on:
     paths:
       - .beads/operations/pending/**
       - .beads/apply_operation.py
+      - .beads/apply_operation_compat.py
       - .beads/policy.yaml
       - .github/workflows/apply-beads-operation.yml
   workflow_dispatch:
@@ -52,7 +53,7 @@ jobs:
           "${HOME}/.local/bin/br" --version
 
       - name: Apply the single pending operation
-        run: python3 .beads/apply_operation.py
+        run: python3 .beads/apply_operation_compat.py
 
       - name: Reject whitespace damage
         run: git diff --check
