@@ -41,6 +41,37 @@ replace_once(
     "TerminalCode::ProviderIdMismatch",
     "TerminalCode::InvalidRequest",
 )
+replace_once(
+    ROOT / "src/lib.rs",
+    '''        if let Ok(current) = self.snapshot_internal() {
+            if current.content_sha256 == snapshot.content_sha256 {
+                return Terminal::success(
+                    RestoreResult {
+                        state_generation: self.state_generation,
+                        acknowledged_sequence: self.acknowledged_sequence,
+                        changed: false,
+                    },
+                    self.state_generation,
+                    CommittedEffectState::None,
+                );
+            }
+        }
+''',
+    '''        if let Ok(current) = self.snapshot_internal()
+            && current.content_sha256 == snapshot.content_sha256
+        {
+            return Terminal::success(
+                RestoreResult {
+                    state_generation: self.state_generation,
+                    acknowledged_sequence: self.acknowledged_sequence,
+                    changed: false,
+                },
+                self.state_generation,
+                CommittedEffectState::None,
+            );
+        }
+''',
+)
 
 checker = REPO / "scripts/product/check-dummy-provider-conformance.py"
 replace_once(
