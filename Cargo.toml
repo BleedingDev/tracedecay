@@ -24,6 +24,7 @@ members = [
     "crates/tracedecay-maintenance",
     "crates/tracedecay-memory-provider-api",
     "crates/tracedecay-memory-fabric",
+    "crates/tracedecay-memory-provider-native",
     "crates/tracedecay-mcp",
     "crates/tracedecay-policy",
     "crates/tracedecay-private-fs",
