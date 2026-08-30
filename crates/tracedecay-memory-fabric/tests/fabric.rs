@@ -61,6 +61,7 @@ fn payload() -> Result<CanonicalPayload, ApiError> {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn terminal(
     operation: ProviderOperation,
     provider: &str,

@@ -125,6 +125,13 @@ fn effect_is_allowed(expectation: CommittedEffectExpectation, state: CommittedEf
     }
 }
 
+fn validated_terminal(result: Result<TerminalRecord, ApiError>) -> TerminalRecord {
+    match result {
+        Ok(terminal) => terminal,
+        Err(_) => std::process::abort(),
+    }
+}
+
 fn diagnostic_for(code: TerminalCode) -> Option<String> {
     if matches!(
         code,
@@ -148,7 +155,7 @@ impl MemoryProvider for TestProvider {
 
     fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
         HandshakeResponse {
-            terminal: TerminalRecord::new(
+            terminal: validated_terminal(TerminalRecord::new(
                 ProviderOperation::Handshake,
                 self.descriptor.provider_id.clone(),
                 TerminalCode::Success,
@@ -157,8 +164,7 @@ impl MemoryProvider for TestProvider {
                 request.request_id.clone(),
                 DIGEST,
                 None,
-            )
-            .expect("valid test handshake terminal"),
+            )),
             descriptor: Some(self.descriptor.clone()),
             provider_instance_id: Some("test.provider.instance-1".to_owned()),
             state_namespace: Some("scope-1".to_owned()),
@@ -171,7 +177,7 @@ impl MemoryProvider for TestProvider {
 
     fn invoke(&self, call: &ProviderCall) -> ProviderReply {
         ProviderReply {
-            terminal: TerminalRecord::new(
+            terminal: validated_terminal(TerminalRecord::new(
                 call.operation,
                 call.provider_id.clone(),
                 TerminalCode::SuccessZeroResults,
@@ -180,8 +186,7 @@ impl MemoryProvider for TestProvider {
                 call.operation_id.clone(),
                 DIGEST,
                 None,
-            )
-            .expect("valid test invocation terminal"),
+            )),
             payload: Some(call.payload.clone()),
             warnings: Vec::new(),
             extensions: Vec::new(),
@@ -253,7 +258,7 @@ fn exact_scope_is_complete_and_borrowable() -> Result<(), ApiError> {
 }
 
 #[test]
-fn request_control_distinguishes_cancellation_and_deadline() {
+fn request_control_distinguishes_cancellation_and_deadline() -> Result<(), TerminalCode> {
     let cancellation = CancellationToken::new();
     let control = OperationControl::new(i64::MAX, 10, cancellation.clone());
     assert!(control.snapshot().is_ok());
@@ -271,7 +276,7 @@ fn request_control_distinguishes_cancellation_and_deadline() {
 
     let decaying = OperationControl::new(i64::MAX, 10_000, CancellationToken::new());
     std::thread::sleep(Duration::from_millis(2));
-    let snapshot = decaying.snapshot().expect("live decaying budget");
+    let snapshot = decaying.snapshot()?;
     assert!(snapshot.remaining_millis > 0);
     assert!(snapshot.remaining_millis < 10_000);
 
@@ -281,7 +286,7 @@ fn request_control_distinguishes_cancellation_and_deadline() {
         .unwrap_or(i64::MAX);
     let short_wall_deadline = now_micros.saturating_add(20_000);
     let wall_capped = OperationControl::new(short_wall_deadline, 10_000, CancellationToken::new());
-    let snapshot = wall_capped.snapshot().expect("live wall-capped budget");
+    let snapshot = wall_capped.snapshot()?;
     assert!(snapshot.remaining_millis > 0);
     assert!(snapshot.remaining_millis <= 20);
     assert!(wall_capped.remaining_millis() <= 20);
@@ -292,6 +297,7 @@ fn request_control_distinguishes_cancellation_and_deadline() {
     cancelled.cancel();
     let both_terminal = OperationControl::new(1, 0, cancelled);
     assert_eq!(both_terminal.snapshot(), Err(TerminalCode::Cancelled));
+    Ok(())
 }
 
 #[test]

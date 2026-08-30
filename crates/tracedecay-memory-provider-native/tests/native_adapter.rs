@@ -417,7 +417,7 @@ fn declared_optional_operation_routes_to_lifecycle_port() {
     );
     assert_eq!(
         reply.terminal.committed_effect().committed_item_refs(),
-        &[request.operation_id.clone()]
+        std::slice::from_ref(&request.operation_id)
     );
     assert_eq!(reply.terminal.provider_receipt_sha256(), Some(ONE_SHA));
     assert_eq!(

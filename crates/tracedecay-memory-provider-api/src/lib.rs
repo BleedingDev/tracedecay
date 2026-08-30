@@ -1583,6 +1583,7 @@ pub struct TerminalRecord {
 impl TerminalRecord {
     /// Creates a terminal record whose effect and fallback fields match the
     /// generated terminal-code policy table.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         operation: ProviderOperation,
         provider_id: OwnedProviderId,

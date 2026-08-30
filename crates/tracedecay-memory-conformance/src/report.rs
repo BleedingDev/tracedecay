@@ -220,6 +220,41 @@ impl ObservedStepSummary {
             payload_present: reply.payload.is_some(),
         }
     }
+
+    /// Replaces failed fixture-controlled terminal-identity strings with their
+    /// expected values so provider-invented identities never persist in
+    /// retained summaries. The deviation itself stays visible through the
+    /// step's failed invariant fields; provider-attested evidence such as
+    /// committed-effect receipts and fallback policies is retained raw.
+    pub(crate) fn with_fixture_controlled_terminal_identity(
+        mut self,
+        violations: &[ConformanceViolation],
+    ) -> Self {
+        let expected_for = |field: &str| {
+            violations
+                .iter()
+                .find(|violation| violation.field == field)
+                .map(|violation| violation.expected.clone())
+        };
+        let operation_id = expected_for("terminal.operation_id");
+        let exact_scope_sha256 = expected_for("terminal.exact_scope_sha256");
+        if operation_id.is_none() && exact_scope_sha256.is_none() {
+            return self;
+        }
+        if let Ok(terminal) = TerminalRecord::new(
+            self.terminal.operation(),
+            self.terminal.provider_id().clone(),
+            self.terminal.terminal_code(),
+            self.terminal.committed_effect().clone(),
+            self.terminal.fallback().clone(),
+            operation_id.unwrap_or_else(|| self.terminal.operation_id().to_owned()),
+            exact_scope_sha256.unwrap_or_else(|| self.terminal.exact_scope_sha256().to_owned()),
+            self.terminal.diagnostic_id().map(str::to_owned),
+        ) {
+            self.terminal = terminal;
+        }
+        self
+    }
 }
 
 /// One observer step containing terminal consequences but no operation payload.
@@ -636,7 +671,11 @@ impl DifferentialReport {
                     product_provider_contacted: product_step.map(|step| step.provider_contacted()),
                     observer_provider_contacted: observer_step
                         .map(|step| step.provider_contacted()),
-                    product_observed: product_step.map(|step| step.output.summary()),
+                    product_observed: product_step.map(|step| {
+                        step.output
+                            .summary()
+                            .with_fixture_controlled_terminal_identity(step.evaluation.violations())
+                    }),
                     observer_observed: observer_step.map(|step| step.observed.clone()),
                 }
             })

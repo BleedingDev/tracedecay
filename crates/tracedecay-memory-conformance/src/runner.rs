@@ -70,7 +70,10 @@ impl<'provider> ProviderHarness<'provider> {
             .steps
             .into_iter()
             .map(|step| {
-                let observed = step.output.summary();
+                let observed = step
+                    .output
+                    .summary()
+                    .with_fixture_controlled_terminal_identity(step.evaluation.violations());
                 ObserverStepResult::new(step.evaluation, observed, step.provider_contacted)
             })
             .collect();
