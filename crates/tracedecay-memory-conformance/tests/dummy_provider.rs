@@ -50,13 +50,12 @@ impl DummyProvider {
     }
 
     fn terminal(&self, call: &ProviderCall, code: TerminalCode) -> TerminalRecord {
-        let committed_effect = if code == TerminalCode::Success
-            && call.operation.mutates_provider_state()
-        {
-            CommittedEffectState::Committed
-        } else {
-            CommittedEffectState::None
-        };
+        let committed_effect =
+            if code == TerminalCode::Success && call.operation.mutates_provider_state() {
+                CommittedEffectState::Committed
+            } else {
+                CommittedEffectState::None
+            };
         TerminalRecord {
             terminal_code: code,
             committed_effect,
@@ -189,13 +188,21 @@ fn fixture() -> Result<MandatoryConformanceFixture, Box<dyn Error>> {
         handshake,
         TerminalCode::Success,
         ZERO_SHA,
-        ExpectedCall::new(call(ProviderOperation::Health)?, TerminalCode::Success, ZERO_SHA)?,
+        ExpectedCall::new(
+            call(ProviderOperation::Health)?,
+            TerminalCode::Success,
+            ZERO_SHA,
+        )?,
         ExpectedCall::new(
             call(ProviderOperation::Observe)?,
             TerminalCode::Success,
             ZERO_SHA,
         )?,
-        ExpectedCall::new(call(ProviderOperation::Recall)?, TerminalCode::Success, ZERO_SHA)?,
+        ExpectedCall::new(
+            call(ProviderOperation::Recall)?,
+            TerminalCode::Success,
+            ZERO_SHA,
+        )?,
     )?)
 }
 

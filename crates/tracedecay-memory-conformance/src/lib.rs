@@ -582,10 +582,7 @@ impl ScenarioRunner {
             .iter()
             .map(|call| {
                 let reply = provider.invoke(call);
-                let payload_sha256 = reply
-                    .payload
-                    .as_ref()
-                    .map(|payload| payload.sha256.clone());
+                let payload_sha256 = reply.payload.as_ref().map(|payload| payload.sha256.clone());
                 ScenarioStepResult {
                     operation: call.operation,
                     operation_id: call.operation_id.clone(),
@@ -651,8 +648,7 @@ impl DifferentialReport {
                     }
                     _ => false,
                 };
-                let same_payload = left_step
-                    .and_then(|step| step.payload_sha256.as_deref())
+                let same_payload = left_step.and_then(|step| step.payload_sha256.as_deref())
                     == right_step.and_then(|step| step.payload_sha256.as_deref());
                 DifferentialCase {
                     index,
