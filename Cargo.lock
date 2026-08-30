@@ -6528,6 +6528,13 @@ name = "tracedecay-memory-provider-api"
 version = "0.1.0-beta.37"
 
 [[package]]
+name = "tracedecay-memory-provider-native"
+version = "0.1.0-beta.37"
+dependencies = [
+ "tracedecay-memory-provider-api",
+]
+
+[[package]]
 name = "tracedecay-policy"
 version = "0.1.0"
 dependencies = [
