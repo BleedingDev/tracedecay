@@ -1,0 +1,458 @@
+{
+  "schema_version": 1,
+  "bead_id": "tdmem-0105",
+  "title": "TraceDecay V2 provider patch-footprint policy",
+  "upstream_floor": {
+    "repository": "ScriptedAlchemy/tracedecay",
+    "pull_request": 707,
+    "sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+    "metadata": "product/upstream/tracedecay-v2-pr707.json"
+  },
+  "policy_revision": "patch-footprint.v1",
+  "scope": "Initial pluggable-memory implementation through Native parity and NCM observer admission. Later phases must either remain inside these caps or approve a new policy revision by ADR.",
+  "principles": [
+    "Add product-owned crates and tests instead of embedding provider logic in Zack-owned crates.",
+    "Mount product behavior only at narrow application, daemon-composition, observation, recall, feedback, and configuration seams.",
+    "Every intentional edit to an upstream-owned existing file has one convergence-map entry with rationale, semantic invariants, focused verification, line budget, and rebase/removal plan.",
+    "Provider names are confined to product registry and adapters; upstream public transports and stores depend on capability contracts only.",
+    "Database internals, code-index internals, generated contracts, host-specific adapters, and toolchain/build policy are zero-touch zones unless an ADR proves the seam cannot be mounted elsewhere.",
+    "An exception does not silently raise the global budget: it requires both an ADR and an explicit policy revision when a hard cap would be exceeded."
+  ],
+  "product_owned_paths": [
+    ".beads/**",
+    "product/**",
+    "scripts/product/**",
+    "scripts/check-product-upstream-floor.py",
+    "tests/product_*",
+    ".github/workflows/apply-beads-operation.yml",
+    ".github/workflows/materialize-beads.yml",
+    ".github/workflows/product-*.yml",
+    "crates/tracedecay-memory-provider-api/**",
+    "crates/tracedecay-memory-provider-registry/**",
+    "crates/tracedecay-memory-provider-native/**",
+    "crates/tracedecay-memory-provider-ncm/**",
+    "crates/tracedecay-memory-observation/**",
+    "crates/tracedecay-memory-context/**",
+    "crates/tracedecay-memory-conformance/**",
+    "crates/tracedecay/tests/product_memory_provider/**",
+    "crates/tracedecay/tests/product_memory_provider_*.rs"
+  ],
+  "initial_budget": {
+    "max_upstream_existing_production_files": 12,
+    "max_upstream_existing_test_or_fixture_files": 6,
+    "max_total_upstream_changed_lines": 900,
+    "max_changed_lines_per_upstream_file": 180,
+    "max_composition_root_files": 6,
+    "max_allowed_touch_point_files_per_category": 3,
+    "default_max_exception_zone_files": 0,
+    "max_exception_files_per_adr": 2,
+    "max_workspace_manifest_files": 2,
+    "manual_generated_file_edits": 0,
+    "notes": [
+      "Added files under product_owned_paths are excluded from the upstream footprint totals.",
+      "Renaming or copying an upstream file counts as touching the destination and source.",
+      "Changed lines are additions plus deletions from git numstat against the immutable upstream floor.",
+      "Cargo.lock is a generated dependency-resolution output: it may change only with a workspace-manifest touch and a focused cargo metadata/build receipt; it is not a manually editable contract."
+    ]
+  },
+  "allowed_touch_points": [
+    {
+      "id": "workspace_wiring",
+      "category": "workspace",
+      "paths": [
+        "Cargo.toml",
+        "Cargo.lock"
+      ],
+      "max_files": 2,
+      "max_changed_lines": 140,
+      "allowed_changes": [
+        "register additive product-owned workspace crates",
+        "add workspace dependencies used by product-owned crates",
+        "refresh Cargo.lock through the pinned toolchain"
+      ],
+      "forbidden_changes": [
+        "changing upstream feature defaults to force provider behavior",
+        "replacing upstream dependency versions unrelated to the product crates",
+        "hand-editing Cargo.lock"
+      ],
+      "required_verification": [
+        "cargo metadata --locked --format-version 1",
+        "clean workspace build receipt"
+      ]
+    },
+    {
+      "id": "application_contract_mount",
+      "category": "application",
+      "paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-application/src/lib.rs",
+        "crates/tracedecay/src/application_surface.rs"
+      ],
+      "max_files": 3,
+      "max_changed_lines": 220,
+      "allowed_changes": [
+        "register provider-neutral capability ports and typed outcomes",
+        "mount product-owned application routers or retained operations",
+        "carry exact scope, deadline, cancellation, provenance, and terminal state"
+      ],
+      "forbidden_changes": [
+        "provider-name branching",
+        "concrete NCM or OCEAN types in public TraceDecay contracts",
+        "silent fallback or fake readiness"
+      ],
+      "required_verification": [
+        "application contract/schema tests",
+        "public transport parity tests"
+      ]
+    },
+    {
+      "id": "daemon_composition_mount",
+      "category": "composition",
+      "paths": [
+        "crates/tracedecay/src/daemon/project_composition.rs",
+        "crates/tracedecay/src/daemon/project_open_owners.rs",
+        "crates/tracedecay/src/daemon/retained_owner.rs",
+        "crates/tracedecay/src/daemon/service/project_runtime.rs",
+        "crates/tracedecay/src/daemon/invocation_state.rs",
+        "crates/tracedecay/src/runtime_ports.rs"
+      ],
+      "max_files": 3,
+      "max_changed_lines": 260,
+      "allowed_changes": [
+        "construct and retain product-owned capability registries and lifecycle ports",
+        "inject provider-neutral observation, recall, feedback, maintenance, and inspection capabilities",
+        "bind exact project/worktree/provider scope at startup"
+      ],
+      "forbidden_changes": [
+        "provider implementation logic in the composition root",
+        "global mutable provider singleton",
+        "unbounded worker or queue",
+        "provider authority over source, sessions, Native facts, or configuration"
+      ],
+      "required_verification": [
+        "daemon composition/restart tests",
+        "scope-isolation journey",
+        "provider unavailable and shutdown tests"
+      ]
+    },
+    {
+      "id": "normalized_observation_mount",
+      "category": "observation",
+      "paths": [
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
+        "crates/tracedecay/src/mcp/server/hook_writes.rs",
+        "crates/tracedecay/src/daemon/service/invocation/observability_producer.rs"
+      ],
+      "max_files": 2,
+      "max_changed_lines": 160,
+      "allowed_changes": [
+        "fan out an already-admitted normalized observation into a bounded product-owned dispatcher",
+        "attach stable operation identity and exact scope after canonical ingest or settlement"
+      ],
+      "forbidden_changes": [
+        "blocking or changing canonical host ingest in observer mode",
+        "host-specific provider logic",
+        "provider output affecting prompts or external actions"
+      ],
+      "required_verification": [
+        "observer non-interference tests",
+        "queue capacity and crash-recovery tests",
+        "host ingest parity tests"
+      ]
+    },
+    {
+      "id": "recall_context_mount",
+      "category": "recall",
+      "paths": [
+        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
+        "crates/tracedecay/src/daemon/session_retrieval/contract.rs",
+        "crates/tracedecay-usecases/src/context/mod.rs",
+        "crates/tracedecay-usecases/src/context/read_modes.rs"
+      ],
+      "max_files": 3,
+      "max_changed_lines": 260,
+      "allowed_changes": [
+        "invoke provider-neutral bounded advisory recall",
+        "validate provenance, freshness, exact scope, policy, deadline, and cancellation before context assembly",
+        "report typed per-lane coverage and degradation"
+      ],
+      "forbidden_changes": [
+        "provider constructing the final context envelope",
+        "provider candidate replacing current code truth",
+        "cross-worktree or cross-session candidate reuse",
+        "silent fallback to another provider"
+      ],
+      "required_verification": [
+        "context compiler conformance",
+        "stale-memory and provider-failure journeys",
+        "multi-worktree scope isolation"
+      ]
+    },
+    {
+      "id": "post_settlement_feedback_mount",
+      "category": "feedback",
+      "paths": [
+        "crates/tracedecay/src/daemon/service/invocation/feedback.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory_tracking.rs",
+        "crates/tracedecay/src/daemon/scheduler/automation_observation.rs"
+      ],
+      "max_files": 2,
+      "max_changed_lines": 160,
+      "allowed_changes": [
+        "emit idempotent provider feedback/outcome observations after canonical settlement",
+        "record typed dispatch receipts without changing the settled result"
+      ],
+      "forbidden_changes": [
+        "provider directly changing Native trust",
+        "post-commit provider failure becoming canonical operation failure",
+        "provider-specific transport schema"
+      ],
+      "required_verification": [
+        "Native feedback parity tests",
+        "post-settlement failure isolation tests"
+      ]
+    },
+    {
+      "id": "configuration_registry_mount",
+      "category": "configuration",
+      "paths": [
+        "crates/tracedecay/src/config.rs",
+        "crates/tracedecay-usecases/src/configuration/runtime.rs",
+        "crates/tracedecay-usecases/src/configuration/operations.rs"
+      ],
+      "max_files": 2,
+      "max_changed_lines": 180,
+      "allowed_changes": [
+        "register provider-neutral configuration keys and capability selection",
+        "pin explicit observer/active mode and provider instance scope"
+      ],
+      "forbidden_changes": [
+        "provider self-activation",
+        "provider names outside registry/adapter construction",
+        "credentials embedded in public configuration values",
+        "configuration bypassing transactional revision and audit"
+      ],
+      "required_verification": [
+        "configuration authorization and rollback tests",
+        "provider selection and no-silent-fallback tests"
+      ]
+    }
+  ],
+  "exception_zones": [
+    {
+      "id": "native_database_internals",
+      "paths": [
+        "crates/tracedecay-runtime-core/src/store/**",
+        "crates/tracedecay-store/**",
+        "crates/tracedecay-global-db/**",
+        "crates/tracedecay-graph-db/**",
+        "crates/tracedecay-rusqlite-runtime/**"
+      ],
+      "default_policy": "forbidden",
+      "reason": "These crates own canonical Native persistence, lineage, schemas, transactions, graph publication, and recovery. Cognitive providers must sit above them.",
+      "required_exception_evidence": [
+        "ADR proving no application/composition seam can satisfy the requirement",
+        "convergence-map entry with semantic invariants and rollback plan",
+        "Native parity and migration/recovery tests",
+        "policy revision if the zero-file zone cap is raised"
+      ]
+    },
+    {
+      "id": "code_index_internals",
+      "paths": [
+        "crates/tracedecay-code-index/**",
+        "crates/tracedecay-code-index-runtime/**",
+        "crates/tracedecay-code-index-retention/**",
+        "crates/tracedecay-code-extraction/**",
+        "crates/tracedecay-query/**",
+        "crates/tracedecay-semantic/**"
+      ],
+      "default_policy": "forbidden",
+      "reason": "TraceDecay remains authority for current code and verified code projections; provider integration must consume ports rather than alter indexing semantics.",
+      "required_exception_evidence": [
+        "ADR with rejected port-level alternatives",
+        "generation/staleness invariant tests",
+        "convergence-map entry and rebase plan",
+        "policy revision if the zero-file zone cap is raised"
+      ]
+    },
+    {
+      "id": "generated_contracts",
+      "paths": [
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay-dashboard-api/src/contract_schema.rs",
+        "Cargo.lock"
+      ],
+      "default_policy": "generated_only",
+      "reason": "Generated outputs must come from their owning catalog/generator or pinned dependency resolver, never manual provider edits.",
+      "required_exception_evidence": [
+        "generator/catalog source touch in the same change",
+        "reproduction command and zero-drift receipt",
+        "convergence-map entry identifying generated output",
+        "ADR only when the generator contract itself changes"
+      ]
+    },
+    {
+      "id": "host_specific_adapters",
+      "paths": [
+        "crates/tracedecay-agent-hosts/**",
+        "crates/tracedecay-host-integration/**",
+        "crates/tracedecay-hooks/**",
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/hermes.rs",
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/context_scout.rs"
+      ],
+      "default_policy": "forbidden",
+      "reason": "Provider observation belongs after host-neutral admission. Host-specific edits multiply patch cost and risk different authority semantics per agent.",
+      "required_exception_evidence": [
+        "ADR proving normalized host-neutral observation is insufficient",
+        "parity tests for every supported coding-agent host",
+        "convergence-map entry with removal plan",
+        "policy revision if the zero-file zone cap is raised"
+      ]
+    },
+    {
+      "id": "toolchain_build_and_ci_policy",
+      "paths": [
+        "rust-toolchain.toml",
+        ".cargo/config.toml",
+        "deny.toml",
+        ".github/workflows/ci*.yml",
+        ".github/workflows/release*.yml"
+      ],
+      "default_policy": "forbidden",
+      "reason": "Provider work must not weaken or silently reshape Zack's supported build, lint, test, or release lanes.",
+      "required_exception_evidence": [
+        "ADR with upstream compatibility impact",
+        "clean baseline and cross-platform evidence",
+        "convergence-map entry and revert plan",
+        "policy revision if the zero-file zone cap is raised"
+      ]
+    }
+  ],
+  "dependency_direction_rules": [
+    {
+      "id": "provider_api_is_inward",
+      "from_packages": [
+        "tracedecay-memory-provider-api"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay",
+        "tracedecay-runtime-core",
+        "tracedecay-store",
+        "tracedecay-global-db",
+        "tracedecay-code-index*",
+        "tracedecay-memory-provider-native",
+        "tracedecay-memory-provider-ncm"
+      ],
+      "reason": "The capability contract cannot depend on a concrete provider, root composition, or persistence implementation."
+    },
+    {
+      "id": "context_compiler_is_provider_neutral",
+      "from_packages": [
+        "tracedecay-memory-context"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-native",
+        "tracedecay-memory-provider-ncm",
+        "ncm*",
+        "ocean*"
+      ],
+      "reason": "Final context assembly depends only on provider API/capability registry and TraceDecay application ports."
+    },
+    {
+      "id": "adapters_do_not_depend_on_each_other",
+      "from_packages": [
+        "tracedecay-memory-provider-native"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-ncm",
+        "ncm*",
+        "ocean*",
+        "tracedecay"
+      ],
+      "reason": "The Native adapter cannot know external providers or the root binary crate."
+    },
+    {
+      "id": "ncm_adapter_does_not_reach_native_store",
+      "from_packages": [
+        "tracedecay-memory-provider-ncm"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-native",
+        "tracedecay-runtime-core",
+        "tracedecay-store",
+        "tracedecay-global-db",
+        "tracedecay",
+        "ocean*"
+      ],
+      "reason": "NCM uses provider contracts and its own SDK/transport, never Native persistence or root internals."
+    },
+    {
+      "id": "transports_are_adapter_blind",
+      "from_packages": [
+        "tracedecay-cli",
+        "tracedecay-mcp",
+        "tracedecay-dashboard-api",
+        "tracedecay-sdk"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-native",
+        "tracedecay-memory-provider-ncm",
+        "ncm*",
+        "ocean*"
+      ],
+      "reason": "Public transports expose provider-neutral application contracts."
+    },
+    {
+      "id": "upstream_crates_do_not_import_concrete_adapters",
+      "from_packages": [
+        "tracedecay-*"
+      ],
+      "except_packages": [
+        "tracedecay",
+        "tracedecay-memory-provider-registry",
+        "tracedecay-memory-provider-native",
+        "tracedecay-memory-provider-ncm",
+        "tracedecay-memory-conformance"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-native",
+        "tracedecay-memory-provider-ncm",
+        "ncm*",
+        "ocean*"
+      ],
+      "reason": "Only the narrow composition/registry layer may construct concrete adapters."
+    }
+  ],
+  "convergence_map": {
+    "path": "product/upstream/convergence-map.json",
+    "entry_required_for_every_upstream_existing_file": true,
+    "required_entry_fields": [
+      "path",
+      "touch_point",
+      "rationale",
+      "semantic_invariants",
+      "verification",
+      "bead_ids",
+      "line_budget",
+      "rebase_or_removal_plan",
+      "status"
+    ],
+    "exception_required_fields": [
+      "zone",
+      "adr",
+      "why_unavoidable",
+      "alternatives_rejected",
+      "policy_revision",
+      "rollback_plan"
+    ]
+  },
+  "verification": {
+    "checker": "scripts/product/check-patch-footprint-policy.py",
+    "tests": [
+      "tests/product_patch_footprint_policy_test.py"
+    ],
+    "branch_diff_command": "git diff --numstat 08fbe33a7c7f403191fd5d6e356c7b6681b96403...HEAD --",
+    "convergence_map": "product/upstream/convergence-map.json"
+  }
+}
