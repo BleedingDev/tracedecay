@@ -31,6 +31,16 @@ replace_once(
     '"status": "accepted_candidate"',
     '"status": "accepted"',
 )
+replace_once(
+    ROOT / "src/lib.rs",
+    "TerminalCode::ProviderIdMismatch",
+    "TerminalCode::InvalidRequest",
+)
+replace_once(
+    ROOT / "tests/conformance.rs",
+    "TerminalCode::ProviderIdMismatch",
+    "TerminalCode::InvalidRequest",
+)
 
 checker = REPO / "scripts/product/check-dummy-provider-conformance.py"
 replace_once(
