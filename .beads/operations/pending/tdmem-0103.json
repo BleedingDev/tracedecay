@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "attempt": 2,
+  "issue_id": "tdmem-0103",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Closing the Native memory seam audit after validating the machine-readable authority map against the real repository and its public operation catalogs.",
+  "checks": [
+    {
+      "name": "Native memory surface-map contract tests",
+      "argv": ["python3", "tests/product_native_memory_surface_map_test.py"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "Native memory surface-map repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-native-memory-surface-map.py",
+        "--repo",
+        ".",
+        "--map",
+        "product/architecture/native-memory-surface-map.json"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "acceptance_criteria": [
+    "All production memory entry points are listed.",
+    "Current write owner and read authority are named for each path.",
+    "Generated/derived surfaces are separated from canonical stores.",
+    "Likely provider seams are ranked by invasiveness."
+  ],
+  "close_reason": "Mapped the complete TraceDecay Native memory production surface, named every authority, separated canonical and derived state, and ranked the viable provider seams.",
+  "close_comment": "Evidence: product/architecture/native-memory-surface-map.json enumerates all retained HTTP, MCP, CLI, and SDK memory operations plus dashboard, hook, automation, retrieval, privacy, maintenance, and graph-reconciliation entry points. The paired Markdown explains end-to-end call paths. scripts/product/check-native-memory-surface-map.py validates the map against real source markers, catalogs, generated SDK descriptors, and repository paths; tests/product_native_memory_surface_map_test.py covers missing operations, route drift, authority drift, derived-state drift, observation isolation, seam ordering, and stale source references. The clean V2 baseline receipt remains product/baseline/tracedecay-v2-pr707-linux.json."
+}
