@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 6,
+  "attempt": 7,
   "issue_id": "tdmem-0301",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Creating the first product-owned workspace crate as the only provider-neutral Rust runtime boundary over the generated M1 authority, with no TraceDecay internal or concrete-provider dependency.",
-  "retry_note": "The previous strict Clippy run proved the production library was clean and rejected test-only expect calls plus missing integration-test crate documentation. This retry rewrites the tests to use Result propagation, direct known-valid terminal fixtures, explicit Option matching, and crate documentation under the same strict lints.",
+  "retry_note": "The previous strict Clippy run left one assertions_on_constants failure in the negative Option branch. This retry converts that branch into the existing typed ApiError return without allowing panic or weakening any test assertion.",
   "checks": [
     {"name":"provider API workspace metadata","argv":["cargo","metadata","--locked","--format-version","1","--no-deps"],"timeout_seconds":180},
     {"name":"provider API formatting","argv":["cargo","fmt","--package","tracedecay-memory-provider-api","--","--check"],"timeout_seconds":180},
@@ -22,5 +22,5 @@
     "Root Cargo.toml and generated Cargo.lock changes are minimal, reproducible, convergence-mapped path-package wiring and leave all existing dependency versions, default features, and upstream behavior unchanged."
   ],
   "close_reason": "Added the independently compiling provider-neutral Rust API crate over the canonical generated M1 contract authority, with strict validation, live request control, typed provider traits, no forbidden upstream internals, and mapped workspace wiring.",
-  "close_comment": "Evidence: crates/tracedecay-memory-provider-api reuses product/contracts/memory-provider-v1/generated/rust/memory_provider_v1.rs directly and defines validated owned provider/capability IDs, complete TraceDecay-owned coding scope, cooperative cancellation, finite operation control, capability-routed operations, negotiated provider limits, real descriptors, canonical payload/extension wrappers, validated calls, typed terminal replies, HandshakeRequestParts and handshake values, and the object-safe MemoryProvider trait. The crate has no dependencies. Its strict-lint-clean behavioral tests cover generated identifier validation, exact scope, cancellation versus deadline, mandatory and duplicate capabilities, mutation idempotency, operation-capability admission, trait-object handshake/invocation, and deterministic capability ordering without unwrap, expect, panic, todo, or unimplemented calls. Root Cargo.toml and Cargo.lock contain only additive path-package wiring tracked in the convergence map. Cargo metadata, fmt, strict Clippy, tests, generated-binding drift, patch budget, and metadata dependency audit all pass."
+  "close_comment": "Evidence: crates/tracedecay-memory-provider-api reuses product/contracts/memory-provider-v1/generated/rust/memory_provider_v1.rs directly and defines validated owned provider/capability IDs, complete TraceDecay-owned coding scope, cooperative cancellation, finite operation control, capability-routed operations, negotiated provider limits, real descriptors, canonical payload/extension wrappers, validated calls, typed terminal replies, HandshakeRequestParts and handshake values, and the object-safe MemoryProvider trait. The crate has no dependencies. Its strict-lint-clean behavioral tests cover generated identifier validation, exact scope, cancellation versus deadline, mandatory and duplicate capabilities, mutation idempotency, operation-capability admission, trait-object handshake/invocation, and deterministic capability ordering without unwrap, expect, panic, todo, unimplemented, or constant-false assertions. Root Cargo.toml and Cargo.lock contain only additive path-package wiring tracked in the convergence map. Cargo metadata, fmt, strict Clippy, tests, generated-binding drift, patch budget, and metadata dependency audit all pass."
 }
