@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": 1,
+  "authority": "derived-receipt",
+  "canonical_metadata": "product/upstream/tracedecay-v2-pr707.json",
+  "canonical_metadata_blob_sha": "8453424d60438b3ce2c7dd41f46931d709d321ca",
+  "source_repository": "ScriptedAlchemy/tracedecay",
+  "pull_request": 707,
+  "product_repository": "BleedingDev/tracedecay",
+  "product_branch": "feat/pluggable-memory-providers-v2",
+  "pinned_floor_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+  "purpose": "Stable compact receipt consumed by M0 architecture gates. The canonical provenance and moving PR observation remain owned by canonical_metadata.",
+  "verification": {
+    "command": "python3 scripts/check-product-upstream-floor.py --repo . --metadata product/upstream/tracedecay-v2-pr707.json",
+    "invariant": "pinned_floor_sha must equal canonical_metadata.pinned_floor.sha and be an ancestor of the product branch head"
+  }
+}
