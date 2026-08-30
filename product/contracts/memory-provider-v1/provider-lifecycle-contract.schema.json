@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/schemas/memory-provider-v1/provider-lifecycle-contract.schema.json",
+  "title": "TraceDecay memory provider lifecycle contract V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "bead_id",
+    "title",
+    "status",
+    "authority",
+    "scope",
+    "depends_on_contracts",
+    "common_request",
+    "capability_gating",
+    "health",
+    "feedback",
+    "maintenance",
+    "inspection",
+    "correction",
+    "deletion_by_source",
+    "snapshot",
+    "replay",
+    "provider_local_projection",
+    "lifecycle_specific_terminal_states",
+    "invariants",
+    "verification_beads"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "contract_id": { "const": "tracedecay.memory.provider.lifecycle.v1" },
+    "bead_id": { "const": "tdmem-0205" },
+    "title": { "type": "string", "minLength": 1 },
+    "status": { "const": "accepted" },
+    "authority": { "const": "TraceDecay lifecycle admission and provider-local capability fabric" },
+    "scope": { "const": "coding_agents_only" },
+    "depends_on_contracts": {
+      "type": "array",
+      "const": [
+        "tracedecay.memory.provider.registry.v1",
+        "tracedecay.memory.provider.handshake.v1",
+        "tracedecay.memory.provider.observation.v1",
+        "tracedecay.memory.provider.recall.v1"
+      ]
+    },
+    "common_request": { "$ref": "#/$defs/object" },
+    "capability_gating": { "$ref": "#/$defs/object" },
+    "health": { "$ref": "#/$defs/object" },
+    "feedback": { "$ref": "#/$defs/object" },
+    "maintenance": { "$ref": "#/$defs/object" },
+    "inspection": { "$ref": "#/$defs/object" },
+    "correction": { "$ref": "#/$defs/object" },
+    "deletion_by_source": { "$ref": "#/$defs/object" },
+    "snapshot": { "$ref": "#/$defs/object" },
+    "replay": { "$ref": "#/$defs/object" },
+    "provider_local_projection": { "$ref": "#/$defs/object" },
+    "lifecycle_specific_terminal_states": {
+      "type": "array",
+      "minItems": 25,
+      "maxItems": 25,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+    },
+    "invariants": {
+      "type": "array",
+      "minItems": 15,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 20 }
+    },
+    "verification_beads": {
+      "type": "array",
+      "minItems": 10,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/beadId" }
+    }
+  },
+  "$defs": {
+    "beadId": {
+      "type": "string",
+      "pattern": "^tdmem-[0-9]{4}$"
+    },
+    "object": {
+      "type": "object",
+      "minProperties": 1
+    }
+  }
+}
