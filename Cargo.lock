@@ -6517,6 +6517,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracedecay-memory-fabric"
+version = "0.1.0-beta.37"
+dependencies = [
+ "tracedecay-memory-provider-api",
+]
+
+[[package]]
 name = "tracedecay-memory-provider-api"
 version = "0.1.0-beta.37"
 
