@@ -13,9 +13,7 @@ use tracedecay_memory_provider_api::{
     OwnedVersionedId, ProviderCall, ProviderCallParts, ProviderDescriptor, ProviderLimits,
     ProviderOperation, ProviderReply, TerminalRecord,
 };
-use tracedecay_memory_provider_ncm::{
-    NcmAdapterError, NcmProviderAdapter, NcmRuntimePort,
-};
+use tracedecay_memory_provider_ncm::{NcmAdapterError, NcmProviderAdapter, NcmRuntimePort};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -286,7 +284,9 @@ fn construction_requires_configured_and_runtime_identity_to_match() -> TestResul
             assert_eq!(expected.as_str(), "ncm.configured");
             assert_eq!(declared.as_str(), "ncm.runtime");
         }
-        Ok(_) => assert!(false, "identity mismatch unexpectedly succeeded"),
+        Ok(_) => {
+            return Err(std::io::Error::other("identity mismatch unexpectedly succeeded").into());
+        }
     }
     Ok(())
 }
@@ -402,7 +402,10 @@ fn crate_has_only_the_provider_api_and_no_topology_dependency() {
         "tokio",
         "reqwest",
     ] {
-        assert!(!manifest.contains(forbidden), "forbidden dependency: {forbidden}");
+        assert!(
+            !manifest.contains(forbidden),
+            "forbidden dependency: {forbidden}"
+        );
     }
 
     let source = include_str!("../src/lib.rs");
@@ -417,6 +420,9 @@ fn crate_has_only_the_provider_api_and_no_topology_dependency() {
         "tracedecay_store",
         "tracedecay_code_index",
     ] {
-        assert!(!source.contains(forbidden), "topology leaked through: {forbidden}");
+        assert!(
+            !source.contains(forbidden),
+            "topology leaked through: {forbidden}"
+        );
     }
 }
