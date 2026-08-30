@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "attempt": 2,
+  "issue_id": "tdmem-0202",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Validating the canonical provider handshake after the capability authority landed: protocol negotiation must fail closed before mutation, finite limits must cover transport and execution, and implementation/state identity must stay immutable for one retained instance.",
+  "checks": [
+    {
+      "name": "provider handshake contract tests",
+      "argv": ["python3", "tests/product_provider_handshake_contract_test.py"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider handshake repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-handshake-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-handshake-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-handshake-contract.schema.json",
+        "--doc",
+        "product/contracts/memory-provider-v1/provider-handshake-contract.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider registry compatibility validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-registry-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-registry-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-registry-contract.schema.json",
+        "--readme",
+        "product/contracts/memory-provider-v1/README.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "upstream patch-footprint remains within policy",
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "acceptance_criteria": [
+    "Handshake has one canonical schema.",
+    "Incompatible providers fail with a typed terminal outcome.",
+    "Limits cover payload size, concurrency, queueing, and supported scopes.",
+    "Build/state identity is immutable for a running provider instance."
+  ],
+  "close_reason": "Accepted the canonical V1 provider handshake with fail-closed version negotiation, finite scoped limits, typed terminal outcomes, and immutable implementation/state identity for each retained instance.",
+  "close_comment": "Evidence: product/contracts/memory-provider-v1/provider-handshake-contract.json plus its strict JSON Schema define the only V1 handshake request, response, protocol, exact-scope, identity, limits, readiness and receipt authority. Compatibility selects one accepted registration and exact protocol intersection before any state mutation; provider, adapter, protocol, challenge, state owner/schema/namespace/scope, capabilities and limits each fail to deterministic typed non-ready states. Eight bounded limit dimensions cover request/response payloads, observation batches, recall candidates, concurrent operations, operation duration, snapshots and inspection; exact supported scope is separately mandatory and wildcard/CWD inference is forbidden. Implementation build/artifact identity and provider state namespace/schema/scope/generation are independently digested into an expiring ready receipt that cannot survive provider restart, registration revision, or scope revision. Tests and the repository checker enforce read-only handshake, deadline/cancellation propagation, no fake readiness and no silent fallback."
+}
