@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 5,
+  "attempt": 6,
   "issue_id": "tdmem-0303",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Closing the Native adapter crate only after it compiles inside the root workspace, depends solely on the provider API, validates the stable Native identity, routes mandatory and declared optional operations without payload or scope transformation, delegates authoritative terminals to a mockable application port, and leaves Native persistence entirely outside the crate.",
-  "retry_note": "The prior run reached the focused checks and failed only the deterministic rustfmt gate in the generated test file. The materializer now runs the pinned workspace formatter before preparing commits; no implementation or acceptance assertion was weakened.",
+  "retry_note": "The formatted implementation reached Clippy, which correctly required a regenerated root lockfile for the new path package. The materializer now performs an unlocked focused cargo check before convergence accounting, committing the actual generated lock entry; all closure checks remain --locked and unchanged.",
   "checks": [
     {
       "name": "workspace resolves with the Native adapter",
