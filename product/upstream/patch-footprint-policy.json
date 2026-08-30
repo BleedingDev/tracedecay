@@ -206,6 +206,25 @@
       "status"
     ]
   },
+  "dependency_direction_exception_contract": {
+    "adr_prefix": "product/architecture/adr/",
+    "exact_edge_only": true,
+    "required_fields": [
+      "id",
+      "rule_id",
+      "from_package",
+      "to_package",
+      "adr",
+      "rationale",
+      "reviewed_by",
+      "status"
+    ],
+    "status_values": [
+      "active",
+      "retired"
+    ]
+  },
+  "dependency_direction_exceptions": [],
   "dependency_direction_rules": [
     {
       "forbidden_dependencies": [
