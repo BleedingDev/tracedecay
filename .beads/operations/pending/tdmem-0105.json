@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0105",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Defining and enforcing the initial upstream patch budget, narrow provider-neutral touch points, zero-touch exception zones, dependency directions, and the bidirectional convergence-map contract.",
+  "checks": [
+    {
+      "name": "patch-footprint policy contract tests",
+      "argv": ["python3", "tests/product_patch_footprint_policy_test.py"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "patch-footprint repository and dependency validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "acceptance_criteria": [
+    "Allowed touch points are enumerated.",
+    "Forbidden dependency directions are documented.",
+    "Every exception requires an ADR and convergence-map entry.",
+    "A quantitative initial patch budget is stated."
+  ],
+  "close_reason": "Established and executable-validated the initial upstream patch-footprint budget, allowed provider mounts, forbidden zones and dependencies, and mandatory ADR-backed convergence tracking.",
+  "close_comment": "Evidence: product/upstream/patch-footprint-policy.json defines seven narrow touch-point categories, five zero-touch exception zones, six forbidden dependency-direction rules, and hard caps of 12 existing upstream production files, 6 upstream test/fixture files, 900 total changed lines, and 180 lines per upstream file. product/upstream/convergence-map.json is the bidirectional ledger and currently proves zero Zack-owned existing-file edits. scripts/product/check-patch-footprint-policy.py validates the immutable PR #707 floor, actual git numstat footprint, per-category and global budgets, convergence-map completeness, ADR evidence, generated-output rules, and Cargo dependency directions; tests/product_patch_footprint_policy_test.py covers budget loosening, broad path hiding, missing touch/dependency rules, floor drift, snapshot drift, orphan entries, incomplete exceptions, stale paths, duplicates, and ADR requirement removal."
+}
