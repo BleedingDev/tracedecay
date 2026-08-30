@@ -42,6 +42,11 @@ replace_once(
     "TerminalCode::InvalidRequest",
 )
 replace_once(
+    ROOT / "tests/conformance.rs",
+    "use std::error::Error;\n",
+    "//! Mandatory and restart conformance journeys for the deterministic dummy provider.\n\nuse std::error::Error;\n",
+)
+replace_once(
     ROOT / "src/lib.rs",
     '''        if let Ok(current) = self.snapshot_internal() {
             if current.content_sha256 == snapshot.content_sha256 {
