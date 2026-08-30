@@ -1,0 +1,27 @@
+[package]
+name = "tracedecay-memory-provider-ncm"
+version.workspace = true
+edition.workspace = true
+publish = false
+license = "MIT"
+description = "Topology-neutral adapter boundary for licensed NCM cognitive memory"
+repository = "https://github.com/BleedingDev/tracedecay"
+
+[dependencies]
+sha2 = "0.11"
+tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+warnings = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
