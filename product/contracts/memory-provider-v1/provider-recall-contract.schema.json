@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/schemas/memory-provider-v1/provider-recall-contract.schema.json",
+  "title": "TraceDecay memory provider recall contract V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "bead_id",
+    "title",
+    "status",
+    "authority",
+    "scope",
+    "depends_on_contracts",
+    "recall_request",
+    "exact_scope_semantics",
+    "temporal_query",
+    "budgets",
+    "exclusions",
+    "extension_contract",
+    "provider_candidate",
+    "content_reference",
+    "native_score",
+    "host_normalized_score",
+    "validity",
+    "provenance",
+    "explanation",
+    "recall_response",
+    "coverage",
+    "ordering",
+    "recall_specific_terminal_states",
+    "invariants",
+    "verification_beads"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "contract_id": { "const": "tracedecay.memory.provider.recall.v1" },
+    "bead_id": { "const": "tdmem-0204" },
+    "title": { "type": "string", "minLength": 1 },
+    "status": { "const": "accepted" },
+    "authority": { "const": "TraceDecay recall admission and context compiler" },
+    "scope": { "const": "coding_agents_only" },
+    "depends_on_contracts": {
+      "type": "array",
+      "const": [
+        "tracedecay.memory.provider.registry.v1",
+        "tracedecay.memory.provider.handshake.v1"
+      ]
+    },
+    "recall_request": { "$ref": "#/$defs/object" },
+    "exact_scope_semantics": { "$ref": "#/$defs/object" },
+    "temporal_query": { "$ref": "#/$defs/object" },
+    "budgets": { "$ref": "#/$defs/object" },
+    "exclusions": { "$ref": "#/$defs/object" },
+    "extension_contract": { "$ref": "#/$defs/object" },
+    "provider_candidate": { "$ref": "#/$defs/object" },
+    "content_reference": { "$ref": "#/$defs/object" },
+    "native_score": { "$ref": "#/$defs/object" },
+    "host_normalized_score": { "$ref": "#/$defs/object" },
+    "validity": { "$ref": "#/$defs/object" },
+    "provenance": { "$ref": "#/$defs/object" },
+    "explanation": { "$ref": "#/$defs/object" },
+    "recall_response": { "$ref": "#/$defs/object" },
+    "coverage": { "$ref": "#/$defs/object" },
+    "ordering": { "$ref": "#/$defs/object" },
+    "recall_specific_terminal_states": {
+      "type": "array",
+      "minItems": 17,
+      "maxItems": 17,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+    },
+    "invariants": {
+      "type": "array",
+      "minItems": 16,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 20 }
+    },
+    "verification_beads": {
+      "type": "array",
+      "minItems": 10,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/beadId" }
+    }
+  },
+  "$defs": {
+    "beadId": {
+      "type": "string",
+      "pattern": "^tdmem-[0-9]{4}$"
+    },
+    "object": {
+      "type": "object",
+      "minProperties": 1
+    }
+  }
+}
