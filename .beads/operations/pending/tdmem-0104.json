@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0104",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Defining and validating the coding-memory authority matrix across code truth, exact repository/worktree/branch/session identity, Native facts, provider observations/state/recall, curated rules, and final context assembly.",
+  "checks": [
+    {
+      "name": "coding-memory authority-matrix contract tests",
+      "argv": ["python3", "tests/product_coding_memory_authority_matrix_test.py"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "coding-memory authority-matrix repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-coding-memory-authority-matrix.py",
+        "--repo",
+        ".",
+        "--matrix",
+        "product/architecture/coding-memory-authority-matrix.json"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "acceptance_criteria": [
+    "No state has two canonical writers.",
+    "Provider recall is explicitly advisory.",
+    "TraceDecay Native remains authority for accepted explicit facts.",
+    "The matrix covers repository, worktree, branch, agent session, and provider namespaces."
+  ],
+  "close_reason": "Defined and executable-validated the coding-memory authority matrix with single writers, exact namespaces, advisory provider recall, and TraceDecay-owned final context assembly.",
+  "close_comment": "Evidence: product/architecture/coding-memory-authority-matrix.json names the owner, sole canonical writer, read/write interfaces, consistency model, failure behavior, exact namespace variants, provider semantics, and prohibited side effects for code truth, repository/worktree/branch identity, session evidence, accepted Native facts, provider observation journal, provider cognitive state, provider recall, curated rules, and final context. The Markdown companion explains precedence and call paths. scripts/product/check-coding-memory-authority-matrix.py cross-validates the matrix against real source authorities and the completed tdmem-0103 Native surface map; tests/product_coding_memory_authority_matrix_test.py rejects writer duplication, Native-authority drift, provider authority escalation, scope overlap, precedence drift, silent fallback, and stale source references."
+}
