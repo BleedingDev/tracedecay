@@ -5,6 +5,7 @@
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Closing the Native memory seam audit after validating the machine-readable authority map against the real repository and its public operation catalogs.",
+  "retry_note": "The first completion run found the issue-scoped applied slot occupied by the earlier claim. That claim is archived in .beads/operations/history/tdmem-0103.claim.json and the completion slot was rotated without changing Beads issue state.",
   "checks": [
     {
       "name": "Native memory surface-map contract tests",
