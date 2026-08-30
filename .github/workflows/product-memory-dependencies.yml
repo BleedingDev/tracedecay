@@ -1,0 +1,59 @@
+name: Product memory dependency policy
+
+on:
+  push:
+    branches:
+      - feat/pluggable-memory-providers-v2
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/*/Cargo.toml
+      - product/upstream/patch-footprint-policy.json
+      - product/upstream/convergence-map.json
+      - product/architecture/adr/**
+      - product/architecture/memory-dependency-policy.md
+      - scripts/product/check-memory-dependency-policy.py
+      - scripts/product/check-patch-footprint-policy.py
+      - tests/product_memory_dependency_policy_test.py
+      - tests/product_patch_footprint_policy_test.py
+      - .github/workflows/product-memory-dependencies.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/*/Cargo.toml
+      - product/upstream/patch-footprint-policy.json
+      - product/upstream/convergence-map.json
+      - product/architecture/adr/**
+      - product/architecture/memory-dependency-policy.md
+      - scripts/product/check-memory-dependency-policy.py
+      - scripts/product/check-patch-footprint-policy.py
+      - tests/product_memory_dependency_policy_test.py
+      - tests/product_patch_footprint_policy_test.py
+      - .github/workflows/product-memory-dependencies.yml
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-direction:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate dependency policy fixtures
+        run: python3 tests/product_memory_dependency_policy_test.py
+      - name: Validate real workspace dependency graph
+        run: >-
+          python3 scripts/product/check-memory-dependency-policy.py
+          --repo .
+          --policy product/upstream/patch-footprint-policy.json
+      - name: Validate upstream footprint policy
+        run: >-
+          python3 scripts/product/check-patch-footprint-policy.py
+          --repo .
+          --policy product/upstream/patch-footprint-policy.json
+          --map product/upstream/convergence-map.json
+      - name: Resolve locked workspace graph
+        run: cargo metadata --locked --format-version 1 --no-deps

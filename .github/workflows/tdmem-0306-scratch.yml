@@ -1,0 +1,66 @@
+name: Validate tdmem-0306 dependency policy
+
+on:
+  push:
+    branches:
+      - agent/tdmem-0306-dependency-policy
+    paths:
+      - scripts/product/check-memory-dependency-policy.py
+      - tests/product_memory_dependency_policy_test.py
+      - product/architecture/memory-dependency-policy.md
+      - .github/workflows/product-memory-dependencies.yml
+      - .github/workflows/tdmem-0306-scratch.yml
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Materialize exception contract for validation
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path("product/upstream/patch-footprint-policy.json")
+          value = json.loads(path.read_text(encoding="utf-8"))
+          value["dependency_direction_exception_contract"] = {
+              "required_fields": [
+                  "id",
+                  "rule_id",
+                  "from_package",
+                  "to_package",
+                  "adr",
+                  "rationale",
+                  "reviewed_by",
+                  "status",
+              ],
+              "status_values": ["active", "retired"],
+              "exact_edge_only": True,
+              "adr_prefix": "product/architecture/adr/",
+          }
+          value["dependency_direction_exceptions"] = []
+          path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+      - name: Compile Python gates
+        run: >-
+          python3 -m py_compile
+          scripts/product/check-memory-dependency-policy.py
+          tests/product_memory_dependency_policy_test.py
+      - name: Run dependency-policy fixtures
+        run: python3 tests/product_memory_dependency_policy_test.py
+      - name: Check real workspace graph
+        run: >-
+          python3 scripts/product/check-memory-dependency-policy.py
+          --repo .
+          --policy product/upstream/patch-footprint-policy.json
+      - name: Keep upstream footprint policy green
+        run: >-
+          python3 scripts/product/check-patch-footprint-policy.py
+          --repo .
+          --policy product/upstream/patch-footprint-policy.json
+          --map product/upstream/convergence-map.json
