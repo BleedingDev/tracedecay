@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 2,
+  "attempt": 3,
   "issue_id": "tdmem-0208",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Closing generated Rust bindings only after deterministic regeneration, strict rustc compilation and runtime probes, no forbidden constructs, no duplicate hand-maintained wire types, and a checked-in CI lane that fails on contract or generated drift.",
-  "retry_note": "The first evidence run generated the Rust authority correctly but the preparer published the wrong prepared-files manifest shape and failed to retire itself. The one-shot materializer now emits the workflow's canonical list-of-paths manifest and unlinks itself after successful generation; binding semantics are unchanged.",
+  "retry_note": "Attempt 1 exposed an invalid preparer manifest; attempt 2 proved materialization and retirement but correctly failed because the product-owned workflow authority had not yet been mounted at .github/workflows/product-memory-contracts.yml. The checked-in workflow now byte-matches its product template; generated binding semantics are unchanged.",
   "checks": [
     {
       "name": "generated Rust binding mutation and architecture tests",
