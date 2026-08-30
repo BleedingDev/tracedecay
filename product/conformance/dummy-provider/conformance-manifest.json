@@ -2,7 +2,7 @@
   "schema_version": 1,
   "manifest_id": "tracedecay.memory.provider.dummy-conformance.v1",
   "bead_id": "tdmem-0209",
-  "status": "accepted_candidate",
+  "status": "accepted",
   "provider_id": "test.dummy",
   "provider_protocol": "1.0",
   "implementation": {

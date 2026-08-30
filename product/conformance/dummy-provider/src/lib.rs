@@ -17,8 +17,8 @@
 //! operation returns a typed terminal outcome. It has no TraceDecay storage, code-index,
 //! host, dashboard, transport, or concrete NCM dependency.
 
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::str;
 
 use sha2::{Digest, Sha256};
@@ -29,8 +29,7 @@ use sha2::{Digest, Sha256};
 pub mod contract;
 
 use contract::{
-    CancellationState, CommittedEffectState, FallbackEligibility, RequestControl,
-    TerminalCode,
+    CancellationState, CommittedEffectState, FallbackEligibility, RequestControl, TerminalCode,
 };
 
 const SNAPSHOT_MAGIC: &[u8] = b"TRACEDECAY-DUMMY-SNAPSHOT-V1\n";
@@ -335,7 +334,7 @@ impl DummyProvider {
             return Terminal::failure(code, self.state_generation);
         }
         if requested_provider_id != self.provider_id {
-            return Terminal::failure(TerminalCode::ProviderIdMismatch, self.state_generation);
+            return Terminal::failure(TerminalCode::InvalidRequest, self.state_generation);
         }
         if exact_scope_digest != self.exact_scope_digest {
             return Terminal::failure(TerminalCode::ScopeMismatch, self.state_generation);
@@ -399,14 +398,13 @@ impl DummyProvider {
             .iter()
             .any(|extension| extension.required)
         {
-            return Terminal::failure(
-                TerminalCode::CapabilityUnsupported,
-                self.state_generation,
-            );
+            return Terminal::failure(TerminalCode::CapabilityUnsupported, self.state_generation);
         }
-        if observation.extensions.iter().any(|extension| {
-            extension.payload_sha256 != sha256_hex(&extension.canonical_payload)
-        }) {
+        if observation
+            .extensions
+            .iter()
+            .any(|extension| extension.payload_sha256 != sha256_hex(&extension.canonical_payload))
+        {
             return Terminal::failure(TerminalCode::ContractViolation, self.state_generation);
         }
         let fingerprint_sha256 = observation_fingerprint(&observation);
@@ -427,10 +425,7 @@ impl DummyProvider {
             }
             Entry::Vacant(vacant) => {
                 if context.expected_state_generation != self.state_generation {
-                    return Terminal::failure(
-                        TerminalCode::StaleIdentity,
-                        self.state_generation,
-                    );
+                    return Terminal::failure(TerminalCode::StaleIdentity, self.state_generation);
                 }
                 let expected_sequence = self.acknowledged_sequence.saturating_add(1);
                 if observation.source_sequence != expected_sequence {
@@ -497,11 +492,7 @@ impl DummyProvider {
         if payload.candidates.is_empty() {
             Terminal::zero_results(payload, self.state_generation)
         } else {
-            Terminal::success(
-                payload,
-                self.state_generation,
-                CommittedEffectState::None,
-            )
+            Terminal::success(payload, self.state_generation, CommittedEffectState::None)
         }
     }
 
@@ -515,11 +506,9 @@ impl DummyProvider {
             return Terminal::failure(TerminalCode::StaleIdentity, self.state_generation);
         }
         match self.snapshot_internal() {
-            Ok(snapshot) => Terminal::success(
-                snapshot,
-                self.state_generation,
-                CommittedEffectState::None,
-            ),
+            Ok(snapshot) => {
+                Terminal::success(snapshot, self.state_generation, CommittedEffectState::None)
+            }
             Err(_) => Terminal::failure(TerminalCode::InternalFailure, self.state_generation),
         }
     }
@@ -543,10 +532,7 @@ impl DummyProvider {
         let decoded = match decode_snapshot(&snapshot.bytes) {
             Ok(decoded) => decoded,
             Err(_) => {
-                return Terminal::failure(
-                    TerminalCode::StateIncompatible,
-                    self.state_generation,
-                );
+                return Terminal::failure(TerminalCode::StateIncompatible, self.state_generation);
             }
         };
         if decoded.provider_id != self.provider_id
@@ -556,18 +542,18 @@ impl DummyProvider {
         {
             return Terminal::failure(TerminalCode::StateIncompatible, self.state_generation);
         }
-        if let Ok(current) = self.snapshot_internal() {
-            if current.content_sha256 == snapshot.content_sha256 {
-                return Terminal::success(
-                    RestoreResult {
-                        state_generation: self.state_generation,
-                        acknowledged_sequence: self.acknowledged_sequence,
-                        changed: false,
-                    },
-                    self.state_generation,
-                    CommittedEffectState::None,
-                );
-            }
+        if let Ok(current) = self.snapshot_internal()
+            && current.content_sha256 == snapshot.content_sha256
+        {
+            return Terminal::success(
+                RestoreResult {
+                    state_generation: self.state_generation,
+                    acknowledged_sequence: self.acknowledged_sequence,
+                    changed: false,
+                },
+                self.state_generation,
+                CommittedEffectState::None,
+            );
         }
         if !self.observations.is_empty() || self.state_generation != 0 {
             return Terminal::failure(TerminalCode::Conflict, self.state_generation);
@@ -782,8 +768,8 @@ impl<'a> SnapshotCursor<'a> {
     }
 
     fn read_bytes(&mut self) -> Result<Vec<u8>, SnapshotCodecError> {
-        let length = usize::try_from(self.read_u64()?)
-            .map_err(|_| SnapshotCodecError::LengthOverflow)?;
+        let length =
+            usize::try_from(self.read_u64()?).map_err(|_| SnapshotCodecError::LengthOverflow)?;
         Ok(self.read_exact(length)?.to_vec())
     }
 
@@ -805,8 +791,8 @@ fn decode_snapshot(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotCodecError> 
     let exact_scope_digest = cursor.read_string()?;
     let state_generation = cursor.read_u64()?;
     let acknowledged_sequence = cursor.read_u64()?;
-    let observation_count = usize::try_from(cursor.read_u64()?)
-        .map_err(|_| SnapshotCodecError::LengthOverflow)?;
+    let observation_count =
+        usize::try_from(cursor.read_u64()?).map_err(|_| SnapshotCodecError::LengthOverflow)?;
     let mut observations = BTreeMap::new();
     for _ in 0..observation_count {
         let idempotency_key = cursor.read_string()?;
@@ -815,8 +801,8 @@ fn decode_snapshot(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotCodecError> 
         let canonical_content = cursor.read_string()?;
         let payload_sha256 = cursor.read_string()?;
         let fingerprint_sha256 = cursor.read_string()?;
-        let extension_count = usize::try_from(cursor.read_u64()?)
-            .map_err(|_| SnapshotCodecError::LengthOverflow)?;
+        let extension_count =
+            usize::try_from(cursor.read_u64()?).map_err(|_| SnapshotCodecError::LengthOverflow)?;
         let mut extensions = Vec::with_capacity(extension_count);
         for _ in 0..extension_count {
             let extension_id = cursor.read_string()?;

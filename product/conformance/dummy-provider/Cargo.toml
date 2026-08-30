@@ -2,7 +2,7 @@
 name = "tracedecay-memory-dummy-provider"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.97.1"
 publish = false
 license = "MIT"
 description = "Deterministic mandatory-conformance provider for TraceDecay Memory Provider V1"

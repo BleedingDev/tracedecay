@@ -1,3 +1,5 @@
+//! Mandatory and restart conformance journeys for the deterministic dummy provider.
+
 use std::error::Error;
 use std::io;
 
@@ -117,7 +119,7 @@ fn compatible_handshake_is_read_only() -> Result<(), Box<dyn Error>> {
 fn provider_identity_mismatch_fails_closed() -> Result<(), Box<dyn Error>> {
     let provider = provider(SCOPE_A)?;
     let terminal = provider.handshake("test.other", SCOPE_A, live_control());
-    assert_eq!(terminal.terminal_code, TerminalCode::ProviderIdMismatch);
+    assert_eq!(terminal.terminal_code, TerminalCode::InvalidRequest);
     assert_eq!(terminal.committed_effect, CommittedEffectState::None);
     assert!(terminal.payload.is_none());
     assert_eq!(provider.state_generation(), 0);
@@ -382,10 +384,7 @@ fn nonempty_different_restore_conflicts() -> Result<(), Box<dyn Error>> {
 
     let mut destination = provider(SCOPE_A)?;
     apply(&mut destination, "destination", 1, "different state")?;
-    let terminal = destination.restore(
-        &context(SCOPE_A, 1, "different-restore"),
-        &snapshot,
-    );
+    let terminal = destination.restore(&context(SCOPE_A, 1, "different-restore"), &snapshot);
     assert_eq!(terminal.terminal_code, TerminalCode::Conflict);
     assert_eq!(terminal.committed_effect, CommittedEffectState::None);
     assert_eq!(destination.state_generation(), 1);
@@ -433,10 +432,8 @@ fn cross_scope_snapshot_is_incompatible() -> Result<(), Box<dyn Error>> {
 #[test]
 fn unsupported_feedback_is_explicit() -> Result<(), Box<dyn Error>> {
     let provider = provider(SCOPE_A)?;
-    let terminal = provider.unsupported_optional(
-        &context(SCOPE_A, 0, "feedback"),
-        "feedback.record.v1",
-    );
+    let terminal =
+        provider.unsupported_optional(&context(SCOPE_A, 0, "feedback"), "feedback.record.v1");
     assert_eq!(terminal.terminal_code, TerminalCode::CapabilityUnsupported);
     assert_eq!(terminal.fallback, FallbackEligibility::Forbidden);
     assert_eq!(terminal.committed_effect, CommittedEffectState::None);
@@ -446,10 +443,8 @@ fn unsupported_feedback_is_explicit() -> Result<(), Box<dyn Error>> {
 #[test]
 fn unsupported_maintenance_is_explicit() -> Result<(), Box<dyn Error>> {
     let provider = provider(SCOPE_A)?;
-    let terminal = provider.unsupported_optional(
-        &context(SCOPE_A, 0, "maintenance"),
-        "maintenance.run.v1",
-    );
+    let terminal =
+        provider.unsupported_optional(&context(SCOPE_A, 0, "maintenance"), "maintenance.run.v1");
     assert_eq!(terminal.terminal_code, TerminalCode::CapabilityUnsupported);
     assert_eq!(terminal.fallback, FallbackEligibility::Forbidden);
     assert_eq!(terminal.committed_effect, CommittedEffectState::None);
