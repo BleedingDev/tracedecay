@@ -1,0 +1,37 @@
+name: Product upstream floor
+
+on:
+  push:
+    paths:
+      - product/upstream/**
+      - scripts/check-product-upstream-floor.py
+      - tests/product_upstream_floor_test.sh
+      - .github/workflows/product-upstream.yml
+  pull_request:
+    paths:
+      - product/upstream/**
+      - scripts/check-product-upstream-floor.py
+      - tests/product_upstream_floor_test.sh
+      - .github/workflows/product-upstream.yml
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run focused verifier tests
+        run: bash tests/product_upstream_floor_test.sh
+
+      - name: Verify the real checkout contains the pinned floor
+        run: |
+          python3 scripts/check-product-upstream-floor.py \
+            --repo . \
+            --metadata product/upstream/tracedecay-v2-pr707.json

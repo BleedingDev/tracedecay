@@ -5,7 +5,7 @@ This directory is the versioned planning authority for branch
 
 ## Fixed program scope
 
-- Base: `ScriptedAlchemy/tracedecay` PR #707, head SHA
+- Base: `ScriptedAlchemy/tracedecay` PR #707, pinned floor SHA
   `08fbe33a7c7f403191fd5d6e356c7b6681b96403`.
 - Product scope: **coding agents only**.
 - Repository shape: **one TraceDecay V2 monorepo**.
@@ -85,7 +85,7 @@ br update --actor "$ACTOR" <id> \
 
 # Mark every acceptance checkbox complete before closure.
 br update --actor "$ACTOR" <id> \
-  --acceptance-criteria-file /path/to/completed-checklist.md
+  --acceptance-criteria $'- [x] First criterion\n- [x] Second criterion'
 
 br close --actor "$ACTOR" <id> \
   --reason "Completed with commit/test evidence" \
@@ -94,6 +94,12 @@ br close --actor "$ACTOR" <id> \
 br dep cycles --json
 br sync --flush-only
 ```
+
+For automated work, commit exactly one reviewed JSON operation under
+`.beads/operations/pending/`. `apply-beads-operation.yml` installs the pinned
+`br`, rebuilds the local database, claims the bead, runs argv-based evidence
+checks, completes the checklist, closes the bead, emits a receipt, repacks the
+canonical plan, and moves the operation to `operations/applied/`.
 
 ## Governance
 

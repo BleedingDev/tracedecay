@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": 1,
+  "authority": "product-owned",
+  "product": {
+    "repository": "BleedingDev/tracedecay",
+    "branch": "feat/pluggable-memory-providers-v2",
+    "program_bead": "tdmem-0000"
+  },
+  "source": {
+    "repository": "ScriptedAlchemy/tracedecay",
+    "pull_request": 707,
+    "url": "https://github.com/ScriptedAlchemy/tracedecay/pull/707"
+  },
+  "pinned_floor": {
+    "sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+    "selected_at": "2026-08-29T23:13:31Z",
+    "selection_basis": "PR #707 head when the product branch was created",
+    "must_be_ancestor_of_product_head": true
+  },
+  "observed_pull_request": {
+    "retrieved_at": "2026-08-30",
+    "state": "open",
+    "base_ref": "master",
+    "base_sha": "b9204dcf7de8faac4ef05af367a546aa29c32e9f",
+    "head_ref": "codex/tracedecay-total-redesign-plan-reopened",
+    "head_sha": "a98f61ca354a2dde6ed2e690d267d99908b30ef8",
+    "pinned_floor_is_current_head": false
+  },
+  "update_procedure": {
+    "observed_pull_request": "Refresh only the observed snapshot after reading PR #707 metadata, then run the verifier and focused test.",
+    "pinned_floor": "Never move the floor in place. Open a dedicated convergence bead, record old and new SHAs, prove ancestry or an explicit transplant, and update the product branch through a reviewed commit."
+  }
+}
