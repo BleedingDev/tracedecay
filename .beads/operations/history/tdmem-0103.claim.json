@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0103",
+  "mode": "claim",
+  "actor": "assistant",
+  "claim_comment": "Mapping the complete Native memory surface across contracts, canonical stores, use cases, daemon composition, CLI, MCP, SDK, dashboard, hooks, automation, maintenance, projections, and focused verification. The deliverable will name authorities and rank provider seams without changing runtime behavior.",
+  "applied_commit": "fae59080bba60d007906432ca5295082beefd8a8",
+  "receipt_blob_sha": "1d63f3d5f9e1d988904f100e7cbb22620c10cb94",
+  "note": "Archived before the completion operation reused the issue-scoped applied/receipt slots; full receipt remains recoverable from applied_commit."
+}
