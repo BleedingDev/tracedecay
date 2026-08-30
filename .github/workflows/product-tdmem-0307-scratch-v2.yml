@@ -1,0 +1,99 @@
+name: Validate tdmem-0307 default-off composition
+
+on:
+  push:
+    branches:
+      - agent/tdmem-0307-composition
+    paths:
+      - crates/tracedecay/Cargo.toml
+      - crates/tracedecay/src/lib.rs
+      - crates/tracedecay/src/memory_provider_composition.rs
+      - crates/tracedecay/tests/product_memory_provider/composition.rs
+      - Cargo.lock
+      - product/upstream/patch-footprint-policy.json
+      - product/upstream/convergence-map.json
+      - scripts/product/tdmem-0307-scratch.py
+      - tests/product_memory_composition_feature_test.py
+      - .github/workflows/product-tdmem-0307-scratch-v2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out validation branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Materialize and validate root wiring
+        run: python3 scripts/product/tdmem-0307-scratch.py
+
+      - name: Prove feature and source isolation
+        run: |
+          python3 -m py_compile \
+            scripts/product/tdmem-0307-scratch.py \
+            tests/product_memory_composition_feature_test.py
+          python3 tests/product_memory_composition_feature_test.py
+          rustfmt --edition 2024 --check \
+            crates/tracedecay/src/memory_provider_composition.rs \
+            crates/tracedecay/tests/product_memory_provider/composition.rs
+
+      - name: Prove default graph excludes Memory Fabric
+        run: |
+          cargo tree -p tracedecay --no-default-features -e normal --prefix none --locked \
+            > /tmp/default-tree.txt
+          if grep -q 'tracedecay-memory-' /tmp/default-tree.txt; then
+            cat /tmp/default-tree.txt
+            echo 'default-off graph unexpectedly contains Memory Fabric crates' >&2
+            exit 1
+          fi
+
+      - name: Prove enabled graph contains explicit memory crates
+        run: |
+          cargo tree -p tracedecay --no-default-features \
+            --features memory-provider-fabric -e normal --prefix none --locked \
+            > /tmp/enabled-tree.txt
+          for package in \
+            tracedecay-memory-provider-api \
+            tracedecay-memory-fabric \
+            tracedecay-memory-provider-native
+          do
+            grep -q "^${package} " /tmp/enabled-tree.txt
+          done
+
+      - name: Check default-off root library
+        run: cargo check -p tracedecay --no-default-features --lib --locked
+
+      - name: Check and lint enabled composition
+        run: |
+          cargo check -p tracedecay --no-default-features \
+            --features memory-provider-fabric --lib --locked
+          cargo clippy -p tracedecay --no-default-features \
+            --features memory-provider-fabric \
+            --lib --test memory_provider_composition --locked -- -D warnings
+
+      - name: Run focused composition journeys
+        run: >-
+          cargo test -p tracedecay
+          --no-default-features
+          --features memory-provider-fabric
+          --test memory_provider_composition
+          --locked
+
+      - name: Re-run architecture and footprint gates
+        run: |
+          python3 scripts/product/check-memory-dependency-direction.py \
+            --repo . \
+            --policy product/architecture/memory-dependency-policy.json
+          python3 scripts/product/check-memory-dependency-policy.py \
+            --repo . \
+            --policy product/upstream/patch-footprint-policy.json
+          python3 scripts/product/check-patch-footprint-policy.py \
+            --repo . \
+            --policy product/upstream/patch-footprint-policy.json \
+            --map product/upstream/convergence-map.json
+          git diff --check
