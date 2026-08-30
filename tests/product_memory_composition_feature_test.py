@@ -77,7 +77,9 @@ class MemoryCompositionFeatureTest(unittest.TestCase):
                 encoding="utf-8",
             )
             errors = CHECKER.check_repository(repo)
-            self.assertTrue(any("default must not enable" in error for error in errors))
+            self.assertTrue(
+                any("default features must remain exactly" in error for error in errors)
+            )
 
     def test_non_optional_registry_dependency_fails(self) -> None:
         directory, repo = self.fixture()
