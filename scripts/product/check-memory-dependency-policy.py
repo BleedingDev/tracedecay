@@ -261,6 +261,11 @@ def validate_repository(
             for value in rule.get("forbidden_dependencies", [])
             if isinstance(value, str)
         ]
+        allowed = [
+            value
+            for value in rule.get("allowed_dependencies", [])
+            if isinstance(value, str)
+        ]
         for package, (path, dependencies) in manifests.items():
             if not package_matches(package, from_patterns) or package_matches(
                 package, except_patterns
@@ -268,6 +273,8 @@ def validate_repository(
                 continue
             for dependency in sorted(dependencies):
                 if not package_matches(dependency, forbidden):
+                    continue
+                if package_matches(dependency, allowed):
                     continue
                 violations += 1
                 key = (rule_id, package, dependency)
