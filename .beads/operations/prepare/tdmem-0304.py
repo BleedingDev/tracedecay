@@ -119,6 +119,14 @@ if source.count(stale_parts_set) != 2:
     raise SystemExit("could not locate the two stale provider-call builder sets")
 source = source.replace(stale_parts_set, fixed_parts_vec)
 
+stale_mutable_request = (
+    "    let mut request = call(NCM_PROVIDER_ID, ProviderOperation::Recall);\n"
+)
+fixed_request = "    let request = call(NCM_PROVIDER_ID, ProviderOperation::Recall);\n"
+if source.count(stale_mutable_request) != 1:
+    raise SystemExit("could not locate the unnecessarily mutable cancelled request")
+source = source.replace(stale_mutable_request, fixed_request, 1)
+
 BODY.write_text(source, encoding="utf-8")
 subprocess.run(["python3", str(BODY)], cwd=ROOT, check=True)
 HERE.unlink()
