@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0107",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Consolidating the clean baseline, Native seam audit, authority matrix, patch-footprint policy, convergence map, and foundational ADRs into a machine-checked M0 GO/NO-GO decision with hard gates and dependency-aware implementation order.",
+  "checks": [
+    {
+      "name": "M0 GO/NO-GO contract tests",
+      "argv": ["python3", "tests/product_m0_go_no_go_test.py"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "M0 GO/NO-GO repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-m0-go-no-go.py",
+        "--repo",
+        ".",
+        "--decision",
+        "product/architecture/m0-go-no-go.json",
+        "--report",
+        "product/architecture/m0-go-no-go.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "foundational ADR repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-foundational-adrs.py",
+        "--repo",
+        ".",
+        "--manifest",
+        "product/architecture/adr/manifest.json",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "upstream patch-footprint remains within policy",
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "acceptance_criteria": [
+    "The report explicitly says GO or NO-GO for implementing the provider boundary on this pinned V2 floor.",
+    "The decision cites the clean baseline, seam map, authority matrix, patch budget, convergence map, and foundational ADRs.",
+    "Residual risks, blockers, no-go triggers, and deferred decisions are explicit.",
+    "A GO decision locks a dependency-aware implementation order beginning with provider-neutral contracts and conformance."
+  ],
+  "close_reason": "Recorded a machine-checked M0 GO decision: the provider boundary is viable above existing TraceDecay application ports without replacing canonical authorities, with explicit hard gates, risks, deferred NCM/OCEAN decisions, and implementation order beginning at tdmem-0201.",
+  "close_comment": "Evidence: product/architecture/m0-go-no-go.json and .md consolidate the immutable upstream floor, successful clean baseline receipt, complete Native memory surface map, accepted authority matrix, enforced patch-footprint/convergence policy, and eight foundational ADRs. The verdict is GO only above existing application/use-case seams; current code, exact repository/worktree/branch/session identity, accepted Native facts, curated rules, host integration, and final context remain TraceDecay-owned. Provider recall stays advisory, observer output is result-unreachable, writes require bounded durable idempotent recovery, Native stays direct until parity, NCM topology remains deferred to tdmem-0701/0702, and OCEAN remains a reserved slot. scripts/product/check-m0-go-no-go.py validates all evidence, authority conditions, seven residual risk classes, deferred decisions, contiguous dependency-aware implementation train, six hard gates, and NO-GO triggers against real Beads IDs; tests/product_m0_go_no_go_test.py rejects authority weakening, missing evidence/risks, unknown blockers, premature NCM/OCEAN decisions, skipped M1 contracts, wrong topology order, removed hard gates, and collapsed stop conditions."
+}
