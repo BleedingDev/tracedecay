@@ -210,7 +210,7 @@
     }
   },
   "compatibility_algorithm": [
-    "Resolve exactly one accepted registry registration by provider_id and registration_revision.",
+    "Resolve exactly one accepted registry registration by provider_id and registration revision (registration_revision).",
     "Reject before provider contact when the request deadline is expired or cancellation is already terminal.",
     "Call the selected adapter handshake with exact scope, request identity, challenge, required capabilities, and host ceilings.",
     "Require exact provider_id echo and a valid challenge response.",
