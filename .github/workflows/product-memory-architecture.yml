@@ -1,0 +1,41 @@
+name: Product memory architecture
+
+on:
+  push:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/tracedecay-memory-*/**
+      - product/architecture/memory-dependency-policy.json
+      - scripts/product/check-memory-dependency-direction.py
+      - tests/product_memory_dependency_direction_test.py
+      - .github/workflows/product-memory-architecture.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/tracedecay-memory-*/**
+      - product/architecture/memory-dependency-policy.json
+      - scripts/product/check-memory-dependency-direction.py
+      - tests/product_memory_dependency_direction_test.py
+      - .github/workflows/product-memory-architecture.yml
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-direction:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run focused policy tests
+        run: python3 tests/product_memory_dependency_direction_test.py
+
+      - name: Verify the real Cargo dependency graph
+        run: |
+          python3 scripts/product/check-memory-dependency-direction.py \
+            --repo . \
+            --policy product/architecture/memory-dependency-policy.json
