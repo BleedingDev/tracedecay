@@ -19,6 +19,7 @@ EXPECTED_DECISIONS = {
     "ADR-0006": "context_compilation",
     "ADR-0007": "observer_isolation_and_activation",
     "ADR-0008": "upstream_convergence",
+    "ADR-0009": "ncm_execution_topology",
 }
 
 EXPECTED_PATHS = {
@@ -30,6 +31,7 @@ EXPECTED_PATHS = {
     "ADR-0006": "product/architecture/adr/ADR-0006-context-compilation.md",
     "ADR-0007": "product/architecture/adr/ADR-0007-observer-isolation-and-activation.md",
     "ADR-0008": "product/architecture/adr/ADR-0008-upstream-convergence.md",
+    "ADR-0009": "product/architecture/adr/ADR-0009-ncm-isolated-local-process.md",
 }
 
 EXPECTED_STATUSES = {
@@ -41,6 +43,7 @@ EXPECTED_STATUSES = {
     "ADR-0006": "accepted",
     "ADR-0007": "accepted",
     "ADR-0008": "accepted",
+    "ADR-0009": "accepted_with_production_blockers",
 }
 
 REQUIRED_SECTIONS = [
@@ -99,6 +102,16 @@ REQUIRED_GLOBAL_PHRASES = {
         "Every current upstream existing-file diff",
         "never force-update",
     ],
+    "ADR-0009": [
+        "supervised isolated local process",
+        "`NcmCognitiveSurface`",
+        "one provider-owned state directory",
+        "no TraceDecay database",
+        "restart invalidates the readiness result",
+        "production admission stays blocked",
+        "server-side deadline/cancellation",
+        "atomic crash-safe persistence",
+    ],
 }
 
 REQUIRED_SOURCE_AUTHORITIES = {
@@ -107,6 +120,74 @@ REQUIRED_SOURCE_AUTHORITIES = {
     "product/upstream/patch-footprint-policy.json",
     "product/upstream/convergence-map.json",
     "product/baseline/tracedecay-v2-pr707-linux.json",
+}
+
+NCM_TOPOLOGY_EVIDENCE = {
+    "crates/tracedecay-memory-provider-ncm/audits/tdmem-0701-licensed-surface-audit.md",
+    "crates/tracedecay-memory-provider-ncm/audits/tdmem-0701-capability-matrix.json",
+    "product/contracts/memory-provider-v1/provider-lifecycle-contract.json",
+    "product/contracts/memory-provider-v1/provider-observation-contract.json",
+}
+
+NCM_TOPOLOGY_FIELDS = {
+    "state",
+    "selected_topology",
+    "transport",
+    "adapter_boundary",
+    "instance_cardinality",
+    "state_ownership",
+    "restart_readiness",
+    "restart_effect_evidence",
+    "production_admission",
+    "denied_authorities",
+    "required_blockers",
+}
+
+NCM_DENIED_AUTHORITIES = {
+    "tracedecay_databases",
+    "repository_and_worktree_files",
+    "host_credentials",
+    "raw_scope_identity",
+    "git_and_code_navigation",
+    "session_truth",
+    "canonical_facts",
+    "tools_and_approvals",
+    "prompt_and_final_context",
+}
+
+NCM_PRODUCTION_BLOCKERS = {
+    "exact_scope_isolation",
+    "loaded_state_identity",
+    "server_cancellation_and_effect_reconciliation",
+    "durable_deduplication",
+    "atomic_persistence",
+    "supervisor_capability",
+}
+
+NCM_REQUIRED_REJECTIONS = {
+    "in-process Biomem integration",
+    "MCP stdio as the provider transport",
+}
+
+NCM_REQUIRED_SECTION_PHRASES = {
+    "Decision": [
+        "It does not admit NCM to production.",
+        "Mandatory observation remains blocking",
+        "selected HTTP endpoint",
+        "Durable operation identities, dedupe records",
+        "Every request receives one monotonic remaining budget",
+    ],
+    "Migration path": [
+        "exclusive supervisor migration fence",
+        "source and destination provider/build/config/schema/generation/scope identity",
+        "item/count conservation",
+    ],
+    "Consequences": [
+        "Process isolation is not a source-protection or IP boundary",
+    ],
+    "Invariants": [
+        "operation/effect evidence needed for dedupe and reconciliation",
+    ],
 }
 
 BEAD_ID_RE = re.compile(r"^tdmem-[0-9]{4}$")
@@ -255,7 +336,10 @@ def validate_decision_metadata(
     graph: dict[str, set[str]] = {}
 
     for decision_id, row in decisions.items():
-        expected_topic = EXPECTED_DECISIONS[decision_id]
+        expected_topic = EXPECTED_DECISIONS.get(decision_id)
+        if expected_topic is None:
+            errors.append(f"unexpected foundational ADR {decision_id}")
+            continue
         if row.get("topic") != expected_topic:
             errors.append(f"{decision_id}.topic must be {expected_topic}")
         if row.get("path") != EXPECTED_PATHS[decision_id]:
@@ -297,6 +381,11 @@ def validate_decision_metadata(
         )
         graph[decision_id] = set()
         for dependency in dependencies:
+            if not isinstance(dependency, str):
+                errors.append(
+                    f"{decision_id} depends_on_adrs entries must be ADR ids"
+                )
+                continue
             if dependency not in decisions:
                 errors.append(f"{decision_id} depends on unknown ADR {dependency!r}")
                 continue
@@ -377,20 +466,40 @@ def validate_adr_files(
         if len(re.findall(r"(?m)^\d+\. ", invariants)) < 4:
             errors.append(f"{decision_id} must state at least four numbered invariants")
         verification = section_body(text, "Verification")
-        for bead_id in row.get("verification_beads", []):
+        verification_beads = row.get("verification_beads")
+        if not isinstance(verification_beads, list):
+            verification_beads = []
+        for bead_id in verification_beads:
             if isinstance(bead_id, str) and f"`{bead_id}`" not in verification:
                 errors.append(
                     f"{decision_id} verification section does not cite {bead_id}"
                 )
 
-        for phrase in REQUIRED_GLOBAL_PHRASES[decision_id]:
+        for phrase in REQUIRED_GLOBAL_PHRASES.get(decision_id, []):
             if phrase.casefold() not in text.casefold():
                 errors.append(f"{decision_id} is missing required phrase {phrase!r}")
-        for rejection in row.get("required_rejections", []):
+        required_rejections = row.get("required_rejections")
+        if not isinstance(required_rejections, list):
+            required_rejections = []
+        for rejection in required_rejections:
             if isinstance(rejection, str) and rejection.casefold() not in rejected.casefold():
                 errors.append(
                     f"{decision_id} rejected-alternatives section is missing manifest rejection {rejection!r}"
                 )
+
+        if decision_id == "ADR-0009":
+            for section, phrases in NCM_REQUIRED_SECTION_PHRASES.items():
+                body = section_body(text, section)
+                if not body:
+                    errors.append(
+                        f"ADR-0009 is missing non-empty topology section {section!r}"
+                    )
+                    continue
+                for phrase in phrases:
+                    if phrase.casefold() not in body.casefold():
+                        errors.append(
+                            f"ADR-0009 {section!r} section is missing semantic requirement {phrase!r}"
+                        )
 
 
 def validate_topology_gate(
@@ -425,6 +534,90 @@ def validate_topology_gate(
                 f"NCM topology gate must not preselect {forbidden_field!r}"
             )
 
+    selection_row = decisions.get("ADR-0009", {})
+    selection = selection_row.get("ncm_topology")
+    if not isinstance(selection, dict):
+        errors.append("ADR-0009 must define the selected NCM topology")
+        return
+
+    if set(selection) != NCM_TOPOLOGY_FIELDS:
+        errors.append(
+            "ADR-0009.ncm_topology fields must exactly encode the selected boundary"
+        )
+
+    exact_values = {
+        "state": "selected",
+        "selected_topology": "isolated_local_process",
+        "transport": "private_loopback_http",
+        "adapter_boundary": "NcmCognitiveSurface",
+        "instance_cardinality": "one_instance_per_exact_scope",
+        "state_ownership": "one_provider_owned_state_directory_per_exact_scope",
+        "restart_readiness": "invalidated",
+        "restart_effect_evidence": "durable_and_queryable",
+        "production_admission": "blocked",
+    }
+    for field, expected in exact_values.items():
+        if selection.get(field) != expected:
+            errors.append(f"ADR-0009.ncm_topology.{field} must be {expected}")
+
+    required_rejections = selection_row.get("required_rejections")
+    rejection_strings = (
+        {value for value in required_rejections if isinstance(value, str)}
+        if isinstance(required_rejections, list)
+        else set()
+    )
+    if (
+        not isinstance(required_rejections, list)
+        or len(rejection_strings) != len(required_rejections)
+        or rejection_strings != NCM_REQUIRED_REJECTIONS
+    ):
+        errors.append(
+            "ADR-0009 required_rejections must exactly reject in-process Biomem and MCP stdio"
+        )
+
+    denied = require_list(
+        selection.get("denied_authorities"),
+        "ADR-0009.ncm_topology.denied_authorities",
+        errors,
+    )
+    denied_strings = {value for value in denied if isinstance(value, str)}
+    if (
+        len(denied_strings) != len(denied)
+        or len(denied_strings) != len(NCM_DENIED_AUTHORITIES)
+        or denied_strings != NCM_DENIED_AUTHORITIES
+    ):
+        errors.append(
+            "ADR-0009 denied authorities must exactly forbid host and TraceDecay authority"
+        )
+
+    blockers = require_list(
+        selection.get("required_blockers"),
+        "ADR-0009.ncm_topology.required_blockers",
+        errors,
+    )
+    blocker_strings = {value for value in blockers if isinstance(value, str)}
+    if (
+        len(blocker_strings) != len(blockers)
+        or len(blocker_strings) != len(NCM_PRODUCTION_BLOCKERS)
+        or blocker_strings != NCM_PRODUCTION_BLOCKERS
+    ):
+        errors.append(
+            "ADR-0009 production blockers must preserve exact-scope, identity, cancellation/effect, dedupe, persistence, and supervisor gaps"
+        )
+
+    evidence = require_list(
+        selection_row.get("evidence_sources"),
+        "ADR-0009.evidence_sources",
+        errors,
+    )
+    evidence_strings = {value for value in evidence if isinstance(value, str)}
+    if (
+        len(evidence_strings) != len(evidence)
+        or len(evidence_strings) != len(NCM_TOPOLOGY_EVIDENCE)
+        or evidence_strings != NCM_TOPOLOGY_EVIDENCE
+    ):
+        errors.append("ADR-0009 evidence_sources must exactly bind the audit and contracts")
+
 
 def validate_document(
     repo: Path,
@@ -436,6 +629,16 @@ def validate_document(
     validate_decision_metadata(decisions, issue_ids, errors)
     validate_adr_files(repo, decisions, errors)
     validate_topology_gate(decisions, errors)
+    topology_evidence = decisions.get("ADR-0009", {}).get("evidence_sources", [])
+    if isinstance(topology_evidence, list):
+        for raw in topology_evidence:
+            if not isinstance(raw, str):
+                continue
+            path = Path(raw)
+            if path.is_absolute() or ".." in path.parts:
+                errors.append(f"ADR-0009 evidence source must be repository-relative: {raw}")
+            elif not (repo / path).is_file():
+                errors.append(f"ADR-0009 evidence source is missing: {raw}")
     return errors
 
 
@@ -463,6 +666,9 @@ def main() -> int:
         print(json.dumps({"ok": False, "errors": errors}, indent=2, sort_keys=True))
         return 1
 
+    topology_selection = next(
+        row for row in manifest["decisions"] if row["id"] == "ADR-0009"
+    )["ncm_topology"]
     receipt = {
         "ok": True,
         "schema_version": manifest["schema_version"],
@@ -476,7 +682,8 @@ def main() -> int:
                 for bead in decision["verification_beads"]
             }
         ),
-        "ncm_topology_state": manifest["decisions"][3]["ncm_topology"]["state"],
+        "ncm_topology_state": topology_selection["state"],
+        "ncm_production_admission": topology_selection["production_admission"],
         "manifest": relative(manifest_path, repo),
     }
     print(json.dumps(receipt, indent=2, sort_keys=True))

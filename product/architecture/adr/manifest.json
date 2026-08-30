@@ -217,6 +217,68 @@
       "depends_on_adrs": [
         "ADR-0003"
       ]
+    },
+    {
+      "id": "ADR-0009",
+      "topic": "ncm_execution_topology",
+      "title": "Run each NCM exact scope in a supervised isolated local process",
+      "path": "product/architecture/adr/ADR-0009-ncm-isolated-local-process.md",
+      "status": "accepted_with_production_blockers",
+      "decision_summary": "The selected design requires one supervised Biomem process and provider-owned state directory per exact scope behind NcmCognitiveSurface and private loopback HTTP. The enforced child boundary must deny TraceDecay database, repository, credential, and raw identity authority; restart invalidates readiness while durable operation evidence survives reconciliation. Production remains blocked on exact-scope isolation plus the audited identity, cancellation/effect, deduplication, persistence, and supervisor gaps.",
+      "evidence_sources": [
+        "crates/tracedecay-memory-provider-ncm/audits/tdmem-0701-licensed-surface-audit.md",
+        "crates/tracedecay-memory-provider-ncm/audits/tdmem-0701-capability-matrix.json",
+        "product/contracts/memory-provider-v1/provider-lifecycle-contract.json",
+        "product/contracts/memory-provider-v1/provider-observation-contract.json"
+      ],
+      "ncm_topology": {
+        "state": "selected",
+        "selected_topology": "isolated_local_process",
+        "transport": "private_loopback_http",
+        "adapter_boundary": "NcmCognitiveSurface",
+        "instance_cardinality": "one_instance_per_exact_scope",
+        "state_ownership": "one_provider_owned_state_directory_per_exact_scope",
+        "restart_readiness": "invalidated",
+        "restart_effect_evidence": "durable_and_queryable",
+        "production_admission": "blocked",
+        "denied_authorities": [
+          "tracedecay_databases",
+          "repository_and_worktree_files",
+          "host_credentials",
+          "raw_scope_identity",
+          "git_and_code_navigation",
+          "session_truth",
+          "canonical_facts",
+          "tools_and_approvals",
+          "prompt_and_final_context"
+        ],
+        "required_blockers": [
+          "exact_scope_isolation",
+          "loaded_state_identity",
+          "server_cancellation_and_effect_reconciliation",
+          "durable_deduplication",
+          "atomic_persistence",
+          "supervisor_capability"
+        ]
+      },
+      "required_rejections": [
+        "in-process Biomem integration",
+        "MCP stdio as the provider transport"
+      ],
+      "verification_beads": [
+        "tdmem-0504",
+        "tdmem-0701",
+        "tdmem-0702",
+        "tdmem-0703",
+        "tdmem-0704",
+        "tdmem-0707"
+      ],
+      "depends_on_adrs": [
+        "ADR-0001",
+        "ADR-0003",
+        "ADR-0004",
+        "ADR-0005"
+      ]
     }
   ]
 }
