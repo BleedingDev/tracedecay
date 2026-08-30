@@ -1,0 +1,272 @@
+{
+  "actor": "assistant",
+  "beads_commands": [
+    {
+      "argv": [
+        "br",
+        "sync",
+        "--import-only",
+        "--rebuild"
+      ],
+      "duration_ms": 895,
+      "exit_code": 0,
+      "name": "rebuild Beads database",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 92,
+      "stdout_sha256": "d3d3117c0f627602d1b76be654a70c2b97973d9e383edc798a39c32b477cd010",
+      "stdout_tail": "Imported from JSONL (via automatic recovery):\n  Created: 131 issues\n  Rebuilt blocked cache\n"
+    },
+    {
+      "argv": [
+        "br",
+        "show",
+        "tdmem-0202",
+        "--json"
+      ],
+      "duration_ms": 49,
+      "exit_code": 0,
+      "name": "show issue",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 5070,
+      "stdout_sha256": "4b6c970fb022d973cbc6ce3a7328b82bd0dc4619b81fdf1e48e6588112bcbe0d",
+      "stdout_tail": "efine the provider contract and capability model\",\"status\":\"open\",\"priority\":0,\"dependency_type\":\"parent-child\"},{\"id\":\"tdmem-0201\",\"title\":\"Define the provider capability registry\",\"status\":\"closed\",\"priority\":0,\"dependency_type\":\"blocks\"}],\"dependents\":[{\"id\":\"tdmem-0206\",\"title\":\"Define typed terminal, degraded, cancellation, and retry outcomes\",\"status\":\"open\",\"priority\":0,\"dependency_type\":\"blocks\"},{\"id\":\"tdmem-0607\",\"title\":\"Implement explicit provider routing and fallback policy\",\"status\":\"open\",\"priority\":0,\"dependency_type\":\"blocks\"},{\"id\":\"tdmem-0504\",\"title\":\"Implement provider lifecycle supervision and crash isolation\",\"status\":\"open\",\"priority\":1,\"dependency_type\":\"blocks\"}],\"parent\":\"tdmem-0200\",\"inherited_context\":[{\"source_id\":\"tdmem-0000\",\"source_role\":\"epic\",\"source_title\":\"Program: Pluggable Cognitive Memory Providers for TraceDecay V2\",\"field_used\":\"agent_context\",\"content\":\"{\\\"constraints\\\":[\\\"Scope is coding agents only. Do not introduce game, NPC, OntOS, or general-purpose product surfaces in this program.\\\",\\\"Use TraceDecay V2 PR #707 head 08fbe33a7c7f403191fd5d6e356c7b6681b96403 as the initial upstream floor.\\\",\\\"Preserve TraceDecay as authority for current code, repository/worktree identity, sessions, tools, approvals, and host integration.\\\",\\\"Memory-provider output is advisory context. It cannot silently mutate canonical code truth or TraceDecay Native facts.\\\",\\\"Keep all work in this monorepo, but isolate product-owned code in dedicated crates and narrow composition-root mounts.\\\",\\\"TraceDecay Native, NCM, and future OCEAN must sit behind one capability-based provider boundary; never branch on provider names outside registry/adapters.\\\",\\\"No silent fallback, fake readiness, placeholder success, swallowed error, unbounded queue, or undocumented authority.\\\",\\\"Every production path must propagate deadlines and cancellation, return typed terminal outcomes, preserve provenance, and enforce exact project/worktree scope.\\\",\\\"All writes must be idempotent and crash-recoverable. Observer providers must never affect prompts, canonical facts, or externally visible actions.\\\",\\\"Do not close a bead without its acceptance checklist, focused tests, and at least one real product journey where applicable.\\\",\\\"Track every intentional edit to Zack-owned files in the upstream convergence map with rationale and semantic invariants.\\\",\\\"Use Beads Rust JSONL as the versioned planning authority; keep the SQLite database local and rebuildable.\\\"],\\\"deliverables\\\":[\\\"Provider API and capability registry\\\",\\\"TraceDecay Native adapter with parity\\\",\\\"NCM adapter and guarded observer/active modes\\\",\\\"Observation dispatch, recall integration, feedback, maintenance, inspection, and conformance\\\",\\\"Coding-agent journeys for Claude Code, Codex, Cursor, multi-worktree, restart, stale correction, and provider failure\\\",\\\"Repeatable upstream convergence workflow for Zack and structured lesson intake from Jeffrey\\\"],\\\"objective\\\":\\\"Deliver a pluggable cognitive-memory layer inside the TraceDecay V2 monorepo for coding agents.\\\",\\\"references\\\":[\\\"https://github.com/ScriptedAlchemy/tracedecay/pull/707\\\",\\\"https://github.com/BleedingDev/tracedecay/tree/feat/pluggable-memory-providers-v2\\\",\\\"https://github.com/bleedingDev/biomem\\\",\\\"https://github.com/Dicklesworthstone/beads_rust\\\"]}\"},{\"source_id\":\"tdmem-0200\",\"source_role\":\"parent\",\"source_title\":\"M1 \u2014 Define the provider contract and capability model\",\"field_used\":\"agent_context\",\"content\":\"{\\\"constraints\\\":[\\\"Follow the root program constraints inherited from tdmem-0000.\\\",\\\"Keep product-owned implementation isolated from Zack-owned crates unless the seam cannot be mounted otherwise.\\\",\\\"Every upstream-owned file touched must be recorded in the convergence map before the bead closes.\\\"],\\\"deliverables\\\":[\\\"Provider API\\\",\\\"Capability registry\\\",\\\"Wire schemas\\\",\\\"Conformance fixtures\\\"],\\\"objective\\\":\\\"M1 \u2014 Define the provider contract and capability model\\\",\\\"references\\\":[]}\"}]}]\n"
+    },
+    {
+      "argv": [
+        "br",
+        "update",
+        "--actor",
+        "assistant",
+        "tdmem-0202",
+        "--status",
+        "in_progress",
+        "--transition-comment",
+        "Validating the canonical provider handshake after the capability authority landed: protocol negotiation must fail closed before mutation, finite limits must cover transport and execution, and implementation/state identity must stay immutable for one retained instance."
+      ],
+      "duration_ms": 397,
+      "exit_code": 0,
+      "name": "claim issue",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 3475,
+      "stdout_sha256": "037b6d3a16fc445287f4b34ed6680d9917bc15c958c0ea4fc15c5e5a746c96ba",
+      "stdout_tail": "Updated tdmem-0202: Define provider handshake, version negotiation, limits, and identity\n  status: open \u2192 in_progress\n\n--- Inherited context (from epic tdmem-0000: \"Program: Pluggable Cognitive Memory Providers for TraceDecay V2\") ---\n{\n  \"constraints\": [\n    \"Scope is coding agents only. Do not introduce game, NPC, OntOS, or general-purpose product surfaces in this program.\",\n    \"Use TraceDecay V2 PR #707 head 08fbe33a7c7f403191fd5d6e356c7b6681b96403 as the initial upstream floor.\",\n    \"Preserve TraceDecay as authority for current code, repository/worktree identity, sessions, tools, approvals, and host integration.\",\n    \"Memory-provider output is advisory context. It cannot silently mutate canonical code truth or TraceDecay Native facts.\",\n    \"Keep all work in this monorepo, but isolate product-owned code in dedicated crates and narrow composition-root mounts.\",\n    \"TraceDecay Native, NCM, and future OCEAN must sit behind one capability-based provider boundary; never branch on provider names outside registry/adapters.\",\n    \"No silent fallback, fake readiness, placeholder success, swallowed error, unbounded queue, or undocumented authority.\",\n    \"Every production path must propagate deadlines and cancellation, return typed terminal outcomes, preserve provenance, and enforce exact project/worktree scope.\",\n    \"All writes must be idempotent and crash-recoverable. Observer providers must never affect prompts, canonical facts, or externally visible actions.\",\n    \"Do not close a bead without its acceptance checklist, focused tests, and at least one real product journey where applicable.\",\n    \"Track every intentional edit to Zack-owned files in the upstream convergence map with rationale and semantic invariants.\",\n    \"Use Beads Rust JSONL as the versioned planning authority; keep the SQLite database local and rebuildable.\"\n  ],\n  \"deliverables\": [\n    \"Provider API and capability registry\",\n    \"TraceDecay Native adapter with parity\",\n    \"NCM adapter and guarded observer/active modes\",\n    \"Observation dispatch, recall integration, feedback, maintenance, inspection, and conformance\",\n    \"Coding-agent journeys for Claude Code, Codex, Cursor, multi-worktree, restart, stale correction, and provider failure\",\n    \"Repeatable upstream convergence workflow for Zack and structured lesson intake from Jeffrey\"\n  ],\n  \"objective\": \"Deliver a pluggable cognitive-memory layer inside the TraceDecay V2 monorepo for coding agents.\",\n  \"references\": [\n    \"https://github.com/ScriptedAlchemy/tracedecay/pull/707\",\n    \"https://github.com/BleedingDev/tracedecay/tree/feat/pluggable-memory-providers-v2\",\n    \"https://github.com/bleedingDev/biomem\",\n    \"https://github.com/Dicklesworthstone/beads_rust\"\n  ]\n}\n--- End inherited context (tdmem-0000) ---\n--- Inherited context (from parent tdmem-0200: \"M1 \u2014 Define the provider contract and capability model\") ---\n{\n  \"constraints\": [\n    \"Follow the root program constraints inherited from tdmem-0000.\",\n    \"Keep product-owned implementation isolated from Zack-owned crates unless the seam cannot be mounted otherwise.\",\n    \"Every upstream-owned file touched must be recorded in the convergence map before the bead closes.\"\n  ],\n  \"deliverables\": [\n    \"Provider API\",\n    \"Capability registry\",\n    \"Wire schemas\",\n    \"Conformance fixtures\"\n  ],\n  \"objective\": \"M1 \u2014 Define the provider contract and capability model\",\n  \"references\": []\n}\n--- End inherited context (tdmem-0200) ---\n"
+    },
+    {
+      "argv": [
+        "br",
+        "update",
+        "--actor",
+        "assistant",
+        "tdmem-0202",
+        "--acceptance-criteria",
+        "- [x] Handshake has one canonical schema.\n- [x] Incompatible providers fail with a typed terminal outcome.\n- [x] Limits cover payload size, concurrency, queueing, and supported scopes.\n- [x] Build/state identity is immutable for a running provider instance."
+      ],
+      "duration_ms": 227,
+      "exit_code": 0,
+      "name": "complete acceptance criteria",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 89,
+      "stdout_sha256": "9f6f09431aae64369dd30b57b79acf5a0619c6f0c65f2d7ef87241c154b3d454",
+      "stdout_tail": "Updated tdmem-0202: Define provider handshake, version negotiation, limits, and identity\n"
+    },
+    {
+      "argv": [
+        "br",
+        "close",
+        "--actor",
+        "assistant",
+        "tdmem-0202",
+        "--reason",
+        "Accepted the canonical V1 provider handshake with fail-closed version negotiation, finite scoped limits, typed terminal outcomes, and immutable implementation/state identity for each retained instance.",
+        "--transition-comment",
+        "Evidence: product/contracts/memory-provider-v1/provider-handshake-contract.json plus its strict JSON Schema define the only V1 handshake request, response, protocol, exact-scope, identity, limits, readiness and receipt authority. Compatibility selects one accepted registration and exact protocol intersection before any state mutation; provider, adapter, protocol, challenge, state owner/schema/namespace/scope, capabilities and limits each fail to deterministic typed non-ready states. Eight bounded limit dimensions cover request/response payloads, observation batches, recall candidates, concurrent operations, operation duration, snapshots and inspection; exact supported scope is separately mandatory and wildcard/CWD inference is forbidden. Implementation build/artifact identity and provider state namespace/schema/scope/generation are independently digested into an expiring ready receipt that cannot survive provider restart, registration revision, or scope revision. Tests and the repository checker enforce read-only handshake, deadline/cancellation propagation, no fake readiness and no silent fallback."
+      ],
+      "duration_ms": 284,
+      "exit_code": 0,
+      "name": "close issue",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 296,
+      "stdout_sha256": "d47e2d19f002e5c935e7cf5b725eebf0cdf7a9d1dc78a4a227196521833b9cd9",
+      "stdout_tail": "\u2713 Closed tdmem-0202: Define provider handshake, version negotiation, limits, and identity (Accepted the canonical V1 provider handshake with fail-closed version negotiation, finite scoped limits, typed terminal outcomes, and immutable implementation/state identity for each retained instance.)\n"
+    },
+    {
+      "argv": [
+        "br",
+        "sync",
+        "--flush-only"
+      ],
+      "duration_ms": 91,
+      "exit_code": 0,
+      "name": "flush Beads JSONL",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 36,
+      "stdout_sha256": "3729c3a3978f7481160ebb0a2d0d702f0484310f76e0219a5c5bcbb40d5126d0",
+      "stdout_tail": "Nothing to export (no dirty issues)\n"
+    },
+    {
+      "argv": [
+        "br",
+        "dep",
+        "cycles",
+        "--json"
+      ],
+      "duration_ms": 30,
+      "exit_code": 0,
+      "name": "check dependency cycles",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 145,
+      "stdout_sha256": "33e568c4decf5b3081ac0ef00cc4ed65a1dc13c5350edd609f2ea2a1a5ae9897",
+      "stdout_tail": "{\"cycles\":[],\"count\":0,\"active_count\":0,\"archived_closed_count\":0,\"total_count\":0,\"blocking_only\":false,\"include_closed\":false,\"scope\":\"active\"}\n"
+    },
+    {
+      "argv": [
+        "br",
+        "doctor"
+      ],
+      "duration_ms": 284,
+      "exit_code": 1,
+      "name": "run Beads doctor",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 2534,
+      "stdout_sha256": "0f0952e0a37939af315d0dcbd32c352cd44dd50e4916ba82a72bdfadfba4829c",
+      "stdout_tail": "br doctor\nHEALTH workspace: healthy\nOK jsonl.merge_artifacts\nOK base_jsonl\nOK doctor.runs_dir\nOK doctor.runs_creatable\nOK permissions.recovery_dir\nOK permissions.write_lock\nOK permissions.root_gitignore\nOK permissions.db_sidecars\nOK permissions.config_yaml_secrets\nOK br_path_dupes\nOK gitignore.beads_inner_present\nOK tmp_files_orphan\nOK br_history.size\nOK gitignore.beads_inner\nOK routes_jsonl: No routes.jsonl present (cross-project routing is optional)\nOK rust_log: RUST_LOG unset; release default is quiet enough for --json\nOK permissions.beads_dir: `.beads/` and critical children are user-writable\nOK config.yaml: config.yaml parses cleanly (220 bytes)\nOK metadata.json: metadata.json parses cleanly (63 bytes); declared targets exist on disk\nOK binary_version: Running br 0.5.7; no beads_rust Cargo.toml reachable from .beads/ \u2014 not flagging\nOK write_lock: .beads/.write.lock is 3s old (within 300s threshold); not stale\nOK routes.targets: No local or town routes.jsonl present (route targets are optional)\nOK startup_cache.health\nOK sync.merge_pending: No pending sync merge requires artifact reconciliation\nOK permissions.jsonl_world_writable\nOK jsonl_crlf\nOK jsonl_bom\nOK jsonl_eof_newline\nOK jsonl_size\nOK jsonl.duplicate_ids\nOK sync_jsonl_path: JSONL path is within sync allowlist\nOK sync_conflict_markers: No merge conflict markers found\nOK jsonl.parse: Parsed 131 records\nOK dep.dead_closed_blocking_edges: 13 open issue(s) have blocking edges whose blockers are closed (satisfied dependencies \u2014 the normal result of completing work)\nOK dep.fully_unblocked_open: 5 open issue(s) have all blockers completed (5 ready to work, 0 deliberately excluded from ready)\nOK db_bloat\nOK wal_size\nWARN db.recovery_artifacts: Preserved recovery artifacts remain for this database family (7 item(s))\nOK db.recovery_artifacts.aged\nOK db.foreign_recovery_debris\nOK db.sidecars: SHM sidecar at /home/runner/work/tracedecay/tracedecay/.beads/beads.db-shm is inert beside the WAL (a WAL-only family is expected for frankensqlite; the WAL index lives in process memory)\nOK schema.tables\nOK schema.columns\nOK db.recoverable_anomalies\nOK db.null_defaults\nOK sqlite.integrity_check\nOK db.export_hash_cache\nOK base_jsonl.missing_post_flush\nOK dirty_bitmap\nOK comments.orphans\nOK labels.orphans\nOK dependencies.orphans\nOK audit.suspect_close_reasons\nOK counts.db_vs_jsonl: Both have 131 records\nOK sync.metadata: Database and JSONL are in sync\nOK db.write_probe: Rollback-only issue write succeeded for tdmem-0000\nOK sqlite3.integrity_check\n"
+    },
+    {
+      "argv": [
+        "br",
+        "show",
+        "tdmem-0202",
+        "--json"
+      ],
+      "duration_ms": 42,
+      "exit_code": 0,
+      "name": "show issue",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 6945,
+      "stdout_sha256": "f3c1a9360dd5cbeb49042690999ab82299860ddd5b714ae5dd319096885b362c",
+      "stdout_tail": "istic typed non-ready states. Eight bounded limit dimensions cover request/response payloads, observation batches, recall candidates, concurrent operations, operation duration, snapshots and inspection; exact supported scope is separately mandatory and wildcard/CWD inference is forbidden. Implementation build/artifact identity and provider state namespace/schema/scope/generation are independently digested into an expiring ready receipt that cannot survive provider restart, registration revision, or scope revision. Tests and the repository checker enforce read-only handshake, deadline/cancellation propagation, no fake readiness and no silent fallback.\",\"created_at\":\"2026-08-30T11:19:59Z\"}],\"parent\":\"tdmem-0200\",\"inherited_context\":[{\"source_id\":\"tdmem-0000\",\"source_role\":\"epic\",\"source_title\":\"Program: Pluggable Cognitive Memory Providers for TraceDecay V2\",\"field_used\":\"agent_context\",\"content\":\"{\\\"constraints\\\":[\\\"Scope is coding agents only. Do not introduce game, NPC, OntOS, or general-purpose product surfaces in this program.\\\",\\\"Use TraceDecay V2 PR #707 head 08fbe33a7c7f403191fd5d6e356c7b6681b96403 as the initial upstream floor.\\\",\\\"Preserve TraceDecay as authority for current code, repository/worktree identity, sessions, tools, approvals, and host integration.\\\",\\\"Memory-provider output is advisory context. It cannot silently mutate canonical code truth or TraceDecay Native facts.\\\",\\\"Keep all work in this monorepo, but isolate product-owned code in dedicated crates and narrow composition-root mounts.\\\",\\\"TraceDecay Native, NCM, and future OCEAN must sit behind one capability-based provider boundary; never branch on provider names outside registry/adapters.\\\",\\\"No silent fallback, fake readiness, placeholder success, swallowed error, unbounded queue, or undocumented authority.\\\",\\\"Every production path must propagate deadlines and cancellation, return typed terminal outcomes, preserve provenance, and enforce exact project/worktree scope.\\\",\\\"All writes must be idempotent and crash-recoverable. Observer providers must never affect prompts, canonical facts, or externally visible actions.\\\",\\\"Do not close a bead without its acceptance checklist, focused tests, and at least one real product journey where applicable.\\\",\\\"Track every intentional edit to Zack-owned files in the upstream convergence map with rationale and semantic invariants.\\\",\\\"Use Beads Rust JSONL as the versioned planning authority; keep the SQLite database local and rebuildable.\\\"],\\\"deliverables\\\":[\\\"Provider API and capability registry\\\",\\\"TraceDecay Native adapter with parity\\\",\\\"NCM adapter and guarded observer/active modes\\\",\\\"Observation dispatch, recall integration, feedback, maintenance, inspection, and conformance\\\",\\\"Coding-agent journeys for Claude Code, Codex, Cursor, multi-worktree, restart, stale correction, and provider failure\\\",\\\"Repeatable upstream convergence workflow for Zack and structured lesson intake from Jeffrey\\\"],\\\"objective\\\":\\\"Deliver a pluggable cognitive-memory layer inside the TraceDecay V2 monorepo for coding agents.\\\",\\\"references\\\":[\\\"https://github.com/ScriptedAlchemy/tracedecay/pull/707\\\",\\\"https://github.com/BleedingDev/tracedecay/tree/feat/pluggable-memory-providers-v2\\\",\\\"https://github.com/bleedingDev/biomem\\\",\\\"https://github.com/Dicklesworthstone/beads_rust\\\"]}\"},{\"source_id\":\"tdmem-0200\",\"source_role\":\"parent\",\"source_title\":\"M1 \u2014 Define the provider contract and capability model\",\"field_used\":\"agent_context\",\"content\":\"{\\\"constraints\\\":[\\\"Follow the root program constraints inherited from tdmem-0000.\\\",\\\"Keep product-owned implementation isolated from Zack-owned crates unless the seam cannot be mounted otherwise.\\\",\\\"Every upstream-owned file touched must be recorded in the convergence map before the bead closes.\\\"],\\\"deliverables\\\":[\\\"Provider API\\\",\\\"Capability registry\\\",\\\"Wire schemas\\\",\\\"Conformance fixtures\\\"],\\\"objective\\\":\\\"M1 \u2014 Define the provider contract and capability model\\\",\\\"references\\\":[]}\"}]}]\n"
+    }
+  ],
+  "checks": [
+    {
+      "argv": [
+        "python3",
+        "tests/product_provider_handshake_contract_test.py"
+      ],
+      "duration_ms": 1271,
+      "exit_code": 0,
+      "name": "provider handshake contract tests",
+      "stderr_bytes": 125,
+      "stderr_sha256": "19ca68a6b68980798f96c09d0191d9e3038d19da5ffe1996a3b2c7206d3771ac",
+      "stderr_tail": "..........................\n----------------------------------------------------------------------\nRan 26 tests in 1.166s\n\nOK\n",
+      "stdout_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_tail": ""
+    },
+    {
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-handshake-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-handshake-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-handshake-contract.schema.json",
+        "--doc",
+        "product/contracts/memory-provider-v1/provider-handshake-contract.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "duration_ms": 44,
+      "exit_code": 0,
+      "name": "provider handshake repository validation",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 282,
+      "stdout_sha256": "fc42062eb901ac76286f9bf290a1a7fdfd30e1ac00512f445c61538b8758598f",
+      "stdout_tail": "{\n  \"bead_id\": \"tdmem-0202\",\n  \"contract_id\": \"tracedecay.memory.provider.handshake.v1\",\n  \"handshake_read_only\": true,\n  \"limit_count\": 8,\n  \"ok\": true,\n  \"protocol\": \"1.0\",\n  \"readiness_state_count\": 22,\n  \"schema_version\": 1,\n  \"silent_fallback\": false,\n  \"status\": \"accepted\"\n}\n"
+    },
+    {
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-registry-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-registry-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-registry-contract.schema.json",
+        "--readme",
+        "product/contracts/memory-provider-v1/README.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "duration_ms": 45,
+      "exit_code": 0,
+      "name": "provider registry compatibility validation",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 271,
+      "stdout_sha256": "38e8290811f43e80ef38ea5d7d8e40be307fa28403f5b2d05db24db6ddad0e88",
+      "stdout_tail": "{\n  \"bead_id\": \"tdmem-0201\",\n  \"bootstrap_slots\": 3,\n  \"mandatory_capabilities\": 3,\n  \"ok\": true,\n  \"optional_capabilities\": 12,\n  \"schema_version\": 1,\n  \"unknown_capability_policy\": \"inert_until_catalog_acceptance_and_new_registration_revision_and_explicit_selection\"\n}\n"
+    },
+    {
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "duration_ms": 115,
+      "exit_code": 0,
+      "name": "upstream patch-footprint remains within policy",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 644,
+      "stdout_sha256": "30c62301dcbe5d0b12b2e89350167a831333a0136bd21b937256b597bcdecdcf",
+      "stdout_tail": "{\n  \"allowed_touch_points\": 7,\n  \"bead_id\": \"tdmem-0105\",\n  \"convergence_map\": \"product/upstream/convergence-map.json\",\n  \"dependency_direction_rules\": 6,\n  \"exception_zones\": 5,\n  \"footprint\": {\n    \"composition_root_files\": 0,\n    \"exception_zone_files\": 0,\n    \"total_upstream_changed_lines\": 0,\n    \"upstream_existing_production_files\": 0,\n    \"upstream_existing_test_or_fixture_files\": 0\n  },\n  \"ok\": true,\n  \"policy\": \"product/upstream/patch-footprint-policy.json\",\n  \"policy_revision\": \"patch-footprint.v1\",\n  \"schema_version\": 1,\n  \"upstream_floor_sha\": \"08fbe33a7c7f403191fd5d6e356c7b6681b96403\",\n  \"workspace_manifests_checked\": 38\n}\n"
+    }
+  ],
+  "completed_at": "2026-08-30T11:19:59.681270Z",
+  "final_status": "closed",
+  "implementation_head": "271bf3e0eefa43252a22fede66b027ffc46f1037",
+  "issue_id": "tdmem-0202",
+  "mode": "complete",
+  "operation_sha256": "30be7f25410dae1038ce37fb8f1ccfc1bce77ab9bdc124e4f57f4c891c3e4134",
+  "plan": {
+    "encoded_bytes": 36824,
+    "issues": 131,
+    "jsonl_sha256": "159b29e85d0c44ec6e702da3169d235da890709d1a1c09ec91fb6510f2f197f1",
+    "materializer_contract": "source-and-output-sha256",
+    "part_size": 4000,
+    "parts": 10
+  },
+  "schema_version": 1,
+  "started_at": "2026-08-30T11:19:55.828077Z"
+}
