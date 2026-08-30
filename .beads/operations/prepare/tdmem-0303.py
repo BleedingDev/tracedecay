@@ -9,7 +9,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve()
 ROOT = HERE.parents[3]
-SOURCE_COMMIT = "3a879d024f983ac67777e532f283ec1b88ca5e02"
+SOURCE_COMMIT = "ff27866d1e69958908437b0cda3f93491bec12ed"
 SOURCE_PATH = ".beads/operations/prepare/tdmem-0303.py"
 BODY = HERE.with_name("_tdmem-0303-body.py")
 MANIFEST = ROOT / ".beads/operations/prepared-files.json"
