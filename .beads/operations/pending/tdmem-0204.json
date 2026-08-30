@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0204",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Closing recall semantics only after proving optional stable memory references, explicit policy-addressable provenance absence, non-comparable provider-native scores without host normalization, and exact temporal/scope behavior.",
+  "checks": [
+    {
+      "name": "provider recall contract tests",
+      "argv": ["python3", "tests/product_provider_recall_contract_test.py"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider recall repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-recall-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-recall-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-recall-contract.schema.json",
+        "--doc",
+        "product/contracts/memory-provider-v1/provider-recall-contract.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider observation contract remains valid",
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-observation-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-observation-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-observation-contract.schema.json",
+        "--doc",
+        "product/contracts/memory-provider-v1/provider-observation-contract.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider registry contract remains valid",
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-registry-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-registry-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-registry-contract.schema.json",
+        "--readme",
+        "product/contracts/memory-provider-v1/README.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider handshake contract remains valid",
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-handshake-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-handshake-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-handshake-contract.schema.json",
+        "--doc",
+        "product/contracts/memory-provider-v1/provider-handshake-contract.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "upstream patch-footprint remains within policy",
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "acceptance_criteria": [
+    "Stable memory refs are optional.",
+    "Missing provenance is explicit and policy-addressable.",
+    "Native score semantics cannot be compared across providers without normalization.",
+    "Temporal and scope semantics are unambiguous."
+  ],
+  "close_reason": "Accepted the V1 provider-neutral recall contract with optional stable memory identity, explicit provenance policy, host-owned score normalization, exact coding scope, and deterministic temporal semantics.",
+  "close_comment": "Evidence: provider-recall-contract.json and its strict schema define exact provider/registration/readiness/scope/request identity, current/as-of/interval/history semantics, finite handshake-clamped budgets, canonical exclusions, inert-or-explicit extensions, request-scoped candidate IDs, optional stable memory refs, exactly one content form, canonical content digests, typed references, provider-native score-domain metadata, TraceDecay-owned normalized scores, explicit validity/supersession/revocation, available/redacted/unavailable provenance with policy actions, bounded explanations, deterministic coverage/ordering, and typed recall states. Provider-native scores cannot be cross-compared without normalization; providers cannot supply normalized scores, widen scope, cross worktrees/branches/sessions, inject context, select the final pack, fabricate provenance, exceed budgets, ignore exclusions, or use empty candidates as failure/fallback. The validator cross-checks the accepted registry/handshake authorities and tests every acceptance criterion plus negative scope, temporal, score, provenance, extension, coverage, ordering, terminal, Beads, and schema cases."
+}
