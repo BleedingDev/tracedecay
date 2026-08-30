@@ -34,6 +34,7 @@ tracedecay-memory-provider-registry = { path = "../tracedecay-memory-provider-re
 '''
 
 VALID_MOUNT = '''#[cfg(feature = "memory-fabric")]
+#[allow(dead_code)]
 pub(crate) fn compose_native_memory_fabric(
     port: std::sync::Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>,
     config: tracedecay_memory_provider_registry::NativeCompositionConfig,
