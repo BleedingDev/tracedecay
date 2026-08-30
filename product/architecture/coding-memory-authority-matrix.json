@@ -1,0 +1,594 @@
+{
+  "schema_version": 1,
+  "bead_id": "tdmem-0104",
+  "title": "Coding-memory authority matrix",
+  "source_surface_map": "product/architecture/native-memory-surface-map.json",
+  "decision": "TraceDecay owns coding context, exact repository/worktree/session identity, accepted Native facts, curated configuration, and final context assembly. Cognitive providers own only their provider-local state and return advisory candidates through capability ports.",
+  "global_invariants": [
+    "Every durable state domain has exactly one canonical authority and one named canonical writer.",
+    "Current code in the exact admitted worktree is the highest-priority truth; memory never rewrites or contradicts it silently.",
+    "TraceDecay Native remains the sole authority for accepted explicit facts and their lineage, provenance, feedback, and trust transitions.",
+    "Session evidence remains a separate authority from accepted explicit facts.",
+    "Provider observations and provider cognitive state are namespaced by provider and exact coding scope.",
+    "Provider recall candidates are advisory, provenance-bearing, bounded, cancellable, and incapable of direct canonical mutation.",
+    "Curated rules are changed only through the TraceDecay configuration control plane.",
+    "The TraceDecay context compiler is the sole owner of final context assembly and emits typed partial or unavailable outcomes instead of silent fallback.",
+    "Repository, worktree, branch, agent-session, and provider namespaces are explicit and never inferred from the current working directory at request time."
+  ],
+  "namespace_axes": [
+    {
+      "id": "profile_id",
+      "authority": "TraceDecay profile identity authority",
+      "purpose": "Separates user/profile-owned configuration, sessions, and optional profile memory."
+    },
+    {
+      "id": "project_id",
+      "authority": "TraceDecay project enrollment and registry authority",
+      "purpose": "Stable project owner for code, project sessions, and project memory."
+    },
+    {
+      "id": "repository_id",
+      "authority": "Registered scope admission",
+      "purpose": "Identifies the admitted repository independently of a path alias."
+    },
+    {
+      "id": "worktree_id",
+      "authority": "Registered scope admission",
+      "purpose": "Separates linked worktrees that share one Git repository."
+    },
+    {
+      "id": "branch_ref",
+      "authority": "Git ref resolved for the exact worktree",
+      "purpose": "Pins branch-sensitive reads and context to an explicit ref when one exists."
+    },
+    {
+      "id": "agent_session_id",
+      "authority": "TraceDecay host/session admission",
+      "purpose": "Separates evidence and outcomes from concurrent coding-agent sessions."
+    },
+    {
+      "id": "provider_id",
+      "authority": "TraceDecay provider capability registry",
+      "purpose": "Stable logical provider namespace independent of transport or process identity."
+    },
+    {
+      "id": "provider_instance_id",
+      "authority": "TraceDecay provider lifecycle registry",
+      "purpose": "Separates provider installations, processes, accounts, or local stores."
+    },
+    {
+      "id": "request_id",
+      "authority": "TraceDecay application request admission",
+      "purpose": "Binds final context and terminal outcomes to one immutable request."
+    },
+    {
+      "id": "operation_id",
+      "authority": "TraceDecay idempotency and effect identity",
+      "purpose": "Deduplicates observations, feedback, and durable effects across retries."
+    }
+  ],
+  "authority_domains": [
+    {
+      "id": "current_code_truth",
+      "implementation_state": "current",
+      "authority_class": "canonical",
+      "owner": "exact_worktree_filesystem",
+      "canonical_writer": "Exact admitted worktree filesystem; TraceDecay mutations publish only through the authorized atomic source-edit authority.",
+      "write_interfaces": [
+        "SourceEditFileAuthority::publish",
+        "authorized external editor or Git operation acting on the same exact worktree"
+      ],
+      "read_interfaces": [
+        "TraceDecay source-read application ports",
+        "generation-pinned code graph and code-query ports",
+        "authorized source-edit preview and revalidation"
+      ],
+      "consistency_model": "The filesystem bytes in the exact admitted worktree are authoritative. Source edits compare expected content and file identity, publish atomically, and fail on races or unsafe paths; derived indexes may lag but cannot replace source bytes.",
+      "failure_behavior": "Fail closed on scope mismatch, unsafe path, symlink traversal, stale file identity, cancellation, deadline, or publication conflict. A stale graph is reported as unavailable/partial rather than treated as current code.",
+      "namespace_variants": [
+        {
+          "name": "project_checkout",
+          "required": ["project_id", "repository_id", "worktree_id", "branch_ref"],
+          "optional": ["request_id", "operation_id"],
+          "forbidden": ["provider_id", "provider_instance_id"]
+        }
+      ],
+      "provider_semantics": "Providers may cite code evidence but cannot write, shadow, or supersede current code truth.",
+      "prohibited_side_effects": [
+        "provider output directly editing files",
+        "memory content overriding current source bytes",
+        "using a code index generation as canonical source truth",
+        "routing a request to a sibling worktree or branch"
+      ],
+      "source_paths": [
+        "crates/tracedecay/src/tracedecay/edits/file_authority.rs",
+        "crates/tracedecay/src/daemon/project_open_owners/source_edit_owner.rs",
+        "crates/tracedecay-usecases/src/context/source_read.rs"
+      ]
+    },
+    {
+      "id": "repository_identity",
+      "implementation_state": "current",
+      "authority_class": "canonical_identity",
+      "owner": "project_enrollment_authority",
+      "canonical_writer": "TraceDecay project enrollment authority binding the durable project registry to the authoritative repository identity marker.",
+      "write_interfaces": [
+        "project enrollment and registry lifecycle"
+      ],
+      "read_interfaces": [
+        "RegisteredScopeResolver",
+        "project registry reads",
+        "ResolvedScope"
+      ],
+      "consistency_model": "A project ID is accepted only with its registered root and authoritative repository identity. Missing or inconsistent markers fail closed; path strings alone are insufficient identity.",
+      "failure_behavior": "Return typed resolution/unavailable errors on missing enrollment, marker mismatch, unrelated repository, or invalid project identity. Never synthesize a Git repository identity from CWD.",
+      "namespace_variants": [
+        {
+          "name": "registered_project",
+          "required": ["project_id", "repository_id"],
+          "optional": ["profile_id"],
+          "forbidden": ["provider_id", "provider_instance_id", "agent_session_id"]
+        }
+      ],
+      "provider_semantics": "Providers receive the admitted repository ID as immutable scope input and cannot mint or alias it.",
+      "prohibited_side_effects": [
+        "provider-defined repository IDs",
+        "path-only repository identity",
+        "cross-repository recall",
+        "silently accepting a missing identity marker"
+      ],
+      "source_paths": [
+        "crates/tracedecay-usecases/src/context/registered_scope.rs",
+        "crates/tracedecay/src/project_registry.rs",
+        "crates/tracedecay/src/tracedecay/lifecycle/identity.rs"
+      ]
+    },
+    {
+      "id": "worktree_identity",
+      "implementation_state": "current",
+      "authority_class": "canonical_identity",
+      "owner": "registered_scope_admission",
+      "canonical_writer": "TraceDecay registered-scope admission over canonical roots and proved Git linked-worktree topology.",
+      "write_interfaces": [
+        "project/worktree enrollment and lifecycle admission"
+      ],
+      "read_interfaces": [
+        "RegisteredScopeResolver",
+        "ResolvedGitRoute::worktree_id",
+        "ResolvedScope::worktree_id"
+      ],
+      "consistency_model": "Each admitted request carries one canonical worktree ID. A linked sibling is accepted only when its Git common directory proves repository identity and its own canonical root supplies a distinct worktree identity.",
+      "failure_behavior": "Deny unrelated sibling roots, relative paths, uncanonicalizable roots, or missing worktree identity. Do not collapse multiple linked worktrees into one context namespace.",
+      "namespace_variants": [
+        {
+          "name": "exact_worktree",
+          "required": ["project_id", "repository_id", "worktree_id"],
+          "optional": ["branch_ref", "agent_session_id"],
+          "forbidden": ["provider_id", "provider_instance_id"]
+        }
+      ],
+      "provider_semantics": "Provider state and recall must include the admitted worktree ID; repository-only provider buckets are insufficient for mutable coding context.",
+      "prohibited_side_effects": [
+        "cross-worktree recall without explicit multi-root operation",
+        "deriving worktree identity from CWD",
+        "sharing mutable provider state across worktrees by default"
+      ],
+      "source_paths": [
+        "crates/tracedecay-usecases/src/context/registered_scope.rs",
+        "crates/tracedecay-usecases/src/context/mod.rs",
+        "crates/tracedecay-runtime-core/src/worktree.rs"
+      ]
+    },
+    {
+      "id": "branch_identity",
+      "implementation_state": "current",
+      "authority_class": "canonical_identity",
+      "owner": "git_ref_authority",
+      "canonical_writer": "Git reference state for the exact admitted worktree.",
+      "write_interfaces": [
+        "authorized Git branch/ref operations"
+      ],
+      "read_interfaces": [
+        "current_branch for the exact canonical root",
+        "ResolvedGitRoute::branch_id",
+        "ResolvedScope::reference"
+      ],
+      "consistency_model": "Branch-sensitive context is pinned to the ref observed for the exact worktree. Detached/non-Git scopes carry no fabricated branch; consumers must handle absence explicitly.",
+      "failure_behavior": "Return no branch or typed stale/unavailable state when the ref cannot be proved. Never reuse another worktree's active branch.",
+      "namespace_variants": [
+        {
+          "name": "branch_scoped_project",
+          "required": ["project_id", "repository_id", "worktree_id", "branch_ref"],
+          "optional": ["agent_session_id"],
+          "forbidden": ["provider_id", "provider_instance_id"]
+        },
+        {
+          "name": "detached_or_non_git_project",
+          "required": ["project_id", "repository_id", "worktree_id"],
+          "optional": ["agent_session_id"],
+          "forbidden": ["branch_ref", "provider_id", "provider_instance_id"]
+        }
+      ],
+      "provider_semantics": "Providers receive branch ref as part of scope when available; they cannot infer it from repository name or process CWD.",
+      "prohibited_side_effects": [
+        "cross-branch recall presented as current",
+        "fabricating refs for detached or non-Git scopes",
+        "provider-controlled branch routing"
+      ],
+      "source_paths": [
+        "crates/tracedecay/src/branch.rs",
+        "crates/tracedecay-usecases/src/context/registered_scope.rs",
+        "crates/tracedecay-usecases/src/context/mod.rs"
+      ]
+    },
+    {
+      "id": "session_evidence",
+      "implementation_state": "current",
+      "authority_class": "canonical",
+      "owner": "host_session_admission_authority",
+      "canonical_writer": "TraceDecay host admission and session/transcript ingest authority for the admitted profile or project session store.",
+      "write_interfaces": [
+        "HostAdmissionFacade",
+        "transcript_capture_kernel",
+        "session and LCM ingest authorities"
+      ],
+      "read_interfaces": [
+        "SessionApplicationRetrievalPortV1",
+        "admitted LCM describe/expand/search operations",
+        "session temporal retrieval"
+      ],
+      "consistency_model": "Append/ingest receipts, source cursors, and exact session-store identity make replay idempotent. Project sessions retain repository/worktree/branch route; profile sessions use a disjoint reserved scope.",
+      "failure_behavior": "Typed denied, unavailable, cancelled, timed-out, partial, or deferred outcomes. An unavailable session authority is not represented as an empty successful history.",
+      "namespace_variants": [
+        {
+          "name": "project_session",
+          "required": ["profile_id", "project_id", "repository_id", "worktree_id", "agent_session_id"],
+          "optional": ["branch_ref", "request_id", "operation_id"],
+          "forbidden": ["provider_id", "provider_instance_id"]
+        },
+        {
+          "name": "profile_session",
+          "required": ["profile_id", "agent_session_id"],
+          "optional": ["request_id", "operation_id"],
+          "forbidden": ["project_id", "repository_id", "worktree_id", "branch_ref", "provider_id", "provider_instance_id"]
+        }
+      ],
+      "provider_semantics": "Normalized admitted observations may be mirrored to providers after canonical ingest, but provider state never replaces session evidence.",
+      "prohibited_side_effects": [
+        "calling transcript observations accepted explicit facts",
+        "provider writes into TraceDecay session tables",
+        "cross-session or cross-project evidence leakage",
+        "empty success when the session authority is unavailable"
+      ],
+      "source_paths": [
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
+        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
+        "crates/tracedecay/src/store/session_ingest_authority.rs"
+      ]
+    },
+    {
+      "id": "explicit_facts",
+      "implementation_state": "current",
+      "authority_class": "canonical",
+      "owner": "native_explicit_fact_authority",
+      "canonical_writer": "TraceDecay Native MemoryApplication over the owner-bound DatabaseFactStore/ProjectMemoryFactStore.",
+      "write_interfaces": [
+        "fact_store_add",
+        "fact_store_update",
+        "fact_store_remove",
+        "fact_store_curate",
+        "automatic fact promotion after durable admission"
+      ],
+      "read_interfaces": [
+        "fact_store_get/list/search/probe/related/reason/contradict",
+        "memory_status",
+        "Native dashboard memory reads"
+      ],
+      "consistency_model": "Owner-bound append-only facts, lineage, provenance, idempotent operation identity, sanitization receipts, and durable mutation receipts. Search and relation graph data are derived from this authority.",
+      "failure_behavior": "Fail closed on owner mismatch, invalid fact ID, privacy rejection, cancellation, deadline, conflict, unavailable store, or unknown effect settlement. No external provider fallback writes Native facts.",
+      "namespace_variants": [
+        {
+          "name": "project_facts",
+          "required": ["project_id"],
+          "optional": ["repository_id", "worktree_id", "branch_ref", "request_id", "operation_id"],
+          "forbidden": ["provider_id", "provider_instance_id", "agent_session_id"]
+        },
+        {
+          "name": "profile_facts",
+          "required": ["profile_id"],
+          "optional": ["request_id", "operation_id"],
+          "forbidden": ["project_id", "repository_id", "worktree_id", "branch_ref", "provider_id", "provider_instance_id", "agent_session_id"]
+        }
+      ],
+      "provider_semantics": "Providers may return candidate evidence. Promotion into an accepted explicit fact requires a separate authorized Native command and durable receipt; there is no implicit promotion.",
+      "prohibited_side_effects": [
+        "provider directly implementing or replacing ProjectMemoryFactStore",
+        "provider recall silently becoming a Native fact",
+        "multiple canonical fact writers",
+        "provider output changing Native feedback or trust"
+      ],
+      "source_paths": [
+        "crates/tracedecay-usecases/src/memory/mod.rs",
+        "crates/tracedecay-runtime-core/src/store/memory/mod.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs",
+        "product/architecture/native-memory-surface-map.json"
+      ],
+      "native_surface_authority": "native_explicit_fact_log"
+    },
+    {
+      "id": "provider_observation_journal",
+      "implementation_state": "planned",
+      "authority_class": "canonical",
+      "owner": "product_observation_dispatcher",
+      "canonical_writer": "TraceDecay product observation dispatcher writing one bounded idempotent provider-observation journal/outbox.",
+      "write_interfaces": [
+        "planned ObservationDispatchPortV1 after canonical host or operation settlement"
+      ],
+      "read_interfaces": [
+        "planned provider delivery worker",
+        "planned inspection and reconciliation API"
+      ],
+      "consistency_model": "At-least-once delivery from a durable journal, deduplicated by operation ID plus provider and exact scope. Provider acknowledgements are receipts; queue capacity and retry policy are bounded.",
+      "failure_behavior": "Observer-mode dispatch failure is recorded and retryable but cannot alter prompts, Native facts, source edits, session ingest, or the already-settled host action. Capacity exhaustion returns a typed terminal outcome and never drops silently.",
+      "namespace_variants": [
+        {
+          "name": "project_provider_observation",
+          "required": ["project_id", "repository_id", "worktree_id", "provider_id", "provider_instance_id", "operation_id"],
+          "optional": ["profile_id", "branch_ref", "agent_session_id", "request_id"],
+          "forbidden": []
+        },
+        {
+          "name": "profile_provider_observation",
+          "required": ["profile_id", "provider_id", "provider_instance_id", "operation_id"],
+          "optional": ["agent_session_id", "request_id"],
+          "forbidden": ["project_id", "repository_id", "worktree_id", "branch_ref"]
+        }
+      ],
+      "provider_semantics": "The journal records what TraceDecay offered and what a provider acknowledged; it is not provider cognitive state and has no direct context influence.",
+      "prohibited_side_effects": [
+        "unbounded observation queue",
+        "silent observation loss",
+        "observer failure changing canonical outcomes",
+        "provider adapter writing journal records without dispatcher admission"
+      ],
+      "source_paths": [
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
+        "crates/tracedecay/src/daemon/service/invocation/feedback.rs",
+        "product/architecture/native-memory-surface-map.json"
+      ]
+    },
+    {
+      "id": "provider_cognitive_state",
+      "implementation_state": "planned",
+      "authority_class": "canonical_external",
+      "owner": "selected_provider_instance",
+      "canonical_writer": "The selected provider instance behind its capability adapter; TraceDecay never writes or interprets provider-internal representation directly.",
+      "write_interfaces": [
+        "provider adapter observe/feedback/maintenance capability calls"
+      ],
+      "read_interfaces": [
+        "provider adapter recall/health/inspection capability calls"
+      ],
+      "consistency_model": "Provider-defined persistence behind a versioned capability contract. TraceDecay supplies exact namespace, idempotency identity, deadline, cancellation, provenance, and bounded payloads but does not share Native tables.",
+      "failure_behavior": "Typed unavailable, unsupported, cancelled, timed-out, partial, stale, or failed provider outcomes. No silent fallback and no fabricated readiness; provider failure cannot corrupt TraceDecay authorities.",
+      "namespace_variants": [
+        {
+          "name": "project_provider_state",
+          "required": ["project_id", "repository_id", "worktree_id", "provider_id", "provider_instance_id"],
+          "optional": ["profile_id", "branch_ref", "agent_session_id", "operation_id"],
+          "forbidden": []
+        },
+        {
+          "name": "profile_provider_state",
+          "required": ["profile_id", "provider_id", "provider_instance_id"],
+          "optional": ["agent_session_id", "operation_id"],
+          "forbidden": ["project_id", "repository_id", "worktree_id", "branch_ref"]
+        }
+      ],
+      "provider_semantics": "This is the provider's sole internal authority. Other providers and TraceDecay Native do not co-write it; provider-name branching stays inside registry/adapters.",
+      "prohibited_side_effects": [
+        "TraceDecay depending on provider database schemas",
+        "one provider writing another provider's state",
+        "provider state treated as current code truth",
+        "provider state treated as accepted Native facts"
+      ],
+      "source_paths": [
+        "product/architecture/native-memory-surface-map.json",
+        "crates/tracedecay/src/daemon/project_composition.rs",
+        "crates/tracedecay-application/src/application_surface.rs"
+      ]
+    },
+    {
+      "id": "provider_recall_candidates",
+      "implementation_state": "planned",
+      "authority_class": "advisory_ephemeral",
+      "owner": "selected_provider_recall_adapter",
+      "canonical_writer": null,
+      "write_interfaces": [],
+      "read_interfaces": [
+        "planned RecallProviderPortV1 invoked by the TraceDecay context compiler"
+      ],
+      "consistency_model": "One bounded response per admitted request, tied to provider ID, provider instance, exact scope, provider revision, source provenance, freshness evidence, score domain, deadline, and cancellation token.",
+      "failure_behavior": "Typed unavailable/unsupported/cancelled/timed-out/partial/stale outcomes. Missing candidates are not reported as successful empty recall unless the provider explicitly completed with zero results.",
+      "namespace_variants": [
+        {
+          "name": "project_recall",
+          "required": ["project_id", "repository_id", "worktree_id", "provider_id", "provider_instance_id", "request_id"],
+          "optional": ["profile_id", "branch_ref", "agent_session_id"],
+          "forbidden": ["operation_id"]
+        }
+      ],
+      "provider_semantics": "advisory_only",
+      "prohibited_side_effects": [
+        "direct source edit",
+        "direct Native fact mutation",
+        "direct configuration or curated-rule mutation",
+        "unlabelled insertion into final context",
+        "cross-scope candidate reuse",
+        "silent fallback to a different provider"
+      ],
+      "source_paths": [
+        "crates/tracedecay-usecases/src/context/mod.rs",
+        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
+        "product/architecture/native-memory-surface-map.json"
+      ]
+    },
+    {
+      "id": "curated_rules",
+      "implementation_state": "current_and_extended",
+      "authority_class": "canonical",
+      "owner": "configuration_control_plane",
+      "canonical_writer": "TraceDecay transactional configuration control plane under explicit authorization, revisioning, audit, and rollback.",
+      "write_interfaces": [
+        "authorized configuration apply/rollback",
+        "managed-skill materialization from an admitted configuration revision"
+      ],
+      "read_interfaces": [
+        "ProjectConfigurationRuntime client",
+        "pinned effective configuration snapshot",
+        "managed-skill readers"
+      ],
+      "consistency_model": "Revisioned transactional configuration with explicit scope resolution, authorization, audit receipts, protected credentials, and pinned effective behavior digests. Generated skill files are projections of this authority.",
+      "failure_behavior": "Typed conflict, denied, invalid, unavailable, cancelled, timed-out, or effect-unknown outcomes. The previous committed revision remains authoritative until a new revision settles.",
+      "namespace_variants": [
+        {
+          "name": "project_rules",
+          "required": ["profile_id", "project_id"],
+          "optional": ["repository_id", "worktree_id", "branch_ref", "request_id", "operation_id"],
+          "forbidden": ["provider_id", "provider_instance_id", "agent_session_id"]
+        },
+        {
+          "name": "profile_rules",
+          "required": ["profile_id"],
+          "optional": ["request_id", "operation_id"],
+          "forbidden": ["project_id", "repository_id", "worktree_id", "branch_ref", "provider_id", "provider_instance_id", "agent_session_id"]
+        }
+      ],
+      "provider_semantics": "Providers may receive effective policy parameters but cannot modify rules, activate themselves, or materialize provider-specific public contracts outside the registry/adapter boundary.",
+      "prohibited_side_effects": [
+        "provider changing configuration directly",
+        "provider output becoming a curated rule without explicit authorized mutation",
+        "generated skill files becoming an independent writer",
+        "silent activation on invalid or unavailable configuration"
+      ],
+      "source_paths": [
+        "crates/tracedecay-usecases/src/configuration/runtime.rs",
+        "crates/tracedecay-usecases/src/configuration/authorization.rs",
+        "crates/tracedecay-usecases/src/configuration/operations.rs"
+      ]
+    },
+    {
+      "id": "final_compiled_context",
+      "implementation_state": "planned_extension_of_current_context_reads",
+      "authority_class": "ephemeral_assembly",
+      "owner": "tracedecay_context_compiler",
+      "canonical_writer": null,
+      "write_interfaces": [],
+      "read_interfaces": [
+        "TraceDecay source/code read ports",
+        "SessionApplicationRetrievalPortV1",
+        "Native MemoryApplication reads",
+        "pinned curated-rule snapshot",
+        "planned capability-based provider recall ports"
+      ],
+      "consistency_model": "One immutable request-scoped assembly over exact admitted identity, pinned configuration/policy revisions, bounded source/session/fact/provider lanes, provenance on every item, deterministic ordering, and explicit coverage/terminal metadata.",
+      "failure_behavior": "Code-truth admission failures fail the request. Optional evidence lanes return typed partial/unavailable status. Provider failure never fabricates context and never silently switches providers; the compiler records omission and provenance coverage.",
+      "namespace_variants": [
+        {
+          "name": "coding_agent_request",
+          "required": ["profile_id", "project_id", "repository_id", "worktree_id", "agent_session_id", "request_id"],
+          "optional": ["branch_ref", "provider_id", "provider_instance_id"],
+          "forbidden": ["operation_id"]
+        }
+      ],
+      "provider_semantics": "TraceDecay alone decides whether, where, and how advisory provider candidates appear. Candidates remain labelled with provider provenance and can be excluded for stale scope, policy, budget, or conflict with code truth.",
+      "prohibited_side_effects": [
+        "provider constructing the final prompt/context envelope",
+        "provider candidate replacing code truth",
+        "unproven cross-worktree or cross-session material",
+        "dropping provenance or authority labels",
+        "silent fallback or fake complete coverage",
+        "context compilation mutating any source authority"
+      ],
+      "source_paths": [
+        "crates/tracedecay-usecases/src/context/mod.rs",
+        "crates/tracedecay-usecases/src/context/read_modes.rs",
+        "crates/tracedecay-usecases/src/context/read_cache.rs",
+        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
+        "product/architecture/native-memory-surface-map.json"
+      ]
+    }
+  ],
+  "cross_domain_rules": [
+    {
+      "id": "truth_precedence",
+      "rule": "Current code truth outranks every memory lane. Curated rules govern selection and disclosure but do not rewrite code truth. Accepted Native facts outrank session evidence and provider candidates as durable memory; provider candidates are always the lowest advisory lane."
+    },
+    {
+      "id": "single_writer",
+      "rule": "Each durable domain has one canonical writer named in this matrix. Adapters and generated projections never become co-writers."
+    },
+    {
+      "id": "explicit_promotion",
+      "rule": "Session evidence or provider output becomes an accepted explicit fact only through a separate authorized Native fact command with sanitization, idempotency, lineage, and durable receipt."
+    },
+    {
+      "id": "observer_isolation",
+      "rule": "Observer providers receive post-admission/post-settlement observations asynchronously through a bounded durable journal and cannot affect prompts, Native facts, source edits, configuration, or externally visible actions."
+    },
+    {
+      "id": "scope_isolation",
+      "rule": "Project memory and provider operations bind project, repository, and worktree; branch, session, and provider identifiers are added whenever the source domain carries them. Missing identity fails closed."
+    },
+    {
+      "id": "provenance_and_freshness",
+      "rule": "Every compiled context item names its authority domain, source identity, observed revision/time, scope, freshness/coverage, and provider provenance where applicable."
+    },
+    {
+      "id": "typed_degradation",
+      "rule": "Unavailable, unsupported, stale, cancelled, timed-out, partial, conflict, and effect-unknown outcomes remain distinct. Empty success is allowed only after an authority completed successfully with zero results."
+    },
+    {
+      "id": "no_silent_fallback",
+      "rule": "Provider selection occurs only in the capability registry under pinned configuration. Failure never switches providers or routes to Native implicitly; any future fallback policy must be explicit, observable, and separately accepted."
+    },
+    {
+      "id": "provider_name_isolation",
+      "rule": "Provider-name branching is confined to registry and adapter construction. CLI, MCP, HTTP, dashboard, context compiler, and canonical stores depend only on capability contracts."
+    }
+  ],
+  "context_lane_order": [
+    {
+      "rank": 1,
+      "domain": "current_code_truth",
+      "role": "authoritative current implementation evidence"
+    },
+    {
+      "rank": 2,
+      "domain": "curated_rules",
+      "role": "authoritative inclusion, safety, disclosure, and behavior policy"
+    },
+    {
+      "rank": 3,
+      "domain": "explicit_facts",
+      "role": "accepted durable project/profile knowledge"
+    },
+    {
+      "rank": 4,
+      "domain": "session_evidence",
+      "role": "admitted historical evidence for the exact session/scope"
+    },
+    {
+      "rank": 5,
+      "domain": "provider_recall_candidates",
+      "role": "advisory cognitive candidates subject to all higher authorities"
+    }
+  ],
+  "verification": {
+    "checker": "scripts/product/check-coding-memory-authority-matrix.py",
+    "tests": [
+      "tests/product_coding_memory_authority_matrix_test.py"
+    ],
+    "native_surface_map": "product/architecture/native-memory-surface-map.json"
+  }
+}
