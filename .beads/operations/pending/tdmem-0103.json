@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0103",
+  "mode": "claim",
+  "actor": "assistant",
+  "claim_comment": "Mapping the complete Native memory surface across contracts, canonical stores, use cases, daemon composition, CLI, MCP, SDK, dashboard, hooks, automation, maintenance, projections, and focused verification. The deliverable will name authorities and rank provider seams without changing runtime behavior."
+}
