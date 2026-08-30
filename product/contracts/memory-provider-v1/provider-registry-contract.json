@@ -2,7 +2,7 @@
   "schema_version": 1,
   "contract_id": "tracedecay.memory.provider.registry.v1",
   "bead_id": "tdmem-0201",
-  "title": "Memory provider identity, capability catalog, registration, and resolution contract",
+  "title": "Memory provider identity and capability registry contract",
   "status": "accepted",
   "authority": "TraceDecay provider registry composition root",
   "scope": "coding_agents_only",
@@ -31,74 +31,744 @@
     "canonical_pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\\.v[1-9][0-9]*$",
     "maximum_bytes": 96,
     "version_is_part_of_identity": true,
-    "unknown_capability_policy": "reject",
-    "duplicate_capability_policy": "reject"
+    "provider_name_is_not_capability_identity": true,
+    "duplicate_capability_policy": "reject_non_canonical_declaration",
+    "unknown_declaration_policy": "preserve_opaque_inert",
+    "unknown_selection_policy": "typed_capability_unsupported"
+  },
+  "capability_registry": {
+    "mandatory": [
+      {
+        "id": "provider.health.v1",
+        "requirement": "mandatory",
+        "purpose": "Report bounded provider readiness and degradation without proving readiness from process, socket, path, or non-empty state existence.",
+        "operation_class": "provider_local_read",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.provider.health.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.provider.health.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "not_ready",
+          "degraded"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0205",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "observation.accept.v1",
+        "requirement": "mandatory",
+        "purpose": "Accept one committed coding-agent observation under an idempotency key and exact TraceDecay scope.",
+        "operation_class": "provider_local_mutation",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.observation.accept.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.observation.accept.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "idempotency_conflict",
+          "sequence_conflict",
+          "provenance_invalid"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0203",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "recall.query.v1",
+        "requirement": "mandatory",
+        "purpose": "Return bounded advisory recall candidates with provenance, validity, scope, and explanation metadata.",
+        "operation_class": "advisory_read",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.recall.query.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.recall.query.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "budget_exhausted",
+          "stale_candidate"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0204",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      }
+    ],
+    "optional": [
+      {
+        "id": "feedback.record.v1",
+        "requirement": "optional",
+        "purpose": "Record post-settlement usefulness or correction feedback without changing TraceDecay canonical authorities.",
+        "operation_class": "provider_local_mutation",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.feedback.record.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.feedback.record.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "target_unknown",
+          "settlement_unverified"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0205",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "maintenance.run.v1",
+        "requirement": "optional",
+        "purpose": "Run one bounded, cancellable provider-local maintenance operation with an auditable receipt.",
+        "operation_class": "provider_local_mutation",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.maintenance.run.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.maintenance.run.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "maintenance_busy",
+          "recovery_required"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0205",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "recall.temporal.v1",
+        "requirement": "optional",
+        "purpose": "Recall advisory candidates constrained by an explicit event-time or validity-time window.",
+        "operation_class": "advisory_read",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.recall.temporal.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.recall.temporal.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "invalid_time_window",
+          "temporal_index_unavailable"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0204",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "recall.associative.v1",
+        "requirement": "optional",
+        "purpose": "Expand advisory recall through provider-local associations without asserting canonical relationships.",
+        "operation_class": "advisory_read",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.recall.associative.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.recall.associative.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "seed_unknown",
+          "expansion_budget_exhausted"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0204",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "facts.explicit.v1",
+        "requirement": "optional",
+        "purpose": "Represent provider-local explicit-fact projections while TraceDecay Native remains authority for accepted explicit facts.",
+        "operation_class": "provider_local_read",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.facts.explicit.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.facts.explicit.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "fact_projection_unavailable",
+          "authority_conflict"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0205",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "explain.trace.v1",
+        "requirement": "optional",
+        "purpose": "Explain why a provider returned or changed advisory state using bounded provenance-linked evidence.",
+        "operation_class": "provider_local_read",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.explain.trace.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.explain.trace.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "explanation_unavailable",
+          "evidence_redacted"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0205",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "correction.apply.v1",
+        "requirement": "optional",
+        "purpose": "Apply an idempotent correction to provider-local cognitive state without mutating TraceDecay canonical facts.",
+        "operation_class": "provider_local_mutation",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.correction.apply.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.correction.apply.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "target_unknown",
+          "revision_conflict"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0205",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "deletion.by_source.v1",
+        "requirement": "optional",
+        "purpose": "Forget provider-local material derived from an exact source identity and emit an auditable receipt.",
+        "operation_class": "provider_local_mutation",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.deletion.by_source.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.deletion.by_source.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "source_unknown",
+          "retention_lock"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0205",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "snapshot.export.v1",
+        "requirement": "optional",
+        "purpose": "Export a bounded provider-local state snapshot with provider, build, schema, scope, and digest identity.",
+        "operation_class": "provider_local_read",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.snapshot.export.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.snapshot.export.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "snapshot_too_large",
+          "snapshot_inconsistent"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0205",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "snapshot.restore.v1",
+        "requirement": "optional",
+        "purpose": "Restore an explicitly compatible provider-local snapshot through a crash-recoverable idempotent mutation.",
+        "operation_class": "provider_local_mutation",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.snapshot.restore.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.snapshot.restore.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "snapshot_incompatible",
+          "snapshot_digest_mismatch",
+          "recovery_required"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0205",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "replay.apply.v1",
+        "requirement": "optional",
+        "purpose": "Replay a bounded sequence of canonical observations with idempotent sequence and state-generation checks.",
+        "operation_class": "provider_local_mutation",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.replay.apply.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.replay.apply.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "sequence_gap",
+          "state_generation_conflict",
+          "recovery_required"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0205",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "inspection.read.v1",
+        "requirement": "optional",
+        "purpose": "Inspect bounded provider-local state and operational receipts without exposing hidden canonical authority.",
+        "operation_class": "provider_local_read",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.inspection.read.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.inspection.read.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation",
+          "inspection_redacted",
+          "cursor_invalid"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0205",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
+      }
+    ]
   },
   "capability_catalog": [
     {
-      "id": "observation.accept.v1",
-      "class": "provider_local_mutation",
-      "advisory_only": true,
-      "detailed_contract_bead": "tdmem-0203",
-      "may_mutate_tracedecay_authority": false
+      "id": "provider.health.v1"
     },
     {
-      "id": "recall.query.v1",
-      "class": "advisory_read",
-      "advisory_only": true,
-      "detailed_contract_bead": "tdmem-0204",
-      "may_mutate_tracedecay_authority": false
+      "id": "observation.accept.v1"
     },
     {
-      "id": "feedback.record.v1",
-      "class": "provider_local_mutation",
-      "advisory_only": true,
-      "detailed_contract_bead": "tdmem-0205",
-      "may_mutate_tracedecay_authority": false
+      "id": "recall.query.v1"
     },
     {
-      "id": "maintenance.run.v1",
-      "class": "provider_local_mutation",
-      "advisory_only": true,
-      "detailed_contract_bead": "tdmem-0205",
-      "may_mutate_tracedecay_authority": false
+      "id": "feedback.record.v1"
     },
     {
-      "id": "inspection.read.v1",
-      "class": "provider_local_read",
-      "advisory_only": true,
-      "detailed_contract_bead": "tdmem-0205",
-      "may_mutate_tracedecay_authority": false
+      "id": "maintenance.run.v1"
     },
     {
-      "id": "correction.apply.v1",
-      "class": "provider_local_mutation",
-      "advisory_only": true,
-      "detailed_contract_bead": "tdmem-0205",
-      "may_mutate_tracedecay_authority": false
+      "id": "recall.temporal.v1"
     },
     {
-      "id": "forget.by_source.v1",
-      "class": "provider_local_mutation",
-      "advisory_only": true,
-      "detailed_contract_bead": "tdmem-0205",
-      "may_mutate_tracedecay_authority": false
+      "id": "recall.associative.v1"
     },
     {
-      "id": "snapshot.export.v1",
-      "class": "provider_local_read",
-      "advisory_only": true,
-      "detailed_contract_bead": "tdmem-0205",
-      "may_mutate_tracedecay_authority": false
+      "id": "facts.explicit.v1"
     },
     {
-      "id": "snapshot.restore.v1",
-      "class": "provider_local_mutation",
-      "advisory_only": true,
-      "detailed_contract_bead": "tdmem-0205",
-      "may_mutate_tracedecay_authority": false
+      "id": "explain.trace.v1"
+    },
+    {
+      "id": "correction.apply.v1"
+    },
+    {
+      "id": "deletion.by_source.v1"
+    },
+    {
+      "id": "snapshot.export.v1"
+    },
+    {
+      "id": "snapshot.restore.v1"
+    },
+    {
+      "id": "replay.apply.v1"
+    },
+    {
+      "id": "inspection.read.v1"
     }
   ],
+  "unknown_capability_contract": {
+    "type_name": "OpaqueMemoryProviderCapabilityV1",
+    "accepted_identity_requirement": "syntactically_valid_versioned_capability_id",
+    "wire_fields": [
+      "id",
+      "canonical_payload"
+    ],
+    "decode_policy": "preserve_canonical_payload_opaque",
+    "encode_policy": "round_trip_canonical_payload_without_semantic_rewrite",
+    "registration_policy": "retain_as_opaque_not_supported",
+    "activation_policy": "inert_until_catalog_acceptance_and_new_registration_revision_and_explicit_selection",
+    "selection_policy": "return_typed_capability_unsupported",
+    "may_count_as_mandatory": false,
+    "may_satisfy_required_capability": false,
+    "may_infer_behavior_from_name": false,
+    "may_activate_from_presence": false
+  },
   "registration_contract": {
     "type_name": "MemoryProviderRegistrationV1",
     "registry_writer": "TraceDecay provider registry composition root",
@@ -107,8 +777,8 @@
       "provider_id",
       "adapter_contract_version",
       "registration_state",
-      "capability_declaration_state",
-      "declared_capabilities",
+      "known_capabilities",
+      "opaque_unknown_capabilities",
       "implementation_identity",
       "registration_revision"
     ],
@@ -118,16 +788,13 @@
       "reserved",
       "retiring"
     ],
-    "capability_declaration_states": [
-      "declared",
-      "deferred_until_compatible_handshake",
-      "unavailable_without_versioned_specification"
-    ],
     "immutable_after_registration": [
       "provider_id",
       "implementation_identity"
     ],
     "revision_rule": "Every accepted registry mutation increments registration_revision exactly once.",
+    "mandatory_capability_rule": "registered providers must declare every mandatory capability before readiness",
+    "unknown_capability_rule": "opaque unknown declarations are preserved but never become supported or active",
     "duplicate_provider_id_policy": "reject_ambiguous_registration",
     "unknown_provider_policy": "reject_unknown_provider",
     "adapter_construction_boundary": "Only the provider registry/composition layer may branch on provider_id to construct an adapter.",
@@ -147,6 +814,7 @@
     "required_capability_semantics": "all",
     "maximum_required_capabilities": 32,
     "duplicate_required_capability_policy": "reject_non_canonical_request",
+    "unknown_required_capability_policy": "return_typed_capability_unsupported",
     "active_provider_cardinality_per_exact_scope": "zero_or_one",
     "resolution_states": [
       "resolved",
@@ -155,7 +823,7 @@
       "provider_reserved",
       "provider_retiring",
       "adapter_unavailable",
-      "capability_declaration_deferred",
+      "mandatory_capability_missing",
       "capability_unsupported",
       "protocol_incompatible",
       "scope_unavailable",
@@ -168,7 +836,8 @@
       "exact_provider_id_match",
       "accepted_registration_revision",
       "compatible_adapter_contract_version",
-      "all_required_capabilities_declared",
+      "all_mandatory_capabilities_declared",
+      "all_required_capabilities_known_and_declared",
       "exact_scope_admission",
       "live_deadline",
       "live_cancellation"
@@ -216,12 +885,14 @@
     }
   ],
   "invariants": [
-    "A provider ID is stable identity, never a display label or runtime location.",
-    "Capability IDs are versioned behavior identities and are never inferred from provider names.",
+    "Mandatory and optional capabilities are separate authoritative sets with no duplicate or overlapping identity.",
+    "Every capability defines canonical inputs, outputs, typed failure modes, and explicit compatibility rules.",
+    "Capability IDs describe versioned behavior and are never inferred from concrete provider names.",
+    "capability_catalog is a derived compatibility projection only; capability_registry remains authoritative and catalog presence cannot activate behavior.",
+    "A syntactically valid unknown capability round-trips as opaque canonical payload and remains inert.",
+    "Unknown capability presence never counts as support, satisfies a requirement, or activates behavior.",
     "Only the registry/composition boundary may branch on provider_id to construct a concrete adapter.",
     "Transport, CLI, MCP, SDK, dashboard, context, and storage surfaces remain provider-neutral.",
-    "Every resolved provider has one exact registration revision and all requested capabilities.",
-    "Unknown, disabled, reserved, retiring, unavailable, incompatible, ambiguous, cancelled, and timed-out resolutions are distinct typed states.",
     "Resolution never silently falls back to TraceDecay Native or another provider.",
     "All provider capabilities are advisory with respect to TraceDecay canonical authorities.",
     "No provider capability directly mutates current code, exact scope identity, sessions, accepted Native facts, curated rules, tools, approvals, or final context.",
@@ -234,6 +905,8 @@
     "tdmem-0204",
     "tdmem-0205",
     "tdmem-0206",
+    "tdmem-0207",
+    "tdmem-0208",
     "tdmem-0209",
     "tdmem-0303",
     "tdmem-0306",
