@@ -1,0 +1,142 @@
+name: Capture TraceDecay V2 baseline
+
+on:
+  push:
+    branches:
+      - feat/pluggable-memory-providers-v2
+    paths:
+      - scripts/product/capture-v2-baseline.py
+      - scripts/product/check-v2-baseline.py
+      - tests/product_v2_baseline_receipt_test.py
+      - product/baseline/README.md
+      - product/upstream/tracedecay-v2-pr707.json
+      - .github/workflows/product-v2-baseline.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: product-v2-baseline-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  AST_GREP_VERSION: "0.44.0"
+  BASELINE_RECEIPT: product/baseline/tracedecay-v2-pr707-linux.json
+
+jobs:
+  capture:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out the exact product branch with full history
+        uses: actions/checkout@v7
+        with:
+          ref: feat/pluggable-memory-providers-v2
+          fetch-depth: 0
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt,clippy
+
+      - name: Configure the Linux linker
+        uses: ./.github/actions/setup-linux-mold
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install ast-grep
+        uses: ./.github/actions/install-ast-grep
+        with:
+          version: ${{ env.AST_GREP_VERSION }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache Cargo registry and Git dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: product-v2-baseline-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            product-v2-baseline-cargo-${{ runner.os }}-
+
+      - name: Test the baseline receipt contract
+        run: |
+          python3 -m py_compile \
+            scripts/product/capture-v2-baseline.py \
+            scripts/product/check-v2-baseline.py \
+            tests/product_v2_baseline_receipt_test.py
+          python3 tests/product_v2_baseline_receipt_test.py
+
+      - name: Capture the clean V2 baseline
+        run: |
+          python3 scripts/product/capture-v2-baseline.py \
+            --repo . \
+            --output "$BASELINE_RECEIPT"
+
+      - name: Validate the receipt contract
+        run: |
+          python3 scripts/product/check-v2-baseline.py \
+            --repo . \
+            --receipt "$BASELINE_RECEIPT"
+
+      - name: Reject unexpected generated working-tree changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          unexpected="$({ git status --porcelain=v1 --untracked-files=all || true; } \
+            | grep -vE '^\?\? product/baseline/tracedecay-v2-pr707-linux\.json$' || true)"
+          if [[ -n "$unexpected" ]]; then
+            echo 'baseline commands changed files outside the receipt:' >&2
+            printf '%s\n' "$unexpected" >&2
+            exit 1
+          fi
+
+      - name: Prove the branch did not move during capture
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin feat/pluggable-memory-providers-v2
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/feat/pluggable-memory-providers-v2)"
+
+      - name: Commit the baseline receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$BASELINE_RECEIPT"
+          git diff --cached --quiet && {
+            echo 'baseline receipt produced no versioned change' >&2
+            exit 1
+          }
+          git commit -m 'test(baseline): capture TraceDecay V2 baseline (tdmem-0102)'
+          git push origin HEAD:feat/pluggable-memory-providers-v2
+
+      - name: Upload receipt for inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tracedecay-v2-pr707-linux-baseline
+          path: ${{ env.BASELINE_RECEIPT }}
+          if-no-files-found: warn
+          retention-days: 30
