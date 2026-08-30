@@ -45,7 +45,7 @@ Exclusion sets cover stable memory references, prior candidate IDs, source/trace
 
 `candidate_id` identifies one candidate within one response. It is not stable across requests and never implies provider-row identity.
 
-`stable_memory_ref` is optional and nullable. This is required for NCM-like providers whose recall may reconstruct or synthesize content from latent traces rather than return a stable row.
+Stable provider memory references are optional. `stable_memory_ref` is nullable because NCM-like providers may reconstruct or synthesize content from latent traces rather than return a stable row.
 
 Every candidate contains exactly one of:
 
