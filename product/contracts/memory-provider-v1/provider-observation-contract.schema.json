@@ -16,6 +16,8 @@
     "observation_envelope",
     "source_identity",
     "observation_kinds",
+    "extension_contract",
+    "memory_effect_semantics",
     "normalization",
     "idempotency",
     "provenance",
@@ -50,8 +52,11 @@
       "type": "array",
       "minItems": 9,
       "maxItems": 9,
+      "uniqueItems": true,
       "items": { "$ref": "#/$defs/observationKind" }
     },
+    "extension_contract": { "$ref": "#/$defs/object" },
+    "memory_effect_semantics": { "$ref": "#/$defs/object" },
     "normalization": { "$ref": "#/$defs/object" },
     "idempotency": { "$ref": "#/$defs/object" },
     "provenance": { "$ref": "#/$defs/object" },
@@ -67,7 +72,8 @@
     },
     "provider_acceptance_outcomes": {
       "type": "array",
-      "minItems": 13,
+      "minItems": 14,
+      "maxItems": 14,
       "uniqueItems": true,
       "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
     },
@@ -75,7 +81,7 @@
     "observer_non_interference": { "$ref": "#/$defs/object" },
     "invariants": {
       "type": "array",
-      "minItems": 13,
+      "minItems": 16,
       "uniqueItems": true,
       "items": { "type": "string", "minLength": 20 }
     },
