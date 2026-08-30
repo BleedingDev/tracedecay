@@ -2,7 +2,7 @@
   "schema_version": 1,
   "contract_id": "tracedecay.memory.provider.observation.v1",
   "bead_id": "tdmem-0203",
-  "title": "Memory provider observation envelope, normalization, idempotency, batching, provenance, privacy, and receipt contract",
+  "title": "Memory provider observation envelope, normalization, idempotency, batching, extensions, provenance, privacy, and receipt contract",
   "status": "accepted",
   "authority": "TraceDecay observation admission and dispatch fabric",
   "scope": "coding_agents_only",
@@ -24,6 +24,7 @@
       "payload_contract",
       "canonical_payload",
       "payload_sha256",
+      "extensions",
       "provenance",
       "privacy",
       "occurred_at",
@@ -112,6 +113,46 @@
       "payload_contract": "tracedecay.memory.observation.automation-outcome.v1"
     }
   ],
+  "extension_contract": {
+    "type_name": "MemoryProviderObservationExtensionV1",
+    "required_fields": [
+      "extension_id",
+      "extension_version",
+      "criticality",
+      "canonical_payload",
+      "payload_sha256"
+    ],
+    "extension_id_pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+    "extension_version_minimum": 1,
+    "maximum_extensions": 32,
+    "maximum_extension_bytes": 262144,
+    "maximum_total_extension_bytes": 524288,
+    "criticality_values": [
+      "optional",
+      "required"
+    ],
+    "known_extension_policy": "validate_against_versioned_extension_contract",
+    "unknown_optional_extension_policy": "preserve_opaque_inert_round_trip",
+    "unknown_required_extension_policy": "reject_extension_unsupported",
+    "unknown_extension_may_activate_behavior": false,
+    "unknown_extension_may_mutate_authority": false,
+    "provider_may_drop_preserved_extension": false,
+    "provider_specific_top_level_fields_allowed": false
+  },
+  "memory_effect_semantics": {
+    "observation_is_memory_record": false,
+    "observation_id_is_provider_memory_id": false,
+    "stable_provider_memory_id_required": false,
+    "provider_effect_cardinality": "zero_one_or_many_provider_internal_effects",
+    "provider_internal_representation_is_opaque": true,
+    "provider_may_consolidate_multiple_observations": true,
+    "provider_may_split_one_observation_into_multiple_traces": true,
+    "provider_may_reject_without_effect": true,
+    "provider_effect_summary_is_not_canonical_memory_state": true,
+    "provider_effect_summary_required_in_delivery_receipt": true,
+    "traceability_requirement": "Every provider effect or no-effect decision remains attributable to observation_id and idempotency_key through the immutable delivery receipt.",
+    "native_fact_promotion_is_separate_authorized_operation": true
+  },
   "normalization": {
     "canonical_encoding": "rfc8785_json",
     "unicode_normalization": "nfc",
@@ -121,6 +162,7 @@
     "duplicate_object_keys_allowed": false,
     "unknown_payload_contract_policy": "reject_contract_violation",
     "payload_digest": "sha256_over_canonical_payload",
+    "extension_payload_digest": "sha256_over_canonical_extension_payload",
     "envelope_digest": "sha256_over_canonical_envelope_without_transport_metadata",
     "transport_metadata_in_digest": false,
     "provider_specific_payload_shape_allowed": false
@@ -128,7 +170,7 @@
   "idempotency": {
     "type_name": "MemoryProviderObservationIdempotencyKeyV1",
     "encoding": "lowercase_hex_64",
-    "derivation": "sha256_over_contract_provider_registration_scope_source_authority_source_event_id_source_event_revision_observation_kind_payload_contract",
+    "derivation": "sha256_over_contract_provider_registration_scope_source_authority_source_event_id_source_event_revision_observation_kind_payload_contract_payload_sha256_extensions_digest",
     "stable_across_delivery_retries": true,
     "stable_across_dispatch_process_restart": true,
     "stable_across_provider_restart": true,
@@ -233,11 +275,11 @@
     "Require a canonically settled source receipt before creating an observation.",
     "Resolve exact provider registration and current readiness receipt for the same exact scope.",
     "Reject expired deadline or already-cancelled request before journal append.",
-    "Validate source identity, observation kind, payload contract, provenance, privacy, and bounds.",
-    "Canonicalize payload and derive payload digest, observation ID, idempotency key, and envelope digest.",
+    "Validate source identity, observation kind, payload contract, extensions, provenance, privacy, and bounds.",
+    "Canonicalize payload and extensions and derive payload digest, extension digest, observation ID, idempotency key, and envelope digest.",
     "Append the admitted immutable envelope to the durable bounded observation journal.",
     "Dispatch at least once subject to effective batch, byte, concurrency, deadline, and cancellation limits.",
-    "Require the provider to deduplicate by idempotency key and compare payload digest.",
+    "Require the provider to deduplicate by idempotency key and compare payload and extension digests.",
     "Persist a delivery receipt for every acknowledged, duplicate, rejected, partial, cancelled, timed-out, or unknown-effect attempt.",
     "Never alter the already-settled canonical source outcome because provider admission or delivery failed."
   ],
@@ -249,6 +291,7 @@
     "rejected_provenance_unavailable",
     "rejected_privacy_policy",
     "rejected_payload_too_large",
+    "rejected_extension_unsupported",
     "idempotency_conflict",
     "provider_unavailable",
     "deadline_exceeded",
@@ -263,6 +306,7 @@
       "observation_id",
       "idempotency_key",
       "payload_sha256",
+      "extensions_digest",
       "provider_id",
       "provider_instance_id",
       "registration_revision",
@@ -271,6 +315,7 @@
       "attempt_number",
       "outcome",
       "committed_effect",
+      "provider_effect_summary",
       "provider_receipt_digest",
       "started_at",
       "finished_at",
@@ -284,6 +329,14 @@
       "partial",
       "unknown"
     ],
+    "provider_effect_summary_fields": [
+      "effect_count",
+      "stable_memory_refs",
+      "provider_trace_refs",
+      "no_effect_reason"
+    ],
+    "stable_memory_refs_optional": true,
+    "provider_trace_refs_optional": true,
     "provider_receipt_digest_required_for": [
       "applied",
       "duplicate_acknowledged",
@@ -302,16 +355,19 @@
   },
   "invariants": [
     "An observation is created only from a canonically settled TraceDecay source event and never participates in that source transaction.",
-    "Every envelope is immutable, exact-scope, provider-targeted, registration-pinned, readiness-pinned, bounded, provenance-bearing, privacy-bearing, and request-controlled.",
-    "Canonical payload bytes and SHA-256 are deterministic across process restart and transport topology.",
+    "Every coding observation is immutable and carries exact profile, project, repository, worktree, branch, and agent-session scope through the compatible readiness receipt.",
+    "Every envelope is provider-targeted, registration-pinned, readiness-pinned, bounded, provenance-bearing, privacy-bearing, extension-aware, and request-controlled.",
+    "Canonical payload and extension bytes plus SHA-256 digests are deterministic across process restart and transport topology.",
+    "Unknown optional extensions round-trip as opaque inert data; unknown required extensions fail explicitly and never activate behavior.",
+    "An observation is an admitted input event, not a provider memory record; one observation may create zero, one, or many opaque provider-local effects.",
     "Idempotency keys are deterministic across retries and crashes and never depend only on timestamps or random retry values.",
-    "The same idempotency key with the same payload is a duplicate acknowledgement; the same key with different payload is an explicit conflict.",
+    "The same idempotency key with the same payload and extensions is a duplicate acknowledgement; the same key with different canonical content is an explicit conflict.",
     "Providers persist deduplication state strongly enough to survive acknowledgement loss and provider restart.",
     "Delivery is at least once, may be out of order, and always carries source sequence and immutable occurrence/admission times.",
     "Unknown payload contracts, missing provenance/privacy, unadmitted secrets, oversize payloads, scope mismatch, and malformed canonical JSON fail closed.",
     "Provider-local application never mutates current code, exact scope identity, sessions, accepted Native facts, curated rules, tools, approvals, or final context.",
     "Observer admission, dispatch, latency, failure, duplicate, conflict, partial effect, or unknown effect cannot alter the canonical source outcome.",
-    "Every delivery attempt has an immutable typed receipt and success is impossible without provider acknowledgement.",
+    "Every delivery attempt has an immutable typed receipt; every provider effect or no-effect decision is attributable to the observation and success is impossible without provider acknowledgement.",
     "Batch limits come from the compatible readiness receipt and partial commits are represented honestly rather than retried as whole-batch success.",
     "Forget-source identity and expiry are admitted before dispatch and a provider may not extend retention."
   ],
