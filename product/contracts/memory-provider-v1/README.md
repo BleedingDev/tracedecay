@@ -1,70 +1,34 @@
-# TraceDecay Memory Provider Contract V1
+# Memory provider contract V1
 
-This directory owns the product-level, provider-neutral contracts for pluggable cognitive memory. M1 defines behavior before M2 creates Rust crates or concrete adapters.
+`tdmem-0201` establishes the provider-neutral capability registry used by every later provider contract. It defines identity and semantics only; no Native, NCM, or OCEAN adapter is implemented here.
 
-## Current contract
+## Stable identities
 
-`provider-registry-contract.json` defines:
+A provider uses stable `MemoryProviderIdV1` identity. Display names, process IDs, sockets, database paths, configuration order, and state digests are never identity. Capability IDs are versioned behavior names, not provider names. Only the registry/composition boundary may branch on `provider_id`; CLI, MCP, SDK, dashboard, context, storage, and application surfaces remain provider-neutral.
 
-- stable `MemoryProviderIdV1` identity;
-- versioned capability identity and the initial capability catalog;
-- authoritative, revisioned registration;
-- explicit capability requirements and fail-closed provider resolution;
-- bootstrap identity slots for TraceDecay Native, NCM, and future OCEAN;
-- the prohibition on provider-name branching outside adapter construction;
-- the prohibition on silent fallback or successful empty resolution.
+## Mandatory versus optional
 
-`provider-registry-contract.schema.json` is the strict structural schema. `scripts/product/check-provider-registry-contract.py` adds semantic checks that JSON Schema cannot express, including Beads references, reserved-slot rules, authority limits, and contract consistency.
+The authoritative registry has two non-overlapping sets:
 
-## Authority boundary
+- Mandatory: `provider.health.v1`, `observation.accept.v1`, and `recall.query.v1`. A registered provider cannot become ready without all three.
+- Optional: feedback, maintenance, temporal recall, associative activation, explicit-fact projection, explainability, correction, source deletion, snapshot export/restore, replay, and inspection.
 
-The registry composition root is authoritative only for provider registration, concrete-adapter construction, and exact selection resolution. It is **not** authoritative for:
+Every entry carries canonical input and output contract identities, bounded typed failure modes, and explicit compatibility rules. Exact capability major versions are required; unknown optional fields are preserved; implicit downgrade is forbidden; behavior activates only after a known catalog entry, an accepted registration revision, and explicit selection.
 
-- current source code;
-- repository, worktree, branch, profile, or session identity;
-- admitted session evidence;
-- accepted TraceDecay Native facts, lineage, privacy, feedback, or trust;
-- curated rules or configuration settlement;
-- final coding-context assembly.
+For compatibility with already-landed M1 validators, `capability_catalog` is a derived ID-only projection of both authoritative sets. It is not an activation source; `capability_registry` remains authoritative.
 
-Every capability in the V1 catalog is advisory with respect to those TraceDecay authorities. Provider-local mutation means mutation of the selected provider's own cognitive state only.
+## Unknown capability round-trip
 
-## Identity rules
+A syntactically valid unknown capability is decoded as `OpaqueMemoryProviderCapabilityV1` with its canonical payload preserved. Re-encoding must round-trip that payload without semantic rewriting. Presence never means support: the declaration is retained as opaque, cannot count as mandatory, cannot satisfy a required capability, cannot infer behavior from its name, and cannot activate anything. Explicit selection returns typed `capability_unsupported`. Promotion requires a future accepted catalog revision, a new registration revision, and explicit selection.
 
-Provider ID is stable machine identity, not presentation. It cannot be derived from display name, process/socket/database location, state digest, configuration order, or runtime order. Upgrades retain the same provider ID when they are the same logical provider and use explicit implementation/protocol versions for compatibility.
+## Fail-closed resolution
 
-Capability IDs include a major version suffix such as `recall.query.v1`. Unknown and duplicate capability IDs are rejected. A provider name never implies capabilities; only an accepted registration revision and compatible handshake can declare them.
+Resolution requires exact provider identity, accepted registration revision, compatible adapter contract, all mandatory capabilities, every explicitly required known capability, exact TraceDecay scope, a live deadline, and live cancellation. There is no implicit fallback and no successful empty resolution.
 
-## Registry and selection rules
+## Reserved provider slots
 
-The provider cannot self-register. TraceDecay's composition root creates one registration with an exact revision. Duplicate IDs are ambiguous and fail closed.
+- `tracedecay.native` is declared but remains gated by parity work.
+- `ncm` is reserved; surface audit precedes transport/topology selection.
+- `ocean` reserves identity only because no versioned specification exists.
 
-A selection request names one provider ID and every required capability. Resolution succeeds only when:
-
-1. the provider ID matches exactly;
-2. registration state is usable;
-3. adapter/protocol versions are compatible;
-4. every requested capability is declared;
-5. exact coding scope is admitted;
-6. deadline and cancellation are live.
-
-All non-success states are typed. There is no implicit fallback to `tracedecay.native`, no first-success provider search, and no empty “ready” result.
-
-## Bootstrap slots
-
-- `tracedecay.native`: declared identity; implementation and parity remain gated by `tdmem-0401`–`tdmem-0404`.
-- `ncm`: reserved identity; capabilities and topology remain gated by licensed-surface audit and ADR (`tdmem-0701`, `tdmem-0702`) before observer integration.
-- `ocean`: identity reservation only. It has no implementation gate, capabilities, or delivered status until a versioned specification exists.
-
-None of the bootstrap slots counts as implemented in this contract bead.
-
-## Follow-on contracts
-
-- `tdmem-0202`: handshake, implementation identity, protocol compatibility, limits, deadline, and cancellation.
-- `tdmem-0203`: normalized observation envelope and idempotency.
-- `tdmem-0204`: recall request, candidates, scores, provenance, warnings, and coverage.
-- `tdmem-0205`: feedback, maintenance, correction, forgetting, inspection, snapshot, and restore.
-- `tdmem-0206`: typed terminal/degradation/retry/partial-effect outcomes.
-- `tdmem-0209`: provider conformance model.
-
-Concrete Native/NCM adapters remain out of scope until these provider-neutral contracts and M2 dependency guards are accepted.
+None of the bootstrap slots counts as implemented. Concrete Native/NCM adapters remain out of scope for this bead.
