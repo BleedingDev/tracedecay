@@ -75,7 +75,7 @@ def check_repository(repo: Path) -> list[str]:
     except OSError as error:
         return errors + [f"cannot read composition mount {mount_path}: {error}"]
     required_fragments = (
-        '#[cfg(feature = "memory-fabric")]\npub(crate) fn compose_native_memory_fabric(',
+        '#[cfg(feature = "memory-fabric")]\n#[allow(dead_code)]\npub(crate) fn compose_native_memory_fabric(',
         "tracedecay_memory_provider_registry::compose_native_memory(port, config)",
     )
     for fragment in required_fragments:
