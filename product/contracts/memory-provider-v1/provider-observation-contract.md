@@ -1,6 +1,6 @@
 # Memory Provider Observation Contract V1
 
-Provider observations are admitted **after** the canonical TraceDecay source event settles. They never participate in the source transaction and never change its result.
+Provider observations are admitted after the canonical TraceDecay source event settles. They never participate in the source transaction and never change its result.
 
 ## Envelope
 
