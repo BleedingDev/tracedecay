@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0206",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Closing terminal semantics only after every mandatory operation is forced through one typed envelope, cancellation remains distinct from timeout, partial/unknown effects identify the committed boundary, and retry/fallback are explicit bounded directives rather than empty-response inference.",
+  "checks": [
+    {
+      "name": "provider terminal contract tests",
+      "argv": ["python3", "tests/product_provider_terminal_contract_test.py"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider terminal repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-terminal-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-terminal-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-terminal-contract.schema.json",
+        "--doc",
+        "product/contracts/memory-provider-v1/provider-terminal-contract.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "all preceding provider contracts remain valid",
+      "argv": [
+        "bash",
+        "-lc",
+        "python3 scripts/product/check-provider-registry-contract.py --repo . --contract product/contracts/memory-provider-v1/provider-registry-contract.json --schema product/contracts/memory-provider-v1/provider-registry-contract.schema.json --readme product/contracts/memory-provider-v1/README.md --issues .beads/issues.jsonl && python3 scripts/product/check-provider-handshake-contract.py --repo . --contract product/contracts/memory-provider-v1/provider-handshake-contract.json --schema product/contracts/memory-provider-v1/provider-handshake-contract.schema.json --doc product/contracts/memory-provider-v1/provider-handshake-contract.md --issues .beads/issues.jsonl && python3 scripts/product/check-provider-observation-contract.py --repo . --contract product/contracts/memory-provider-v1/provider-observation-contract.json --schema product/contracts/memory-provider-v1/provider-observation-contract.schema.json --doc product/contracts/memory-provider-v1/provider-observation-contract.md --issues .beads/issues.jsonl && python3 scripts/product/check-provider-recall-contract.py --repo . --contract product/contracts/memory-provider-v1/provider-recall-contract.json --schema product/contracts/memory-provider-v1/provider-recall-contract.schema.json --doc product/contracts/memory-provider-v1/provider-recall-contract.md --issues .beads/issues.jsonl && python3 scripts/product/check-provider-lifecycle-contract.py --repo . --contract product/contracts/memory-provider-v1/provider-lifecycle-contract.json --schema product/contracts/memory-provider-v1/provider-lifecycle-contract.schema.json --doc product/contracts/memory-provider-v1/provider-lifecycle-contract.md --issues .beads/issues.jsonl"
+      ],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "upstream patch-footprint remains within policy",
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "acceptance_criteria": [
+    "Every mandatory operation returns a typed terminal envelope.",
+    "Cancellation is distinct from timeout.",
+    "Partial effects identify the committed boundary.",
+    "Fallback eligibility is explicit, never inferred from an empty response."
+  ],
+  "close_reason": "Accepted the V1 closed terminal envelope with distinct cancellation/timeout, explicit coverage, bounded retry and fallback directives, and receipt-backed none/committed/partial/unknown effect boundaries.",
+  "close_comment": "Evidence: provider-terminal-contract.json and strict schema define one mandatory terminal envelope for health, observe, recall, and every provider operation. The closed twenty-code table separates success, zero-results, partial reads, caller/policy/identity/state/resource/request-control/availability/compatibility/effect/protocol/provider failures. Domain detail is inert. Results are typed/canonical/bounded. Coverage differentiates complete/partial/zero. Retry is explicit, bounded, policy-gated, defaults off, retains mutation idempotency, and waits for effect reconciliation. Fallback defaults forbidden, is never inferred from empty results or unavailability, and current policy has no automatic fallback. Committed effects record exact boundary, generations, committed/uncommitted item sets, receipts, and reconciliation; partial_effect and effect_unknown have mandatory matching states. Cancellation and deadline are distinct monotonic terminal events and never success. The validator cross-checks all accepted M1 contracts and registry mandatory capabilities; mutation tests enforce every acceptance criterion plus envelope, table, payload, coverage, retry, fallback, effect, precedence, mandatory mapping, Beads, and schema rules."
+}
