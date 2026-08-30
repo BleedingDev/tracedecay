@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 publish = false
 license = "MIT"
-description = "Provider-neutral conformance fixtures and differential reports for TraceDecay memory"
+description = "Provider-neutral conformance and differential evaluation harness for TraceDecay memory"
 repository = "https://github.com/BleedingDev/tracedecay"
 
 [dependencies]
