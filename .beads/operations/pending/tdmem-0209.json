@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 2,
+  "attempt": 3,
   "issue_id": "tdmem-0209",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Closing M1 implementability only after a standalone deterministic Rust provider passes mandatory health/observe/recall conformance, duplicate/conflict semantics, real cancellation/deadline preflight, exact scope, deterministic snapshot/restart, explicit unsupported lifecycle calls, strict linting, and product-owned evidence validation.",
-  "retry_note": "The first run correctly exposed three evidence-checker bugs rather than provider failures: the accepted registry stores mandatory/optional capabilities as object arrays, the standalone root package must be exempt from its own forbidden dependency prefix, and helper functions must not be counted as #[test] journeys. The checker now follows the canonical registry shape, parses Cargo.lock structurally, and matches only attributed tests.",
+  "retry_note": "The second run reached strict Rust compilation and exposed one genuine adapter bug: provider identity mismatch was incorrectly modeled as a non-existent terminal-code variant. The accepted terminal contract has no provider_id_mismatch terminal code, so the dummy handshake now fails closed with invalid_request while retaining the dedicated provider_identity_mismatch conformance journey and zero-effect assertions.",
   "checks": [
     {
       "name": "dummy-provider evidence mutation tests",
