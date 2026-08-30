@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/schemas/memory-provider-v1/provider-terminal-contract.schema.json",
+  "title": "TraceDecay memory provider terminal contract V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "bead_id",
+    "title",
+    "status",
+    "authority",
+    "scope",
+    "depends_on_contracts",
+    "terminal_envelope",
+    "terminal_codes",
+    "domain_detail",
+    "result_payload",
+    "coverage",
+    "retry",
+    "fallback",
+    "committed_effect",
+    "request_control_precedence",
+    "mandatory_operation_mapping",
+    "mandatory_operation_rules",
+    "terminal_validation_order",
+    "invariants",
+    "verification_beads"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "contract_id": { "const": "tracedecay.memory.provider.terminal.v1" },
+    "bead_id": { "const": "tdmem-0206" },
+    "title": { "type": "string", "minLength": 1 },
+    "status": { "const": "accepted" },
+    "authority": { "const": "TraceDecay provider protocol terminal envelope" },
+    "scope": { "const": "coding_agents_only" },
+    "depends_on_contracts": {
+      "type": "array",
+      "const": [
+        "tracedecay.memory.provider.registry.v1",
+        "tracedecay.memory.provider.handshake.v1",
+        "tracedecay.memory.provider.observation.v1",
+        "tracedecay.memory.provider.recall.v1",
+        "tracedecay.memory.provider.lifecycle.v1"
+      ]
+    },
+    "terminal_envelope": { "$ref": "#/$defs/object" },
+    "terminal_codes": {
+      "type": "array",
+      "minItems": 20,
+      "maxItems": 20,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/terminalCode" }
+    },
+    "domain_detail": { "$ref": "#/$defs/object" },
+    "result_payload": { "$ref": "#/$defs/object" },
+    "coverage": { "$ref": "#/$defs/object" },
+    "retry": { "$ref": "#/$defs/object" },
+    "fallback": { "$ref": "#/$defs/object" },
+    "committed_effect": { "$ref": "#/$defs/object" },
+    "request_control_precedence": { "$ref": "#/$defs/object" },
+    "mandatory_operation_mapping": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/mandatoryOperation" }
+    },
+    "mandatory_operation_rules": { "$ref": "#/$defs/object" },
+    "terminal_validation_order": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 20 }
+    },
+    "invariants": {
+      "type": "array",
+      "minItems": 15,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 20 }
+    },
+    "verification_beads": {
+      "type": "array",
+      "minItems": 10,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/beadId" }
+    }
+  },
+  "$defs": {
+    "beadId": {
+      "type": "string",
+      "pattern": "^tdmem-[0-9]{4}$"
+    },
+    "object": {
+      "type": "object",
+      "minProperties": 1
+    },
+    "terminalCode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "class",
+        "effect_expectation",
+        "retry_class",
+        "fallback_eligibility"
+      ],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "class": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "effect_expectation": { "type": "string", "minLength": 1 },
+        "retry_class": { "type": "string", "minLength": 1 },
+        "fallback_eligibility": {
+          "enum": ["forbidden", "explicit_policy_only"]
+        }
+      }
+    },
+    "mandatoryOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability_id", "operation_kind", "result_contract_id"],
+      "properties": {
+        "capability_id": { "type": "string", "minLength": 1 },
+        "operation_kind": { "type": "string", "minLength": 1 },
+        "result_contract_id": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
