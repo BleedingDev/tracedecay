@@ -1,0 +1,530 @@
+{
+  "schema_version": 1,
+  "contract_id": "tracedecay.memory.provider.lifecycle.v1",
+  "bead_id": "tdmem-0205",
+  "title": "Memory provider health, feedback, maintenance, inspection, correction, deletion, snapshot, and replay contract",
+  "status": "accepted",
+  "authority": "TraceDecay lifecycle admission and provider-local capability fabric",
+  "scope": "coding_agents_only",
+  "depends_on_contracts": [
+    "tracedecay.memory.provider.registry.v1",
+    "tracedecay.memory.provider.handshake.v1",
+    "tracedecay.memory.provider.observation.v1",
+    "tracedecay.memory.provider.recall.v1"
+  ],
+  "common_request": {
+    "type_name": "MemoryProviderLifecycleRequestContextV1",
+    "required_fields": [
+      "provider_id",
+      "registration_revision",
+      "ready_receipt_digest",
+      "exact_scope_identity",
+      "operation_id",
+      "idempotency_key",
+      "expected_state_generation",
+      "request_identity",
+      "policy_revision",
+      "deadline",
+      "cancellation",
+      "extensions"
+    ],
+    "operation_id_type": "uuid_v7_lowercase",
+    "idempotency_key_encoding": "lowercase_hex_64",
+    "exact_scope_match_required": true,
+    "live_ready_receipt_required": true,
+    "deadline_required": true,
+    "cancellation_required": true,
+    "unknown_optional_extension_policy": "preserve_opaque_inert_round_trip",
+    "unknown_required_extension_policy": "reject_extension_unsupported",
+    "provider_may_widen_scope": false,
+    "provider_may_extend_deadline": false,
+    "provider_may_mutate_tracedecay_authority": false
+  },
+  "capability_gating": {
+    "type_name": "MemoryProviderLifecycleCapabilityGateV1",
+    "capability_to_operation": [
+      {
+        "capability_id": "provider.health.v1",
+        "operation_contract_id": "tracedecay.memory.provider.health.v1",
+        "requirement": "mandatory"
+      },
+      {
+        "capability_id": "feedback.record.v1",
+        "operation_contract_id": "tracedecay.memory.provider.feedback.v1",
+        "requirement": "optional"
+      },
+      {
+        "capability_id": "maintenance.run.v1",
+        "operation_contract_id": "tracedecay.memory.provider.maintenance.v1",
+        "requirement": "optional"
+      },
+      {
+        "capability_id": "inspection.read.v1",
+        "operation_contract_id": "tracedecay.memory.provider.inspection.v1",
+        "requirement": "optional"
+      },
+      {
+        "capability_id": "correction.apply.v1",
+        "operation_contract_id": "tracedecay.memory.provider.correction.v1",
+        "requirement": "optional"
+      },
+      {
+        "capability_id": "deletion.by_source.v1",
+        "operation_contract_id": "tracedecay.memory.provider.deletion-by-source.v1",
+        "requirement": "optional"
+      },
+      {
+        "capability_id": "snapshot.export.v1",
+        "operation_contract_id": "tracedecay.memory.provider.snapshot-export.v1",
+        "requirement": "optional"
+      },
+      {
+        "capability_id": "snapshot.restore.v1",
+        "operation_contract_id": "tracedecay.memory.provider.snapshot-restore.v1",
+        "requirement": "optional"
+      },
+      {
+        "capability_id": "replay.apply.v1",
+        "operation_contract_id": "tracedecay.memory.provider.replay.v1",
+        "requirement": "optional"
+      },
+      {
+        "capability_id": "facts.explicit.v1",
+        "operation_contract_id": "tracedecay.memory.provider.explicit-fact-projection.v1",
+        "requirement": "optional"
+      },
+      {
+        "capability_id": "explain.trace.v1",
+        "operation_contract_id": "tracedecay.memory.provider.explain-trace.v1",
+        "requirement": "optional"
+      }
+    ],
+    "unsupported_operation_outcome": "capability_unsupported",
+    "unsupported_operation_may_fallback": false,
+    "provider_name_implies_capability": false,
+    "capability_requires_registration_and_handshake_declaration": true
+  },
+  "health": {
+    "type_name": "MemoryProviderHealthV1",
+    "contract_id": "tracedecay.memory.provider.health.v1",
+    "capability_id": "provider.health.v1",
+    "mutation": false,
+    "required_request_fields": [
+      "common_request",
+      "requested_checks"
+    ],
+    "requested_checks": [
+      "protocol",
+      "state",
+      "scope",
+      "capacity",
+      "persistence",
+      "recovery",
+      "privacy"
+    ],
+    "required_response_fields": [
+      "provider_id",
+      "provider_instance_id",
+      "implementation_identity_digest",
+      "state_identity_digest",
+      "state_generation",
+      "scope_digest",
+      "readiness",
+      "capability_states",
+      "effective_limits_digest",
+      "backlog",
+      "recovery_state",
+      "warnings"
+    ],
+    "readiness_states": [
+      "ready",
+      "degraded",
+      "not_ready",
+      "unavailable"
+    ],
+    "process_existence_proves_ready": false,
+    "socket_existence_proves_ready": false,
+    "nonempty_state_proves_ready": false,
+    "health_may_mutate_state": false
+  },
+  "feedback": {
+    "type_name": "MemoryProviderFeedbackV1",
+    "contract_id": "tracedecay.memory.provider.feedback.v1",
+    "capability_id": "feedback.record.v1",
+    "mutation": true,
+    "required_request_fields": [
+      "common_request",
+      "target",
+      "signal",
+      "weight",
+      "canonical_outcome_receipt",
+      "evidence_refs",
+      "occurred_at"
+    ],
+    "target": {
+      "type_name": "MemoryProviderFeedbackTargetV1",
+      "selection_rule": "exactly_one",
+      "target_kinds": [
+        "stable_memory_ref",
+        "recall_trace_ref",
+        "context_pack_item_ref"
+      ],
+      "stable_memory_ref_required": false,
+      "recall_trace_ref_scope_bound": true,
+      "context_pack_item_ref_request_bound": true,
+      "unknown_target_policy": "target_unknown"
+    },
+    "signals": [
+      "helpful",
+      "harmful",
+      "ignored",
+      "corrected",
+      "superseded"
+    ],
+    "weight_representation": "canonical_decimal_string_closed_0_to_1",
+    "canonical_outcome_receipt_required": true,
+    "unsettled_outcome_policy": "settlement_unverified",
+    "idempotent": true,
+    "same_key_different_feedback_policy": "idempotency_conflict",
+    "provider_may_change_native_trust": false,
+    "required_response_fields": [
+      "target_digest",
+      "signal",
+      "state_generation_before",
+      "state_generation_after",
+      "applied_effect",
+      "provider_receipt_digest",
+      "warnings"
+    ]
+  },
+  "maintenance": {
+    "type_name": "MemoryProviderMaintenanceV1",
+    "contract_id": "tracedecay.memory.provider.maintenance.v1",
+    "capability_id": "maintenance.run.v1",
+    "mutation": true,
+    "required_request_fields": [
+      "common_request",
+      "task",
+      "maximum_items",
+      "maximum_bytes",
+      "maximum_duration_millis",
+      "dry_run"
+    ],
+    "tasks": [
+      "consolidate",
+      "decay",
+      "prune_expired",
+      "validate_state",
+      "repair",
+      "compact"
+    ],
+    "all_limits_positive_and_finite": true,
+    "maximum_items_hard_limit": 1000000,
+    "maximum_bytes_hard_limit": 1073741824,
+    "maximum_duration_millis_hard_limit": 3600000,
+    "effective_duration_is_minimum_of_request_handshake_and_deadline": true,
+    "one_mutating_maintenance_operation_per_provider_scope": true,
+    "concurrent_mutation_policy": "maintenance_busy",
+    "deadline_and_cancellation_reach_provider_loop": true,
+    "partial_progress_must_be_reported": true,
+    "unbounded_scan_allowed": false,
+    "required_response_fields": [
+      "task",
+      "dry_run",
+      "state_generation_before",
+      "state_generation_after",
+      "scanned_items",
+      "changed_items",
+      "removed_items",
+      "partial",
+      "resume_cursor",
+      "provider_receipt_digest",
+      "warnings"
+    ]
+  },
+  "inspection": {
+    "type_name": "MemoryProviderInspectionV1",
+    "contract_id": "tracedecay.memory.provider.inspection.v1",
+    "capability_id": "inspection.read.v1",
+    "mutation": false,
+    "required_request_fields": [
+      "common_request",
+      "view",
+      "selector",
+      "maximum_items",
+      "maximum_bytes",
+      "redaction_policy_revision",
+      "cursor"
+    ],
+    "views": [
+      "state_summary",
+      "source_influence",
+      "trace",
+      "delivery_receipt",
+      "maintenance_receipt",
+      "snapshot_metadata",
+      "capability_status"
+    ],
+    "all_limits_positive_and_finite": true,
+    "provider_internal_secret_material_allowed": false,
+    "raw_credentials_allowed": false,
+    "hidden_canonical_authority_allowed": false,
+    "redaction_required": true,
+    "cursor_scope_bound": true,
+    "required_response_fields": [
+      "view",
+      "items",
+      "coverage",
+      "next_cursor",
+      "redactions",
+      "state_generation",
+      "warnings"
+    ]
+  },
+  "correction": {
+    "type_name": "MemoryProviderCorrectionV1",
+    "contract_id": "tracedecay.memory.provider.correction.v1",
+    "capability_id": "correction.apply.v1",
+    "mutation": true,
+    "required_request_fields": [
+      "common_request",
+      "target",
+      "correction_kind",
+      "replacement",
+      "expected_target_revision",
+      "reason",
+      "evidence_refs"
+    ],
+    "target_selection_rule": "exactly_one",
+    "target_kinds": [
+      "stable_memory_ref",
+      "recall_trace_ref",
+      "source_ref"
+    ],
+    "correction_kinds": [
+      "supersede",
+      "restrict_scope",
+      "change_validity",
+      "replace_content",
+      "mark_incorrect"
+    ],
+    "expected_target_revision_required": true,
+    "revision_mismatch_policy": "revision_conflict",
+    "idempotent": true,
+    "same_key_different_correction_policy": "idempotency_conflict",
+    "native_fact_mutation_allowed": false,
+    "source_code_mutation_allowed": false,
+    "required_response_fields": [
+      "target_digest",
+      "correction_kind",
+      "state_generation_before",
+      "state_generation_after",
+      "affected_provider_effects",
+      "provider_receipt_digest",
+      "warnings"
+    ]
+  },
+  "deletion_by_source": {
+    "type_name": "MemoryProviderDeletionBySourceV1",
+    "contract_id": "tracedecay.memory.provider.deletion-by-source.v1",
+    "capability_id": "deletion.by_source.v1",
+    "mutation": true,
+    "required_request_fields": [
+      "common_request",
+      "forget_source_keys",
+      "mode",
+      "include_snapshots",
+      "retention_lock_policy_revision",
+      "verification_query"
+    ],
+    "minimum_source_keys": 1,
+    "maximum_source_keys": 1024,
+    "duplicate_source_key_policy": "reject_non_canonical_request",
+    "modes": [
+      "remove_influence",
+      "hard_delete",
+      "anonymize"
+    ],
+    "default_mode": "remove_influence",
+    "include_snapshots_required": true,
+    "provider_may_report_success_without_verification": false,
+    "verifiable_postcondition": {
+      "required_fields": [
+        "matched_effects",
+        "removed_effects",
+        "anonymized_effects",
+        "retained_under_lock",
+        "remaining_influence_count",
+        "snapshots_examined",
+        "snapshots_rewritten",
+        "verification_query_digest",
+        "verification_state",
+        "state_generation_before",
+        "state_generation_after"
+      ],
+      "verification_states": [
+        "verified_absent",
+        "verified_anonymized",
+        "retained_under_explicit_lock",
+        "verification_failed",
+        "partial"
+      ],
+      "successful_remove_requires_remaining_influence_zero": true,
+      "retention_lock_requires_explicit_receipt": true,
+      "snapshot_omission_may_be_silent": false,
+      "provider_recall_may_return_deleted_source": false
+    },
+    "idempotent": true,
+    "same_key_different_source_set_policy": "idempotency_conflict",
+    "native_fact_deletion_allowed": false,
+    "session_evidence_deletion_allowed": false,
+    "required_response_fields": [
+      "postcondition",
+      "provider_receipt_digest",
+      "warnings"
+    ]
+  },
+  "snapshot": {
+    "type_name": "MemoryProviderSnapshotV1",
+    "export_contract_id": "tracedecay.memory.provider.snapshot-export.v1",
+    "restore_contract_id": "tracedecay.memory.provider.snapshot-restore.v1",
+    "export_capability_id": "snapshot.export.v1",
+    "restore_capability_id": "snapshot.restore.v1",
+    "snapshot_identity_required_fields": [
+      "snapshot_id",
+      "provider_id",
+      "implementation_identity_digest",
+      "state_schema_version",
+      "exact_scope_digest",
+      "state_generation",
+      "observation_sequence",
+      "parent_snapshot_id",
+      "content_sha256",
+      "byte_length",
+      "created_at"
+    ],
+    "snapshot_bytes_limit_source": "effective_limit.snapshot_bytes",
+    "export_is_read_only": true,
+    "export_consistent_generation_required": true,
+    "restore_mutation": true,
+    "restore_idempotent": true,
+    "restore_requires_exact_provider": true,
+    "restore_requires_compatible_implementation": true,
+    "restore_requires_compatible_state_schema": true,
+    "restore_requires_exact_scope": true,
+    "restore_requires_digest_match": true,
+    "restore_requires_expected_generation": true,
+    "implicit_reset_allowed": false,
+    "implicit_overwrite_allowed": false,
+    "incompatible_restore_outcome": "state_incompatible",
+    "restore_required_response_fields": [
+      "snapshot_id",
+      "state_generation_before",
+      "state_generation_after",
+      "restored_observation_sequence",
+      "provider_receipt_digest",
+      "warnings"
+    ]
+  },
+  "replay": {
+    "type_name": "MemoryProviderReplayV1",
+    "contract_id": "tracedecay.memory.provider.replay.v1",
+    "capability_id": "replay.apply.v1",
+    "mutation": true,
+    "required_request_fields": [
+      "common_request",
+      "observation_batch_refs",
+      "first_source_sequence",
+      "last_source_sequence",
+      "expected_state_generation",
+      "expected_previous_acknowledged_sequence"
+    ],
+    "batch_refs_are_canonical_observation_receipts": true,
+    "sequence_monotonic_required": true,
+    "sequence_gap_policy": "sequence_gap",
+    "idempotent": true,
+    "duplicate_sequence_same_digest_policy": "duplicate_acknowledged",
+    "duplicate_sequence_different_digest_policy": "idempotency_conflict",
+    "deadline_and_cancellation_reach_provider_loop": true,
+    "partial_progress_must_be_reported": true,
+    "required_response_fields": [
+      "first_source_sequence",
+      "last_source_sequence",
+      "acknowledged_sequence",
+      "state_generation_before",
+      "state_generation_after",
+      "applied_observations",
+      "duplicate_observations",
+      "partial",
+      "provider_receipt_digest",
+      "warnings"
+    ]
+  },
+  "provider_local_projection": {
+    "explicit_fact_capability_id": "facts.explicit.v1",
+    "explain_trace_capability_id": "explain.trace.v1",
+    "explicit_projection_is_native_fact_authority": false,
+    "provider_explanation_is_proof": false,
+    "promotion_to_native_requires_separate_authorized_operation": true,
+    "missing_projection_or_explanation_outcome": "capability_unsupported_or_unavailable"
+  },
+  "lifecycle_specific_terminal_states": [
+    "success",
+    "success_no_effect",
+    "partial_effect",
+    "effect_unknown",
+    "invalid_request",
+    "unauthorized",
+    "capability_unsupported",
+    "scope_unavailable",
+    "scope_mismatch",
+    "stale_identity",
+    "target_unknown",
+    "source_unknown",
+    "revision_conflict",
+    "idempotency_conflict",
+    "settlement_unverified",
+    "maintenance_busy",
+    "retention_lock",
+    "deadline_exceeded",
+    "cancelled",
+    "provider_unavailable",
+    "state_incompatible",
+    "reset_required",
+    "extension_unsupported",
+    "contract_violation",
+    "internal_failure"
+  ],
+  "invariants": [
+    "Every lifecycle operation is capability-gated by accepted registration and compatible handshake declarations; provider names never imply support.",
+    "Unsupported optional lifecycle operations return the typed capability_unsupported result and never silently fall back.",
+    "All provider-local mutations carry exact coding scope, stable operation identity, deterministic idempotency, expected state generation, deadline, and live cancellation.",
+    "Health is mandatory, read-only, bounded, and never infers readiness from process, socket, path, or non-empty state existence.",
+    "Feedback targets exactly one stable memory reference, recall trace, or context-pack item and requires a canonically settled outcome receipt.",
+    "Feedback may change provider-local learning state but never TraceDecay Native trust or another canonical authority.",
+    "Maintenance is finite, bounded, single-writer per provider scope, cancellation-aware, and reports partial progress and a resume cursor.",
+    "Inspection is bounded, redacted, provider-local, and cannot expose raw credentials, hidden canonical authority, or unadmitted secret material.",
+    "Correction is idempotent, revision-checked, provider-local, and cannot change source code or accepted Native facts.",
+    "Deletion by source has a verifiable postcondition covering remaining influence, retention locks, and every included snapshot; success cannot hide residual influence.",
+    "A deleted source may not reappear in provider recall unless a new canonically admitted observation creates a new source revision.",
+    "Snapshots bind provider/build/schema/scope/generation/sequence/digest identity and incompatible restore never silently resets or overwrites state.",
+    "Replay consumes canonical observation receipts in monotonic sequence and reports duplicate, partial, gap, and state-generation outcomes explicitly.",
+    "Provider-local explicit-fact projections and explanations remain advisory and require a separate authorized Native promotion to become canonical facts.",
+    "Every success, no-effect, partial, unknown-effect, conflict, timeout, cancellation, unsupported, unavailable, or incompatible lifecycle result is typed and receipt-backed where an effect may have committed."
+  ],
+  "verification_beads": [
+    "tdmem-0206",
+    "tdmem-0207",
+    "tdmem-0209",
+    "tdmem-0402",
+    "tdmem-0503",
+    "tdmem-0504",
+    "tdmem-0506",
+    "tdmem-0705",
+    "tdmem-0802",
+    "tdmem-0803",
+    "tdmem-0805",
+    "tdmem-0806",
+    "tdmem-1106"
+  ]
+}
