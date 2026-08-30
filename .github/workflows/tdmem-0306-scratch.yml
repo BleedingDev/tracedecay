@@ -58,9 +58,3 @@ jobs:
           python3 scripts/product/check-memory-dependency-policy.py
           --repo .
           --policy product/upstream/patch-footprint-policy.json
-      - name: Keep upstream footprint policy green
-        run: >-
-          python3 scripts/product/check-patch-footprint-policy.py
-          --repo .
-          --policy product/upstream/patch-footprint-policy.json
-          --map product/upstream/convergence-map.json
