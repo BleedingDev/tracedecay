@@ -4,7 +4,8 @@
     {
       "bead_ids": [
         "tdmem-0301",
-        "tdmem-0302"
+        "tdmem-0302",
+        "tdmem-0303"
       ],
       "generated": {
         "generator_path": "rust-toolchain.toml",
@@ -26,13 +27,16 @@
         "cargo metadata --locked --format-version 1 --no-deps",
         "git diff --check",
         "cargo clippy -p tracedecay-memory-fabric --all-targets --locked -- -D warnings",
-        "cargo test -p tracedecay-memory-fabric --locked"
+        "cargo test -p tracedecay-memory-fabric --locked",
+        "cargo clippy -p tracedecay-memory-provider-native --all-targets --locked -- -D warnings",
+        "cargo test -p tracedecay-memory-provider-native --locked"
       ]
     },
     {
       "bead_ids": [
         "tdmem-0301",
-        "tdmem-0302"
+        "tdmem-0302",
+        "tdmem-0303"
       ],
       "line_budget": 80,
       "path": "Cargo.toml",
@@ -50,7 +54,9 @@
         "cargo clippy -p tracedecay-memory-provider-api --all-targets --locked -- -D warnings",
         "cargo test -p tracedecay-memory-provider-api --locked",
         "cargo clippy -p tracedecay-memory-fabric --all-targets --locked -- -D warnings",
-        "cargo test -p tracedecay-memory-fabric --locked"
+        "cargo test -p tracedecay-memory-fabric --locked",
+        "cargo clippy -p tracedecay-memory-provider-native --all-targets --locked -- -D warnings",
+        "cargo test -p tracedecay-memory-provider-native --locked"
       ]
     }
   ],
@@ -83,8 +89,8 @@
   "snapshot": {
     "composition_root_files": 0,
     "exception_zone_files": 0,
-    "observed_state": "The product branch changes only additive root workspace membership and generated path-package lock entries; provider API and fabric remain product-owned.",
-    "total_upstream_changed_lines": 13,
+    "observed_state": "The product branch changes only additive root workspace membership and generated path-package lock entries; provider API, fabric, and Native adapter remain product-owned.",
+    "total_upstream_changed_lines": 21,
     "upstream_existing_production_files": 2,
     "upstream_existing_test_or_fixture_files": 0
   },
