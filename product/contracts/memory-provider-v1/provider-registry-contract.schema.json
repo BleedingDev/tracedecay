@@ -1,0 +1,276 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/schemas/memory-provider-v1/provider-registry-contract.schema.json",
+  "title": "TraceDecay memory provider registry contract V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "bead_id",
+    "title",
+    "status",
+    "authority",
+    "scope",
+    "provider_identity",
+    "capability_identity",
+    "capability_catalog",
+    "registration_contract",
+    "selection_contract",
+    "bootstrap_slots",
+    "invariants",
+    "verification_beads"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "contract_id": { "const": "tracedecay.memory.provider.registry.v1" },
+    "bead_id": { "const": "tdmem-0201" },
+    "title": { "type": "string", "minLength": 1 },
+    "status": { "const": "accepted" },
+    "authority": { "const": "TraceDecay provider registry composition root" },
+    "scope": { "const": "coding_agents_only" },
+    "provider_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type_name",
+        "encoding",
+        "canonical_pattern",
+        "minimum_bytes",
+        "maximum_bytes",
+        "case_sensitive",
+        "stable_across_restarts",
+        "stable_across_adapter_upgrades",
+        "display_name_is_not_identity",
+        "forbidden_sources"
+      ],
+      "properties": {
+        "type_name": { "const": "MemoryProviderIdV1" },
+        "encoding": { "const": "utf-8" },
+        "canonical_pattern": { "type": "string", "minLength": 1 },
+        "minimum_bytes": { "const": 1 },
+        "maximum_bytes": { "type": "integer", "minimum": 32, "maximum": 128 },
+        "case_sensitive": { "const": true },
+        "stable_across_restarts": { "const": true },
+        "stable_across_adapter_upgrades": { "const": true },
+        "display_name_is_not_identity": { "const": true },
+        "forbidden_sources": {
+          "type": "array",
+          "minItems": 6,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "capability_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type_name",
+        "canonical_pattern",
+        "maximum_bytes",
+        "version_is_part_of_identity",
+        "unknown_capability_policy",
+        "duplicate_capability_policy"
+      ],
+      "properties": {
+        "type_name": { "const": "MemoryProviderCapabilityIdV1" },
+        "canonical_pattern": { "type": "string", "minLength": 1 },
+        "maximum_bytes": { "type": "integer", "minimum": 32, "maximum": 192 },
+        "version_is_part_of_identity": { "const": true },
+        "unknown_capability_policy": { "const": "reject" },
+        "duplicate_capability_policy": { "const": "reject" }
+      }
+    },
+    "capability_catalog": {
+      "type": "array",
+      "minItems": 9,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/capability" }
+    },
+    "registration_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type_name",
+        "registry_writer",
+        "provider_self_registration",
+        "required_fields",
+        "registration_states",
+        "capability_declaration_states",
+        "immutable_after_registration",
+        "revision_rule",
+        "duplicate_provider_id_policy",
+        "unknown_provider_policy",
+        "adapter_construction_boundary",
+        "public_surface_provider_branching"
+      ],
+      "properties": {
+        "type_name": { "const": "MemoryProviderRegistrationV1" },
+        "registry_writer": { "const": "TraceDecay provider registry composition root" },
+        "provider_self_registration": { "const": false },
+        "required_fields": {
+          "type": "array",
+          "minItems": 7,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "registration_states": {
+          "type": "array",
+          "const": ["registered", "disabled", "reserved", "retiring"]
+        },
+        "capability_declaration_states": {
+          "type": "array",
+          "const": [
+            "declared",
+            "deferred_until_compatible_handshake",
+            "unavailable_without_versioned_specification"
+          ]
+        },
+        "immutable_after_registration": {
+          "type": "array",
+          "const": ["provider_id", "implementation_identity"]
+        },
+        "revision_rule": { "type": "string", "minLength": 1 },
+        "duplicate_provider_id_policy": { "const": "reject_ambiguous_registration" },
+        "unknown_provider_policy": { "const": "reject_unknown_provider" },
+        "adapter_construction_boundary": { "type": "string", "minLength": 1 },
+        "public_surface_provider_branching": { "const": false }
+      }
+    },
+    "selection_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type_name",
+        "required_request_fields",
+        "required_capability_semantics",
+        "maximum_required_capabilities",
+        "duplicate_required_capability_policy",
+        "active_provider_cardinality_per_exact_scope",
+        "resolution_states",
+        "resolved_requires",
+        "silent_fallback",
+        "fallback_provider",
+        "successful_empty_resolution"
+      ],
+      "properties": {
+        "type_name": { "const": "MemoryProviderSelectionRequestV1" },
+        "required_request_fields": {
+          "type": "array",
+          "minItems": 7,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "required_capability_semantics": { "const": "all" },
+        "maximum_required_capabilities": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "duplicate_required_capability_policy": { "const": "reject_non_canonical_request" },
+        "active_provider_cardinality_per_exact_scope": { "const": "zero_or_one" },
+        "resolution_states": {
+          "type": "array",
+          "minItems": 12,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "resolved_requires": {
+          "type": "array",
+          "minItems": 7,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "silent_fallback": { "const": false },
+        "fallback_provider": { "type": "null" },
+        "successful_empty_resolution": { "const": false }
+      }
+    },
+    "bootstrap_slots": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/bootstrapSlot" }
+    },
+    "invariants": {
+      "type": "array",
+      "minItems": 10,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 20 }
+    },
+    "verification_beads": {
+      "type": "array",
+      "minItems": 8,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/beadId" }
+    }
+  },
+  "$defs": {
+    "beadId": {
+      "type": "string",
+      "pattern": "^tdmem-[0-9]{4}$"
+    },
+    "providerId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+      "maxLength": 64
+    },
+    "capabilityId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\\.v[1-9][0-9]*$",
+      "maxLength": 96
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "class",
+        "advisory_only",
+        "detailed_contract_bead",
+        "may_mutate_tracedecay_authority"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/capabilityId" },
+        "class": {
+          "enum": [
+            "advisory_read",
+            "provider_local_read",
+            "provider_local_mutation"
+          ]
+        },
+        "advisory_only": { "const": true },
+        "detailed_contract_bead": { "$ref": "#/$defs/beadId" },
+        "may_mutate_tracedecay_authority": { "const": false }
+      }
+    },
+    "bootstrapSlot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider_id",
+        "display_name",
+        "slot_state",
+        "specification_state",
+        "capability_declaration_state",
+        "implementation_gate_beads",
+        "counts_as_implemented"
+      ],
+      "properties": {
+        "provider_id": { "$ref": "#/$defs/providerId" },
+        "display_name": { "type": "string", "minLength": 1 },
+        "slot_state": { "enum": ["declared", "reserved"] },
+        "specification_state": { "type": "string", "minLength": 1 },
+        "capability_declaration_state": {
+          "enum": [
+            "deferred_until_compatible_handshake",
+            "unavailable_without_versioned_specification"
+          ]
+        },
+        "implementation_gate_beads": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/beadId" }
+        },
+        "counts_as_implemented": { "const": false }
+      }
+    }
+  }
+}
