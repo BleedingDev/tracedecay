@@ -7,6 +7,7 @@ on:
     paths:
       - .beads/operations/pending/**
       - .beads/apply_operation.py
+      - .beads/policy.yaml
       - .github/workflows/apply-beads-operation.yml
   workflow_dispatch:
 
