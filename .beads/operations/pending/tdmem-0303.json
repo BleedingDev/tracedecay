@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 3,
+  "attempt": 4,
   "issue_id": "tdmem-0303",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Closing the Native adapter crate only after it compiles inside the root workspace, depends solely on the provider API, validates the stable Native identity, routes mandatory and declared optional operations without payload or scope transformation, delegates authoritative terminals to a mockable application port, and leaves Native persistence entirely outside the crate.",
-  "retry_note": "The first retry removed the stale Cargo.lock convergence assumption. The materializer now also filters every prepared path against the actual working-tree diff, so unchanged generated workspace files cannot create a false commit while all runtime and architecture gates remain unchanged.",
+  "retry_note": "The previous retry referenced the wrong historical materializer commit. This attempt loads the exact reviewed body from ff27866d1e69958908437b0cda3f93491bec12ed, applies only the unchanged-lockfile guard, filters prepared paths against the real working-tree diff, and leaves every runtime and architecture gate unchanged.",
   "checks": [
     {
       "name": "workspace resolves with the Native adapter",
