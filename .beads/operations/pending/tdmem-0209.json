@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 4,
+  "attempt": 5,
   "issue_id": "tdmem-0209",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Closing M1 implementability only after a standalone deterministic Rust provider passes mandatory health/observe/recall conformance, duplicate/conflict semantics, real cancellation/deadline preflight, exact scope, deterministic snapshot/restart, explicit unsupported lifecycle calls, strict linting, and product-owned evidence validation.",
-  "retry_note": "Attempt 3 was triggered by the pending-operation update before the terminal-code preparer fix landed and therefore repeated the already-understood compile failure. This attempt runs from the fixed preparer: provider identity mismatch is represented by the accepted invalid_request terminal code, with the dedicated mismatch journey still proving fail-closed zero-effect behavior.",
+  "retry_note": "Attempt 4 passed evidence validation and reached strict Clippy, which correctly rejected one nested snapshot-identity branch under deny(warnings). The restore path now uses an equivalent let-chain, preserving no-overwrite and idempotent-restore semantics while satisfying the pinned Rust 1.97.1 lint set.",
   "checks": [
     {
       "name": "dummy-provider evidence mutation tests",
