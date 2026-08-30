@@ -6535,6 +6535,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracedecay-memory-provider-ncm"
+version = "0.1.0-beta.37"
+dependencies = [
+ "sha2 0.11.0",
+ "tracedecay-memory-provider-api",
+]
+
+[[package]]
 name = "tracedecay-policy"
 version = "0.1.0"
 dependencies = [
