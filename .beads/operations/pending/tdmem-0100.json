@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0100",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Closing M0 only after revalidating immutable upstream provenance, the clean V2 receipt, the complete Native seam map, the single-writer authority matrix, the patch-footprint guard, the foundational ADR set, and the accepted provider-seam GO decision.",
+  "checks": [
+    {
+      "name": "immutable upstream floor ancestry journey",
+      "argv": [
+        "python3",
+        "scripts/check-product-upstream-floor.py",
+        "--repo",
+        ".",
+        "--metadata",
+        "product/upstream/tracedecay-v2-pr707.json",
+        "--require-product-branch"
+      ],
+      "timeout_seconds": 120
+    },
+    {
+      "name": "published clean V2 baseline receipt validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-v2-baseline.py",
+        "--repo",
+        ".",
+        "--receipt",
+        "product/baseline/tracedecay-v2-pr707-linux.json"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "Native memory surface-map repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-native-memory-surface-map.py",
+        "--repo",
+        ".",
+        "--map",
+        "product/architecture/native-memory-surface-map.json"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "coding-memory authority-matrix repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-coding-memory-authority-matrix.py",
+        "--repo",
+        ".",
+        "--matrix",
+        "product/architecture/coding-memory-authority-matrix.json"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "patch-footprint repository and dependency validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "foundational ADR repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-foundational-adrs.py",
+        "--repo",
+        ".",
+        "--manifest",
+        "product/architecture/adr/manifest.json",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "accepted M0 GO decision validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-m0-go-no-go.py",
+        "--repo",
+        ".",
+        "--decision",
+        "product/architecture/m0-go-no-go.json",
+        "--report",
+        "product/architecture/m0-go-no-go.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "acceptance_criteria": [
+    "The exact upstream SHA, PR metadata, toolchain, and generated-contract state are recorded.",
+    "The supported build/test baseline is reproducible from a clean checkout.",
+    "Write, recall, feedback, maintenance, inspection, and host-injection seams are mapped to concrete crates and composition roots.",
+    "A signed-off go/no-go report confirms a viable provider boundary without replacing TraceDecay authorities."
+  ],
+  "close_reason": "Completed M0 with immutable upstream provenance, a successful reproducible V2 baseline, complete Native memory and authority maps, enforced convergence limits, accepted ADRs, and a machine-checked GO decision.",
+  "close_comment": "Evidence: product/upstream/tracedecay-v2-pr707.json pins PR #707 floor 08fbe33a7c7f403191fd5d6e356c7b6681b96403 and the ancestry verifier proves it is in the product branch. product/baseline/tracedecay-v2-pr707-linux.json records the clean build plus focused memory, retrieval, host, daemon, dashboard, generated-drift, and working-tree lanes. product/architecture/native-memory-surface-map.json maps all production writes, recall/read, feedback, maintenance, inspection, host-injection, hooks, automation, CLI, MCP, SDK, dashboard, canonical stores, and derived projections. product/architecture/coding-memory-authority-matrix.json preserves one canonical writer per state, Native accepted-fact authority, exact repository/worktree/branch/session/provider namespaces, advisory provider recall, and TraceDecay-owned final context. product/upstream/patch-footprint-policy.json and convergence-map.json enforce narrow additive mounts and currently report zero existing Zack-owned file edits. product/architecture/adr/manifest.json binds eight foundational decisions. product/architecture/m0-go-no-go.json records the accepted GO verdict, concrete insertion points, bounded first slice, residual risks, hard gates, kill conditions, deferred NCM/OCEAN decisions, and dependency-aware implementation order beginning at tdmem-0201."
+}
