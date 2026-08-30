@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 3,
+  "attempt": 4,
   "issue_id": "tdmem-0209",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Closing M1 implementability only after a standalone deterministic Rust provider passes mandatory health/observe/recall conformance, duplicate/conflict semantics, real cancellation/deadline preflight, exact scope, deterministic snapshot/restart, explicit unsupported lifecycle calls, strict linting, and product-owned evidence validation.",
-  "retry_note": "The second run reached strict Rust compilation and exposed one genuine adapter bug: provider identity mismatch was incorrectly modeled as a non-existent terminal-code variant. The accepted terminal contract has no provider_id_mismatch terminal code, so the dummy handshake now fails closed with invalid_request while retaining the dedicated provider_identity_mismatch conformance journey and zero-effect assertions.",
+  "retry_note": "Attempt 3 was triggered by the pending-operation update before the terminal-code preparer fix landed and therefore repeated the already-understood compile failure. This attempt runs from the fixed preparer: provider identity mismatch is represented by the accepted invalid_request terminal code, with the dedicated mismatch journey still proving fail-closed zero-effect behavior.",
   "checks": [
     {
       "name": "dummy-provider evidence mutation tests",
