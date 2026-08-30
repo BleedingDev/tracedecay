@@ -1,0 +1,267 @@
+{
+  "schema_version": 1,
+  "bead_id": "tdmem-0107",
+  "title": "M0 go/no-go decision for pluggable cognitive memory providers",
+  "date": "2026-08-30",
+  "verdict": "go",
+  "decision": "Proceed with a capability-based provider boundary above existing TraceDecay Native application ports. Do not replace TraceDecay authorities, Native fact-store contracts, repository/worktree identity, session evidence, host integration, or final context ownership.",
+  "next_executable_bead": "tdmem-0201",
+  "conditions": {
+    "provider_boundary_viable_without_authority_replacement": true,
+    "native_explicit_fact_authority_preserved": true,
+    "current_code_truth_remains_tracedecay_owned": true,
+    "repository_worktree_branch_session_scope_remains_tracedecay_owned": true,
+    "provider_recall_is_advisory": true,
+    "final_context_compilation_remains_tracedecay_owned": true,
+    "observer_mode_is_mechanically_non_influential": true,
+    "provider_writes_are_idempotent_and_crash_recoverable": true,
+    "upstream_patch_budget_is_locked": true,
+    "ncm_execution_topology_is_deferred": true,
+    "ocean_implementation_is_deferred_until_a_versioned_specification": true
+  },
+  "evidence": [
+    {
+      "id": "upstream_floor",
+      "path": "product/upstream/pr707-floor.json",
+      "status": "accepted",
+      "finding": "The product branch descends from immutable PR #707 floor 08fbe33a7c7f403191fd5d6e356c7b6681b96403."
+    },
+    {
+      "id": "clean_baseline",
+      "path": "product/baseline/tracedecay-v2-pr707-linux.json",
+      "status": "passed",
+      "finding": "GitHub Actions run 33299093667 completed the clean V2 build plus focused memory, retrieval, host, daemon, dashboard, generated-drift, and working-tree checks; receipt commit b391cd32ba51e5a8ad584740073554476bca5d8c records the run."
+    },
+    {
+      "id": "native_memory_surface",
+      "path": "product/architecture/native-memory-surface-map.json",
+      "status": "complete",
+      "finding": "Production write, read/recall, feedback, maintenance, inspection, host-injection, CLI, MCP, SDK, dashboard, hooks, automation, store, and test paths are mapped to concrete owners and seams."
+    },
+    {
+      "id": "authority_matrix",
+      "path": "product/architecture/coding-memory-authority-matrix.json",
+      "status": "accepted",
+      "finding": "Every durable domain has one canonical writer; provider state and recall remain separate advisory authorities."
+    },
+    {
+      "id": "patch_footprint",
+      "path": "product/upstream/patch-footprint-policy.json",
+      "status": "enforced",
+      "finding": "Additive product-owned work is preferred; existing upstream-file edits have hard quantitative caps, allowed mounts, forbidden zones, and convergence-map requirements."
+    },
+    {
+      "id": "convergence_map",
+      "path": "product/upstream/convergence-map.json",
+      "status": "clean",
+      "finding": "At the M0 decision point no Zack-owned existing production or test file is intentionally modified by product implementation."
+    },
+    {
+      "id": "foundational_adrs",
+      "path": "product/architecture/adr/manifest.json",
+      "status": "accepted",
+      "finding": "Eight binding decisions cover provider boundaries, authority, crate layout, execution topology gate, persistence/recovery, context compilation, observer isolation, and upstream convergence."
+    }
+  ],
+  "go_reasons": [
+    "The provider boundary can be mounted above existing application/use-case ports rather than replacing ProjectMemoryFactStore or DatabaseFactStore.",
+    "TraceDecay already exposes exact owner/scope, deadlines, cancellation, provenance, typed terminal outcomes, idempotent commands, durable receipts, and recovery seams that can constrain provider adapters.",
+    "Native behavior can first be adapted and parity-tested behind the same provider-neutral contract before NCM influences any agent context.",
+    "Observer delivery can be isolated after canonical settlement through a bounded durable outbox, so provider failure need not affect product behavior.",
+    "The patch-footprint policy permits narrow composition/application mounts while keeping product crates additive and independently removable."
+  ],
+  "residual_risks": [
+    {
+      "id": "contract_semantic_leakage",
+      "severity": "high",
+      "risk": "Native fact-store semantics could leak into the provider API and exclude cognitive providers.",
+      "mitigation": "Define capability-oriented contracts and prove them with dummy-provider conformance before concrete adapters.",
+      "blocking_beads": ["tdmem-0201", "tdmem-0209", "tdmem-0306"]
+    },
+    {
+      "id": "native_parity_drift",
+      "severity": "critical",
+      "risk": "Routing Native through the new boundary could change outputs, receipts, errors, or recovery behavior.",
+      "mitigation": "Keep the direct path as the oracle and require golden parity before default cutover.",
+      "blocking_beads": ["tdmem-0401", "tdmem-0402", "tdmem-0403", "tdmem-0404"]
+    },
+    {
+      "id": "partial_provider_effects",
+      "severity": "critical",
+      "risk": "Crashes around provider commit/acknowledgement could duplicate or lose observations.",
+      "mitigation": "Use stable idempotency, durable bounded journal state, typed partial effects, receipts, replay, and crash injection.",
+      "blocking_beads": ["tdmem-0203", "tdmem-0206", "tdmem-0502", "tdmem-0503", "tdmem-0506"]
+    },
+    {
+      "id": "unsafe_recall_admission",
+      "severity": "critical",
+      "risk": "Stale, cross-worktree, revoked, sensitive, or injection-like provider content could enter an agent context.",
+      "mitigation": "Keep TraceDecay-owned exact-scope admission, temporal/revocation checks, deterministic budgets, evidence formatting, and explain traces.",
+      "blocking_beads": ["tdmem-0204", "tdmem-0603", "tdmem-0604", "tdmem-0608", "tdmem-0609"]
+    },
+    {
+      "id": "observer_influence",
+      "severity": "critical",
+      "risk": "Observer output, latency, or failures could accidentally alter prompts or canonical outcomes.",
+      "mitigation": "Use a result-unreachable observer route and compare output/state hashes across healthy and failing observers.",
+      "blocking_beads": ["tdmem-0305", "tdmem-0505", "tdmem-0703", "tdmem-0903"]
+    },
+    {
+      "id": "ncm_surface_and_topology_unknown",
+      "severity": "high",
+      "risk": "The licensed NCM implementation may not support the assumed API, lifecycle, persistence, or deployment topology.",
+      "mitigation": "Audit the licensed surface first and select topology only through the explicit decision-gate ADR.",
+      "blocking_beads": ["tdmem-0701", "tdmem-0702"]
+    },
+    {
+      "id": "upstream_convergence_cost",
+      "severity": "high",
+      "risk": "Provider mounts could make future PR #707 successor syncs conflict-heavy or semantically unsafe.",
+      "mitigation": "Enforce additive ownership, convergence entries, hard caps, isolated sync trains, conflict receipts, and parity gates.",
+      "blocking_beads": ["tdmem-0308", "tdmem-1203", "tdmem-1205", "tdmem-1206", "tdmem-1208"]
+    }
+  ],
+  "deferred_decisions": [
+    {
+      "id": "ncm_execution_topology",
+      "state": "deferred",
+      "reason": "The licensed surface has not yet been audited.",
+      "decision_gate": ["tdmem-0701", "tdmem-0702"]
+    },
+    {
+      "id": "ocean_implementation",
+      "state": "deferred",
+      "reason": "No versioned OCEAN provider specification is available; only a provider slot is reserved.",
+      "decision_gate": []
+    },
+    {
+      "id": "active_multi_provider_blending",
+      "state": "not_authorized",
+      "reason": "Initial delivery selects one explicit active provider; cross-provider blending requires separate authority, scoring, and failure-policy evidence.",
+      "decision_gate": []
+    }
+  ],
+  "implementation_order": [
+    {
+      "order": 1,
+      "milestone": "M1",
+      "name": "Provider-neutral contracts and conformance model",
+      "entry_bead": "tdmem-0201",
+      "exit_bead": "tdmem-0209",
+      "required_before_next": ["tdmem-0201", "tdmem-0202", "tdmem-0203", "tdmem-0204", "tdmem-0205", "tdmem-0206", "tdmem-0209"]
+    },
+    {
+      "order": 2,
+      "milestone": "M2",
+      "name": "Product-owned crate skeletons, dependency guards, and composition mount",
+      "entry_bead": "tdmem-0301",
+      "exit_bead": "tdmem-0308",
+      "required_before_next": ["tdmem-0301", "tdmem-0303", "tdmem-0304", "tdmem-0305", "tdmem-0306", "tdmem-0307", "tdmem-0308"]
+    },
+    {
+      "order": 3,
+      "milestone": "M3",
+      "name": "TraceDecay Native adapter and parity",
+      "entry_bead": "tdmem-0401",
+      "exit_bead": "tdmem-0404",
+      "required_before_next": ["tdmem-0401", "tdmem-0402", "tdmem-0403", "tdmem-0404"]
+    },
+    {
+      "order": 4,
+      "milestone": "M4",
+      "name": "Durable observation dispatch and provider lifecycle",
+      "entry_bead": "tdmem-0502",
+      "exit_bead": "tdmem-0506",
+      "required_before_next": ["tdmem-0502", "tdmem-0503", "tdmem-0504", "tdmem-0505", "tdmem-0506"]
+    },
+    {
+      "order": 5,
+      "milestone": "M5",
+      "name": "Provider recall admission and TraceDecay-owned context compiler",
+      "entry_bead": "tdmem-0601",
+      "exit_bead": "tdmem-0609",
+      "required_before_next": ["tdmem-0601", "tdmem-0602", "tdmem-0603", "tdmem-0604", "tdmem-0608", "tdmem-0609"]
+    },
+    {
+      "order": 6,
+      "milestone": "M6",
+      "name": "Licensed NCM audit, topology decision, observer integration, then guarded active mode",
+      "entry_bead": "tdmem-0701",
+      "exit_bead": "tdmem-0706",
+      "required_before_next": ["tdmem-0701", "tdmem-0702", "tdmem-0703", "tdmem-0706"]
+    },
+    {
+      "order": 7,
+      "milestone": "M7",
+      "name": "Feedback, correction, promotion, maintenance, and inspection workflows",
+      "entry_bead": "tdmem-0807",
+      "exit_bead": "tdmem-0807",
+      "required_before_next": ["tdmem-0807"]
+    },
+    {
+      "order": 8,
+      "milestone": "M8",
+      "name": "Safety, conformance, evaluation, and observer-isolation gates",
+      "entry_bead": "tdmem-0903",
+      "exit_bead": "tdmem-0903",
+      "required_before_next": ["tdmem-0903"]
+    },
+    {
+      "order": 9,
+      "milestone": "M9-M10",
+      "name": "SDK, host integrations, packaging, and coding-agent journeys",
+      "entry_bead": "tdmem-1001",
+      "exit_bead": "tdmem-1101",
+      "required_before_next": ["tdmem-1001", "tdmem-1101"]
+    },
+    {
+      "order": 10,
+      "milestone": "M11",
+      "name": "Repeatable upstream convergence train",
+      "entry_bead": "tdmem-1201",
+      "exit_bead": "tdmem-1208",
+      "required_before_next": ["tdmem-1201", "tdmem-1202", "tdmem-1203", "tdmem-1204", "tdmem-1205", "tdmem-1206", "tdmem-1208"]
+    }
+  ],
+  "hard_gates": [
+    {
+      "id": "no_contract_bypass",
+      "rule": "No concrete provider implementation or public provider surface before M1 contracts and conformance model are accepted."
+    },
+    {
+      "id": "no_native_cutover_without_parity",
+      "rule": "Native remains on the direct path until exact parity evidence and rollback are accepted."
+    },
+    {
+      "id": "no_ncm_transport_before_audit",
+      "rule": "No production NCM transport code before tdmem-0701 and tdmem-0702."
+    },
+    {
+      "id": "no_observer_influence",
+      "rule": "Observer mode cannot affect prompts, canonical state, tools, approvals, or external actions."
+    },
+    {
+      "id": "no_active_mode_before_safety_gates",
+      "rule": "Active NCM mode requires scope, stale-memory, crash-recovery, provider-failure, privacy, and observer-isolation evidence."
+    },
+    {
+      "id": "no_unmapped_upstream_edits",
+      "rule": "Every existing upstream-owned file edit requires a current convergence-map entry and must remain within hard patch caps."
+    }
+  ],
+  "no_go_triggers": [
+    "A provider requires canonical ownership of current code, exact scope identity, sessions, accepted Native facts, curated rules, or final context.",
+    "The provider boundary requires direct ProjectMemoryFactStore implementation or shared Native fact tables.",
+    "Deadline, cancellation, provenance, exact scope, idempotency, typed terminal outcomes, bounded queues, or recovery cannot reach the concrete provider path.",
+    "Observer execution can affect a product-visible output or canonical operation result.",
+    "Native parity cannot be proved or rolled back.",
+    "NCM licensing or audited surface does not permit a compliant bounded adapter.",
+    "Required implementation exceeds the upstream patch budget without an accepted exception ADR."
+  ],
+  "sign_off": {
+    "decision_owner": "product-planning",
+    "evidence_owner": "assistant",
+    "state": "ready_for_m1_after_tdmemory_0106_is_closed",
+    "first_action": "Implement tdmem-0201 and commit provider identity/capability registry contracts before any concrete provider adapter."
+  }
+}
