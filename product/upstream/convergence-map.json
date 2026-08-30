@@ -3,7 +3,8 @@
   "entries": [
     {
       "bead_ids": [
-        "tdmem-0301"
+        "tdmem-0301",
+        "tdmem-0302"
       ],
       "generated": {
         "generator_path": "rust-toolchain.toml",
@@ -23,12 +24,15 @@
       "touch_point": "workspace_wiring",
       "verification": [
         "cargo metadata --locked --format-version 1 --no-deps",
-        "git diff --check"
+        "git diff --check",
+        "cargo clippy -p tracedecay-memory-fabric --all-targets --locked -- -D warnings",
+        "cargo test -p tracedecay-memory-fabric --locked"
       ]
     },
     {
       "bead_ids": [
-        "tdmem-0301"
+        "tdmem-0301",
+        "tdmem-0302"
       ],
       "line_budget": 80,
       "path": "Cargo.toml",
@@ -44,7 +48,9 @@
       "verification": [
         "cargo metadata --locked --format-version 1 --no-deps",
         "cargo clippy -p tracedecay-memory-provider-api --all-targets --locked -- -D warnings",
-        "cargo test -p tracedecay-memory-provider-api --locked"
+        "cargo test -p tracedecay-memory-provider-api --locked",
+        "cargo clippy -p tracedecay-memory-fabric --all-targets --locked -- -D warnings",
+        "cargo test -p tracedecay-memory-fabric --locked"
       ]
     }
   ],
@@ -77,8 +83,8 @@
   "snapshot": {
     "composition_root_files": 0,
     "exception_zone_files": 0,
-    "observed_state": "The product branch changes only additive root workspace membership and its generated path-package lock entry; provider implementation remains additive.",
-    "total_upstream_changed_lines": 5,
+    "observed_state": "The product branch changes only additive root workspace membership and generated path-package lock entries; provider API and fabric remain product-owned.",
+    "total_upstream_changed_lines": 13,
     "upstream_existing_production_files": 2,
     "upstream_existing_test_or_fixture_files": 0
   },
