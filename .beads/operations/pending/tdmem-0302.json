@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0302",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Creating a bounded capability-driven fabric over the provider API with exact registration revisions, no provider-name routing, finite concurrency, real deadline/cancellation preflight, and a structurally isolated observer result path.",
+  "checks": [
+    {
+      "name": "memory fabric workspace metadata",
+      "argv": ["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "memory fabric formatting",
+      "argv": ["cargo", "fmt", "--package", "tracedecay-memory-fabric", "--", "--check"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "memory fabric strict Clippy",
+      "argv": ["cargo", "clippy", "--package", "tracedecay-memory-fabric", "--all-targets", "--locked", "--", "-D", "warnings"],
+      "timeout_seconds": 900
+    },
+    {
+      "name": "memory fabric tests",
+      "argv": ["cargo", "test", "--package", "tracedecay-memory-fabric", "--locked"],
+      "timeout_seconds": 900
+    },
+    {
+      "name": "provider API remains strict",
+      "argv": ["cargo", "clippy", "--package", "tracedecay-memory-provider-api", "--all-targets", "--locked", "--", "-D", "warnings"],
+      "timeout_seconds": 900
+    },
+    {
+      "name": "canonical M1 generated Rust remains unchanged",
+      "argv": ["python3", "scripts/product/generate-memory-provider-rust.py", "--repo", ".", "--check"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "upstream patch footprint and dependency directions",
+      "argv": ["python3", "scripts/product/check-patch-footprint-policy.py", "--repo", ".", "--policy", "product/upstream/patch-footprint-policy.json", "--map", "product/upstream/convergence-map.json"],
+      "timeout_seconds": 240
+    },
+    {
+      "name": "fabric dependency graph is provider-neutral",
+      "argv": [
+        "python3",
+        "-c",
+        "import json,subprocess; data=json.loads(subprocess.check_output(['cargo','metadata','--locked','--format-version','1','--no-deps'], text=True)); pkg=next(p for p in data['packages'] if p['name']=='tracedecay-memory-fabric'); deps={d['name'] for d in pkg['dependencies']}; assert deps=={'tracedecay-memory-provider-api'}, deps"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "fabric source contains no concrete provider routing",
+      "argv": [
+        "python3",
+        "-c",
+        "from pathlib import Path; text=Path('crates/tracedecay-memory-fabric/src/lib.rs').read_text().lower(); forbidden=['provider_id.as_str() ==','match provider_id.as_str()','\"ncm\"','\"ocean\"','\"tracedecay.native\"','tracedecay_store','tracedecay_runtime_core','code_index']; bad=[v for v in forbidden if v in text]; assert not bad,bad"
+      ],
+      "timeout_seconds": 60
+    }
+  ],
+  "acceptance_criteria": [
+    "The tracedecay-memory-fabric crate compiles independently and depends only on tracedecay-memory-provider-api, with no TraceDecay database, code-index, root-daemon, transport, or concrete-provider dependency.",
+    "Registration, selection, and routing are driven by stable provider identity, exact registration revision, declared capabilities, explicit Disabled/Observer/Active modes, and typed fail-closed errors; no provider-name conditional or fallback exists.",
+    "Every call is admitted through finite registry and concurrency limits plus live deadline/cancellation preflight, and no queue, background task, global singleton, or unbounded async work is introduced.",
+    "Observer delivery accepts only observation.accept.v1 and returns a structurally isolated receipt with no result payload or extension channel into product context, while observer recall is rejected before provider contact."
+  ],
+  "close_reason": "Added the independently compiling capability-driven memory fabric with bounded registration/concurrency, exact revision/capability routing, typed request preflight, active/observer separation, and no provider-specific or TraceDecay-internal coupling.",
+  "close_comment": "Evidence: crates/tracedecay-memory-fabric depends only on tracedecay-memory-provider-api and implements finite FabricConfig, typed FabricError, stable registration state, deterministic provider status, lock-free bounded call permits, exact revision and capability checks, cancellation/deadline preflight, compatible handshake validation, active invocation, and observation-only delivery. ObserverReceipt intentionally strips provider payloads/extensions so observer values are unreachable from context by type. No worker, queue, transport, persistence, DB/code-index/daemon/host dependency, global singleton, provider-name conditional, or fallback exists. Strict Rust tests cover bounded/duplicate/mismatched registration, capability-driven active calls, missing optional capability, structural observer isolation, disabled/revision failures before provider contact, cancellation/deadline non-contact, deterministic ordering, and finite concurrent permits. Workspace/lock wiring is generated and convergence-mapped; product ownership policy and checker recognize the additive fabric crate. Metadata, fmt, Clippy -D warnings, tests, provider API regression, M1 binding drift, patch budget, dependency graph, and concrete-provider scanner all pass."
+}
