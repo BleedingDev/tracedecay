@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Retry tdmem-0301 without treating an unchanged Cargo.lock as prepared output."""
+"""Retry tdmem-0301 with canonical formatting and an unchanged lockfile."""
 
 from __future__ import annotations
 
@@ -19,6 +19,32 @@ source = subprocess.check_output(
 )
 BODY.write_text(source, encoding="utf-8")
 subprocess.run(["python3", str(BODY)], cwd=ROOT, check=True)
+
+api_test = ROOT / "crates/tracedecay-memory-provider-api/tests/api.rs"
+test_text = api_test.read_text(encoding="utf-8")
+old = '''    assert_eq!(
+        ProviderCall::new(missing_capability),
+        Err(ApiError::MissingOperationCapability("recall.query.v1"))
+    );
+'''
+new = '''    assert!(matches!(
+        ProviderCall::new(missing_capability),
+        Err(ApiError::MissingOperationCapability("recall.query.v1"))
+    ));
+'''
+if old not in test_text:
+    raise SystemExit("provider API assertion patch marker is missing")
+api_test.write_text(test_text.replace(old, new, 1), encoding="utf-8")
+subprocess.run(
+    [
+        "cargo",
+        "fmt",
+        "--package",
+        "tracedecay-memory-provider-api",
+    ],
+    cwd=ROOT,
+    check=True,
+)
 
 manifest_path = ROOT / ".beads/operations/prepared-files.json"
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
