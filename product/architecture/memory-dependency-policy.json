@@ -58,6 +58,20 @@
         "tracedecay-memory-provider-api"
       ],
       "reason": "Conformance remains provider-neutral and dashboard-independent."
+    },
+    {
+      "package": "tracedecay-memory-provider-registry",
+      "allowed_direct_dependencies": [
+        "tracedecay-memory-fabric",
+        "tracedecay-memory-provider-api",
+        "tracedecay-memory-provider-native"
+      ],
+      "required_direct_dependencies": [
+        "tracedecay-memory-fabric",
+        "tracedecay-memory-provider-api",
+        "tracedecay-memory-provider-native"
+      ],
+      "reason": "The default-off composition registry is the one product-owned crate allowed to construct the Native adapter behind the provider-neutral fabric."
     }
   ],
   "rules": [
@@ -128,6 +142,23 @@
         "tracedecay-memory-provider-api"
       ],
       "reason": "The same harness must run every provider without importing a concrete adapter or product surface."
+    },
+    {
+      "id": "composition-registry-is-narrow",
+      "from_packages": [
+        "tracedecay-memory-provider-registry"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-*",
+        "ncm*",
+        "ocean*"
+      ],
+      "allowed_dependencies": [
+        "tracedecay-memory-fabric",
+        "tracedecay-memory-provider-api",
+        "tracedecay-memory-provider-native"
+      ],
+      "reason": "The composition registry may construct only the provider-neutral fabric and Native adapter, never stores, code indexes, hosts, transports, or the root crate."
     },
     {
       "id": "public-transports-are-adapter-blind",
