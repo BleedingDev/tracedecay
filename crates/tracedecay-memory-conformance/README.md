@@ -1,12 +1,9 @@
 # TraceDecay Memory Conformance
 
-This product-owned crate runs any `MemoryProvider` through one pinned mandatory fixture: compatible handshake, health, observation acceptance, and recall.
+Provider-neutral fixtures, mandatory conformance, scenario execution, and differential reporting for the Memory Provider V1 boundary.
 
-The fixture records the exact canonical contract-set ID and digest, fixture ID and build digest, logical provider ID, provider implementation digest, exact TraceDecay scope digest, and complete canonical calls. A run is rejected when any identity or mandatory capability differs.
+The crate depends only on `tracedecay-memory-provider-api`; it does not depend on the dashboard, host, fabric, Native adapter, NCM adapter, stores, or code index.
 
-Two output surfaces are intentionally separate:
+A `FixtureIdentity` pins the exact versioned contract identity, contract-set digest, logical provider identity, provider build identity, and implementation digest. `ConformanceHarness` runs descriptor identity, mandatory capabilities, handshake, health, observation acceptance, and recall against any `MemoryProvider`. `ScenarioRunner` records typed terminal outcomes and payload digests without requiring provider-internal state equivalence. `DifferentialReport` compares those neutral results.
 
-- `ProductConformanceReport` retains validated canonical replies for explicit evaluation and differential comparison.
-- `ObserverConformanceReport` contains only provider/fixture identities and terminal receipts. It has no payload, warning, extension, receipt, namespace, or accepted-scope field, so observer output cannot become agent context accidentally.
-
-The crate depends only on `tracedecay-memory-provider-api`. It contains no provider implementation, transport, database, code index, dashboard, daemon, host adapter, or execution-topology choice.
+`ObserverConformanceResult` can retain only a `ProductOutputDigest` and an isolated conformance report. It has no product-output bytes, prompt mutation surface, or active-provider replacement path.
