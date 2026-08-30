@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "manifest_id": "tracedecay.memory.provider.dummy-conformance.v1",
+  "bead_id": "tdmem-0209",
+  "status": "accepted_candidate",
+  "provider_id": "test.dummy",
+  "provider_protocol": "1.0",
+  "implementation": {
+    "package_name": "tracedecay-memory-dummy-provider",
+    "package_version": "0.0.0",
+    "edition": "2024",
+    "minimum_rust_version": "1.85",
+    "publish": false,
+    "license": "MIT",
+    "state_schema_version": "dummy.state.v1",
+    "execution_topology": "in_process_test_crate",
+    "transport": "direct_rust_api_for_conformance_only"
+  },
+  "contract_authorities": {
+    "contract_set": "product/contracts/memory-provider-v1/contract-set.json",
+    "golden_manifest": "product/contracts/memory-provider-v1/goldens/manifest.json",
+    "generated_rust_manifest": "product/contracts/memory-provider-v1/generated/rust/manifest.json",
+    "generated_rust_source": "product/contracts/memory-provider-v1/generated/rust/memory_provider_v1.rs"
+  },
+  "capabilities": {
+    "mandatory": [
+      "provider.health.v1",
+      "observation.accept.v1",
+      "recall.query.v1"
+    ],
+    "implemented_optional": [
+      "snapshot.export.v1",
+      "snapshot.restore.v1"
+    ],
+    "explicitly_unsupported_optional": [
+      "feedback.record.v1",
+      "maintenance.run.v1",
+      "inspection.read.v1",
+      "correction.apply.v1",
+      "deletion.by_source.v1",
+      "replay.apply.v1",
+      "facts.explicit.v1",
+      "explain.trace.v1",
+      "recall.temporal.v1",
+      "activation.associative.v1",
+      "state.deterministic-replay.v1",
+      "observation.experience.v1"
+    ],
+    "provider_name_implies_capability": false,
+    "unsupported_outcome": "capability_unsupported",
+    "silent_fallback": false
+  },
+  "state_model": {
+    "authority": "provider_local_only",
+    "representation": "BTreeMap_idempotency_key_to_canonical_observation",
+    "source_sequence_monotonic": true,
+    "state_generation_monotonic": true,
+    "duplicate_same_key_same_fingerprint": "duplicate_acknowledged_without_new_effect",
+    "duplicate_same_key_different_fingerprint": "conflict_without_new_effect",
+    "snapshot_encoding": "canonical_length_prefixed_binary_v1",
+    "snapshot_digest": "sha256",
+    "snapshot_deterministic": true,
+    "restore_idempotent": true,
+    "implicit_reset": false,
+    "implicit_overwrite": false
+  },
+  "authority_and_isolation": {
+    "exact_scope_required": true,
+    "provider_may_widen_scope": false,
+    "provider_may_mutate_tracedecay_authority": false,
+    "provider_may_inject_context": false,
+    "provider_may_trigger_tools_or_external_actions": false,
+    "provider_may_change_native_trust": false,
+    "provider_may_access_tracedecay_database": false,
+    "provider_may_access_code_index": false,
+    "unknown_optional_extensions_are_inert": true,
+    "unknown_required_extensions_fail_before_effect": true
+  },
+  "request_control": {
+    "already_cancelled_outcome": "cancelled_without_effect",
+    "expired_deadline_outcome": "deadline_exceeded_without_effect",
+    "cancellation_distinct_from_timeout": true,
+    "health_read_only": true,
+    "recall_read_only": true,
+    "snapshot_export_read_only": true
+  },
+  "dependencies": {
+    "allowed_direct": [
+      "sha2"
+    ],
+    "forbidden_prefixes": [
+      "tracedecay",
+      "ncm",
+      "ocean"
+    ],
+    "path_dependencies_allowed": false,
+    "workspace_dependencies_allowed": false
+  },
+  "source_paths": [
+    "product/conformance/dummy-provider/Cargo.toml",
+    "product/conformance/dummy-provider/src/lib.rs",
+    "product/conformance/dummy-provider/tests/conformance.rs",
+    "product/conformance/dummy-provider/README.md"
+  ],
+  "required_test_cases": [
+    "compatible_handshake_is_read_only",
+    "provider_identity_mismatch_fails_closed",
+    "health_reports_real_capabilities_without_mutation",
+    "cancelled_call_stops_before_effect",
+    "expired_deadline_stops_before_effect",
+    "scope_mismatch_fails_closed",
+    "observation_applies_once",
+    "duplicate_observation_is_idempotent",
+    "same_key_different_observation_conflicts",
+    "source_sequence_gap_conflicts",
+    "stale_state_generation_fails",
+    "required_unknown_extension_is_unsupported",
+    "optional_unknown_extension_round_trips_inertly",
+    "recall_is_deterministic_and_advisory",
+    "zero_results_is_typed_success",
+    "snapshot_bytes_are_deterministic",
+    "restart_restore_preserves_recall",
+    "identical_restore_is_no_effect",
+    "nonempty_different_restore_conflicts",
+    "corrupt_snapshot_fails_closed",
+    "cross_scope_snapshot_is_incompatible",
+    "unsupported_feedback_is_explicit",
+    "unsupported_maintenance_is_explicit"
+  ],
+  "verification": {
+    "checker": "scripts/product/check-dummy-provider-conformance.py",
+    "python_tests": "tests/product_dummy_provider_conformance_test.py",
+    "rust_tests": "product/conformance/dummy-provider/tests/conformance.rs",
+    "commands": [
+      "cargo fmt --manifest-path product/conformance/dummy-provider/Cargo.toml --all -- --check",
+      "cargo clippy --manifest-path product/conformance/dummy-provider/Cargo.toml --all-targets --locked -- -D warnings",
+      "cargo test --manifest-path product/conformance/dummy-provider/Cargo.toml --locked",
+      "python3 scripts/product/check-dummy-provider-conformance.py --repo ."
+    ]
+  }
+}
