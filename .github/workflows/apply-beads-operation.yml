@@ -52,6 +52,84 @@ jobs:
           echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
           "${HOME}/.local/bin/br" --version
 
+      - name: Materialize and commit prepared product files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t pending_paths < <(
+            find .beads/operations/pending -maxdepth 1 -type f -name '*.json' -print 2>/dev/null \
+              | sort
+          )
+          if [[ ${#pending_paths[@]} -ne 1 ]]; then
+            printf 'expected exactly one pending operation, found %s\n' "${#pending_paths[@]}" >&2
+            printf '%s\n' "${pending_paths[@]}" >&2
+            exit 1
+          fi
+          issue_id="$(python3 - "${pending_paths[0]}" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          issue_id = value.get("issue_id")
+          if not isinstance(issue_id, str) or not issue_id:
+              raise SystemExit("pending operation has no issue_id")
+          print(issue_id)
+          PY
+          )"
+          prepare_script=".beads/operations/prepare/${issue_id}.py"
+          if [[ ! -f "$prepare_script" ]]; then
+            echo "no prepared product files for ${issue_id}"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python3 "$prepare_script"
+          manifest='.beads/operations/prepared-files.json'
+          test -f "$manifest"
+
+          python3 - "$manifest" "$prepare_script" "$issue_id" <<'PY'
+          import json
+          import pathlib
+          import subprocess
+          import sys
+
+          manifest_path = pathlib.Path(sys.argv[1])
+          prepare_script = pathlib.Path(sys.argv[2])
+          issue_id = sys.argv[3]
+          rows = json.loads(manifest_path.read_text(encoding="utf-8"))
+          if not isinstance(rows, list) or not rows:
+              raise SystemExit("prepared file manifest must contain at least one entry")
+
+          seen: set[str] = set()
+          for index, row in enumerate(rows):
+              if not isinstance(row, dict) or set(row) != {"path", "message"}:
+                  raise SystemExit(f"invalid prepared file manifest entry {index}")
+              path = row["path"]
+              message = row["message"]
+              if not isinstance(path, str) or not path or path in seen:
+                  raise SystemExit(f"invalid or duplicate prepared path at entry {index}")
+              if not isinstance(message, str) or not message.strip():
+                  raise SystemExit(f"invalid commit message at entry {index}")
+              seen.add(path)
+              subprocess.run(["git", "add", "--", path], check=True)
+              if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
+                  raise SystemExit(f"prepared path produced no change: {path}")
+              subprocess.run(["git", "commit", "-m", message], check=True)
+
+          manifest_path.unlink()
+          subprocess.run(["git", "add", "-u", "--", str(prepare_script)], check=True)
+          if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
+              raise SystemExit("prepared materializer did not retire itself")
+          subprocess.run(
+              ["git", "commit", "-m", f"chore(beads): retire {issue_id} materializer"],
+              check=True,
+          )
+          if subprocess.run(["git", "status", "--porcelain"]).stdout:
+              raise SystemExit("prepared materialization left working-tree changes")
+          PY
+
       - name: Apply the single pending operation
         run: python3 .beads/apply_operation_compat.py
 
@@ -86,4 +164,21 @@ jobs:
             exit 1
           }
           git commit -m "chore(beads): apply ${issue_id} operation"
-          git push origin HEAD:feat/pluggable-memory-providers-v2
+
+          branch='feat/pluggable-memory-providers-v2'
+          for attempt in 1 2 3 4 5; do
+            if git push origin "HEAD:${branch}"; then
+              exit 0
+            fi
+            if [[ "$attempt" -eq 5 ]]; then
+              echo "failed to publish Beads operation after ${attempt} attempts" >&2
+              exit 1
+            fi
+            git fetch origin "$branch"
+            if ! git rebase "origin/${branch}"; then
+              git rebase --abort || true
+              echo 'concurrent branch changes conflict with the Beads receipt; manual review required' >&2
+              exit 1
+            fi
+            sleep "$((attempt * 2))"
+          done

@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "attempt": 2,
+  "issue_id": "tdmem-0201",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Repairing the provider capability authority so mandatory and optional behavior are explicit, every capability carries a complete operation contract, and unknown versioned capabilities round-trip as inert data instead of being activated or silently discarded.",
+  "checks": [
+    {
+      "name": "provider registry contract tests",
+      "argv": ["python3", "tests/product_provider_registry_contract_test.py"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider registry repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-registry-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-registry-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-registry-contract.schema.json",
+        "--readme",
+        "product/contracts/memory-provider-v1/README.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider handshake remains compatible",
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-handshake-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-handshake-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-handshake-contract.schema.json",
+        "--doc",
+        "product/contracts/memory-provider-v1/provider-handshake-contract.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider observation remains compatible",
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-observation-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-observation-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-observation-contract.schema.json",
+        "--doc",
+        "product/contracts/memory-provider-v1/provider-observation-contract.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "M0 GO decision remains locked",
+      "argv": [
+        "python3",
+        "scripts/product/check-m0-go-no-go.py",
+        "--repo",
+        ".",
+        "--decision",
+        "product/architecture/m0-go-no-go.json",
+        "--report",
+        "product/architecture/m0-go-no-go.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "upstream patch-footprint remains within policy",
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "acceptance_criteria": [
+    "Mandatory capabilities and optional capabilities are separated.",
+    "Each capability defines inputs, outputs, failure modes, and compatibility rules.",
+    "Unknown capabilities round-trip without accidental activation."
+  ],
+  "close_reason": "Accepted the corrected V1 provider capability registry with explicit mandatory/optional classes, complete per-capability semantics, and inert lossless handling of unknown versioned capabilities.",
+  "close_comment": "Evidence: product/contracts/memory-provider-v1/provider-registry-contract.json now makes capability_registry the authority, separates provider.health/observation/recall mandatory capabilities from twelve optional behaviors, and defines ordered inputs, outputs, typed failures, compatibility, advisory authority, and detailed contract gates for every entry. Unknown canonical capability records preserve their opaque payload byte-for-byte across decode/encode, remain excluded from requested or activated sets, and return typed capability_unsupported when explicitly required. The legacy capability_catalog is retained only as a derived ID projection so already-landed handshake and observation validators remain compatible without becoming an activation authority. The strict schema, README, repository validator, and 24 mutation tests enforce class separation, full operation semantics, duplicate/version rules, exact scope, no provider-name branching, no silent fallback, NCM/OCEAN deferral, and unknown-capability round-trip/non-activation."
+}
