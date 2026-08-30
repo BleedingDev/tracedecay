@@ -1,0 +1,459 @@
+{
+  "schema_version": 1,
+  "scenario_set_id": "tracedecay.memory.provider.golden-scenarios.v1",
+  "bead_id": "tdmem-0207",
+  "canonical_encoding": "utf8_rfc8785_json_without_bom_with_lf",
+  "fixtures": [
+    {
+      "fixture_id": "handshake.cancelled.pre-dispatch",
+      "category": "cancellation",
+      "contract_id": "tracedecay.memory.provider.handshake.v1",
+      "operation": "handshake",
+      "input": {
+        "provider_id": "tracedecay.native",
+        "request_identity": "req-handshake-cancelled",
+        "cancellation": "already_cancelled",
+        "deadline": "2026-08-30T16:00:00Z"
+      },
+      "expected": {
+        "terminal_code": "cancelled",
+        "provider_called": false,
+        "committed_effect": "none"
+      }
+    },
+    {
+      "fixture_id": "handshake.protocol.incompatible",
+      "category": "incompatibility",
+      "contract_id": "tracedecay.memory.provider.handshake.v1",
+      "operation": "handshake",
+      "input": {
+        "provider_id": "ncm",
+        "host_protocol_ranges": ["1.0-1.0"],
+        "provider_protocol_ranges": ["2.0-2.0"]
+      },
+      "expected": {
+        "terminal_code": "state_incompatible",
+        "readiness_state": "protocol_incompatible",
+        "provider_state_mutated": false
+      }
+    },
+    {
+      "fixture_id": "handshake.ready.success",
+      "category": "success",
+      "contract_id": "tracedecay.memory.provider.handshake.v1",
+      "operation": "handshake",
+      "input": {
+        "provider_id": "tracedecay.native",
+        "registration_revision": 7,
+        "protocol_ranges": ["1.0-1.0"],
+        "scope_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "required_capabilities": [
+          "provider.health.v1",
+          "observation.accept.v1",
+          "recall.query.v1"
+        ]
+      },
+      "expected": {
+        "terminal_code": "success",
+        "readiness_state": "ready",
+        "selected_protocol": "1.0",
+        "ready_receipt_required": true
+      }
+    },
+    {
+      "fixture_id": "handshake.timeout.pre-dispatch",
+      "category": "timeout",
+      "contract_id": "tracedecay.memory.provider.handshake.v1",
+      "operation": "handshake",
+      "input": {
+        "provider_id": "tracedecay.native",
+        "request_identity": "req-handshake-timeout",
+        "cancellation": "live",
+        "deadline": "2026-08-30T10:00:00Z",
+        "dispatch_time": "2026-08-30T10:00:01Z"
+      },
+      "expected": {
+        "terminal_code": "deadline_exceeded",
+        "provider_called": false,
+        "committed_effect": "none"
+      }
+    },
+    {
+      "fixture_id": "lifecycle.feedback.unsupported",
+      "category": "degradation",
+      "contract_id": "tracedecay.memory.provider.lifecycle.v1",
+      "operation": "feedback",
+      "input": {
+        "provider_id": "minimal.provider",
+        "target_kind": "recall_trace_ref",
+        "signal": "helpful",
+        "declared_capabilities": [
+          "provider.health.v1",
+          "observation.accept.v1",
+          "recall.query.v1"
+        ]
+      },
+      "expected": {
+        "terminal_code": "capability_unsupported",
+        "fallback_eligibility": "explicit_policy_only",
+        "fallback_performed": false
+      }
+    },
+    {
+      "fixture_id": "lifecycle.forget.verified-absent",
+      "category": "success",
+      "contract_id": "tracedecay.memory.provider.lifecycle.v1",
+      "operation": "deletion_by_source",
+      "input": {
+        "provider_id": "ncm",
+        "forget_source_keys": ["source:session:abc:message:7"],
+        "mode": "remove_influence",
+        "include_snapshots": true
+      },
+      "expected": {
+        "terminal_code": "success",
+        "verification_state": "verified_absent",
+        "remaining_influence_count": 0,
+        "snapshots_examined": 2,
+        "provider_recall_may_return_source": false
+      }
+    },
+    {
+      "fixture_id": "lifecycle.maintenance.cancelled",
+      "category": "cancellation",
+      "contract_id": "tracedecay.memory.provider.lifecycle.v1",
+      "operation": "maintenance",
+      "input": {
+        "task": "consolidate",
+        "maximum_items": 1000,
+        "maximum_duration_millis": 5000,
+        "cancellation_at_item": 17
+      },
+      "expected": {
+        "terminal_code": "cancelled",
+        "committed_effect": "partial",
+        "changed_items": 16,
+        "resume_cursor_required": true
+      }
+    },
+    {
+      "fixture_id": "lifecycle.snapshot.incompatible",
+      "category": "incompatibility",
+      "contract_id": "tracedecay.memory.provider.lifecycle.v1",
+      "operation": "snapshot_restore",
+      "input": {
+        "provider_id": "ncm",
+        "snapshot_state_schema": "ncm.state.v3",
+        "provider_state_schema": "ncm.state.v4",
+        "scope_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "expected": {
+        "terminal_code": "state_incompatible",
+        "implicit_reset": false,
+        "implicit_overwrite": false
+      }
+    },
+    {
+      "fixture_id": "malformed.unknown-top-level-field",
+      "category": "malformed",
+      "contract_id": "tracedecay.memory.provider.terminal.v1",
+      "operation": "recall",
+      "input": {
+        "terminal_code": "success",
+        "unknown_top_level": "must-not-be-accepted"
+      },
+      "expected": {
+        "terminal_code": "contract_violation",
+        "unknown_field_preserved": false
+      }
+    },
+    {
+      "fixture_id": "observation.apply.success",
+      "category": "success",
+      "contract_id": "tracedecay.memory.provider.observation.v1",
+      "operation": "observe",
+      "input": {
+        "observation_id": "018f1f72-7b60-7000-8000-000000000001",
+        "idempotency_key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "source_event_revision": 4,
+        "payload_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "extensions": []
+      },
+      "expected": {
+        "terminal_code": "success",
+        "acceptance_outcome": "applied",
+        "committed_effect": "committed",
+        "provider_effect_count": 1
+      }
+    },
+    {
+      "fixture_id": "observation.duplicate.idempotent",
+      "category": "idempotent_duplicate",
+      "contract_id": "tracedecay.memory.provider.observation.v1",
+      "operation": "observe",
+      "input": {
+        "idempotency_key": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "first_payload_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "retry_payload_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "expected": {
+        "terminal_code": "success",
+        "acceptance_outcome": "duplicate_acknowledged",
+        "second_provider_effect_created": false
+      }
+    },
+    {
+      "fixture_id": "observation.idempotency.conflict",
+      "category": "idempotency_conflict",
+      "contract_id": "tracedecay.memory.provider.observation.v1",
+      "operation": "observe",
+      "input": {
+        "idempotency_key": "1111111111111111111111111111111111111111111111111111111111111111",
+        "first_payload_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "retry_payload_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "expected": {
+        "terminal_code": "conflict",
+        "acceptance_outcome": "idempotency_conflict",
+        "second_provider_effect_created": false
+      }
+    },
+    {
+      "fixture_id": "observation.unknown-optional-extension.roundtrip",
+      "category": "unknown_optional_roundtrip",
+      "contract_id": "tracedecay.memory.provider.observation.v1",
+      "operation": "observe",
+      "input": {
+        "extension": {
+          "extension_id": "vendor.future-hint",
+          "extension_version": 9,
+          "criticality": "optional",
+          "canonical_payload": {
+            "opaque": "preserve-me",
+            "sequence": 7
+          }
+        }
+      },
+      "expected": {
+        "terminal_code": "success",
+        "round_trip_extension_equals_input": true,
+        "extension_activated_behavior": false
+      }
+    },
+    {
+      "fixture_id": "observation.unknown-required-extension.reject",
+      "category": "unknown_required_rejection",
+      "contract_id": "tracedecay.memory.provider.observation.v1",
+      "operation": "observe",
+      "input": {
+        "extension": {
+          "extension_id": "vendor.required-future",
+          "extension_version": 2,
+          "criticality": "required",
+          "canonical_payload": {
+            "opaque": "cannot-ignore"
+          }
+        }
+      },
+      "expected": {
+        "terminal_code": "contract_violation",
+        "acceptance_outcome": "rejected_extension_unsupported",
+        "provider_effect_created": false
+      }
+    },
+    {
+      "fixture_id": "recall.malformed.native-score",
+      "category": "malformed",
+      "contract_id": "tracedecay.memory.provider.recall.v1",
+      "operation": "recall",
+      "input": {
+        "candidate_id": "candidate-1",
+        "native_score": {
+          "score_domain_id": "ncm.activation",
+          "raw_value": "NaN"
+        }
+      },
+      "expected": {
+        "terminal_code": "contract_violation",
+        "candidate_admitted": false
+      }
+    },
+    {
+      "fixture_id": "recall.partial.degraded",
+      "category": "degradation",
+      "contract_id": "tracedecay.memory.provider.recall.v1",
+      "operation": "recall",
+      "input": {
+        "maximum_candidates": 20,
+        "provider_scanned_items": 100,
+        "deadline_reached_after_items": 60
+      },
+      "expected": {
+        "terminal_code": "partial",
+        "coverage_state": "partial",
+        "coverage_reason": "deadline",
+        "resume_cursor_required": true
+      }
+    },
+    {
+      "fixture_id": "recall.provenance.unavailable",
+      "category": "degradation",
+      "contract_id": "tracedecay.memory.provider.recall.v1",
+      "operation": "recall",
+      "input": {
+        "candidate_id": "candidate-no-provenance",
+        "provenance_state": "unavailable",
+        "policy_action": "exclude"
+      },
+      "expected": {
+        "terminal_code": "success_zero_results",
+        "candidate_admitted": false,
+        "exclusion_reason": "provenance_unavailable"
+      }
+    },
+    {
+      "fixture_id": "recall.stale-scope",
+      "category": "stale_scope",
+      "contract_id": "tracedecay.memory.provider.recall.v1",
+      "operation": "recall",
+      "input": {
+        "request_scope_revision": 12,
+        "ready_receipt_scope_revision": 11,
+        "request_worktree": "worktree-a",
+        "candidate_worktree": "worktree-a"
+      },
+      "expected": {
+        "terminal_code": "stale_identity",
+        "candidate_admitted": false,
+        "provider_called": false
+      }
+    },
+    {
+      "fixture_id": "recall.success.current",
+      "category": "success",
+      "contract_id": "tracedecay.memory.provider.recall.v1",
+      "operation": "recall",
+      "input": {
+        "temporal_mode": "current",
+        "evaluation_time": "2026-08-30T15:00:00Z",
+        "scope_revision": 12,
+        "maximum_candidates": 3
+      },
+      "expected": {
+        "terminal_code": "success",
+        "coverage_state": "complete",
+        "candidate_count": 2,
+        "stable_memory_ref_required": false,
+        "provider_may_inject_context": false
+      }
+    },
+    {
+      "fixture_id": "recall.zero-results",
+      "category": "zero_results",
+      "contract_id": "tracedecay.memory.provider.recall.v1",
+      "operation": "recall",
+      "input": {
+        "query": "unknown symbol convention",
+        "scope_revision": 12
+      },
+      "expected": {
+        "terminal_code": "success_zero_results",
+        "coverage_state": "zero_results",
+        "candidate_count": 0,
+        "fallback_eligible": false
+      }
+    },
+    {
+      "fixture_id": "registry.resolve.native.success",
+      "category": "success",
+      "contract_id": "tracedecay.memory.provider.registry.v1",
+      "operation": "resolve",
+      "input": {
+        "provider_id": "tracedecay.native",
+        "registration_revision": 7,
+        "required_capabilities": [
+          "provider.health.v1",
+          "observation.accept.v1",
+          "recall.query.v1"
+        ]
+      },
+      "expected": {
+        "resolution_state": "resolved",
+        "fallback_provider": null,
+        "all_capabilities_declared": true
+      }
+    },
+    {
+      "fixture_id": "registry.unknown-optional-capability.roundtrip",
+      "category": "unknown_optional_roundtrip",
+      "contract_id": "tracedecay.memory.provider.registry.v1",
+      "operation": "decode_encode_capabilities",
+      "input": {
+        "unknown_capability": {
+          "id": "vendor.future-capability.v7",
+          "requirement": "optional",
+          "opaque_payload": {
+            "feature": "future",
+            "revision": 7
+          }
+        }
+      },
+      "expected": {
+        "round_trip_equals_input": true,
+        "activated": false,
+        "requested": false
+      }
+    },
+    {
+      "fixture_id": "registry.unknown-required-capability.reject",
+      "category": "unknown_required_rejection",
+      "contract_id": "tracedecay.memory.provider.registry.v1",
+      "operation": "resolve",
+      "input": {
+        "provider_id": "tracedecay.native",
+        "required_capabilities": [
+          "vendor.required-future.v9"
+        ]
+      },
+      "expected": {
+        "resolution_state": "capability_unsupported",
+        "activated": false,
+        "fallback_performed": false
+      }
+    },
+    {
+      "fixture_id": "terminal.effect-unknown",
+      "category": "effect_unknown",
+      "contract_id": "tracedecay.memory.provider.terminal.v1",
+      "operation": "observe",
+      "input": {
+        "provider_commit_observed": true,
+        "provider_ack_received": false,
+        "provider_receipt_available": false
+      },
+      "expected": {
+        "terminal_code": "effect_unknown",
+        "committed_effect": "unknown",
+        "retry_allowed_before_reconciliation": false,
+        "fallback_eligible": false
+      }
+    },
+    {
+      "fixture_id": "terminal.partial-effect",
+      "category": "partial_effect",
+      "contract_id": "tracedecay.memory.provider.terminal.v1",
+      "operation": "maintenance",
+      "input": {
+        "intended_items": ["a", "b", "c"],
+        "committed_items": ["a", "b"],
+        "uncommitted_items": ["c"]
+      },
+      "expected": {
+        "terminal_code": "partial_effect",
+        "committed_effect": "partial",
+        "committed_boundary_required": true,
+        "retry_allowed_before_reconciliation": false
+      }
+    }
+  ]
+}
