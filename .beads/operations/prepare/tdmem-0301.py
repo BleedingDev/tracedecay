@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Retry tdmem-0301 with canonical formatting and an unchanged lockfile."""
+"""Retry tdmem-0301 with canonical formatting and a generated lock entry."""
 
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 
@@ -35,32 +34,17 @@ new = '''    assert!(matches!(
 if old not in test_text:
     raise SystemExit("provider API assertion patch marker is missing")
 api_test.write_text(test_text.replace(old, new, 1), encoding="utf-8")
+
 subprocess.run(
-    [
-        "cargo",
-        "fmt",
-        "--package",
-        "tracedecay-memory-provider-api",
-    ],
+    ["cargo", "metadata", "--format-version", "1"],
+    cwd=ROOT,
+    check=True,
+    stdout=subprocess.DEVNULL,
+)
+subprocess.run(
+    ["cargo", "fmt", "--package", "tracedecay-memory-provider-api"],
     cwd=ROOT,
     check=True,
 )
-
-manifest_path = ROOT / ".beads/operations/prepared-files.json"
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-manifest = [row for row in manifest if row.get("path") != "Cargo.lock"]
-manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-
-map_path = ROOT / "product/upstream/convergence-map.json"
-document = json.loads(map_path.read_text(encoding="utf-8"))
-document["entries"] = [
-    row for row in document["entries"] if row.get("path") != "Cargo.lock"
-]
-document["snapshot"]["upstream_existing_production_files"] = 1
-document["snapshot"]["observed_state"] = (
-    "The product branch changes only additive root workspace membership; "
-    "Cargo.lock is unchanged because the dependency-free provider API adds no resolved package edge."
-)
-map_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 Path(__file__).unlink()
