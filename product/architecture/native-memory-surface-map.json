@@ -1,0 +1,839 @@
+{
+  "schema_version": 1,
+  "bead_id": "tdmem-0103",
+  "title": "TraceDecay V2 Native memory production surface map",
+  "scope": "Coding-agent memory paths on feat/pluggable-memory-providers-v2; provider behavior is unchanged.",
+  "invariants": [
+    "FactOwnerV1 is the immutable scope key for every Native fact read and write.",
+    "Explicit facts have one canonical writer: the owner-bound Native fact authority.",
+    "Provider recall candidates are advisory and cannot mutate canonical facts or code truth.",
+    "Session observations and LCM history are separate authorities; automation may promote reviewed material only through the Native fact write path.",
+    "Search indexes, FHRR vectors, trust summaries, dashboards, and the Grafeo relation graph are derived and rebuildable.",
+    "Every production effect propagates request identity, deadline/cancellation, typed terminal outcomes, and durable reconciliation where required."
+  ],
+  "authorities": [
+    {
+      "id": "native_explicit_fact_log",
+      "class": "canonical",
+      "state": "append_only_facts_lineage_and_provenance",
+      "scope": [
+        "profile",
+        "project_id"
+      ],
+      "write_owner": "MemoryApplication over DatabaseFactStore/ProjectMemoryFactStore selected by FactOwnerV1",
+      "read_authority": "The same owner-bound Native store; reads never discover a different path per request.",
+      "source_paths": [
+        "crates/tracedecay-usecases/src/memory/mod.rs",
+        "crates/tracedecay-runtime-core/src/store/memory/mod.rs",
+        "crates/tracedecay/src/tracedecay/facts.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "prohibited": [
+        "provider writes to canonical fact tables",
+        "transport-specific alternate writers",
+        "silent fallback to another owner or store"
+      ]
+    },
+    {
+      "id": "native_feedback_log",
+      "class": "canonical",
+      "state": "fact_feedback_events_and_trust_transitions",
+      "scope": [
+        "profile",
+        "project_id",
+        "fact_id"
+      ],
+      "write_owner": "Owner-bound MemoryApplication feedback command through DatabaseFactStore",
+      "read_authority": "Native feedback history/status queries over the same store",
+      "source_paths": [
+        "crates/tracedecay-usecases/src/memory/project_memory.rs",
+        "crates/tracedecay-runtime-core/src/store/memory/mod.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "prohibited": [
+        "external provider directly changing Native trust",
+        "feedback recorded without stable operation identity"
+      ]
+    },
+    {
+      "id": "automatic_fact_receipts",
+      "class": "canonical_receipt",
+      "state": "idempotent_automatic_fact_decisions_and_automation_settlement",
+      "scope": [
+        "project_id",
+        "run_id",
+        "operation_id"
+      ],
+      "write_owner": "Daemon automation effect/runner and Native automatic-fact application",
+      "read_authority": "Automation receipt and run-ledger readers",
+      "source_paths": [
+        "crates/tracedecay-runtime-core/src/store/memory/automation_run_receipts.rs",
+        "crates/tracedecay/src/daemon/dashboard_automation/retained_curator.rs",
+        "crates/tracedecay/src/daemon/automation_effect.rs"
+      ],
+      "prohibited": [
+        "treating a proposed provider observation as an accepted fact",
+        "reporting success before durable settlement"
+      ]
+    },
+    {
+      "id": "session_observation_store",
+      "class": "canonical_separate_domain",
+      "state": "host_transcript_observations_lcm_messages_and_session_evidence",
+      "scope": [
+        "profile",
+        "project_id",
+        "agent_session"
+      ],
+      "write_owner": "Host admission plus session/transcript ingest authorities",
+      "read_authority": "Admitted session/LCM retrieval service",
+      "source_paths": [
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
+        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
+        "crates/tracedecay/src/store/session_ingest_authority.rs"
+      ],
+      "prohibited": [
+        "calling session observations canonical explicit facts",
+        "cross-project or cross-profile retrieval"
+      ]
+    },
+    {
+      "id": "native_relation_graph",
+      "class": "derived",
+      "state": "verified_grafeo_fact_topology",
+      "scope": [
+        "profile",
+        "project_id",
+        "store_generation"
+      ],
+      "write_owner": "Derived graph publication/reconciliation triggered after canonical writes",
+      "read_authority": "Generation-pinned relation graph readers",
+      "source_paths": [
+        "crates/tracedecay-runtime-core/src/store/memory/graph.rs",
+        "crates/tracedecay/src/daemon/store_runtime/session_registry/memory_graph_reconciliation_tasks.rs"
+      ],
+      "rebuildable": true,
+      "prohibited": [
+        "direct product mutation of topology",
+        "using graph presence as proof a fact is canonical"
+      ]
+    },
+    {
+      "id": "native_search_projection",
+      "class": "derived",
+      "state": "fts_jaccard_holographic_and_trust_ranking",
+      "scope": [
+        "profile",
+        "project_id",
+        "read_snapshot"
+      ],
+      "write_owner": "Native store projection code",
+      "read_authority": "ProjectMemoryFactStore search/probe/reason/contradiction queries",
+      "source_paths": [
+        "crates/tracedecay-runtime-core/src/store/memory/search.rs",
+        "crates/tracedecay-runtime-core/src/store/memory/scoring.rs",
+        "crates/tracedecay-runtime-core/src/store/memory/projection.rs"
+      ],
+      "rebuildable": true,
+      "prohibited": [
+        "treating a score as canonical truth",
+        "persisting provider-specific score semantics in Native fact rows"
+      ]
+    },
+    {
+      "id": "native_status_projection",
+      "class": "derived",
+      "state": "counts_trust_bands_feedback_funnel_and_dashboard_payloads",
+      "scope": [
+        "profile",
+        "project_id",
+        "read_snapshot"
+      ],
+      "write_owner": "None; calculated from authoritative stores and projections",
+      "read_authority": "Native memory status/dashboard read APIs",
+      "source_paths": [
+        "crates/tracedecay-runtime-core/src/store/memory/status.rs",
+        "crates/tracedecay-dashboard-api/src/memory_api.rs",
+        "crates/tracedecay-dashboard-api/src/memory_service"
+      ],
+      "rebuildable": true,
+      "prohibited": [
+        "using dashboard payloads as a write authority",
+        "fabricating ready status when an authority is unavailable"
+      ]
+    }
+  ],
+  "public_operations": [
+    {
+      "id": "fact_store_curate",
+      "effect_class": "administrative",
+      "direction": "write",
+      "paginated": false,
+      "surfaces": {
+        "http": "/application/retained/fact_store_curate",
+        "mcp": "tracedecay_fact_store_curate",
+        "cli": "tracedecay tool fact_store_curate",
+        "sdk": "operation.application.fact_store_curate"
+      },
+      "transport_owner": "retained application catalog and daemon route",
+      "execution_owner": "retained Memory Curator adapter",
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_explicit_fact_log",
+      "canonical_mutation": true,
+      "source_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay/src/daemon/dashboard_automation/retained_curator.rs"
+      ],
+      "notes": "Launches the durable Memory Curator automation; accepted mutations still settle through the Native fact authority."
+    },
+    {
+      "id": "fact_store_add",
+      "effect_class": "administrative",
+      "direction": "write",
+      "paginated": false,
+      "surfaces": {
+        "http": "/application/retained/fact_store_add",
+        "mcp": "tracedecay_fact_store_add",
+        "cli": "tracedecay tool fact_store_add",
+        "sdk": "operation.application.fact_store_add"
+      },
+      "transport_owner": "retained application catalog and daemon route",
+      "execution_owner": "DirectRetainedMemoryPortV1",
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_explicit_fact_log",
+      "canonical_mutation": true,
+      "source_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "notes": "Adds one explicit project/profile fact through the owner-bound memory application."
+    },
+    {
+      "id": "fact_store_search",
+      "effect_class": "read",
+      "direction": "read",
+      "paginated": true,
+      "surfaces": {
+        "http": "/application/retained/fact_store_search",
+        "mcp": "tracedecay_fact_store_search",
+        "cli": "tracedecay tool fact_store_search",
+        "sdk": "operation.application.fact_store_search"
+      },
+      "transport_owner": "retained application catalog and daemon route",
+      "execution_owner": "DirectRetainedMemoryPortV1",
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_search_projection",
+      "canonical_mutation": false,
+      "source_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "notes": "Ranks authorized facts using canonical rows plus rebuildable search/graph projections."
+    },
+    {
+      "id": "fact_store_probe",
+      "effect_class": "read",
+      "direction": "read",
+      "paginated": true,
+      "surfaces": {
+        "http": "/application/retained/fact_store_probe",
+        "mcp": "tracedecay_fact_store_probe",
+        "cli": "tracedecay tool fact_store_probe",
+        "sdk": "operation.application.fact_store_probe"
+      },
+      "transport_owner": "retained application catalog and daemon route",
+      "execution_owner": "DirectRetainedMemoryPortV1",
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_search_projection",
+      "canonical_mutation": false,
+      "source_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "notes": "Bounded probe over authorized Native facts."
+    },
+    {
+      "id": "fact_store_related",
+      "effect_class": "read",
+      "direction": "read",
+      "paginated": true,
+      "surfaces": {
+        "http": "/application/retained/fact_store_related",
+        "mcp": "tracedecay_fact_store_related",
+        "cli": "tracedecay tool fact_store_related",
+        "sdk": "operation.application.fact_store_related"
+      },
+      "transport_owner": "retained application catalog and daemon route",
+      "execution_owner": "DirectRetainedMemoryPortV1",
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_relation_graph",
+      "canonical_mutation": false,
+      "source_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "notes": "Uses the verified relation graph as an advisory expansion over canonical facts."
+    },
+    {
+      "id": "fact_store_reason",
+      "effect_class": "read",
+      "direction": "read",
+      "paginated": true,
+      "surfaces": {
+        "http": "/application/retained/fact_store_reason",
+        "mcp": "tracedecay_fact_store_reason",
+        "cli": "tracedecay tool fact_store_reason",
+        "sdk": "operation.application.fact_store_reason"
+      },
+      "transport_owner": "retained application catalog and daemon route",
+      "execution_owner": "DirectRetainedMemoryPortV1",
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_search_projection",
+      "canonical_mutation": false,
+      "source_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "notes": "Returns supporting Native facts; result is advisory and owner-scoped."
+    },
+    {
+      "id": "fact_store_contradict",
+      "effect_class": "read",
+      "direction": "read",
+      "paginated": false,
+      "surfaces": {
+        "http": "/application/retained/fact_store_contradict",
+        "mcp": "tracedecay_fact_store_contradict",
+        "cli": "tracedecay tool fact_store_contradict",
+        "sdk": "operation.application.fact_store_contradict"
+      },
+      "transport_owner": "retained application catalog and daemon route",
+      "execution_owner": "DirectRetainedMemoryPortV1",
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_search_projection",
+      "canonical_mutation": false,
+      "source_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "notes": "Finds bounded contradictions without mutating canonical facts."
+    },
+    {
+      "id": "fact_store_get",
+      "effect_class": "read",
+      "direction": "read",
+      "paginated": false,
+      "surfaces": {
+        "http": "/application/retained/fact_store_get",
+        "mcp": "tracedecay_fact_store_get",
+        "cli": "tracedecay tool fact_store_get",
+        "sdk": "operation.application.fact_store_get"
+      },
+      "transport_owner": "retained application catalog and daemon route",
+      "execution_owner": "DirectRetainedMemoryPortV1",
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_explicit_fact_log",
+      "canonical_mutation": false,
+      "source_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "notes": "Reads one owner-validated fact."
+    },
+    {
+      "id": "fact_store_update",
+      "effect_class": "administrative",
+      "direction": "write",
+      "paginated": false,
+      "surfaces": {
+        "http": "/application/retained/fact_store_update",
+        "mcp": "tracedecay_fact_store_update",
+        "cli": "tracedecay tool fact_store_update",
+        "sdk": "operation.application.fact_store_update"
+      },
+      "transport_owner": "retained application catalog and daemon route",
+      "execution_owner": "DirectRetainedMemoryPortV1",
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_explicit_fact_log",
+      "canonical_mutation": true,
+      "source_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "notes": "Appends an owner-scoped update and lineage receipt."
+    },
+    {
+      "id": "fact_store_remove",
+      "effect_class": "administrative",
+      "direction": "write",
+      "paginated": false,
+      "surfaces": {
+        "http": "/application/retained/fact_store_remove",
+        "mcp": "tracedecay_fact_store_remove",
+        "cli": "tracedecay tool fact_store_remove",
+        "sdk": "operation.application.fact_store_remove"
+      },
+      "transport_owner": "retained application catalog and daemon route",
+      "execution_owner": "DirectRetainedMemoryPortV1",
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_explicit_fact_log",
+      "canonical_mutation": true,
+      "source_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "notes": "Appends an owner-scoped removal/tombstone and lineage receipt."
+    },
+    {
+      "id": "fact_store_list",
+      "effect_class": "read",
+      "direction": "read",
+      "paginated": true,
+      "surfaces": {
+        "http": "/application/retained/fact_store_list",
+        "mcp": "tracedecay_fact_store_list",
+        "cli": "tracedecay tool fact_store_list",
+        "sdk": "operation.application.fact_store_list"
+      },
+      "transport_owner": "retained application catalog and daemon route",
+      "execution_owner": "DirectRetainedMemoryPortV1",
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_explicit_fact_log",
+      "canonical_mutation": false,
+      "source_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "notes": "Lists authorized facts with deterministic pagination."
+    },
+    {
+      "id": "fact_feedback",
+      "effect_class": "administrative",
+      "direction": "write",
+      "paginated": false,
+      "surfaces": {
+        "http": "/application/retained/fact_feedback",
+        "mcp": "tracedecay_fact_feedback",
+        "cli": "tracedecay tool fact_feedback",
+        "sdk": "operation.application.fact_feedback"
+      },
+      "transport_owner": "retained application catalog and daemon route",
+      "execution_owner": "DirectRetainedMemoryPortV1",
+      "write_owner": "native_feedback_log",
+      "read_authority": "native_feedback_log",
+      "canonical_mutation": true,
+      "source_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "notes": "Records scoped feedback and the resulting trust transition through the same Native store."
+    },
+    {
+      "id": "memory_status",
+      "effect_class": "read",
+      "direction": "read",
+      "paginated": false,
+      "surfaces": {
+        "http": "/application/retained/memory_status",
+        "mcp": "tracedecay_memory_status",
+        "cli": "tracedecay tool memory_status",
+        "sdk": "operation.application.memory_status"
+      },
+      "transport_owner": "retained application catalog and daemon route",
+      "execution_owner": "DirectRetainedMemoryPortV1",
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_status_projection",
+      "canonical_mutation": false,
+      "source_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+      ],
+      "notes": "Inspects counts, trust bands, algebra metadata, and feedback funnel as a derived read model."
+    }
+  ],
+  "internal_entry_points": [
+    {
+      "id": "daemon_retained_memory_owner",
+      "category": "composition_and_execution",
+      "effect": "mixed",
+      "entry": "DirectRetainedMemoryPortV1",
+      "source_paths": [
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory_target.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory_mutation.rs"
+      ],
+      "write_owner": "native_explicit_fact_log or native_feedback_log",
+      "read_authority": "owner-bound Native store",
+      "canonical_mutation": true,
+      "notes": "Exact project/profile routing and retained effect preparation happen here."
+    },
+    {
+      "id": "dashboard_holographic_inspection",
+      "category": "inspection",
+      "effect": "read",
+      "entry": "/api/plugins/holographic/*",
+      "source_paths": [
+        "crates/tracedecay-dashboard-api/src/lib.rs",
+        "crates/tracedecay-dashboard-api/src/memory_api.rs",
+        "crates/tracedecay-dashboard-api/src/memory_service"
+      ],
+      "write_owner": "none",
+      "read_authority": "native_explicit_fact_log plus derived graph/search/status projections",
+      "canonical_mutation": false,
+      "notes": "Dashboard state retains an immutable memory_owner and mem_db. FHRR vectors and graph payloads are derived on read."
+    },
+    {
+      "id": "memory_curator_automation",
+      "category": "maintenance_and_curation",
+      "effect": "write",
+      "entry": "fact_store_curate / Memory Curator automation",
+      "source_paths": [
+        "crates/tracedecay/src/daemon/dashboard_automation/retained_curator.rs",
+        "crates/tracedecay-usecases/src/memory/curation.rs",
+        "crates/tracedecay-automation-runtime/src/automation/runner.rs"
+      ],
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_explicit_fact_log",
+      "canonical_mutation": true,
+      "notes": "Automation proposes reviewed changes; durable settlement and receipts precede success."
+    },
+    {
+      "id": "automatic_fact_promotion",
+      "category": "automation",
+      "effect": "write",
+      "entry": "session reflector / automatic fact add",
+      "source_paths": [
+        "crates/tracedecay-usecases/src/memory/project_memory.rs",
+        "crates/tracedecay-runtime-core/src/store/memory/automatic_facts",
+        "crates/tracedecay-automation-runtime/src/automation/automatic_facts.rs",
+        "crates/tracedecay/tests/automation_runner_test/session_reflector.rs"
+      ],
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "session_observation_store and native_explicit_fact_log",
+      "canonical_mutation": true,
+      "notes": "Promotion is idempotent and receipt-backed; raw observations remain a separate authority."
+    },
+    {
+      "id": "host_observation_ingest",
+      "category": "host_and_hooks",
+      "effect": "write",
+      "entry": "Claude/Codex/Cursor and other hook transcript capture",
+      "source_paths": [
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
+        "crates/tracedecay-host-admission/src",
+        "crates/tracedecay-sessions/src"
+      ],
+      "write_owner": "session_observation_store",
+      "read_authority": "session_observation_store",
+      "canonical_mutation": false,
+      "notes": "This writes session evidence, not explicit Native facts; it is the safest observer-provider fan-out point."
+    },
+    {
+      "id": "session_context_retrieval",
+      "category": "recall_and_host_injection",
+      "effect": "read",
+      "entry": "SessionApplicationRetrievalPortV1",
+      "source_paths": [
+        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
+        "crates/tracedecay/src/daemon/session_retrieval/contract.rs",
+        "crates/tracedecay-usecases/src/context"
+      ],
+      "write_owner": "none",
+      "read_authority": "session_observation_store",
+      "canonical_mutation": false,
+      "notes": "Exact mounted scope, immutable request context, cancellation, deadlines, and bounded results are enforced before prompt/context use."
+    },
+    {
+      "id": "native_fact_retrieval_and_tracking",
+      "category": "recall_and_feedback",
+      "effect": "mixed",
+      "entry": "search/probe/related/reason plus retrieval tracking",
+      "source_paths": [
+        "crates/tracedecay-usecases/src/memory/project_memory.rs",
+        "crates/tracedecay-runtime-core/src/store/memory/search.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory_tracking.rs"
+      ],
+      "write_owner": "native_feedback_log for access/retrieval telemetry only",
+      "read_authority": "native_explicit_fact_log plus native_search_projection/native_relation_graph",
+      "canonical_mutation": false,
+      "notes": "Retrieval telemetry does not create or rewrite an explicit fact."
+    },
+    {
+      "id": "privacy_remediation",
+      "category": "maintenance",
+      "effect": "write",
+      "entry": "daemon-owned at-rest privacy rescan",
+      "source_paths": [
+        "crates/tracedecay/src/daemon/privacy_remediation.rs",
+        "crates/tracedecay-usecases/src/memory/privacy_remediation.rs",
+        "crates/tracedecay-runtime-core/src/store/memory/privacy_purge.rs"
+      ],
+      "write_owner": "native_explicit_fact_log",
+      "read_authority": "native_explicit_fact_log and session_observation_store",
+      "canonical_mutation": true,
+      "notes": "Quarantine/purge operations are bounded, receipt-backed, and run after project admission."
+    },
+    {
+      "id": "store_maintenance",
+      "category": "maintenance",
+      "effect": "write",
+      "entry": "daemon store maintenance and retention",
+      "source_paths": [
+        "crates/tracedecay/src/daemon/store_maintenance/mod.rs",
+        "crates/tracedecay/src/daemon/store_maintenance/graph_replay.rs",
+        "crates/tracedecay/src/daemon/maintenance.rs"
+      ],
+      "write_owner": "retained Native database/runtime owners",
+      "read_authority": "retained Native database/runtime owners",
+      "canonical_mutation": true,
+      "notes": "Administrative repair/retention is not a provider extension point."
+    },
+    {
+      "id": "memory_graph_reconciliation",
+      "category": "derived_maintenance",
+      "effect": "write",
+      "entry": "post-commit graph publication and daemon reconciliation tasks",
+      "source_paths": [
+        "crates/tracedecay-runtime-core/src/store/memory/mod.rs",
+        "crates/tracedecay-runtime-core/src/store/memory/graph.rs",
+        "crates/tracedecay/src/daemon/store_runtime/session_registry/memory_graph_reconciliation_tasks.rs"
+      ],
+      "write_owner": "native_relation_graph",
+      "read_authority": "native_explicit_fact_log",
+      "canonical_mutation": false,
+      "notes": "Topology is derived from canonical facts and can be replayed/rebuilt."
+    },
+    {
+      "id": "sdk_operation_client",
+      "category": "sdk",
+      "effect": "mixed",
+      "entry": "generated TypedOperation descriptors and TraceDecay SDK client",
+      "source_paths": [
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay-sdk/src/client.rs",
+        "crates/tracedecay-application/src/retained_surfaces.rs"
+      ],
+      "write_owner": "none; transport only",
+      "read_authority": "daemon retained application route",
+      "canonical_mutation": false,
+      "notes": "SDK does not own state; it invokes the same daemon-owned HTTP bindings."
+    }
+  ],
+  "derived_surfaces": [
+    {
+      "id": "grafeo_memory_relation_graph",
+      "authority": "native_relation_graph",
+      "rebuildable": true,
+      "canonical": false,
+      "source_paths": [
+        "crates/tracedecay-runtime-core/src/store/memory/graph.rs",
+        "crates/tracedecay-dashboard-api/src/memory_service/graph.rs"
+      ]
+    },
+    {
+      "id": "fts_and_ranking_scores",
+      "authority": "native_search_projection",
+      "rebuildable": true,
+      "canonical": false,
+      "source_paths": [
+        "crates/tracedecay-runtime-core/src/store/memory/search.rs",
+        "crates/tracedecay-runtime-core/src/store/memory/scoring.rs"
+      ]
+    },
+    {
+      "id": "fhrr_vectors",
+      "authority": "native_search_projection",
+      "rebuildable": true,
+      "canonical": false,
+      "source_paths": [
+        "crates/tracedecay-runtime-core/src/store/memory/projection.rs",
+        "crates/tracedecay-dashboard-api/src/memory_service/projection.rs"
+      ]
+    },
+    {
+      "id": "dashboard_memory_payloads",
+      "authority": "native_status_projection",
+      "rebuildable": true,
+      "canonical": false,
+      "source_paths": [
+        "crates/tracedecay-dashboard-api/src/memory_api.rs",
+        "crates/tracedecay-dashboard-api/src/memory_service"
+      ]
+    },
+    {
+      "id": "trust_and_feedback_summary",
+      "authority": "native_status_projection",
+      "rebuildable": true,
+      "canonical": false,
+      "source_paths": [
+        "crates/tracedecay-runtime-core/src/store/memory/status.rs",
+        "crates/tracedecay-dashboard-api/src/memory_api.rs"
+      ]
+    },
+    {
+      "id": "automatic_fact_and_automation_views",
+      "authority": "automatic_fact_receipts",
+      "rebuildable": true,
+      "canonical": false,
+      "source_paths": [
+        "crates/tracedecay-runtime-core/src/store/memory/automatic_facts",
+        "crates/tracedecay-runtime-core/src/store/memory/automation_run_receipts.rs"
+      ]
+    }
+  ],
+  "provider_seams": [
+    {
+      "rank": 1,
+      "id": "normalized_observation_fanout",
+      "invasiveness": "lowest",
+      "recommendation": "preferred_observer_mount",
+      "mount_paths": [
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
+        "crates/tracedecay-sessions/src"
+      ],
+      "allowed_side_effects": [
+        "enqueue a bounded idempotent provider observation after host admission",
+        "record provider-local receipt/telemetry"
+      ],
+      "prohibited_side_effects": [
+        "change prompts",
+        "write Native facts",
+        "block canonical host ingest"
+      ],
+      "rationale": "Already normalized, scope-bound host observations can be mirrored without changing Native authority."
+    },
+    {
+      "rank": 2,
+      "id": "advisory_recall_contributor",
+      "invasiveness": "low",
+      "recommendation": "preferred_active_read_mount",
+      "mount_paths": [
+        "crates/tracedecay-usecases/src/context",
+        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs"
+      ],
+      "allowed_side_effects": [
+        "return provenance-rich bounded advisory candidates",
+        "report typed unavailable/partial/cancelled outcomes"
+      ],
+      "prohibited_side_effects": [
+        "claim code truth",
+        "bypass exact project/worktree scope",
+        "silently fall back to Native or another provider"
+      ],
+      "rationale": "A context compiler can merge advisory candidates after scope/provenance validation and before prompt rendering."
+    },
+    {
+      "rank": 3,
+      "id": "outcome_and_feedback_fanout",
+      "invasiveness": "medium_low",
+      "recommendation": "observer_feedback_mount",
+      "mount_paths": [
+        "crates/tracedecay/src/daemon/retained_owner/memory_tracking.rs",
+        "crates/tracedecay/src/daemon/service/invocation/feedback.rs"
+      ],
+      "allowed_side_effects": [
+        "send idempotent outcome/feedback observations after Native settlement",
+        "maintain provider-local learning state"
+      ],
+      "prohibited_side_effects": [
+        "rewrite Native trust",
+        "turn provider feedback failure into Native effect failure after commit"
+      ],
+      "rationale": "Post-settlement fan-out preserves the canonical result while giving providers learning signals."
+    },
+    {
+      "rank": 4,
+      "id": "capability_registry_and_daemon_composition",
+      "invasiveness": "medium",
+      "recommendation": "required_product_composition_mount",
+      "mount_paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay/src/daemon/project_composition.rs",
+        "crates/tracedecay/src/daemon/retained_owner.rs"
+      ],
+      "allowed_side_effects": [
+        "select capability implementations from configuration",
+        "retain provider lifecycle/deadline/cancellation ports"
+      ],
+      "prohibited_side_effects": [
+        "provider-name branching outside registry/adapters",
+        "fabricated readiness",
+        "unbounded queues"
+      ],
+      "rationale": "Necessary for pluggability, but touches upstream-sensitive composition roots and must stay narrow."
+    },
+    {
+      "rank": 5,
+      "id": "project_memory_fact_store_replacement",
+      "invasiveness": "high",
+      "recommendation": "rejected",
+      "mount_paths": [
+        "crates/tracedecay-store/src/memory",
+        "crates/tracedecay-runtime-core/src/store/memory/mod.rs"
+      ],
+      "allowed_side_effects": [],
+      "prohibited_side_effects": [
+        "implement an external cognitive provider as ProjectMemoryFactStore",
+        "replace DatabaseFactStore",
+        "couple provider representation to Native fact contracts"
+      ],
+      "rationale": "This boundary owns canonical facts, lineage, privacy, graph publication, and many Native-only invariants; replacing it conflates advisory cognition with durable fact authority."
+    },
+    {
+      "rank": 6,
+      "id": "transport_or_projection_provider_branching",
+      "invasiveness": "forbidden",
+      "recommendation": "forbidden",
+      "mount_paths": [
+        "crates/tracedecay-cli/src/tool_command.rs",
+        "crates/tracedecay/src/mcp",
+        "crates/tracedecay-dashboard-api/src"
+      ],
+      "allowed_side_effects": [],
+      "prohibited_side_effects": [
+        "if/else on provider names in CLI, MCP, HTTP, dashboard, or store code",
+        "provider-specific public schemas",
+        "silent canonical mutation from advisory output"
+      ],
+      "rationale": "Scattered branching makes authority unverifiable and future providers impossible to add safely."
+    }
+  ],
+  "verification": {
+    "checker": "scripts/product/check-native-memory-surface-map.py",
+    "tests": [
+      "tests/product_native_memory_surface_map_test.py",
+      "crates/tracedecay/tests/mcp_suite/mcp_handler_test/memory_facts_test.rs",
+      "crates/tracedecay/tests/mcp_suite/mcp_handler_test/memory_feedback_test.rs",
+      "crates/tracedecay/tests/dashboard_api_test/memory_curation.rs",
+      "crates/tracedecay/tests/automation_runner_test/memory_curator.rs",
+      "crates/tracedecay/tests/memory_suite/memory_eval_test.rs"
+    ],
+    "baseline_receipt": "product/baseline/tracedecay-v2-pr707-linux.json"
+  }
+}
