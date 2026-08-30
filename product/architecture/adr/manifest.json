@@ -30,7 +30,7 @@
       "status": "accepted",
       "decision_summary": "Providers implement versioned capabilities above TraceDecay application ports. TraceDecay Native remains the explicit-fact authority; cognitive providers return advisory recall and receive observations/outcomes without implementing ProjectMemoryFactStore.",
       "required_rejections": [
-        "direct ProjectMemoryFactStore implementation",
+        "Direct `ProjectMemoryFactStore` implementation",
         "provider-name branching"
       ],
       "verification_beads": [
@@ -70,15 +70,11 @@
       "status": "accepted",
       "decision_summary": "Use additive product-owned crates with inward provider contracts, provider-neutral orchestration/context, isolated Native and NCM adapters, and mechanical dependency guards. Only the narrow registry/composition layer constructs concrete adapters.",
       "required_rejections": [
-        "provider logic in the root crate",
+        "Put provider logic in the root `tracedecay` crate",
         "provider-name branching"
       ],
       "verification_beads": [
         "tdmem-0301",
-        "tdmem-0302",
-        "tdmem-0303",
-        "tdmem-0304",
-        "tdmem-0305",
         "tdmem-0306",
         "tdmem-0307",
         "tdmem-0308"
@@ -108,8 +104,8 @@
         ]
       },
       "required_rejections": [
-        "premature NCM transport choice",
-        "one topology for every provider"
+        "Choose in-process NCM immediately",
+        "Mandate one execution topology for every provider"
       ],
       "verification_beads": [
         "tdmem-0202",
@@ -156,7 +152,7 @@
       "decision_summary": "TraceDecay alone assembles final request-scoped context. Current code, policy, Native facts, session evidence, and provider candidates remain separate lanes with exact scope, provenance, freshness, deterministic normalization, budgets, and typed per-lane degradation.",
       "required_rejections": [
         "provider-built final context",
-        "raw score comparison across providers"
+        "Compare raw scores across providers"
       ],
       "verification_beads": [
         "tdmem-0204",
@@ -164,9 +160,6 @@
         "tdmem-0602",
         "tdmem-0603",
         "tdmem-0604",
-        "tdmem-0605",
-        "tdmem-0606",
-        "tdmem-0607",
         "tdmem-0608",
         "tdmem-0609"
       ],
