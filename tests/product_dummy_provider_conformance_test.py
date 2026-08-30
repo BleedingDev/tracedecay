@@ -154,7 +154,7 @@ class DummyProviderConformanceTest(unittest.TestCase):
         ] = True
         self.assert_rejected(
             manifest,
-            "dummy Rust source imports forbidden implementation",
+            "authority_and_isolation.provider_may_mutate_tracedecay_authority must be False",
         )
 
     def test_provider_database_access_cannot_be_enabled(self) -> None:
@@ -164,18 +164,18 @@ class DummyProviderConformanceTest(unittest.TestCase):
         ] = True
         self.assert_rejected(
             manifest,
-            "provider_may_access_tracedecay_database",
+            "authority_and_isolation.provider_may_access_tracedecay_database must be False",
         )
 
     def test_snapshot_determinism_cannot_be_weakened(self) -> None:
         manifest = copy.deepcopy(self.manifest)
         manifest["state_model"]["snapshot_deterministic"] = False
-        self.assert_rejected(manifest, "snapshot_deterministic")
+        self.assert_rejected(manifest, "state_model.snapshot_deterministic must be True")
 
     def test_implicit_reset_cannot_be_enabled(self) -> None:
         manifest = copy.deepcopy(self.manifest)
         manifest["state_model"]["implicit_reset"] = True
-        self.assert_rejected(manifest, "implicit_reset")
+        self.assert_rejected(manifest, "state_model.implicit_reset must be False")
 
     def test_missing_checker_is_rejected(self) -> None:
         manifest = copy.deepcopy(self.manifest)
