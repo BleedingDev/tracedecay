@@ -1,0 +1,26 @@
+[package]
+name = "tracedecay-memory-provider-native"
+version.workspace = true
+edition.workspace = true
+publish = false
+license = "MIT"
+description = "Provider-neutral adapter boundary for TraceDecay Native memory application ports"
+repository = "https://github.com/BleedingDev/tracedecay"
+
+[dependencies]
+tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+warnings = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
