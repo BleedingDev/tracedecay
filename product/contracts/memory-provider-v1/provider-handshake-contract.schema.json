@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/schemas/memory-provider-v1/provider-handshake-contract.schema.json",
+  "title": "TraceDecay memory provider handshake contract V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "bead_id",
+    "title",
+    "status",
+    "authority",
+    "scope",
+    "depends_on_contracts",
+    "protocol_identity",
+    "handshake_request",
+    "handshake_response",
+    "implementation_identity",
+    "state_identity",
+    "exact_scope_identity",
+    "limit_catalog",
+    "limit_negotiation",
+    "request_control",
+    "compatibility_algorithm",
+    "readiness_states",
+    "ready_receipt",
+    "side_effect_contract",
+    "invariants",
+    "verification_beads"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "contract_id": { "const": "tracedecay.memory.provider.handshake.v1" },
+    "bead_id": { "const": "tdmem-0202" },
+    "title": { "type": "string", "minLength": 1 },
+    "status": { "const": "accepted" },
+    "authority": { "const": "TraceDecay provider registry composition root" },
+    "scope": { "const": "coding_agents_only" },
+    "depends_on_contracts": {
+      "type": "array",
+      "const": ["tracedecay.memory.provider.registry.v1"]
+    },
+    "protocol_identity": { "$ref": "#/$defs/strictObject" },
+    "handshake_request": { "$ref": "#/$defs/strictObject" },
+    "handshake_response": { "$ref": "#/$defs/strictObject" },
+    "implementation_identity": { "$ref": "#/$defs/strictObject" },
+    "state_identity": { "$ref": "#/$defs/strictObject" },
+    "exact_scope_identity": { "$ref": "#/$defs/strictObject" },
+    "limit_catalog": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/limit" }
+    },
+    "limit_negotiation": { "$ref": "#/$defs/strictObject" },
+    "request_control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deadline", "cancellation"],
+      "properties": {
+        "deadline": { "$ref": "#/$defs/strictObject" },
+        "cancellation": { "$ref": "#/$defs/strictObject" }
+      }
+    },
+    "compatibility_algorithm": {
+      "type": "array",
+      "minItems": 10,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 20 }
+    },
+    "readiness_states": {
+      "type": "array",
+      "minItems": 20,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+    },
+    "ready_receipt": { "$ref": "#/$defs/strictObject" },
+    "side_effect_contract": { "$ref": "#/$defs/strictObject" },
+    "invariants": {
+      "type": "array",
+      "minItems": 12,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 20 }
+    },
+    "verification_beads": {
+      "type": "array",
+      "minItems": 8,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/beadId" }
+    }
+  },
+  "$defs": {
+    "beadId": {
+      "type": "string",
+      "pattern": "^tdmem-[0-9]{4}$"
+    },
+    "strictObject": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": true
+    },
+    "limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "minimum", "maximum", "unit"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "minimum": { "type": "integer", "minimum": 1 },
+        "maximum": { "type": "integer", "minimum": 1 },
+        "unit": { "enum": ["bytes", "items", "operations", "milliseconds"] }
+      }
+    }
+  }
+}
