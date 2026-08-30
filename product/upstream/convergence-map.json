@@ -6,7 +6,8 @@
         "tdmem-0301",
         "tdmem-0302",
         "tdmem-0303",
-        "tdmem-0304"
+        "tdmem-0304",
+        "tdmem-0305"
       ],
       "generated": {
         "generator_path": "rust-toolchain.toml",
@@ -32,7 +33,9 @@
         "cargo clippy -p tracedecay-memory-provider-native --all-targets --locked -- -D warnings",
         "cargo test -p tracedecay-memory-provider-native --locked",
         "cargo clippy -p tracedecay-memory-provider-ncm --all-targets --locked -- -D warnings",
-        "cargo test -p tracedecay-memory-provider-ncm --locked"
+        "cargo test -p tracedecay-memory-provider-ncm --locked",
+        "cargo clippy -p tracedecay-memory-conformance --all-targets --locked -- -D warnings",
+        "cargo test -p tracedecay-memory-conformance --locked"
       ]
     },
     {
@@ -40,7 +43,8 @@
         "tdmem-0301",
         "tdmem-0302",
         "tdmem-0303",
-        "tdmem-0304"
+        "tdmem-0304",
+        "tdmem-0305"
       ],
       "line_budget": 80,
       "path": "Cargo.toml",
@@ -62,7 +66,9 @@
         "cargo clippy -p tracedecay-memory-provider-native --all-targets --locked -- -D warnings",
         "cargo test -p tracedecay-memory-provider-native --locked",
         "cargo clippy -p tracedecay-memory-provider-ncm --all-targets --locked -- -D warnings",
-        "cargo test -p tracedecay-memory-provider-ncm --locked"
+        "cargo test -p tracedecay-memory-provider-ncm --locked",
+        "cargo clippy -p tracedecay-memory-conformance --all-targets --locked -- -D warnings",
+        "cargo test -p tracedecay-memory-conformance --locked"
       ]
     }
   ],
@@ -95,8 +101,8 @@
   "snapshot": {
     "composition_root_files": 0,
     "exception_zone_files": 0,
-    "observed_state": "The product branch changes only additive workspace membership and generated path-package lock entries; provider API, fabric, Native adapter, and topology-neutral NCM boundary remain product-owned.",
-    "total_upstream_changed_lines": 30,
+    "observed_state": "The product branch changes only additive workspace membership and generated path-package lock entries; provider API, fabric, Native adapter, topology-neutral NCM boundary, and provider-neutral conformance harness remain product-owned.",
+    "total_upstream_changed_lines": 38,
     "upstream_existing_production_files": 2,
     "upstream_existing_test_or_fixture_files": 0
   },
