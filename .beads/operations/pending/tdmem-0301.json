@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 3,
+  "attempt": 4,
   "issue_id": "tdmem-0301",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Creating the first product-owned workspace crate as the only provider-neutral Rust runtime boundary over the generated M1 authority, with no TraceDecay internal or concrete-provider dependency.",
-  "retry_note": "The previous run reached the evidence gates and correctly rejected non-canonical rustfmt output. This retry formats the materialized crate before committing it and replaces one invalid Result equality assertion with an equivalent matches assertion; no contract or production behavior was weakened.",
+  "retry_note": "The previous run proved formatting but also proved that Cargo requires the new workspace path package in Cargo.lock before any --locked compile. This retry generates the lockfile with the pinned toolchain, commits only its deterministic path-package entry, and keeps the existing dependency graph unchanged.",
   "checks": [
     {"name":"provider API workspace metadata","argv":["cargo","metadata","--locked","--format-version","1","--no-deps"],"timeout_seconds":180},
     {"name":"provider API formatting","argv":["cargo","fmt","--package","tracedecay-memory-provider-api","--","--check"],"timeout_seconds":180},
@@ -19,8 +19,8 @@
     "The tracedecay-memory-provider-api crate compiles and tests independently inside the existing Rust workspace under the pinned toolchain and strict lint policy.",
     "The public API reuses the generated M1 contract values and adds only owned runtime identity, exact scope, live cancellation, bounded call/terminal types, handshake values, and the object-safe MemoryProvider trait; no second wire schema exists.",
     "Cargo metadata and the patch-policy dependency audit prove the crate has no TraceDecay storage, code-index, daemon, dashboard, host, transport, Native-adapter, NCM, or OCEAN dependency.",
-    "The root workspace change is one additive, convergence-mapped member; Cargo.lock remains byte-identical because the dependency-free crate adds no resolved package edge, and upstream default features and behavior remain unchanged."
+    "Root Cargo.toml and generated Cargo.lock changes are minimal, reproducible, convergence-mapped path-package wiring and leave all existing dependency versions, default features, and upstream behavior unchanged."
   ],
   "close_reason": "Added the independently compiling provider-neutral Rust API crate over the canonical generated M1 contract authority, with strict validation, live request control, typed provider traits, no forbidden upstream internals, and mapped workspace wiring.",
-  "close_comment": "Evidence: crates/tracedecay-memory-provider-api reuses product/contracts/memory-provider-v1/generated/rust/memory_provider_v1.rs directly and defines validated owned provider/capability IDs, complete TraceDecay-owned coding scope, cooperative cancellation, finite operation control, capability-routed operations, negotiated provider limits, real descriptors, canonical payload/extension wrappers, validated calls, typed terminal replies, handshake values, and the object-safe MemoryProvider trait. The crate has no dependencies. Its falsifiable tests cover generated identifier validation, exact scope, cancellation versus deadline, mandatory and duplicate capabilities, mutation idempotency, operation-capability admission, trait-object handshake/invocation, and deterministic capability ordering. Root Cargo.toml contains one additive member tracked in the convergence map; Cargo.lock remains unchanged. Cargo metadata, fmt, strict Clippy, tests, generated-binding drift, patch budget, and metadata dependency audit all pass."
+  "close_comment": "Evidence: crates/tracedecay-memory-provider-api reuses product/contracts/memory-provider-v1/generated/rust/memory_provider_v1.rs directly and defines validated owned provider/capability IDs, complete TraceDecay-owned coding scope, cooperative cancellation, finite operation control, capability-routed operations, negotiated provider limits, real descriptors, canonical payload/extension wrappers, validated calls, typed terminal replies, handshake values, and the object-safe MemoryProvider trait. The crate has no dependencies. Its falsifiable tests cover generated identifier validation, exact scope, cancellation versus deadline, mandatory and duplicate capabilities, mutation idempotency, operation-capability admission, trait-object handshake/invocation, and deterministic capability ordering. Root Cargo.toml and Cargo.lock contain only additive path-package wiring tracked in the convergence map. Cargo metadata, fmt, strict Clippy, tests, generated-binding drift, patch budget, and metadata dependency audit all pass."
 }
