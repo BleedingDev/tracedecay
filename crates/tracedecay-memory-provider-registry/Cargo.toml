@@ -1,0 +1,28 @@
+[package]
+name = "tracedecay-memory-provider-registry"
+version.workspace = true
+edition.workspace = true
+publish = false
+license = "MIT"
+description = "Default-off provider composition root for TraceDecay memory"
+repository = "https://github.com/BleedingDev/tracedecay"
+
+[dependencies]
+tracedecay-memory-fabric = { path = "../tracedecay-memory-fabric" }
+tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
+tracedecay-memory-provider-native = { path = "../tracedecay-memory-provider-native" }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+warnings = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
