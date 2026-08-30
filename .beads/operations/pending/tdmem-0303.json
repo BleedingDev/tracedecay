@@ -1,10 +1,11 @@
 {
   "schema_version": 1,
-  "attempt": 1,
+  "attempt": 2,
   "issue_id": "tdmem-0303",
   "mode": "complete",
   "actor": "assistant",
   "claim_comment": "Closing the Native adapter crate only after it compiles inside the root workspace, depends solely on the provider API, validates the stable Native identity, routes mandatory and declared optional operations without payload or scope transformation, delegates authoritative terminals to a mockable application port, and leaves Native persistence entirely outside the crate.",
+  "retry_note": "The first materialization correctly proved Cargo did not change Cargo.lock for this additive path package. The reviewed materializer now treats an unchanged generated lockfile as no prepared change while preserving the Cargo.toml convergence entry and every runtime/test gate.",
   "checks": [
     {
       "name": "workspace resolves with the Native adapter",
