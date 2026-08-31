@@ -96,10 +96,33 @@ pub enum ApiError {
     },
     /// A mutating operation lacked a deterministic idempotency key.
     MissingIdempotencyKey,
+    /// An accepted provider registration revision was zero.
+    InvalidRegistrationRevision,
     /// The operation capability was not present in the request requirements.
     MissingOperationCapability(&'static str),
     /// An opaque extension version was zero.
     InvalidExtensionVersion,
+    /// Canonical bytes no longer matched their declared SHA-256 digest.
+    ContentDigestMismatch(&'static str),
+    /// A bounded collection exceeded its maximum item count.
+    TooManyBoundaryItems {
+        /// Stable collection identity.
+        field: &'static str,
+        /// Maximum item count accepted.
+        maximum: usize,
+    },
+    /// Canonical boundary content exceeded its byte ceiling.
+    BoundaryBytesExceeded {
+        /// Stable content identity.
+        field: &'static str,
+        /// Maximum bytes accepted.
+        maximum: u64,
+    },
+    /// A terminal code carried a result payload it cannot admit.
+    PayloadForbiddenForTerminal {
+        /// Closed terminal code.
+        terminal_code: TerminalCode,
+    },
     /// A committed-effect generation pair was incomplete or regressed.
     InvalidEffectGenerations,
     /// A committed-effect field combination contradicted its state.
@@ -193,6 +216,9 @@ impl fmt::Display for ApiError {
             Self::MissingIdempotencyKey => {
                 formatter.write_str("mutating operation has no idempotency key")
             }
+            Self::InvalidRegistrationRevision => {
+                formatter.write_str("provider registration revision must be positive")
+            }
             Self::MissingOperationCapability(capability) => {
                 write!(
                     formatter,
@@ -202,6 +228,23 @@ impl fmt::Display for ApiError {
             Self::InvalidExtensionVersion => {
                 formatter.write_str("opaque extension version must be positive")
             }
+            Self::ContentDigestMismatch(field) => {
+                write!(
+                    formatter,
+                    "field {field} does not match its canonical bytes"
+                )
+            }
+            Self::TooManyBoundaryItems { field, maximum } => {
+                write!(formatter, "boundary field {field} exceeds {maximum} items")
+            }
+            Self::BoundaryBytesExceeded { field, maximum } => {
+                write!(formatter, "boundary field {field} exceeds {maximum} bytes")
+            }
+            Self::PayloadForbiddenForTerminal { terminal_code } => write!(
+                formatter,
+                "terminal {} forbids a result payload",
+                terminal_code.as_wire()
+            ),
             Self::InvalidEffectGenerations => {
                 formatter.write_str("committed-effect generations are incomplete or regressed")
             }
@@ -864,7 +907,7 @@ impl ProviderDescriptor {
     }
 }
 
-/// Canonical payload bytes with an externally verified digest.
+/// Canonical payload bytes bound to their verified digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalPayload {
     /// Versioned payload contract identity.
@@ -882,16 +925,27 @@ impl CanonicalPayload {
         bytes: Vec<u8>,
         sha256: impl Into<String>,
     ) -> Result<Self, ApiError> {
-        let sha256 = sha256.into();
-        require_sha256(&sha256, "payload_sha256")?;
-        if bytes.is_empty() {
-            return Err(ApiError::EmptyField("canonical_payload"));
-        }
-        Ok(Self {
+        let payload = Self {
             contract_id,
             bytes,
-            sha256,
-        })
+            sha256: sha256.into(),
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    /// Revalidates canonical bytes and their declared digest after mutation.
+    pub fn validate(&self) -> Result<(), ApiError> {
+        CapabilityId::new(self.contract_id.as_str()).map_err(ApiError::InvalidVersionedId)?;
+        require_sha256(&self.sha256, "payload_sha256")?;
+        if self.bytes.is_empty() {
+            return Err(ApiError::EmptyField("canonical_payload"));
+        }
+        let actual = lowercase_sha256_hex(Sha256::digest(&self.bytes).into());
+        if self.sha256 != actual {
+            return Err(ApiError::ContentDigestMismatch("payload_sha256"));
+        }
+        Ok(())
     }
 }
 
@@ -919,21 +973,32 @@ impl OwnedOpaqueExtension {
         payload_sha256: impl Into<String>,
         canonical_payload: Vec<u8>,
     ) -> Result<Self, ApiError> {
-        if extension_version == 0 {
-            return Err(ApiError::InvalidExtensionVersion);
-        }
-        let payload_sha256 = payload_sha256.into();
-        require_sha256(&payload_sha256, "extension_payload_sha256")?;
-        if canonical_payload.is_empty() {
-            return Err(ApiError::EmptyField("extension_canonical_payload"));
-        }
-        Ok(Self {
+        let extension = Self {
             extension_id,
             extension_version,
             required,
-            payload_sha256,
+            payload_sha256: payload_sha256.into(),
             canonical_payload,
-        })
+        };
+        extension.validate()?;
+        Ok(extension)
+    }
+
+    /// Revalidates opaque canonical bytes and metadata after mutation.
+    pub fn validate(&self) -> Result<(), ApiError> {
+        CapabilityId::new(self.extension_id.as_str()).map_err(ApiError::InvalidVersionedId)?;
+        if self.extension_version == 0 {
+            return Err(ApiError::InvalidExtensionVersion);
+        }
+        require_sha256(&self.payload_sha256, "extension_payload_sha256")?;
+        if self.canonical_payload.is_empty() {
+            return Err(ApiError::EmptyField("extension_canonical_payload"));
+        }
+        let actual = lowercase_sha256_hex(Sha256::digest(&self.canonical_payload).into());
+        if self.payload_sha256 != actual {
+            return Err(ApiError::ContentDigestMismatch("extension_payload_sha256"));
+        }
+        Ok(())
     }
 
     /// Borrows the generated extension representation.
@@ -983,15 +1048,6 @@ pub struct ProviderCall {
 impl ProviderCall {
     /// Validates a complete runtime call.
     pub fn new(parts: ProviderCallParts) -> Result<Self, ApiError> {
-        parts.exact_scope.validate()?;
-        require_sha256(&parts.ready_receipt_sha256, "ready_receipt_sha256")?;
-        require_non_empty(&parts.request_id, "request_id")?;
-        require_non_empty(&parts.operation_id, "operation_id")?;
-        if parts.operation.mutates_provider_state()
-            && parts.idempotency_key.as_deref().is_none_or(str::is_empty)
-        {
-            return Err(ApiError::MissingIdempotencyKey);
-        }
         let mut required_capabilities = BTreeSet::new();
         for capability in parts.required_capabilities {
             let capability_name = capability.as_str().to_owned();
@@ -999,14 +1055,7 @@ impl ProviderCall {
                 return Err(ApiError::DuplicateCapability(capability_name));
             }
         }
-        let operation_capability = parts.operation.capability_id();
-        if !required_capabilities
-            .iter()
-            .any(|capability| capability.as_str() == operation_capability)
-        {
-            return Err(ApiError::MissingOperationCapability(operation_capability));
-        }
-        Ok(Self {
+        let call = Self {
             operation: parts.operation,
             provider_id: parts.provider_id,
             registration_revision: parts.registration_revision,
@@ -1020,7 +1069,101 @@ impl ProviderCall {
             payload: parts.payload,
             required_capabilities,
             extensions: parts.extensions,
-        })
+        };
+        call.validate()?;
+        Ok(call)
+    }
+
+    /// Revalidates the complete public call envelope after mutation.
+    pub fn validate(&self) -> Result<(), ApiError> {
+        contract::ProviderId::new(self.provider_id.as_str())
+            .map_err(ApiError::InvalidProviderId)?;
+        if self.registration_revision == 0 {
+            return Err(ApiError::InvalidRegistrationRevision);
+        }
+        self.exact_scope.validate()?;
+        require_sha256(&self.ready_receipt_sha256, "ready_receipt_sha256")?;
+        require_non_empty(&self.request_id, "request_id")?;
+        require_bounded_canonical_text(
+            &self.request_id,
+            "request_id",
+            contract::TERMINAL_OPERATION_ID_MAX_BYTES,
+        )?;
+        require_non_empty(&self.operation_id, "operation_id")?;
+        require_bounded_canonical_text(
+            &self.operation_id,
+            "operation_id",
+            contract::TERMINAL_OPERATION_ID_MAX_BYTES,
+        )?;
+        if let Some(idempotency_key) = &self.idempotency_key {
+            require_bounded_canonical_text(
+                idempotency_key,
+                "idempotency_key",
+                contract::TERMINAL_OPERATION_ID_MAX_BYTES,
+            )?;
+        }
+        if self.operation.mutates_provider_state() && self.idempotency_key.is_none() {
+            return Err(ApiError::MissingIdempotencyKey);
+        }
+        for capability in &self.required_capabilities {
+            CapabilityId::new(capability.as_str()).map_err(ApiError::InvalidVersionedId)?;
+        }
+        let operation_capability = self.operation.capability_id();
+        if !self
+            .required_capabilities
+            .iter()
+            .any(|capability| capability.as_str() == operation_capability)
+        {
+            return Err(ApiError::MissingOperationCapability(operation_capability));
+        }
+        self.payload.validate()?;
+
+        let (maximum_extensions, maximum_extension_bytes) =
+            if self.operation == ProviderOperation::Recall {
+                (16, 131_072_u64)
+            } else {
+                (32, 262_144_u64)
+            };
+        if self.extensions.len() > maximum_extensions {
+            return Err(ApiError::TooManyBoundaryItems {
+                field: "extensions",
+                maximum: maximum_extensions,
+            });
+        }
+        let mut total_extension_bytes = 0_u64;
+        for extension in &self.extensions {
+            extension.validate()?;
+            let extension_bytes =
+                u64::try_from(extension.canonical_payload.len()).unwrap_or(u64::MAX);
+            if extension_bytes > maximum_extension_bytes {
+                return Err(ApiError::BoundaryBytesExceeded {
+                    field: "extension_canonical_payload",
+                    maximum: maximum_extension_bytes,
+                });
+            }
+            total_extension_bytes = total_extension_bytes.saturating_add(extension_bytes);
+        }
+        if self.operation == ProviderOperation::Observe && total_extension_bytes > 524_288 {
+            return Err(ApiError::BoundaryBytesExceeded {
+                field: "extensions",
+                maximum: 524_288,
+            });
+        }
+        Ok(())
+    }
+
+    /// Revalidates the call and its aggregate variable content against the
+    /// effective request byte ceiling negotiated during handshake.
+    pub fn validate_request_bytes(&self, request_bytes: u64) -> Result<(), ApiError> {
+        self.validate()?;
+        let aggregate_bytes = encoded_provider_call_bytes(self);
+        if aggregate_bytes > request_bytes {
+            return Err(ApiError::BoundaryBytesExceeded {
+                field: "request",
+                maximum: request_bytes,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1845,24 +1988,8 @@ impl TerminalRecord {
         reconciliation_action: &str,
         diagnostic_id: impl AsRef<str>,
     ) -> Self {
-        let valid_mutating_call = call.operation.mutates_provider_state()
-            && call.exact_scope.validate().is_ok()
-            && require_bounded_canonical_text(
-                &call.operation_id,
-                "operation_id",
-                contract::TERMINAL_OPERATION_ID_MAX_BYTES,
-            )
-            .is_ok()
-            && require_non_empty(&call.request_id, "request_id").is_ok()
-            && require_sha256(&call.ready_receipt_sha256, "ready_receipt_sha256").is_ok()
-            && call
-                .idempotency_key
-                .as_deref()
-                .is_some_and(|key| !key.is_empty())
-            && call
-                .required_capabilities
-                .iter()
-                .any(|capability| capability.as_str() == call.operation.capability_id());
+        let valid_mutating_call =
+            call.operation.mutates_provider_state() && call.validate().is_ok();
         if !valid_mutating_call {
             return Self::internal_failure_before_dispatch_for_call(call, diagnostic_id);
         }
@@ -2039,6 +2166,196 @@ pub struct ProviderReply {
     pub state_generation: u64,
 }
 
+impl ProviderReply {
+    /// Revalidates provider-owned response content against the effective byte ceiling.
+    pub fn validate(&self, response_bytes: u64) -> Result<(), ApiError> {
+        let terminal_code = self.terminal.terminal_code();
+        if self.payload.is_some()
+            && !matches!(
+                terminal_code,
+                TerminalCode::Success | TerminalCode::SuccessZeroResults | TerminalCode::Partial
+            )
+        {
+            return Err(ApiError::PayloadForbiddenForTerminal { terminal_code });
+        }
+        if self.warnings.len() > 32 {
+            return Err(ApiError::TooManyBoundaryItems {
+                field: "warnings",
+                maximum: 32,
+            });
+        }
+        let (maximum_extensions, maximum_extension_bytes) =
+            if self.terminal.operation() == ProviderOperation::Recall {
+                (16, 131_072_u64)
+            } else {
+                (32, 262_144_u64)
+            };
+        if self.extensions.len() > maximum_extensions {
+            return Err(ApiError::TooManyBoundaryItems {
+                field: "extensions",
+                maximum: maximum_extensions,
+            });
+        }
+
+        if let Some(payload) = &self.payload {
+            payload.validate()?;
+        }
+        let mut total_extension_bytes = 0_u64;
+        for extension in &self.extensions {
+            extension.validate()?;
+            let extension_bytes =
+                u64::try_from(extension.canonical_payload.len()).unwrap_or(u64::MAX);
+            if extension_bytes > maximum_extension_bytes {
+                return Err(ApiError::BoundaryBytesExceeded {
+                    field: "extension_canonical_payload",
+                    maximum: maximum_extension_bytes,
+                });
+            }
+            total_extension_bytes = total_extension_bytes.saturating_add(extension_bytes);
+        }
+        if self.terminal.operation() == ProviderOperation::Observe
+            && total_extension_bytes > 524_288
+        {
+            return Err(ApiError::BoundaryBytesExceeded {
+                field: "extensions",
+                maximum: 524_288,
+            });
+        }
+        let aggregate_bytes = encoded_provider_reply_bytes(self);
+        if aggregate_bytes > response_bytes {
+            return Err(ApiError::BoundaryBytesExceeded {
+                field: "response",
+                maximum: response_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn encoded_provider_call_bytes(call: &ProviderCall) -> u64 {
+    let mut total = framed_str_bytes(call.operation.capability_id());
+    total = total.saturating_add(framed_str_bytes(call.provider_id.as_str()));
+    total = total.saturating_add(8);
+    total = total.saturating_add(framed_str_bytes(&call.ready_receipt_sha256));
+    total = total.saturating_add(encoded_scope_bytes(&call.exact_scope));
+    total = total.saturating_add(framed_str_bytes(&call.request_id));
+    total = total.saturating_add(framed_str_bytes(&call.operation_id));
+    total = total.saturating_add(8);
+    total = total.saturating_add(encoded_optional_str_bytes(call.idempotency_key.as_deref()));
+    total = total.saturating_add(8);
+    total = total.saturating_add(8);
+    total = total.saturating_add(framed_str_bytes("live"));
+    total = total.saturating_add(encoded_payload_bytes(&call.payload));
+    total = total.saturating_add(8);
+    for capability in &call.required_capabilities {
+        total = total.saturating_add(framed_str_bytes(capability.as_str()));
+    }
+    total = total.saturating_add(8);
+    for extension in &call.extensions {
+        total = total.saturating_add(encoded_extension_bytes(extension));
+    }
+    total
+}
+
+fn encoded_provider_reply_bytes(reply: &ProviderReply) -> u64 {
+    let terminal = &reply.terminal;
+    let mut total = framed_str_bytes(terminal.operation().as_wire());
+    total = total.saturating_add(framed_str_bytes(terminal.provider_id().as_str()));
+    total = total.saturating_add(framed_str_bytes(terminal.terminal_code().as_wire()));
+    total = total.saturating_add(encoded_committed_effect_bytes(terminal.committed_effect()));
+    total = total.saturating_add(encoded_fallback_bytes(terminal.fallback()));
+    total = total.saturating_add(framed_str_bytes(terminal.operation_id()));
+    total = total.saturating_add(framed_str_bytes(terminal.exact_scope_sha256()));
+    total = total.saturating_add(encoded_optional_str_bytes(terminal.diagnostic_id()));
+    total = total.saturating_add(1);
+    if let Some(payload) = &reply.payload {
+        total = total.saturating_add(encoded_payload_bytes(payload));
+    }
+    total = total.saturating_add(encoded_string_vector_bytes(&reply.warnings));
+    total = total.saturating_add(8);
+    for extension in &reply.extensions {
+        total = total.saturating_add(encoded_extension_bytes(extension));
+    }
+    total.saturating_add(8)
+}
+
+fn encoded_committed_effect_bytes(effect: &CommittedEffectEvidence) -> u64 {
+    let mut total = framed_str_bytes(effect.state().as_wire());
+    total = total.saturating_add(encoded_optional_str_bytes(effect.committed_boundary()));
+    total = total.saturating_add(encoded_optional_u64_bytes(effect.state_generation_before()));
+    total = total.saturating_add(encoded_optional_u64_bytes(effect.state_generation_after()));
+    total = total.saturating_add(encoded_string_vector_bytes(effect.committed_item_refs()));
+    total = total.saturating_add(encoded_string_vector_bytes(effect.uncommitted_item_refs()));
+    total = total.saturating_add(encoded_optional_str_bytes(effect.provider_receipt_sha256()));
+    total = total.saturating_add(encoded_optional_str_bytes(effect.reconciliation_action()));
+    total.saturating_add(encoded_optional_str_bytes(effect.verification_sha256()))
+}
+
+fn encoded_fallback_bytes(fallback: &FallbackDirective) -> u64 {
+    let mut total = framed_str_bytes(fallback.eligibility().as_wire());
+    total = total.saturating_add(encoded_optional_str_bytes(
+        fallback.source_provider_id().map(OwnedProviderId::as_str),
+    ));
+    total = total.saturating_add(1);
+    if let Some(policy) = fallback.policy() {
+        total = total.saturating_add(framed_str_bytes(policy.policy_id()));
+        total = total.saturating_add(8);
+        total = total.saturating_add(framed_str_bytes(policy.target_provider_id().as_str()));
+    }
+    total.saturating_add(encoded_optional_str_bytes(fallback.reason()))
+}
+
+fn encoded_optional_u64_bytes(value: Option<u64>) -> u64 {
+    1_u64.saturating_add(value.map_or(0, |_| 8))
+}
+
+fn encoded_string_vector_bytes(values: &[String]) -> u64 {
+    values.iter().fold(8_u64, |total, value| {
+        total.saturating_add(framed_str_bytes(value))
+    })
+}
+
+fn encoded_scope_bytes(scope: &OwnedExactScope) -> u64 {
+    let mut total = 8_u64;
+    for value in [
+        &scope.profile_id,
+        &scope.project_id,
+        &scope.repository_identity,
+        &scope.worktree_identity,
+        &scope.branch_identity,
+        &scope.agent_session_id,
+    ] {
+        total = total.saturating_add(framed_str_bytes(value));
+    }
+    total
+}
+
+fn encoded_payload_bytes(payload: &CanonicalPayload) -> u64 {
+    framed_str_bytes(payload.contract_id.as_str())
+        .saturating_add(framed_slice_bytes(&payload.bytes))
+        .saturating_add(framed_str_bytes(&payload.sha256))
+}
+
+fn encoded_extension_bytes(extension: &OwnedOpaqueExtension) -> u64 {
+    framed_str_bytes(extension.extension_id.as_str())
+        .saturating_add(4)
+        .saturating_add(1)
+        .saturating_add(framed_str_bytes(&extension.payload_sha256))
+        .saturating_add(framed_slice_bytes(&extension.canonical_payload))
+}
+
+fn encoded_optional_str_bytes(value: Option<&str>) -> u64 {
+    1_u64.saturating_add(value.map_or(0, framed_str_bytes))
+}
+
+fn framed_str_bytes(value: &str) -> u64 {
+    framed_slice_bytes(value.as_bytes())
+}
+
+fn framed_slice_bytes(value: &[u8]) -> u64 {
+    8_u64.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
+}
+
 /// Compatible handshake request.
 #[derive(Clone, Debug)]
 pub struct HandshakeRequest {
@@ -2084,8 +2401,6 @@ pub struct HandshakeRequestParts {
 impl HandshakeRequest {
     /// Validates one handshake request assembled from explicit parts.
     pub fn new(parts: HandshakeRequestParts) -> Result<Self, ApiError> {
-        parts.exact_scope.validate()?;
-        require_non_empty(&parts.request_id, "request_id")?;
         let mut capability_set = BTreeSet::new();
         for capability in parts.required_capabilities {
             let capability_name = capability.as_str().to_owned();
@@ -2093,16 +2408,39 @@ impl HandshakeRequest {
                 return Err(ApiError::DuplicateCapability(capability_name));
             }
         }
-        Ok(Self {
+        let request = Self {
             provider_id: parts.provider_id,
             registration_revision: parts.registration_revision,
             exact_scope: parts.exact_scope,
             request_id: parts.request_id,
             required_capabilities: capability_set,
-            host_limits: parts.host_limits.validate()?,
+            host_limits: parts.host_limits,
             control: parts.control,
             challenge_nonce: parts.challenge_nonce,
-        })
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Revalidates the complete public handshake request after mutation.
+    pub fn validate(&self) -> Result<(), ApiError> {
+        contract::ProviderId::new(self.provider_id.as_str())
+            .map_err(ApiError::InvalidProviderId)?;
+        if self.registration_revision == 0 {
+            return Err(ApiError::InvalidRegistrationRevision);
+        }
+        self.exact_scope.validate()?;
+        require_non_empty(&self.request_id, "request_id")?;
+        require_bounded_canonical_text(
+            &self.request_id,
+            "request_id",
+            contract::TERMINAL_OPERATION_ID_MAX_BYTES,
+        )?;
+        for capability in &self.required_capabilities {
+            CapabilityId::new(capability.as_str()).map_err(ApiError::InvalidVersionedId)?;
+        }
+        self.host_limits.validate()?;
+        Ok(())
     }
 }
 

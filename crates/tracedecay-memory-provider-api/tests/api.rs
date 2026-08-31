@@ -11,13 +11,16 @@ use tracedecay_memory_provider_api::{
     ApiError, CancellationToken, CanonicalPayload, CommittedEffectEvidence,
     CommittedEffectEvidenceParts, FallbackDirective, HandshakeRequest, HandshakeRequestParts,
     HandshakeResponse, MAX_COMMITTED_EFFECT_ITEM_REF_BYTES, MAX_COMMITTED_EFFECT_ITEM_REFS,
-    MemoryProvider, OperationControl, OwnedExactScope, OwnedProviderId, OwnedVersionedId,
-    PinnedFallbackPolicy, ProviderCall, ProviderCallParts, ProviderDescriptor, ProviderLimits,
-    ProviderOperation, ProviderReply, TerminalRecord, UNKNOWN_EFFECT_RECONCILIATION_ACTION,
+    MemoryProvider, OperationControl, OwnedExactScope, OwnedOpaqueExtension, OwnedProviderId,
+    OwnedVersionedId, PinnedFallbackPolicy, ProviderCall, ProviderCallParts, ProviderDescriptor,
+    ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
+    UNKNOWN_EFFECT_RECONCILIATION_ACTION,
 };
 
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const ALT_DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const EMPTY_OBJECT_DIGEST: &str =
+    "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
 fn capability(value: &str) -> Result<OwnedVersionedId, ApiError> {
     OwnedVersionedId::new(value)
@@ -71,7 +74,17 @@ fn payload() -> Result<CanonicalPayload, ApiError> {
     CanonicalPayload::new(
         capability("tracedecay.memory.test-request.v1")?,
         br#"{}"#.to_vec(),
-        DIGEST,
+        EMPTY_OBJECT_DIGEST,
+    )
+}
+
+fn extension() -> Result<OwnedOpaqueExtension, ApiError> {
+    OwnedOpaqueExtension::new(
+        capability("vendor.test-extension.v1")?,
+        1,
+        false,
+        EMPTY_OBJECT_DIGEST,
+        br#"{}"#.to_vec(),
     )
 }
 
@@ -354,6 +367,274 @@ fn descriptor_revalidates_public_boundary_fields() -> Result<(), ApiError> {
     assert_eq!(
         invalid.validate(),
         Err(ApiError::ZeroLimit("request_bytes"))
+    );
+    Ok(())
+}
+
+#[test]
+fn canonical_payload_rebinds_bytes_to_declared_digest_after_mutation() -> Result<(), ApiError> {
+    let valid = payload()?;
+    assert_eq!(valid.validate(), Ok(()));
+
+    let mut invalid = valid.clone();
+    invalid.bytes.push(b' ');
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::ContentDigestMismatch("payload_sha256"))
+    );
+
+    let mut invalid = valid;
+    invalid.sha256 = ALT_DIGEST.to_owned();
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::ContentDigestMismatch("payload_sha256"))
+    );
+    Ok(())
+}
+
+#[test]
+fn opaque_extension_revalidates_metadata_and_content_after_mutation() -> Result<(), ApiError> {
+    let valid = extension()?;
+    assert_eq!(valid.validate(), Ok(()));
+
+    let mut invalid = valid.clone();
+    invalid.extension_version = 0;
+    assert_eq!(invalid.validate(), Err(ApiError::InvalidExtensionVersion));
+
+    let mut invalid = valid;
+    invalid.canonical_payload.push(b' ');
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::ContentDigestMismatch("extension_payload_sha256"))
+    );
+    Ok(())
+}
+
+#[test]
+fn provider_call_revalidates_public_and_nested_fields_after_mutation() -> Result<(), ApiError> {
+    let call = ProviderCall::new(ProviderCallParts {
+        operation: ProviderOperation::Recall,
+        provider_id: provider_id()?,
+        registration_revision: 1,
+        ready_receipt_sha256: DIGEST.to_owned(),
+        exact_scope: scope()?,
+        request_id: "request-boundary".to_owned(),
+        operation_id: "operation-boundary".to_owned(),
+        expected_state_generation: 0,
+        idempotency_key: None,
+        control: OperationControl::new(i64::MAX, 10, CancellationToken::new()),
+        payload: payload()?,
+        required_capabilities: vec![capability("recall.query.v1")?],
+        extensions: vec![extension()?],
+    })?;
+    assert_eq!(call.validate(), Ok(()));
+    assert_eq!(call.validate_request_bytes(1_024), Ok(()));
+    assert_eq!(
+        call.validate_request_bytes(1),
+        Err(ApiError::BoundaryBytesExceeded {
+            field: "request",
+            maximum: 1,
+        })
+    );
+
+    let mut invalid = call.clone();
+    invalid.exact_scope.project_id.clear();
+    assert_eq!(invalid.validate(), Err(ApiError::EmptyField("project_id")));
+
+    let mut invalid = call.clone();
+    invalid.registration_revision = 0;
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::InvalidRegistrationRevision)
+    );
+
+    let mut invalid = call.clone();
+    invalid.request_id = " request-boundary ".to_owned();
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::NonCanonicalTerminalText("request_id"))
+    );
+
+    let mut invalid = call.clone();
+    invalid.request_id =
+        "x".repeat(tracedecay_memory_provider_api::contract::TERMINAL_OPERATION_ID_MAX_BYTES + 1);
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::TerminalTextTooLong {
+            field: "request_id",
+            maximum: tracedecay_memory_provider_api::contract::TERMINAL_OPERATION_ID_MAX_BYTES,
+        })
+    );
+
+    let mut invalid = call.clone();
+    invalid.ready_receipt_sha256.clear();
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::InvalidSha256("ready_receipt_sha256"))
+    );
+
+    let mut invalid = call.clone();
+    invalid.operation_id = " operation-boundary ".to_owned();
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::NonCanonicalTerminalText("operation_id"))
+    );
+
+    let mut invalid = call.clone();
+    invalid.idempotency_key = Some(String::new());
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::NonCanonicalTerminalText("idempotency_key"))
+    );
+
+    let mut invalid = call.clone();
+    invalid.operation = ProviderOperation::Observe;
+    assert_eq!(invalid.validate(), Err(ApiError::MissingIdempotencyKey));
+
+    let mut invalid = call.clone();
+    invalid.operation = ProviderOperation::Health;
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::MissingOperationCapability("provider.health.v1"))
+    );
+
+    let mut invalid = call.clone();
+    invalid.payload.bytes.push(b' ');
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::ContentDigestMismatch("payload_sha256"))
+    );
+
+    let mut invalid = call.clone();
+    invalid.extensions[0].canonical_payload.push(b' ');
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::ContentDigestMismatch("extension_payload_sha256"))
+    );
+
+    let mut invalid = call;
+    invalid.extensions = vec![extension()?; 17];
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::TooManyBoundaryItems {
+            field: "extensions",
+            maximum: 16,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn handshake_request_revalidates_public_fields_after_mutation() -> Result<(), ApiError> {
+    let request = HandshakeRequest::new(HandshakeRequestParts {
+        provider_id: provider_id()?,
+        registration_revision: 1,
+        exact_scope: scope()?,
+        request_id: "handshake-boundary".to_owned(),
+        required_capabilities: vec![capability("provider.health.v1")?],
+        host_limits: limits(),
+        control: OperationControl::new(i64::MAX, 10, CancellationToken::new()),
+        challenge_nonce: [7; 32],
+    })?;
+    assert_eq!(request.validate(), Ok(()));
+
+    let mut invalid = request.clone();
+    invalid.request_id.clear();
+    assert_eq!(invalid.validate(), Err(ApiError::EmptyField("request_id")));
+
+    let mut invalid = request.clone();
+    invalid.registration_revision = 0;
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::InvalidRegistrationRevision)
+    );
+
+    let mut invalid = request;
+    invalid.host_limits.response_bytes = 0;
+    assert_eq!(
+        invalid.validate(),
+        Err(ApiError::ZeroLimit("response_bytes"))
+    );
+    Ok(())
+}
+
+#[test]
+fn provider_reply_revalidates_nested_content_and_response_bounds() -> Result<(), ApiError> {
+    let terminal = TerminalRecord::new(
+        ProviderOperation::Recall,
+        provider_id()?,
+        TerminalCode::SuccessZeroResults,
+        CommittedEffectEvidence::none(Some(7)),
+        FallbackDirective::forbidden(),
+        "operation-reply-boundary",
+        DIGEST,
+        None,
+    )?;
+    let reply = ProviderReply {
+        terminal,
+        payload: Some(payload()?),
+        warnings: Vec::new(),
+        extensions: vec![extension()?],
+        state_generation: 7,
+    };
+    assert_eq!(reply.validate(1_024), Ok(()));
+
+    let mut invalid = reply.clone();
+    if let Some(payload) = &mut invalid.payload {
+        payload.bytes.push(b' ');
+    }
+    assert_eq!(
+        invalid.validate(1_024),
+        Err(ApiError::ContentDigestMismatch("payload_sha256"))
+    );
+
+    let mut invalid = reply.clone();
+    invalid.warnings = vec!["warning".to_owned(); 33];
+    assert_eq!(
+        invalid.validate(1_024),
+        Err(ApiError::TooManyBoundaryItems {
+            field: "warnings",
+            maximum: 32,
+        })
+    );
+
+    let mut invalid = reply.clone();
+    invalid.extensions = vec![extension()?; 17];
+    assert_eq!(
+        invalid.validate(8_192),
+        Err(ApiError::TooManyBoundaryItems {
+            field: "extensions",
+            maximum: 16,
+        })
+    );
+
+    assert_eq!(
+        reply.validate(1),
+        Err(ApiError::BoundaryBytesExceeded {
+            field: "response",
+            maximum: 1,
+        })
+    );
+
+    let failure_terminal = TerminalRecord::new(
+        ProviderOperation::Recall,
+        provider_id()?,
+        TerminalCode::InvalidRequest,
+        CommittedEffectEvidence::none(Some(7)),
+        FallbackDirective::forbidden(),
+        "operation-reply-failure",
+        DIGEST,
+        Some("diagnostic.invalid-request.v1".to_owned()),
+    )?;
+    let invalid = ProviderReply {
+        terminal: failure_terminal,
+        ..reply
+    };
+    assert_eq!(
+        invalid.validate(1_024),
+        Err(ApiError::PayloadForbiddenForTerminal {
+            terminal_code: TerminalCode::InvalidRequest,
+        })
     );
     Ok(())
 }
