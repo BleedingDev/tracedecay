@@ -454,6 +454,109 @@ class UpstreamChangeClassificationTest(unittest.TestCase):
                 self.assertIsNone(row["crate_after"])
                 self.assertEqual(row["crate_before"]["name"], "obsolete-crate")
 
+    def test_rename_is_delete_add_and_each_side_uses_its_commit_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = GitFixture(Path(temp_dir))
+            fixture.write(
+                "crates/old/Cargo.toml",
+                '[package]\nname = "old-crate"\nversion = "0.1.0"\n',
+            )
+            fixture.write("crates/old/src/lib.rs", "pub fn seam() {}\n")
+            old = fixture.commit("old floor")
+            fixture.git("mv", "crates/old", "crates/new")
+            fixture.write(
+                "crates/new/Cargo.toml",
+                '[package]\nname = "new-crate"\nversion = "0.1.0"\n',
+            )
+            candidate = fixture.commit("candidate floor")
+            mapped_paths = [
+                "crates/new/Cargo.toml",
+                "crates/new/src/lib.rs",
+                "crates/old/Cargo.toml",
+                "crates/old/src/lib.rs",
+            ]
+            map_path, policy_path = fixture.authorities(
+                old,
+                [upstream_area("crate_seams", ["crates/**"], ["crate_mount"])],
+                [patch(path, "crate_seams", "crate_mount") for path in mapped_paths],
+                [{"id": "crate_mount", "paths": ["crates/**"]}],
+            )
+
+            result, report = self.run_classifier(
+                fixture, old, candidate, map_path, policy_path
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                [(row["path"], row["status_code"]) for row in report["changed_files"]],
+                [
+                    ("crates/new/Cargo.toml", "A"),
+                    ("crates/new/src/lib.rs", "A"),
+                    ("crates/old/Cargo.toml", "D"),
+                    ("crates/old/src/lib.rs", "D"),
+                ],
+            )
+            added = report["changed_files"][0]
+            deleted = report["changed_files"][2]
+            self.assertIsNone(added["crate_before"])
+            self.assertEqual(added["crate_after"]["name"], "new-crate")
+            self.assertEqual(added["crate"]["name"], "new-crate")
+            self.assertEqual(deleted["crate_before"]["name"], "old-crate")
+            self.assertIsNone(deleted["crate_after"])
+            self.assertEqual(deleted["crate"]["name"], "old-crate")
+            self.assertEqual(
+                report["changed_crates"],
+                [
+                    {
+                        "changed_file_count": 2,
+                        "manifest": "crates/new/Cargo.toml",
+                        "name": "new-crate",
+                        "present_after": True,
+                        "present_before": False,
+                        "root": "crates/new",
+                    },
+                    {
+                        "changed_file_count": 2,
+                        "manifest": "crates/old/Cargo.toml",
+                        "name": "old-crate",
+                        "present_after": False,
+                        "present_before": True,
+                        "root": "crates/old",
+                    },
+                ],
+            )
+
+    def test_nul_delimited_diff_preserves_control_character_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = GitFixture(Path(temp_dir))
+            fixture.write("README.md", "old\n")
+            old = fixture.commit("old floor")
+            unusual_path = "upstream/odd\tname.rs"
+            fixture.write(unusual_path, "candidate\n")
+            candidate = fixture.commit("candidate floor")
+            map_path, policy_path = fixture.authorities(old, [], [], [])
+
+            result, report = self.run_classifier(
+                fixture, old, candidate, map_path, policy_path
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(report["summary"]["changed_file_count"], 1)
+            self.assertEqual(report["changed_files"][0]["path"], unusual_path)
+            self.assertEqual(report["changed_files"][0]["status_code"], "A")
+            self.assertEqual(
+                report["diagnostics"]["items"],
+                [
+                    {
+                        "code": "invalid_changed_path",
+                        "message": (
+                            "git changed path is not normalized repo-relative POSIX"
+                        ),
+                        "path": unusual_path,
+                    }
+                ],
+            )
+
     def test_unrelated_candidate_history_fails_with_complete_relationship(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = GitFixture(Path(temp_dir))
