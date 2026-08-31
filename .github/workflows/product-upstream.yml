@@ -1,37 +1,274 @@
-name: Product upstream floor
+name: Product upstream convergence
 
 on:
   push:
-    paths:
-      - product/upstream/**
-      - scripts/check-product-upstream-floor.py
-      - tests/product_upstream_floor_test.sh
-      - .github/workflows/product-upstream.yml
+    branches:
+      - feat/pluggable-memory-providers-v2
+      - "sync/upstream/**"
   pull_request:
-    paths:
-      - product/upstream/**
-      - scripts/check-product-upstream-floor.py
-      - tests/product_upstream_floor_test.sh
-      - .github/workflows/product-upstream.yml
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: product-upstream-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  verify:
+  upstream_required:
+    name: "[tdmem-1206][required][upstream_required]"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Install pinned cargo-nextest
+        uses: taiki-e/install-action@acdba816b0980ba6b63f1109f89a046e15fc301a # nextest
+      - name: Verify upstream floor and change ownership
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tests/product_upstream_floor_test.sh
+          python3 scripts/check-product-upstream-floor.py --repo . --metadata product/upstream/tracedecay-v2-pr707.json
+          python3 tests/product_upstream_vendor_floor_test.py
+          python3 tests/product_upstream_change_classification_test.py
+          python3 tests/product_upstream_ownership_registry_test.py
+          python3 scripts/product/check-upstream-ownership-registry.py --repo .
+          cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers
+          cargo check --workspace --all-targets --features test-transport --locked
+          cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked
+      - name: Record upstream gate ownership
+        if: always()
+        shell: bash
+        run: echo "bead=tdmem-1206 area=upstream_required required=true result=${{ job.status }} commit=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+  product_contracts:
+    name: "[tdmem-1206][required][product_contracts]"
+    needs: upstream_required
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify provider contracts and architecture rules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test_file in \
+            tests/product_provider_registry_contract_test.py \
+            tests/product_provider_handshake_contract_test.py \
+            tests/product_provider_observation_contract_test.py \
+            tests/product_provider_recall_contract_test.py \
+            tests/product_provider_lifecycle_contract_test.py \
+            tests/product_provider_terminal_contract_test.py \
+            tests/product_memory_provider_contract_set_test.py \
+            tests/product_memory_provider_rust_bindings_test.py \
+            tests/product_memory_dependency_policy_test.py \
+            tests/product_memory_dependency_direction_test.py \
+            tests/product_patch_footprint_policy_test.py
+          do
+            python3 "$test_file"
+          done
+          python3 scripts/product/check-memory-provider-contract-set.py --repo .
+          python3 scripts/product/check-memory-provider-rust-bindings.py --repo .
+          python3 scripts/product/check-memory-dependency-policy.py --repo . --policy product/upstream/patch-footprint-policy.json
+          python3 scripts/product/check-memory-dependency-direction.py --repo . --policy product/architecture/memory-dependency-policy.json
+          python3 scripts/product/check-patch-footprint-policy.py --repo . --policy product/upstream/patch-footprint-policy.json --map product/upstream/convergence-map.json
+      - name: Record product contract ownership
+        if: always()
+        shell: bash
+        run: echo "bead=tdmem-1206 area=product_contracts required=true result=${{ job.status }} commit=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+  native_parity:
+    name: "[tdmem-1206][required][native_parity]"
+    needs: product_contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Verify Native adapter and direct-provider parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-provider-native --locked
+          cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_recall_ -- --nocapture
+          python3 tests/product_memory_composition_feature_test.py
+          python3 scripts/product/check-memory-composition-feature.py --repo .
+      - name: Record Native parity ownership
+        if: always()
+        shell: bash
+        run: echo "bead=tdmem-1206 area=native_parity required=true result=${{ job.status }} commit=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+  provider_conformance:
+    name: "[tdmem-1206][required][provider_conformance]"
+    needs: native_parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Verify common fabric and provider conformance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-provider-api --locked
+          cargo test -p tracedecay-memory-fabric --locked
+          cargo test -p tracedecay-memory-provider-registry --locked
+          cargo test -p tracedecay-memory-conformance --locked
+          cargo test --manifest-path product/conformance/dummy-provider/Cargo.toml --locked
+          python3 scripts/product/check-dummy-provider-conformance.py --repo .
+          python3 tests/product_dummy_provider_conformance_test.py
+      - name: Record provider conformance ownership
+        if: always()
+        shell: bash
+        run: echo "bead=tdmem-1206 area=provider_conformance required=true result=${{ job.status }} commit=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+  scope_crash_security:
+    name: "[tdmem-1206][required][scope_crash_security]"
+    needs: provider_conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Verify scope, crash, restart, and shutdown behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification
+          cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline
+          cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1
+          python3 tests/product_memory_fabric_disabled_mode_test.py
+      - name: Record scope and reliability ownership
+        if: always()
+        shell: bash
+        run: echo "bead=tdmem-1206 area=scope_crash_security required=true result=${{ job.status }} commit=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+  generated_drift:
+    name: "[tdmem-1206][required][generated_drift]"
+    needs: scope_crash_security
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Verify generated contracts and clean output
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/product/generate-memory-provider-goldens.py --repo . --check
+          python3 scripts/product/check-memory-provider-contract-set.py --repo .
+          python3 scripts/product/generate-memory-provider-rust.py --repo . --check
+          python3 scripts/product/check-memory-provider-rust-bindings.py --repo .
+          cargo metadata --locked --format-version 1 --no-deps
+          git diff --check
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
+      - name: Record generated-drift ownership
+        if: always()
+        shell: bash
+        run: echo "bead=tdmem-1206 area=generated_drift required=true result=${{ job.status }} commit=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+  informational_macos_floor:
+    name: "[tdmem-1206][informational][macos_floor]"
+    runs-on: macos-latest
+    continue-on-error: true
+    timeout-minutes: 10
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify floor portability
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tests/product_upstream_floor_test.sh
+          python3 scripts/check-product-upstream-floor.py --repo . --metadata product/upstream/tracedecay-v2-pr707.json
+      - name: Record informational ownership
+        if: always()
+        shell: bash
+        run: echo "bead=tdmem-1206 area=macos_floor required=false result=${{ job.status }} commit=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+  convergence_result:
+    name: "[tdmem-1206][required][convergence_result]"
+    if: always()
+    needs:
+      - upstream_required
+      - product_contracts
+      - native_parity
+      - provider_conformance
+      - scope_crash_security
+      - generated_drift
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Check out complete history
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Run focused verifier tests
-        run: bash tests/product_upstream_floor_test.sh
-
-      - name: Verify the real checkout contains the pinned floor
+      - name: Report and enforce every required result
+        shell: bash
         run: |
-          python3 scripts/check-product-upstream-floor.py \
-            --repo . \
-            --metadata product/upstream/tracedecay-v2-pr707.json
+          set -euo pipefail
+          {
+            echo "| bead | area | required | result |"
+            echo "|---|---|---|---|"
+            echo "| tdmem-1206 | upstream_required | true | ${{ needs.upstream_required.result }} |"
+            echo "| tdmem-1206 | product_contracts | true | ${{ needs.product_contracts.result }} |"
+            echo "| tdmem-1206 | native_parity | true | ${{ needs.native_parity.result }} |"
+            echo "| tdmem-1206 | provider_conformance | true | ${{ needs.provider_conformance.result }} |"
+            echo "| tdmem-1206 | scope_crash_security | true | ${{ needs.scope_crash_security.result }} |"
+            echo "| tdmem-1206 | generated_drift | true | ${{ needs.generated_drift.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          required_results=(
+            "${{ needs.upstream_required.result }}"
+            "${{ needs.product_contracts.result }}"
+            "${{ needs.native_parity.result }}"
+            "${{ needs.provider_conformance.result }}"
+            "${{ needs.scope_crash_security.result }}"
+            "${{ needs.generated_drift.result }}"
+          )
+          for result in "${required_results[@]}"; do
+            if [[ "$result" != "success" ]]; then
+              echo "required convergence gate did not succeed: $result" >&2
+              exit 1
+            fi
+          done
