@@ -279,6 +279,30 @@
         "ADR-0004",
         "ADR-0005"
       ]
+    },
+    {
+      "id": "ADR-0010",
+      "topic": "native_provider_parity_projection",
+      "title": "Project Native behavior through the provider boundary with explicit semantic parity",
+      "path": "product/architecture/adr/ADR-0010-native-provider-parity-projection.md",
+      "status": "accepted",
+      "decision_summary": "Compare direct and provider-routed Native behavior through semantic goldens that preserve fact identity, content, order, fixed-point scores, explanations, provenance, current validity, and typed no-effect failures while documenting exact-scope, read-only recall, temporal, lifecycle, and envelope non-equivalences.",
+      "required_rejections": [
+        "Compare the complete provider envelope byte-for-byte with direct Native output",
+        "Treat the provider exact-scope envelope as a Native project/profile owner",
+        "Record Native retrieval telemetry during provider recall",
+        "Allow provider feedback to update Native trust"
+      ],
+      "verification_beads": [
+        "tdmem-0402",
+        "tdmem-0403",
+        "tdmem-0405"
+      ],
+      "depends_on_adrs": [
+        "ADR-0001",
+        "ADR-0002",
+        "ADR-0006"
+      ]
     }
   ]
 }
