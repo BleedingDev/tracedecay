@@ -20,6 +20,9 @@ from typing import Any, Iterable
 REPO = Path(__file__).resolve().parents[1]
 CORPUS = REPO / "product/evaluation/coding-memory-scenarios.v1.json"
 SCHEMA = REPO / "product/evaluation/coding-memory-scenarios.v1.schema.json"
+TERMINAL_CONTRACT = (
+    REPO / "product/contracts/memory-provider-v1/provider-terminal-contract.json"
+)
 
 EXPECTED_SCENARIOS = {
     "stale_project_change",
@@ -47,6 +50,13 @@ SCENARIO_FIELDS = {
     "expected_admissible_behavior",
     "adjudication_rubric",
 }
+
+CANONICAL_TERMINAL_CODES = frozenset(
+    entry["code"]
+    for entry in json.loads(TERMINAL_CONTRACT.read_text(encoding="utf-8"))[
+        "terminal_codes"
+    ]
+)
 
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
 PROVIDER_IMPLEMENTATION_NAMES = re.compile(r"(?i)\b(?:native|ncm|ocean)\b")
@@ -343,6 +353,15 @@ class CodingMemoryScenarioCorpusTest(unittest.TestCase):
             with self.subTest(scenario=scenario["id"]):
                 for term in required_terms[scenario["id"]]:
                     self.assertIn(term, text)
+
+    def test_allowed_terminal_outcomes_use_only_canonical_wire_values(self) -> None:
+        for scenario in self.corpus["scenarios"]:
+            with self.subTest(scenario=scenario["id"]):
+                outcomes = scenario["expected_admissible_behavior"][
+                    "allowed_terminal_outcomes"
+                ]
+                for outcome in outcomes:
+                    self.assertIn(outcome, CANONICAL_TERMINAL_CODES, outcome)
 
 
 if __name__ == "__main__":

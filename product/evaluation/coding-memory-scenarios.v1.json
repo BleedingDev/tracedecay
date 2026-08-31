@@ -1010,7 +1010,7 @@
           "Switch providers implicitly to hide the failure.",
           "Allow corrupt content to enter final context as a successful result."
         ],
-        "allowed_terminal_outcomes": ["state_corrupt", "provider_unavailable", "success_zero_results"],
+        "allowed_terminal_outcomes": ["state_incompatible", "provider_unavailable", "success_zero_results"],
         "provider_effect": "Integrity failure is read-only and cannot mutate TraceDecay authorities or source files."
       },
       "adjudication_rubric": {
@@ -1130,7 +1130,7 @@
           "Reintroduce the old note after provider restart.",
           "Delete unrelated project evidence as a side effect."
         ],
-        "allowed_terminal_outcomes": ["success", "success_zero_results", "capability_unsupported", "deletion_unverified"],
+        "allowed_terminal_outcomes": ["success", "success_zero_results", "capability_unsupported", "effect_unknown"],
         "provider_effect": "Deletion affects provider-local state and cannot rewrite source authority or unrelated facts."
       },
       "adjudication_rubric": {
