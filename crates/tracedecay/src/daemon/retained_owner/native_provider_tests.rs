@@ -957,6 +957,21 @@ async fn native_recall_current_preserves_order_and_projects_native_score_explain
         assert_eq!(candidate["provenance"]["state"], json!("available"));
         assert_eq!(candidate["provenance"]["origin_refs"], json!(source_refs));
         assert_eq!(candidate["provenance"]["source_refs"], json!(source_refs));
+        assert_eq!(
+            candidate["provenance"]["native_linkage"],
+            json!({
+                "outcome_history": {
+                    "state": "partial",
+                    "active_assertion_id": fact.active_assertion_id.to_string(),
+                    "last_event_id": fact.last_event_id.to_string(),
+                    "full_lineage": {
+                        "state": "unavailable",
+                        "reason": RECALL_HISTORY_UNAVAILABLE_REASON,
+                        "refs": [],
+                    },
+                },
+            })
+        );
         assert_eq!(candidate["provenance"]["observation_refs"], json!([]));
         assert_eq!(candidate["provenance"]["transform_chain"], json!([]));
         assert_eq!(candidate["provenance"]["provider_trace_refs"], json!([]));
@@ -965,6 +980,14 @@ async fn native_recall_current_preserves_order_and_projects_native_score_explain
             .as_str()
             .unwrap_or_default()
             .is_empty());
+        assert_eq!(
+            candidate["explanation"]["native_linkage_ref"],
+            json!("provenance.native_linkage")
+        );
+        assert_eq!(
+            candidate["explanation"]["native_score_ref"],
+            json!("native_score")
+        );
         assert_eq!(candidate["explanation"]["matched_features"], json!([]));
         assert_eq!(candidate["explanation"]["activation_trace_refs"], json!([]));
         assert_eq!(

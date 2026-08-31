@@ -77,6 +77,7 @@ const RECALL_BUDGET_DIAGNOSTIC: &str = "native.recall_budget_exhausted";
 const RECALL_SCORE_DOMAIN: &str = "tracedecay.native.project-memory.search.v1";
 const RECALL_SCORE_DOMAIN_VERSION: u32 = 1;
 const RECALL_CONTRACT_ID: &str = "tracedecay.memory.provider.recall.v1";
+const RECALL_HISTORY_UNAVAILABLE_REASON: &str = "native.recall_history_unsupported";
 
 /// Construction failures for the project-owned Native application port.
 #[derive(Debug)]
@@ -1496,13 +1497,20 @@ fn build_native_recall_reply(
         sha256_hex(&response_bytes),
     )
     .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
-    Ok(ProviderReply {
+    let reply = ProviderReply {
         terminal: terminal_for_call(call, terminal_code, None),
         payload: Some(payload),
         warnings: Vec::new(),
         extensions: call.extensions.clone(),
         state_generation: call.expected_state_generation,
-    })
+    };
+    match reply.validate(NATIVE_RESPONSE_BYTES) {
+        Ok(()) => Ok(reply),
+        Err(ApiError::BoundaryBytesExceeded { .. }) => {
+            Err(NativeReadFailure::RecallBudgetExhausted)
+        }
+        Err(_) => Err(NativeReadFailure::RecallProjectionInvalid),
+    }
 }
 
 const NATIVE_RESPONSE_BYTES: u64 = 8_192;
@@ -1523,6 +1531,26 @@ fn native_recall_candidate(
     let scores = hit.scores;
     let category = serde_json::to_value(&fact.category)
         .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
+    let score_components = serde_json::json!({
+        "score_millionths": scores.score_millionths,
+        "fts_score_millionths": scores.fts_score_millionths,
+        "jaccard_score_millionths": scores.jaccard_score_millionths,
+        "holographic_score_millionths": scores.holographic_score_millionths,
+        "trust_score_millionths": scores.trust_score_millionths,
+    });
+    let full_lineage_unavailable = serde_json::json!({
+        "state": "unavailable",
+        "reason": RECALL_HISTORY_UNAVAILABLE_REASON,
+        "refs": [],
+    });
+    let native_linkage = serde_json::json!({
+        "outcome_history": {
+            "state": "partial",
+            "active_assertion_id": fact.active_assertion_id.to_string(),
+            "last_event_id": fact.last_event_id.to_string(),
+            "full_lineage": full_lineage_unavailable,
+        },
+    });
     Ok(serde_json::json!({
         "candidate_id": format!("{}:{}", call.request_id, fact.fact_id),
         "stable_memory_ref": fact.fact_id.to_string(),
@@ -1538,13 +1566,7 @@ fn native_recall_candidate(
             "declared_maximum": "1.500000",
             "calibration_state": "provider_calibrated",
             "semantics": "project-memory combined score; fixed-point millionths",
-            "components": {
-                "score_millionths": scores.score_millionths,
-                "fts_score_millionths": scores.fts_score_millionths,
-                "jaccard_score_millionths": scores.jaccard_score_millionths,
-                "holographic_score_millionths": scores.holographic_score_millionths,
-                "trust_score_millionths": scores.trust_score_millionths,
-            },
+            "components": score_components,
         },
         "exact_scope_identity": exact_scope_value(call),
         "validity": {
@@ -1562,6 +1584,7 @@ fn native_recall_candidate(
             "origin_refs": source_refs,
             "observation_refs": [],
             "source_refs": fact_source_refs(fact),
+            "native_linkage": native_linkage,
             "transform_chain": [],
             "provider_trace_refs": [],
             "redaction_reason": Value::Null,
@@ -1570,6 +1593,8 @@ fn native_recall_candidate(
             "summary": summary,
             "matched_features": [],
             "activation_trace_refs": [],
+            "native_linkage_ref": "provenance.native_linkage",
+            "native_score_ref": "native_score",
             "limitations": ["native score is not host-normalized"],
         },
         "source_refs": fact_source_refs(fact),
