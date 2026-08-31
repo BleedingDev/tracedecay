@@ -22,7 +22,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use tracedecay_memory_provider_api::contract::{FallbackEligibility, TerminalCode};
+use tracedecay_memory_provider_api::contract::{CAPABILITIES, FallbackEligibility, TerminalCode};
 use tracedecay_memory_provider_api::{
     ApiError, FallbackDirective, HandshakeRequest, HandshakeResponse, MemoryProvider,
     OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderDescriptor,
@@ -380,6 +380,53 @@ impl Drop for Permit<'_> {
     }
 }
 
+/// Whether a provider registration has a retained, successful handshake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderReadiness {
+    /// A successful handshake is retained for the accepted registration.
+    Ready,
+    /// The registration has no currently retained successful handshake.
+    NotReady,
+}
+
+impl ProviderReadiness {
+    /// Returns whether this registration is ready for provider operations.
+    #[must_use]
+    pub const fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
+/// Availability of one provider capability in a status projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderCapabilityAvailability {
+    /// The accepted descriptor declares a known capability and readiness is retained.
+    SupportedReady,
+    /// The accepted descriptor declares a known capability without retained readiness.
+    SupportedNotReady,
+    /// The accepted descriptor does not declare this capability.
+    Undeclared,
+    /// The provider declared an identifier outside the canonical capability catalog.
+    DataUnavailable,
+}
+
+impl ProviderCapabilityAvailability {
+    /// Returns whether the accepted descriptor declares this capability.
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        matches!(self, Self::SupportedReady | Self::SupportedNotReady)
+    }
+
+    /// Returns whether this capability is supported by a ready registration.
+    #[must_use]
+    pub const fn is_ready(self) -> bool {
+        matches!(self, Self::SupportedReady)
+    }
+}
+
+/// Compatibility alias for callers that refer to capability states as status.
+pub type ProviderCapabilityStatus = ProviderCapabilityAvailability;
+
 /// Immutable provider status returned in canonical provider-ID order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderStatus {
@@ -391,6 +438,32 @@ pub struct ProviderStatus {
     pub mode: ProviderMode,
     /// Descriptor captured when the registration was accepted.
     pub descriptor: ProviderDescriptor,
+    /// Truthful readiness derived from retained successful handshake state.
+    pub readiness: ProviderReadiness,
+    /// Per-capability availability, including canonical undeclared capabilities.
+    pub capabilities: BTreeMap<OwnedVersionedId, ProviderCapabilityAvailability>,
+    /// Effective limits from the retained successful handshake, if any.
+    pub effective_limits: Option<ProviderLimits>,
+    /// Ready-receipt digest from the retained successful handshake, if any.
+    pub ready_receipt_sha256: Option<String>,
+}
+
+impl ProviderStatus {
+    /// Returns the typed availability of a queried capability identifier.
+    #[must_use]
+    pub fn capability_availability(&self, capability_id: &str) -> ProviderCapabilityAvailability {
+        self.capabilities
+            .iter()
+            .find(|(declared, _)| declared.as_str() == capability_id)
+            .map(|(_, availability)| *availability)
+            .unwrap_or(ProviderCapabilityAvailability::Undeclared)
+    }
+
+    /// Returns the typed availability of a queried capability identifier.
+    #[must_use]
+    pub fn capability_status(&self, capability_id: &str) -> ProviderCapabilityAvailability {
+        self.capability_availability(capability_id)
+    }
 }
 
 /// Structurally isolated result of observation delivery.
@@ -511,13 +584,83 @@ impl MemoryFabric {
             .map_err(|_| FabricError::RegistryPoisoned)?;
         Ok(registrations
             .iter()
-            .map(|(provider_id, registration)| ProviderStatus {
-                provider_id: provider_id.clone(),
-                registration_revision: registration.revision,
-                mode: registration.mode,
-                descriptor: registration.descriptor.clone(),
+            .map(|(provider_id, registration)| {
+                let readiness = Self::retained_readiness(registration);
+                ProviderStatus {
+                    provider_id: provider_id.clone(),
+                    registration_revision: registration.revision,
+                    mode: registration.mode,
+                    descriptor: registration.descriptor.clone(),
+                    readiness: if readiness.is_some() {
+                        ProviderReadiness::Ready
+                    } else {
+                        ProviderReadiness::NotReady
+                    },
+                    capabilities: Self::status_capabilities(&registration.descriptor, readiness),
+                    effective_limits: readiness.map(|readiness| readiness.effective_limits),
+                    ready_receipt_sha256: readiness
+                        .map(|readiness| readiness.ready_receipt_sha256.clone()),
+                }
             })
             .collect())
+    }
+
+    fn retained_readiness(registration: &Registration) -> Option<&Readiness> {
+        let readiness = registration.readiness.as_ref()?;
+        if registration.mode == ProviderMode::Disabled
+            || readiness.epoch != registration.readiness_epoch
+            || readiness.registration_revision != registration.revision
+            || readiness.capabilities != registration.descriptor.capabilities
+            || readiness.state_generation != registration.accepted_state_generation
+            || readiness.provider_instance_id.trim().is_empty()
+            || readiness.state_namespace.trim().is_empty()
+        {
+            None
+        } else {
+            Some(readiness)
+        }
+    }
+
+    fn status_capabilities(
+        descriptor: &ProviderDescriptor,
+        readiness: Option<&Readiness>,
+    ) -> BTreeMap<OwnedVersionedId, ProviderCapabilityAvailability> {
+        let mut capabilities = BTreeMap::new();
+        for capability in &descriptor.capabilities {
+            capabilities.insert(
+                capability.clone(),
+                Self::status_capability_availability(descriptor, readiness, capability),
+            );
+        }
+        for specification in CAPABILITIES {
+            if let Ok(capability) = OwnedVersionedId::new(specification.capability_id) {
+                capabilities.entry(capability.clone()).or_insert_with(|| {
+                    Self::status_capability_availability(descriptor, readiness, &capability)
+                });
+            }
+        }
+        capabilities
+    }
+
+    fn status_capability_availability(
+        descriptor: &ProviderDescriptor,
+        readiness: Option<&Readiness>,
+        capability: &OwnedVersionedId,
+    ) -> ProviderCapabilityAvailability {
+        if !descriptor.capabilities.contains(capability) {
+            return ProviderCapabilityAvailability::Undeclared;
+        }
+        if !CAPABILITIES
+            .iter()
+            .any(|specification| specification.capability_id == capability.as_str())
+        {
+            return ProviderCapabilityAvailability::DataUnavailable;
+        }
+        if readiness.is_some_and(|readiness| readiness.capabilities.contains(capability)) {
+            ProviderCapabilityAvailability::SupportedReady
+        } else {
+            ProviderCapabilityAvailability::SupportedNotReady
+        }
     }
 
     /// Performs a bounded read-only handshake for a non-disabled provider.

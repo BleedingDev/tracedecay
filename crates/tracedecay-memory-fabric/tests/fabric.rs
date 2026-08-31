@@ -6,7 +6,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use tracedecay_memory_fabric::{
-    FabricConfig, FabricError, MemoryFabric, ObserverReceipt, ProviderMode,
+    FabricConfig, FabricError, MemoryFabric, ObserverReceipt, ProviderCapabilityAvailability,
+    ProviderMode, ProviderReadiness,
 };
 use tracedecay_memory_provider_api::contract::{
     CommittedEffectState, FallbackEligibility, TerminalCode,
@@ -1831,5 +1832,93 @@ fn statuses_are_deterministic_and_mode_changes_require_revision() -> Result<(), 
     assert_eq!(statuses[0].provider_id.as_str(), "provider.a");
     assert_eq!(statuses[0].mode, ProviderMode::Active);
     assert_eq!(statuses[1].provider_id.as_str(), "provider.b");
+    Ok(())
+}
+
+#[test]
+fn status_reports_declared_capabilities_as_not_ready_before_handshake() -> Result<(), Box<dyn Error>>
+{
+    let provider_name = "provider.status-before-handshake";
+    let fabric = MemoryFabric::new(FabricConfig::new(1, 1)?)?;
+    let provider = TestProvider::new(
+        provider_name,
+        &["feedback.record.v1", "vendor.extension.v1"],
+    )?;
+    fabric.register(
+        provider_id(provider_name)?,
+        1,
+        ProviderMode::Active,
+        Arc::new(provider),
+    )?;
+
+    let status = &fabric.statuses()?[0];
+    assert_eq!(status.readiness, ProviderReadiness::NotReady);
+    assert_eq!(status.effective_limits, None);
+    assert_eq!(status.ready_receipt_sha256, None);
+    assert_eq!(
+        status.capability_availability("provider.health.v1"),
+        ProviderCapabilityAvailability::SupportedNotReady
+    );
+    assert_eq!(
+        status.capability_availability("feedback.record.v1"),
+        ProviderCapabilityAvailability::SupportedNotReady
+    );
+    assert_eq!(
+        status.capability_availability("correction.apply.v1"),
+        ProviderCapabilityAvailability::Undeclared
+    );
+    assert_eq!(
+        status.capability_availability("vendor.extension.v1"),
+        ProviderCapabilityAvailability::DataUnavailable
+    );
+    Ok(())
+}
+
+#[test]
+fn status_reflects_retained_handshake_limits_receipt_and_readiness() -> Result<(), Box<dyn Error>> {
+    let provider_name = "provider.status-after-handshake";
+    let fabric = MemoryFabric::new(FabricConfig::new(1, 1)?)?;
+    let mut provider = TestProvider::new(provider_name, &["feedback.record.v1"])?;
+    let mut provider_limits = limits();
+    provider_limits.request_bytes = 2048;
+    provider_limits.response_bytes = 4096;
+    provider_limits.observation_batch_items = 4;
+    provider_limits.recall_candidates = 8;
+    provider.descriptor.limits = provider_limits;
+    fabric.register(
+        provider_id(provider_name)?,
+        1,
+        ProviderMode::Active,
+        Arc::new(provider),
+    )?;
+
+    fabric.handshake(&handshake_request(provider_name)?)?;
+    let status = &fabric.statuses()?[0];
+    assert_eq!(status.readiness, ProviderReadiness::Ready);
+    assert_eq!(status.effective_limits, Some(provider_limits));
+    assert_eq!(status.ready_receipt_sha256.as_deref(), Some(DIGEST));
+    assert_eq!(
+        status.capability_availability("provider.health.v1"),
+        ProviderCapabilityAvailability::SupportedReady
+    );
+    assert_eq!(
+        status.capability_availability("feedback.record.v1"),
+        ProviderCapabilityAvailability::SupportedReady
+    );
+
+    fabric.set_mode(&provider_id(provider_name)?, 1, ProviderMode::Disabled)?;
+    let status = &fabric.statuses()?[0];
+    assert_eq!(status.readiness, ProviderReadiness::NotReady);
+    assert_eq!(status.effective_limits, None);
+    assert_eq!(status.ready_receipt_sha256, None);
+    assert_eq!(
+        status.capability_availability("provider.health.v1"),
+        ProviderCapabilityAvailability::SupportedNotReady
+    );
+
+    fabric.set_mode(&provider_id(provider_name)?, 1, ProviderMode::Active)?;
+    let status = &fabric.statuses()?[0];
+    assert_eq!(status.readiness, ProviderReadiness::NotReady);
+    assert_eq!(status.effective_limits, None);
     Ok(())
 }

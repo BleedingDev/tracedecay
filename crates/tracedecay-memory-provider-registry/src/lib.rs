@@ -33,7 +33,8 @@ use std::sync::Arc;
 
 use tracedecay_memory_fabric::MemoryFabric;
 pub use tracedecay_memory_fabric::{
-    FabricConfig, FabricError, ObserverReceipt, ProviderMode, ProviderStatus,
+    FabricConfig, FabricError, ObserverReceipt, ProviderCapabilityAvailability, ProviderMode,
+    ProviderReadiness, ProviderStatus,
 };
 // Re-export the narrow provider-neutral surface that product composition needs
 // to implement an application port. The product crate deliberately depends on

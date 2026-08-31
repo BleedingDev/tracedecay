@@ -20,7 +20,8 @@ use tracedecay_memory_provider_native::{
 };
 use tracedecay_memory_provider_registry::{
     EnabledProviderMode, FabricConfig, FabricError, NativeProviderActivation, ObserverReceipt,
-    ProjectMemoryProviderComposition, ProviderMode, RegistryError,
+    ProjectMemoryProviderComposition, ProviderCapabilityAvailability, ProviderMode,
+    ProviderReadiness, RegistryError,
 };
 
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -450,6 +451,57 @@ fn enabled_mode_injects_native_with_configured_revision_mode_and_limits()
         assert_eq!(statuses[0].descriptor.limits, native_limits);
         assert!(port.descriptor_calls.load(Ordering::Relaxed) >= 2);
     }
+    Ok(())
+}
+
+#[test]
+fn statuses_project_readiness_capabilities_and_effective_limits() -> Result<(), Box<dyn Error>> {
+    let port = Arc::new(EvidenceNativePort::new());
+    let composition =
+        ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
+            fabric_config: config(1, 2),
+            port,
+            registration_revision: 31,
+            mode: EnabledProviderMode::Active,
+        })?;
+    let registry = composition.registry().expect("enabled registry");
+
+    let before_handshake = registry.statuses()?;
+    assert_eq!(before_handshake.len(), 1);
+    let before_handshake = &before_handshake[0];
+    assert_eq!(before_handshake.readiness, ProviderReadiness::NotReady);
+    assert_eq!(before_handshake.effective_limits, None);
+    assert_eq!(
+        before_handshake.capability_availability("provider.health.v1"),
+        ProviderCapabilityAvailability::SupportedNotReady
+    );
+    assert_eq!(
+        before_handshake.capability_availability("recall.query.v1"),
+        ProviderCapabilityAvailability::SupportedNotReady
+    );
+
+    let handshake_response = registry.handshake(&handshake())?;
+    let after_handshake = registry.statuses()?;
+    assert_eq!(after_handshake.len(), 1);
+    let after_handshake = &after_handshake[0];
+    assert_eq!(after_handshake.readiness, ProviderReadiness::Ready);
+    assert_eq!(after_handshake.effective_limits, Some(limits()));
+    assert_eq!(
+        after_handshake.effective_limits,
+        handshake_response.effective_limits
+    );
+    assert_eq!(
+        after_handshake.capability_availability("provider.health.v1"),
+        ProviderCapabilityAvailability::SupportedReady
+    );
+    assert_eq!(
+        after_handshake.capability_availability("recall.query.v1"),
+        ProviderCapabilityAvailability::SupportedReady
+    );
+    assert_eq!(
+        after_handshake.ready_receipt_sha256.as_deref(),
+        Some(ONE_SHA)
+    );
     Ok(())
 }
 
