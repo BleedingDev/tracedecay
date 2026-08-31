@@ -9,17 +9,22 @@ use tracedecay_memory_provider_api::contract::{
     CommittedEffectState, FallbackEligibility, TerminalCode,
 };
 use tracedecay_memory_provider_api::{
-    CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
+    ApiError, CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
     HandshakeRequest, HandshakeRequestParts, HandshakeResponse, MemoryProvider, OperationControl,
     OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderCallParts,
     ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
 };
 use tracedecay_memory_provider_native::{
     NATIVE_PROVIDER_ID, NativeAdapterError, NativeMemoryApplicationPort, NativeProvider,
+    OBSERVATION_CONTRACT_ID,
 };
 
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const ONE_SHA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const FIXTURE_SHA: &str = "ffbc2dfc402782325da71132100e74ff511d1585dd80e4ea196ed4bcace3fef2";
+const FACT_SHAPED_OBSERVATION_SHA: &str =
+    "345f350426c8d55ebaa4b10c41862eaeae8b910cd3dceb939ef3d256885c5c6d";
+const FACT_SHAPED_OBSERVATION: &[u8] = b"{\"native_fact\":{\"owner\":\"project\",\"trust\":0.9,\"temporal\":\"current\",\"receipt\":\"receipt\"}}";
 
 #[derive(Default)]
 struct Counters {
@@ -29,11 +34,12 @@ struct Counters {
     observe: AtomicUsize,
     recall: AtomicUsize,
     lifecycle: AtomicUsize,
-    reject: AtomicUsize,
 }
 
 struct MockNativePort {
     descriptor: ProviderDescriptor,
+    followup_descriptor: Mutex<Option<ProviderDescriptor>>,
+    observation_code: TerminalCode,
     counters: Counters,
     last_call: Mutex<Option<ProviderCall>>,
     last_handshake: Mutex<Option<HandshakeRequest>>,
@@ -61,10 +67,30 @@ impl MockNativePort {
                 limits(),
             )
             .expect("descriptor"),
+            followup_descriptor: Mutex::new(None),
+            observation_code: TerminalCode::Success,
             counters: Counters::default(),
             last_call: Mutex::new(None),
             last_handshake: Mutex::new(None),
         }
+    }
+
+    fn with_followup_descriptor(
+        provider_id: &str,
+        optional: &[&str],
+        followup_descriptor: ProviderDescriptor,
+    ) -> Self {
+        let port = Self::new(provider_id, optional);
+        *port
+            .followup_descriptor
+            .lock()
+            .expect("followup descriptor lock") = Some(followup_descriptor);
+        port
+    }
+
+    fn with_observation_code(mut self, observation_code: TerminalCode) -> Self {
+        self.observation_code = observation_code;
+        self
     }
 
     fn terminal(&self, call: &ProviderCall, code: TerminalCode) -> ProviderReply {
@@ -114,7 +140,16 @@ impl MockNativePort {
 
 impl NativeMemoryApplicationPort for MockNativePort {
     fn descriptor(&self) -> ProviderDescriptor {
-        self.counters.descriptor.fetch_add(1, Ordering::Relaxed);
+        let call_index = self.counters.descriptor.fetch_add(1, Ordering::Relaxed);
+        if call_index > 0
+            && let Some(descriptor) = self
+                .followup_descriptor
+                .lock()
+                .expect("followup descriptor lock")
+                .as_ref()
+        {
+            return descriptor.clone();
+        }
         self.descriptor.clone()
     }
 
@@ -152,7 +187,7 @@ impl NativeMemoryApplicationPort for MockNativePort {
     fn observe(&self, call: &ProviderCall) -> ProviderReply {
         self.counters.observe.fetch_add(1, Ordering::Relaxed);
         self.record(call);
-        self.terminal(call, TerminalCode::Success)
+        self.terminal(call, self.observation_code)
     }
 
     fn recall(&self, call: &ProviderCall) -> ProviderReply {
@@ -165,16 +200,6 @@ impl NativeMemoryApplicationPort for MockNativePort {
         self.counters.lifecycle.fetch_add(1, Ordering::Relaxed);
         self.record(call);
         self.terminal(call, TerminalCode::Success)
-    }
-
-    fn reject(
-        &self,
-        call: &ProviderCall,
-        terminal_code: TerminalCode,
-        _diagnostic_id: &'static str,
-    ) -> ProviderReply {
-        self.counters.reject.fetch_add(1, Ordering::Relaxed);
-        self.terminal(call, terminal_code)
     }
 }
 
@@ -204,6 +229,23 @@ fn scope() -> OwnedExactScope {
     .expect("scope")
 }
 
+fn operation_contract_id(operation: ProviderOperation) -> &'static str {
+    match operation {
+        ProviderOperation::Handshake => "tracedecay.memory.provider.handshake.v1",
+        ProviderOperation::Health => "tracedecay.memory.provider.health.v1",
+        ProviderOperation::Observe => OBSERVATION_CONTRACT_ID,
+        ProviderOperation::Recall => "tracedecay.memory.provider.recall.v1",
+        ProviderOperation::Feedback => "tracedecay.memory.provider.feedback.v1",
+        ProviderOperation::Maintenance => "tracedecay.memory.provider.maintenance.v1",
+        ProviderOperation::Inspection => "tracedecay.memory.provider.inspection.v1",
+        ProviderOperation::Correction => "tracedecay.memory.provider.correction.v1",
+        ProviderOperation::DeleteBySource => "tracedecay.memory.provider.deletion-by-source.v1",
+        ProviderOperation::SnapshotExport => "tracedecay.memory.provider.snapshot-export.v1",
+        ProviderOperation::SnapshotRestore => "tracedecay.memory.provider.snapshot-restore.v1",
+        ProviderOperation::Replay => "tracedecay.memory.provider.replay.v1",
+    }
+}
+
 fn call(provider_id: &str, operation: ProviderOperation) -> ProviderCall {
     ProviderCall::new(ProviderCallParts {
         operation,
@@ -219,9 +261,9 @@ fn call(provider_id: &str, operation: ProviderOperation) -> ProviderCall {
             .then(|| "idempotency-a".to_owned()),
         control: OperationControl::new(i64::MAX, 500, CancellationToken::new()),
         payload: CanonicalPayload::new(
-            OwnedVersionedId::new("tracedecay.memory.test-payload.v1").expect("payload contract"),
+            OwnedVersionedId::new(operation_contract_id(operation)).expect("payload contract"),
             b"{\"fixture\":true}".to_vec(),
-            ONE_SHA,
+            FIXTURE_SHA,
         )
         .expect("payload"),
         required_capabilities: vec![
@@ -260,6 +302,149 @@ fn constructor_rejects_non_native_identity() {
             expected: NATIVE_PROVIDER_ID,
             declared: "vendor.memory".to_owned(),
         })
+    );
+}
+
+#[test]
+fn constructor_rejects_a_mutated_invalid_descriptor() {
+    let mut port = MockNativePort::new(NATIVE_PROVIDER_ID, &[]);
+    port.descriptor
+        .capabilities
+        .retain(|capability| capability.as_str() != "recall.query.v1");
+    let result = NativeProvider::new(Arc::new(port));
+    assert_eq!(
+        result.err(),
+        Some(NativeAdapterError::InvalidDescriptor(
+            ApiError::MandatoryCapabilityMissing("recall.query.v1")
+        ))
+    );
+}
+
+#[test]
+fn descriptor_generation_advances_without_changing_immutable_fields() {
+    let initial = MockNativePort::new(NATIVE_PROVIDER_ID, &["feedback.record.v1"]);
+    let mut advanced = initial.descriptor.clone();
+    advanced.state_generation = 8;
+    let port = Arc::new(MockNativePort::with_followup_descriptor(
+        NATIVE_PROVIDER_ID,
+        &["feedback.record.v1"],
+        advanced,
+    ));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+
+    let descriptor = provider.descriptor();
+    assert_eq!(descriptor.state_generation, 8);
+    assert!(descriptor.supports("feedback.record.v1"));
+    assert_eq!(port.counters.descriptor.load(Ordering::Relaxed), 2);
+
+    let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Feedback);
+    let reply = provider.invoke(&request);
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(port.counters.lifecycle.load(Ordering::Relaxed), 1);
+    assert_eq!(port.counters.descriptor.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn descriptor_immutable_drift_is_blocked_before_operation_dispatch() {
+    for drift in ["capability", "identity"] {
+        let initial = MockNativePort::new(NATIVE_PROVIDER_ID, &["feedback.record.v1"]);
+        let mut drifted = initial.descriptor.clone();
+        drifted.state_generation = 8;
+        if drift == "capability" {
+            drifted
+                .capabilities
+                .retain(|capability| capability.as_str() != "feedback.record.v1");
+        } else {
+            drifted.provider_id = OwnedProviderId::new("vendor.memory").expect("drifted id");
+        }
+        let port = Arc::new(MockNativePort::with_followup_descriptor(
+            NATIVE_PROVIDER_ID,
+            &["feedback.record.v1"],
+            drifted,
+        ));
+        let provider = NativeProvider::new(port.clone()).expect("adapter");
+
+        let descriptor = provider.descriptor();
+        assert_eq!(descriptor.provider_id.as_str(), NATIVE_PROVIDER_ID);
+        assert_eq!(descriptor.state_generation, 7);
+        assert!(descriptor.supports("feedback.record.v1"));
+
+        let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Feedback);
+        let reply = provider.invoke(&request);
+        assert_eq!(
+            reply.terminal.terminal_code(),
+            TerminalCode::ContractViolation
+        );
+        assert_eq!(
+            reply.terminal.diagnostic_id(),
+            Some("native.descriptor_drift")
+        );
+        assert_eq!(port.counters.lifecycle.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn descriptor_generation_regression_is_blocked_before_operation_dispatch() {
+    let initial = MockNativePort::new(NATIVE_PROVIDER_ID, &[]);
+    let mut regressed = initial.descriptor.clone();
+    regressed.state_generation = 6;
+    let port = Arc::new(MockNativePort::with_followup_descriptor(
+        NATIVE_PROVIDER_ID,
+        &[],
+        regressed,
+    ));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+
+    assert_eq!(provider.descriptor().state_generation, 7);
+    let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Health);
+    let reply = provider.invoke(&request);
+    assert_eq!(
+        reply.terminal.terminal_code(),
+        TerminalCode::ContractViolation
+    );
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some("native.descriptor_drift")
+    );
+    assert_eq!(port.counters.health.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn descriptor_drift_remains_latched_after_the_port_recovers() {
+    let initial = MockNativePort::new(NATIVE_PROVIDER_ID, &[]);
+    let mut drifted = initial.descriptor.clone();
+    drifted.state_schema_version = "native-state-v2".to_owned();
+    let port = Arc::new(MockNativePort::with_followup_descriptor(
+        NATIVE_PROVIDER_ID,
+        &[],
+        drifted,
+    ));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+
+    assert_eq!(
+        provider.descriptor().state_schema_version,
+        "native-state-v1"
+    );
+    *port
+        .followup_descriptor
+        .lock()
+        .expect("followup descriptor lock") = None;
+    let descriptor_calls = port.counters.descriptor.load(Ordering::Relaxed);
+
+    let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Health);
+    let reply = provider.invoke(&request);
+    assert_eq!(
+        reply.terminal.terminal_code(),
+        TerminalCode::ContractViolation
+    );
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some("native.descriptor_drift")
+    );
+    assert_eq!(port.counters.health.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        port.counters.descriptor.load(Ordering::Relaxed),
+        descriptor_calls
     );
 }
 
@@ -322,7 +507,125 @@ fn handshake_preserves_exact_scope_and_request_identity() {
 }
 
 #[test]
-fn mandatory_operations_route_without_payload_transformation() {
+fn invalid_handshake_envelopes_fail_before_native_contact() {
+    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+    let base = handshake(NATIVE_PROVIDER_ID);
+
+    let mut zero_revision = base.clone();
+    zero_revision.registration_revision = 0;
+    let mut invalid_scope = base.clone();
+    invalid_scope.exact_scope.profile_id.clear();
+    let mut malformed_request_id = base.clone();
+    malformed_request_id.request_id = "\n".to_owned();
+    let mut invalid_limits = base;
+    invalid_limits.host_limits.request_bytes = 0;
+
+    for request in [
+        zero_revision,
+        invalid_scope,
+        malformed_request_id,
+        invalid_limits,
+    ] {
+        let response = provider.handshake(&request);
+        assert_eq!(
+            response.terminal.terminal_code(),
+            TerminalCode::InvalidRequest
+        );
+        assert_eq!(
+            response.terminal.diagnostic_id(),
+            Some("native.handshake_request_invalid")
+        );
+        assert_eq!(response.terminal.provider_id().as_str(), NATIVE_PROVIDER_ID);
+        assert_eq!(
+            response.terminal.committed_effect().state(),
+            CommittedEffectState::None
+        );
+        assert!(response.descriptor.is_none());
+        assert!(response.provider_instance_id.is_none());
+        assert!(response.state_namespace.is_none());
+        assert!(response.accepted_scope.is_none());
+        assert!(response.effective_limits.is_none());
+        assert!(response.ready_receipt_sha256.is_none());
+        assert!(response.warnings.is_empty());
+    }
+
+    let wrong_target = handshake("vendor.memory");
+    let wrong_target_response = provider.handshake(&wrong_target);
+    assert_eq!(
+        wrong_target_response.terminal.terminal_code(),
+        TerminalCode::InvalidRequest
+    );
+    assert_eq!(
+        wrong_target_response.terminal.diagnostic_id(),
+        Some("native.provider_id_mismatch")
+    );
+    assert_eq!(
+        wrong_target_response.terminal.provider_id().as_str(),
+        NATIVE_PROVIDER_ID
+    );
+    assert_eq!(port.counters.descriptor.load(Ordering::Relaxed), 1);
+    assert_eq!(port.counters.handshake.load(Ordering::Relaxed), 0);
+    assert!(
+        port.last_handshake
+            .lock()
+            .expect("last handshake lock")
+            .is_none()
+    );
+}
+
+#[test]
+fn mutated_operation_envelopes_fail_before_all_native_contact() {
+    let port = Arc::new(MockNativePort::new(
+        NATIVE_PROVIDER_ID,
+        &["feedback.record.v1"],
+    ));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+
+    let mut stale_payload_digest = call(NATIVE_PROVIDER_ID, ProviderOperation::Health);
+    stale_payload_digest.payload.sha256 = ZERO_SHA.to_owned();
+    let mut invalid_scope = call(NATIVE_PROVIDER_ID, ProviderOperation::Recall);
+    invalid_scope.exact_scope.repository_identity.clear();
+    let mut missing_idempotency = call(NATIVE_PROVIDER_ID, ProviderOperation::Feedback);
+    missing_idempotency.idempotency_key = None;
+    let mut malformed_receipt = call(NATIVE_PROVIDER_ID, ProviderOperation::Recall);
+    malformed_receipt.ready_receipt_sha256 = "invalid".to_owned();
+    let mut malformed_request_id = call(NATIVE_PROVIDER_ID, ProviderOperation::Health);
+    malformed_request_id.request_id = "\n".to_owned();
+    let mut malformed_operation_id = call(NATIVE_PROVIDER_ID, ProviderOperation::Feedback);
+    malformed_operation_id.operation_id = "\n".to_owned();
+
+    for request in [
+        stale_payload_digest,
+        invalid_scope,
+        missing_idempotency,
+        malformed_receipt,
+        malformed_request_id,
+        malformed_operation_id,
+    ] {
+        let reply = provider.invoke(&request);
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
+        assert_eq!(
+            reply.terminal.diagnostic_id(),
+            Some("native.provider_call_invalid")
+        );
+        assert_eq!(
+            reply.terminal.committed_effect().state(),
+            CommittedEffectState::None
+        );
+        assert_eq!(reply.terminal.provider_receipt_sha256(), None);
+        assert_eq!(reply.payload, None);
+    }
+    assert_eq!(port.counters.descriptor.load(Ordering::Relaxed), 1);
+    assert_eq!(port.counters.health.load(Ordering::Relaxed), 0);
+    assert_eq!(port.counters.observe.load(Ordering::Relaxed), 0);
+    assert_eq!(port.counters.recall.load(Ordering::Relaxed), 0);
+    assert_eq!(port.counters.lifecycle.load(Ordering::Relaxed), 0);
+    assert!(port.last_call.lock().expect("last call lock").is_none());
+}
+
+#[test]
+fn supported_mandatory_operations_route_without_payload_transformation() {
     let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
     let provider = NativeProvider::new(port.clone()).expect("adapter");
     for operation in [
@@ -433,7 +736,6 @@ fn declared_optional_operation_routes_to_lifecycle_port() {
         FallbackEligibility::Forbidden
     );
     assert_eq!(port.counters.lifecycle.load(Ordering::Relaxed), 1);
-    assert_eq!(port.counters.reject.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -477,7 +779,6 @@ fn undeclared_optional_operation_is_explicitly_unsupported() {
     );
     assert_eq!(reply.state_generation, request.expected_state_generation);
     assert_eq!(port.counters.lifecycle.load(Ordering::Relaxed), 0);
-    assert_eq!(port.counters.reject.load(Ordering::Relaxed), 0);
     assert_eq!(
         port.counters.descriptor.load(Ordering::Relaxed),
         descriptor_calls
@@ -506,7 +807,6 @@ fn wrong_target_identity_is_rejected_before_native_operation() {
         FallbackEligibility::Forbidden
     );
     assert_eq!(port.counters.recall.load(Ordering::Relaxed), 0);
-    assert_eq!(port.counters.reject.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -531,19 +831,35 @@ fn handshake_operation_must_use_the_handshake_method() {
         FallbackEligibility::Forbidden
     );
     assert_eq!(port.counters.handshake.load(Ordering::Relaxed), 0);
-    assert_eq!(port.counters.reject.load(Ordering::Relaxed), 0);
 }
 
 #[test]
-fn provider_has_no_internal_memory_state() {
-    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+fn fact_shaped_generic_observation_is_rejected_by_native_authority() {
+    let port = Arc::new(
+        MockNativePort::new(NATIVE_PROVIDER_ID, &[])
+            .with_observation_code(TerminalCode::CapabilityUnsupported),
+    );
     let provider = NativeProvider::new(port.clone()).expect("adapter");
-    let before = provider.descriptor();
-    let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Observe);
+    let descriptor_calls = port.counters.descriptor.load(Ordering::Relaxed);
+    let mut request = call(NATIVE_PROVIDER_ID, ProviderOperation::Observe);
+    request.payload = CanonicalPayload::new(
+        OwnedVersionedId::new(OBSERVATION_CONTRACT_ID).expect("observation contract"),
+        FACT_SHAPED_OBSERVATION.to_vec(),
+        FACT_SHAPED_OBSERVATION_SHA,
+    )
+    .expect("fact-shaped observation");
     let reply = provider.invoke(&request);
     assert_eq!(
+        reply.terminal.terminal_code(),
+        TerminalCode::CapabilityUnsupported
+    );
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some("native.capability_unsupported")
+    );
+    assert_eq!(
         reply.terminal.committed_effect().state(),
-        CommittedEffectState::Committed
+        CommittedEffectState::None
     );
     assert_eq!(
         reply.terminal.committed_effect().state_generation_before(),
@@ -551,11 +867,82 @@ fn provider_has_no_internal_memory_state() {
     );
     assert_eq!(
         reply.terminal.committed_effect().state_generation_after(),
-        Some(reply.state_generation)
+        Some(request.expected_state_generation)
     );
-    assert_eq!(reply.terminal.provider_receipt_sha256(), Some(ONE_SHA));
-    assert_eq!(provider.descriptor(), before);
+    assert_eq!(reply.terminal.provider_receipt_sha256(), None);
+    assert_eq!(reply.payload, None);
+    assert_eq!(reply.state_generation, request.expected_state_generation);
+    assert_eq!(
+        port.counters.descriptor.load(Ordering::Relaxed),
+        descriptor_calls + 1
+    );
     assert_eq!(port.counters.observe.load(Ordering::Relaxed), 1);
+    let recorded = port
+        .last_call
+        .lock()
+        .expect("last call lock")
+        .clone()
+        .expect("recorded observation");
+    assert_eq!(recorded.payload, request.payload);
+    assert_eq!(recorded.exact_scope, request.exact_scope);
+}
+
+#[test]
+fn invalid_generic_observations_fail_before_native_contact() {
+    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+    let base = call(NATIVE_PROVIDER_ID, ProviderOperation::Observe);
+
+    let mut wrong_contract = base.clone();
+    wrong_contract.payload.contract_id =
+        OwnedVersionedId::new("tracedecay.memory.provider.recall.v1").expect("recall contract");
+    let wrong_contract_reply = provider.invoke(&wrong_contract);
+    assert_eq!(
+        wrong_contract_reply.terminal.terminal_code(),
+        TerminalCode::InvalidRequest
+    );
+
+    let mut stale_digest = base.clone();
+    stale_digest.payload.sha256 = ZERO_SHA.to_owned();
+    let stale_digest_reply = provider.invoke(&stale_digest);
+    assert_eq!(
+        stale_digest_reply.terminal.terminal_code(),
+        TerminalCode::InvalidRequest
+    );
+
+    let mut missing_idempotency = base;
+    missing_idempotency.idempotency_key = None;
+    let missing_idempotency_reply = provider.invoke(&missing_idempotency);
+    assert_eq!(
+        missing_idempotency_reply.terminal.terminal_code(),
+        TerminalCode::InvalidRequest
+    );
+
+    assert_eq!(
+        wrong_contract_reply.terminal.diagnostic_id(),
+        Some("native.observation_contract_invalid")
+    );
+    for reply in [&stale_digest_reply, &missing_idempotency_reply] {
+        assert_eq!(
+            reply.terminal.diagnostic_id(),
+            Some("native.provider_call_invalid")
+        );
+    }
+
+    for reply in [
+        wrong_contract_reply,
+        stale_digest_reply,
+        missing_idempotency_reply,
+    ] {
+        assert_eq!(
+            reply.terminal.committed_effect().state(),
+            CommittedEffectState::None
+        );
+        assert_eq!(reply.terminal.provider_receipt_sha256(), None);
+        assert_eq!(reply.payload, None);
+    }
+    assert_eq!(port.counters.observe.load(Ordering::Relaxed), 0);
+    assert_eq!(port.counters.descriptor.load(Ordering::Relaxed), 1);
 }
 
 #[test]

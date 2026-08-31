@@ -22,19 +22,25 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
-    HandshakeRequest, HandshakeResponse, MemoryProvider, OwnedProviderId, OwnedVersionedId,
-    ProviderCall, ProviderDescriptor, ProviderOperation, ProviderReply, TerminalRecord,
+    ApiError, HandshakeRequest, HandshakeResponse, MemoryProvider, ProviderCall,
+    ProviderDescriptor, ProviderOperation, ProviderReply, TerminalRecord,
 };
 
 /// Stable logical provider identity for TraceDecay Native memory.
 pub const NATIVE_PROVIDER_ID: &str = "tracedecay.native";
 
+/// Provider-neutral contract carried by an admitted observation call.
+pub const OBSERVATION_CONTRACT_ID: &str = "tracedecay.memory.provider.observation.v1";
+
 /// Construction failure before a Native adapter can be registered.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeAdapterError {
+    /// The application port exposed an invalid or incomplete descriptor.
+    InvalidDescriptor(ApiError),
     /// The supplied application port did not expose the stable Native identity.
     ProviderIdMismatch {
         /// Required stable identity.
@@ -47,6 +53,12 @@ pub enum NativeAdapterError {
 impl fmt::Display for NativeAdapterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidDescriptor(error) => {
+                write!(
+                    formatter,
+                    "Native application port descriptor is invalid: {error}"
+                )
+            }
             Self::ProviderIdMismatch { expected, declared } => write!(
                 formatter,
                 "Native application port declared provider {declared}, expected {expected}"
@@ -75,9 +87,13 @@ pub trait NativeMemoryApplicationPort: Send + Sync + 'static {
     /// Executes mandatory Native health without changing state.
     fn health(&self, call: &ProviderCall) -> ProviderReply;
 
-    /// Admits a provider observation through the existing Native application
-    /// policy. Arbitrary observations must not be converted into facts by the
-    /// adapter itself.
+    /// Maps or rejects one validated observation under Native authority.
+    ///
+    /// The adapter forwards the generic V1 envelope unchanged. The trusted
+    /// application implementation must explicitly authorize any promotion,
+    /// preserve owner, provenance, trust, temporal state, idempotency, and
+    /// receipts, and reject or stage non-equivalent observations rather than
+    /// canonicalizing arbitrary bytes into Native facts.
     fn observe(&self, call: &ProviderCall) -> ProviderReply;
 
     /// Executes existing Native recall and preserves Native ordering, scores,
@@ -86,23 +102,15 @@ pub trait NativeMemoryApplicationPort: Send + Sync + 'static {
 
     /// Executes one declared optional Native lifecycle or inspection operation.
     fn lifecycle(&self, call: &ProviderCall) -> ProviderReply;
-
-    /// Returns a typed Native rejection with the authoritative exact-scope
-    /// digest and diagnostic identity.
-    fn reject(
-        &self,
-        call: &ProviderCall,
-        terminal_code: TerminalCode,
-        diagnostic_id: &'static str,
-    ) -> ProviderReply;
 }
 
 /// Provider-neutral TraceDecay Native adapter over one existing application
 /// port.
 pub struct NativeProvider {
     port: Arc<dyn NativeMemoryApplicationPort>,
-    provider_id: OwnedProviderId,
-    declared_capabilities: Vec<OwnedVersionedId>,
+    descriptor: ProviderDescriptor,
+    state_generation: AtomicU64,
+    descriptor_drifted: AtomicBool,
 }
 
 impl NativeProvider {
@@ -110,17 +118,53 @@ impl NativeProvider {
     /// stable Native identity and the mandatory provider capabilities.
     pub fn new(port: Arc<dyn NativeMemoryApplicationPort>) -> Result<Self, NativeAdapterError> {
         let descriptor = port.descriptor();
+        descriptor
+            .validate()
+            .map_err(NativeAdapterError::InvalidDescriptor)?;
         if descriptor.provider_id.as_str() != NATIVE_PROVIDER_ID {
             return Err(NativeAdapterError::ProviderIdMismatch {
                 expected: NATIVE_PROVIDER_ID,
                 declared: descriptor.provider_id.as_str().to_owned(),
             });
         }
+        let state_generation = AtomicU64::new(descriptor.state_generation);
         Ok(Self {
             port,
-            provider_id: descriptor.provider_id,
-            declared_capabilities: descriptor.capabilities.into_iter().collect(),
+            descriptor,
+            state_generation,
+            descriptor_drifted: AtomicBool::new(false),
         })
+    }
+
+    fn descriptor_snapshot(&self) -> ProviderDescriptor {
+        let mut descriptor = self.descriptor.clone();
+        descriptor.state_generation = self.state_generation.load(Ordering::Acquire);
+        descriptor
+    }
+
+    fn refresh_descriptor(&self) -> Option<ProviderDescriptor> {
+        if self.descriptor_drifted.load(Ordering::Acquire) {
+            return None;
+        }
+        let candidate = self.port.descriptor();
+        if candidate.validate().is_err() || !same_immutable_descriptor(&self.descriptor, &candidate)
+        {
+            self.descriptor_drifted.store(true, Ordering::Release);
+            return None;
+        }
+
+        let previous_generation = self.state_generation.load(Ordering::Acquire);
+        if candidate.state_generation < previous_generation {
+            self.descriptor_drifted.store(true, Ordering::Release);
+            return None;
+        }
+        self.state_generation
+            .fetch_max(candidate.state_generation, Ordering::AcqRel);
+        if self.descriptor_drifted.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(self.descriptor_snapshot())
+        }
     }
 
     fn reject(
@@ -129,16 +173,21 @@ impl NativeProvider {
         terminal_code: TerminalCode,
         diagnostic_id: &'static str,
     ) -> ProviderReply {
+        let exact_scope_sha256 = if call.exact_scope.validate().is_ok() {
+            call.exact_scope.exact_scope_sha256()
+        } else {
+            String::new()
+        };
         let terminal = TerminalRecord::failure_before_dispatch(
             call.operation,
-            self.provider_id.clone(),
+            self.descriptor.provider_id.clone(),
             terminal_code,
             if call.operation_id.is_empty() {
                 "native.invalid-operation-id"
             } else {
                 call.operation_id.as_str()
             },
-            call.exact_scope.exact_scope_sha256(),
+            exact_scope_sha256,
             None,
             diagnostic_id,
         );
@@ -152,19 +201,93 @@ impl NativeProvider {
             state_generation: call.expected_state_generation,
         }
     }
+
+    fn validate_observation(&self, call: &ProviderCall) -> Option<ProviderReply> {
+        if !valid_generic_observation_payload(call) {
+            return Some(self.reject(
+                call,
+                TerminalCode::InvalidRequest,
+                "native.observation_contract_invalid",
+            ));
+        }
+        None
+    }
+
+    fn reject_handshake(
+        &self,
+        request: &HandshakeRequest,
+        terminal_code: TerminalCode,
+        diagnostic_id: &'static str,
+    ) -> HandshakeResponse {
+        let exact_scope_sha256 = if request.exact_scope.validate().is_ok() {
+            request.exact_scope.exact_scope_sha256()
+        } else {
+            String::new()
+        };
+        let terminal = TerminalRecord::failure_before_dispatch(
+            ProviderOperation::Handshake,
+            self.descriptor.provider_id.clone(),
+            terminal_code,
+            &request.request_id,
+            exact_scope_sha256,
+            None,
+            diagnostic_id,
+        );
+        HandshakeResponse {
+            terminal,
+            descriptor: None,
+            provider_instance_id: None,
+            state_namespace: None,
+            accepted_scope: None,
+            effective_limits: None,
+            ready_receipt_sha256: None,
+            warnings: Vec::new(),
+        }
+    }
 }
 
 impl MemoryProvider for NativeProvider {
     fn descriptor(&self) -> ProviderDescriptor {
-        self.port.descriptor()
+        match self.refresh_descriptor() {
+            Some(descriptor) => descriptor,
+            None => self.descriptor_snapshot(),
+        }
     }
 
     fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        if request.validate().is_err() {
+            return self.reject_handshake(
+                request,
+                TerminalCode::InvalidRequest,
+                "native.handshake_request_invalid",
+            );
+        }
+        if request.provider_id.as_str() != self.descriptor.provider_id.as_str() {
+            return self.reject_handshake(
+                request,
+                TerminalCode::InvalidRequest,
+                "native.provider_id_mismatch",
+            );
+        }
+        if self.refresh_descriptor().is_none() {
+            return self.reject_handshake(
+                request,
+                TerminalCode::ContractViolation,
+                "native.descriptor_drift",
+            );
+        }
         self.port.handshake(request)
     }
 
     fn invoke(&self, call: &ProviderCall) -> ProviderReply {
-        if call.provider_id.as_str() != self.provider_id.as_str() {
+        if call.validate().is_err() {
+            return self.reject(
+                call,
+                TerminalCode::InvalidRequest,
+                "native.provider_call_invalid",
+            );
+        }
+        if call.provider_id.as_str() != self.descriptor.provider_id.as_str() {
             return self.reject(
                 call,
                 TerminalCode::InvalidRequest,
@@ -178,16 +301,27 @@ impl MemoryProvider for NativeProvider {
                 "native.handshake_requires_handshake_port",
             );
         }
-        if !self
-            .declared_capabilities
-            .iter()
-            .any(|capability| capability.as_str() == call.operation.capability_id())
+        if call.operation == ProviderOperation::Observe
+            && let Some(rejection) = self.validate_observation(call)
         {
+            return rejection;
+        }
+        if !self.descriptor.supports(call.operation.capability_id()) {
             return self.reject(
                 call,
                 TerminalCode::CapabilityUnsupported,
                 "native.capability_unsupported",
             );
+        }
+        match self.refresh_descriptor() {
+            Some(_) => {}
+            None => {
+                return self.reject(
+                    call,
+                    TerminalCode::ContractViolation,
+                    "native.descriptor_drift",
+                );
+            }
         }
         match call.operation {
             ProviderOperation::Health => self.port.health(call),
@@ -204,8 +338,22 @@ impl MemoryProvider for NativeProvider {
             ProviderOperation::Handshake => self.reject(
                 call,
                 TerminalCode::InvalidRequest,
-                "native.handshake_requires_handshake_port",
+                "native.operation_dispatch_unreachable",
             ),
         }
     }
+}
+
+fn same_immutable_descriptor(left: &ProviderDescriptor, right: &ProviderDescriptor) -> bool {
+    left.provider_id == right.provider_id
+        && left.implementation_identity_sha256 == right.implementation_identity_sha256
+        && left.state_schema_version == right.state_schema_version
+        && left.protocol_major == right.protocol_major
+        && left.protocol_minor == right.protocol_minor
+        && left.capabilities == right.capabilities
+        && left.limits == right.limits
+}
+
+fn valid_generic_observation_payload(call: &ProviderCall) -> bool {
+    call.payload.contract_id.as_str() == OBSERVATION_CONTRACT_ID && call.validate().is_ok()
 }

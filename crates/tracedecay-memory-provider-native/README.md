@@ -5,9 +5,13 @@ This product-owned crate places the existing TraceDecay Native memory applicatio
 The adapter:
 
 - accepts only a port that declares the stable `tracedecay.native` identity;
-- routes mandatory health, observation, and recall calls without rewriting canonical payload or exact scope;
+- retains validated immutable identity, schema, protocol, capability, and limit fields while refreshing only monotonic Native state generation;
+- revalidates complete public handshake and operation envelopes before any Native application-port contact;
+- routes mandatory health and recall calls without rewriting canonical payload or exact scope;
+- validates generic observation envelopes before forwarding them unchanged to the trusted Native application port;
+- requires that application authority to reject or stage non-equivalent observations and authorize promotion only through a typed Native path that preserves owner, provenance, trust, temporal state, idempotency, and durable receipts;
 - routes only declared optional lifecycle capabilities;
-- delegates all terminal records, provenance, receipts, scoring, temporal state, and rejection diagnostics to the Native application authority;
+- delegates dispatched-operation terminal records, provenance, receipts, scoring, and temporal state to the Native application authority while constructing zero-contact boundary rejections locally;
 - contains no TraceDecay database, store, graph, code-index, daemon, host, dashboard, transport, NCM, or OCEAN dependency.
 
 M2 proves the boundary with a mock application port. M3 supplies the real owner-bound TraceDecay application bridge and direct-versus-provider parity journeys. No second fact store, score implementation, curation path, or persistence format is introduced here.

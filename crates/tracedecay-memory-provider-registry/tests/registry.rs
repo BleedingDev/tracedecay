@@ -26,6 +26,9 @@ use tracedecay_memory_provider_registry::{
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const ONE_SHA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const TWO_SHA: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const REGISTRY_PAYLOAD_SHA: &str =
+    "2bc217171d7030f82de2853ea3e4914b803d3504a3409433d62bf426a613d7ee";
+const OPAQUE_PAYLOAD_SHA: &str = "a4ebe309c7d7eaf1b08aec54feea5668a4b10a564770d162dbd7a131990d0de8";
 
 struct MockNativePort {
     descriptor: ProviderDescriptor,
@@ -64,15 +67,6 @@ impl NativeMemoryApplicationPort for MockNativePort {
     }
 
     fn lifecycle(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn reject(
-        &self,
-        _call: &ProviderCall,
-        _terminal_code: tracedecay_memory_provider_api::contract::TerminalCode,
-        _diagnostic_id: &'static str,
-    ) -> ProviderReply {
         unexpected_provider_contact()
     }
 }
@@ -218,15 +212,6 @@ impl NativeMemoryApplicationPort for EvidenceNativePort {
     fn lifecycle(&self, _call: &ProviderCall) -> ProviderReply {
         unexpected_provider_contact()
     }
-
-    fn reject(
-        &self,
-        _call: &ProviderCall,
-        _terminal_code: TerminalCode,
-        _diagnostic_id: &'static str,
-    ) -> ProviderReply {
-        unexpected_provider_contact()
-    }
 }
 
 fn limits() -> ProviderLimits {
@@ -278,25 +263,42 @@ fn exact_scope() -> OwnedExactScope {
     .expect("exact scope")
 }
 
-fn call(operation: ProviderOperation) -> ProviderCall {
+fn call_after_handshake(
+    operation: ProviderOperation,
+    response: &HandshakeResponse,
+) -> ProviderCall {
+    assert_eq!(response.terminal.terminal_code(), TerminalCode::Success);
+    let ready_receipt_sha256 = response
+        .ready_receipt_sha256
+        .clone()
+        .expect("successful handshake ready receipt");
+    let expected_state_generation = response
+        .descriptor
+        .as_ref()
+        .expect("successful handshake descriptor")
+        .state_generation;
+    let payload_contract = match operation {
+        ProviderOperation::Observe => "tracedecay.memory.provider.observation.v1",
+        _ => "tracedecay.memory.registry-test.request.v1",
+    };
+
     ProviderCall::new(ProviderCallParts {
         operation,
         provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider"),
         registration_revision: 31,
-        ready_receipt_sha256: ZERO_SHA.to_owned(),
+        ready_receipt_sha256,
         exact_scope: exact_scope(),
         request_id: format!("request-{}", operation.capability_id()),
         operation_id: format!("operation-{}", operation.capability_id()),
-        expected_state_generation: 5,
+        expected_state_generation,
         idempotency_key: operation
             .mutates_provider_state()
             .then(|| "registry-idempotency-key".to_owned()),
         control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
         payload: CanonicalPayload::new(
-            OwnedVersionedId::new("tracedecay.memory.registry-test.request.v1")
-                .expect("payload contract"),
+            OwnedVersionedId::new(payload_contract).expect("payload contract"),
             br#"{"registry":true}"#.to_vec(),
-            ONE_SHA,
+            REGISTRY_PAYLOAD_SHA,
         )
         .expect("payload"),
         required_capabilities: vec![
@@ -307,7 +309,7 @@ fn call(operation: ProviderOperation) -> ProviderCall {
                 OwnedVersionedId::new("vendor.registry-test.optional.v1").expect("extension id"),
                 1,
                 false,
-                TWO_SHA,
+                OPAQUE_PAYLOAD_SHA,
                 br#"{"opaque":true}"#.to_vec(),
             )
             .expect("optional extension"),
@@ -470,7 +472,8 @@ fn active_route_preserves_structured_fallback_evidence() -> Result<(), Box<dyn E
         })?;
     let registry = composition.registry().expect("enabled registry");
 
-    let call = call(ProviderOperation::Health);
+    let handshake_response = registry.handshake(&handshake())?;
+    let call = call_after_handshake(ProviderOperation::Health, &handshake_response);
     let reply = registry.invoke_active(&call)?;
 
     assert_eq!(
@@ -627,7 +630,8 @@ fn observer_route_strips_output_but_preserves_structured_effect_evidence()
             mode: EnabledProviderMode::Observer,
         })?;
     let registry = composition.registry().expect("enabled registry");
-    let call = call(ProviderOperation::Observe);
+    let handshake_response = registry.handshake(&handshake())?;
+    let call = call_after_handshake(ProviderOperation::Observe, &handshake_response);
 
     assert_eq!(
         registry.invoke_active(&call),
