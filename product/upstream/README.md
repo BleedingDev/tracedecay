@@ -2,6 +2,9 @@
 
 This directory records the immutable upstream floor beneath the product-owned
 TraceDecay memory-provider branch. It is deliberately outside Zack-owned crates.
+The machine-readable sync contract is [`sync-policy.json`](sync-policy.json),
+and every isolated train uses the strict
+[`sync-train-receipt.schema.json`](sync-train-receipt.schema.json) contract.
 
 `tracedecay-v2-pr707.json` separates two facts that must never be conflated:
 
@@ -57,6 +60,46 @@ isolation:
 - `BleedingDev` is the one sync owner and owns product patches.
   `ScriptedAlchemy` owns review of claims about upstream intent. Ownership does
   not replace focused behavioral verification.
+
+The policy revision is `sync-train.v1` and the workflow name is
+`run-upstream-sync-train`. A receipt binds that revision and schema to one
+terminal train. It records the product repository/ref, immutable starting
+product head and floor SHA, resolved candidate upstream ref/SHA, isolated sync
+branch and strategy, every conflict's exact path/source/owner/resolution and
+rationale, ordered gate results, terminal state, and final ref/commit outcome.
+
+## Run an isolated sync train
+
+The train is reviewable and single-directional:
+
+1. Run the [vendor-floor preflight](../../scripts/product/check-upstream-vendor-floor.py)
+   from a clean checkout and resolve one approved moving discovery ref to an
+   exact candidate SHA. Moving ref names are discovery inputs only; they are
+   never accepted as a floor.
+2. Create `refs/heads/sync/upstream/<candidate-short-sha>` at the current
+   product branch head. The product branch and released `main`/`master` refs
+   are never sync targets.
+3. Merge or rebase the pinned candidate on that isolated branch. Record an
+   entry in the receipt for every conflict path, including which side supplied
+   the source, the owning authority, the selected resolution, and the
+   semantic rationale. An unresolved conflict fails the train.
+4. Run required upstream gates first, followed by product contracts, Native
+   parity, provider conformance, scope/crash/security journeys, and generated
+   drift checks. A required failure cannot be hidden by a later product pass.
+5. Finalize the isolated sync ref with compare-and-swap against the recorded
+   starting product head and floor. The released product ref remains unchanged
+   in this workflow. The isolated commit contains code, candidate floor
+   metadata, and the convergence receipt together; the actual commit SHA is
+   recorded after the ref transaction because a commit cannot embed its own
+   SHA. A later `tdmem-1208` promotion may only fast-forward a released ref;
+   force and non-fast-forward updates remain prohibited.
+6. On any failure, conflict, gate failure, or CAS mismatch, abort without
+   changing the canonical floor metadata or released product ref. A retained
+   sync branch is review evidence only and is not a floor update.
+
+The first actual floor advancement remains the separate `tdmem-1208`
+rehearsal. This bead defines the contract and workflow policy; it does not
+move `pinned_floor.sha`.
 
 The immutable accepted floor remains PR #707 creation head
 `08fbe33a7c7f403191fd5d6e356c7b6681b96403`. The dated

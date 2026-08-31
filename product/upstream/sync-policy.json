@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "schema_version": 1,
+  "policy_revision": "sync-train.v1",
   "authority": "product-owned",
   "ownership": {
     "sync_owner": "BleedingDev",
@@ -30,7 +31,9 @@
   "floor": {
     "metadata": "product/upstream/tracedecay-v2-pr707.json",
     "pull_request": 707,
-    "sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403"
+    "sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+    "advancement_authority": "tdmem-1208",
+    "immutable_until_approved_train": true
   },
   "preflight": {
     "requires_clean_worktree": true,
@@ -41,5 +44,87 @@
       "refs/remotes/origin/main",
       "refs/remotes/origin/master"
     ]
+  },
+  "workflow": {
+    "name": "run-upstream-sync-train",
+    "policy_path": "product/upstream/sync-policy.json",
+    "receipt_schema_path": "product/upstream/sync-train-receipt.schema.json",
+    "receipt_path_template": "product/upstream/sync-train-receipts/{train_id}.json",
+    "sync_branch_template": "refs/heads/sync/upstream/{candidate_short_sha}",
+    "allowed_strategies": [
+      "merge",
+      "rebase"
+    ],
+    "candidate_must_be_immutable_sha": true,
+    "moving_refs_are_discovery_only": true,
+    "conflict_receipt_required": true,
+    "first_floor_advancement_bead": "tdmem-1208"
+  },
+  "conflicts": {
+    "path_format": "repo-relative-posix",
+    "required_fields": [
+      "path",
+      "source",
+      "owner",
+      "resolution",
+      "rationale"
+    ],
+    "receipt_required_even_when_empty": true,
+    "unresolved_conflict_is_terminal_failure": true
+  },
+  "gates": {
+    "upstream_required_first": true,
+    "fail_closed": true,
+    "required_order": [
+      "upstream_required",
+      "product_contracts",
+      "native_parity",
+      "provider_conformance",
+      "scope_crash_security",
+      "generated_drift"
+    ],
+    "required_gate_status": "passed"
+  },
+  "finalization": {
+    "method": "compare_and_swap",
+    "sync_train_publication_target": "isolated_sync_ref",
+    "released_branch_update_in_this_workflow": "unchanged",
+    "cas": {
+      "required": true,
+      "compare_refs": [
+        "refs/heads/feat/pluggable-memory-providers-v2"
+      ],
+      "compare_values": [
+        "product.starting_head_sha",
+        "product.starting_floor_sha"
+      ],
+      "mismatch_action": "abort_without_canonical_mutation"
+    },
+    "released_refs": [
+      "refs/heads/main",
+      "refs/heads/master",
+      "refs/heads/feat/pluggable-memory-providers-v2"
+    ],
+    "released_branch_update": "fast_forward_only",
+    "force_update_allowed": false,
+    "non_fast_forward_update_allowed": false,
+    "same_commit_bundle": {
+      "required": true,
+      "members": [
+        "code",
+        "floor_metadata",
+        "convergence_receipt"
+      ],
+      "metadata_path": "product/upstream/tracedecay-v2-pr707.json",
+      "receipt_schema_path": "product/upstream/sync-train-receipt.schema.json"
+    },
+    "abort": {
+      "canonical_floor_ref_unchanged": true,
+      "canonical_floor_metadata_unchanged": true,
+      "released_product_ref_unchanged": true,
+      "partial_publication_forbidden": true,
+      "receipt_terminal_state": "aborted",
+      "sync_branch_may_be_retained_for_review": true
+    }
   }
 }

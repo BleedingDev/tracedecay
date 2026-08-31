@@ -1,0 +1,730 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/schemas/product/upstream/sync-train-receipt.schema.json",
+  "title": "TraceDecay upstream sync-train convergence receipt",
+  "description": "A terminal, product-owned receipt for one isolated upstream convergence train. It records the immutable starting point, conflict decisions, gate outcomes, and the compare-and-swap publication result.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "$id",
+    "contract_id",
+    "schema_version",
+    "receipt_id",
+    "bead_id",
+    "workflow",
+    "policy_revision",
+    "started_at",
+    "completed_at",
+    "product",
+    "upstream",
+    "sync",
+    "conflicts",
+    "gates",
+    "terminal",
+    "finalization"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "$id": {
+      "const": "https://tracedecay.dev/schemas/product/upstream/sync-train-receipt.schema.json"
+    },
+    "contract_id": {
+      "const": "tracedecay.upstream-sync-train-receipt.v1"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "receipt_id": {
+      "type": "string",
+      "pattern": "^sync-train-[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "bead_id": {
+      "type": "string",
+      "pattern": "^tdmem-[0-9]{4}$"
+    },
+    "workflow": {
+      "$ref": "#/$defs/workflow"
+    },
+    "policy_revision": {
+      "const": "sync-train.v1"
+    },
+    "started_at": {
+      "$ref": "#/$defs/date_time"
+    },
+    "completed_at": {
+      "$ref": "#/$defs/date_time"
+    },
+    "product": {
+      "$ref": "#/$defs/product_start"
+    },
+    "upstream": {
+      "$ref": "#/$defs/upstream_candidate"
+    },
+    "sync": {
+      "$ref": "#/$defs/sync_branch"
+    },
+    "conflicts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/conflict"
+      }
+    },
+    "gates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/gate"
+      }
+    },
+    "terminal": {
+      "$ref": "#/$defs/terminal"
+    },
+    "finalization": {
+      "$ref": "#/$defs/finalization"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "terminal": {
+            "properties": {
+              "state": {
+                "const": "succeeded"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "gates": {
+            "minItems": 6,
+            "maxItems": 6,
+            "prefixItems": [
+              {
+                "$ref": "#/$defs/passed_upstream_required_gate"
+              },
+              {
+                "$ref": "#/$defs/passed_product_contracts_gate"
+              },
+              {
+                "$ref": "#/$defs/passed_native_parity_gate"
+              },
+              {
+                "$ref": "#/$defs/passed_provider_conformance_gate"
+              },
+              {
+                "$ref": "#/$defs/passed_scope_crash_security_gate"
+              },
+              {
+                "$ref": "#/$defs/passed_generated_drift_gate"
+              }
+            ]
+          },
+          "finalization": {
+            "properties": {
+              "outcome": {
+                "const": "published"
+              },
+              "sync_ref": {
+                "type": "string",
+                "pattern": "^refs/heads/sync/upstream/[A-Za-z0-9._-]+$"
+              },
+              "sync_head_sha": {
+                "type": "null"
+              },
+              "released_head_sha": {
+                "$ref": "#/$defs/sha"
+              },
+              "released_ref_update": {
+                "properties": {
+                  "mode": {
+                    "const": "unchanged"
+                  }
+                }
+              },
+              "cas": {
+                "properties": {
+                  "attempted": {
+                    "const": true
+                  },
+                  "result": {
+                    "const": "matched_and_published"
+                  }
+                }
+              },
+              "same_commit": {
+                "properties": {
+                  "verified": {
+                    "const": true
+                  },
+                  "bundle_commit_sha": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "aborted",
+                  "failed"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "finalization": {
+            "properties": {
+              "outcome": {
+                "const": "not_published"
+              },
+              "released_ref_update": {
+                "properties": {
+                  "mode": {
+                    "enum": [
+                      "unchanged",
+                      "not_attempted"
+                    ]
+                  }
+                }
+              },
+              "cas": {
+                "properties": {
+                  "attempted": {
+                    "type": "boolean"
+                  },
+                  "result": {
+                    "enum": [
+                      "mismatch_aborted",
+                      "not_attempted"
+                    ]
+                  }
+                }
+              },
+              "same_commit": {
+                "properties": {
+                  "verified": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "passed_upstream_required_gate": {
+      "$ref": "#/$defs/passed_gate",
+      "properties": {
+        "id": {
+          "const": "upstream_required"
+        }
+      }
+    },
+    "passed_product_contracts_gate": {
+      "$ref": "#/$defs/passed_gate",
+      "properties": {
+        "id": {
+          "const": "product_contracts"
+        }
+      }
+    },
+    "passed_native_parity_gate": {
+      "$ref": "#/$defs/passed_gate",
+      "properties": {
+        "id": {
+          "const": "native_parity"
+        }
+      }
+    },
+    "passed_provider_conformance_gate": {
+      "$ref": "#/$defs/passed_gate",
+      "properties": {
+        "id": {
+          "const": "provider_conformance"
+        }
+      }
+    },
+    "passed_scope_crash_security_gate": {
+      "$ref": "#/$defs/passed_gate",
+      "properties": {
+        "id": {
+          "const": "scope_crash_security"
+        }
+      }
+    },
+    "passed_generated_drift_gate": {
+      "$ref": "#/$defs/passed_gate",
+      "properties": {
+        "id": {
+          "const": "generated_drift"
+        }
+      }
+    },
+    "passed_gate": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/gate"
+        },
+        {
+          "properties": {
+            "required": {
+              "const": true
+            },
+            "status": {
+              "const": "passed"
+            }
+          }
+        }
+      ]
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "date_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    },
+    "repo_path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\\\]+$"
+    },
+    "full_ref": {
+      "type": "string",
+      "pattern": "^refs/(?:heads|remotes)/[A-Za-z0-9._/-]+$"
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "policy_path",
+        "receipt_schema_path"
+      ],
+      "properties": {
+        "name": {
+          "const": "run-upstream-sync-train"
+        },
+        "policy_path": {
+          "const": "product/upstream/sync-policy.json"
+        },
+        "receipt_schema_path": {
+          "const": "product/upstream/sync-train-receipt.schema.json"
+        }
+      }
+    },
+    "product_start": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "starting_ref",
+        "released_ref",
+        "starting_head_sha",
+        "starting_floor_sha",
+        "floor_metadata_path"
+      ],
+      "properties": {
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "starting_ref": {
+          "type": "string",
+          "pattern": "^refs/heads/[A-Za-z0-9._/-]+$"
+        },
+        "released_ref": {
+          "type": "string",
+          "pattern": "^refs/heads/[A-Za-z0-9._/-]+$"
+        },
+        "starting_head_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "starting_floor_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "floor_metadata_path": {
+          "$ref": "#/$defs/repo_path"
+        }
+      }
+    },
+    "upstream_candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "candidate_ref",
+        "candidate_sha",
+        "selected_at"
+      ],
+      "properties": {
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "candidate_ref": {
+          "$ref": "#/$defs/full_ref"
+        },
+        "candidate_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "selected_at": {
+          "$ref": "#/$defs/date_time"
+        }
+      }
+    },
+    "sync_branch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch_ref",
+        "base_product_head_sha",
+        "base_floor_sha",
+        "strategy",
+        "created_at"
+      ],
+      "properties": {
+        "branch_ref": {
+          "type": "string",
+          "pattern": "^refs/heads/sync/upstream/[A-Za-z0-9._-]+$"
+        },
+        "base_product_head_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "base_floor_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "strategy": {
+          "enum": [
+            "merge",
+            "rebase"
+          ]
+        },
+        "created_at": {
+          "$ref": "#/$defs/date_time"
+        }
+      }
+    },
+    "conflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "source",
+        "owner",
+        "resolution",
+        "rationale"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/repo_path"
+        },
+        "source": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$"
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolution": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9._-]*$"
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_path": {
+          "$ref": "#/$defs/repo_path"
+        },
+        "source_sha": {
+          "$ref": "#/$defs/sha"
+        }
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "phase",
+        "owner",
+        "required",
+        "status",
+        "command",
+        "evidence"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9._-]*$"
+        },
+        "phase": {
+          "enum": [
+            "upstream",
+            "product",
+            "publication"
+          ]
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "skipped",
+            "not_run"
+          ]
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "terminal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "reason"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "aborted"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "finalization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outcome",
+        "sync_ref",
+        "sync_head_sha",
+        "released_ref",
+        "released_head_sha",
+        "released_ref_update",
+        "cas",
+        "same_commit"
+      ],
+      "properties": {
+        "outcome": {
+          "enum": [
+            "published",
+            "not_published"
+          ]
+        },
+        "sync_ref": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "^refs/heads/sync/upstream/[A-Za-z0-9._-]+$"
+            }
+          ]
+        },
+        "sync_head_sha": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/sha"
+            }
+          ]
+        },
+        "released_ref": {
+          "type": "string",
+          "pattern": "^refs/heads/[A-Za-z0-9._/-]+$"
+        },
+        "released_head_sha": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/sha"
+            }
+          ]
+        },
+        "released_ref_update": {
+          "$ref": "#/$defs/ref_update"
+        },
+        "cas": {
+          "$ref": "#/$defs/cas"
+        },
+        "same_commit": {
+          "$ref": "#/$defs/same_commit"
+        }
+      }
+    },
+    "ref_update": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "old_sha",
+        "new_sha"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "fast_forward",
+            "unchanged",
+            "not_attempted"
+          ]
+        },
+        "old_sha": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/sha"
+            }
+          ]
+        },
+        "new_sha": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/sha"
+            }
+          ]
+        }
+      }
+    },
+    "cas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required",
+        "attempted",
+        "result",
+        "expected_product_head_sha",
+        "observed_product_head_sha"
+      ],
+      "properties": {
+        "required": {
+          "const": true
+        },
+        "attempted": {
+          "type": "boolean"
+        },
+        "result": {
+          "enum": [
+            "matched_and_published",
+            "mismatch_aborted",
+            "not_attempted"
+          ]
+        },
+        "expected_product_head_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "observed_product_head_sha": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/sha"
+            }
+          ]
+        }
+      }
+    },
+    "same_commit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required",
+        "verified",
+        "bundle_commit_sha",
+        "members"
+      ],
+      "properties": {
+        "required": {
+          "const": true
+        },
+        "verified": {
+          "type": "boolean"
+        },
+        "bundle_commit_sha": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/sha"
+            }
+          ]
+        },
+        "members": {
+          "type": "array",
+          "const": [
+            "code",
+            "floor_metadata",
+            "convergence_receipt"
+          ]
+        }
+      }
+    }
+  }
+}
