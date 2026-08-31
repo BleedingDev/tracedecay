@@ -35,7 +35,10 @@ EXPECTED_BUDGET = {
     "max_total_upstream_changed_lines": 900,
     "max_changed_lines_per_upstream_file": 180,
     "max_composition_root_files": 6,
-    "max_allowed_touch_point_files_per_category": 3,
+    # 5 covers the dormant daemon composition mount (manifest, compose root,
+    # lifetime-retention pair, focused ownership test); every other category
+    # stays tighter through its local max_files, which binds via min().
+    "max_allowed_touch_point_files_per_category": 5,
     "default_max_exception_zone_files": 0,
     "max_exception_files_per_adr": 2,
     "max_workspace_manifest_files": 2,

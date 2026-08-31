@@ -53,7 +53,8 @@
       "allowed_changes": [
         "construct and retain product-owned capability registries and lifecycle ports",
         "inject provider-neutral observation, recall, feedback, maintenance, and inspection capabilities",
-        "bind exact project/worktree/provider scope at startup"
+        "bind exact project/worktree/provider scope at startup",
+        "retain the composed dormant host across the daemon and MCP project-server lifetime"
       ],
       "category": "composition",
       "forbidden_changes": [
@@ -64,7 +65,7 @@
       ],
       "id": "daemon_composition_mount",
       "max_changed_lines": 260,
-      "max_files": 3,
+      "max_files": 5,
       "paths": [
         "crates/tracedecay/Cargo.toml",
         "crates/tracedecay/src/daemon/project_composition.rs",
@@ -408,7 +409,6 @@
       "reason": "Only the narrow composition/registry layer may construct concrete adapters."
     }
   ],
-  "dependency_direction_exceptions": [],
   "exception_zones": [
     {
       "default_policy": "forbidden",
@@ -503,7 +503,7 @@
   "initial_budget": {
     "default_max_exception_zone_files": 0,
     "manual_generated_file_edits": 0,
-    "max_allowed_touch_point_files_per_category": 3,
+    "max_allowed_touch_point_files_per_category": 5,
     "max_changed_lines_per_upstream_file": 180,
     "max_composition_root_files": 6,
     "max_exception_files_per_adr": 2,
