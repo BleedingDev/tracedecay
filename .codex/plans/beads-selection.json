@@ -1,0 +1,36 @@
+{
+  "claimed_plan_ids": [
+    "tdmem-0401",
+    "tdmem-floor-daemon-test-env-kmw"
+  ],
+  "direct_blocking_edge_count": 160,
+  "excluded_deferred_plan_ids": [
+    "tdmem-1300",
+    "tdmem-1301",
+    "tdmem-1302",
+    "tdmem-1303",
+    "tdmem-1304",
+    "tdmem-1305"
+  ],
+  "excluded_epic_plan_ids": [
+    "tdmem-0000",
+    "tdmem-0400",
+    "tdmem-0500",
+    "tdmem-0600",
+    "tdmem-0700",
+    "tdmem-0800",
+    "tdmem-0900",
+    "tdmem-1000",
+    "tdmem-1100",
+    "tdmem-1200",
+    "tdmem-1400"
+  ],
+  "inherited_parent_gate_edge_count": 140,
+  "isolated_plan_ids": [
+    "tdmem-floor-daemon-test-env-kmw"
+  ],
+  "runnable_edge_count": 300,
+  "runnable_plan_count": 83,
+  "schema": "tracedecay.beads-plan-selection.v1",
+  "source": "br list/show with auto import/flush disabled"
+}
