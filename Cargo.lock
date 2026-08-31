@@ -6543,6 +6543,7 @@ dependencies = [
 name = "tracedecay-memory-provider-native"
 version = "0.1.0-beta.37"
 dependencies = [
+ "serde_json",
  "tracedecay-memory-provider-api",
 ]
 

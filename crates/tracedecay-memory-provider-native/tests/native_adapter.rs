@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use serde_json::Value;
 use tracedecay_memory_provider_api::contract::{
     CommittedEffectState, FallbackEligibility, TerminalCode,
 };
@@ -15,8 +16,9 @@ use tracedecay_memory_provider_api::{
     ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
 };
 use tracedecay_memory_provider_native::{
-    NATIVE_PROVIDER_ID, NativeAdapterError, NativeMemoryApplicationPort, NativeProvider,
-    OBSERVATION_CONTRACT_ID,
+    NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
+    NATIVE_PROVIDER_ID, NativeAdapterError, NativeMemoryApplicationPort, NativeObservation,
+    NativeProvider, OBSERVATION_CONTRACT_ID,
 };
 
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -25,6 +27,9 @@ const FIXTURE_SHA: &str = "ffbc2dfc402782325da71132100e74ff511d1585dd80e4ea196ed
 const FACT_SHAPED_OBSERVATION_SHA: &str =
     "345f350426c8d55ebaa4b10c41862eaeae8b910cd3dceb939ef3d256885c5c6d";
 const FACT_SHAPED_OBSERVATION: &[u8] = b"{\"native_fact\":{\"owner\":\"project\",\"trust\":0.9,\"temporal\":\"current\",\"receipt\":\"receipt\"}}";
+const PROMOTED_OBSERVATION: &[u8] = b"{\"canonical_payload\":{\"fact\":\"promote\"},\"observation_kind\":\"native.fact_promoted.v1\",\"payload_contract\":\"tracedecay.memory.observation.native-fact-promotion.v1\"}";
+const PROMOTED_OBSERVATION_SHA: &str =
+    "e5e7fdeecb1a62f0ecd1f5330b50cd96bb4e90dc26c37e114d7860ffdcf0e9a2";
 
 #[derive(Default)]
 struct Counters {
@@ -68,6 +73,7 @@ struct MockNativePort {
     observation_code: TerminalCode,
     counters: Counters,
     last_call: Mutex<Option<ProviderCall>>,
+    last_observation: Mutex<Option<(String, String, Value)>>,
     last_handshake: Mutex<Option<HandshakeRequest>>,
 }
 
@@ -97,6 +103,7 @@ impl MockNativePort {
             observation_code: TerminalCode::Success,
             counters: Counters::default(),
             last_call: Mutex::new(None),
+            last_observation: Mutex::new(None),
             last_handshake: Mutex::new(None),
         }
     }
@@ -112,11 +119,6 @@ impl MockNativePort {
             .lock()
             .expect("followup descriptor lock") = Some(followup_descriptor);
         port
-    }
-
-    fn with_observation_code(mut self, observation_code: TerminalCode) -> Self {
-        self.observation_code = observation_code;
-        self
     }
 
     fn terminal(&self, call: &ProviderCall, code: TerminalCode) -> ProviderReply {
@@ -210,10 +212,15 @@ impl NativeMemoryApplicationPort for MockNativePort {
         self.terminal(call, TerminalCode::Success)
     }
 
-    fn observe(&self, call: &ProviderCall) -> ProviderReply {
+    fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
         self.counters.observe.fetch_add(1, Ordering::Relaxed);
-        self.record(call);
-        self.terminal(call, self.observation_code)
+        *self.last_observation.lock().expect("last observation lock") = Some((
+            observation.observation_kind.clone(),
+            observation.payload_contract.clone(),
+            observation.canonical_payload.clone(),
+        ));
+        self.record(observation.call);
+        self.terminal(observation.call, self.observation_code)
     }
 
     fn recall(&self, call: &ProviderCall) -> ProviderReply {
@@ -351,6 +358,11 @@ fn all_provider_operations() -> [ProviderOperation; 12] {
 }
 
 fn call(provider_id: &str, operation: ProviderOperation) -> ProviderCall {
+    let (payload_bytes, payload_sha256) = if operation == ProviderOperation::Observe {
+        (PROMOTED_OBSERVATION.to_vec(), PROMOTED_OBSERVATION_SHA)
+    } else {
+        (b"{\"fixture\":true}".to_vec(), FIXTURE_SHA)
+    };
     ProviderCall::new(ProviderCallParts {
         operation,
         provider_id: OwnedProviderId::new(provider_id).expect("provider id"),
@@ -366,8 +378,8 @@ fn call(provider_id: &str, operation: ProviderOperation) -> ProviderCall {
         control: OperationControl::new(i64::MAX, 500, CancellationToken::new()),
         payload: CanonicalPayload::new(
             OwnedVersionedId::new(operation_contract_id(operation)).expect("payload contract"),
-            b"{\"fixture\":true}".to_vec(),
-            FIXTURE_SHA,
+            payload_bytes,
+            payload_sha256,
         )
         .expect("payload"),
         required_capabilities: vec![
@@ -376,6 +388,17 @@ fn call(provider_id: &str, operation: ProviderOperation) -> ProviderCall {
         extensions: Vec::new(),
     })
     .expect("call")
+}
+
+fn observation_call(json: &str, payload_sha256: &str) -> ProviderCall {
+    let mut request = call(NATIVE_PROVIDER_ID, ProviderOperation::Observe);
+    request.payload = CanonicalPayload::new(
+        OwnedVersionedId::new(OBSERVATION_CONTRACT_ID).expect("observation contract"),
+        json.as_bytes().to_vec(),
+        payload_sha256,
+    )
+    .expect("observation payload");
+    request
 }
 
 fn handshake(provider_id: &str) -> HandshakeRequest {
@@ -1043,11 +1066,177 @@ fn handshake_operation_must_use_the_handshake_method() {
 }
 
 #[test]
-fn fact_shaped_generic_observation_is_rejected_by_native_authority() {
-    let port = Arc::new(
-        MockNativePort::new(NATIVE_PROVIDER_ID, &[])
-            .with_observation_code(TerminalCode::CapabilityUnsupported),
+fn promoted_observation_is_typed_and_preserves_the_original_call() {
+    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+    let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Observe);
+    let reply = provider.invoke(&request);
+
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(port.counters.observe.load(Ordering::Relaxed), 1);
+    let parsed = port
+        .last_observation
+        .lock()
+        .expect("last observation lock")
+        .clone()
+        .expect("typed observation");
+    assert_eq!(parsed.0, NATIVE_FACT_PROMOTION_OBSERVATION_KIND);
+    assert_eq!(parsed.1, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID);
+    assert_eq!(parsed.2, serde_json::json!({"fact": "promote"}));
+
+    let recorded = port
+        .last_call
+        .lock()
+        .expect("last call lock")
+        .clone()
+        .expect("recorded observation");
+    assert_eq!(recorded.operation, request.operation);
+    assert_eq!(recorded.provider_id, request.provider_id);
+    assert_eq!(
+        recorded.registration_revision,
+        request.registration_revision
     );
+    assert_eq!(recorded.ready_receipt_sha256, request.ready_receipt_sha256);
+    assert_eq!(recorded.exact_scope, request.exact_scope);
+    assert_eq!(recorded.request_id, request.request_id);
+    assert_eq!(recorded.operation_id, request.operation_id);
+    assert_eq!(
+        recorded.expected_state_generation,
+        request.expected_state_generation
+    );
+    assert_eq!(recorded.idempotency_key, request.idempotency_key);
+    assert_eq!(
+        recorded.control.snapshot().expect("recorded control"),
+        request.control.snapshot().expect("request control")
+    );
+    assert_eq!(recorded.payload, request.payload);
+    assert_eq!(
+        recorded.required_capabilities,
+        request.required_capabilities
+    );
+    assert_eq!(recorded.extensions, request.extensions);
+}
+
+#[test]
+fn known_non_native_observation_kinds_are_staged_without_native_contact() {
+    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+    let descriptor_calls = port.counters.descriptor.load(Ordering::Relaxed);
+    let cases = [
+        (
+            "session.message_committed.v1",
+            "tracedecay.memory.observation.session-message.v1",
+            "9944b6c6a88edd3d3518110ebcba9566de1b077ff3ae1f0c19a21c47be76b291",
+        ),
+        (
+            "tool.execution_settled.v1",
+            "tracedecay.memory.observation.tool-execution.v1",
+            "1ce3001fd5f5c006e3a9f40699c872c3d8c04128bbb59d93bdf969daf439a5e6",
+        ),
+        (
+            "source.edit_settled.v1",
+            "tracedecay.memory.observation.source-edit.v1",
+            "e89eeb143ab42fbd4d1c6af64581bf4081fec37445c631abb2285ddede317fea",
+        ),
+        (
+            "test.execution_settled.v1",
+            "tracedecay.memory.observation.test-execution.v1",
+            "66c7831fb471b1e0e1cf4c3023bbc4cf3c109e1cf70de78b94743df1346a020e",
+        ),
+        (
+            "diagnostic.observed.v1",
+            "tracedecay.memory.observation.diagnostic.v1",
+            "53ff926555cadd5217484297e319b26e1be9e9a3de92d8590fb232598cf631a8",
+        ),
+        (
+            "git.evidence_observed.v1",
+            "tracedecay.memory.observation.git-evidence.v1",
+            "ee1d9b254a58459febf76c6b2f9df45c603bcf501071f546a816f8f2e8e953d4",
+        ),
+        (
+            "feedback.outcome_settled.v1",
+            "tracedecay.memory.observation.feedback-outcome.v1",
+            "ecee2a6d7d0a9cfa40c11e5a5c3fce6a6dcdc5a003f17a54cb083f0e48e39c85",
+        ),
+        (
+            "automation.outcome_settled.v1",
+            "tracedecay.memory.observation.automation-outcome.v1",
+            "8dd095ed652ad8695f84a4bbac24df917d0a3a9b49b92235476716d6f5f362f7",
+        ),
+    ];
+
+    for (kind, payload_contract, payload_sha256) in cases {
+        let json = format!(
+            "{{\"canonical_payload\":{{\"event\":\"staged\"}},\"observation_kind\":\"{kind}\",\"payload_contract\":\"{payload_contract}\"}}"
+        );
+        let reply = provider.invoke(&observation_call(&json, payload_sha256));
+        assert_eq!(
+            reply.terminal.terminal_code(),
+            TerminalCode::CapabilityUnsupported
+        );
+        assert_eq!(
+            reply.terminal.diagnostic_id(),
+            Some("native.observation_staged")
+        );
+    }
+
+    assert_eq!(port.counters.observe.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        port.counters.descriptor.load(Ordering::Relaxed),
+        descriptor_calls
+    );
+    assert!(port.last_call.lock().expect("last call lock").is_none());
+}
+
+#[test]
+fn unknown_mismatched_and_malformed_observations_fail_before_native_contact() {
+    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+    let descriptor_calls = port.counters.descriptor.load(Ordering::Relaxed);
+    let cases = [
+        (
+            "not-json",
+            "0c21a879c732a67910d80988df4919d794f6a070aab610ef865032a28046b021",
+            TerminalCode::InvalidRequest,
+            "native.observation_envelope_invalid",
+        ),
+        (
+            "{\"canonical_payload\":{\"event\":\"unknown\"},\"observation_kind\":\"vendor.future.v1\",\"payload_contract\":\"vendor.future-payload.v1\"}",
+            "a6c8e823e4920e40530c7fa0c3626c85d4b642f43a12268e425f967dbf82982c",
+            TerminalCode::InvalidRequest,
+            "native.observation_kind_unknown",
+        ),
+        (
+            "{\"canonical_payload\":{\"event\":\"mismatch\"},\"observation_kind\":\"native.fact_promoted.v1\",\"payload_contract\":\"tracedecay.memory.observation.session-message.v1\"}",
+            "e987fbc09093731507ba0f0a7a3c51718ad163687fbe06fc50576f7de52527f4",
+            TerminalCode::InvalidRequest,
+            "native.observation_kind_contract_mismatch",
+        ),
+        (
+            "{\"observation_kind\":\"native.fact_promoted.v1\",\"payload_contract\":\"tracedecay.memory.observation.native-fact-promotion.v1\"}",
+            "286469241bc8446189bdf53846a8b618e9392b8e6e6a0dd5c2d149e58ae4d8f9",
+            TerminalCode::InvalidRequest,
+            "native.observation_envelope_invalid",
+        ),
+    ];
+
+    for (json, payload_sha256, terminal_code, diagnostic_id) in cases {
+        let reply = provider.invoke(&observation_call(json, payload_sha256));
+        assert_eq!(reply.terminal.terminal_code(), terminal_code);
+        assert_eq!(reply.terminal.diagnostic_id(), Some(diagnostic_id));
+    }
+
+    assert_eq!(port.counters.observe.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        port.counters.descriptor.load(Ordering::Relaxed),
+        descriptor_calls
+    );
+    assert!(port.last_call.lock().expect("last call lock").is_none());
+}
+
+#[test]
+fn fact_shaped_generic_observation_is_rejected_by_native_authority() {
+    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
     let provider = NativeProvider::new(port.clone()).expect("adapter");
     let descriptor_calls = port.counters.descriptor.load(Ordering::Relaxed);
     let mut request = call(NATIVE_PROVIDER_ID, ProviderOperation::Observe);
@@ -1058,13 +1247,10 @@ fn fact_shaped_generic_observation_is_rejected_by_native_authority() {
     )
     .expect("fact-shaped observation");
     let reply = provider.invoke(&request);
-    assert_eq!(
-        reply.terminal.terminal_code(),
-        TerminalCode::CapabilityUnsupported
-    );
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
     assert_eq!(
         reply.terminal.diagnostic_id(),
-        Some("native.capability_unsupported")
+        Some("native.observation_envelope_invalid")
     );
     assert_eq!(
         reply.terminal.committed_effect().state(),
@@ -1072,28 +1258,21 @@ fn fact_shaped_generic_observation_is_rejected_by_native_authority() {
     );
     assert_eq!(
         reply.terminal.committed_effect().state_generation_before(),
-        Some(request.expected_state_generation)
+        None
     );
     assert_eq!(
         reply.terminal.committed_effect().state_generation_after(),
-        Some(request.expected_state_generation)
+        None
     );
     assert_eq!(reply.terminal.provider_receipt_sha256(), None);
     assert_eq!(reply.payload, None);
     assert_eq!(reply.state_generation, request.expected_state_generation);
     assert_eq!(
         port.counters.descriptor.load(Ordering::Relaxed),
-        descriptor_calls + 1
+        descriptor_calls
     );
-    assert_eq!(port.counters.observe.load(Ordering::Relaxed), 1);
-    let recorded = port
-        .last_call
-        .lock()
-        .expect("last call lock")
-        .clone()
-        .expect("recorded observation");
-    assert_eq!(recorded.payload, request.payload);
-    assert_eq!(recorded.exact_scope, request.exact_scope);
+    assert_eq!(port.counters.observe.load(Ordering::Relaxed), 0);
+    assert!(port.last_call.lock().expect("last call lock").is_none());
 }
 
 #[test]

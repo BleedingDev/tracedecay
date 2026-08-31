@@ -34,12 +34,14 @@
     {
       "package": "tracedecay-memory-provider-native",
       "allowed_direct_dependencies": [
+        "serde_json",
         "tracedecay-memory-provider-api"
       ],
       "required_direct_dependencies": [
+        "serde_json",
         "tracedecay-memory-provider-api"
       ],
-      "reason": "The Native adapter exposes a narrow application port and owns no TraceDecay internals."
+      "reason": "The Native adapter parses the provider-neutral observation envelope at its boundary, exposes a narrow application port, and owns no TraceDecay internals."
     },
     {
       "package": "tracedecay-memory-provider-ncm",

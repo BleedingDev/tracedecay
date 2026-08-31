@@ -24,6 +24,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use serde_json::Value;
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
     ApiError, HandshakeRequest, HandshakeResponse, MemoryProvider, ProviderCall,
@@ -35,6 +36,14 @@ pub const NATIVE_PROVIDER_ID: &str = "tracedecay.native";
 
 /// Provider-neutral contract carried by an admitted observation call.
 pub const OBSERVATION_CONTRACT_ID: &str = "tracedecay.memory.provider.observation.v1";
+
+/// Observation kind reserved for an explicitly authorized Native promotion
+/// event.
+pub const NATIVE_FACT_PROMOTION_OBSERVATION_KIND: &str = "native.fact_promoted.v1";
+
+/// Payload contract paired with [`NATIVE_FACT_PROMOTION_OBSERVATION_KIND`].
+pub const NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID: &str =
+    "tracedecay.memory.observation.native-fact-promotion.v1";
 
 const HANDSHAKE_CONTRACT_ID: &str = "tracedecay.memory.provider.handshake.v1";
 const HEALTH_CONTRACT_ID: &str = "tracedecay.memory.provider.health.v1";
@@ -81,6 +90,53 @@ impl fmt::Display for NativeAdapterError {
 
 impl Error for NativeAdapterError {}
 
+/// The parsed, verification-only view of an admitted observation envelope.
+///
+/// `call` is the original provider call, so its exact scope, request and
+/// operation identities, idempotency key, control token, and opaque extensions
+/// remain unchanged. The remaining fields are copied from the canonical JSON
+/// envelope without semantic rewriting. This value authorizes no Native fact
+/// write; fact promotion remains a separate explicitly authorized operation.
+#[derive(Clone, Debug)]
+pub struct NativeObservation<'call> {
+    /// The original admitted provider call.
+    pub call: &'call ProviderCall,
+    /// Exact `observation_kind` from the canonical envelope.
+    pub observation_kind: String,
+    /// Exact `payload_contract` from the canonical envelope.
+    pub payload_contract: String,
+    /// Parsed `canonical_payload` from the canonical envelope.
+    pub canonical_payload: Value,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservationParseError {
+    Malformed,
+    UnknownKind,
+    KindContractMismatch,
+    UnsupportedKind,
+}
+
+impl ObservationParseError {
+    const fn terminal_code(self) -> TerminalCode {
+        match self {
+            Self::UnsupportedKind => TerminalCode::CapabilityUnsupported,
+            Self::Malformed | Self::UnknownKind | Self::KindContractMismatch => {
+                TerminalCode::InvalidRequest
+            }
+        }
+    }
+
+    const fn diagnostic_id(self) -> &'static str {
+        match self {
+            Self::Malformed => "native.observation_envelope_invalid",
+            Self::UnknownKind => "native.observation_kind_unknown",
+            Self::KindContractMismatch => "native.observation_kind_contract_mismatch",
+            Self::UnsupportedKind => "native.observation_staged",
+        }
+    }
+}
+
 /// Narrow application boundary implemented by the existing TraceDecay Native
 /// memory composition in M3.
 ///
@@ -99,14 +155,16 @@ pub trait NativeMemoryApplicationPort: Send + Sync + 'static {
     /// Executes mandatory Native health without changing state.
     fn health(&self, call: &ProviderCall) -> ProviderReply;
 
-    /// Maps or rejects one validated observation under Native authority.
+    /// Verifies one explicitly authorized Native promotion observation under
+    /// Native authority.
     ///
-    /// The adapter forwards the generic V1 envelope unchanged. The trusted
-    /// application implementation must explicitly authorize any promotion,
+    /// The adapter parses and classifies the provider-neutral envelope before
+    /// this method is called. The trusted application implementation must
     /// preserve owner, provenance, trust, temporal state, idempotency, and
-    /// receipts, and reject or stage non-equivalent observations rather than
-    /// canonicalizing arbitrary bytes into Native facts.
-    fn observe(&self, call: &ProviderCall) -> ProviderReply;
+    /// receipts. Receiving a [`NativeObservation`] is verification-only and
+    /// must not imply a fact write; a separate authorized operation owns any
+    /// Native mutation.
+    fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply;
 
     /// Executes existing Native recall and preserves Native ordering, scores,
     /// evidence, temporal state, and provenance in the canonical payload.
@@ -250,6 +308,61 @@ impl NativeProvider {
         None
     }
 
+    fn parse_observation<'call>(
+        call: &'call ProviderCall,
+    ) -> Result<NativeObservation<'call>, ObservationParseError> {
+        let envelope = serde_json::from_slice::<Value>(&call.payload.bytes)
+            .map_err(|_| ObservationParseError::Malformed)?;
+        let object = envelope
+            .as_object()
+            .ok_or(ObservationParseError::Malformed)?;
+        let observation_kind = object
+            .get("observation_kind")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(ObservationParseError::Malformed)?
+            .to_owned();
+        let payload_contract = object
+            .get("payload_contract")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(ObservationParseError::Malformed)?
+            .to_owned();
+        let canonical_payload = object
+            .get("canonical_payload")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .ok_or(ObservationParseError::Malformed)?;
+
+        let expected_payload_contract = match observation_kind.as_str() {
+            "session.message_committed.v1" => "tracedecay.memory.observation.session-message.v1",
+            "tool.execution_settled.v1" => "tracedecay.memory.observation.tool-execution.v1",
+            "source.edit_settled.v1" => "tracedecay.memory.observation.source-edit.v1",
+            "test.execution_settled.v1" => "tracedecay.memory.observation.test-execution.v1",
+            "diagnostic.observed.v1" => "tracedecay.memory.observation.diagnostic.v1",
+            "git.evidence_observed.v1" => "tracedecay.memory.observation.git-evidence.v1",
+            NATIVE_FACT_PROMOTION_OBSERVATION_KIND => NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
+            "feedback.outcome_settled.v1" => "tracedecay.memory.observation.feedback-outcome.v1",
+            "automation.outcome_settled.v1" => {
+                "tracedecay.memory.observation.automation-outcome.v1"
+            }
+            _ => return Err(ObservationParseError::UnknownKind),
+        };
+        if payload_contract != expected_payload_contract {
+            return Err(ObservationParseError::KindContractMismatch);
+        }
+        if observation_kind != NATIVE_FACT_PROMOTION_OBSERVATION_KIND {
+            return Err(ObservationParseError::UnsupportedKind);
+        }
+
+        Ok(NativeObservation {
+            call,
+            observation_kind,
+            payload_contract,
+            canonical_payload,
+        })
+    }
+
     fn reject_handshake(
         &self,
         request: &HandshakeRequest,
@@ -348,6 +461,16 @@ impl MemoryProvider for NativeProvider {
         if let Some(rejection) = self.validate_payload_contract(call) {
             return rejection;
         }
+        let observation = if call.operation == ProviderOperation::Observe {
+            match Self::parse_observation(call) {
+                Ok(observation) => Some(observation),
+                Err(error) => {
+                    return self.reject(call, error.terminal_code(), error.diagnostic_id());
+                }
+            }
+        } else {
+            None
+        };
         match self.refresh_descriptor() {
             Some(_) => {}
             None => {
@@ -360,7 +483,14 @@ impl MemoryProvider for NativeProvider {
         }
         match call.operation {
             ProviderOperation::Health => self.port.health(call),
-            ProviderOperation::Observe => self.port.observe(call),
+            ProviderOperation::Observe => match observation {
+                Some(observation) => self.port.observe(observation),
+                None => self.reject(
+                    call,
+                    TerminalCode::ContractViolation,
+                    "native.observation_dispatch_missing",
+                ),
+            },
             ProviderOperation::Recall => self.port.recall(call),
             ProviderOperation::Feedback => self.port.feedback(call),
             ProviderOperation::Maintenance => self.port.maintenance(call),

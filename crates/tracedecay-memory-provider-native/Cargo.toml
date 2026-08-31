@@ -8,6 +8,7 @@ description = "Provider-neutral adapter boundary for TraceDecay Native memory ap
 repository = "https://github.com/BleedingDev/tracedecay"
 
 [dependencies]
+serde_json = "1"
 tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
 
 [lints.rust]
