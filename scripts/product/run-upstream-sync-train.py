@@ -1006,17 +1006,46 @@ def ensure_no_untracked(repo: Path, *, allowed_paths: set[str] | None = None) ->
                 raise SyncTrainError(f"untracked file is outside the train: {relative}")
 
 
-def conflict_values(entry: dict[str, Any], path: str, state: dict[str, Any]) -> tuple[str, str, str]:
+def conflict_values(
+    entry: dict[str, Any],
+    path: str,
+    state: dict[str, Any],
+    *,
+    require_resolution_fields: bool,
+) -> tuple[str | None, str | None, str | None]:
     if not isinstance(entry, dict):
         raise SyncTrainError(f"conflict record for {path!r} must be an object")
-    owner = validate_conflict_owner(entry.get("owner"), state, f"conflict {path} owner")
-    resolution = validate_resolution(entry.get("resolution"), f"conflict {path} resolution")
-    rationale = require_nonempty(entry.get("rationale"), f"conflict {path} rationale")
+    owner_value = entry.get("owner")
+    resolution_value = entry.get("resolution")
+    rationale_value = entry.get("rationale")
+    if not require_resolution_fields and all(
+        value is None for value in (owner_value, resolution_value, rationale_value)
+    ):
+        return None, None, None
+    if any(value is None for value in (owner_value, resolution_value, rationale_value)):
+        raise SyncTrainError(
+            f"conflict {path} owner, resolution, and rationale must be provided together"
+        )
+    owner = validate_conflict_owner(owner_value, state, f"conflict {path} owner")
+    resolution = validate_resolution(resolution_value, f"conflict {path} resolution")
+    rationale = require_nonempty(rationale_value, f"conflict {path} rationale")
     return owner, resolution, rationale
 
 
-def validate_conflicts(state: dict[str, Any], repo: Path | None = None) -> list[dict[str, Any]]:
-    """Validate complete conflict provenance and reject duplicate sources/paths."""
+def validate_conflicts(
+    state: dict[str, Any],
+    repo: Path | None = None,
+    *,
+    require_resolution_fields: bool = True,
+) -> list[dict[str, Any]]:
+    """Validate conflict provenance and optionally require recorded resolutions.
+
+    Every prepared conflict is represented in state from the start, so an
+    operator can record those entries one at a time. The optional unresolved
+    fields are accepted only as the untouched all-``None`` triplet; every
+    structural, path, source, and Git blob check remains active. Gates,
+    finalization, and receipts use the strict default.
+    """
 
     conflicts = state.get("conflicts")
     if not isinstance(conflicts, list):
@@ -1054,7 +1083,12 @@ def validate_conflicts(state: dict[str, Any], repo: Path | None = None) -> list[
                 f"duplicate original upstream source {source_path!r} at {source_sha}"
             )
         seen_sources.add(source_key)
-        conflict_values(entry, path, state)
+        conflict_values(
+            entry,
+            path,
+            state,
+            require_resolution_fields=require_resolution_fields,
+        )
         if repo is not None:
             expected_source_blob = blob_sha(repo, source_sha, source_path)
             if source.get("blob_sha") != expected_source_blob:
@@ -1372,11 +1406,11 @@ def record_conflict(args: argparse.Namespace) -> dict[str, Any]:
     selected["owner"] = owner
     selected["resolution"] = resolution
     selected["rationale"] = rationale
-    # Re-validate the complete set after updating the selected entry.  This
-    # keeps state edits fail-closed and makes synthetic or duplicate conflict
-    # paths impossible even if state.json was hand-edited.
+    # Re-validate every entry after updating the selected one. Structural and
+    # provenance checks stay fail-closed while the other prepared entries may
+    # remain untouched until their own record-conflict invocation.
     state["conflicts"] = sorted_conflicts(conflicts)
-    validate_conflicts(state, repo)
+    validate_conflicts(state, repo, require_resolution_fields=False)
     state["status"] = "conflicted"
     write_json(state_path(train_dir), state)
     return {
