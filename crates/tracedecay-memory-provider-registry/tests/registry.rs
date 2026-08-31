@@ -16,7 +16,7 @@ use tracedecay_memory_provider_api::{
     TerminalRecord,
 };
 use tracedecay_memory_provider_native::{
-    NATIVE_PROVIDER_ID, NativeAdapterError, NativeMemoryApplicationPort,
+    NATIVE_PROVIDER_ID, NativeAdapterError, NativeMemoryApplicationPort, NativeObservation,
 };
 use tracedecay_memory_provider_registry::{
     EnabledProviderMode, FabricConfig, FabricError, NativeProviderActivation, ObserverReceipt,
@@ -29,6 +29,9 @@ const TWO_SHA: &str = "222222222222222222222222222222222222222222222222222222222
 const REGISTRY_PAYLOAD_SHA: &str =
     "2bc217171d7030f82de2853ea3e4914b803d3504a3409433d62bf426a613d7ee";
 const OPAQUE_PAYLOAD_SHA: &str = "a4ebe309c7d7eaf1b08aec54feea5668a4b10a564770d162dbd7a131990d0de8";
+const OBSERVATION_PAYLOAD_SHA: &str =
+    "b6c0cb54c14eb8485ba9f86925c370bbcb8e464687f875b7fa1085a1d1b9b1fe";
+const OBSERVATION_PAYLOAD: &[u8] = br#"{"canonical_payload":{"kind":"settled_native_fact_write","fact":{"fixture":true},"commit":{"fixture":true}},"observation_kind":"native.fact_promoted.v1","payload_contract":"tracedecay.memory.observation.native-fact-promotion.v1"}"#;
 
 struct MockNativePort {
     descriptor: ProviderDescriptor,
@@ -58,7 +61,7 @@ impl NativeMemoryApplicationPort for MockNativePort {
         unexpected_provider_contact()
     }
 
-    fn observe(&self, _call: &ProviderCall) -> ProviderReply {
+    fn observe(&self, _observation: NativeObservation<'_>) -> ProviderReply {
         unexpected_provider_contact()
     }
 
@@ -228,9 +231,9 @@ impl NativeMemoryApplicationPort for EvidenceNativePort {
         self.unavailable_reply(call)
     }
 
-    fn observe(&self, call: &ProviderCall) -> ProviderReply {
+    fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
         self.observe_calls.fetch_add(1, Ordering::Relaxed);
-        self.committed_observation_reply(call)
+        self.committed_observation_reply(observation.call)
     }
 
     fn recall(&self, _call: &ProviderCall) -> ProviderReply {
@@ -348,6 +351,11 @@ fn call_after_handshake(
         ProviderOperation::Replay => "tracedecay.memory.provider.replay.v1",
     };
 
+    let (payload_bytes, payload_sha256) = match operation {
+        ProviderOperation::Observe => (OBSERVATION_PAYLOAD.to_vec(), OBSERVATION_PAYLOAD_SHA),
+        _ => (br#"{"registry":true}"#.to_vec(), REGISTRY_PAYLOAD_SHA),
+    };
+
     ProviderCall::new(ProviderCallParts {
         operation,
         provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider"),
@@ -363,8 +371,8 @@ fn call_after_handshake(
         control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
         payload: CanonicalPayload::new(
             OwnedVersionedId::new(payload_contract).expect("payload contract"),
-            br#"{"registry":true}"#.to_vec(),
-            REGISTRY_PAYLOAD_SHA,
+            payload_bytes,
+            payload_sha256,
         )
         .expect("payload"),
         required_capabilities: vec![

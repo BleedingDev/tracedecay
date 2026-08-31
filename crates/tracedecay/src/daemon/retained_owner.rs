@@ -21,6 +21,8 @@ mod memory_mapping;
 mod memory_mutation;
 mod memory_target;
 mod memory_tracking;
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod native_provider;
 mod profile;
 pub(crate) mod receipts;
 mod session;

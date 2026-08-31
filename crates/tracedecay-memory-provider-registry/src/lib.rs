@@ -35,11 +35,20 @@ use tracedecay_memory_fabric::MemoryFabric;
 pub use tracedecay_memory_fabric::{
     FabricConfig, FabricError, ObserverReceipt, ProviderMode, ProviderStatus,
 };
-use tracedecay_memory_provider_api::{
-    ApiError, HandshakeRequest, HandshakeResponse, OwnedProviderId, ProviderCall, ProviderReply,
+// Re-export the narrow provider-neutral surface that product composition needs
+// to implement an application port. The product crate deliberately depends on
+// this registry crate only; concrete provider crates stay behind this boundary.
+pub use tracedecay_memory_provider_api::contract::{CommittedEffectState, TerminalCode};
+pub use tracedecay_memory_provider_api::{
+    ApiError, CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
+    HandshakeRequest, HandshakeRequestParts, HandshakeResponse, OperationControl, OwnedExactScope,
+    OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderCallParts, ProviderDescriptor,
+    ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
 };
-use tracedecay_memory_provider_native::{
-    NATIVE_PROVIDER_ID, NativeAdapterError, NativeMemoryApplicationPort, NativeProvider,
+pub use tracedecay_memory_provider_native::{
+    NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
+    NATIVE_PROVIDER_ID, NativeAdapterError, NativeMemoryApplicationPort, NativeObservation,
+    NativeProvider, OBSERVATION_CONTRACT_ID,
 };
 
 /// A non-disabled Native participation mode.

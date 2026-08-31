@@ -909,7 +909,7 @@ async fn execute_status_on_db(
     evidence_outcome(context, RetainedSurfaceOperation::MemoryStatus, result)
 }
 
-fn memory_application(
+pub(super) fn memory_application(
     database: &Database,
     owner: FactOwnerV1,
 ) -> Result<MemoryApplication<DatabaseFactStore<'_>>, RetainedSurfaceExecutionErrorV1> {
