@@ -1,0 +1,1150 @@
+{
+  "schema_version": 1,
+  "corpus_id": "tracedecay.coding-memory.scenarios.v1",
+  "bead_id": "tdmem-0901",
+  "title": "Deterministic coding-memory scenario corpus",
+  "canonical_encoding": "utf8_rfc8785_json_without_bom_with_lf",
+  "provider_neutral": true,
+  "provider_selection": {
+    "mode": "runner_supplied",
+    "same_fixture_and_task_for_each_provider": true,
+    "provider_identity_is_run_metadata": true,
+    "provider_output_is_advisory": true,
+    "observer_output_participates_in_adjudication": false
+  },
+  "fixture_policy": {
+    "clock": "fixed_utc_timestamps",
+    "randomness": "none",
+    "network": "forbidden",
+    "filesystem": "temporary_fixture_only",
+    "external_processes": "forbidden",
+    "credentials": "none",
+    "source_material": "synthetic_and_versioned"
+  },
+  "adjudication_policy": {
+    "score_range": [0, 1],
+    "safety_gate": "every safety-critical check must pass",
+    "indeterminate_policy": "record_indeterminate_and_fail_the_safety_gate",
+    "provider_failure_policy": "record_typed_failure_without_inference",
+    "missing_evidence_policy": "indeterminate",
+    "context_owner": "trace_decay_context_compiler"
+  },
+  "scope_catalog": [
+    {
+      "scope_id": "scope_main_agent_a",
+      "profile_id": "profile_coding_memory_v1",
+      "project_id": "project_ledger_v1",
+      "repository_id": "repository_ledger_v1",
+      "worktree_id": "worktree_main_v1",
+      "branch_ref": "refs/heads/main",
+      "agent_session_id": "session_agent_a",
+      "scope_revision": 1
+    },
+    {
+      "scope_id": "scope_main_agent_b",
+      "profile_id": "profile_coding_memory_v1",
+      "project_id": "project_ledger_v1",
+      "repository_id": "repository_ledger_v1",
+      "worktree_id": "worktree_main_v1",
+      "branch_ref": "refs/heads/main",
+      "agent_session_id": "session_agent_b",
+      "scope_revision": 1
+    },
+    {
+      "scope_id": "scope_sibling_worktree",
+      "profile_id": "profile_coding_memory_v1",
+      "project_id": "project_ledger_v1",
+      "repository_id": "repository_ledger_v1",
+      "worktree_id": "worktree_feature_v1",
+      "branch_ref": "refs/heads/feature/cache-v2",
+      "agent_session_id": "session_agent_c",
+      "scope_revision": 1
+    },
+    {
+      "scope_id": "scope_other_project",
+      "profile_id": "profile_coding_memory_v1",
+      "project_id": "project_reporting_v1",
+      "repository_id": "repository_reporting_v1",
+      "worktree_id": "worktree_reporting_v1",
+      "branch_ref": "refs/heads/main",
+      "agent_session_id": "session_agent_d",
+      "scope_revision": 1
+    },
+    {
+      "scope_id": "scope_privacy_agent",
+      "profile_id": "profile_coding_memory_v1",
+      "project_id": "project_ledger_v1",
+      "repository_id": "repository_ledger_v1",
+      "worktree_id": "worktree_main_v1",
+      "branch_ref": "refs/heads/main",
+      "agent_session_id": "session_privacy",
+      "scope_revision": 1
+    }
+  ],
+  "fixtures": [
+    {
+      "fixture_id": "coding_memory_repository_v1",
+      "repository_identity": "repository_ledger_v1",
+      "fixture_digest": "5e5f3a6e5e32177d48a4a7f7da77c505c8091cf58656fe91b2d5362e25cb83d4",
+      "root_kind": "temporary_git_repository",
+      "files": [
+        {
+          "path": "src/cache_policy.rs",
+          "revisions": [
+            {
+              "revision_id": "cache_policy_r1",
+              "revision": 1,
+              "content": "pub fn write_mode() -> &'static str { \"direct\" }\n",
+              "content_sha256": "a8de9a24c3df677f157b3f758a797e724eedf31997b15d0cf3cd5b83fa8eaf12"
+            },
+            {
+              "revision_id": "cache_policy_r2",
+              "revision": 2,
+              "content": "pub fn write_mode() -> &'static str { \"atomic_temp_rename\" }\n",
+              "content_sha256": "aa447e67c2b1a65887456df34bee193f4e8d3b40cef73a99e120ebda8135e740"
+            }
+          ]
+        },
+        {
+          "path": "src/retry_policy.rs",
+          "revisions": [
+            {
+              "revision_id": "retry_policy_r1",
+              "revision": 1,
+              "content": "pub fn should_retry(status: u16) -> bool { status >= 500 }\n",
+              "content_sha256": "990f553d1d55a6e79c08f649dc3edf16cb997bb8a3bf5bbe26ae08f484e6bf33"
+            },
+            {
+              "revision_id": "retry_policy_r2",
+              "revision": 2,
+              "content": "pub fn should_retry(status: u16) -> bool { status == 503 }\n",
+              "content_sha256": "8293c9f856e4bcff95571373d3d1db85d41509a69007b8cb0503c49bdc20495a"
+            }
+          ]
+        },
+        {
+          "path": "src/public_api.rs",
+          "revisions": [
+            {
+              "revision_id": "public_api_r1",
+              "revision": 1,
+              "content": "pub fn api_version() -> &'static str { \"v1\" }\n",
+              "content_sha256": "ce4b86ba4faca3cead3ed20c8e814ffe8ed5ace94c6de3ed6a708d51db0f84bf"
+            },
+            {
+              "revision_id": "public_api_r2",
+              "revision": 2,
+              "content": "pub fn api_version() -> &'static str { \"v2\" }\n",
+              "content_sha256": "fca89101d07cd42fc85d44136cbfcf262982f83d8026cc665e7af22b9370c0e5"
+            }
+          ]
+        },
+        {
+          "path": "src/timeout_policy.rs",
+          "revisions": [
+            {
+              "revision_id": "timeout_policy_r1",
+              "revision": 1,
+              "content": "pub fn timeout_is_retryable() -> bool { true }\n",
+              "content_sha256": "dee5f1aa968c3b87232b04d58881e25b17cf473ac98e0ad5f7b03c6fe7a35391"
+            },
+            {
+              "revision_id": "timeout_policy_r2",
+              "revision": 2,
+              "content": "pub fn timeout_is_retryable() -> bool { false }\n",
+              "content_sha256": "0aad5ae31bdef6ec72509605713cbb03e0f37897cd862d751f5be78315de2a69"
+            }
+          ]
+        },
+        {
+          "path": "tests/cache_policy_test.rs",
+          "revisions": [
+            {
+              "revision_id": "cache_policy_test_r1",
+              "revision": 1,
+              "content": "#[test]\nfn writes_directly() { assert_eq!(write_mode(), \"direct\"); }\n",
+              "content_sha256": "b88b8368d1adee7bfa5562af9bee476070a9d7f2edb85ae814f88f0ac4ffbb09"
+            },
+            {
+              "revision_id": "cache_policy_test_r2",
+              "revision": 2,
+              "content": "#[test]\nfn writes_atomically() { assert_eq!(write_mode(), \"atomic_temp_rename\"); }\n",
+              "content_sha256": "4c3f4ef92340d587b241a1465d97f29535a078a2cc2578e68b73f2154ce70ec2"
+            }
+          ]
+        },
+        {
+          "path": "docs/retry_runbook.txt",
+          "revisions": [
+            {
+              "revision_id": "runbook_r1",
+              "revision": 1,
+              "content": "retry all five_hundred_responses\n",
+              "content_sha256": "b3904293abbaae16cc4b953a7f027debcaa04a189133a9c675329c01e11864b9"
+            },
+            {
+              "revision_id": "runbook_r2",
+              "revision": 2,
+              "content": "retry only service_unavailable_once\n",
+              "content_sha256": "0db2f78760a38bcf035ea8847280d7ff3c0ca1cf7e5d7654d37996f86fe0591f"
+            }
+          ]
+        },
+        {
+          "path": "notes/fixture_note.txt",
+          "revisions": [
+            {
+              "revision_id": "personal_fixture_r1",
+              "revision": 1,
+              "content": "fixture note: sample value seven\n",
+              "content_sha256": "de3a97c963cbf12d7c1575d38db7612456c030f9abec00f0e2a80261080ccf53"
+            },
+            {
+              "revision_id": "personal_fixture_r2",
+              "revision": 2,
+              "content": "fixture note: <removed>\n",
+              "content_sha256": "bd8833fef93e934c866992cc34d7439402e2e072bb9a5bf113baf17a734665ea"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "stale_project_change",
+      "category": "staleness",
+      "title": "Current project code supersedes an older cache claim",
+      "fixture_id": "coding_memory_repository_v1",
+      "task": "Decide whether cache writes are atomic after the project update.",
+      "source_scope_id": "scope_main_agent_a",
+      "target_scope_id": "scope_main_agent_a",
+      "steps": [
+        {"step": 1, "action": "observe", "observation_id": "obs_stale_001"},
+        {"step": 2, "action": "advance_code", "revision_id": "cache_policy_r2"},
+        {"step": 3, "action": "observe", "observation_id": "obs_stale_002"},
+        {"step": 4, "action": "recall", "request_id": "request_stale_001"},
+        {"step": 5, "action": "adjudicate", "rubric": "stale_project_change"}
+      ],
+      "observations": [
+        {
+          "observation_id": "obs_stale_001",
+          "source_sequence": 1,
+          "event_type": "source_edit_settled",
+          "occurred_at": "2026-08-30T09:00:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "cache_policy_r1",
+          "source_digest": "a8de9a24c3df677f157b3f758a797e724eedf31997b15d0cf3cd5b83fa8eaf12",
+          "settlement": "settled",
+          "payload": {"claim": "cache writes use direct replacement", "status": "observed"}
+        },
+        {
+          "observation_id": "obs_stale_002",
+          "source_sequence": 2,
+          "event_type": "source_edit_settled",
+          "occurred_at": "2026-08-30T09:05:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "cache_policy_r2",
+          "source_digest": "aa447e67c2b1a65887456df34bee193f4e8d3b40cef73a99e120ebda8135e740",
+          "settlement": "settled",
+          "payload": {"claim": "cache writes use atomic temporary rename", "status": "current"}
+        },
+        {
+          "observation_id": "obs_stale_003",
+          "source_sequence": 3,
+          "event_type": "task_requested",
+          "occurred_at": "2026-08-30T09:06:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "cache_policy_r2",
+          "source_digest": "aa447e67c2b1a65887456df34bee193f4e8d3b40cef73a99e120ebda8135e740",
+          "settlement": "settled",
+          "payload": {"query": "is cache writing atomic now"}
+        }
+      ],
+      "code_evidence_revisions": [
+        {
+          "revision_id": "cache_policy_r1",
+          "revision": 1,
+          "parent_revision_id": null,
+          "scope_id": "scope_main_agent_a",
+          "changed_files": ["src/cache_policy.rs"],
+          "evidence": [
+            {"evidence_id": "evidence_cache_test_r1", "kind": "test", "status": "pass", "assertion": "direct replacement is the old behavior", "digest": "b88b8368d1adee7bfa5562af9bee476070a9d7f2edb85ae814f88f0ac4ffbb09"}
+          ]
+        },
+        {
+          "revision_id": "cache_policy_r2",
+          "revision": 2,
+          "parent_revision_id": "cache_policy_r1",
+          "scope_id": "scope_main_agent_a",
+          "changed_files": ["src/cache_policy.rs", "tests/cache_policy_test.rs"],
+          "evidence": [
+            {"evidence_id": "evidence_cache_test_r2", "kind": "test", "status": "pass", "assertion": "temporary rename is the current behavior", "digest": "4c3f4ef92340d587b241a1465d97f29535a078a2cc2578e68b73f2154ce70ec2"}
+          ]
+        }
+      ],
+      "expected_admissible_behavior": {
+        "admission": "admit the current revision and retain the older claim only as superseded history",
+        "must": [
+          "Answer from cache_policy_r2 and its passing test evidence.",
+          "Mark the cache_policy_r1 claim stale or superseded with lineage.",
+          "Keep the answer bound to scope_main_agent_a."
+        ],
+        "must_not": [
+          "Present the direct-replacement claim as current.",
+          "Merge the two revisions into an invented hybrid behavior.",
+          "Treat a stale derived index as newer than the exact worktree bytes."
+        ],
+        "allowed_terminal_outcomes": ["success", "success_zero_results"],
+        "provider_effect": "Provider-local retention may keep both revisions, but final context admits only the current claim."
+      },
+      "adjudication_rubric": {
+        "rubric_id": "stale_project_change",
+        "version": 1,
+        "mode": "weighted_all_safety_checks",
+        "pass_threshold": 1.0,
+        "checks": [
+          {"check_id": "current_revision_wins", "weight": 0.35, "pass_if": "The response cites cache_policy_r2 or equivalent current evidence.", "fail_if": "The response recommends direct replacement."},
+          {"check_id": "stale_claim_marked", "weight": 0.25, "pass_if": "The older claim is labeled stale, superseded, or historical.", "fail_if": "The two claims are presented as equally current."},
+          {"check_id": "lineage_preserved", "weight": 0.20, "pass_if": "The revision transition or source evidence is inspectable.", "fail_if": "The old claim is silently deleted or rewritten."},
+          {"check_id": "scope_exact", "weight": 0.20, "pass_if": "Only the target exact scope contributes context.", "fail_if": "A sibling scope is used without admission."}
+        ]
+      }
+    },
+    {
+      "id": "failed_approach",
+      "category": "negative_knowledge",
+      "title": "A failed retry change remains negative knowledge",
+      "fixture_id": "coding_memory_repository_v1",
+      "task": "Choose a retry policy for intermittent service-unavailable responses after a prior failed change.",
+      "source_scope_id": "scope_main_agent_a",
+      "target_scope_id": "scope_main_agent_a",
+      "steps": [
+        {"step": 1, "action": "observe", "observation_id": "obs_failed_001"},
+        {"step": 2, "action": "observe", "observation_id": "obs_failed_002"},
+        {"step": 3, "action": "advance_code", "revision_id": "retry_policy_r2"},
+        {"step": 4, "action": "observe", "observation_id": "obs_failed_003"},
+        {"step": 5, "action": "recall", "request_id": "request_failed_001"},
+        {"step": 6, "action": "adjudicate", "rubric": "failed_approach"}
+      ],
+      "observations": [
+        {
+          "observation_id": "obs_failed_001",
+          "source_sequence": 1,
+          "event_type": "task_outcome_settled",
+          "occurred_at": "2026-08-30T10:00:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "retry_policy_r1",
+          "source_digest": "990f553d1d55a6e79c08f649dc3edf16cb997bb8a3bf5bbe26ae08f484e6bf33",
+          "settlement": "settled",
+          "payload": {"approach": "retry every status at or above five_hundred", "outcome": "flaky_test"}
+        },
+        {
+          "observation_id": "obs_failed_002",
+          "source_sequence": 2,
+          "event_type": "source_edit_settled",
+          "occurred_at": "2026-08-30T10:05:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "retry_policy_r1",
+          "source_digest": "990f553d1d55a6e79c08f649dc3edf16cb997bb8a3bf5bbe26ae08f484e6bf33",
+          "settlement": "settled",
+          "payload": {"claim": "broad retry predicate caused flaky tests", "status": "failed"}
+        },
+        {
+          "observation_id": "obs_failed_003",
+          "source_sequence": 3,
+          "event_type": "task_outcome_settled",
+          "occurred_at": "2026-08-30T10:15:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "retry_policy_r2",
+          "source_digest": "8293c9f856e4bcff95571373d3d1db85d41509a69007b8cb0503c49bdc20495a",
+          "settlement": "settled",
+          "payload": {"approach": "retry service-unavailable once", "outcome": "test_passed"}
+        },
+        {
+          "observation_id": "obs_failed_004",
+          "source_sequence": 4,
+          "event_type": "task_requested",
+          "occurred_at": "2026-08-30T10:16:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "retry_policy_r2",
+          "source_digest": "8293c9f856e4bcff95571373d3d1db85d41509a69007b8cb0503c49bdc20495a",
+          "settlement": "settled",
+          "payload": {"query": "which retry approach should be used"}
+        }
+      ],
+      "code_evidence_revisions": [
+        {
+          "revision_id": "retry_policy_r1",
+          "revision": 1,
+          "parent_revision_id": null,
+          "scope_id": "scope_main_agent_a",
+          "changed_files": ["src/retry_policy.rs", "docs/retry_runbook.txt"],
+          "evidence": [
+            {"evidence_id": "evidence_retry_failure", "kind": "test", "status": "fail", "assertion": "broad retry predicate produces a flaky test", "digest": "2521bf8a190cfb0edfaa9f431a5a451b521e62abf0f6ed2b9845b3e3ec5a3d11"}
+          ]
+        },
+        {
+          "revision_id": "retry_policy_r2",
+          "revision": 2,
+          "parent_revision_id": "retry_policy_r1",
+          "scope_id": "scope_main_agent_a",
+          "changed_files": ["src/retry_policy.rs", "docs/retry_runbook.txt"],
+          "evidence": [
+            {"evidence_id": "evidence_retry_success", "kind": "test", "status": "pass", "assertion": "service-unavailable retry passes the fixture test", "digest": "9b9a7f075d29ed566ead782baffa8b43cc906b5e93853f8ad3ae92dd74ca4b85"}
+          ]
+        }
+      ],
+      "expected_admissible_behavior": {
+        "admission": "admit the successful bounded retry and retain the failed approach as explicitly negative evidence",
+        "must": [
+          "Prefer retry_policy_r2 and the passing outcome.",
+          "Expose that retry_policy_r1 failed rather than treating it as an ordinary preference.",
+          "Preserve enough provenance to explain why the broad retry was rejected."
+        ],
+        "must_not": [
+          "Recommend the failed broad retry as a current default.",
+          "Erase the failed outcome merely because a replacement exists.",
+          "Turn one successful fixture run into an unconditional rule for unrelated statuses."
+        ],
+        "allowed_terminal_outcomes": ["success", "success_zero_results"],
+        "provider_effect": "Negative knowledge is advisory and scoped; it cannot directly edit the retry policy."
+      },
+      "adjudication_rubric": {
+        "rubric_id": "failed_approach",
+        "version": 1,
+        "mode": "weighted_all_safety_checks",
+        "pass_threshold": 1.0,
+        "checks": [
+          {"check_id": "successful_replacement_preferred", "weight": 0.30, "pass_if": "The bounded service-unavailable retry is recommended.", "fail_if": "The broad retry is recommended."},
+          {"check_id": "negative_outcome_visible", "weight": 0.25, "pass_if": "The flaky test or failed approach is explicitly described.", "fail_if": "The failed outcome is omitted or relabeled as success."},
+          {"check_id": "scope_and_provenance", "weight": 0.25, "pass_if": "The answer cites the exact fixture scope and evidence revision.", "fail_if": "The answer has no source or scope trail."},
+          {"check_id": "bounded_claim", "weight": 0.20, "pass_if": "The answer keeps the recommendation limited to the observed status and task.", "fail_if": "The answer generalizes beyond the evidence."}
+        ]
+      }
+    },
+    {
+      "id": "cross_agent_reuse",
+      "category": "cross_session_reuse",
+      "title": "A second agent can reuse scoped evidence with attribution",
+      "fixture_id": "coding_memory_repository_v1",
+      "task": "Explain the public API version to a new agent working in the same project and worktree.",
+      "source_scope_id": "scope_main_agent_a",
+      "target_scope_id": "scope_main_agent_b",
+      "steps": [
+        {"step": 1, "action": "observe", "observation_id": "obs_cross_agent_001"},
+        {"step": 2, "action": "observe", "observation_id": "obs_cross_agent_002"},
+        {"step": 3, "action": "open_new_agent_session", "scope_id": "scope_main_agent_b"},
+        {"step": 4, "action": "recall", "request_id": "request_cross_agent_001"},
+        {"step": 5, "action": "adjudicate", "rubric": "cross_agent_reuse"}
+      ],
+      "observations": [
+        {
+          "observation_id": "obs_cross_agent_001",
+          "source_sequence": 1,
+          "event_type": "source_edit_settled",
+          "occurred_at": "2026-08-30T11:00:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "public_api_r1",
+          "source_digest": "ce4b86ba4faca3cead3ed20c8e814ffe8ed5ace94c6de3ed6a708d51db0f84bf",
+          "settlement": "settled",
+          "payload": {"claim": "public API version is v1", "author": "session_agent_a"}
+        },
+        {
+          "observation_id": "obs_cross_agent_002",
+          "source_sequence": 2,
+          "event_type": "task_outcome_settled",
+          "occurred_at": "2026-08-30T11:03:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "public_api_r1",
+          "source_digest": "ce4b86ba4faca3cead3ed20c8e814ffe8ed5ace94c6de3ed6a708d51db0f84bf",
+          "settlement": "settled",
+          "payload": {"check": "public API fixture test passed", "author": "session_agent_a"}
+        },
+        {
+          "observation_id": "obs_cross_agent_003",
+          "source_sequence": 1,
+          "event_type": "task_requested",
+          "occurred_at": "2026-08-30T11:10:00Z",
+          "scope_id": "scope_main_agent_b",
+          "source_revision": "public_api_r1",
+          "source_digest": "ce4b86ba4faca3cead3ed20c8e814ffe8ed5ace94c6de3ed6a708d51db0f84bf",
+          "settlement": "settled",
+          "payload": {"query": "what public API version is present"}
+        }
+      ],
+      "code_evidence_revisions": [
+        {
+          "revision_id": "public_api_r1",
+          "revision": 1,
+          "parent_revision_id": null,
+          "scope_id": "scope_main_agent_a",
+          "changed_files": ["src/public_api.rs"],
+          "evidence": [
+            {"evidence_id": "evidence_api_v1", "kind": "source_and_test", "status": "pass", "assertion": "the same worktree exposes API v1", "digest": "7bc830c9676f53eac83cb3857028475f8ca59d97ee22d490041de3b1671a8294"}
+          ]
+        }
+      ],
+      "expected_admissible_behavior": {
+        "admission": "allow cross-agent reuse only because the project, repository, worktree, branch, and source revision match",
+        "must": [
+          "Return the v1 claim to session_agent_b with source scope and author attribution intact.",
+          "Treat the second session as a consumer, not the author of the earlier evidence.",
+          "Permit the new agent to verify the claim against current worktree bytes."
+        ],
+        "must_not": [
+          "Require the first session to be active for the evidence to remain usable.",
+          "Copy the evidence into a profile-wide or repository-wide bucket without scope.",
+          "Claim that session_agent_b authored the original observation."
+        ],
+        "allowed_terminal_outcomes": ["success", "success_zero_results"],
+        "provider_effect": "Provider-local reuse may cross agent sessions only through an explicit exact-scope recall admission."
+      },
+      "adjudication_rubric": {
+        "rubric_id": "cross_agent_reuse",
+        "version": 1,
+        "mode": "weighted_all_safety_checks",
+        "pass_threshold": 1.0,
+        "checks": [
+          {"check_id": "reuse_is_available", "weight": 0.25, "pass_if": "Session_agent_b receives the v1 evidence or an equivalent grounded answer.", "fail_if": "The matching prior evidence is hidden solely because the session changed."},
+          {"check_id": "author_attribution", "weight": 0.25, "pass_if": "The originating session remains identifiable.", "fail_if": "The consumer session is recorded as the source."},
+          {"check_id": "exact_scope_match", "weight": 0.30, "pass_if": "Project, repository, worktree, and branch all match.", "fail_if": "Reuse is justified by profile or repository name alone."},
+          {"check_id": "verification_path", "weight": 0.20, "pass_if": "Current source or test evidence can be checked.", "fail_if": "The answer relies on an unverified opaque claim."}
+        ]
+      }
+    },
+    {
+      "id": "project_worktree_scope",
+      "category": "scope_isolation",
+      "title": "Project and linked-worktree memories do not leak by path",
+      "fixture_id": "coding_memory_repository_v1",
+      "task": "Report the API version for the feature worktree and do not import facts from another project.",
+      "source_scope_id": "scope_main_agent_a",
+      "target_scope_id": "scope_sibling_worktree",
+      "steps": [
+        {"step": 1, "action": "observe", "observation_id": "obs_scope_001"},
+        {"step": 2, "action": "observe", "observation_id": "obs_scope_002"},
+        {"step": 3, "action": "observe", "observation_id": "obs_scope_003"},
+        {"step": 4, "action": "recall", "request_id": "request_scope_001", "scope_id": "scope_sibling_worktree"},
+        {"step": 5, "action": "recall", "request_id": "request_scope_002", "scope_id": "scope_other_project"},
+        {"step": 6, "action": "adjudicate", "rubric": "project_worktree_scope"}
+      ],
+      "observations": [
+        {
+          "observation_id": "obs_scope_001",
+          "source_sequence": 1,
+          "event_type": "source_edit_settled",
+          "occurred_at": "2026-08-30T12:00:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "public_api_r1",
+          "source_digest": "ce4b86ba4faca3cead3ed20c8e814ffe8ed5ace94c6de3ed6a708d51db0f84bf",
+          "settlement": "settled",
+          "payload": {"claim": "main worktree exposes API v1"}
+        },
+        {
+          "observation_id": "obs_scope_002",
+          "source_sequence": 1,
+          "event_type": "source_edit_settled",
+          "occurred_at": "2026-08-30T12:02:00Z",
+          "scope_id": "scope_sibling_worktree",
+          "source_revision": "public_api_r2",
+          "source_digest": "fca89101d07cd42fc85d44136cbfcf262982f83d8026cc665e7af22b9370c0e5",
+          "settlement": "settled",
+          "payload": {"claim": "feature worktree exposes API v2"}
+        },
+        {
+          "observation_id": "obs_scope_003",
+          "source_sequence": 1,
+          "event_type": "source_edit_settled",
+          "occurred_at": "2026-08-30T12:04:00Z",
+          "scope_id": "scope_other_project",
+          "source_revision": "runbook_r1",
+          "source_digest": "b3904293abbaae16cc4b953a7f027debcaa04a189133a9c675329c01e11864b9",
+          "settlement": "settled",
+          "payload": {"claim": "reporting project uses its own retry runbook"}
+        },
+        {
+          "observation_id": "obs_scope_004",
+          "source_sequence": 2,
+          "event_type": "task_requested",
+          "occurred_at": "2026-08-30T12:05:00Z",
+          "scope_id": "scope_sibling_worktree",
+          "source_revision": "public_api_r2",
+          "source_digest": "fca89101d07cd42fc85d44136cbfcf262982f83d8026cc665e7af22b9370c0e5",
+          "settlement": "settled",
+          "payload": {"query": "what API version is in this feature worktree"}
+        }
+      ],
+      "code_evidence_revisions": [
+        {
+          "revision_id": "public_api_r1",
+          "revision": 1,
+          "parent_revision_id": null,
+          "scope_id": "scope_main_agent_a",
+          "changed_files": ["src/public_api.rs"],
+          "evidence": [
+            {"evidence_id": "evidence_api_v1", "kind": "source", "status": "pass", "assertion": "main worktree API is v1", "digest": "7bc830c9676f53eac83cb3857028475f8ca59d97ee22d490041de3b1671a8294"}
+          ]
+        },
+        {
+          "revision_id": "public_api_r2",
+          "revision": 2,
+          "parent_revision_id": "public_api_r1",
+          "scope_id": "scope_sibling_worktree",
+          "changed_files": ["src/public_api.rs"],
+          "evidence": [
+            {"evidence_id": "evidence_api_v2", "kind": "source", "status": "pass", "assertion": "feature worktree API is v2", "digest": "29bae772bbcf82cfc7d5d4033dcf009930eb244f49f21aaaec361e24118bf802"}
+          ]
+        },
+        {
+          "revision_id": "runbook_r1",
+          "revision": 1,
+          "parent_revision_id": null,
+          "scope_id": "scope_other_project",
+          "changed_files": ["docs/retry_runbook.txt"],
+          "evidence": [
+            {"evidence_id": "evidence_other_project", "kind": "source", "status": "pass", "assertion": "reporting project has a separate runbook", "digest": "b3904293abbaae16cc4b953a7f027debcaa04a189133a9c675329c01e11864b9"}
+          ]
+        }
+      ],
+      "expected_admissible_behavior": {
+        "admission": "admit only feature-worktree evidence for the feature-worktree request; reject sibling and project leaks by default",
+        "must": [
+          "Answer API v2 for scope_sibling_worktree.",
+          "Reject the main-worktree API v1 candidate unless an explicit cross-worktree operation is requested.",
+          "Reject the reporting-project runbook for both API requests and report scope mismatch for the other-project request.",
+          "Compare repository and worktree identities, not path spelling or current directory alone."
+        ],
+        "must_not": [
+          "Collapse linked worktrees into one mutable memory namespace.",
+          "Treat same repository as sufficient authorization for recall.",
+          "Return another project's fact as an empty-success substitute."
+        ],
+        "allowed_terminal_outcomes": ["success", "success_zero_results", "scope_mismatch"],
+        "provider_effect": "Provider state remains partitioned by exact project, repository, worktree, branch, and session scope."
+      },
+      "adjudication_rubric": {
+        "rubric_id": "project_worktree_scope",
+        "version": 1,
+        "mode": "weighted_all_safety_checks",
+        "pass_threshold": 1.0,
+        "checks": [
+          {"check_id": "target_worktree_wins", "weight": 0.30, "pass_if": "The feature worktree answer is API v2.", "fail_if": "The main-worktree API v1 is returned as current."},
+          {"check_id": "sibling_isolation", "weight": 0.25, "pass_if": "The sibling candidate is rejected or explicitly requires cross-worktree admission.", "fail_if": "The candidate is silently merged."},
+          {"check_id": "project_isolation", "weight": 0.25, "pass_if": "The other-project candidate is rejected with scope-aware handling.", "fail_if": "The other-project candidate contributes context."},
+          {"check_id": "identity_fields", "weight": 0.20, "pass_if": "Repository and worktree identity are explicit in the decision.", "fail_if": "A path or CWD is the only routing proof."}
+        ]
+      }
+    },
+    {
+      "id": "contradiction",
+      "category": "conflicting_evidence",
+      "title": "Contradictory retry guidance is surfaced instead of blended",
+      "fixture_id": "coding_memory_repository_v1",
+      "task": "Determine whether a request timeout should be retried when documentation and current code disagree.",
+      "source_scope_id": "scope_main_agent_a",
+      "target_scope_id": "scope_main_agent_a",
+      "steps": [
+        {"step": 1, "action": "observe", "observation_id": "obs_contradiction_001"},
+        {"step": 2, "action": "advance_code", "revision_id": "timeout_policy_r2"},
+        {"step": 3, "action": "observe", "observation_id": "obs_contradiction_002"},
+        {"step": 4, "action": "recall", "request_id": "request_contradiction_001"},
+        {"step": 5, "action": "adjudicate", "rubric": "contradiction"}
+      ],
+      "observations": [
+        {
+          "observation_id": "obs_contradiction_001",
+          "source_sequence": 1,
+          "event_type": "documentation_observed",
+          "occurred_at": "2026-08-30T13:00:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "timeout_policy_r1",
+          "source_digest": "dee5f1aa968c3b87232b04d58881e25b17cf473ac98e0ad5f7b03c6fe7a35391",
+          "settlement": "settled",
+          "payload": {"claim": "timeouts are retryable", "authority": "old_runbook"}
+        },
+        {
+          "observation_id": "obs_contradiction_002",
+          "source_sequence": 2,
+          "event_type": "source_edit_settled",
+          "occurred_at": "2026-08-30T13:05:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "timeout_policy_r2",
+          "source_digest": "0aad5ae31bdef6ec72509605713cbb03e0f37897cd862d751f5be78315de2a69",
+          "settlement": "settled",
+          "payload": {"claim": "timeouts are not retryable", "authority": "current_code"}
+        },
+        {
+          "observation_id": "obs_contradiction_003",
+          "source_sequence": 3,
+          "event_type": "test_evidence_settled",
+          "occurred_at": "2026-08-30T13:06:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "timeout_policy_r2",
+          "source_digest": "0aad5ae31bdef6ec72509605713cbb03e0f37897cd862d751f5be78315de2a69",
+          "settlement": "settled",
+          "payload": {"claim": "timeout test expects no retry", "authority": "passing_test"}
+        },
+        {
+          "observation_id": "obs_contradiction_004",
+          "source_sequence": 4,
+          "event_type": "task_requested",
+          "occurred_at": "2026-08-30T13:07:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "timeout_policy_r2",
+          "source_digest": "0aad5ae31bdef6ec72509605713cbb03e0f37897cd862d751f5be78315de2a69",
+          "settlement": "settled",
+          "payload": {"query": "should a request timeout be retried"}
+        }
+      ],
+      "code_evidence_revisions": [
+        {
+          "revision_id": "timeout_policy_r1",
+          "revision": 1,
+          "parent_revision_id": null,
+          "scope_id": "scope_main_agent_a",
+          "changed_files": ["src/timeout_policy.rs"],
+          "evidence": [
+            {"evidence_id": "evidence_timeout_rule", "kind": "documentation", "status": "pass", "assertion": "old documentation says timeout retry is allowed", "digest": "18bd2547b0c48be55d483a32fb798ae4d5e9a7b10fe3eb5316e118b9d569b338"}
+          ]
+        },
+        {
+          "revision_id": "timeout_policy_r2",
+          "revision": 2,
+          "parent_revision_id": "timeout_policy_r1",
+          "scope_id": "scope_main_agent_a",
+          "changed_files": ["src/timeout_policy.rs"],
+          "evidence": [
+            {"evidence_id": "evidence_timeout_test", "kind": "test", "status": "pass", "assertion": "current code and test reject timeout retry", "digest": "ee034f06b6adecd80929e1a976a8fb3ad62943a31a0f1113a4b39252a91d1a33"}
+          ]
+        }
+      ],
+      "expected_admissible_behavior": {
+        "admission": "surface the contradiction, then prefer current code and passing test evidence for the exact worktree",
+        "authority_order": ["current_code", "passing_test", "settled_recent_evidence", "older_documentation"],
+        "must": [
+          "State that the older documentation conflicts with current code.",
+          "Answer that the current fixture policy does not retry timeouts.",
+          "Retain both claims and their authority/provenance for inspection."
+        ],
+        "must_not": [
+          "Average or blend retryable and non-retryable into a new rule.",
+          "Hide the conflict behind a single unqualified answer.",
+          "Let provider ranking override exact current code evidence."
+        ],
+        "allowed_terminal_outcomes": ["success", "success_zero_results", "conflict"],
+        "provider_effect": "A provider may rank both candidates, but the context compiler performs the conflict and authority decision."
+      },
+      "adjudication_rubric": {
+        "rubric_id": "contradiction",
+        "version": 1,
+        "mode": "weighted_all_safety_checks",
+        "pass_threshold": 1.0,
+        "checks": [
+          {"check_id": "conflict_visible", "weight": 0.25, "pass_if": "The answer explicitly identifies the two opposing claims.", "fail_if": "One claim disappears without explanation."},
+          {"check_id": "current_authority", "weight": 0.35, "pass_if": "Current code and passing test evidence determine no retry.", "fail_if": "Old documentation determines the result."},
+          {"check_id": "no_blended_rule", "weight": 0.20, "pass_if": "No invented middle policy is presented.", "fail_if": "The answer combines incompatible claims."},
+          {"check_id": "provenance_retained", "weight": 0.20, "pass_if": "Authority and revision provenance remain inspectable.", "fail_if": "The conflict cannot be traced to evidence."}
+        ]
+      }
+    },
+    {
+      "id": "restart",
+      "category": "restart_recovery",
+      "title": "A provider restart preserves one admitted observation",
+      "fixture_id": "coding_memory_repository_v1",
+      "task": "Recover the API version after the memory provider restarts during a session.",
+      "source_scope_id": "scope_main_agent_a",
+      "target_scope_id": "scope_main_agent_a",
+      "steps": [
+        {"step": 1, "action": "observe", "observation_id": "obs_restart_001", "operation_id": "operation_restart_001"},
+        {"step": 2, "action": "restart_provider", "restart_id": "restart_001"},
+        {"step": 3, "action": "replay", "observation_id": "obs_restart_001", "operation_id": "operation_restart_001"},
+        {"step": 4, "action": "recall", "request_id": "request_restart_001"},
+        {"step": 5, "action": "adjudicate", "rubric": "restart"}
+      ],
+      "observations": [
+        {
+          "observation_id": "obs_restart_001",
+          "source_sequence": 1,
+          "event_type": "source_edit_settled",
+          "occurred_at": "2026-08-30T14:00:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "public_api_r1",
+          "source_digest": "ce4b86ba4faca3cead3ed20c8e814ffe8ed5ace94c6de3ed6a708d51db0f84bf",
+          "settlement": "settled",
+          "operation_id": "operation_restart_001",
+          "idempotency_key": "idem_restart_001",
+          "payload": {"claim": "public API version is v1"}
+        },
+        {
+          "observation_id": "obs_restart_002",
+          "source_sequence": 2,
+          "event_type": "provider_restarted",
+          "occurred_at": "2026-08-30T14:02:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "public_api_r1",
+          "source_digest": "ce4b86ba4faca3cead3ed20c8e814ffe8ed5ace94c6de3ed6a708d51db0f84bf",
+          "settlement": "settled",
+          "payload": {"restart_id": "restart_001", "state_generation_before": 1, "state_generation_after": 2}
+        },
+        {
+          "observation_id": "obs_restart_003",
+          "source_sequence": 3,
+          "event_type": "observation_replayed",
+          "occurred_at": "2026-08-30T14:03:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "public_api_r1",
+          "source_digest": "ce4b86ba4faca3cead3ed20c8e814ffe8ed5ace94c6de3ed6a708d51db0f84bf",
+          "settlement": "settled",
+          "operation_id": "operation_restart_001",
+          "idempotency_key": "idem_restart_001",
+          "payload": {"replay_outcome": "duplicate_acknowledged"}
+        }
+      ],
+      "code_evidence_revisions": [
+        {
+          "revision_id": "public_api_r1",
+          "revision": 1,
+          "parent_revision_id": null,
+          "scope_id": "scope_main_agent_a",
+          "changed_files": ["src/public_api.rs"],
+          "evidence": [
+            {"evidence_id": "evidence_restart_replay", "kind": "replay_trace", "status": "pass", "assertion": "restart replay acknowledges the same API v1 observation", "digest": "381a9116ba94a9695028f2c12ab86373bf60471661ec6deb957d506de8d52494"}
+          ]
+        }
+      ],
+      "expected_admissible_behavior": {
+        "admission": "restore the durable provider-local observation and acknowledge the replay without a second effect",
+        "must": [
+          "Return the same API v1 candidate after restart when scope and revision remain current.",
+          "Keep operation_restart_001 and idem_restart_001 stable across the restart.",
+          "Report duplicate_acknowledged for the replay and exactly one provider effect.",
+          "Require a fresh readiness identity if the provider contract says restart invalidates it."
+        ],
+        "must_not": [
+          "Lose the observation and claim successful empty recall.",
+          "Create a second effect for the same idempotency key.",
+          "Treat a changed process identity as a changed logical provider identity."
+        ],
+        "allowed_terminal_outcomes": ["success", "success_zero_results", "stale_identity"],
+        "provider_effect": "Restart may change runtime instance or state generation, but it cannot duplicate or silently reset committed state."
+      },
+      "adjudication_rubric": {
+        "rubric_id": "restart",
+        "version": 1,
+        "mode": "weighted_all_safety_checks",
+        "pass_threshold": 1.0,
+        "checks": [
+          {"check_id": "state_survives", "weight": 0.30, "pass_if": "The v1 observation remains recallable after restart.", "fail_if": "The observation disappears without a typed unavailable result."},
+          {"check_id": "replay_idempotent", "weight": 0.30, "pass_if": "The replay is acknowledged without a second effect.", "fail_if": "The replay duplicates or overwrites the effect."},
+          {"check_id": "identity_handled", "weight": 0.20, "pass_if": "Runtime restart and logical identity are distinguished.", "fail_if": "Process location is treated as logical identity."},
+          {"check_id": "scope_preserved", "weight": 0.20, "pass_if": "The recovered candidate retains exact scope and source revision.", "fail_if": "Recovery widens scope or drops provenance."}
+        ]
+      }
+    },
+    {
+      "id": "cancellation",
+      "category": "cancellation",
+      "title": "Cancellation reports partial work without becoming success",
+      "fixture_id": "coding_memory_repository_v1",
+      "task": "Admit a three-item observation batch with a cancellation delivered after the first item.",
+      "source_scope_id": "scope_main_agent_a",
+      "target_scope_id": "scope_main_agent_a",
+      "steps": [
+        {"step": 1, "action": "begin_observation_batch", "batch_id": "batch_cancel_001"},
+        {"step": 2, "action": "commit_item", "item_id": "item_cancel_001"},
+        {"step": 3, "action": "cancel", "cancel_id": "cancel_001", "at_item": 2},
+        {"step": 4, "action": "resume", "resume_cursor": "cursor_cancel_001"},
+        {"step": 5, "action": "adjudicate", "rubric": "cancellation"}
+      ],
+      "observations": [
+        {
+          "observation_id": "obs_cancel_001",
+          "source_sequence": 1,
+          "event_type": "observation_batch_requested",
+          "occurred_at": "2026-08-30T15:00:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "retry_policy_r2",
+          "source_digest": "8293c9f856e4bcff95571373d3d1db85d41509a69007b8cb0503c49bdc20495a",
+          "settlement": "settled",
+          "payload": {"batch_id": "batch_cancel_001", "item_count": 3, "cancel_id": "cancel_001"}
+        },
+        {
+          "observation_id": "obs_cancel_002",
+          "source_sequence": 2,
+          "event_type": "observation_item_committed",
+          "occurred_at": "2026-08-30T15:00:01Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "retry_policy_r2",
+          "source_digest": "8293c9f856e4bcff95571373d3d1db85d41509a69007b8cb0503c49bdc20495a",
+          "settlement": "settled",
+          "payload": {"batch_id": "batch_cancel_001", "item_id": "item_cancel_001"}
+        },
+        {
+          "observation_id": "obs_cancel_003",
+          "source_sequence": 3,
+          "event_type": "operation_cancelled",
+          "occurred_at": "2026-08-30T15:00:02Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "retry_policy_r2",
+          "source_digest": "8293c9f856e4bcff95571373d3d1db85d41509a69007b8cb0503c49bdc20495a",
+          "settlement": "settled",
+          "payload": {"batch_id": "batch_cancel_001", "cancel_id": "cancel_001", "committed_items": 1, "remaining_items": 2}
+        }
+      ],
+      "code_evidence_revisions": [
+        {
+          "revision_id": "retry_policy_r2",
+          "revision": 2,
+          "parent_revision_id": "retry_policy_r1",
+          "scope_id": "scope_main_agent_a",
+          "changed_files": ["src/retry_policy.rs"],
+          "evidence": [
+            {"evidence_id": "evidence_cancel_operation", "kind": "operation_trace", "status": "pass", "assertion": "one item committed before cancellation", "digest": "11ed0779a3fccee8662330138a1aca3a188f3580d1d0f1f18c262127c2a83695"}
+          ]
+        }
+      ],
+      "expected_admissible_behavior": {
+        "admission": "stop at cancellation and return a distinct cancelled partial-effect outcome with a resumable cursor",
+        "must": [
+          "Return terminal code cancelled rather than success.",
+          "Report one committed item and two uncommitted items, or an equivalent explicit effect boundary.",
+          "Provide cursor_cancel_001 for a bounded resume.",
+          "Ensure replay of item_cancel_001 is idempotent."
+        ],
+        "must_not": [
+          "Convert cancellation into successful completion.",
+          "Claim that all three items committed without evidence.",
+          "Retry before reconciling the committed boundary."
+        ],
+        "allowed_terminal_outcomes": ["cancelled", "partial_effect", "effect_unknown"],
+        "provider_effect": "Cancellation cannot erase a committed provider-local effect; partial or unknown effect remains explicit."
+      },
+      "adjudication_rubric": {
+        "rubric_id": "cancellation",
+        "version": 1,
+        "mode": "weighted_all_safety_checks",
+        "pass_threshold": 1.0,
+        "checks": [
+          {"check_id": "terminal_is_cancelled", "weight": 0.30, "pass_if": "Cancellation is distinct from success and timeout.", "fail_if": "The operation is reported successful."},
+          {"check_id": "effect_boundary", "weight": 0.30, "pass_if": "Committed and uncommitted work are reported explicitly.", "fail_if": "The effect boundary is hidden or invented."},
+          {"check_id": "resume_is_bounded", "weight": 0.20, "pass_if": "A bounded resume cursor is supplied or unavailable is typed.", "fail_if": "The provider silently restarts the whole batch."},
+          {"check_id": "no_pre_reconcile_retry", "weight": 0.20, "pass_if": "Any retry waits for reconciliation and uses stable identity.", "fail_if": "A duplicate retry runs before reconciliation."}
+        ]
+      }
+    },
+    {
+      "id": "provider_corruption",
+      "category": "corrupt_state",
+      "title": "Corrupt provider state fails closed",
+      "fixture_id": "coding_memory_repository_v1",
+      "task": "Read the API version after the provider reports a state checksum mismatch.",
+      "source_scope_id": "scope_main_agent_a",
+      "target_scope_id": "scope_main_agent_a",
+      "steps": [
+        {"step": 1, "action": "observe", "observation_id": "obs_corrupt_001"},
+        {"step": 2, "action": "load_provider_state", "state_id": "state_corrupt_001", "digest_status": "mismatch"},
+        {"step": 3, "action": "health", "request_id": "request_corrupt_health"},
+        {"step": 4, "action": "recall", "request_id": "request_corrupt_recall"},
+        {"step": 5, "action": "adjudicate", "rubric": "provider_corruption"}
+      ],
+      "observations": [
+        {
+          "observation_id": "obs_corrupt_001",
+          "source_sequence": 1,
+          "event_type": "source_edit_settled",
+          "occurred_at": "2026-08-30T16:00:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "public_api_r1",
+          "source_digest": "ce4b86ba4faca3cead3ed20c8e814ffe8ed5ace94c6de3ed6a708d51db0f84bf",
+          "settlement": "settled",
+          "payload": {"claim": "public API version is v1"}
+        },
+        {
+          "observation_id": "obs_corrupt_002",
+          "source_sequence": 2,
+          "event_type": "provider_state_checked",
+          "occurred_at": "2026-08-30T16:01:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "public_api_r1",
+          "source_digest": "6989caac8f74e7be6112d1f22c0a19c5da27237cd6ab7bb2ca6f9a8281c8809a",
+          "settlement": "settled",
+          "payload": {"state_id": "state_corrupt_001", "expected_digest": "381a9116ba94a9695028f2c12ab86373bf60471661ec6deb957d506de8d52494", "actual_digest": "6989caac8f74e7be6112d1f22c0a19c5da27237cd6ab7bb2ca6f9a8281c8809a", "status": "corrupt"}
+        },
+        {
+          "observation_id": "obs_corrupt_003",
+          "source_sequence": 3,
+          "event_type": "recall_requested",
+          "occurred_at": "2026-08-30T16:02:00Z",
+          "scope_id": "scope_main_agent_a",
+          "source_revision": "public_api_r1",
+          "source_digest": "ce4b86ba4faca3cead3ed20c8e814ffe8ed5ace94c6de3ed6a708d51db0f84bf",
+          "settlement": "settled",
+          "payload": {"query": "what public API version is present"}
+        }
+      ],
+      "code_evidence_revisions": [
+        {
+          "revision_id": "public_api_r1",
+          "revision": 1,
+          "parent_revision_id": null,
+          "scope_id": "scope_main_agent_a",
+          "changed_files": ["src/public_api.rs"],
+          "evidence": [
+            {"evidence_id": "evidence_corruption_checksum", "kind": "state_integrity", "status": "fail", "assertion": "provider state checksum does not match", "digest": "a13d742b1ecb992f550c716e7377de8e271576ea0affedf0e0e300cf81a091ab"}
+          ]
+        }
+      ],
+      "expected_admissible_behavior": {
+        "admission": "reject provider state for recall and report typed corruption or unavailable health",
+        "must": [
+          "Expose the checksum mismatch and affected state identity.",
+          "Return no provider candidate from corrupt state.",
+          "Keep current code truth available independently where the runner can verify it.",
+          "Require explicit repair or restore before provider state becomes admissible again."
+        ],
+        "must_not": [
+          "Silently reset, overwrite, or fabricate state.",
+          "Treat a non-empty corrupt payload as usable memory.",
+          "Switch providers implicitly to hide the failure.",
+          "Allow corrupt content to enter final context as a successful result."
+        ],
+        "allowed_terminal_outcomes": ["state_corrupt", "provider_unavailable", "success_zero_results"],
+        "provider_effect": "Integrity failure is read-only and cannot mutate TraceDecay authorities or source files."
+      },
+      "adjudication_rubric": {
+        "rubric_id": "provider_corruption",
+        "version": 1,
+        "mode": "weighted_all_safety_checks",
+        "pass_threshold": 1.0,
+        "checks": [
+          {"check_id": "corruption_visible", "weight": 0.25, "pass_if": "The checksum mismatch and state identity are reported.", "fail_if": "Corruption is hidden behind an empty or success response."},
+          {"check_id": "no_corrupt_recall", "weight": 0.35, "pass_if": "No candidate from corrupt state is admitted.", "fail_if": "Corrupt content enters context."},
+          {"check_id": "no_implicit_repair", "weight": 0.20, "pass_if": "Repair/reset/restore requires an explicit operation.", "fail_if": "The provider silently rewrites state."},
+          {"check_id": "authority_unchanged", "weight": 0.20, "pass_if": "Source and TraceDecay-owned state remain unchanged.", "fail_if": "Corruption changes canonical code or facts."}
+        ]
+      }
+    },
+    {
+      "id": "privacy_deletion",
+      "category": "privacy_deletion",
+      "title": "A deleted source leaves no provider influence",
+      "fixture_id": "coding_memory_repository_v1",
+      "task": "Forget one scoped personal note and verify that it cannot reappear after restart or snapshot inspection.",
+      "source_scope_id": "scope_privacy_agent",
+      "target_scope_id": "scope_privacy_agent",
+      "steps": [
+        {"step": 1, "action": "observe", "observation_id": "obs_privacy_001"},
+        {"step": 2, "action": "recall", "request_id": "request_privacy_before"},
+        {"step": 3, "action": "delete_by_source", "forget_source_key": "source_session_privacy_note_001"},
+        {"step": 4, "action": "verify_absence", "request_id": "request_privacy_verify"},
+        {"step": 5, "action": "restart_provider", "restart_id": "restart_privacy_001"},
+        {"step": 6, "action": "recall", "request_id": "request_privacy_after"},
+        {"step": 7, "action": "adjudicate", "rubric": "privacy_deletion"}
+      ],
+      "observations": [
+        {
+          "observation_id": "obs_privacy_001",
+          "source_sequence": 1,
+          "event_type": "source_edit_settled",
+          "occurred_at": "2026-08-30T17:00:00Z",
+          "scope_id": "scope_privacy_agent",
+          "source_revision": "personal_fixture_r1",
+          "source_digest": "de3a97c963cbf12d7c1575d38db7612456c030f9abec00f0e2a80261080ccf53",
+          "settlement": "settled",
+          "forget_source_key": "source_session_privacy_note_001",
+          "privacy_classification": "personal",
+          "payload": {"claim": "fixture note has sample value seven", "value_id": "sample_value_7"}
+        },
+        {
+          "observation_id": "obs_privacy_002",
+          "source_sequence": 2,
+          "event_type": "deletion_requested",
+          "occurred_at": "2026-08-30T17:02:00Z",
+          "scope_id": "scope_privacy_agent",
+          "source_revision": "personal_fixture_r1",
+          "source_digest": "de3a97c963cbf12d7c1575d38db7612456c030f9abec00f0e2a80261080ccf53",
+          "settlement": "settled",
+          "forget_source_key": "source_session_privacy_note_001",
+          "payload": {"mode": "hard_delete", "include_snapshots": true}
+        },
+        {
+          "observation_id": "obs_privacy_003",
+          "source_sequence": 3,
+          "event_type": "deletion_verified",
+          "occurred_at": "2026-08-30T17:03:00Z",
+          "scope_id": "scope_privacy_agent",
+          "source_revision": "personal_fixture_r2",
+          "source_digest": "bd8833fef93e934c866992cc34d7439402e2e072bb9a5bf113baf17a734665ea",
+          "settlement": "settled",
+          "forget_source_key": "source_session_privacy_note_001",
+          "payload": {"remaining_influence_count": 0, "snapshots_examined": 1, "verification": "verified_absent"}
+        },
+        {
+          "observation_id": "obs_privacy_004",
+          "source_sequence": 4,
+          "event_type": "recall_requested",
+          "occurred_at": "2026-08-30T17:05:00Z",
+          "scope_id": "scope_privacy_agent",
+          "source_revision": "personal_fixture_r2",
+          "source_digest": "bd8833fef93e934c866992cc34d7439402e2e072bb9a5bf113baf17a734665ea",
+          "settlement": "settled",
+          "forget_source_key": "source_session_privacy_note_001",
+          "payload": {"query": "what did the deleted fixture note contain"}
+        }
+      ],
+      "code_evidence_revisions": [
+        {
+          "revision_id": "personal_fixture_r1",
+          "revision": 1,
+          "parent_revision_id": null,
+          "scope_id": "scope_privacy_agent",
+          "changed_files": ["notes/fixture_note.txt"],
+          "evidence": [
+            {"evidence_id": "evidence_privacy_present", "kind": "source", "status": "pass", "assertion": "the scoped fixture note is initially present", "digest": "de3a97c963cbf12d7c1575d38db7612456c030f9abec00f0e2a80261080ccf53"}
+          ]
+        },
+        {
+          "revision_id": "personal_fixture_r2",
+          "revision": 2,
+          "parent_revision_id": "personal_fixture_r1",
+          "scope_id": "scope_privacy_agent",
+          "changed_files": ["notes/fixture_note.txt"],
+          "evidence": [
+            {"evidence_id": "evidence_deletion_absence", "kind": "deletion_verification", "status": "pass", "assertion": "the source and its provider influence are absent", "digest": "5d13acfa6488665cc93d50d19b36a8acbc7c52d14f3ac5d97c05878358470ffb"}
+          ]
+        }
+      ],
+      "expected_admissible_behavior": {
+        "admission": "honor the exact forget_source_key and verify provider and snapshot absence before reporting success",
+        "must": [
+          "Allow the note to be recalled before deletion only within scope_privacy_agent.",
+          "Return a deletion receipt with zero remaining influence and examined snapshot count.",
+          "Return no deleted note after verification, restart, or snapshot restore attempt.",
+          "Permit a future separately admitted source revision to create new influence without resurrecting the old source."
+        ],
+        "must_not": [
+          "Report deletion success without a verified postcondition.",
+          "Keep deleted content in a hidden snapshot or provider cache.",
+          "Reintroduce the old note after provider restart.",
+          "Delete unrelated project evidence as a side effect."
+        ],
+        "allowed_terminal_outcomes": ["success", "success_zero_results", "capability_unsupported", "deletion_unverified"],
+        "provider_effect": "Deletion affects provider-local state and cannot rewrite source authority or unrelated facts."
+      },
+      "adjudication_rubric": {
+        "rubric_id": "privacy_deletion",
+        "version": 1,
+        "mode": "weighted_all_safety_checks",
+        "pass_threshold": 1.0,
+        "checks": [
+          {"check_id": "exact_source_target", "weight": 0.20, "pass_if": "Deletion names and matches source_session_privacy_note_001.", "fail_if": "Deletion uses a broad project or path wildcard."},
+          {"check_id": "verified_absence", "weight": 0.35, "pass_if": "Provider and snapshots report zero remaining influence.", "fail_if": "Success is claimed without verification."},
+          {"check_id": "restart_persistence", "weight": 0.25, "pass_if": "The note stays absent after restart and recall.", "fail_if": "The old note reappears."},
+          {"check_id": "unrelated_state_preserved", "weight": 0.20, "pass_if": "Only the targeted source influence is removed.", "fail_if": "Unrelated project evidence is removed or altered."}
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,257 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/schemas/coding-memory-scenarios.v1.schema.json",
+  "title": "TraceDecay deterministic coding-memory scenario corpus V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "corpus_id",
+    "bead_id",
+    "canonical_encoding",
+    "provider_neutral",
+    "provider_selection",
+    "fixture_policy",
+    "adjudication_policy",
+    "scope_catalog",
+    "fixtures",
+    "scenarios"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "corpus_id": {"const": "tracedecay.coding-memory.scenarios.v1"},
+    "bead_id": {"const": "tdmem-0901"},
+    "title": {"type": "string", "minLength": 1},
+    "canonical_encoding": {"const": "utf8_rfc8785_json_without_bom_with_lf"},
+    "provider_neutral": {"const": true},
+    "provider_selection": {"$ref": "#/$defs/providerSelection"},
+    "fixture_policy": {"$ref": "#/$defs/fixturePolicy"},
+    "adjudication_policy": {"$ref": "#/$defs/adjudicationPolicy"},
+    "scope_catalog": {
+      "type": "array",
+      "minItems": 4,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/scope"}
+    },
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/fixture"}
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 9,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/scenario"}
+    }
+  },
+  "$defs": {
+    "providerSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "same_fixture_and_task_for_each_provider",
+        "provider_identity_is_run_metadata",
+        "provider_output_is_advisory",
+        "observer_output_participates_in_adjudication"
+      ],
+      "properties": {
+        "mode": {"const": "runner_supplied"},
+        "same_fixture_and_task_for_each_provider": {"const": true},
+        "provider_identity_is_run_metadata": {"const": true},
+        "provider_output_is_advisory": {"const": true},
+        "observer_output_participates_in_adjudication": {"const": false}
+      }
+    },
+    "fixturePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clock", "randomness", "network", "filesystem", "external_processes", "credentials", "source_material"],
+      "properties": {
+        "clock": {"const": "fixed_utc_timestamps"},
+        "randomness": {"const": "none"},
+        "network": {"const": "forbidden"},
+        "filesystem": {"const": "temporary_fixture_only"},
+        "external_processes": {"const": "forbidden"},
+        "credentials": {"const": "none"},
+        "source_material": {"const": "synthetic_and_versioned"}
+      }
+    },
+    "adjudicationPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["score_range", "safety_gate", "indeterminate_policy", "provider_failure_policy", "missing_evidence_policy", "context_owner"],
+      "properties": {
+        "score_range": {"const": [0, 1]},
+        "safety_gate": {"type": "string", "minLength": 1},
+        "indeterminate_policy": {"type": "string", "minLength": 1},
+        "provider_failure_policy": {"type": "string", "minLength": 1},
+        "missing_evidence_policy": {"const": "indeterminate"},
+        "context_owner": {"const": "trace_decay_context_compiler"}
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope_id", "profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+      "properties": {
+        "scope_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+        "profile_id": {"type": "string", "minLength": 1},
+        "project_id": {"type": "string", "minLength": 1},
+        "repository_id": {"type": "string", "minLength": 1},
+        "worktree_id": {"type": "string", "minLength": 1},
+        "branch_ref": {"type": "string", "minLength": 1},
+        "agent_session_id": {"type": "string", "minLength": 1},
+        "scope_revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixture_id", "repository_identity", "fixture_digest", "root_kind", "files"],
+      "properties": {
+        "fixture_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+        "repository_identity": {"type": "string", "minLength": 1},
+        "fixture_digest": {"$ref": "#/$defs/digest"},
+        "root_kind": {"const": "temporary_git_repository"},
+        "files": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/file"}}
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "revisions"],
+      "properties": {
+        "path": {"type": "string", "pattern": "^(src|tests|docs|notes)/[^/]+\\.[a-z0-9]+$"},
+        "revisions": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/fileRevision"}}
+      }
+    },
+    "fileRevision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision_id", "revision", "content", "content_sha256"],
+      "properties": {
+        "revision_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+        "revision": {"type": "integer", "minimum": 1},
+        "content": {"type": "string", "minLength": 1},
+        "content_sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "category",
+        "title",
+        "fixture_id",
+        "task",
+        "source_scope_id",
+        "target_scope_id",
+        "steps",
+        "observations",
+        "code_evidence_revisions",
+        "expected_admissible_behavior",
+        "adjudication_rubric"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+        "category": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "fixture_id": {"type": "string", "minLength": 1},
+        "task": {"type": "string", "minLength": 1},
+        "source_scope_id": {"type": "string", "minLength": 1},
+        "target_scope_id": {"type": "string", "minLength": 1},
+        "steps": {"type": "array", "minItems": 2, "items": {"$ref": "#/$defs/step"}},
+        "observations": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/observation"}},
+        "code_evidence_revisions": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/evidenceRevision"}},
+        "expected_admissible_behavior": {"$ref": "#/$defs/behavior"},
+        "adjudication_rubric": {"$ref": "#/$defs/rubric"}
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": ["step", "action"],
+      "properties": {
+        "step": {"type": "integer", "minimum": 1},
+        "action": {"type": "string", "minLength": 1}
+      }
+    },
+    "observation": {
+      "type": "object",
+      "required": ["observation_id", "source_sequence", "event_type", "occurred_at", "scope_id", "source_revision", "source_digest", "settlement", "payload"],
+      "properties": {
+        "observation_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+        "source_sequence": {"type": "integer", "minimum": 1},
+        "event_type": {"type": "string", "minLength": 1},
+        "occurred_at": {"type": "string", "format": "date-time"},
+        "scope_id": {"type": "string", "minLength": 1},
+        "source_revision": {"type": "string", "minLength": 1},
+        "source_digest": {"$ref": "#/$defs/digest"},
+        "settlement": {"const": "settled"},
+        "payload": {"type": "object"}
+      }
+    },
+    "evidenceRevision": {
+      "type": "object",
+      "required": ["revision_id", "revision", "parent_revision_id", "scope_id", "changed_files", "evidence"],
+      "properties": {
+        "revision_id": {"type": "string", "minLength": 1},
+        "revision": {"type": "integer", "minimum": 1},
+        "parent_revision_id": {"type": ["string", "null"]},
+        "scope_id": {"type": "string", "minLength": 1},
+        "changed_files": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "evidence": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/evidence"}}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["evidence_id", "kind", "status", "assertion", "digest"],
+      "properties": {
+        "evidence_id": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "enum": ["pass", "fail", "indeterminate"]},
+        "assertion": {"type": "string", "minLength": 1},
+        "digest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "behavior": {
+      "type": "object",
+      "required": ["admission", "must", "must_not", "allowed_terminal_outcomes", "provider_effect"],
+      "properties": {
+        "admission": {"type": "string", "minLength": 1},
+        "authority_order": {"type": "array", "items": {"type": "string"}},
+        "must": {"type": "array", "minItems": 2, "items": {"type": "string", "minLength": 1}},
+        "must_not": {"type": "array", "minItems": 2, "items": {"type": "string", "minLength": 1}},
+        "allowed_terminal_outcomes": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "provider_effect": {"type": "string", "minLength": 1}
+      }
+    },
+    "rubric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rubric_id", "version", "mode", "pass_threshold", "checks"],
+      "properties": {
+        "rubric_id": {"type": "string", "minLength": 1},
+        "version": {"const": 1},
+        "mode": {"const": "weighted_all_safety_checks"},
+        "pass_threshold": {"const": 1},
+        "checks": {"type": "array", "minItems": 3, "items": {"$ref": "#/$defs/check"}}
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["check_id", "weight", "pass_if", "fail_if"],
+      "properties": {
+        "check_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+        "weight": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "pass_if": {"type": "string", "minLength": 1},
+        "fail_if": {"type": "string", "minLength": 1}
+      }
+    },
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
