@@ -22,8 +22,10 @@ use tracedecay_memory_provider_ncm::{
 
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const ONE_SHA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const PROVIDER_RECEIPT_SHA: &str =
+    "2222222222222222222222222222222222222222222222222222222222222222";
+const VERIFICATION_SHA: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 const EMPTY_OBJECT_SHA: &str = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
-const LARGE_PAYLOAD_SHA: &str = "7ce100971f64e7001e8fe5a51973ecdfe1ced42befe7ee8d5fd6219506b5393c";
 const LARGE_EXTENSION_SHA: &str =
     "91e3faafd322bcdf160f3f0ce886acb092b9b9e2a1e8526b40f21a8898a8700b";
 
@@ -41,14 +43,19 @@ struct MockSurface {
     handshake_code: Option<TerminalCode>,
     corrupt_payload_digest: bool,
     warning_count: usize,
+    handshake_warning_size: usize,
     leak_terminal_diagnostic_aliases: bool,
     leak_effect_metadata_aliases: bool,
+    leak_provider_receipt_alias: bool,
+    leak_verification_alias: bool,
     leak_warning_aliases: bool,
     malformed_handshake_proof: bool,
     malformed_handshake_proof_call: Option<usize>,
     reply_state_generation: Option<u64>,
     inject_extension: bool,
     large_response_payload: bool,
+    leak_surface_payload_identity: bool,
+    safe_response_payload: bool,
     block_handshake_call: Option<usize>,
     handshake_entered: Option<Arc<Barrier>>,
     handshake_release: Option<Arc<Barrier>>,
@@ -93,14 +100,19 @@ impl MockSurface {
             handshake_code: None,
             corrupt_payload_digest: false,
             warning_count: 0,
+            handshake_warning_size: 0,
             leak_terminal_diagnostic_aliases: false,
             leak_effect_metadata_aliases: false,
+            leak_provider_receipt_alias: false,
+            leak_verification_alias: false,
             leak_warning_aliases: false,
             malformed_handshake_proof: false,
             malformed_handshake_proof_call: None,
             reply_state_generation: None,
             inject_extension: false,
             large_response_payload: false,
+            leak_surface_payload_identity: false,
+            safe_response_payload: false,
             block_handshake_call: None,
             handshake_entered: None,
             handshake_release: None,
@@ -124,6 +136,13 @@ impl MockSurface {
             .lock()
             .expect("descriptor lock")
             .implementation_identity_sha256 = identity_sha256.to_owned();
+    }
+
+    fn change_state_generation(&self, state_generation: u64) {
+        self.descriptor
+            .lock()
+            .expect("descriptor lock")
+            .state_generation = state_generation;
     }
 
     fn with_reply_effect(mut self, effect: CommittedEffectState) -> Self {
@@ -161,6 +180,16 @@ impl MockSurface {
         self
     }
 
+    fn with_leaking_provider_receipt(mut self) -> Self {
+        self.leak_provider_receipt_alias = true;
+        self
+    }
+
+    fn with_leaking_verification(mut self) -> Self {
+        self.leak_verification_alias = true;
+        self
+    }
+
     fn with_leaking_warnings(mut self) -> Self {
         self.leak_warning_aliases = true;
         self
@@ -168,6 +197,11 @@ impl MockSurface {
 
     fn with_warning_count(mut self, warning_count: usize) -> Self {
         self.warning_count = warning_count;
+        self
+    }
+
+    fn with_handshake_warning_size(mut self, warning_size: usize) -> Self {
+        self.handshake_warning_size = warning_size;
         self
     }
 
@@ -225,6 +259,16 @@ impl MockSurface {
         self
     }
 
+    fn with_surface_payload_identity_leak(mut self) -> Self {
+        self.leak_surface_payload_identity = true;
+        self
+    }
+
+    fn with_safe_response_payload(mut self) -> Self {
+        self.safe_response_payload = true;
+        self
+    }
+
     fn terminal(
         &self,
         operation_id: &str,
@@ -254,6 +298,10 @@ impl MockSurface {
             CommittedEffectState::None => CommittedEffectEvidence::none(state_generation_before),
             CommittedEffectState::Committed => {
                 let before = state_generation_before.expect("committed generation before");
+                let receipt_alias = aliases
+                    .iter()
+                    .find(|value| value.as_str() == ONE_SHA)
+                    .map_or(ONE_SHA, String::as_str);
                 CommittedEffectEvidence::committed(
                     before,
                     before.saturating_add(1),
@@ -262,8 +310,16 @@ impl MockSurface {
                     } else {
                         vec!["ncm.item-committed".to_owned()]
                     },
-                    ONE_SHA,
-                    ONE_SHA,
+                    if self.leak_provider_receipt_alias {
+                        receipt_alias
+                    } else {
+                        PROVIDER_RECEIPT_SHA
+                    },
+                    if self.leak_verification_alias {
+                        receipt_alias
+                    } else {
+                        VERIFICATION_SHA
+                    },
                 )
                 .expect("committed effect")
             }
@@ -275,16 +331,17 @@ impl MockSurface {
                     before.saturating_add(1),
                     vec!["ncm.item-committed".to_owned()],
                     vec!["ncm.item-uncommitted".to_owned()],
-                    ONE_SHA,
+                    PROVIDER_RECEIPT_SHA,
                     "resume:ncm.item-uncommitted",
-                    ONE_SHA,
+                    VERIFICATION_SHA,
                 )
                 .expect("partial effect")
             }
-            CommittedEffectState::Unknown => {
-                CommittedEffectEvidence::unknown(ONE_SHA, "ncm.surface.reconcile-operation.v1")
-                    .expect("unknown effect")
-            }
+            CommittedEffectState::Unknown => CommittedEffectEvidence::unknown(
+                PROVIDER_RECEIPT_SHA,
+                "ncm.surface.reconcile-operation.v1",
+            )
+            .expect("unknown effect"),
         };
         let malformed_scope = if operation == ProviderOperation::Handshake {
             self.malformed_handshake_scope
@@ -369,7 +426,10 @@ impl NcmCognitiveSurface for MockSurface {
             effective_limits: Some(request.host_limits.minimum(descriptor.limits)),
             ready_receipt_sha256: Some(ready_receipt_sha256),
             challenge_response_sha256: Some(challenge_response_sha256),
-            warnings: Vec::new(),
+            warnings: (self.handshake_warning_size > 0)
+                .then(|| "w".repeat(self.handshake_warning_size))
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -388,8 +448,23 @@ impl NcmCognitiveSurface for MockSurface {
         }
         let mut payload = call.payload.clone();
         if self.large_response_payload {
-            payload.bytes = vec![b'x'; 64];
-            payload.sha256 = LARGE_PAYLOAD_SHA.to_owned();
+            payload.bytes = vec![b'x'; 16_384];
+            payload.sha256 = hex_digest(&Sha256::digest(&payload.bytes));
+        }
+        if self.leak_surface_payload_identity {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "surface_namespace": call.namespace.as_str(),
+                "safe": true
+            }))
+            .expect("surface leak fixture");
+            payload = canonical_payload(call.operation, &bytes);
+        }
+        if self.safe_response_payload {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "safe": {"kind": "observation"}
+            }))
+            .expect("safe response fixture");
+            payload = canonical_payload(call.operation, &bytes);
         }
         if self.corrupt_payload_digest {
             payload.sha256 = ZERO_SHA.to_owned();
@@ -613,6 +688,46 @@ fn canonical_request_size(call: &ProviderCall) -> u64 {
         total = total.saturating_add(canonical_extension_size(extension));
     }
     total
+}
+
+fn canonical_surface_request_size(call: &ProviderCall) -> u64 {
+    let mut total = framed_size(call.operation.capability_id());
+    total = total.saturating_add(framed_size(
+        NcmNamespace::from_exact_scope(&call.exact_scope).as_str(),
+    ));
+    total = total.saturating_add(8);
+    total = total.saturating_add(framed_size(ONE_SHA));
+    total = total.saturating_add(framed_size(ZERO_SHA));
+    total = total.saturating_add(framed_size(ZERO_SHA));
+    total = total.saturating_add(8);
+    total = total.saturating_add(1);
+    if call.idempotency_key.is_some() {
+        total = total.saturating_add(framed_size(ZERO_SHA));
+    }
+    total = total.saturating_add(16);
+    total = total.saturating_add(framed_size("live"));
+    total = total.saturating_add(canonical_payload_size(&call.payload));
+    total = total.saturating_add(8);
+    for capability in &call.required_capabilities {
+        total = total.saturating_add(framed_size(capability.as_str()));
+    }
+    total.saturating_add(8)
+}
+
+fn canonical_surface_handshake_request_size(request: &HandshakeRequest) -> u64 {
+    let mut total = 8_u64;
+    total = total.saturating_add(framed_size(
+        NcmNamespace::from_exact_scope(&request.exact_scope).as_str(),
+    ));
+    total = total.saturating_add(framed_size(ZERO_SHA));
+    total = total.saturating_add(8);
+    for capability in &request.required_capabilities {
+        total = total.saturating_add(framed_size(capability.as_str()));
+    }
+    total = total.saturating_add(8 * 8);
+    total = total.saturating_add(16);
+    total = total.saturating_add(framed_size("live"));
+    total.saturating_add(32)
 }
 
 fn canonical_response_size(call: &ProviderCall, reply: &ProviderReply) -> u64 {
@@ -915,6 +1030,40 @@ fn invoke_before_handshake_never_reaches_surface() {
 }
 
 #[test]
+fn empty_health_idempotency_key_never_panics_or_reaches_surface() {
+    let surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+    let mut request = ready_call(&provider, ProviderOperation::Health);
+    request.idempotency_key = Some(String::new());
+
+    let reply = provider.invoke(&request);
+
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some("ncm.call_envelope_invalid")
+    );
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn empty_recall_idempotency_key_never_panics_or_reaches_surface() {
+    let surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+    let mut request = ready_call(&provider, ProviderOperation::Recall);
+    request.idempotency_key = Some(String::new());
+
+    let reply = provider.invoke(&request);
+
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some("ncm.call_envelope_invalid")
+    );
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn wrong_ready_receipt_never_reaches_surface() {
     let surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
     let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
@@ -926,26 +1075,33 @@ fn wrong_ready_receipt_never_reaches_surface() {
 }
 
 #[test]
-fn invalid_replacement_handshake_revokes_prior_readiness_before_contact() {
+fn invalid_replacement_handshakes_preserve_prior_readiness_without_contact() {
     let surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
     let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
     let old_call = ready_call(&provider, ProviderOperation::Recall);
-    let mut invalid = handshake(NCM_PROVIDER_ID);
-    invalid.exact_scope.profile_id.clear();
+    let mut invalid_scope = handshake(NCM_PROVIDER_ID);
+    invalid_scope.exact_scope.profile_id.clear();
+    let mut invalid_revision = handshake(NCM_PROVIDER_ID);
+    invalid_revision.registration_revision = 0;
+    let mut invalid_request_id = handshake(NCM_PROVIDER_ID);
+    invalid_request_id.request_id = " non-canonical".to_owned();
 
-    let response = provider.handshake(&invalid);
-    assert_eq!(
-        response.terminal.terminal_code(),
-        TerminalCode::InvalidRequest
-    );
+    for invalid in [invalid_scope, invalid_revision, invalid_request_id] {
+        let response = provider.handshake(&invalid);
+        assert_eq!(
+            response.terminal.terminal_code(),
+            TerminalCode::InvalidRequest
+        );
+        assert_eq!(
+            response.terminal.diagnostic_id(),
+            Some("ncm.handshake_request_invalid")
+        );
+    }
     assert_eq!(surface.handshake_calls.load(Ordering::Relaxed), 1);
 
     let reply = provider.invoke(&old_call);
-    assert_eq!(
-        reply.terminal.terminal_code(),
-        TerminalCode::ProviderUnavailable
-    );
-    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -994,6 +1150,37 @@ fn successful_replacement_uses_a_new_public_epoch_receipt() {
     new_call.ready_receipt_sha256 = new_receipt;
     let new_reply = provider.invoke(&new_call);
     assert_eq!(new_reply.terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn public_ready_receipt_binds_accepted_state_generation() {
+    let first_surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let first_provider = NcmProviderAdapter::new(first_surface).expect("adapter");
+    let first_receipt = establish_readiness(&first_provider, &handshake(NCM_PROVIDER_ID));
+
+    let second_surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    second_surface.change_state_generation(5);
+    let second_provider = NcmProviderAdapter::new(second_surface).expect("adapter");
+    let second_receipt = establish_readiness(&second_provider, &handshake(NCM_PROVIDER_ID));
+
+    assert_ne!(first_receipt, second_receipt);
+}
+
+#[test]
+fn mutation_dispatch_retires_the_accepted_ready_receipt() {
+    let surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+    let request = ready_call(&provider, ProviderOperation::Observe);
+
+    let first_reply = provider.invoke(&request);
+    assert_eq!(first_reply.terminal.terminal_code(), TerminalCode::Success);
+
+    let stale_reply = provider.invoke(&request);
+    assert_eq!(
+        stale_reply.terminal.terminal_code(),
+        TerminalCode::StaleIdentity
+    );
     assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 1);
 }
 
@@ -1136,11 +1323,8 @@ fn post_construction_invalid_host_limits_never_reach_handshake_surface() {
     );
     assert_eq!(surface.handshake_calls.load(Ordering::Relaxed), 1);
     let old_reply = provider.invoke(&old_call);
-    assert_eq!(
-        old_reply.terminal.terminal_code(),
-        TerminalCode::ProviderUnavailable
-    );
-    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(old_reply.terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -1215,7 +1399,8 @@ fn mandatory_operation_uses_opaque_ids_and_scope_safe_payload() {
 
 #[test]
 fn surface_capture_contains_no_public_ids_scope_or_extension_bytes() {
-    let surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let surface =
+        Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false).with_safe_response_payload());
     let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
     let mut request = ready_call(&provider, ProviderOperation::Observe);
     let exact_scope = request.exact_scope.clone();
@@ -1274,20 +1459,6 @@ fn surface_capture_contains_no_public_ids_scope_or_extension_bytes() {
     assert_ne!(mapped.operation_id, request.operation_id);
     assert_ne!(mapped.idempotency_key, request.idempotency_key);
     assert!(mapped.extensions.is_empty());
-    let repeated_reply = provider.invoke(&request);
-    assert_eq!(
-        repeated_reply.terminal.terminal_code(),
-        TerminalCode::Success
-    );
-    let repeated = surface
-        .last_call
-        .lock()
-        .expect("call lock")
-        .clone()
-        .expect("repeated mapped call");
-    assert_eq!(repeated.request_id, mapped.request_id);
-    assert_eq!(repeated.operation_id, mapped.operation_id);
-    assert_eq!(repeated.idempotency_key, mapped.idempotency_key);
     let mapped_payload = serde_json::from_slice::<serde_json::Value>(&mapped.payload.bytes)
         .expect("mapped JSON payload");
     assert_eq!(
@@ -1340,6 +1511,45 @@ fn raw_scope_outside_exact_scope_subtree_never_reaches_surface() {
         Some("ncm.request_contract_or_scope_projection_invalid")
     );
     assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn public_scope_digest_and_ready_receipt_never_reach_surface_payload() {
+    let surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+    let base = ready_call(&provider, ProviderOperation::Recall);
+    let public_scope_digest = base.exact_scope.exact_scope_sha256();
+
+    for leaked_identity in [&public_scope_digest, &base.ready_receipt_sha256] {
+        let mut request = base.clone();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "query": leaked_identity
+        }))
+        .expect("leak fixture");
+        request.payload = canonical_payload(ProviderOperation::Recall, &bytes);
+
+        let reply = provider.invoke(&request);
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
+    }
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn surface_payload_identity_never_leaks_back_to_public_reply() {
+    let surface = Arc::new(
+        MockSurface::new(NCM_PROVIDER_ID, &[], false).with_surface_payload_identity_leak(),
+    );
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+    let request = ready_call(&provider, ProviderOperation::Recall);
+
+    let reply = provider.invoke(&request);
+
+    assert_eq!(
+        reply.terminal.terminal_code(),
+        TerminalCode::ContractViolation
+    );
+    assert!(reply.payload.is_none());
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -1458,6 +1668,33 @@ fn cancelled_request_never_reaches_surface() {
 }
 
 #[test]
+fn cancellation_after_read_dispatch_prevents_success_publication() {
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let surface = Arc::new(
+        MockSurface::new(NCM_PROVIDER_ID, &[], false).with_blocking_invoke(
+            1,
+            entered.clone(),
+            release.clone(),
+        ),
+    );
+    let provider = Arc::new(NcmProviderAdapter::new(surface.clone()).expect("adapter"));
+    let request = ready_call(provider.as_ref(), ProviderOperation::Recall);
+    let cancellation = request.control.cancellation();
+
+    let invoke_provider = provider.clone();
+    let invoke = std::thread::spawn(move || invoke_provider.invoke(&request));
+    entered.wait();
+    cancellation.cancel();
+    release.wait();
+    let reply = invoke.join().expect("invoke thread");
+
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Cancelled);
+    assert!(reply.payload.is_none());
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn negotiated_operation_budget_caps_handshake_and_invoke_surface_controls() {
     let mut bounded_limits = limits();
     bounded_limits.operation_millis = 100;
@@ -1508,7 +1745,7 @@ fn negotiated_concurrency_limit_is_nonblocking_and_raii_released() {
     let rejected = provider.invoke(&request);
     assert_eq!(
         rejected.terminal.terminal_code(),
-        TerminalCode::ProviderUnavailable
+        TerminalCode::CapacityExceeded
     );
     assert_eq!(
         rejected.terminal.diagnostic_id(),
@@ -1582,6 +1819,64 @@ fn malformed_handshake_challenge_is_rejected() {
 }
 
 #[test]
+fn projected_surface_handshake_accepts_exact_limit_and_rejects_one_byte_over() {
+    let template = handshake(NCM_PROVIDER_ID);
+    let encoded_bytes = canonical_surface_handshake_request_size(&template);
+    assert!(encoded_bytes > 1);
+
+    let exact_surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let exact_provider = NcmProviderAdapter::new(exact_surface.clone()).expect("adapter");
+    let mut exact_request = template.clone();
+    exact_request.host_limits.request_bytes = encoded_bytes;
+    let exact_response = exact_provider.handshake(&exact_request);
+    assert_eq!(
+        exact_response.terminal.terminal_code(),
+        TerminalCode::Success
+    );
+    assert_eq!(exact_surface.handshake_calls.load(Ordering::Relaxed), 1);
+
+    let rejected_surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let rejected_provider = NcmProviderAdapter::new(rejected_surface.clone()).expect("adapter");
+    let mut oversized_request = template;
+    oversized_request.host_limits.request_bytes = encoded_bytes - 1;
+    let rejected = rejected_provider.handshake(&oversized_request);
+    assert_eq!(
+        rejected.terminal.terminal_code(),
+        TerminalCode::InvalidRequest
+    );
+    assert_eq!(
+        rejected.terminal.diagnostic_id(),
+        Some("ncm.projected_handshake_request_limit_exceeded")
+    );
+    assert_eq!(rejected_surface.handshake_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn oversized_handshake_response_is_rejected_without_installing_readiness() {
+    let surface =
+        Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false).with_handshake_warning_size(9_000));
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+
+    let response = provider.handshake(&handshake(NCM_PROVIDER_ID));
+
+    assert_eq!(
+        response.terminal.terminal_code(),
+        TerminalCode::ContractViolation
+    );
+    assert_eq!(
+        response.terminal.diagnostic_id(),
+        Some("ncm.surface_handshake_response_limit_exceeded")
+    );
+    assert!(response.ready_receipt_sha256.is_none());
+    let reply = provider.invoke(&call(NCM_PROVIDER_ID, ProviderOperation::Recall));
+    assert_eq!(
+        reply.terminal.terminal_code(),
+        TerminalCode::ProviderUnavailable
+    );
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn structured_terminal_api_prevents_a_read_reply_from_claiming_a_committed_effect() {
     let request = call(NCM_PROVIDER_ID, ProviderOperation::Recall);
     let effect = CommittedEffectEvidence::committed(
@@ -1651,6 +1946,26 @@ fn committed_effect_metadata_cannot_leak_public_scope_or_opaque_aliases() {
 }
 
 #[test]
+fn provider_receipt_cannot_leak_public_scope_or_opaque_aliases() {
+    let surface =
+        Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false).with_leaking_provider_receipt());
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+    let request = ready_call(&provider, ProviderOperation::Observe);
+    let reply = provider.invoke(&request);
+    assert_surface_alias_leak_is_rejected(surface.as_ref(), &reply, &request);
+}
+
+#[test]
+fn verification_digest_cannot_leak_public_scope_or_opaque_aliases() {
+    let surface =
+        Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false).with_leaking_verification());
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+    let request = ready_call(&provider, ProviderOperation::Observe);
+    let reply = provider.invoke(&request);
+    assert_surface_alias_leak_is_rejected(surface.as_ref(), &reply, &request);
+}
+
+#[test]
 fn warnings_cannot_leak_public_scope_or_opaque_aliases() {
     let surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false).with_leaking_warnings());
     let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
@@ -1687,10 +2002,11 @@ fn warning_overflow_is_rejected() {
 }
 
 #[test]
-fn canonical_request_envelope_accepts_exact_limit_and_rejects_one_byte_over() {
-    let mut template = call(NCM_PROVIDER_ID, ProviderOperation::Recall);
-    template.extensions.push(optional_extension());
-    let encoded_bytes = canonical_request_size(&template);
+fn projected_surface_request_accepts_exact_limit_and_rejects_one_byte_over() {
+    let template = call(NCM_PROVIDER_ID, ProviderOperation::Recall);
+    let public_bytes = canonical_request_size(&template);
+    let encoded_bytes = canonical_surface_request_size(&template);
+    assert!(encoded_bytes > public_bytes);
     assert!(encoded_bytes > 1);
 
     let mut exact_limits = limits();
@@ -1724,13 +2040,20 @@ fn canonical_request_envelope_accepts_exact_limit_and_rejects_one_byte_over() {
         rejected.terminal.terminal_code(),
         TerminalCode::InvalidRequest
     );
+    assert_eq!(
+        rejected.terminal.diagnostic_id(),
+        Some("ncm.projected_request_limit_exceeded")
+    );
     assert_eq!(rejected_surface.invoke_calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]
 fn canonical_response_envelope_accepts_exact_limit_and_rejects_one_byte_over() {
     let mut template = call(NCM_PROVIDER_ID, ProviderOperation::Observe);
-    template.extensions.push(optional_extension());
+    let large_extension_payload = vec![b'x'; 2_048];
+    template
+        .extensions
+        .push(opaque_extension(&large_extension_payload));
     let state_generation_after = template.expected_state_generation.saturating_add(1);
     let expected_reply = ProviderReply {
         terminal: TerminalRecord::new(
@@ -1741,8 +2064,8 @@ fn canonical_response_envelope_accepts_exact_limit_and_rejects_one_byte_over() {
                 template.expected_state_generation,
                 state_generation_after,
                 vec!["ncm.item-committed".to_owned()],
-                ONE_SHA,
-                ONE_SHA,
+                PROVIDER_RECEIPT_SHA,
+                VERIFICATION_SHA,
             )
             .expect("expected committed effect"),
             FallbackDirective::forbidden(),
@@ -1811,7 +2134,7 @@ fn negotiated_host_response_limit_rejects_oversized_surface_payload() {
         Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false).with_large_response_payload());
     let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
     let mut handshake_request = handshake(NCM_PROVIDER_ID);
-    handshake_request.host_limits.response_bytes = 32;
+    handshake_request.host_limits.response_bytes = 4_096;
     let receipt = establish_readiness(&provider, &handshake_request);
     let mut request = call(NCM_PROVIDER_ID, ProviderOperation::Recall);
     request.ready_receipt_sha256 = receipt;
@@ -1829,20 +2152,14 @@ fn response_limit_counts_payload_extensions_and_warning_bytes_together() {
     let surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false).with_warning_count(1));
     let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
     let mut handshake_request = handshake(NCM_PROVIDER_ID);
-    handshake_request.host_limits.response_bytes = 10;
+    handshake_request.host_limits.response_bytes = 2_048;
     let receipt = establish_readiness(&provider, &handshake_request);
     let mut request = call(NCM_PROVIDER_ID, ProviderOperation::Recall);
     request.ready_receipt_sha256 = receipt;
-    request.extensions.push(
-        OwnedOpaqueExtension::new(
-            OwnedVersionedId::new("vendor.optional.v1").expect("extension id"),
-            1,
-            false,
-            EMPTY_OBJECT_SHA,
-            b"{}".to_vec(),
-        )
-        .expect("extension"),
-    );
+    let extension_payload = vec![b'x'; 2_048];
+    request
+        .extensions
+        .push(opaque_extension(&extension_payload));
     let reply = provider.invoke(&request);
     assert_eq!(
         reply.terminal.terminal_code(),
@@ -1864,6 +2181,23 @@ fn state_generation_cannot_move_backward() {
         TerminalCode::ContractViolation
     );
     assert_eq!(reply.state_generation, 4);
+}
+
+#[test]
+fn malformed_read_reply_cannot_publish_untrusted_state_generation() {
+    let surface = Arc::new(
+        MockSurface::new(NCM_PROVIDER_ID, &[], false).with_reply_state_generation(u64::MAX),
+    );
+    let provider = NcmProviderAdapter::new(surface).expect("adapter");
+    let request = ready_call(&provider, ProviderOperation::Recall);
+
+    let reply = provider.invoke(&request);
+
+    assert_eq!(
+        reply.terminal.terminal_code(),
+        TerminalCode::ContractViolation
+    );
+    assert_eq!(reply.state_generation, request.expected_state_generation);
 }
 
 #[test]
