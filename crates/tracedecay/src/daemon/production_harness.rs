@@ -9,7 +9,10 @@ use super::bootstrap::set_owner_only_permissions;
 // `use super::*` cannot carry it into a `test-transport` build. Import it
 // directly under the same gate the harness itself is compiled behind.
 #[cfg(any(test, feature = "test-transport"))]
-use super::project_composition::daemon_transcript_source_home;
+use super::project_composition::{
+    ProjectMemoryProviderActivation, daemon_transcript_source_home,
+    production_project_server_with_activation,
+};
 #[cfg(any(test, feature = "test-transport"))]
 use super::project_server_lifecycle::{detach_project_servers, shutdown_detached_project_servers};
 #[cfg(any(test, feature = "test-transport"))]
@@ -99,6 +102,29 @@ impl ProductionProjectCompositionHarnessV1 {
             live_profile_root,
             None,
             false,
+            ProjectMemoryProviderActivation::Disabled,
+        )
+        .await
+    }
+
+    /// Opens the isolated composition with the real project-owned Native
+    /// provider mounted through the ordinary production composition seam.
+    /// This activation is intentionally test/transport-only; production
+    /// callers continue through [`Self::open`] and remain Disabled.
+    #[cfg(any(test, feature = "test-transport"))]
+    #[doc(hidden)]
+    pub async fn open_with_native_provider_for_test(
+        isolation_root: impl AsRef<Path>,
+        project_roots: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self> {
+        let live_profile_root = crate::config::user_data_dir().filter(|path| path.exists());
+        Self::open_with_live_profile_root(
+            isolation_root,
+            project_roots,
+            live_profile_root,
+            None,
+            false,
+            ProjectMemoryProviderActivation::NativeActive,
         )
         .await
     }
@@ -115,6 +141,7 @@ impl ProductionProjectCompositionHarnessV1 {
             live_profile_root,
             Some(scope_prefix.into()),
             false,
+            ProjectMemoryProviderActivation::Disabled,
         )
         .await
     }
@@ -125,6 +152,7 @@ impl ProductionProjectCompositionHarnessV1 {
         live_profile_root: Option<PathBuf>,
         scope_prefix: Option<String>,
         long_lived_session_maintenance_for_test: bool,
+        memory_provider_activation: ProjectMemoryProviderActivation,
     ) -> Result<Self> {
         let (isolation_root, profile_root, project_roots) = hotpath::measure_block!(
             "daemon.harness.isolate",
@@ -286,7 +314,7 @@ impl ProductionProjectCompositionHarnessV1 {
             let composition = store_administration
                 .with_writer(|| async {
                     let cancellation = CancellationToken::new();
-                    production_project_server(
+                    production_project_server_with_activation(
                         &store_administration,
                         &project_open_gates,
                         &invocation,
@@ -298,6 +326,7 @@ impl ProductionProjectCompositionHarnessV1 {
                             startup_catch_up: false,
                         },
                         &cancellation,
+                        memory_provider_activation,
                         #[cfg(test)]
                         None,
                     )
@@ -360,6 +389,7 @@ impl ProductionProjectCompositionHarnessV1 {
             Some(live_profile_root),
             None,
             false,
+            ProjectMemoryProviderActivation::Disabled,
         )
         .await
     }
@@ -369,7 +399,15 @@ impl ProductionProjectCompositionHarnessV1 {
         isolation_root: impl AsRef<Path>,
         project_roots: impl IntoIterator<Item = PathBuf>,
     ) -> Result<Self> {
-        Self::open_with_live_profile_root(isolation_root, project_roots, None, None, true).await
+        Self::open_with_live_profile_root(
+            isolation_root,
+            project_roots,
+            None,
+            None,
+            true,
+            ProjectMemoryProviderActivation::Disabled,
+        )
+        .await
     }
 
     pub fn isolation_root(&self) -> &Path {

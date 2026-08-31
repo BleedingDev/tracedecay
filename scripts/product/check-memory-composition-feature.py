@@ -16,6 +16,7 @@ REGISTRY_DEP_FEATURE = f"dep:{REGISTRY_PACKAGE}"
 REGISTRY_CRATE_IDENT = "tracedecay_memory_provider_registry"
 ROOT_MANIFEST = Path("crates/tracedecay/Cargo.toml")
 COMPOSITION_MOUNT = Path("crates/tracedecay/src/daemon/project_composition.rs")
+ACTIVATION_HARNESS = Path("crates/tracedecay/src/daemon/production_harness.rs")
 # Files that may retain the composed host for the project-server lifetime.
 # They may name the registry crate's composition type but must never compose
 # providers themselves.
@@ -77,6 +78,14 @@ ROOT_SOURCE = Path("crates/tracedecay/src")
 # The concrete Native adapter type; a word boundary keeps the registry's
 # NativeProviderActivation seam from matching.
 CONCRETE_NATIVE_ADAPTER = re.compile(r"\bNativeProvider\b")
+TEST_NATIVE_ARM = re.compile(
+    r'#\[cfg\(any\(test, feature = "test-transport"\)\)\]\s*'
+    r"ProjectMemoryProviderActivation::NativeActive\s*=>\s*\{"
+)
+TEST_NATIVE_HARNESS_ENTRY = re.compile(
+    r'#\[cfg\(any\(test, feature = "test-transport"\)\)\]\s*'
+    r'#\[doc\(hidden\)\]\s*pub async fn open_with_native_provider_for_test\('
+)
 
 
 def read_toml(path: Path) -> dict[str, Any]:
@@ -177,11 +186,33 @@ def check_repository(repo: Path) -> list[str]:
     required_fragments = (
         f'#[cfg(feature = "{FEATURE}")]\nfn mount_project_memory_provider_host(',
         f"{REGISTRY_CRATE_IDENT}::ProjectMemoryProviderComposition::compose(activation)",
-        f"{REGISTRY_CRATE_IDENT}::NativeProviderActivation::Disabled,",
     )
     for fragment in required_fragments:
         if fragment not in mount:
             errors.append(f"composition mount is missing exact fragment: {fragment}")
+    direct_disabled = (
+        f"{REGISTRY_CRATE_IDENT}::NativeProviderActivation::Disabled" in mount
+    )
+    selector_disabled = (
+        "pub(super) async fn production_project_server(" in mount
+        and "production_project_server_with_activation(" in mount
+        and "ProjectMemoryProviderActivation::Disabled," in mount
+    )
+    uses_activation_selector = "ProjectMemoryProviderActivation" in mount
+    if (uses_activation_selector and not selector_disabled) or (
+        not uses_activation_selector and not direct_disabled
+    ):
+        errors.append(
+            "production composition must explicitly select the Disabled provider activation"
+        )
+    enabled_count = mount.count(
+        f"{REGISTRY_CRATE_IDENT}::NativeProviderActivation::Enabled"
+    )
+    if enabled_count:
+        if enabled_count != 1 or TEST_NATIVE_ARM.search(mount) is None:
+            errors.append(
+                "Native provider activation must remain inside the exact test-transport-gated arm"
+            )
     for forbidden in (
         "tracedecay_memory_provider_native",
         "NcmProviderAdapter",
@@ -217,6 +248,19 @@ def check_repository(repo: Path) -> list[str]:
                 errors.append(
                     f"production sources must keep the provider host dormant: {relative}"
                 )
+            native_active_count = text.count(
+                "ProjectMemoryProviderActivation::NativeActive"
+            )
+            if native_active_count:
+                if (
+                    relative != ACTIVATION_HARNESS
+                    or native_active_count != 1
+                    or TEST_NATIVE_HARNESS_ENTRY.search(text) is None
+                ):
+                    errors.append(
+                        "test-only Native provider activation leaked outside its gated "
+                        f"harness entry: {relative}"
+                    )
             if not is_feature_gated_adapter and (
                 "tracedecay_memory_provider_native" in text
                 or CONCRETE_NATIVE_ADAPTER.search(text)

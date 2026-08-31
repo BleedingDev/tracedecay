@@ -34,9 +34,24 @@ tracedecay-memory-provider-registry = { path = "../tracedecay-memory-provider-re
 '''
 
 VALID_MOUNT = '''#[cfg(feature = "memory-provider-host")]
+enum ProjectMemoryProviderActivation {
+    Disabled,
+    #[cfg(any(test, feature = "test-transport"))]
+    NativeActive,
+}
+
+#[cfg(feature = "memory-provider-host")]
 fn mount_project_memory_provider_host(
-    activation: tracedecay_memory_provider_registry::NativeProviderActivation,
+    activation: ProjectMemoryProviderActivation,
 ) -> Result<crate::mcp::server::MemoryProviderHostMount> {
+    let activation = match activation {
+        ProjectMemoryProviderActivation::Disabled =>
+            tracedecay_memory_provider_registry::NativeProviderActivation::Disabled,
+        #[cfg(any(test, feature = "test-transport"))]
+        ProjectMemoryProviderActivation::NativeActive => {
+            tracedecay_memory_provider_registry::NativeProviderActivation::Enabled { port }
+        }
+    };
     let composition =
         tracedecay_memory_provider_registry::ProjectMemoryProviderComposition::compose(activation)
             .map_err(|error| TraceDecayError::Config {
@@ -45,10 +60,17 @@ fn mount_project_memory_provider_host(
     Ok(Arc::new(composition))
 }
 
-fn production_mount() -> Result<crate::mcp::server::MemoryProviderHostMount> {
-    mount_project_memory_provider_host(
-        tracedecay_memory_provider_registry::NativeProviderActivation::Disabled,
+pub(super) async fn production_project_server() {
+    production_project_server_with_activation(
+        ProjectMemoryProviderActivation::Disabled,
     )
+}
+'''
+
+VALID_ACTIVATION_HARNESS = '''#[cfg(any(test, feature = "test-transport"))]
+#[doc(hidden)]
+pub async fn open_with_native_provider_for_test() {
+    activate(ProjectMemoryProviderActivation::NativeActive);
 }
 '''
 
@@ -91,11 +113,13 @@ class MemoryCompositionFeatureTest(unittest.TestCase):
         manifest = repo / "crates/tracedecay/Cargo.toml"
         mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
         retention = repo / "crates/tracedecay/src/mcp/server/construction.rs"
+        harness = repo / "crates/tracedecay/src/daemon/production_harness.rs"
         manifest.parent.mkdir(parents=True)
         mount.parent.mkdir(parents=True)
         retention.parent.mkdir(parents=True)
         manifest.write_text(VALID_MANIFEST, encoding="utf-8")
         mount.write_text(VALID_MOUNT, encoding="utf-8")
+        harness.write_text(VALID_ACTIVATION_HARNESS, encoding="utf-8")
         retention.write_text(VALID_RETENTION, encoding="utf-8")
         (repo / "crates/tracedecay/src/lib.rs").write_text(
             "pub mod stable;\n", encoding="utf-8"
@@ -165,6 +189,47 @@ class MemoryCompositionFeatureTest(unittest.TestCase):
             self.assertFalse(
                 any("concrete Native adapter" in error for error in errors)
             )
+
+    def test_test_only_native_activation_requires_exact_cfg_gate(self) -> None:
+        directory, repo = self.fixture()
+        with directory:
+            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
+            mount.write_text(
+                VALID_MOUNT.replace(
+                    '#[cfg(any(test, feature = "test-transport"))]\n'
+                    "        ProjectMemoryProviderActivation::NativeActive => {",
+                    "        ProjectMemoryProviderActivation::NativeActive => {",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            errors = CHECKER.check_repository(repo)
+            self.assertTrue(any("exact test-transport-gated arm" in error for error in errors))
+
+    def test_production_selector_cannot_enable_native_provider(self) -> None:
+        directory, repo = self.fixture()
+        with directory:
+            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
+            mount.write_text(
+                VALID_MOUNT.replace(
+                    "ProjectMemoryProviderActivation::Disabled,\n    )",
+                    "ProjectMemoryProviderActivation::NativeActive,\n    )",
+                ),
+                encoding="utf-8",
+            )
+            errors = CHECKER.check_repository(repo)
+            self.assertTrue(any("explicitly select the Disabled" in error for error in errors))
+
+    def test_native_active_call_outside_gated_harness_fails(self) -> None:
+        directory, repo = self.fixture()
+        with directory:
+            leaked = repo / "crates/tracedecay/src/eager.rs"
+            leaked.write_text(
+                "fn eager() { activate(ProjectMemoryProviderActivation::NativeActive); }\n",
+                encoding="utf-8",
+            )
+            errors = CHECKER.check_repository(repo)
+            self.assertTrue(any("activation leaked" in error for error in errors))
 
     def test_feature_gated_native_adapter_allowlist_passes(self) -> None:
         directory, repo = self.fixture()

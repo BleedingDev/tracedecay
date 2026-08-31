@@ -34,10 +34,49 @@ pub(super) struct ProductionProjectComposition {
 /// Production intentionally supplies `Disabled` today. A future enabled
 /// caller cannot omit the Native application port because that authority is a
 /// required field of the `NativeProviderActivation::Enabled` variant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ProjectMemoryProviderActivation {
+    /// Keep the provider host fully dormant.
+    Disabled,
+    /// Construct and mount the project-owned Native provider.
+    #[cfg(any(test, feature = "test-transport"))]
+    NativeActive,
+}
+
 #[cfg(feature = "memory-provider-host")]
 fn mount_project_memory_provider_host(
-    activation: tracedecay_memory_provider_registry::NativeProviderActivation,
+    activation: ProjectMemoryProviderActivation,
+    _cg: &Arc<crate::tracedecay::TraceDecay>,
+    _canonical_project_path: &Path,
 ) -> Result<crate::mcp::server::MemoryProviderHostMount> {
+    let activation = match activation {
+        ProjectMemoryProviderActivation::Disabled => {
+            tracedecay_memory_provider_registry::NativeProviderActivation::Disabled
+        }
+        #[cfg(any(test, feature = "test-transport"))]
+        ProjectMemoryProviderActivation::NativeActive => {
+            let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(_cg)));
+            let port =
+                super::retained_owner::native_provider::project_native_memory_application_port(
+                    graph_cell,
+                    _canonical_project_path.to_path_buf(),
+                )
+                .map_err(|error| TraceDecayError::Config {
+                    message: format!(
+                        "could not construct project Native application port: {error}"
+                    ),
+                })?;
+            tracedecay_memory_provider_registry::NativeProviderActivation::Enabled {
+                fabric_config: tracedecay_memory_provider_registry::FabricConfig {
+                    max_registered_providers: 1,
+                    max_in_flight: 1,
+                },
+                port,
+                registration_revision: 1,
+                mode: tracedecay_memory_provider_registry::EnabledProviderMode::Active,
+            }
+        }
+    };
     let composition =
         tracedecay_memory_provider_registry::ProjectMemoryProviderComposition::compose(activation)
             .map_err(|error| TraceDecayError::Config {
@@ -236,6 +275,38 @@ pub(super) async fn production_project_server(
     cancellation: &CancellationToken,
     #[cfg(test)] project_open_attempts: Option<&Arc<AtomicUsize>>,
 ) -> Result<ProductionProjectComposition> {
+    production_project_server_with_activation(
+        store_administration,
+        project_open_gates,
+        invocation,
+        http_application_registry,
+        canonical_project_path,
+        handshake,
+        runtime,
+        cancellation,
+        ProjectMemoryProviderActivation::Disabled,
+        #[cfg(test)]
+        project_open_attempts,
+    )
+    .await
+}
+
+/// Opens one project composition with an explicit product-provider
+/// activation. The selector is private to the daemon and its test harness;
+/// normal production/open callers use [`production_project_server`], which
+/// always selects [`ProjectMemoryProviderActivation::Disabled`].
+pub(super) async fn production_project_server_with_activation(
+    store_administration: &StoreAdministration,
+    project_open_gates: &tokio::sync::Mutex<ProjectOpenGates>,
+    invocation: &DaemonInvocationState,
+    http_application_registry: &http_application::DaemonHttpApplicationRegistry,
+    canonical_project_path: &Path,
+    handshake: &DaemonHandshake,
+    runtime: ProductionProjectCompositionRuntime,
+    cancellation: &CancellationToken,
+    activation: ProjectMemoryProviderActivation,
+    #[cfg(test)] project_open_attempts: Option<&Arc<AtomicUsize>>,
+) -> Result<ProductionProjectComposition> {
     Box::pin(production_project_server_inner(
         store_administration,
         project_open_gates,
@@ -245,6 +316,7 @@ pub(super) async fn production_project_server(
         handshake,
         runtime,
         cancellation,
+        activation,
         #[cfg(test)]
         project_open_attempts,
     ))
@@ -260,6 +332,7 @@ async fn production_project_server_inner(
     handshake: &DaemonHandshake,
     runtime: ProductionProjectCompositionRuntime,
     cancellation: &CancellationToken,
+    activation: ProjectMemoryProviderActivation,
     #[cfg(test)] project_open_attempts: Option<&Arc<AtomicUsize>>,
 ) -> Result<ProductionProjectComposition> {
     let project_open_started = Instant::now();
@@ -388,9 +461,10 @@ async fn production_project_server_inner(
     // candidate can be published. Disabled composition creates no fabric,
     // provider adapter, storage, or background work.
     #[cfg(feature = "memory-provider-host")]
-    let memory_provider_host_mount = mount_project_memory_provider_host(
-        tracedecay_memory_provider_registry::NativeProviderActivation::Disabled,
-    )?;
+    let memory_provider_host_mount =
+        mount_project_memory_provider_host(activation, &cg, canonical_project_path)?;
+    #[cfg(not(feature = "memory-provider-host"))]
+    let _ = activation;
 
     let current_key = Arc::new(tokio::sync::Mutex::new(key.clone()));
     let current_project_path = Arc::new(tokio::sync::Mutex::new(
