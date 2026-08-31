@@ -1,0 +1,1213 @@
+{
+  "schema_version": 1,
+  "contract_id": "tracedecay.observation-policy.v1",
+  "bead_id": "tdmem-0501",
+  "title": "Post-commit coding-agent host event observation policy",
+  "status": "accepted",
+  "scope": "coding_agents_only",
+  "authority": "TraceDecay host and application settlement authority",
+  "policy_boundary": {
+    "admission_boundary": "after_canonical_source_settlement",
+    "default_disposition": "exclude",
+    "unknown_event_disposition": "exclude",
+    "completed_or_committed_coding_outcomes_only": true,
+    "provider_fanout_after_settlement": true,
+    "rolled_back_never_admitted": true,
+    "uncommitted_secrets_never_admitted": true,
+    "transient_and_noise_default_excluded": true,
+    "provider_failure_cannot_change_source_outcome": true,
+    "observation_contract": "product/contracts/memory-provider-v1/provider-observation-contract.json"
+  },
+  "dimensions": {
+    "durability": {
+      "values": [
+        "committed_durable",
+        "session_durable",
+        "settled_durable",
+        "ephemeral",
+        "uncommitted",
+        "rolled_back",
+        "unknown"
+      ],
+      "admitted_values": [
+        "committed_durable",
+        "session_durable",
+        "settled_durable"
+      ],
+      "excluded_values": [
+        "ephemeral",
+        "uncommitted",
+        "rolled_back",
+        "unknown"
+      ]
+    },
+    "sensitivity": {
+      "values": [
+        "public",
+        "internal",
+        "sensitive",
+        "sensitive_possible",
+        "secret",
+        "personal_data",
+        "unknown"
+      ],
+      "secret_value": "secret",
+      "admission_rule": "Secret and unadmitted personal data never cross the provider boundary; admitted payloads carry a privacy classification and redaction result."
+    },
+    "relevance": {
+      "values": ["high", "medium", "low", "noise"],
+      "noise_value": "noise",
+      "admission_rule": "Admit only bounded coding outcomes whose relevance is evidenced by the settled event; classify transient operational output as noise."
+    }
+  },
+  "coding_scope_derivation": {
+    "policy_id": "coding_scope_v1",
+    "mode": "required_authoritative_receipt",
+    "authority": "TraceDecay registered-scope and host-session admission",
+    "receipt_name": "ScopeAdmissionReceiptV1",
+    "required_fields": [
+      "profile_id",
+      "project_id",
+      "repository_id",
+      "worktree_id",
+      "branch_ref",
+      "agent_session_id",
+      "scope_revision"
+    ],
+    "identity_fields": [
+      "profile_id",
+      "project_id",
+      "repository_id",
+      "worktree_id",
+      "branch_ref",
+      "agent_session_id",
+      "scope_revision"
+    ],
+    "optional_fields": ["branch_ref"],
+    "evidence_only_fields": [
+      "source_path",
+      "working_directory",
+      "repository_display_name"
+    ],
+    "forbidden_inference_inputs": [
+      "cwd",
+      "path_string",
+      "repository_name",
+      "nearest_project",
+      "process_id",
+      "timestamp_only"
+    ],
+    "algorithm": "Copy the exact identity fields from the already validated ScopeAdmissionReceiptV1 attached to the host or application event; verify its scope revision and session binding, and never parse a path, CWD, repository name, process ID, or nearest project to invent scope.",
+    "failure": "exclude_scope_unresolved"
+  },
+  "source_provenance_derivation": {
+    "policy_id": "source_provenance_v1",
+    "mode": "required_authoritative_receipt",
+    "authority": "TraceDecay canonical source settlement authority",
+    "receipt_name": "CanonicalSettlementReceiptV1",
+    "required_fields": [
+      "source_authority",
+      "source_event_id",
+      "source_event_revision",
+      "source_event_sha256",
+      "canonical_settlement_receipt"
+    ],
+    "identity_fields": [
+      "source_authority",
+      "source_event_id",
+      "source_event_revision",
+      "source_event_sha256"
+    ],
+    "optional_fields": ["evidence_anchors", "transform_chain"],
+    "evidence_only_fields": [
+      "source_path",
+      "byte_range",
+      "line_range",
+      "working_directory"
+    ],
+    "forbidden_inference_inputs": [
+      "path_string",
+      "cwd",
+      "display_label",
+      "timestamp_only",
+      "unsettled_result",
+      "heuristic_event_name"
+    ],
+    "algorithm": "Copy source authority, event identity, revision, digest, and the canonical settlement receipt from the owning host or application authority; verify that the receipt binds the settled digest and commit point, and treat paths and ranges as evidence anchors only, never as source identity.",
+    "failure": "exclude_source_unsettled_or_provenance_unavailable"
+  },
+  "admission_requirements": [
+    "The event is a completed or committed coding outcome, not an intent or preview.",
+    "The canonical source authority has emitted a settlement receipt before provider fan-out.",
+    "The exact scope receipt supplies profile, project, repository, worktree, branch, session, and revision identity.",
+    "The source provenance receipt supplies authority, event ID, revision, digest, and settlement proof.",
+    "The event is classified for durability, sensitivity, and coding relevance.",
+    "Secret-like and unadmitted personal content is rejected or redacted before admission.",
+    "Provider delivery is advisory and cannot alter the settled source outcome."
+  ],
+  "default_exclusion_reasons": [
+    {
+      "code": "speculative_intent",
+      "description": "A request, plan, preview, or proposed action has not produced a settled coding outcome.",
+      "boundary": "before_canonical_source_settlement",
+      "retry_policy": "do_not_retry_as_observation"
+    },
+    {
+      "code": "rolled_back",
+      "description": "The source authority reports that the attempted mutation was reverted or did not remain committed.",
+      "boundary": "source_settlement_rejected",
+      "retry_policy": "never_replay_rolled_back_content"
+    },
+    {
+      "code": "uncommitted",
+      "description": "Content exists only in an editor, overlay, temporary buffer, or pending transaction.",
+      "boundary": "before_durable_commit",
+      "retry_policy": "wait_for_a_new_settled_event"
+    },
+    {
+      "code": "secret",
+      "description": "The payload contains raw credentials, secret material, or a secret-like value that is not redacted.",
+      "boundary": "privacy_filter_before_observation",
+      "retry_policy": "do_not_retry_raw_payload"
+    },
+    {
+      "code": "transient",
+      "description": "The event is an in-flight lifecycle signal, heartbeat, cancellation, or temporary snapshot.",
+      "boundary": "before_stable_outcome",
+      "retry_policy": "do_not_replay_transient_signal"
+    },
+    {
+      "code": "noise",
+      "description": "The event is operational or read-only noise with no bounded coding outcome to teach.",
+      "boundary": "outside_coding_outcome_set",
+      "retry_policy": "do_not_retry_noise"
+    },
+    {
+      "code": "incomplete_outcome",
+      "description": "The operation ended without a definitive committed or completed result.",
+      "boundary": "settlement_receipt_missing_terminal_state",
+      "retry_policy": "admit_only_a_later_definitive_settlement"
+    },
+    {
+      "code": "scope_unresolved",
+      "description": "The authoritative exact coding scope is absent, stale, or inconsistent.",
+      "boundary": "before_scope_binding",
+      "retry_policy": "re-admit_only_with_a_valid_scope_receipt"
+    },
+    {
+      "code": "provenance_unavailable",
+      "description": "The owning authority cannot provide a stable source identity and canonical settlement proof.",
+      "boundary": "before_source_identity",
+      "retry_policy": "do_not_guess_source_identity"
+    },
+    {
+      "code": "provider_operational",
+      "description": "The signal describes provider delivery or infrastructure state rather than a host coding outcome.",
+      "boundary": "outside_host_source_event",
+      "retry_policy": "retain_only_in_provider_operations_telemetry"
+    }
+  ],
+  "host_families": [
+    {
+      "host_id": "claude",
+      "source_authority": "host_session",
+      "event_surface": "hook and transcript records",
+      "scope_receipt": "ScopeAdmissionReceiptV1",
+      "source_paths": [
+        "crates/tracedecay-sessions/src/runtime/hosts/claude_observation.rs",
+        "crates/tracedecay-capture/src/claude/mod.rs"
+      ],
+      "observation_mapping": "host.session_message_committed.v1",
+      "notes": "A provider observation follows the durable session observation commit, not an incoming hook intent."
+    },
+    {
+      "host_id": "codex",
+      "source_authority": "host_session",
+      "event_surface": "rollout JSONL frames and app-server records",
+      "scope_receipt": "ScopeAdmissionReceiptV1",
+      "source_paths": [
+        "crates/tracedecay-sessions/src/runtime/hosts/codex/observation.rs",
+        "crates/tracedecay-capture/src/codex.rs"
+      ],
+      "observation_mapping": "host.session_message_committed.v1",
+      "notes": "The resolved project or profile admission owns the rollout; a path is never used as source identity."
+    },
+    {
+      "host_id": "cursor",
+      "source_authority": "host_session",
+      "event_surface": "Cursor transcript snapshot records",
+      "scope_receipt": "ScopeAdmissionReceiptV1",
+      "source_paths": [
+        "crates/tracedecay-sessions/src/runtime/hosts/cursor.rs",
+        "crates/tracedecay-capture/src/cursor.rs"
+      ],
+      "observation_mapping": "host.session_message_committed.v1",
+      "notes": "Only a complete normalized snapshot admitted by the host authority can leave the session boundary."
+    },
+    {
+      "host_id": "cursor_composer",
+      "source_authority": "host_session",
+      "event_surface": "Cursor Composer SQLite records",
+      "scope_receipt": "ScopeAdmissionReceiptV1",
+      "source_paths": [
+        "crates/tracedecay-sessions/src/runtime/hosts/cursor_composer/capture.rs",
+        "crates/tracedecay-capture/src/cursor_composer.rs"
+      ],
+      "observation_mapping": "host.session_message_committed.v1",
+      "notes": "SQLite row identity and the durable session scope are evidence; ambient database paths are not identity."
+    },
+    {
+      "host_id": "cline_family",
+      "source_authority": "host_session",
+      "event_surface": "API and UI snapshot records",
+      "scope_receipt": "ScopeAdmissionReceiptV1",
+      "source_paths": [
+        "crates/tracedecay-sessions/src/runtime/hosts/cline_like/observation.rs",
+        "crates/tracedecay-capture/src/lib.rs"
+      ],
+      "observation_mapping": "host.session_message_committed.v1",
+      "notes": "Snapshot completion and canonical admission are required before a provider can observe the record."
+    },
+    {
+      "host_id": "hermes",
+      "source_authority": "host_session",
+      "event_surface": "Hermes state database rows",
+      "scope_receipt": "ScopeAdmissionReceiptV1",
+      "source_paths": [
+        "crates/tracedecay-sessions/src/runtime/hosts/hermes/observation.rs",
+        "crates/tracedecay-sessions/src/runtime/hosts/hermes/state_db.rs"
+      ],
+      "observation_mapping": "host.session_message_committed.v1",
+      "notes": "A settled native row is normalized under the authoritative project/profile route before fan-out."
+    },
+    {
+      "host_id": "kiro",
+      "source_authority": "host_session",
+      "event_surface": "Kiro workspace session snapshots",
+      "scope_receipt": "ScopeAdmissionReceiptV1",
+      "source_paths": [
+        "crates/tracedecay-sessions/src/runtime/hosts/kiro/observation.rs",
+        "crates/tracedecay-capture/src/kiro.rs"
+      ],
+      "observation_mapping": "host.session_message_committed.v1",
+      "notes": "The source generation and snapshot order are ordering evidence, while scope comes from admission."
+    },
+    {
+      "host_id": "kimi",
+      "source_authority": "host_session",
+      "event_surface": "Kimi transcript records",
+      "scope_receipt": "ScopeAdmissionReceiptV1",
+      "source_paths": [
+        "crates/tracedecay-sessions/src/runtime/hosts/kimi.rs",
+        "crates/tracedecay-capture/src/kimi.rs"
+      ],
+      "observation_mapping": "host.session_message_committed.v1",
+      "notes": "Only normalized, privacy-classified, durably admitted records are eligible."
+    },
+    {
+      "host_id": "opencode",
+      "source_authority": "host_session",
+      "event_surface": "OpenCode session and event snapshots",
+      "scope_receipt": "ScopeAdmissionReceiptV1",
+      "source_paths": [
+        "crates/tracedecay-sessions/src/runtime/hosts/opencode.rs",
+        "crates/tracedecay-capture/src/opencode.rs"
+      ],
+      "observation_mapping": "host.session_message_committed.v1",
+      "notes": "Session status and LSP notifications are not observations unless the owning authority settles a coding outcome."
+    },
+    {
+      "host_id": "vibe",
+      "source_authority": "host_session",
+      "event_surface": "Vibe session records",
+      "scope_receipt": "ScopeAdmissionReceiptV1",
+      "source_paths": [
+        "crates/tracedecay-sessions/src/runtime/hosts/vibe.rs",
+        "crates/tracedecay-capture/src/vibe.rs"
+      ],
+      "observation_mapping": "host.session_message_committed.v1",
+      "notes": "Host-specific wire details remain in the adapter; the observation boundary remains provider-neutral."
+    }
+  ],
+  "event_coverage": {
+    "coverage_basis": "All supported coding-agent host session surfaces and TraceDecay application outcome boundaries that can produce a durable coding signal are represented; an event not listed here is excluded by the unclassified rule.",
+    "host_families": [
+      "claude",
+      "codex",
+      "cursor",
+      "cursor_composer",
+      "cline_family",
+      "hermes",
+      "kiro",
+      "kimi",
+      "opencode",
+      "vibe"
+    ],
+    "admitted_event_ids": [
+      "host.session_message_committed.v1",
+      "application.tool_execution_settled.v1",
+      "application.source_edit_settled.v1",
+      "application.test_execution_settled.v1",
+      "application.diagnostic_snapshot_settled.v1",
+      "application.git_commit_observed.v1",
+      "application.native_fact_promotion_settled.v1",
+      "application.feedback_outcome_settled.v1",
+      "application.automation_outcome_settled.v1"
+    ],
+    "excluded_event_ids": [
+      "host.tool_intent.v1",
+      "host.tool_started.v1",
+      "host.source_edit_proposed.v1",
+      "host.source_edit_rolled_back.v1",
+      "host.source_edit_uncommitted.v1",
+      "host.test_requested.v1",
+      "host.test_aborted.v1",
+      "application.diagnostic_update_transient.v1",
+      "application.git_status_observed.v1",
+      "host.session_heartbeat.v1",
+      "application.recall_candidate_generated.v1",
+      "application.native_fact_proposed.v1",
+      "application.feedback_preview.v1",
+      "application.automation_scheduled.v1",
+      "host.secret_payload.v1",
+      "application.provider_delivery_receipt.v1",
+      "application.file_read_completed.v1",
+      "host.session_compaction_preview.v1"
+    ],
+    "unclassified_event_rule": "exclude_with_unclassified_event_reason_before_scope_binding"
+  },
+  "event_classes": [
+    {
+      "event_id": "host.session_message_committed.v1",
+      "family": "session",
+      "host_or_application": "host",
+      "source_authority": "host_session",
+      "summary": "A normalized user or assistant session message has been durably admitted by the host session authority.",
+      "disposition": "admit",
+      "durability": "session_durable",
+      "sensitivity": "sensitive_possible",
+      "relevance": "high",
+      "observation_kind": "session.message_committed.v1",
+      "canonical_commit_point": {
+        "point_id": "session_observation_store.commit",
+        "authority": "TraceDecay host session admission authority",
+        "settled_state": "ObservationPersistOutcome::Committed with a durable observation ID and cursor advance",
+        "source_paths": [
+          "crates/tracedecay-sessions/src/observation.rs",
+          "crates/tracedecay-global-db/src/observation_adapter.rs"
+        ],
+        "receipt_fields": [
+          "durable_observation_id",
+          "source_cursor",
+          "source_generation",
+          "source_range",
+          "scope_revision",
+          "settlement_digest"
+        ],
+        "ordering_authority": "The source cursor and generation supplied by the host adapter, not wall-clock arrival time.",
+        "provider_fanout": "Only after durable session observation commit and privacy settlement."
+      },
+      "exclusion_reason": null,
+      "scope_derivation": {
+        "policy_id": "coding_scope_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay host-session admission",
+        "receipt_name": "ScopeAdmissionReceiptV1",
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "optional_fields": ["branch_ref"],
+        "evidence_only_fields": ["source_path", "working_directory"],
+        "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
+        "algorithm": "Copy the exact scope identity from the validated admission receipt; never parse a path or CWD to infer a project or worktree.",
+        "failure": "exclude_scope_unresolved"
+      },
+      "source_provenance_derivation": {
+        "policy_id": "source_provenance_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay host session authority",
+        "receipt_name": "CanonicalSettlementReceiptV1",
+        "required_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256", "canonical_settlement_receipt"],
+        "identity_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256"],
+        "optional_fields": ["evidence_anchors", "transform_chain"],
+        "evidence_only_fields": ["source_path", "byte_range", "working_directory"],
+        "forbidden_inference_inputs": ["path_string", "cwd", "display_label", "timestamp_only"],
+        "algorithm": "Copy and verify the host settlement receipt and source digest; paths and byte ranges remain evidence anchors only.",
+        "failure": "exclude_source_unsettled_or_provenance_unavailable"
+      },
+      "payload_policy": {
+        "content_allowed": ["bounded normalized message content", "typed role and outcome metadata"],
+        "redact_before_admission": true,
+        "forbidden_content": ["raw secrets", "unadmitted personal data", "unsettled tool intent"],
+        "notes": "A message is advisory provider input, never an accepted Native fact by itself."
+      }
+    },
+    {
+      "event_id": "application.tool_execution_settled.v1",
+      "family": "tool_execution",
+      "host_or_application": "application",
+      "source_authority": "tool_execution",
+      "summary": "A tool invocation has reached a typed terminal result and any source effect has a committed-effect receipt.",
+      "disposition": "admit",
+      "durability": "settled_durable",
+      "sensitivity": "sensitive_possible",
+      "relevance": "high",
+      "observation_kind": "tool.execution_settled.v1",
+      "canonical_commit_point": {
+        "point_id": "application.dispatch_settlement.commit",
+        "authority": "TraceDecay application operation owner",
+        "settled_state": "DispatchExecutionSettlement joined with a typed terminal outcome and committed-effect state",
+        "source_paths": [
+          "crates/tracedecay/src/mcp/server/dispatch_settlement.rs",
+          "crates/tracedecay-usecases/src/observability/delivery_settlement.rs"
+        ],
+        "receipt_fields": ["operation_id", "terminal_outcome", "committed_effect", "effect_digest", "scope_revision"],
+        "ordering_authority": "The operation settlement receipt and its source sequence, not request-start or response-arrival time.",
+        "provider_fanout": "Only after the canonical tool result is settled; provider failure cannot change the tool result."
+      },
+      "exclusion_reason": null,
+      "scope_derivation": {
+        "policy_id": "coding_scope_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay application scope admission",
+        "receipt_name": "ScopeAdmissionReceiptV1",
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "optional_fields": ["branch_ref"],
+        "evidence_only_fields": ["tool_name", "source_path", "working_directory"],
+        "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
+        "algorithm": "Copy scope fields from the operation's validated admission receipt and compare the settlement revision; never infer scope from a tool argument or path string.",
+        "failure": "exclude_scope_unresolved"
+      },
+      "source_provenance_derivation": {
+        "policy_id": "source_provenance_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay tool execution settlement authority",
+        "receipt_name": "CanonicalSettlementReceiptV1",
+        "required_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256", "canonical_settlement_receipt"],
+        "identity_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256"],
+        "optional_fields": ["evidence_anchors", "transform_chain"],
+        "evidence_only_fields": ["tool_name", "source_path", "byte_range"],
+        "forbidden_inference_inputs": ["path_string", "cwd", "display_label", "timestamp_only"],
+        "algorithm": "Use the typed terminal settlement and committed-effect receipt as source provenance; do not turn a requested tool call into a settled event.",
+        "failure": "exclude_source_unsettled_or_provenance_unavailable"
+      },
+      "payload_policy": {
+        "content_allowed": ["bounded tool outcome", "committed-effect metadata", "sanitized result digest"],
+        "redact_before_admission": true,
+        "forbidden_content": ["tool intent alone", "raw credentials", "unbounded command output"],
+        "notes": "A failed terminal result can be useful evidence when it is settled; a started or cancelled request is not."
+      }
+    },
+    {
+      "event_id": "application.source_edit_settled.v1",
+      "family": "source_edit",
+      "host_or_application": "application",
+      "source_authority": "source_edit",
+      "summary": "An authorized source edit has atomically published bytes in the exact worktree and emitted a settlement receipt.",
+      "disposition": "admit",
+      "durability": "committed_durable",
+      "sensitivity": "internal_or_sensitive",
+      "relevance": "high",
+      "observation_kind": "source.edit_settled.v1",
+      "canonical_commit_point": {
+        "point_id": "source_edit_authority.atomic_publish",
+        "authority": "Exact admitted worktree source-edit authority",
+        "settled_state": "Atomic publication succeeded and expected file identity/generation was advanced",
+        "source_paths": [
+          "crates/tracedecay-application/src/work_owner_observation.rs",
+          "crates/tracedecay/src/mcp/server/dispatch_settlement.rs"
+        ],
+        "receipt_fields": ["operation_id", "worktree_id", "file_identity", "before_digest", "after_digest", "commit_generation"],
+        "ordering_authority": "The source-edit publication generation and after digest, not editor-buffer time.",
+        "provider_fanout": "Only after atomic source publication; a later rollback is a separate excluded event."
+      },
+      "exclusion_reason": null,
+      "scope_derivation": {
+        "policy_id": "coding_scope_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay exact-worktree admission",
+        "receipt_name": "ScopeAdmissionReceiptV1",
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "optional_fields": ["branch_ref"],
+        "evidence_only_fields": ["source_path", "file_name", "working_directory"],
+        "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
+        "algorithm": "Use the scope receipt selected before publication and bind the edit receipt to its worktree ID; never parse the edited file path to select scope.",
+        "failure": "exclude_scope_unresolved"
+      },
+      "source_provenance_derivation": {
+        "policy_id": "source_provenance_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay source-edit settlement authority",
+        "receipt_name": "CanonicalSettlementReceiptV1",
+        "required_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256", "canonical_settlement_receipt"],
+        "identity_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256"],
+        "optional_fields": ["evidence_anchors", "transform_chain"],
+        "evidence_only_fields": ["source_path", "file_name", "line_range"],
+        "forbidden_inference_inputs": ["path_string", "cwd", "display_label", "timestamp_only"],
+        "algorithm": "Derive source identity from the atomic publication receipt, before/after digests, and source revision; retain paths only as evidence anchors.",
+        "failure": "exclude_source_unsettled_or_provenance_unavailable"
+      },
+      "payload_policy": {
+        "content_allowed": ["bounded edit outcome", "before/after content digests", "typed changed-file metadata"],
+        "redact_before_admission": true,
+        "forbidden_content": ["uncommitted editor buffer", "raw secret material", "path-derived scope claims"],
+        "notes": "The current worktree remains canonical; the provider receives an advisory outcome projection."
+      }
+    },
+    {
+      "event_id": "application.test_execution_settled.v1",
+      "family": "test_execution",
+      "host_or_application": "application",
+      "source_authority": "test_execution",
+      "summary": "A test or verification command has completed with a durable result tied to the exact source generation.",
+      "disposition": "admit",
+      "durability": "settled_durable",
+      "sensitivity": "internal_or_sensitive",
+      "relevance": "high",
+      "observation_kind": "test.execution_settled.v1",
+      "canonical_commit_point": {
+        "point_id": "test_execution_authority.settled",
+        "authority": "TraceDecay test execution and result authority",
+        "settled_state": "Test process reached a typed terminal result and result receipt was durably recorded",
+        "source_paths": ["crates/tracedecay/src/daemon", "crates/tracedecay-usecases/src/observability/delivery_settlement.rs"],
+        "receipt_fields": ["execution_id", "source_generation", "terminal_status", "result_digest", "scope_revision"],
+        "ordering_authority": "Execution receipt and source generation, not process-start or log-line order.",
+        "provider_fanout": "Only after the test result is terminal and durably recorded."
+      },
+      "exclusion_reason": null,
+      "scope_derivation": {
+        "policy_id": "coding_scope_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay test scope admission",
+        "receipt_name": "ScopeAdmissionReceiptV1",
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "optional_fields": ["branch_ref"],
+        "evidence_only_fields": ["test_path", "working_directory"],
+        "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
+        "algorithm": "Copy exact scope from the test execution admission receipt and bind it to the source generation; never infer project scope from a test path.",
+        "failure": "exclude_scope_unresolved"
+      },
+      "source_provenance_derivation": {
+        "policy_id": "source_provenance_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay test execution authority",
+        "receipt_name": "CanonicalSettlementReceiptV1",
+        "required_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256", "canonical_settlement_receipt"],
+        "identity_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256"],
+        "optional_fields": ["evidence_anchors", "transform_chain"],
+        "evidence_only_fields": ["test_path", "log_path", "line_range"],
+        "forbidden_inference_inputs": ["path_string", "cwd", "display_label", "timestamp_only"],
+        "algorithm": "Use the terminal test receipt, source generation, and result digest as provenance; an unfinished process has no admissible source event.",
+        "failure": "exclude_source_unsettled_or_provenance_unavailable"
+      },
+      "payload_policy": {
+        "content_allowed": ["bounded pass/fail outcome", "test identity", "source-generation and result digests"],
+        "redact_before_admission": true,
+        "forbidden_content": ["unbounded raw logs", "credentials in output", "test intent without result"],
+        "notes": "Failure is a settled coding signal; it is not a source edit and cannot be rewritten by a provider."
+      }
+    },
+    {
+      "event_id": "application.diagnostic_snapshot_settled.v1",
+      "family": "diagnostic",
+      "host_or_application": "application",
+      "source_authority": "diagnostic_broker",
+      "summary": "A diagnostic broker has committed a complete bounded snapshot for a known source generation.",
+      "disposition": "admit",
+      "durability": "settled_durable",
+      "sensitivity": "internal_or_sensitive",
+      "relevance": "medium",
+      "observation_kind": "diagnostic.observed.v1",
+      "canonical_commit_point": {
+        "point_id": "diagnostic_snapshot_authority.snapshot_commit",
+        "authority": "TraceDecay diagnostic snapshot authority",
+        "settled_state": "Complete snapshot is committed and bound to a source generation",
+        "source_paths": [
+          "crates/tracedecay-lsp/src/overlay/workspace_diagnostics.rs",
+          "crates/tracedecay-lsp/src/diagnostics.rs"
+        ],
+        "receipt_fields": ["snapshot_id", "source_generation", "coverage", "diagnostic_digest", "scope_revision"],
+        "ordering_authority": "Snapshot ID and source generation, not debounce arrival order.",
+        "provider_fanout": "Only after complete snapshot settlement; partial/unavailable snapshots remain operational evidence."
+      },
+      "exclusion_reason": null,
+      "scope_derivation": {
+        "policy_id": "coding_scope_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay diagnostic scope admission",
+        "receipt_name": "ScopeAdmissionReceiptV1",
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "optional_fields": ["branch_ref"],
+        "evidence_only_fields": ["document_uri", "source_path", "working_directory"],
+        "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
+        "algorithm": "Copy the exact scope attached to the diagnostic snapshot authority and bind its source generation; never derive project identity from a document URI.",
+        "failure": "exclude_scope_unresolved"
+      },
+      "source_provenance_derivation": {
+        "policy_id": "source_provenance_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay diagnostic broker",
+        "receipt_name": "CanonicalSettlementReceiptV1",
+        "required_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256", "canonical_settlement_receipt"],
+        "identity_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256"],
+        "optional_fields": ["evidence_anchors", "transform_chain"],
+        "evidence_only_fields": ["document_uri", "source_path", "line_range"],
+        "forbidden_inference_inputs": ["path_string", "cwd", "display_label", "timestamp_only"],
+        "algorithm": "Use the committed snapshot receipt and digest as provenance; an in-flight debounced update is not a source event.",
+        "failure": "exclude_source_unsettled_or_provenance_unavailable"
+      },
+      "payload_policy": {
+        "content_allowed": ["bounded diagnostic counts", "typed severity and snapshot digest", "source generation"],
+        "redact_before_admission": true,
+        "forbidden_content": ["raw source snippets", "secret-like diagnostics", "partial debounce state"],
+        "notes": "Diagnostic content is evidence about code health, not permission to mutate code or Native facts."
+      }
+    },
+    {
+      "event_id": "application.git_commit_observed.v1",
+      "family": "git_evidence",
+      "host_or_application": "application",
+      "source_authority": "git_evidence",
+      "summary": "The exact worktree's Git authority has observed and settled a commit object for the admitted coding scope.",
+      "disposition": "admit",
+      "durability": "committed_durable",
+      "sensitivity": "internal_or_sensitive",
+      "relevance": "high",
+      "observation_kind": "git.evidence_observed.v1",
+      "canonical_commit_point": {
+        "point_id": "git_ref_authority.commit_observed",
+        "authority": "Git reference authority for the exact admitted worktree",
+        "settled_state": "Commit object and ref observation are verified against the admitted repository/worktree",
+        "source_paths": [
+          "crates/tracedecay-runtime-core/src/branch.rs",
+          "crates/tracedecay-sessions/src/runtime/observation/snapshot_observation.rs"
+        ],
+        "receipt_fields": ["commit_sha", "repository_id", "worktree_id", "branch_ref", "parent_shas", "scope_revision"],
+        "ordering_authority": "The Git commit graph and exact ref, not file mtime or branch display text.",
+        "provider_fanout": "Only after Git evidence is verified; branch/status polling remains excluded noise."
+      },
+      "exclusion_reason": null,
+      "scope_derivation": {
+        "policy_id": "coding_scope_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay Git scope admission",
+        "receipt_name": "ScopeAdmissionReceiptV1",
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "optional_fields": ["branch_ref"],
+        "evidence_only_fields": ["git_common_dir", "display_branch", "working_directory"],
+        "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
+        "algorithm": "Copy repository, worktree, branch, session, and revision from the validated scope and Git route receipts; never derive identity from a path or branch label.",
+        "failure": "exclude_scope_unresolved"
+      },
+      "source_provenance_derivation": {
+        "policy_id": "source_provenance_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay Git evidence authority",
+        "receipt_name": "CanonicalSettlementReceiptV1",
+        "required_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256", "canonical_settlement_receipt"],
+        "identity_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256"],
+        "optional_fields": ["evidence_anchors", "transform_chain"],
+        "evidence_only_fields": ["git_common_dir", "display_branch", "source_path"],
+        "forbidden_inference_inputs": ["path_string", "cwd", "display_label", "timestamp_only"],
+        "algorithm": "Derive source identity from the verified commit object, ref receipt, parent set, and source digest; Git paths remain evidence only.",
+        "failure": "exclude_source_unsettled_or_provenance_unavailable"
+      },
+      "payload_policy": {
+        "content_allowed": ["commit and parent digests", "typed ref evidence", "bounded changed-file summary"],
+        "redact_before_admission": true,
+        "forbidden_content": ["raw credentials from commit bodies", "uncommitted diff content", "branch-name scope guesses"],
+        "notes": "A Git commit is evidence of a committed coding outcome; a status poll is not."
+      }
+    },
+    {
+      "event_id": "application.native_fact_promotion_settled.v1",
+      "family": "native_memory",
+      "host_or_application": "application",
+      "source_authority": "native_fact_promotion",
+      "summary": "An explicitly authorized promotion has passed Native validation and durably settled in the Native fact authority.",
+      "disposition": "admit",
+      "durability": "committed_durable",
+      "sensitivity": "sensitive_possible",
+      "relevance": "high",
+      "observation_kind": "native.fact_promoted.v1",
+      "canonical_commit_point": {
+        "point_id": "native_explicit_fact_log.promotion_commit",
+        "authority": "TraceDecay Native explicit fact authority",
+        "settled_state": "Validated promotion committed with lineage, idempotency, and privacy receipt",
+        "source_paths": [
+          "crates/tracedecay-usecases/src/memory/project_memory.rs",
+          "crates/tracedecay-global-db/src/native_integration"
+        ],
+        "receipt_fields": ["fact_id", "promotion_operation_id", "lineage_digest", "privacy_receipt", "scope_revision"],
+        "ordering_authority": "Native fact log commit and lineage receipt, not a provider proposal timestamp.",
+        "provider_fanout": "Only after explicit Native promotion; provider recall cannot implicitly promote a fact."
+      },
+      "exclusion_reason": null,
+      "scope_derivation": {
+        "policy_id": "coding_scope_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay Native owner scope admission",
+        "receipt_name": "ScopeAdmissionReceiptV1",
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "optional_fields": ["branch_ref"],
+        "evidence_only_fields": ["fact_store_path", "working_directory"],
+        "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
+        "algorithm": "Copy scope from the Native owner receipt and retain provider scope as evidence only; never infer ownership from a database path.",
+        "failure": "exclude_scope_unresolved"
+      },
+      "source_provenance_derivation": {
+        "policy_id": "source_provenance_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay Native promotion authority",
+        "receipt_name": "CanonicalSettlementReceiptV1",
+        "required_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256", "canonical_settlement_receipt"],
+        "identity_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256"],
+        "optional_fields": ["evidence_anchors", "transform_chain"],
+        "evidence_only_fields": ["fact_store_path", "fact_display_label"],
+        "forbidden_inference_inputs": ["path_string", "cwd", "display_label", "timestamp_only"],
+        "algorithm": "Use the explicit promotion operation, Native lineage, and privacy receipt as source provenance; a provider candidate is not a settled promotion.",
+        "failure": "exclude_source_unsettled_or_provenance_unavailable"
+      },
+      "payload_policy": {
+        "content_allowed": ["promotion outcome", "Native fact and lineage digests", "privacy classification"],
+        "redact_before_admission": true,
+        "forbidden_content": ["unpromoted provider recall", "raw secret material", "implicit fact conversion"],
+        "notes": "This observes an authorized Native settlement; it does not grant a cognitive provider Native authority."
+      }
+    },
+    {
+      "event_id": "application.feedback_outcome_settled.v1",
+      "family": "feedback",
+      "host_or_application": "application",
+      "source_authority": "feedback_outcome",
+      "summary": "A user or system feedback outcome has been durably recorded with its bounded target and result.",
+      "disposition": "admit",
+      "durability": "settled_durable",
+      "sensitivity": "sensitive_possible",
+      "relevance": "medium",
+      "observation_kind": "feedback.outcome_settled.v1",
+      "canonical_commit_point": {
+        "point_id": "native_feedback_log.outcome_commit",
+        "authority": "TraceDecay feedback outcome authority",
+        "settled_state": "Feedback source event and resulting trust/outcome transition are durably recorded",
+        "source_paths": ["crates/tracedecay-usecases/src/feedback/observations.rs"],
+        "receipt_fields": ["feedback_event_id", "target_identity", "outcome", "transition_digest", "scope_revision"],
+        "ordering_authority": "Feedback log settlement and target identity, not UI preview order.",
+        "provider_fanout": "Only after feedback is settled; provider output cannot rewrite Native feedback."
+      },
+      "exclusion_reason": null,
+      "scope_derivation": {
+        "policy_id": "coding_scope_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay feedback scope admission",
+        "receipt_name": "ScopeAdmissionReceiptV1",
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "optional_fields": ["branch_ref"],
+        "evidence_only_fields": ["ui_route", "working_directory"],
+        "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
+        "algorithm": "Copy exact scope from the feedback authority's admission receipt; never use a UI route, path, or display label to infer coding scope.",
+        "failure": "exclude_scope_unresolved"
+      },
+      "source_provenance_derivation": {
+        "policy_id": "source_provenance_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay feedback outcome authority",
+        "receipt_name": "CanonicalSettlementReceiptV1",
+        "required_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256", "canonical_settlement_receipt"],
+        "identity_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256"],
+        "optional_fields": ["evidence_anchors", "transform_chain"],
+        "evidence_only_fields": ["ui_route", "display_label"],
+        "forbidden_inference_inputs": ["path_string", "cwd", "display_label", "timestamp_only"],
+        "algorithm": "Use the settled feedback source event and transition digest; previews and unsubmitted controls have no canonical provenance.",
+        "failure": "exclude_source_unsettled_or_provenance_unavailable"
+      },
+      "payload_policy": {
+        "content_allowed": ["bounded feedback outcome", "target and transition digests", "privacy classification"],
+        "redact_before_admission": true,
+        "forbidden_content": ["free-form secret text", "unsubmitted feedback", "provider-private payload"],
+        "notes": "Feedback is an outcome signal and remains separate from source code and Native fact authority."
+      }
+    },
+    {
+      "event_id": "application.automation_outcome_settled.v1",
+      "family": "automation",
+      "host_or_application": "application",
+      "source_authority": "automation_outcome",
+      "summary": "A TraceDecay automation run has reached a durable typed outcome tied to its admitted coding scope.",
+      "disposition": "admit",
+      "durability": "settled_durable",
+      "sensitivity": "sensitive_possible",
+      "relevance": "medium",
+      "observation_kind": "automation.outcome_settled.v1",
+      "canonical_commit_point": {
+        "point_id": "automation_run_ledger.outcome_commit",
+        "authority": "TraceDecay automation run authority",
+        "settled_state": "Run ledger contains a terminal outcome, input/evidence identity, and any committed effect receipt",
+        "source_paths": [
+          "crates/tracedecay/src/daemon/automation_observation.rs",
+          "crates/tracedecay/src/daemon/scheduler/automation_observation.rs"
+        ],
+        "receipt_fields": ["run_id", "terminal_outcome", "input_digest", "effect_digest", "scope_revision"],
+        "ordering_authority": "Automation run ledger settlement and run identity, not scheduler intent or heartbeat timing.",
+        "provider_fanout": "Only after the automation outcome is settled and privacy-checked."
+      },
+      "exclusion_reason": null,
+      "scope_derivation": {
+        "policy_id": "coding_scope_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay automation scope admission",
+        "receipt_name": "ScopeAdmissionReceiptV1",
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "optional_fields": ["branch_ref"],
+        "evidence_only_fields": ["scheduler_path", "working_directory"],
+        "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
+        "algorithm": "Copy exact scope from the automation run's admission receipt and bind it to the run revision; never infer scope from a scheduler path or job label.",
+        "failure": "exclude_scope_unresolved"
+      },
+      "source_provenance_derivation": {
+        "policy_id": "source_provenance_v1",
+        "mode": "required_authoritative_receipt",
+        "authority": "TraceDecay automation outcome authority",
+        "receipt_name": "CanonicalSettlementReceiptV1",
+        "required_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256", "canonical_settlement_receipt"],
+        "identity_fields": ["source_authority", "source_event_id", "source_event_revision", "source_event_sha256"],
+        "optional_fields": ["evidence_anchors", "transform_chain"],
+        "evidence_only_fields": ["scheduler_path", "job_label"],
+        "forbidden_inference_inputs": ["path_string", "cwd", "display_label", "timestamp_only"],
+        "algorithm": "Use the terminal automation receipt and input/effect digests as provenance; a scheduled or running job is not a source event.",
+        "failure": "exclude_source_unsettled_or_provenance_unavailable"
+      },
+      "payload_policy": {
+        "content_allowed": ["typed automation outcome", "bounded input/effect digests", "run identity"],
+        "redact_before_admission": true,
+        "forbidden_content": ["scheduler intent", "raw secrets from logs", "unbounded run output"],
+        "notes": "Automation observation is operational evidence and cannot silently mutate canonical code or facts."
+      }
+    },
+    {
+      "event_id": "host.tool_intent.v1",
+      "family": "tool_execution",
+      "host_or_application": "host",
+      "source_authority": "host_session",
+      "summary": "A host recorded an intention or request to invoke a tool before execution settled.",
+      "disposition": "exclude",
+      "durability": "ephemeral",
+      "sensitivity": "sensitive_possible",
+      "relevance": "low",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "speculative_intent", "description": "Tool intent can be edited, denied, cancelled, or superseded before any coding effect exists.", "boundary": "before_tool_execution_settlement", "retry_policy": "do_not_retry_as_observation"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "No provider observation is formed; exclude the intent before scope binding.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "No settled source receipt exists; exclude rather than guess provenance.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["tool intent", "raw arguments"], "notes": "Intent is not a committed coding outcome."}
+    },
+    {
+      "event_id": "host.tool_started.v1",
+      "family": "tool_execution",
+      "host_or_application": "host",
+      "source_authority": "tool_execution",
+      "summary": "A tool worker started but has not produced a terminal result.",
+      "disposition": "exclude",
+      "durability": "ephemeral",
+      "sensitivity": "sensitive_possible",
+      "relevance": "noise",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "transient", "description": "An in-flight worker may fail or be cancelled and has no settled effect.", "boundary": "before_tool_execution_settlement", "retry_policy": "do_not_replay_transient_signal"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude the lifecycle signal before scope binding; await a terminal settlement event.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "No canonical settlement receipt exists for a started worker.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["in-flight output", "worker metadata"], "notes": "Provider delivery cannot observe execution progress."}
+    },
+    {
+      "event_id": "host.source_edit_proposed.v1",
+      "family": "source_edit",
+      "host_or_application": "host",
+      "source_authority": "source_edit",
+      "summary": "An edit was proposed or previewed but has not atomically published bytes.",
+      "disposition": "exclude",
+      "durability": "uncommitted",
+      "sensitivity": "sensitive_possible",
+      "relevance": "low",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "uncommitted", "description": "Editor and preview state is mutable and may never become current worktree truth.", "boundary": "before_source_edit_authority_commit", "retry_policy": "wait_for_a_new_settled_event"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude proposed bytes before scope binding and before provider fan-out.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "A preview has no canonical source settlement receipt; do not derive provenance from its path.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["editor buffer", "preview diff", "raw secrets"], "notes": "Only a successful atomic publication can be observed."}
+    },
+    {
+      "event_id": "host.source_edit_rolled_back.v1",
+      "family": "source_edit",
+      "host_or_application": "host",
+      "source_authority": "source_edit",
+      "summary": "A previously attempted edit was rolled back or failed to remain committed.",
+      "disposition": "exclude",
+      "durability": "rolled_back",
+      "sensitivity": "sensitive_possible",
+      "relevance": "low",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "rolled_back", "description": "Rolled-back bytes are not current coding truth and must never be taught as a provider observation.", "boundary": "source_settlement_rejected", "retry_policy": "never_replay_rolled_back_content"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude rollback evidence before forming any provider scope envelope.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "The rollback receipt is an exclusion reason, not an admissible source settlement.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["rolled-back bytes", "rollback diff", "secret material"], "notes": "Rollback is explicit negative evidence and does not cross the provider boundary."}
+    },
+    {
+      "event_id": "host.source_edit_uncommitted.v1",
+      "family": "source_edit",
+      "host_or_application": "host",
+      "source_authority": "source_edit",
+      "summary": "A source buffer or temporary file changed without a durable source-edit commit.",
+      "disposition": "exclude",
+      "durability": "uncommitted",
+      "sensitivity": "sensitive_possible",
+      "relevance": "low",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "uncommitted", "description": "Uncommitted state is not authoritative and may be discarded by the host or editor.", "boundary": "before_durable_commit", "retry_policy": "wait_for_a_new_settled_event"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude the buffer change before scope binding; wait for an atomic source-edit settlement.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "No committed source digest or settlement receipt exists.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["uncommitted bytes", "temporary paths", "raw secrets"], "notes": "This is the explicit default for editor and overlay state."}
+    },
+    {
+      "event_id": "host.test_requested.v1",
+      "family": "test_execution",
+      "host_or_application": "host",
+      "source_authority": "test_execution",
+      "summary": "A test run was requested but no result has settled.",
+      "disposition": "exclude",
+      "durability": "ephemeral",
+      "sensitivity": "internal",
+      "relevance": "low",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "speculative_intent", "description": "A request does not establish whether the test ran, passed, or produced a coding signal.", "boundary": "before_test_execution_settlement", "retry_policy": "do_not_retry_as_observation"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude the request before scope binding and await a terminal result receipt.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "A requested test has no settled source event.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["test command intent", "unbounded arguments"], "notes": "Only terminal test outcomes are eligible."}
+    },
+    {
+      "event_id": "host.test_aborted.v1",
+      "family": "test_execution",
+      "host_or_application": "host",
+      "source_authority": "test_execution",
+      "summary": "A test run stopped without a definitive completed result.",
+      "disposition": "exclude",
+      "durability": "ephemeral",
+      "sensitivity": "internal",
+      "relevance": "noise",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "incomplete_outcome", "description": "An aborted test cannot establish a completed coding result and may only reflect cancellation or infrastructure loss.", "boundary": "settlement_receipt_missing_terminal_state", "retry_policy": "admit_only_a_later_definitive_settlement"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude an incomplete run before provider scope binding.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "No terminal source settlement is available for an aborted run.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["partial logs", "cancellation reason text", "temporary output"], "notes": "Infrastructure or cancellation noise stays out of the provider observation stream."}
+    },
+    {
+      "event_id": "application.diagnostic_update_transient.v1",
+      "family": "diagnostic",
+      "host_or_application": "application",
+      "source_authority": "diagnostic_broker",
+      "summary": "A debounced, partial, stale, or in-flight diagnostic update has not settled as a complete snapshot.",
+      "disposition": "exclude",
+      "durability": "ephemeral",
+      "sensitivity": "internal_or_sensitive",
+      "relevance": "noise",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "transient", "description": "Intermediate diagnostic updates are superseded by later snapshots and have no stable source generation.", "boundary": "before_diagnostic_snapshot_settlement", "retry_policy": "do_not_replay_transient_signal"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude the update before scope binding; a complete snapshot may be considered separately.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "No canonical snapshot settlement receipt exists.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["partial diagnostics", "raw source snippets", "debounce state"], "notes": "Only a complete bounded diagnostic snapshot can be relevant evidence."}
+    },
+    {
+      "event_id": "application.git_status_observed.v1",
+      "family": "git_evidence",
+      "host_or_application": "application",
+      "source_authority": "git_evidence",
+      "summary": "A branch, status, or working-tree poll was observed without a settled commit outcome.",
+      "disposition": "exclude",
+      "durability": "ephemeral",
+      "sensitivity": "internal",
+      "relevance": "noise",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "noise", "description": "Polling output is mutable context and cannot prove a committed coding outcome.", "boundary": "outside_coding_outcome_set", "retry_policy": "do_not_retry_noise"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude polling output before scope binding; a verified commit event has its own policy row.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "A status poll has no canonical settlement receipt.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["working-tree paths", "branch display text", "uncommitted diff"], "notes": "Git commit evidence is admitted only through the separate settled commit event."}
+    },
+    {
+      "event_id": "host.session_heartbeat.v1",
+      "family": "session",
+      "host_or_application": "host",
+      "source_authority": "host_session",
+      "summary": "A host emitted a heartbeat, keepalive, or progress marker without a new coding outcome.",
+      "disposition": "exclude",
+      "durability": "ephemeral",
+      "sensitivity": "internal",
+      "relevance": "noise",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "noise", "description": "Keepalive activity is operational noise and has no durable lesson.", "boundary": "outside_coding_outcome_set", "retry_policy": "do_not_retry_noise"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude heartbeat noise before scope binding.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "Heartbeat has no canonical coding settlement receipt.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["PID", "ports", "keepalive metadata"], "notes": "Operational liveness is not provider learning input."}
+    },
+    {
+      "event_id": "application.recall_candidate_generated.v1",
+      "family": "provider_recall",
+      "host_or_application": "application",
+      "source_authority": "provider_operational",
+      "summary": "A provider generated an advisory recall candidate without an explicit Native promotion or host coding settlement.",
+      "disposition": "exclude",
+      "durability": "ephemeral",
+      "sensitivity": "sensitive_possible",
+      "relevance": "noise",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "provider_operational", "description": "Provider recall is advisory output, not a TraceDecay host source event or canonical coding outcome.", "boundary": "outside_host_source_event", "retry_policy": "retain_only_in_provider_operations_telemetry"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Do not form a provider observation from provider recall output.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "Provider output cannot mint a canonical source receipt.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["provider recall body", "provider trace identity"], "notes": "Recall candidates remain advisory and are handled by the recall contract."}
+    },
+    {
+      "event_id": "application.native_fact_proposed.v1",
+      "family": "native_memory",
+      "host_or_application": "application",
+      "source_authority": "native_fact_promotion",
+      "summary": "A fact proposal exists without explicit Native validation and durable promotion.",
+      "disposition": "exclude",
+      "durability": "ephemeral",
+      "sensitivity": "sensitive_possible",
+      "relevance": "low",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "speculative_intent", "description": "A proposal is not a Native fact and may be rejected, edited, or superseded before promotion.", "boundary": "before_native_fact_log_commit", "retry_policy": "do_not_retry_as_observation"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude proposals before scope binding and wait for explicit Native promotion.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "A proposal has no canonical promotion settlement receipt.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["unvalidated fact content", "raw secrets", "provider candidate"], "notes": "Native promotion is a separate admitted event only after its own authority commits."}
+    },
+    {
+      "event_id": "application.feedback_preview.v1",
+      "family": "feedback",
+      "host_or_application": "application",
+      "source_authority": "feedback_outcome",
+      "summary": "A feedback control was previewed or drafted but not submitted and settled.",
+      "disposition": "exclude",
+      "durability": "uncommitted",
+      "sensitivity": "sensitive_possible",
+      "relevance": "low",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "speculative_intent", "description": "A preview does not establish user intent or a durable feedback outcome.", "boundary": "before_feedback_outcome_settlement", "retry_policy": "do_not_retry_as_observation"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude a feedback preview before scope binding.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "No settled feedback source receipt exists.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["draft feedback text", "raw personal data"], "notes": "Only submitted and settled feedback can be observed."}
+    },
+    {
+      "event_id": "application.automation_scheduled.v1",
+      "family": "automation",
+      "host_or_application": "application",
+      "source_authority": "automation_outcome",
+      "summary": "An automation run was scheduled or queued but has not reached a terminal outcome.",
+      "disposition": "exclude",
+      "durability": "ephemeral",
+      "sensitivity": "internal",
+      "relevance": "low",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "speculative_intent", "description": "Scheduling does not prove that automation ran or changed coding state.", "boundary": "before_automation_outcome_settlement", "retry_policy": "do_not_retry_as_observation"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude scheduling intent before scope binding; a settled run has its own event class.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "A scheduled job has no terminal source settlement receipt.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["scheduler intent", "queue metadata", "raw configuration"], "notes": "Only a settled automation outcome can leave the application boundary."}
+    },
+    {
+      "event_id": "host.secret_payload.v1",
+      "family": "privacy",
+      "host_or_application": "host",
+      "source_authority": "host_session",
+      "summary": "A host payload contains raw secret material or unadmitted personal data before privacy-safe redaction.",
+      "disposition": "exclude",
+      "durability": "unknown",
+      "sensitivity": "secret",
+      "relevance": "noise",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "secret", "description": "Raw credentials and unadmitted personal data are never provider observation input, whether or not the surrounding event settled.", "boundary": "privacy_filter_before_observation", "retry_policy": "do_not_retry_raw_payload"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay privacy pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Reject secret-bearing content before binding any provider scope or payload.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay privacy pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "Do not derive or persist source provenance for a raw secret payload; a sanitized replacement must produce a new admitted event.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["credentials", "API keys", "tokens", "unadmitted personal data"], "notes": "Secret classification is fail-closed and cannot be bypassed by a commit claim."}
+    },
+    {
+      "event_id": "application.provider_delivery_receipt.v1",
+      "family": "provider_operations",
+      "host_or_application": "application",
+      "source_authority": "provider_operational",
+      "summary": "A provider delivery receipt records dispatch state but is not a host or application coding source event.",
+      "disposition": "exclude",
+      "durability": "settled_durable",
+      "sensitivity": "internal",
+      "relevance": "noise",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "provider_operational", "description": "Provider delivery state belongs to the observation contract's operational receipts and must not recursively become a source observation.", "boundary": "outside_host_source_event", "retry_policy": "retain_only_in_provider_operations_telemetry"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Do not recursively observe provider delivery receipts.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "Provider receipts cannot mint a canonical host source event.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["provider payload", "provider process metadata"], "notes": "Keep provider delivery evidence in the provider contract and operations ledger."}
+    },
+    {
+      "event_id": "application.file_read_completed.v1",
+      "family": "source_read",
+      "host_or_application": "application",
+      "source_authority": "tool_execution",
+      "summary": "A read-only source or metadata operation completed without a source mutation or durable coding outcome.",
+      "disposition": "exclude",
+      "durability": "ephemeral",
+      "sensitivity": "sensitive_possible",
+      "relevance": "noise",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "noise", "description": "Read completion is common transient activity and does not establish a committed coding outcome by itself.", "boundary": "outside_coding_outcome_set", "retry_policy": "do_not_retry_noise"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude read-only completion before provider scope binding.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "A read result does not provide a canonical coding settlement receipt.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["source text", "file paths", "read cache body"], "notes": "Source reads may support a later committed outcome but are not observations themselves."}
+    },
+    {
+      "event_id": "host.session_compaction_preview.v1",
+      "family": "session",
+      "host_or_application": "host",
+      "source_authority": "host_session",
+      "summary": "A host prepared a compaction or summary preview that has not become a settled session record.",
+      "disposition": "exclude",
+      "durability": "uncommitted",
+      "sensitivity": "sensitive_possible",
+      "relevance": "low",
+      "observation_kind": null,
+      "canonical_commit_point": null,
+      "exclusion_reason": {"code": "transient", "description": "A compaction preview is replaceable derived text until the host commits a session record.", "boundary": "before_session_observation_store_commit", "retry_policy": "do_not_replay_transient_signal"},
+      "scope_derivation": {"policy_id": "coding_scope_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project"], "algorithm": "Exclude preview text before scope binding; only a committed session message can be admitted.", "failure": "excluded_before_scope_binding"},
+      "source_provenance_derivation": {"policy_id": "source_provenance_v1", "mode": "not_applicable_before_exclusion", "authority": "TraceDecay pre-admission filter", "receipt_name": null, "required_fields": [], "identity_fields": [], "optional_fields": [], "evidence_only_fields": [], "forbidden_inference_inputs": ["path_string", "cwd", "timestamp_only", "heuristic_event_name"], "algorithm": "No canonical session settlement receipt exists for a preview.", "failure": "excluded_before_source_identity"},
+      "payload_policy": {"content_allowed": [], "redact_before_admission": true, "forbidden_content": ["summary preview", "raw transcript", "secret material"], "notes": "Derived previews do not cross the provider boundary."}
+    }
+  ],
+  "invariants": [
+    "Only completed or committed coding outcomes may be admitted to provider observation fan-out.",
+    "Every admitted event names one canonical commit point owned by TraceDecay or the exact admitted worktree authority.",
+    "Every excluded event carries a typed reason and is excluded before provider scope binding or payload dispatch.",
+    "Speculative tool intent, proposed edits, rolled-back mutations, and uncommitted buffers never become observations.",
+    "Raw secrets and unadmitted personal data are fail-closed regardless of whether a surrounding operation settled.",
+    "Exact profile, project, repository, worktree, branch, session, and scope revision come from an authoritative receipt, never path parsing.",
+    "Source authority, event ID, revision, digest, and canonical settlement receipt come from the owning authority, while paths are evidence anchors only.",
+    "Unknown host or application events follow the default exclusion rule and require an explicit unclassified reason before any scope is bound.",
+    "Provider latency, failure, or advisory output cannot alter canonical code, session, Native facts, tools, approvals, or settled source outcomes.",
+    "A later settled event may be admitted after an excluded intent or transient, but the excluded event itself is never retroactively replayed."
+  ]
+}

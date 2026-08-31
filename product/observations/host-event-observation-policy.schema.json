@@ -1,0 +1,476 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/schemas/product/observations/host-event-observation-policy.schema.json",
+  "title": "TraceDecay post-commit host event observation policy V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "bead_id",
+    "title",
+    "status",
+    "scope",
+    "authority",
+    "policy_boundary",
+    "dimensions",
+    "coding_scope_derivation",
+    "source_provenance_derivation",
+    "admission_requirements",
+    "default_exclusion_reasons",
+    "host_families",
+    "event_coverage",
+    "event_classes",
+    "invariants"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "contract_id": { "const": "tracedecay.observation-policy.v1" },
+    "bead_id": { "const": "tdmem-0501" },
+    "title": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["draft", "accepted"] },
+    "scope": { "const": "coding_agents_only" },
+    "authority": {
+      "const": "TraceDecay host and application settlement authority"
+    },
+    "policy_boundary": { "$ref": "#/$defs/policyBoundary" },
+    "dimensions": { "$ref": "#/$defs/dimensions" },
+    "coding_scope_derivation": { "$ref": "#/$defs/derivation" },
+    "source_provenance_derivation": { "$ref": "#/$defs/derivation" },
+    "admission_requirements": {
+      "type": "array",
+      "minItems": 6,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "default_exclusion_reasons": {
+      "type": "array",
+      "minItems": 7,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/exclusionReason" }
+    },
+    "host_families": {
+      "type": "array",
+      "minItems": 8,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/hostFamily" }
+    },
+    "event_coverage": { "$ref": "#/$defs/eventCoverage" },
+    "event_classes": {
+      "type": "array",
+      "minItems": 20,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/eventClass" }
+    },
+    "invariants": {
+      "type": "array",
+      "minItems": 8,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 20 }
+    }
+  },
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stringArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/nonEmptyString" }
+    },
+    "policyBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "admission_boundary",
+        "default_disposition",
+        "unknown_event_disposition",
+        "completed_or_committed_coding_outcomes_only",
+        "provider_fanout_after_settlement",
+        "rolled_back_never_admitted",
+        "uncommitted_secrets_never_admitted",
+        "transient_and_noise_default_excluded",
+        "provider_failure_cannot_change_source_outcome",
+        "observation_contract"
+      ],
+      "properties": {
+        "admission_boundary": {
+          "const": "after_canonical_source_settlement"
+        },
+        "default_disposition": { "const": "exclude" },
+        "unknown_event_disposition": { "const": "exclude" },
+        "completed_or_committed_coding_outcomes_only": { "const": true },
+        "provider_fanout_after_settlement": { "const": true },
+        "rolled_back_never_admitted": { "const": true },
+        "uncommitted_secrets_never_admitted": { "const": true },
+        "transient_and_noise_default_excluded": { "const": true },
+        "provider_failure_cannot_change_source_outcome": { "const": true },
+        "observation_contract": {
+          "const": "product/contracts/memory-provider-v1/provider-observation-contract.json"
+        }
+      }
+    },
+    "dimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["durability", "sensitivity", "relevance"],
+      "properties": {
+        "durability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["values", "admitted_values", "excluded_values"],
+          "properties": {
+            "values": { "$ref": "#/$defs/stringArray" },
+            "admitted_values": { "$ref": "#/$defs/stringArray" },
+            "excluded_values": { "$ref": "#/$defs/stringArray" }
+          }
+        },
+        "sensitivity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["values", "secret_value", "admission_rule"],
+          "properties": {
+            "values": { "$ref": "#/$defs/stringArray" },
+            "secret_value": { "const": "secret" },
+            "admission_rule": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        },
+        "relevance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["values", "noise_value", "admission_rule"],
+          "properties": {
+            "values": { "$ref": "#/$defs/stringArray" },
+            "noise_value": { "const": "noise" },
+            "admission_rule": { "$ref": "#/$defs/nonEmptyString" }
+          }
+        }
+      }
+    },
+    "derivation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_id",
+        "mode",
+        "authority",
+        "receipt_name",
+        "required_fields",
+        "identity_fields",
+        "optional_fields",
+        "evidence_only_fields",
+        "forbidden_inference_inputs",
+        "algorithm",
+        "failure"
+      ],
+      "properties": {
+        "policy_id": {
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string",
+          "minLength": 1
+        },
+        "mode": {
+          "enum": [
+            "required_authoritative_receipt",
+            "not_applicable_before_exclusion"
+          ]
+        },
+        "authority": { "$ref": "#/$defs/nonEmptyString" },
+        "receipt_name": {
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "required_fields": { "$ref": "#/$defs/stringArray" },
+        "identity_fields": { "$ref": "#/$defs/stringArray" },
+        "optional_fields": { "$ref": "#/$defs/stringArray" },
+        "evidence_only_fields": { "$ref": "#/$defs/stringArray" },
+        "forbidden_inference_inputs": {
+          "type": "array",
+          "minItems": 4,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "algorithm": {
+          "type": "string",
+          "minLength": 40
+        },
+        "failure": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "exclusionReason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "description", "boundary", "retry_policy"],
+      "properties": {
+        "code": {
+          "enum": [
+            "speculative_intent",
+            "rolled_back",
+            "uncommitted",
+            "secret",
+            "transient",
+            "noise",
+            "incomplete_outcome",
+            "scope_unresolved",
+            "provenance_unavailable",
+            "provider_operational"
+          ]
+        },
+        "description": { "$ref": "#/$defs/nonEmptyString" },
+        "boundary": { "$ref": "#/$defs/nonEmptyString" },
+        "retry_policy": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "hostFamily": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host_id",
+        "source_authority",
+        "event_surface",
+        "scope_receipt",
+        "source_paths",
+        "observation_mapping",
+        "notes"
+      ],
+      "properties": {
+        "host_id": {
+          "pattern": "^[a-z][a-z0-9]*(?:[_-][a-z0-9]+)*$",
+          "type": "string",
+          "minLength": 1
+        },
+        "source_authority": { "const": "host_session" },
+        "event_surface": { "$ref": "#/$defs/nonEmptyString" },
+        "scope_receipt": { "const": "ScopeAdmissionReceiptV1" },
+        "source_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/repositoryPath" }
+        },
+        "observation_mapping": {
+          "const": "host.session_message_committed.v1"
+        },
+        "notes": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "eventCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coverage_basis",
+        "host_families",
+        "admitted_event_ids",
+        "excluded_event_ids",
+        "unclassified_event_rule"
+      ],
+      "properties": {
+        "coverage_basis": { "$ref": "#/$defs/nonEmptyString" },
+        "host_families": {
+          "type": "array",
+          "minItems": 8,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "admitted_event_ids": {
+          "type": "array",
+          "minItems": 9,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "excluded_event_ids": {
+          "type": "array",
+          "minItems": 10,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "unclassified_event_rule": {
+          "const": "exclude_with_unclassified_event_reason_before_scope_binding"
+        }
+      }
+    },
+    "repositoryPath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\\\]+$"
+    },
+    "commitPoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "point_id",
+        "authority",
+        "settled_state",
+        "source_paths",
+        "receipt_fields",
+        "ordering_authority",
+        "provider_fanout"
+      ],
+      "properties": {
+        "point_id": {
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "type": "string",
+          "minLength": 1
+        },
+        "authority": { "$ref": "#/$defs/nonEmptyString" },
+        "settled_state": { "$ref": "#/$defs/nonEmptyString" },
+        "source_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/repositoryPath" }
+        },
+        "receipt_fields": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "ordering_authority": { "$ref": "#/$defs/nonEmptyString" },
+        "provider_fanout": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "eventPayloadPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "content_allowed",
+        "redact_before_admission",
+        "forbidden_content",
+        "notes"
+      ],
+      "properties": {
+        "content_allowed": { "$ref": "#/$defs/stringArray" },
+        "redact_before_admission": { "type": "boolean" },
+        "forbidden_content": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "notes": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "eventClass": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "family",
+        "host_or_application",
+        "source_authority",
+        "summary",
+        "disposition",
+        "durability",
+        "sensitivity",
+        "relevance",
+        "observation_kind",
+        "canonical_commit_point",
+        "exclusion_reason",
+        "scope_derivation",
+        "source_provenance_derivation",
+        "payload_policy"
+      ],
+      "properties": {
+        "event_id": {
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\\.v[1-9][0-9]*$",
+          "type": "string",
+          "minLength": 1
+        },
+        "family": { "$ref": "#/$defs/nonEmptyString" },
+        "host_or_application": { "enum": ["host", "application"] },
+        "source_authority": { "$ref": "#/$defs/nonEmptyString" },
+        "summary": { "$ref": "#/$defs/nonEmptyString" },
+        "disposition": { "enum": ["admit", "exclude"] },
+        "durability": { "$ref": "#/$defs/nonEmptyString" },
+        "sensitivity": { "$ref": "#/$defs/nonEmptyString" },
+        "relevance": { "$ref": "#/$defs/nonEmptyString" },
+        "observation_kind": {
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "canonical_commit_point": {
+          "type": ["object", "null"]
+        },
+        "exclusion_reason": {
+          "type": ["object", "null"]
+        },
+        "scope_derivation": { "$ref": "#/$defs/derivation" },
+        "source_provenance_derivation": { "$ref": "#/$defs/derivation" },
+        "payload_policy": { "$ref": "#/$defs/eventPayloadPolicy" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "disposition": { "const": "admit" } }
+          },
+          "then": {
+            "required": [
+              "observation_kind",
+              "canonical_commit_point",
+              "scope_derivation",
+              "source_provenance_derivation"
+            ],
+            "properties": {
+              "observation_kind": { "type": "string", "minLength": 1 },
+              "canonical_commit_point": { "$ref": "#/$defs/commitPoint" },
+              "exclusion_reason": { "type": "null" },
+              "scope_derivation": {
+                "$ref": "#/$defs/admittedDerivation"
+              },
+              "source_provenance_derivation": {
+                "$ref": "#/$defs/admittedDerivation"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "disposition": { "const": "exclude" } }
+          },
+          "then": {
+            "required": ["exclusion_reason"],
+            "properties": {
+              "observation_kind": { "type": "null" },
+              "canonical_commit_point": { "type": "null" },
+              "exclusion_reason": { "$ref": "#/$defs/exclusionReason" },
+              "scope_derivation": {
+                "$ref": "#/$defs/excludedDerivation"
+              },
+              "source_provenance_derivation": {
+                "$ref": "#/$defs/excludedDerivation"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "admittedDerivation": {
+      "allOf": [
+        { "$ref": "#/$defs/derivation" },
+        {
+          "properties": {
+            "mode": { "const": "required_authoritative_receipt" },
+            "receipt_name": { "type": "string", "minLength": 1 },
+            "required_fields": { "minItems": 1 },
+            "identity_fields": { "minItems": 1 }
+          }
+        }
+      ]
+    },
+    "excludedDerivation": {
+      "allOf": [
+        { "$ref": "#/$defs/derivation" },
+        {
+          "properties": {
+            "mode": { "const": "not_applicable_before_exclusion" },
+            "receipt_name": { "type": "null" },
+            "required_fields": { "maxItems": 0 },
+            "identity_fields": { "maxItems": 0 }
+          }
+        }
+      ]
+    }
+  }
+}
