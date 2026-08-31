@@ -671,10 +671,28 @@ def blob_bytes(repo: Path, commit: str, path: str) -> bytes | None:
     existence = git(
         repo,
         ["cat-file", "-e", f"{commit}:{path}"],
-        allowed_statuses=frozenset({0, 1}),
+        # Git versions differ on the status used for an absent path.  Some
+        # return 1, while newer versions return 128 with a path-resolution
+        # diagnostic.  Keep both statuses observable until the tree lookup
+        # below classifies the result semantically.
+        allowed_statuses=frozenset({0, 1, 128}),
     )
-    if existence.returncode == 1:
-        return None
+    if existence.returncode != 0:
+        # A missing path is an ordinary provenance state, but a missing or
+        # corrupt commit/tree must remain a hard Git error.  ls-tree gives us
+        # that distinction without parsing Git's version-specific diagnostic
+        # text: an absent path has no entry, whereas an invalid/corrupt tree
+        # makes the command fail and therefore propagates through git().
+        tree_entry = git(
+            repo,
+            ["ls-tree", "-z", commit, "--", path],
+        ).stdout
+        if not tree_entry:
+            return None
+        detail = bounded(decode(existence.stderr) or decode(existence.stdout) or "no diagnostic")
+        raise SyncTrainError(
+            f"git cat-file -e {commit}:{path} exited {existence.returncode}: {detail}"
+        )
     return git(repo, ["show", f"{commit}:{path}"]).stdout
 
 
@@ -731,6 +749,13 @@ def current_branch(repo: Path) -> str | None:
     if result.returncode == 1:
         return None
     return decode(result.stdout).strip()
+
+
+def branch_checked_out_elsewhere(repo: Path, branch_ref: str) -> bool:
+    """Return whether another linked worktree currently owns ``branch_ref``."""
+
+    worktrees = git_text(repo, ["worktree", "list", "--porcelain"])
+    return any(line == f"branch {branch_ref}" for line in worktrees.splitlines())
 
 
 def status_bytes(repo: Path, *, index_file: Path | None = None) -> bytes:
@@ -1494,6 +1519,8 @@ def abort(args: argparse.Namespace) -> dict[str, Any]:
     if sync_sha is not None and sync_sha != state["sync_base_sha"]:
         raise SyncTrainError("sync branch moved; refusing to discard a raced train")
 
+    checkout_mode: str | None = None
+    checkout_head: str | None = None
     if current_branch(repo) == state["sync_ref"]:
         paths = status_records(repo)
         if any(path.startswith("?? ") for path in paths):
@@ -1501,13 +1528,33 @@ def abort(args: argparse.Namespace) -> dict[str, Any]:
         git(repo, ["reset", "--hard", product_sha])
         if current_branch(repo) != state["sync_ref"]:
             raise SyncTrainError("sync worktree detached unexpectedly during abort")
-        git(repo, ["switch", state["product_branch"].removeprefix("refs/heads/")])
+        if branch_checked_out_elsewhere(repo, state["product_branch"]):
+            # A linked worktree cannot attach to a branch already checked out
+            # by a sibling worktree. Leave this train checkout detached at
+            # the verified product commit instead.
+            git(repo, ["switch", "--detach", product_sha])
+            checkout_mode = "detached_product_sha"
+        else:
+            git(repo, ["switch", state["product_branch"].removeprefix("refs/heads/")])
+            checkout_mode = "product_branch"
+        checkout_branch = current_branch(repo)
+        checkout_head = resolve_commit(repo, "HEAD", "aborted sync worktree HEAD")
+        if checkout_head != product_sha:
+            raise SyncTrainError("abort did not restore the product commit in the sync worktree")
+        if checkout_mode == "detached_product_sha":
+            if checkout_branch is not None:
+                raise SyncTrainError("abort did not leave the linked train worktree detached")
+        elif checkout_branch != state["product_branch"]:
+            raise SyncTrainError("abort did not restore the product branch in the sync worktree")
+        if status_bytes(repo):
+            raise SyncTrainError("abort left the sync worktree dirty")
 
     product_metadata = metadata_from_commit(repo, product_sha, state["floor_metadata"])
     expected_digest = state.get("floor_metadata_sha256")
     if expected_digest != hashlib.sha256(product_metadata).hexdigest():
         raise SyncTrainError("product floor metadata changed; refusing to call the train aborted")
-    if current_branch(repo) == state["product_branch"]:
+    current = current_branch(repo)
+    if current == state["product_branch"] or checkout_head == product_sha:
         try:
             current_metadata = (repo / state["floor_metadata"]).read_bytes()
         except OSError as error:
@@ -1520,6 +1567,8 @@ def abort(args: argparse.Namespace) -> dict[str, Any]:
             repo,
             ["update-ref", "-d", state["sync_ref"], state["sync_base_sha"]],
         )
+        if resolve_direct_ref(repo, state["sync_ref"], "sync branch", missing_ok=True) is not None:
+            raise SyncTrainError("abort did not remove the isolated sync branch")
     state["status"] = "aborted"
     state["invalidated"] = True
     state["merge_in_progress"] = False
@@ -1539,6 +1588,10 @@ def abort(args: argparse.Namespace) -> dict[str, Any]:
         "product_head_sha": product_sha,
         "sync_ref_removed": sync_sha is not None,
         "floor_metadata_sha256": expected_digest,
+        "checkout_mode": checkout_mode,
+        "checkout_head_sha": resolve_commit(repo, "HEAD", "aborted train checkout HEAD"),
+        "current_branch": current_branch(repo),
+        "worktree_clean": not bool(status_bytes(repo)),
         "train_dir": str(train_dir),
         "terminal_receipt": str(terminal_receipt),
     }

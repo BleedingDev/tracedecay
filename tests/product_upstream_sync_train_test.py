@@ -159,9 +159,14 @@ class UpstreamSyncTrainTest(unittest.TestCase):
         self.git("update-ref", SOURCE_REF, self.source_sha)
         self.git("switch", "-q", "product")
 
-    def git(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def git_at(
+        self,
+        repo: Path,
+        *arguments: str,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            ["git", "-C", str(self.repo), *arguments],
+            ["git", "-C", str(repo), *arguments],
             check=False,
             capture_output=True,
             text=True,
@@ -170,22 +175,34 @@ class UpstreamSyncTrainTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
-    def run_train(self, command: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+    def git(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return self.git_at(self.repo, *arguments, check=check)
+
+    def run_train_at(
+        self,
+        repo: Path,
+        train_dir: Path,
+        command: str,
+        *arguments: str,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 "python3",
                 str(RUNNER),
                 command,
                 "--repo",
-                str(self.repo),
+                str(repo),
                 "--train-dir",
-                str(self.train),
+                str(train_dir),
                 *arguments,
             ],
             check=False,
             capture_output=True,
             text=True,
         )
+
+    def run_train(self, command: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return self.run_train_at(self.repo, self.train, command, *arguments)
 
     def result_json(self, result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
         try:
@@ -303,6 +320,53 @@ class UpstreamSyncTrainTest(unittest.TestCase):
         )
         self.assertEqual(self.git("status", "--porcelain=v1").stdout, "")
 
+    def test_prepare_records_missing_old_rename_path_for_source_correction(self) -> None:
+        source_lines = "".join(f"line-{index}\n" for index in range(1, 10)) + "source\n"
+        product_lines = "".join(f"line-{index}\n" for index in range(1, 10)) + "product\n"
+
+        self.git("switch", "-q", "-c", "rename-source", self.floor_sha)
+        (self.repo / "history.txt").write_text(source_lines, encoding="utf-8")
+        self.git("commit", "-q", "-am", "upstream history change")
+        self.git("mv", "history.txt", "renamed-history.txt")
+        self.git("commit", "-q", "-m", "upstream history rename")
+        source_sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("update-ref", SOURCE_REF, source_sha)
+
+        self.git("switch", "-q", "product")
+        (self.repo / "history.txt").write_text(product_lines, encoding="utf-8")
+        self.git("commit", "-q", "-am", "product history change")
+        product_sha = self.git("rev-parse", "HEAD").stdout.strip()
+        # Exercise the conflict path that Git emits when rename detection is
+        # disabled.  The provenance lookup below still uses an explicit -M.
+        self.git("config", "merge.renames", "false")
+
+        prepared = self.prepare()
+        self.assertEqual(prepared["status"], "conflicted")
+        self.assertEqual(prepared["conflict_paths"], ["history.txt"])
+        self.assertEqual(prepared["product_head_sha"], product_sha)
+        state_path = self.train / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertIsNone(state["conflicts"][0]["source"]["blob_sha"])
+
+        result = self.run_train(
+            "record-conflict",
+            "--path",
+            "history.txt",
+            "--source-path",
+            "renamed-history.txt",
+            "--owner",
+            "product",
+            "--resolution",
+            "retain_product_mount",
+            "--rationale",
+            "retain the product-owned history path after the upstream rename",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        updated = json.loads(state_path.read_text(encoding="utf-8"))
+        source = updated["conflicts"][0]["source"]
+        self.assertEqual(source["path"], "renamed-history.txt")
+        self.assertRegex(source["blob_sha"], r"^[0-9a-f]{40}$")
+
     def test_abort_preserves_product_and_invalidates_partial_train(self) -> None:
         before_product = self.git("rev-parse", PRODUCT_REF).stdout.strip()
         before_metadata = (self.repo / FLOOR_PATH).read_bytes()
@@ -324,6 +388,88 @@ class UpstreamSyncTrainTest(unittest.TestCase):
         self.assertEqual(receipt["terminal"]["state"], "aborted")
         self.assertEqual(receipt["finalization"]["outcome"], "not_published")
         self.assertEqual(self.git("symbolic-ref", "--quiet", "HEAD").stdout.strip(), PRODUCT_REF)
+
+    def test_abort_from_linked_worktree_detaches_at_product_sha(self) -> None:
+        linked_repo = self.root / "sync-worktree"
+        linked_train = self.root / "linked-train"
+        self.git("worktree", "add", "-q", "--detach", str(linked_repo), self.product_sha)
+        self.addCleanup(
+            lambda: self.git("worktree", "remove", "--force", str(linked_repo), check=False)
+        )
+
+        prepared_result = self.run_train_at(
+            linked_repo,
+            linked_train,
+            "prepare",
+            "--product-branch",
+            PRODUCT_REF,
+            "--source-ref",
+            SOURCE_REF,
+            "--floor-metadata",
+            FLOOR_PATH,
+        )
+        self.assertEqual(
+            prepared_result.returncode,
+            0,
+            prepared_result.stdout + prepared_result.stderr,
+        )
+        prepared = self.result_json(prepared_result)
+        sync_ref = prepared["sync_ref"]
+        self.assertEqual(
+            self.git_at(linked_repo, "symbolic-ref", "--quiet", "HEAD").stdout.strip(),
+            sync_ref,
+        )
+
+        aborted_result = self.run_train_at(linked_repo, linked_train, "abort")
+        self.assertEqual(
+            aborted_result.returncode,
+            0,
+            aborted_result.stdout + aborted_result.stderr,
+        )
+        evidence = self.result_json(aborted_result)
+        self.assertEqual(evidence["status"], "aborted")
+        self.assertEqual(evidence["checkout_mode"], "detached_product_sha")
+        self.assertIsNone(evidence["current_branch"])
+        self.assertEqual(evidence["checkout_head_sha"], self.product_sha)
+        self.assertTrue(evidence["worktree_clean"])
+        self.assertNotEqual(
+            self.git_at(linked_repo, "symbolic-ref", "--quiet", "HEAD", check=False).returncode,
+            0,
+        )
+        self.assertEqual(
+            self.git_at(linked_repo, "rev-parse", "HEAD").stdout.strip(),
+            self.product_sha,
+        )
+        self.assertEqual(self.git_at(linked_repo, "status", "--porcelain=v1").stdout, "")
+        self.assertEqual(self.git("rev-parse", PRODUCT_REF).stdout.strip(), self.product_sha)
+        self.assertNotEqual(self.git("show-ref", "--verify", sync_ref, check=False).returncode, 0)
+
+        state = json.loads((linked_train / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "aborted")
+        self.assertTrue(state["invalidated"])
+        receipt = json.loads(
+            (linked_train / "terminal-receipt.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(receipt["terminal"]["state"], "aborted")
+        self.assertEqual(receipt["product"]["starting_head_sha"], self.product_sha)
+        self.assertEqual(receipt["finalization"]["outcome"], "not_published")
+        self.assertIsNone(receipt["finalization"]["sync_ref"])
+        self.assertEqual(
+            receipt["finalization"]["released_ref_update"]["mode"], "unchanged"
+        )
+
+        inspected_result = self.run_train_at(linked_repo, linked_train, "inspect")
+        self.assertEqual(
+            inspected_result.returncode,
+            0,
+            inspected_result.stdout + inspected_result.stderr,
+        )
+        inspected = self.result_json(inspected_result)
+        self.assertTrue(inspected["ok"])
+        self.assertIsNone(inspected["observed"]["current_branch"])
+        self.assertEqual(inspected["observed"]["product_head_sha"], self.product_sha)
+        self.assertIsNone(inspected["observed"]["sync_head_sha"])
+        self.assertEqual(inspected["observed"]["unresolved_paths"], [])
 
     def test_finalize_rejects_unresolved_conflicts(self) -> None:
         before_product = self.git("rev-parse", PRODUCT_REF).stdout.strip()
