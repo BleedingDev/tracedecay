@@ -23,6 +23,56 @@ RETENTION_MOUNTS = (
     Path("crates/tracedecay/src/mcp/server.rs"),
     Path("crates/tracedecay/src/mcp/server/construction.rs"),
 )
+# These are the only root-owned files that may name the registry and the
+# concrete Native adapter.  Keep this an exact path allowlist: a similarly
+# named file elsewhere must still be treated as a leak.
+NATIVE_PROVIDER_FILE = Path(
+    "crates/tracedecay/src/daemon/retained_owner/native_provider.rs"
+)
+NATIVE_PROVIDER_TESTS_FILE = Path(
+    "crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs"
+)
+NATIVE_PROVIDER_PARITY_TESTS_FILE = Path(
+    "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs"
+)
+NATIVE_ADAPTER_FILES = (
+    NATIVE_PROVIDER_FILE,
+    NATIVE_PROVIDER_TESTS_FILE,
+    NATIVE_PROVIDER_PARITY_TESTS_FILE,
+)
+NATIVE_PROVIDER_MODULE_FILE = Path("crates/tracedecay/src/daemon/retained_owner.rs")
+NATIVE_PROVIDER_MODULE_DECLARATION = (
+    f'#[cfg(feature = "{FEATURE}")]\n'
+    "pub(crate) mod native_provider;"
+)
+NATIVE_PROVIDER_TESTS_MODULE_DECLARATION = (
+    '#[cfg(test)]\n'
+    '#[path = "native_provider_tests.rs"]\n'
+    "mod tests;"
+)
+NATIVE_PROVIDER_PARITY_TESTS_MODULE_DECLARATION = (
+    f'#[cfg(all(test, feature = "{FEATURE}"))]\n'
+    '#[path = "retained_owner/native_provider_parity_tests.rs"]\n'
+    "mod native_provider_parity_tests;"
+)
+# Each allowlisted path is checked against the source that declares it.  The
+# nested unit-test file inherits the feature gate from `native_provider.rs`,
+# so verify both its local path declaration and its gated parent declaration.
+NATIVE_ADAPTER_CONSTRAINTS = {
+    NATIVE_PROVIDER_FILE: (
+        (NATIVE_PROVIDER_MODULE_FILE, NATIVE_PROVIDER_MODULE_DECLARATION),
+    ),
+    NATIVE_PROVIDER_TESTS_FILE: (
+        (NATIVE_PROVIDER_MODULE_FILE, NATIVE_PROVIDER_MODULE_DECLARATION),
+        (NATIVE_PROVIDER_FILE, NATIVE_PROVIDER_TESTS_MODULE_DECLARATION),
+    ),
+    NATIVE_PROVIDER_PARITY_TESTS_FILE: (
+        (
+            NATIVE_PROVIDER_MODULE_FILE,
+            NATIVE_PROVIDER_PARITY_TESTS_MODULE_DECLARATION,
+        ),
+    ),
+}
 ROOT_SOURCE = Path("crates/tracedecay/src")
 # The concrete Native adapter type; a word boundary keeps the registry's
 # NativeProviderActivation seam from matching.
@@ -38,6 +88,40 @@ def read_toml(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"TOML root must be a table: {path}")
     return value
+
+
+def feature_gated_native_adapter_files(
+    repo: Path, errors: list[str]
+) -> set[Path]:
+    """Return present adapter files whose module declarations are feature-gated."""
+
+    gated: set[Path] = set()
+    for adapter_path in NATIVE_ADAPTER_FILES:
+        constraints = NATIVE_ADAPTER_CONSTRAINTS[adapter_path]
+        if not (repo / adapter_path).is_file():
+            continue
+        valid = True
+        for source_relative, required_declaration in constraints:
+            source_path = repo / source_relative
+            try:
+                source = source_path.read_text(encoding="utf-8")
+            except OSError as error:
+                errors.append(
+                    f"native adapter file {adapter_path} cannot verify its "
+                    f"feature gate in {source_relative}: {error}"
+                )
+                valid = False
+                continue
+            if required_declaration not in source:
+                errors.append(
+                    f"native adapter file {adapter_path} must be feature-gated; "
+                    f"{source_relative} is missing exact module declaration: "
+                    f"{required_declaration}"
+                )
+                valid = False
+        if valid:
+            gated.add(adapter_path)
+    return gated
 
 
 def check_repository(repo: Path) -> list[str]:
@@ -111,6 +195,7 @@ def check_repository(repo: Path) -> list[str]:
             "composition mount must delegate through the registry, not name NativeProvider"
         )
 
+    feature_gated_adapters = feature_gated_native_adapter_files(repo, errors)
     source_root = repo / ROOT_SOURCE
     if source_root.is_dir():
         for path in sorted(source_root.rglob("*.rs")):
@@ -118,12 +203,13 @@ def check_repository(repo: Path) -> list[str]:
             if relative == COMPOSITION_MOUNT:
                 continue
             text = path.read_text(encoding="utf-8")
+            is_feature_gated_adapter = relative in feature_gated_adapters
             if relative in RETENTION_MOUNTS:
                 if "::compose(" in text:
                     errors.append(
                         f"retention mount must not compose providers: {relative}"
                     )
-            elif REGISTRY_CRATE_IDENT in text:
+            elif not is_feature_gated_adapter and REGISTRY_CRATE_IDENT in text:
                 errors.append(
                     f"registry dependency leaked outside the composition mount: {relative}"
                 )
@@ -131,8 +217,9 @@ def check_repository(repo: Path) -> list[str]:
                 errors.append(
                     f"production sources must keep the provider host dormant: {relative}"
                 )
-            if "tracedecay_memory_provider_native" in text or CONCRETE_NATIVE_ADAPTER.search(
-                text
+            if not is_feature_gated_adapter and (
+                "tracedecay_memory_provider_native" in text
+                or CONCRETE_NATIVE_ADAPTER.search(text)
             ):
                 errors.append(f"concrete Native adapter leaked into root source: {relative}")
     return errors

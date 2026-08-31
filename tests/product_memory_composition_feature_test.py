@@ -57,6 +57,32 @@ pub(crate) type MemoryProviderHostMount =
     Arc<tracedecay_memory_provider_registry::ProjectMemoryProviderComposition>;
 '''
 
+VALID_RETAINED_OWNER = '''#[cfg(feature = "memory-provider-host")]
+pub(crate) mod native_provider;
+#[cfg(all(test, feature = "memory-provider-host"))]
+#[path = "retained_owner/native_provider_parity_tests.rs"]
+mod native_provider_parity_tests;
+'''
+
+VALID_NATIVE_ADAPTER = '''use tracedecay_memory_provider_native::NativeProvider;
+use tracedecay_memory_provider_registry::NativeMemoryApplicationPort;
+'''
+
+VALID_NATIVE_PROVIDER = (
+    VALID_NATIVE_ADAPTER
+    + '#[cfg(test)]\n'
+    + '#[path = "native_provider_tests.rs"]\n'
+    + "mod tests;\n"
+)
+
+NATIVE_ADAPTER_PATHS = (
+    Path("crates/tracedecay/src/daemon/retained_owner/native_provider.rs"),
+    Path("crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs"),
+    Path(
+        "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs"
+    ),
+)
+
 
 class MemoryCompositionFeatureTest(unittest.TestCase):
     def fixture(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
@@ -75,6 +101,19 @@ class MemoryCompositionFeatureTest(unittest.TestCase):
             "pub mod stable;\n", encoding="utf-8"
         )
         return directory, repo
+
+    def write_feature_gated_native_adapters(self, repo: Path) -> None:
+        retained_owner = repo / "crates/tracedecay/src/daemon/retained_owner.rs"
+        retained_owner.write_text(VALID_RETAINED_OWNER, encoding="utf-8")
+        for relative in NATIVE_ADAPTER_PATHS:
+            path = repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                VALID_NATIVE_PROVIDER
+                if relative == NATIVE_ADAPTER_PATHS[0]
+                else VALID_NATIVE_ADAPTER,
+                encoding="utf-8",
+            )
 
     def test_valid_feature_and_mount_pass(self) -> None:
         directory, repo = self.fixture()
@@ -125,6 +164,66 @@ class MemoryCompositionFeatureTest(unittest.TestCase):
             errors = CHECKER.check_repository(repo)
             self.assertFalse(
                 any("concrete Native adapter" in error for error in errors)
+            )
+
+    def test_feature_gated_native_adapter_allowlist_passes(self) -> None:
+        directory, repo = self.fixture()
+        with directory:
+            self.write_feature_gated_native_adapters(repo)
+            self.assertEqual(CHECKER.check_repository(repo), [])
+
+    def test_native_adapter_lookalikes_still_fail(self) -> None:
+        directory, repo = self.fixture()
+        with directory:
+            lookalikes = (
+                Path(
+                    "crates/tracedecay/src/daemon/retained_owner/"
+                    "native_provider_copy.rs"
+                ),
+                Path("crates/tracedecay/src/daemon/foreign_native_provider.rs"),
+            )
+            for relative in lookalikes:
+                path = repo / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(VALID_NATIVE_ADAPTER, encoding="utf-8")
+            errors = CHECKER.check_repository(repo)
+            for relative in lookalikes:
+                self.assertTrue(
+                    any(str(relative) in error for error in errors),
+                    (relative, errors),
+                )
+
+    def test_allowlisted_native_adapter_requires_feature_gate(self) -> None:
+        directory, repo = self.fixture()
+        with directory:
+            self.write_feature_gated_native_adapters(repo)
+            retained_owner = repo / "crates/tracedecay/src/daemon/retained_owner.rs"
+            retained_owner.write_text(
+                VALID_RETAINED_OWNER.replace(
+                    '#[cfg(feature = "memory-provider-host")]\n', "", 1
+                ),
+                encoding="utf-8",
+            )
+            errors = CHECKER.check_repository(repo)
+            self.assertTrue(any("must be feature-gated" in error for error in errors))
+
+    def test_enabled_activation_in_allowlisted_adapter_still_fails(self) -> None:
+        directory, repo = self.fixture()
+        with directory:
+            self.write_feature_gated_native_adapters(repo)
+            adapter = repo / NATIVE_ADAPTER_PATHS[0]
+            adapter.write_text(
+                VALID_NATIVE_ADAPTER
+                + "fn eager() { activate(NativeProviderActivation::Enabled { port }); }\n",
+                encoding="utf-8",
+            )
+            errors = CHECKER.check_repository(repo)
+            self.assertTrue(
+                any(
+                    "must keep the provider host dormant" in error
+                    and str(NATIVE_ADAPTER_PATHS[0]) in error
+                    for error in errors
+                )
             )
 
     def test_registry_leak_outside_mount_fails(self) -> None:
