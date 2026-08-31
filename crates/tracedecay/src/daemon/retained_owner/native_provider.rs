@@ -73,6 +73,7 @@ const RECALL_UNSUPPORTED_DIAGNOSTIC: &str = "native.recall_semantics_unsupported
 const RECALL_SCOPE_MISMATCH_DIAGNOSTIC: &str = "native.recall_scope_mismatch";
 const RECALL_EXTENSION_DIAGNOSTIC: &str = "native.recall_extension_unsupported";
 const RECALL_PROJECTION_DIAGNOSTIC: &str = "native.recall_projection_invalid";
+const RECALL_BUDGET_DIAGNOSTIC: &str = "native.recall_budget_exhausted";
 const RECALL_SCORE_DOMAIN: &str = "tracedecay.native.project-memory.search.v1";
 const RECALL_SCORE_DOMAIN_VERSION: u32 = 1;
 const RECALL_CONTRACT_ID: &str = "tracedecay.memory.provider.recall.v1";
@@ -1035,7 +1036,7 @@ impl NativeReadFailure {
                 RECALL_PROJECTION_DIAGNOSTIC,
             ),
             Self::RecallBudgetExhausted => {
-                (TerminalCode::CapacityExceeded, RECALL_INVALID_DIAGNOSTIC)
+                (TerminalCode::CapacityExceeded, RECALL_BUDGET_DIAGNOSTIC)
             }
         }
     }
@@ -1401,7 +1402,18 @@ fn build_native_recall_reply(
     let mut total_content_bytes = 0_u64;
     let mut excluded_items = 0_u64;
     let mut reasons = graph_coverage_reasons(mapped.graph_coverage);
+    let evaluation_micros = parse_rfc3339_micros(&request.temporal_query.evaluation_time)
+        .ok_or(NativeReadFailure::RecallInvalidRequest)?;
     for hit in &mapped.hits {
+        // The current-fact search has no historical projection to consult. Do
+        // not relabel a newer authoritative projection as if it existed at
+        // the requested evaluation time; exclude it and report the partial
+        // temporal coverage instead.
+        if hit.fact.projected_as_of.0 > evaluation_micros {
+            excluded_items = excluded_items.saturating_add(1);
+            push_reason(&mut reasons, "projected_as_of_after_evaluation_time");
+            continue;
+        }
         let content_bytes = u64::try_from(hit.fact.content.len()).unwrap_or(u64::MAX);
         let source_refs = fact_source_refs(&hit.fact);
         let source_ref_count = u64::try_from(source_refs.len()).unwrap_or(u64::MAX);
@@ -1433,7 +1445,7 @@ fn build_native_recall_reply(
         push_reason(&mut reasons, "candidate_limit");
     }
     let matched_items = u64::try_from(mapped.hits.len()).unwrap_or(u64::MAX);
-    let mut truncated_items = u64::from(mapped.next_after.is_some());
+    let truncated_items = u64::from(mapped.next_after.is_some());
     let mut response = native_recall_response_value(
         call,
         request,
@@ -1444,27 +1456,10 @@ fn build_native_recall_reply(
         &reasons,
         mapped.next_after.as_ref(),
     );
-    let mut response_bytes =
+    let response_bytes =
         serde_json::to_vec(&response).map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
-    while u64::try_from(response_bytes.len()).unwrap_or(u64::MAX) > NATIVE_RESPONSE_BYTES
-        && candidates.pop().is_some()
-    {
-        excluded_items = excluded_items.saturating_add(1);
-        truncated_items = truncated_items.saturating_add(1);
-        push_reason(&mut reasons, "response_byte_budget");
-        response = native_recall_response_value(
-            call,
-            request,
-            &candidates,
-            matched_items,
-            excluded_items,
-            truncated_items,
-            &reasons,
-            mapped.next_after.as_ref(),
-        );
-        response_bytes = serde_json::to_vec(&response)
-            .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
-    }
+    // Candidates cannot be popped here: the store cursor points after the
+    // whole page, so dropping a tail candidate would make it unreachable.
     if u64::try_from(response_bytes.len()).unwrap_or(u64::MAX) > NATIVE_RESPONSE_BYTES {
         return Err(NativeReadFailure::RecallBudgetExhausted);
     }

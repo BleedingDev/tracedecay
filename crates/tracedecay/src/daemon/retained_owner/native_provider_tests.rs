@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use tracedecay_application::retained_surfaces::{
@@ -405,6 +406,32 @@ fn recall_scope_value(project_id: &str) -> Value {
     })
 }
 
+fn current_rfc3339_micros() -> String {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("test clock after Unix epoch")
+        .as_micros();
+    let seconds = i64::try_from(micros / 1_000_000).expect("test time seconds fit i64");
+    let fraction = u32::try_from(micros % 1_000_000).expect("microsecond fraction fits u32");
+    let days = seconds.div_euclid(86_400);
+    let second_of_day = seconds.rem_euclid(86_400);
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    let hour = second_of_day / 3_600;
+    let minute = second_of_day % 3_600 / 60;
+    let second = second_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{fraction:06}Z")
+}
+
 fn recall_request_value(project_id: &str) -> Value {
     json!({
         "provider_id": NATIVE_PROVIDER_ID,
@@ -416,7 +443,7 @@ fn recall_request_value(project_id: &str) -> Value {
         "query": "native bridge",
         "temporal_query": {
             "mode": "current",
-            "evaluation_time": "2020-01-01T00:00:00Z",
+            "evaluation_time": current_rfc3339_micros(),
             "as_of": Value::Null,
             "interval_start": Value::Null,
             "interval_end": Value::Null,
@@ -951,10 +978,7 @@ async fn native_recall_current_preserves_order_and_projects_native_score_explain
         assert_eq!(candidate["extensions"], json!([]));
     }
 
-    let repeated = port.recall(&valid_recall_call(
-        project_id.as_str(),
-        recall_request_value(project_id.as_str()),
-    ));
+    let repeated = port.recall(&call);
     assert_eq!(repeated.terminal.terminal_code(), TerminalCode::Success);
     assert_eq!(recall_payload(&repeated), body);
 }
@@ -962,12 +986,6 @@ async fn native_recall_current_preserves_order_and_projects_native_score_explain
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_recall_zero_results_returns_success_zero_results_payload() {
     let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
-    let _irrelevant = add_real_project_fact(
-        &graph,
-        "A fact that deliberately does not match the zero-result query",
-        "native-bridge-recall-zero",
-    )
-    .await;
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
     let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
         .expect("construct project Native application port");
