@@ -245,9 +245,9 @@ class UpstreamSyncTrainTest(unittest.TestCase):
         self.assertEqual((self.repo / FLOOR_PATH).read_bytes(), before_metadata)
 
         self.record_product_conflict()
-        self.record_gates()
         (self.repo / "code.txt").write_text("base\nproduct change\nresolved\n", encoding="utf-8")
         self.git("add", "code.txt")
+        self.record_gates()
         finalized = self.run_train("finalize")
         self.assertEqual(finalized.returncode, 0, finalized.stdout + finalized.stderr)
         evidence = self.result_json(finalized)
@@ -311,6 +311,11 @@ class UpstreamSyncTrainTest(unittest.TestCase):
         state = json.loads((self.train / "state.json").read_text(encoding="utf-8"))
         self.assertTrue(state["invalidated"])
         self.assertEqual(state["status"], "aborted")
+        receipt = json.loads(
+            Path(evidence["terminal_receipt"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(receipt["terminal"]["state"], "aborted")
+        self.assertEqual(receipt["finalization"]["outcome"], "not_published")
         self.assertEqual(self.git("symbolic-ref", "--quiet", "HEAD").stdout.strip(), PRODUCT_REF)
 
     def test_finalize_rejects_unresolved_conflicts(self) -> None:
@@ -371,6 +376,11 @@ class UpstreamSyncTrainTest(unittest.TestCase):
     def test_required_gates_are_ordered_and_finalize_fails_closed(self) -> None:
         before_product = self.git("rev-parse", PRODUCT_REF).stdout.strip()
         self.prepare()
+        self.record_product_conflict()
+        (self.repo / "code.txt").write_text(
+            "base\nproduct change\nresolved\n", encoding="utf-8"
+        )
+        self.git("add", "code.txt")
         out_of_order = self.run_train(
             "record-gate",
             "--id",
@@ -380,11 +390,6 @@ class UpstreamSyncTrainTest(unittest.TestCase):
         )
         self.assertNotEqual(out_of_order.returncode, 0)
         self.assertIn("earlier required gates", self.result_json(out_of_order)["error"])
-        self.record_product_conflict()
-        (self.repo / "code.txt").write_text(
-            "base\nproduct change\nresolved\n", encoding="utf-8"
-        )
-        self.git("add", "code.txt")
         finalize = self.run_train("finalize")
         self.assertNotEqual(finalize.returncode, 0)
         self.assertIn("is 'not_run'", self.result_json(finalize)["error"])
@@ -392,6 +397,11 @@ class UpstreamSyncTrainTest(unittest.TestCase):
 
     def test_failed_gate_is_durable_and_blocks_later_gates(self) -> None:
         self.prepare()
+        self.record_product_conflict()
+        (self.repo / "code.txt").write_text(
+            "base\nproduct change\nresolved\n", encoding="utf-8"
+        )
+        self.git("add", "code.txt")
         failed = self.run_train(
             "record-gate",
             "--id",
@@ -404,6 +414,14 @@ class UpstreamSyncTrainTest(unittest.TestCase):
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["gates"][0]["status"], "failed")
         self.assertEqual(state["gates"][0]["exit_code"], 7)
+        terminal_receipt = json.loads(
+            (self.train / "terminal-receipt.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(terminal_receipt["terminal"]["state"], "failed")
+        self.assertEqual(
+            terminal_receipt["finalization"]["released_ref_update"]["mode"],
+            "unchanged",
+        )
         later = self.run_train(
             "record-gate",
             "--id",
@@ -442,6 +460,21 @@ class UpstreamSyncTrainTest(unittest.TestCase):
         )
         self.assertNotEqual(unknown_owner.returncode, 0)
         self.assertIn("owner allowed by sync policy", self.result_json(unknown_owner)["error"])
+        unrelated_source = self.run_train(
+            "record-conflict",
+            "--path",
+            "code.txt",
+            "--source-path",
+            "history.txt",
+            "--owner",
+            "product",
+            "--resolution",
+            "retain_product_mount",
+            "--rationale",
+            "unrelated candidate files are not rename provenance",
+        )
+        self.assertNotEqual(unrelated_source.returncode, 0)
+        self.assertIn("not Git rename provenance", self.result_json(unrelated_source)["error"])
 
     def test_prepare_rejects_refs_outside_sync_policy(self) -> None:
         unsafe_product = self.run_train(
@@ -473,11 +506,11 @@ class UpstreamSyncTrainTest(unittest.TestCase):
         prepared = self.prepare()
         sync_ref = prepared["sync_ref"]
         self.record_product_conflict()
-        self.record_gates()
         (self.repo / "code.txt").write_text(
             "base\nproduct change\nresolved\n", encoding="utf-8"
         )
         self.git("add", "code.txt")
+        self.record_gates()
         objects = self.repo / ".git/objects"
         objects.chmod(0o500)
         try:
@@ -488,6 +521,34 @@ class UpstreamSyncTrainTest(unittest.TestCase):
             self.assertEqual((self.repo / FLOOR_PATH).read_bytes(), before_floor)
         finally:
             objects.chmod(0o700)
+
+    def test_receipt_path_cannot_overwrite_product_code(self) -> None:
+        result = self.run_train(
+            "prepare",
+            "--product-branch",
+            PRODUCT_REF,
+            "--source-ref",
+            SOURCE_REF,
+            "--floor-metadata",
+            FLOOR_PATH,
+            "--receipt-path",
+            "code.txt",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("receipt path differs from sync policy", self.result_json(result)["error"])
+
+    def test_gates_require_resolved_conflict_tree(self) -> None:
+        self.prepare()
+        self.record_product_conflict()
+        gate = self.run_train(
+            "record-gate",
+            "--id",
+            "upstream_required",
+            "--command-json",
+            json.dumps(["python3", "-c", "raise SystemExit(0)"]),
+        )
+        self.assertNotEqual(gate.returncode, 0)
+        self.assertIn("conflicts remain unresolved", self.result_json(gate)["error"])
 
 
 if __name__ == "__main__":

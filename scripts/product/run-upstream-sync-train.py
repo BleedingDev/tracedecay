@@ -649,6 +649,36 @@ def blob_sha(repo: Path, commit: str, path: str) -> str | None:
     return require_sha(git_text(repo, ["rev-parse", f"{commit}:{path}"]), "source blob SHA")
 
 
+def upstream_rename_source_paths(
+    repo: Path,
+    product_sha: str,
+    source_sha: str,
+    conflict_path: str,
+) -> set[str]:
+    """Return candidate-tree paths Git relates to a rename conflict path."""
+
+    fields = git(
+        repo,
+        ["diff", "--name-status", "-z", "-M", product_sha, source_sha],
+    ).stdout.split(b"\0")
+    allowed: set[str] = set()
+    index = 0
+    while index < len(fields) and fields[index]:
+        status = decode(fields[index])
+        index += 1
+        if status.startswith(("R", "C")):
+            if index + 1 >= len(fields):
+                raise SyncTrainError("Git returned a truncated rename record")
+            old_path = decode(fields[index])
+            new_path = decode(fields[index + 1])
+            index += 2
+            if conflict_path in {old_path, new_path}:
+                allowed.add(new_path)
+        else:
+            index += 1
+    return allowed
+
+
 def metadata_from_commit(repo: Path, commit: str, path: str) -> bytes:
     data = blob_bytes(repo, commit, path)
     if data is None:
@@ -873,6 +903,39 @@ def make_receipt(
     }
 
 
+def write_terminal_receipt(
+    train_dir: Path,
+    state: dict[str, Any],
+    *,
+    terminal_state: str,
+    reason: str,
+    released_head_sha: str,
+) -> Path:
+    """Persist terminal failure/abort evidence outside canonical Git state."""
+
+    terminal_state_copy = json.loads(json.dumps(state))
+    fallback_owner = terminal_state_copy["conflict_owners"][0]
+    for entry in terminal_state_copy["conflicts"]:
+        entry["owner"] = entry.get("owner") or fallback_owner
+        entry["resolution"] = entry.get("resolution") or "unresolved"
+        entry["rationale"] = entry.get("rationale") or reason
+    receipt = make_receipt(
+        terminal_state_copy,
+        completed_at=utc_now(),
+        terminal_state=terminal_state,
+        terminal_reason=reason,
+        cas_attempted=False,
+        cas_result="not_attempted",
+        released_head_sha=released_head_sha,
+        released_update_mode="unchanged",
+        released_old_sha=released_head_sha,
+        released_new_sha=released_head_sha,
+    )
+    path = train_dir / "terminal-receipt.json"
+    write_json(path, receipt)
+    return path
+
+
 def ensure_no_untracked(repo: Path, *, allowed_paths: set[str] | None = None) -> None:
     allowed_paths = allowed_paths or set()
     for path in status_records(repo):
@@ -924,10 +987,6 @@ def validate_conflicts(state: dict[str, Any], repo: Path | None = None) -> list[
         source_path = require_nonempty(source.get("path"), f"conflict {path} source path")
         if source.get("ref") != state["source_ref"]:
             raise SyncTrainError(f"conflict {path!r} does not retain the pinned upstream ref")
-        if source_path != path and source_path not in detected_paths:
-            raise SyncTrainError(
-                f"conflict {path!r} has an original source path outside the merge conflict set"
-            )
         source_key = (source_sha, source_path)
         if source_key in seen_sources:
             raise SyncTrainError(
@@ -1032,17 +1091,17 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     if status_bytes(repo):
         raise SyncTrainError("working tree must be clean before preparing a sync train")
 
-    receipt_arg = args.receipt_path
-    if receipt_arg is None:
-        template = policy["workflow"]["receipt_path_template"]
-        train_id = f"sync-train-{short_sha}"
-        try:
-            receipt_path_value = template.format(train_id=train_id, short_sha=short_sha)
-        except (KeyError, ValueError) as error:
-            raise SyncTrainError(f"sync policy receipt template is invalid: {error}") from error
-        receipt_path = repo_relative(repo, receipt_path_value, "convergence receipt")
-    else:
-        receipt_path = repo_relative(repo, receipt_arg, "convergence receipt")
+    template = policy["workflow"]["receipt_path_template"]
+    train_id = f"sync-train-{short_sha}"
+    try:
+        receipt_path_value = template.format(train_id=train_id, short_sha=short_sha)
+    except (KeyError, ValueError) as error:
+        raise SyncTrainError(f"sync policy receipt template is invalid: {error}") from error
+    receipt_path = repo_relative(repo, receipt_path_value, "convergence receipt")
+    if args.receipt_path is not None:
+        requested_receipt = repo_relative(repo, args.receipt_path, "convergence receipt")
+        if requested_receipt != receipt_path:
+            raise SyncTrainError("configured receipt path differs from sync policy")
     if receipt_path == floor_path:
         raise SyncTrainError("floor metadata and convergence receipt must be different files")
 
@@ -1224,7 +1283,23 @@ def record_conflict(args: argparse.Namespace) -> dict[str, Any]:
         ):
             raise SyncTrainError(f"conflict {path!r} has an invalid original source")
         if source_path != source.get("path"):
-            raise SyncTrainError("an existing conflict's original source path is immutable")
+            allowed_sources = upstream_rename_source_paths(
+                repo,
+                state["product_head_sha"],
+                state["source_sha"],
+                path,
+            )
+            if source_path not in allowed_sources:
+                raise SyncTrainError(
+                    "corrected original source path is not Git rename provenance for the conflict"
+                )
+            source_blob = blob_sha(repo, state["source_sha"], source_path)
+            if source_blob is None:
+                raise SyncTrainError(
+                    "corrected original source path does not exist at the pinned upstream SHA"
+                )
+            source["path"] = source_path
+            source["blob_sha"] = source_blob
     selected["owner"] = owner
     selected["resolution"] = resolution
     selected["rationale"] = rationale
@@ -1287,6 +1362,13 @@ def record_gate(args: argparse.Namespace) -> dict[str, Any]:
     assert_product_unchanged(repo, state)
     if current_branch(repo) != state["sync_ref"]:
         raise SyncTrainError("gate recording requires the isolated sync branch")
+    unresolved = unmerged_paths(repo)
+    if unresolved:
+        raise SyncTrainError(
+            "required gates cannot run while Git conflicts remain unresolved: "
+            + ", ".join(unresolved[:16])
+        )
+    validate_conflicts(state, repo)
     gate_id = require_nonempty(args.id, "gate id")
     if gate_id not in GATE_ORDER:
         raise SyncTrainError(f"unknown required gate {gate_id!r}")
@@ -1330,12 +1412,22 @@ def record_gate(args: argparse.Namespace) -> dict[str, Any]:
     if status != "passed":
         state["status"] = "failed"
     write_json(state_path(train_dir), state)
+    terminal_receipt: Path | None = None
+    if status != "passed":
+        terminal_receipt = write_terminal_receipt(
+            train_dir,
+            state,
+            terminal_state="failed",
+            reason=f"required gate {gate_id!r} failed",
+            released_head_sha=state["product_head_sha"],
+        )
     result = {
         "ok": status == "passed",
         "action": "record-gate",
         "gate": gate,
         "status": state["status"],
         "train_dir": str(train_dir),
+        "terminal_receipt": str(terminal_receipt) if terminal_receipt else None,
     }
     if status != "passed":
         # Keep the failed gate in durable workflow state, but fail closed so a
@@ -1387,6 +1479,13 @@ def abort(args: argparse.Namespace) -> dict[str, Any]:
     state["invalidated"] = True
     state["merge_in_progress"] = False
     write_json(state_path(train_dir), state)
+    terminal_receipt = write_terminal_receipt(
+        train_dir,
+        state,
+        terminal_state="aborted",
+        reason="sync train aborted before isolated publication",
+        released_head_sha=product_sha,
+    )
     return {
         "ok": True,
         "action": "abort",
@@ -1396,6 +1495,7 @@ def abort(args: argparse.Namespace) -> dict[str, Any]:
         "sync_ref_removed": sync_sha is not None,
         "floor_metadata_sha256": expected_digest,
         "train_dir": str(train_dir),
+        "terminal_receipt": str(terminal_receipt),
     }
 
 
