@@ -81,6 +81,7 @@ class UpstreamSyncTrainTest(unittest.TestCase):
                         "metadata": FLOOR_PATH,
                         "pull_request": 707,
                         "sha": self.base_sha,
+                        "advancement_authority": "tdmem-1208",
                         "immutable_until_approved_train": True,
                     },
                     "preflight": {
@@ -100,6 +101,7 @@ class UpstreamSyncTrainTest(unittest.TestCase):
                         "allowed_strategies": ["merge", "rebase"],
                         "candidate_must_be_immutable_sha": True,
                         "moving_refs_are_discovery_only": True,
+                        "first_floor_advancement_bead": "tdmem-1208",
                     },
                     "conflicts": {
                         "path_format": "repo-relative-posix",
@@ -240,6 +242,10 @@ class UpstreamSyncTrainTest(unittest.TestCase):
         self.assertEqual(prepared["status"], "conflicted")
         sync_ref = prepared["sync_ref"]
         self.assertEqual(prepared["product_head_sha"], self.product_sha)
+        self.assertEqual(
+            json.loads((self.train / "state.json").read_text(encoding="utf-8"))["bead_id"],
+            "tdmem-1208",
+        )
         self.assertEqual(self.git("rev-parse", sync_ref).stdout.strip(), self.product_sha)
         self.assertEqual(self.git("rev-parse", PRODUCT_REF).stdout.strip(), before_product)
         self.assertEqual((self.repo / FLOOR_PATH).read_bytes(), before_metadata)
@@ -267,6 +273,7 @@ class UpstreamSyncTrainTest(unittest.TestCase):
         receipt = json.loads(self.git("show", f"{final_sha}:{receipt_path}").stdout)
         self.assertEqual(receipt["upstream"]["candidate_ref"], SOURCE_REF)
         self.assertEqual(receipt["upstream"]["candidate_sha"], self.source_sha)
+        self.assertEqual(receipt["bead_id"], "tdmem-1208")
         self.assertEqual(
             receipt["conflicts"][0]["source"],
             f"{SOURCE_REF}:{self.source_sha}",
@@ -500,6 +507,37 @@ class UpstreamSyncTrainTest(unittest.TestCase):
         self.assertNotEqual(unsafe_source.returncode, 0)
         self.assertIn("approved policy discovery ref", self.result_json(unsafe_source)["error"])
 
+    def test_prepare_derives_and_validates_policy_authority(self) -> None:
+        stale = self.run_train(
+            "prepare",
+            "--product-branch",
+            PRODUCT_REF,
+            "--source-ref",
+            SOURCE_REF,
+            "--floor-metadata",
+            FLOOR_PATH,
+            "--bead-id",
+            "tdmem-1205",
+        )
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("bead id must be tdmem-1208 from sync policy", self.result_json(stale)["error"])
+
+        policy_path = self.repo / POLICY_PATH
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        policy["workflow"]["first_floor_advancement_bead"] = "tdmem-1205"
+        policy_path.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        mismatched = self.run_train(
+            "prepare",
+            "--product-branch",
+            PRODUCT_REF,
+            "--source-ref",
+            SOURCE_REF,
+            "--floor-metadata",
+            FLOOR_PATH,
+        )
+        self.assertNotEqual(mismatched.returncode, 0)
+        self.assertIn("differs from workflow authority", self.result_json(mismatched)["error"])
+
     def test_finalize_failure_leaves_floor_and_refs_unchanged(self) -> None:
         before_product = self.git("rev-parse", PRODUCT_REF).stdout.strip()
         before_floor = (self.repo / FLOOR_PATH).read_bytes()
@@ -521,6 +559,66 @@ class UpstreamSyncTrainTest(unittest.TestCase):
             self.assertEqual((self.repo / FLOOR_PATH).read_bytes(), before_floor)
         finally:
             objects.chmod(0o700)
+
+    def test_late_finalize_failure_then_abort_unpublishes_candidate(self) -> None:
+        before_product = self.git("rev-parse", PRODUCT_REF).stdout.strip()
+        before_tree = self.git("rev-parse", f"{PRODUCT_REF}^{{tree}}").stdout.strip()
+        before_floor = (self.repo / FLOOR_PATH).read_bytes()
+        prepared = self.prepare()
+        sync_ref = prepared["sync_ref"]
+        self.record_product_conflict()
+        (self.repo / "code.txt").write_text(
+            "base\nproduct change\nresolved\n", encoding="utf-8"
+        )
+        self.git("add", "code.txt")
+        self.record_gates()
+
+        objects = self.repo / ".git/objects"
+        original_mode = objects.stat().st_mode & 0o777
+        objects.chmod(0o500)
+        try:
+            failed = self.run_train("finalize")
+        finally:
+            objects.chmod(original_mode)
+
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        self.assertEqual(self.git("rev-parse", PRODUCT_REF).stdout.strip(), before_product)
+        self.assertEqual(
+            self.git("rev-parse", f"{PRODUCT_REF}^{{tree}}").stdout.strip(),
+            before_tree,
+        )
+        self.assertEqual((self.repo / FLOOR_PATH).read_bytes(), before_floor)
+
+        aborted = self.run_train("abort")
+        self.assertEqual(aborted.returncode, 0, aborted.stdout + aborted.stderr)
+        evidence = self.result_json(aborted)
+        self.assertEqual(evidence["status"], "aborted")
+        self.assertTrue(evidence["sync_ref_removed"])
+        self.assertNotEqual(self.git("show-ref", "--verify", sync_ref, check=False).returncode, 0)
+        self.assertEqual(
+            self.git("for-each-ref", "--format=%(refname)", "refs/heads/sync/upstream").stdout,
+            "",
+        )
+        self.assertEqual(self.git("rev-parse", PRODUCT_REF).stdout.strip(), before_product)
+        self.assertEqual(
+            self.git("rev-parse", f"{PRODUCT_REF}^{{tree}}").stdout.strip(),
+            before_tree,
+        )
+        self.assertEqual((self.repo / FLOOR_PATH).read_bytes(), before_floor)
+        self.assertEqual(self.git("status", "--porcelain=v1").stdout, "")
+        self.assertEqual(
+            self.git("symbolic-ref", "--quiet", "HEAD").stdout.strip(), PRODUCT_REF
+        )
+
+        receipt = json.loads(
+            Path(evidence["terminal_receipt"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(receipt["terminal"]["state"], "aborted")
+        self.assertEqual(receipt["finalization"]["outcome"], "not_published")
+        self.assertIsNone(receipt["finalization"]["sync_ref"])
+        self.assertEqual(
+            receipt["finalization"]["released_ref_update"]["mode"], "unchanged"
+        )
 
     def test_receipt_path_cannot_overwrite_product_code(self) -> None:
         result = self.run_train(

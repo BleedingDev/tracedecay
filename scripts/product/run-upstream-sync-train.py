@@ -40,7 +40,7 @@ RECEIPT_SCHEMA_URL = (
 )
 POLICY_REVISION = "sync-train.v1"
 WORKFLOW_NAME = "run-upstream-sync-train"
-TRAIN_BEAD_ID = "tdmem-1205"
+BEAD_ID_RE = re.compile(r"^tdmem-[0-9]{4}$")
 MAX_DIAGNOSTIC_CHARS = 2_048
 MAX_FIELD_CHARS = 4_096
 MAX_CONFLICTS = 1_000
@@ -136,6 +136,36 @@ def validate_conflict_owner(value: object, state: dict[str, Any], label: str) ->
     if not isinstance(owners, list) or owner not in owners:
         raise SyncTrainError(f"{label} is not an owner allowed by sync policy")
     return owner
+
+
+def policy_train_bead_id(policy: dict[str, Any]) -> str:
+    """Return the policy's single authority for advancing the pinned floor."""
+
+    floor = policy.get("floor")
+    workflow = policy.get("workflow")
+    floor_authority = require_nonempty(
+        floor.get("advancement_authority") if isinstance(floor, dict) else None,
+        "sync policy floor advancement authority",
+    )
+    workflow_authority = require_nonempty(
+        workflow.get("first_floor_advancement_bead")
+        if isinstance(workflow, dict)
+        else None,
+        "sync policy first floor advancement bead",
+    )
+    if not BEAD_ID_RE.fullmatch(floor_authority):
+        raise SyncTrainError(
+            "sync policy floor advancement authority must be a tdmem bead id"
+        )
+    if not BEAD_ID_RE.fullmatch(workflow_authority):
+        raise SyncTrainError(
+            "sync policy first floor advancement bead must be a tdmem bead id"
+        )
+    if floor_authority != workflow_authority:
+        raise SyncTrainError(
+            "sync policy floor advancement authority differs from workflow authority"
+        )
+    return floor_authority
 
 
 def utc_now() -> str:
@@ -432,6 +462,7 @@ def load_policy(repo: Path, policy_argument: str | Path) -> tuple[dict[str, Any]
         or bundle.get("receipt_schema_path") != "product/upstream/sync-train-receipt.schema.json"
     ):
         raise SyncTrainError("sync policy same-commit bundle is invalid")
+    policy_train_bead_id(policy)
     return policy, policy_path
 
 
@@ -516,7 +547,7 @@ def load_json(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
-def load_state(train_dir: Path) -> dict[str, Any]:
+def load_state(train_dir: Path, *, expected_bead_id: str | None = None) -> dict[str, Any]:
     path = state_path(train_dir)
     state = load_json(path, "sync-train state")
     if state.get("schema_version") != SCHEMA_VERSION or state.get("kind") != STATE_KIND:
@@ -531,8 +562,13 @@ def load_state(train_dir: Path) -> dict[str, Any]:
     require_nonempty(state.get("sync_ref"), "sync-train state.sync_ref")
     require_nonempty(state.get("floor_metadata"), "sync-train state.floor_metadata")
     require_sha(state.get("floor_sha"), "sync-train state.floor_sha")
-    if state.get("bead_id") != TRAIN_BEAD_ID:
-        raise SyncTrainError(f"sync-train state.bead_id must be {TRAIN_BEAD_ID}")
+    bead_id = require_nonempty(state.get("bead_id"), "sync-train state.bead_id")
+    if not BEAD_ID_RE.fullmatch(bead_id):
+        raise SyncTrainError("sync-train state.bead_id must be a tdmem bead id")
+    if expected_bead_id is not None and bead_id != expected_bead_id:
+        raise SyncTrainError(
+            f"sync-train state.bead_id must be {expected_bead_id} from sync policy"
+        )
     if state.get("policy_revision") != POLICY_REVISION:
         raise SyncTrainError("sync-train state policy revision is unsupported")
     require_repository(state.get("product_repository"), "sync-train state.product_repository")
@@ -1031,13 +1067,14 @@ def validate_gates(state: dict[str, Any], *, require_passed: bool) -> list[dict[
 def prepare(args: argparse.Namespace) -> dict[str, Any]:
     repo = resolve_repo(Path(args.repo or "."))
     train_dir = train_directory(Path(args.train_dir))
+    policy, policy_path = load_policy(repo, args.policy)
+    policy_bead_id = policy_train_bead_id(policy)
     existing = state_path(train_dir)
     if existing.exists():
-        previous = load_state(train_dir)
+        previous = load_state(train_dir, expected_bead_id=policy_bead_id)
         if previous.get("status") not in {"aborted", "finalized"}:
             raise SyncTrainError("train directory already contains an active sync train")
 
-    policy, policy_path = load_policy(repo, args.policy)
     policy_refs = policy["refs"]
     configured_product_branch = policy_refs["product_branch"]
     product_branch_value = args.product_branch or configured_product_branch
@@ -1119,9 +1156,13 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     upstream_repository = require_repository(
         upstream_remote.get("repository"), "sync policy upstream repository"
     )
-    bead_id = require_nonempty(args.bead_id, "bead id")
-    if bead_id != TRAIN_BEAD_ID:
-        raise SyncTrainError(f"bead id must be {TRAIN_BEAD_ID}")
+    bead_id = (
+        policy_bead_id
+        if args.bead_id is None
+        else require_nonempty(args.bead_id, "bead id")
+    )
+    if bead_id != policy_bead_id:
+        raise SyncTrainError(f"bead id must be {policy_bead_id} from sync policy")
 
     branch_name = sync_ref.removeprefix("refs/heads/")
     # Use the already-resolved exact commit as the start point.  This avoids
@@ -1229,6 +1270,9 @@ def state_repo(args: argparse.Namespace, state: dict[str, Any]) -> Path:
 
 def validate_state_policy(repo: Path, state: dict[str, Any]) -> dict[str, Any]:
     policy, _ = load_policy(repo, state["policy_path"])
+    policy_bead_id = policy_train_bead_id(policy)
+    if state["bead_id"] != policy_bead_id:
+        raise SyncTrainError("sync-train state bead id differs from sync policy authority")
     refs = policy["refs"]
     if refs["product_branch"] != state["product_branch"]:
         raise SyncTrainError("sync policy product branch changed during the train")
@@ -1444,6 +1488,7 @@ def abort(args: argparse.Namespace) -> dict[str, Any]:
     if state["status"] == "finalized":
         raise SyncTrainError("a finalized sync train cannot be aborted")
     repo = state_repo(args, state)
+    validate_state_policy(repo, state)
     product_sha = assert_product_unchanged(repo, state)
     sync_sha = resolve_direct_ref(repo, state["sync_ref"], "sync branch", missing_ok=True)
     if sync_sha is not None and sync_sha != state["sync_base_sha"]:
@@ -1636,6 +1681,7 @@ def inspect(args: argparse.Namespace) -> dict[str, Any]:
     train_dir = train_directory(Path(args.train_dir))
     state = load_state(train_dir)
     repo = state_repo(args, state)
+    validate_state_policy(repo, state)
     observed_product = resolve_direct_ref(repo, state["product_branch"], "product branch", missing_ok=True)
     observed_sync = resolve_direct_ref(repo, state["sync_ref"], "sync branch", missing_ok=True)
     return {
@@ -1676,7 +1722,7 @@ def parser_for() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--receipt-path", "--receipt", dest="receipt_path")
     prepare_parser.add_argument("--sync-prefix")
     prepare_parser.add_argument("--policy", default=DEFAULT_POLICY)
-    prepare_parser.add_argument("--bead-id", default=TRAIN_BEAD_ID)
+    prepare_parser.add_argument("--bead-id")
 
     conflict_parser = subparsers.add_parser("record-conflict", help="record an owned conflict resolution")
     add_repo_argument(conflict_parser)
