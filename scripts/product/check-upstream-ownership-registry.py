@@ -806,6 +806,33 @@ def index_touch_points(
     return touches
 
 
+def index_administrative_exclusions(
+    policy: dict[str, Any], errors: list[str]
+) -> list[str]:
+    """Load the policy-owned path exclusions used by footprint accounting.
+
+    Exclusions are intentionally sourced from the patch policy rather than
+    duplicated in this checker.  If the policy field or any of its patterns
+    is malformed, return no usable exclusions so a malformed policy cannot
+    silently authorize a path.
+    """
+    label = "patch policy.administrative_paths_excluded_from_footprint"
+    before = len(errors)
+    patterns = string_list(
+        policy.get("administrative_paths_excluded_from_footprint"),
+        label,
+        errors,
+    )
+    for offset, pattern in enumerate(patterns):
+        validate_repo_path(
+            pattern,
+            f"{label}[{offset}]",
+            errors,
+            allow_glob=True,
+        )
+    return patterns if len(errors) == before else []
+
+
 def validate_areas(
     repo: Path,
     registry: dict[str, Any],
@@ -1134,6 +1161,8 @@ def classify_paths(
     touches: dict[str, list[str]],
     product_patterns: list[str],
     errors: list[str],
+    *,
+    administrative_patterns: Iterable[str] = (),
 ) -> list[dict[str, str]]:
     results: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -1157,6 +1186,11 @@ def classify_paths(
             errors.append(f"classify_path contains duplicate path {path!r}")
             continue
         seen.add(path)
+        if any(
+            type(pattern) is str and path_matches(path, pattern)
+            for pattern in administrative_patterns
+        ):
+            continue
         active_entry = active_entries.get(path)
         if active_entry is not None:
             results.append(
@@ -1280,6 +1314,7 @@ def validate_document(
         registry, sync_policy, policy, metadata, errors
     )
     touches = index_touch_points(policy, errors)
+    administrative_patterns = index_administrative_exclusions(policy, errors)
     product_patterns = string_list(
         policy.get("product_owned_paths"),
         "patch policy.product_owned_paths",
@@ -1316,7 +1351,13 @@ def validate_document(
         errors,
     )
     classifications = classify_paths(
-        requested_paths, areas, entries, touches, product_patterns, errors
+        requested_paths,
+        areas,
+        entries,
+        touches,
+        product_patterns,
+        errors,
+        administrative_patterns=administrative_patterns,
     )
     changed_paths: list[str] = []
     changed_classifications: list[dict[str, str]] = []
@@ -1327,7 +1368,13 @@ def validate_document(
     ):
         changed_paths = changed_repository_paths(repo, accepted_floor, errors)
         changed_classifications = classify_paths(
-            changed_paths, areas, entries, touches, product_patterns, errors
+            changed_paths,
+            areas,
+            entries,
+            touches,
+            product_patterns,
+            errors,
+            administrative_patterns=administrative_patterns,
         )
     area_counts = Counter(
         area.get("status")

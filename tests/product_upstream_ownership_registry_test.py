@@ -162,6 +162,7 @@ def base_policy() -> dict[str, Any]:
         "schema_version": 1,
         "bead_id": "tdmem-0301",
         "policy_revision": "patch-footprint.v1",
+        "administrative_paths_excluded_from_footprint": [".codex/**"],
         "product_owned_paths": product_patterns,
         "upstream_floor": {
             "metadata": "product/upstream/tracedecay-v2-pr707.json",
@@ -512,6 +513,9 @@ class UpstreamOwnershipRegistryTest(unittest.TestCase):
             changed = repo / "crates/tracedecay-memory-provider-registry/src/lib.rs"
             changed.parent.mkdir(parents=True)
             changed.write_text("pub struct Fixture;\n", encoding="utf-8")
+            excluded = repo / ".codex" / "plans" / "working.md"
+            excluded.parent.mkdir(parents=True)
+            excluded.write_text("administrative plan\n", encoding="utf-8")
             registry, policy, sync_policy, metadata = bind_floor(floor)
             result, payload = self.run_checker(
                 repo_root=repo,
@@ -524,7 +528,7 @@ class UpstreamOwnershipRegistryTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(
                 payload["counts"]["changed_paths"],
-                {"classified": 1, "total": 1},
+                {"classified": 1, "total": 2},
             )
             registry["areas"] = [
                 row for row in registry["areas"] if row["id"] != "provider_registry"
@@ -538,6 +542,64 @@ class UpstreamOwnershipRegistryTest(unittest.TestCase):
                 metadata=metadata,
                 classify_changed_paths=True,
             )
+
+    def test_administrative_paths_follow_policy_and_nearby_paths_require_classification(
+        self,
+    ) -> None:
+        result, payload = self.run_checker(
+            classify_paths=[".codex/plans/working.md"]
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(payload["classifications"], [])
+
+        policy = base_policy()
+        policy["administrative_paths_excluded_from_footprint"] = [".agent-state/**"]
+        result, payload = self.run_checker(
+            policy=policy,
+            classify_paths=[".agent-state/cache.json"],
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(payload["classifications"], [])
+        self.assert_rejected(
+            "unclassified by the M2 ownership registry",
+            policy=policy,
+            classify_paths=[".codex/plans/working.md"],
+        )
+        self.assert_rejected(
+            "unclassified by the M2 ownership registry",
+            classify_paths=[".codex-adjacent/working.md"],
+        )
+
+    def test_malformed_administrative_exclusions_fail_closed(self) -> None:
+        malformed = base_policy()
+        malformed.pop("administrative_paths_excluded_from_footprint")
+        payload = self.assert_rejected(
+            "must be an array",
+            policy=malformed,
+            classify_paths=[".codex/plans/working.md"],
+        )
+        self.assertIn(
+            "unclassified by the M2 ownership registry",
+            "\n".join(payload["errors"]),
+        )
+
+        for exclusions, marker in (
+            ([], "must not be empty"),
+            ([".codex/**", "../outside/**"], "normalized repo-relative POSIX"),
+            ([".codex/**", 7], "must be a non-empty string"),
+        ):
+            with self.subTest(exclusions=exclusions):
+                policy = base_policy()
+                policy["administrative_paths_excluded_from_footprint"] = exclusions
+                payload = self.assert_rejected(
+                    marker,
+                    policy=policy,
+                    classify_paths=[".codex/plans/working.md"],
+                )
+                self.assertIn(
+                    "unclassified by the M2 ownership registry",
+                    "\n".join(payload["errors"]),
+                )
 
     def test_root_is_closed_and_all_fields_are_required(self) -> None:
         for field in sorted(base_registry()):
