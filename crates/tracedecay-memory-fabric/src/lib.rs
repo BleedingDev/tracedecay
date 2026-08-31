@@ -16,17 +16,17 @@
 //! isolation. It contains no provider implementation, persistence, transport,
 //! TraceDecay database, code-index, daemon, dashboard, or host integration.
 
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use tracedecay_memory_provider_api::contract::{FallbackEligibility, TerminalCode};
 use tracedecay_memory_provider_api::{
     ApiError, FallbackDirective, HandshakeRequest, HandshakeResponse, MemoryProvider,
-    OwnedExactScope, OwnedProviderId, ProviderCall, ProviderDescriptor, ProviderOperation,
-    ProviderReply, TerminalRecord,
+    OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderDescriptor,
+    ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
 };
 
 /// Provider participation mode selected by TraceDecay configuration.
@@ -76,6 +76,8 @@ pub enum FabricError {
     Api(ApiError),
     /// The registry lock was poisoned by an aborted owner.
     RegistryPoisoned,
+    /// A provider-local dispatch gate was poisoned by an aborted call.
+    ProviderGatePoisoned,
     /// A provider ID already has a registration.
     DuplicateProvider(String),
     /// The finite registry capacity has been reached.
@@ -98,6 +100,19 @@ pub enum FabricError {
     },
     /// The selected provider is disabled.
     ProviderDisabled(String),
+    /// The provider has no successful readiness bound to this registration.
+    ProviderNotReady(String),
+    /// The call did not carry the currently accepted ready receipt.
+    ReadyReceiptMismatch,
+    /// The call scope differed from the scope bound by the ready receipt.
+    ReadyScopeMismatch,
+    /// The call generation differed from the generation bound by readiness.
+    ReadyStateGenerationMismatch {
+        /// Generation retained by readiness.
+        ready: u64,
+        /// Generation requested by the call.
+        requested: u64,
+    },
     /// An observer-only provider was asked to influence active output.
     ProviderObserverOnly(String),
     /// Observation routing was requested for a non-observation operation.
@@ -145,12 +160,35 @@ pub enum FabricError {
         /// Generation reported by the provider reply or descriptor.
         reported: u64,
     },
+    /// Provider effect evidence omitted the call's required starting generation.
+    ResponseStateGenerationBeforeMissing {
+        /// Generation required by the admitted call.
+        expected: u64,
+    },
+    /// Provider effect evidence omitted the reported settled generation.
+    ResponseStateGenerationAfterMissing {
+        /// Generation reported by the reply or handshake descriptor.
+        reported: u64,
+    },
     /// A successful handshake omitted its compatible descriptor.
     SuccessfulHandshakeMissingDescriptor,
     /// A successful handshake returned another provider identity.
     SuccessfulHandshakeProviderMismatch,
+    /// A successful handshake descriptor differed from the registered descriptor.
+    SuccessfulHandshakeDescriptorMismatch,
+    /// A successful handshake descriptor regressed the accepted state generation.
+    SuccessfulHandshakeStateGenerationRegressed {
+        /// Generation most recently accepted by the fabric.
+        accepted: u64,
+        /// Generation returned by the handshake.
+        returned: u64,
+    },
     /// A successful handshake accepted another coding scope.
     SuccessfulHandshakeScopeMismatch,
+    /// A successful handshake did not negotiate the exact lower ceilings.
+    SuccessfulHandshakeEffectiveLimitsMismatch,
+    /// A failed handshake carried fields reserved for accepted readiness.
+    FailedHandshakeCarriedReadiness,
 }
 
 impl fmt::Display for FabricError {
@@ -159,6 +197,7 @@ impl fmt::Display for FabricError {
             Self::InvalidConfig(message) => formatter.write_str(message),
             Self::Api(error) => write!(formatter, "provider API error: {error}"),
             Self::RegistryPoisoned => formatter.write_str("provider registry lock is poisoned"),
+            Self::ProviderGatePoisoned => formatter.write_str("provider dispatch gate is poisoned"),
             Self::DuplicateProvider(provider) => {
                 write!(formatter, "provider {provider} is already registered")
             }
@@ -180,6 +219,19 @@ impl fmt::Display for FabricError {
             Self::ProviderDisabled(provider) => {
                 write!(formatter, "provider {provider} is disabled")
             }
+            Self::ProviderNotReady(provider) => {
+                write!(formatter, "provider {provider} has no accepted readiness")
+            }
+            Self::ReadyReceiptMismatch => {
+                formatter.write_str("provider call ready receipt is not current")
+            }
+            Self::ReadyScopeMismatch => {
+                formatter.write_str("provider call scope differs from accepted readiness")
+            }
+            Self::ReadyStateGenerationMismatch { ready, requested } => write!(
+                formatter,
+                "provider call generation mismatch: ready {ready}, requested {requested}"
+            ),
             Self::ProviderObserverOnly(provider) => {
                 write!(formatter, "provider {provider} is observer-only")
             }
@@ -219,14 +271,35 @@ impl fmt::Display for FabricError {
                 formatter,
                 "provider response state-generation mismatch: effect evidence {evidence}, reported {reported}"
             ),
+            Self::ResponseStateGenerationBeforeMissing { expected } => write!(
+                formatter,
+                "provider response omitted state-generation-before; expected {expected}"
+            ),
+            Self::ResponseStateGenerationAfterMissing { reported } => write!(
+                formatter,
+                "provider response omitted state-generation-after; reported {reported}"
+            ),
             Self::SuccessfulHandshakeMissingDescriptor => {
                 formatter.write_str("successful handshake omitted provider descriptor")
             }
             Self::SuccessfulHandshakeProviderMismatch => {
                 formatter.write_str("successful handshake returned another provider")
             }
+            Self::SuccessfulHandshakeDescriptorMismatch => {
+                formatter.write_str("successful handshake changed immutable descriptor fields")
+            }
+            Self::SuccessfulHandshakeStateGenerationRegressed { accepted, returned } => write!(
+                formatter,
+                "successful handshake state generation regressed: accepted {accepted}, returned {returned}"
+            ),
             Self::SuccessfulHandshakeScopeMismatch => {
                 formatter.write_str("successful handshake accepted another exact scope")
+            }
+            Self::SuccessfulHandshakeEffectiveLimitsMismatch => {
+                formatter.write_str("successful handshake returned incorrect effective limits")
+            }
+            Self::FailedHandshakeCarriedReadiness => {
+                formatter.write_str("failed handshake carried readiness metadata")
             }
         }
     }
@@ -246,6 +319,23 @@ struct Registration {
     mode: ProviderMode,
     descriptor: ProviderDescriptor,
     provider: Arc<dyn MemoryProvider>,
+    dispatch_gate: Arc<Mutex<()>>,
+    accepted_state_generation: u64,
+    readiness_epoch: u64,
+    readiness: Option<Readiness>,
+}
+
+#[derive(Clone)]
+struct Readiness {
+    epoch: u64,
+    registration_revision: u64,
+    provider_instance_id: String,
+    state_namespace: String,
+    exact_scope: OwnedExactScope,
+    state_generation: u64,
+    capabilities: BTreeSet<OwnedVersionedId>,
+    effective_limits: ProviderLimits,
+    ready_receipt_sha256: String,
 }
 
 struct PermitCounter {
@@ -349,20 +439,13 @@ impl MemoryFabric {
             ));
         }
         let descriptor = provider.descriptor();
+        descriptor.validate()?;
+        let accepted_state_generation = descriptor.state_generation;
         if descriptor.provider_id != provider_id {
             return Err(FabricError::ProviderDescriptorMismatch {
                 selected: provider_id.as_str().to_owned(),
                 declared: descriptor.provider_id.as_str().to_owned(),
             });
-        }
-        for mandatory in [
-            "provider.health.v1",
-            "observation.accept.v1",
-            "recall.query.v1",
-        ] {
-            if !descriptor.supports(mandatory) {
-                return Err(FabricError::MissingCapability(mandatory.to_owned()));
-            }
         }
         let mut registrations = self
             .registrations
@@ -380,6 +463,10 @@ impl MemoryFabric {
                     mode,
                     descriptor,
                     provider,
+                    dispatch_gate: Arc::new(Mutex::new(())),
+                    accepted_state_generation,
+                    readiness_epoch: 0,
+                    readiness: None,
                 });
                 Ok(())
             }
@@ -393,6 +480,12 @@ impl MemoryFabric {
         registration_revision: u64,
         mode: ProviderMode,
     ) -> Result<(), FabricError> {
+        let snapshot = self.registration(provider_id)?;
+        Self::require_revision(&snapshot, registration_revision)?;
+        let _dispatch = snapshot
+            .dispatch_gate
+            .lock()
+            .map_err(|_| FabricError::ProviderGatePoisoned)?;
         let mut registrations = self
             .registrations
             .write()
@@ -401,6 +494,11 @@ impl MemoryFabric {
             .get_mut(provider_id)
             .ok_or_else(|| FabricError::ProviderUnknown(provider_id.as_str().to_owned()))?;
         Self::require_revision(registration, registration_revision)?;
+        registration.readiness_epoch = registration
+            .readiness_epoch
+            .checked_add(1)
+            .ok_or(FabricError::InvalidConfig("readiness epoch is exhausted"))?;
+        registration.readiness = None;
         registration.mode = mode;
         Ok(())
     }
@@ -424,6 +522,22 @@ impl MemoryFabric {
 
     /// Performs a bounded read-only handshake for a non-disabled provider.
     pub fn handshake(&self, request: &HandshakeRequest) -> Result<HandshakeResponse, FabricError> {
+        request.validate()?;
+        let registration = self.registration(&request.provider_id)?;
+        Self::require_revision(&registration, request.registration_revision)?;
+        Self::require_enabled(&request.provider_id, registration.mode)?;
+        Self::require_capabilities(
+            &registration.descriptor,
+            request
+                .required_capabilities
+                .iter()
+                .map(|capability| capability.as_str()),
+        )?;
+        Self::preflight(&request.control)?;
+        let dispatch_gate = Arc::clone(&registration.dispatch_gate);
+        let _dispatch = dispatch_gate
+            .lock()
+            .map_err(|_| FabricError::ProviderGatePoisoned)?;
         let registration = self.registration(&request.provider_id)?;
         Self::require_revision(&registration, request.registration_revision)?;
         Self::require_enabled(&request.provider_id, registration.mode)?;
@@ -436,6 +550,8 @@ impl MemoryFabric {
         )?;
         Self::preflight(&request.control)?;
         let _permit = self.permits.try_acquire()?;
+        let readiness_epoch =
+            self.invalidate_readiness(&request.provider_id, request.registration_revision)?;
         let response = registration.provider.handshake(request);
         Self::validate_terminal(
             ProviderOperation::Handshake,
@@ -444,25 +560,96 @@ impl MemoryFabric {
             &request.exact_scope,
             &response.terminal,
             None,
+            None,
         )?;
-        if response.terminal.terminal_code() == TerminalCode::Success {
-            let descriptor = response
-                .descriptor
-                .as_ref()
-                .ok_or(FabricError::SuccessfulHandshakeMissingDescriptor)?;
-            if descriptor.provider_id != request.provider_id {
-                return Err(FabricError::SuccessfulHandshakeProviderMismatch);
+        if response.warnings.len() > 32 {
+            return Err(ApiError::TooManyBoundaryItems {
+                field: "warnings",
+                maximum: 32,
             }
-            if response.accepted_scope.as_ref() != Some(&request.exact_scope) {
-                return Err(FabricError::SuccessfulHandshakeScopeMismatch);
-            }
-            Self::validate_state_generation(&response.terminal, Some(descriptor.state_generation))?;
+            .into());
         }
+        if response.terminal.terminal_code() != TerminalCode::Success {
+            if response.descriptor.is_some()
+                || response.provider_instance_id.is_some()
+                || response.state_namespace.is_some()
+                || response.accepted_scope.is_some()
+                || response.effective_limits.is_some()
+                || response.ready_receipt_sha256.is_some()
+            {
+                return Err(FabricError::FailedHandshakeCarriedReadiness);
+            }
+            return Ok(response);
+        }
+        let descriptor = response
+            .descriptor
+            .as_ref()
+            .ok_or(FabricError::SuccessfulHandshakeMissingDescriptor)?;
+        descriptor.validate()?;
+        if descriptor.provider_id != request.provider_id {
+            return Err(FabricError::SuccessfulHandshakeProviderMismatch);
+        }
+        Self::validate_handshake_descriptor(
+            &registration.descriptor,
+            registration.accepted_state_generation,
+            descriptor,
+        )?;
+        if response.accepted_scope.as_ref() != Some(&request.exact_scope) {
+            return Err(FabricError::SuccessfulHandshakeScopeMismatch);
+        }
+        let provider_instance_id = Self::require_handshake_text(
+            response.provider_instance_id.as_deref(),
+            "provider_instance_id",
+            None,
+        )?
+        .to_owned();
+        let state_namespace = Self::require_handshake_text(
+            response.state_namespace.as_deref(),
+            "state_namespace",
+            Some(128),
+        )?
+        .to_owned();
+        let effective_limits = response
+            .effective_limits
+            .ok_or(ApiError::EmptyField("effective_limits"))?
+            .validate()?;
+        let expected_limits = request.host_limits.minimum(registration.descriptor.limits);
+        if effective_limits != expected_limits {
+            return Err(FabricError::SuccessfulHandshakeEffectiveLimitsMismatch);
+        }
+        let ready_receipt_sha256 = Self::require_handshake_text(
+            response.ready_receipt_sha256.as_deref(),
+            "ready_receipt_sha256",
+            None,
+        )?
+        .to_owned();
+        Self::require_sha256(&ready_receipt_sha256, "ready_receipt_sha256")?;
+        Self::validate_state_generation(&response.terminal, Some(descriptor.state_generation))?;
+        self.install_readiness(
+            &request.provider_id,
+            Readiness {
+                epoch: readiness_epoch,
+                registration_revision: request.registration_revision,
+                provider_instance_id,
+                state_namespace,
+                exact_scope: request.exact_scope.clone(),
+                state_generation: descriptor.state_generation,
+                capabilities: descriptor.capabilities.clone(),
+                effective_limits,
+                ready_receipt_sha256,
+            },
+        )?;
         Ok(response)
     }
 
     /// Invokes one operation that is allowed to influence active product flow.
     pub fn invoke_active(&self, call: &ProviderCall) -> Result<ProviderReply, FabricError> {
+        call.validate()?;
+        let registration = self.registration(&call.provider_id)?;
+        let dispatch_gate = Arc::clone(&registration.dispatch_gate);
+        let _dispatch = dispatch_gate
+            .lock()
+            .map_err(|_| FabricError::ProviderGatePoisoned)?;
         let registration = self.registration(&call.provider_id)?;
         Self::require_revision(&registration, call.registration_revision)?;
         match registration.mode {
@@ -479,16 +666,30 @@ impl MemoryFabric {
             }
         }
         Self::require_call_capabilities(&registration.descriptor, call)?;
+        let readiness = Self::require_readiness(&registration, call)?;
+        call.validate_request_bytes(readiness.effective_limits.request_bytes)?;
         Self::preflight(&call.control)?;
         let _permit = self.permits.try_acquire()?;
         let reply = registration.provider.invoke(call);
-        Self::validate_terminal(
+        if let Err(error) = reply.validate(readiness.effective_limits.response_bytes) {
+            self.invalidate_matching_readiness(call)?;
+            return Err(error.into());
+        }
+        if let Err(error) = Self::validate_terminal(
             call.operation,
             &call.provider_id,
             &call.operation_id,
             &call.exact_scope,
             &reply.terminal,
+            Some(call.expected_state_generation),
             Some(reply.state_generation),
+        ) {
+            self.invalidate_matching_readiness(call)?;
+            return Err(error);
+        }
+        self.settle_readiness(
+            call,
+            reply.terminal.committed_effect().state_generation_after(),
         )?;
         Ok(reply)
     }
@@ -498,23 +699,43 @@ impl MemoryFabric {
     /// The return type strips payloads and extensions so observer execution is
     /// structurally unable to contribute context through this route.
     pub fn deliver_observation(&self, call: &ProviderCall) -> Result<ObserverReceipt, FabricError> {
+        call.validate()?;
         if call.operation.capability_id() != "observation.accept.v1" {
             return Err(FabricError::OperationNotObservation);
         }
         let registration = self.registration(&call.provider_id)?;
+        let dispatch_gate = Arc::clone(&registration.dispatch_gate);
+        let _dispatch = dispatch_gate
+            .lock()
+            .map_err(|_| FabricError::ProviderGatePoisoned)?;
+        let registration = self.registration(&call.provider_id)?;
         Self::require_revision(&registration, call.registration_revision)?;
         Self::require_enabled(&call.provider_id, registration.mode)?;
         Self::require_call_capabilities(&registration.descriptor, call)?;
+        let readiness = Self::require_readiness(&registration, call)?;
+        call.validate_request_bytes(readiness.effective_limits.request_bytes)?;
         Self::preflight(&call.control)?;
         let _permit = self.permits.try_acquire()?;
         let reply = registration.provider.invoke(call);
-        Self::validate_terminal(
+        if let Err(error) = reply.validate(readiness.effective_limits.response_bytes) {
+            self.invalidate_matching_readiness(call)?;
+            return Err(error.into());
+        }
+        if let Err(error) = Self::validate_terminal(
             call.operation,
             &call.provider_id,
             &call.operation_id,
             &call.exact_scope,
             &reply.terminal,
+            Some(call.expected_state_generation),
             Some(reply.state_generation),
+        ) {
+            self.invalidate_matching_readiness(call)?;
+            return Err(error);
+        }
+        self.settle_readiness(
+            call,
+            reply.terminal.committed_effect().state_generation_after(),
         )?;
         Ok(ObserverReceipt {
             provider_id: call.provider_id.clone(),
@@ -532,6 +753,136 @@ impl MemoryFabric {
             .get(provider_id)
             .cloned()
             .ok_or_else(|| FabricError::ProviderUnknown(provider_id.as_str().to_owned()))
+    }
+
+    fn invalidate_readiness(
+        &self,
+        provider_id: &OwnedProviderId,
+        registration_revision: u64,
+    ) -> Result<u64, FabricError> {
+        let mut registrations = self
+            .registrations
+            .write()
+            .map_err(|_| FabricError::RegistryPoisoned)?;
+        let registration = registrations
+            .get_mut(provider_id)
+            .ok_or_else(|| FabricError::ProviderUnknown(provider_id.as_str().to_owned()))?;
+        Self::require_revision(registration, registration_revision)?;
+        registration.readiness_epoch = registration
+            .readiness_epoch
+            .checked_add(1)
+            .ok_or(FabricError::InvalidConfig("readiness epoch is exhausted"))?;
+        registration.readiness = None;
+        Ok(registration.readiness_epoch)
+    }
+
+    fn install_readiness(
+        &self,
+        provider_id: &OwnedProviderId,
+        readiness: Readiness,
+    ) -> Result<(), FabricError> {
+        let mut registrations = self
+            .registrations
+            .write()
+            .map_err(|_| FabricError::RegistryPoisoned)?;
+        let registration = registrations
+            .get_mut(provider_id)
+            .ok_or_else(|| FabricError::ProviderUnknown(provider_id.as_str().to_owned()))?;
+        Self::require_revision(registration, readiness.registration_revision)?;
+        Self::require_enabled(provider_id, registration.mode)?;
+        if registration.readiness_epoch != readiness.epoch
+            || registration.descriptor.capabilities != readiness.capabilities
+            || readiness.provider_instance_id.trim().is_empty()
+            || readiness.state_namespace.trim().is_empty()
+        {
+            return Err(FabricError::ProviderNotReady(
+                provider_id.as_str().to_owned(),
+            ));
+        }
+        registration.accepted_state_generation = readiness.state_generation;
+        registration.readiness = Some(readiness);
+        Ok(())
+    }
+
+    fn require_readiness(
+        registration: &Registration,
+        call: &ProviderCall,
+    ) -> Result<Readiness, FabricError> {
+        let readiness = registration
+            .readiness
+            .as_ref()
+            .ok_or_else(|| FabricError::ProviderNotReady(call.provider_id.as_str().to_owned()))?;
+        if readiness.epoch != registration.readiness_epoch
+            || readiness.registration_revision != registration.revision
+            || readiness.capabilities != registration.descriptor.capabilities
+            || readiness.state_generation != registration.accepted_state_generation
+            || readiness.provider_instance_id.trim().is_empty()
+            || readiness.state_namespace.trim().is_empty()
+        {
+            return Err(FabricError::ProviderNotReady(
+                call.provider_id.as_str().to_owned(),
+            ));
+        }
+        if readiness.ready_receipt_sha256 != call.ready_receipt_sha256 {
+            return Err(FabricError::ReadyReceiptMismatch);
+        }
+        if readiness.exact_scope != call.exact_scope {
+            return Err(FabricError::ReadyScopeMismatch);
+        }
+        if readiness.state_generation != call.expected_state_generation {
+            return Err(FabricError::ReadyStateGenerationMismatch {
+                ready: readiness.state_generation,
+                requested: call.expected_state_generation,
+            });
+        }
+        Ok(readiness.clone())
+    }
+
+    fn invalidate_matching_readiness(&self, call: &ProviderCall) -> Result<(), FabricError> {
+        let mut registrations = self
+            .registrations
+            .write()
+            .map_err(|_| FabricError::RegistryPoisoned)?;
+        let registration = registrations
+            .get_mut(&call.provider_id)
+            .ok_or_else(|| FabricError::ProviderUnknown(call.provider_id.as_str().to_owned()))?;
+        if registration.readiness.as_ref().is_some_and(|readiness| {
+            readiness.registration_revision == call.registration_revision
+                && readiness.ready_receipt_sha256 == call.ready_receipt_sha256
+                && readiness.exact_scope == call.exact_scope
+        }) {
+            registration.readiness = None;
+        }
+        Ok(())
+    }
+
+    fn settle_readiness(
+        &self,
+        call: &ProviderCall,
+        state_generation_after: Option<u64>,
+    ) -> Result<(), FabricError> {
+        let mut registrations = self
+            .registrations
+            .write()
+            .map_err(|_| FabricError::RegistryPoisoned)?;
+        let registration = registrations
+            .get_mut(&call.provider_id)
+            .ok_or_else(|| FabricError::ProviderUnknown(call.provider_id.as_str().to_owned()))?;
+        let matches_call = registration.readiness.as_ref().is_some_and(|readiness| {
+            readiness.registration_revision == call.registration_revision
+                && readiness.ready_receipt_sha256 == call.ready_receipt_sha256
+                && readiness.exact_scope == call.exact_scope
+                && readiness.state_generation == call.expected_state_generation
+        });
+        if matches_call {
+            if let Some(state_generation_after) = state_generation_after {
+                registration.accepted_state_generation = state_generation_after;
+            }
+            if state_generation_after != Some(call.expected_state_generation) {
+                registration.readiness = None;
+            }
+        }
+        Ok(())
     }
 
     fn require_revision(registration: &Registration, requested: u64) -> Result<(), FabricError> {
@@ -570,6 +921,30 @@ impl MemoryFabric {
         Ok(())
     }
 
+    fn validate_handshake_descriptor(
+        registered: &ProviderDescriptor,
+        accepted_state_generation: u64,
+        returned: &ProviderDescriptor,
+    ) -> Result<(), FabricError> {
+        let immutable_fields_match = registered.provider_id == returned.provider_id
+            && registered.implementation_identity_sha256 == returned.implementation_identity_sha256
+            && registered.state_schema_version == returned.state_schema_version
+            && registered.protocol_major == returned.protocol_major
+            && registered.protocol_minor == returned.protocol_minor
+            && registered.capabilities == returned.capabilities
+            && registered.limits == returned.limits;
+        if !immutable_fields_match {
+            return Err(FabricError::SuccessfulHandshakeDescriptorMismatch);
+        }
+        if returned.state_generation < accepted_state_generation {
+            return Err(FabricError::SuccessfulHandshakeStateGenerationRegressed {
+                accepted: accepted_state_generation,
+                returned: returned.state_generation,
+            });
+        }
+        Ok(())
+    }
+
     fn require_call_capabilities(
         descriptor: &ProviderDescriptor,
         call: &ProviderCall,
@@ -602,6 +977,39 @@ impl MemoryFabric {
         }
     }
 
+    fn require_handshake_text<'a>(
+        value: Option<&'a str>,
+        field: &'static str,
+        maximum: Option<usize>,
+    ) -> Result<&'a str, FabricError> {
+        match value {
+            None | Some("") => Err(ApiError::EmptyField(field).into()),
+            Some(value) if value.trim() != value || value.chars().any(char::is_control) => {
+                Err(ApiError::NonCanonicalTerminalText(field).into())
+            }
+            Some(value) if maximum.is_some_and(|maximum| value.len() > maximum) => {
+                Err(ApiError::TerminalTextTooLong {
+                    field,
+                    maximum: maximum.unwrap_or(usize::MAX),
+                }
+                .into())
+            }
+            Some(value) => Ok(value),
+        }
+    }
+
+    fn require_sha256(value: &str, field: &'static str) -> Result<(), FabricError> {
+        let valid = value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if valid {
+            Ok(())
+        } else {
+            Err(ApiError::InvalidSha256(field).into())
+        }
+    }
+
     fn validate_operation_id(expected: &str, returned: &str) -> Result<(), FabricError> {
         if expected == returned {
             Ok(())
@@ -619,6 +1027,7 @@ impl MemoryFabric {
         expected_operation_id: &str,
         exact_scope: &OwnedExactScope,
         terminal: &TerminalRecord,
+        expected_state_generation: Option<u64>,
         reported_state_generation: Option<u64>,
     ) -> Result<(), FabricError> {
         if terminal.operation() != expected_operation {
@@ -667,6 +1076,20 @@ impl MemoryFabric {
             terminal.exact_scope_sha256(),
             terminal.diagnostic_id().map(str::to_owned),
         )?;
+        if let Some(expected) = expected_state_generation {
+            match terminal.committed_effect().state_generation_before() {
+                Some(evidence) if evidence != expected => {
+                    return Err(FabricError::ResponseStateGenerationMismatch {
+                        evidence,
+                        reported: expected,
+                    });
+                }
+                None => {
+                    return Err(FabricError::ResponseStateGenerationBeforeMissing { expected });
+                }
+                Some(_) => {}
+            }
+        }
         Self::validate_state_generation(terminal, reported_state_generation)
     }
 
@@ -680,6 +1103,9 @@ impl MemoryFabric {
         ) {
             (Some(evidence), Some(reported)) if evidence != reported => {
                 Err(FabricError::ResponseStateGenerationMismatch { evidence, reported })
+            }
+            (None, Some(reported)) => {
+                Err(FabricError::ResponseStateGenerationAfterMissing { reported })
             }
             _ => Ok(()),
         }
