@@ -157,6 +157,9 @@ def base_policy() -> dict[str, Any]:
         "crates/tracedecay-memory-conformance/**",
         "crates/tracedecay/tests/product_memory_provider/**",
         "crates/tracedecay/tests/product_memory_provider_*.rs",
+        "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
+        "crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs",
+        "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs",
     ]
     return {
         "schema_version": 1,

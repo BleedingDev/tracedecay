@@ -128,7 +128,10 @@
       "ownership_class": "product_owned",
       "feature": "native-memory-adapter",
       "path_patterns": [
-        "crates/tracedecay-memory-provider-native/**"
+        "crates/tracedecay-memory-provider-native/**",
+        "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
+        "crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs",
+        "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs"
       ],
       "touch_points": [
         "workspace_wiring",
@@ -136,15 +139,23 @@
       ],
       "bead_ids": [
         "tdmem-0303",
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0401",
+        "tdmem-0402",
+        "tdmem-0403",
+        "tdmem-0405",
+        "tdmem-1204"
       ],
-      "rationale": "Adapt canonical Native application operations without moving Native persistence authority into the provider layer.",
+      "rationale": "Adapt canonical Native application operations through one root-private application port while keeping its implementation and parity fixtures explicitly product-owned.",
       "semantic_invariants": [
         "The adapter delegates all canonical effects through the injected Native application port.",
-        "Provider terminals cannot claim effects that the Native application port did not report."
+        "Provider terminals cannot claim effects that the Native application port did not report.",
+        "Native recall is read-only, exact-scope bound, and semantically equal to the direct Native search after ADR-documented envelope normalization."
       ],
       "tests": [
-        "cargo test -p tracedecay-memory-provider-native --locked"
+        "cargo test -p tracedecay-memory-provider-native --locked",
+        "cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_recall_ -- --nocapture",
+        "python3 tests/product_memory_composition_feature_test.py"
       ],
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
       "upstreamability": {
@@ -366,6 +377,8 @@
         "crates/tracedecay/Cargo.toml",
         "crates/tracedecay/src/daemon/project_composition.rs",
         "crates/tracedecay/src/daemon/tests/ownership.rs",
+        "crates/tracedecay/src/daemon/retained_owner.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs",
         "crates/tracedecay/src/mcp/server.rs",
         "crates/tracedecay/src/mcp/server/construction.rs"
       ],
@@ -374,16 +387,28 @@
       ],
       "bead_ids": [
         "tdmem-0307",
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0401",
+        "tdmem-0402",
+        "tdmem-0403",
+        "tdmem-0404",
+        "tdmem-0405",
+        "tdmem-1204"
       ],
-      "rationale": "Track the exact default-off host feature, project composition, retained ownership proof, and MCP construction seam as one removable mount.",
+      "rationale": "Track the exact default-off host feature, project composition, and the two upstream retained-owner seams that expose existing Native authority to the optional provider host.",
       "semantic_invariants": [
         "Disabled composition creates no provider registry, adapter, storage, queue, or background work.",
         "The provider host mount is retained and retired with exactly one cached project server.",
-        "No concrete provider implementation leaks into MCP routes or public host contracts."
+        "No concrete provider implementation leaks into MCP routes or public host contracts; product-owned Native adapter and test files remain outside this upstream area."
       ],
       "tests": [
-        "cargo test -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss --locked"
+        "cargo test -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss --locked",
+        "cargo test --locked -p tracedecay --features memory-provider-host native_observe_verifies_real_store_without_writing",
+        "cargo test --locked -p tracedecay --features memory-provider-host native_recall_current_preserves_order_and_projects_native_score_explain_provenance",
+        "cargo test --locked -p tracedecay --features memory-provider-host native_recall_does_not_mutate_authoritative_fact_telemetry_or_history",
+        "cargo test --locked -p tracedecay --features memory-provider-host native_recall_matches_direct_search_semantically_on_identical_stores",
+        "python3 tests/product_memory_composition_feature_test.py",
+        "python3 tests/product_memory_fabric_disabled_mode_test.py"
       ],
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
       "upstreamability": {
@@ -687,6 +712,82 @@
       "upstreamability": {
         "kind": "minimal_mount",
         "rationale": "The optional construction field is a bounded transport for project ownership and can be removed atomically."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/retained_owner.rs",
+      "area_id": "composition_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_composition_mount",
+      "rationale": "Gate the retained Native application authority and its direct parity module at the daemon composition boundary so provider behavior is opt-in and removable.",
+      "semantic_invariants": [
+        "Upstream behavior: retained project and profile operations continue to resolve through the owner-bound Native memory authority when the provider host feature is absent.",
+        "Enabled product behavior: memory-provider-host gates only the Native adapter module and parity fixture; provider calls remain behind registry composition and cannot replace canonical Native ownership.",
+        "The retained owner keeps exact project scope, request admission, cancellation, deadlines, receipts, and terminal mappings independent of provider availability."
+      ],
+      "verification": [
+        "git diff --check",
+        "python3 scripts/product/check-memory-composition-feature.py --repo .",
+        "python3 scripts/product/check-upstream-ownership-registry.py --repo ."
+      ],
+      "tests": [
+        "python3 tests/product_memory_composition_feature_test.py",
+        "python3 tests/product_memory_fabric_disabled_mode_test.py",
+        "cargo test --locked -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss"
+      ],
+      "bead_ids": [
+        "tdmem-0401",
+        "tdmem-0402",
+        "tdmem-0403",
+        "tdmem-0404",
+        "tdmem-0405",
+        "tdmem-1204"
+      ],
+      "line_budget": 12,
+      "rebase_or_removal_plan": "Remove the two feature-gated module declarations and parity module path while leaving all existing retained project/profile authorities and their disabled behavior unchanged.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "minimal_mount",
+        "rationale": "The module declarations are the narrow host seam that makes Native provider behavior available only through the optional composition feature."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/retained_owner/memory.rs",
+      "area_id": "composition_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_composition_mount",
+      "rationale": "Expose the existing owner-bound MemoryApplication constructor to the Native provider bridge without introducing a second fact writer or bypassing retained-surface admission.",
+      "semantic_invariants": [
+        "Upstream behavior: retained memory operations still select the exact project or profile database and preserve owner, scope, deadline, cancellation, receipt, and append-only semantics.",
+        "Enabled product behavior: the Native application port reuses the same MemoryApplication authority for settled reads while provider recall and observation remain advisory and bounded.",
+        "Canonical Native facts, lineage, telemetry, feedback, and history remain writable only through the existing owner-bound application and store path."
+      ],
+      "verification": [
+        "git diff --check",
+        "python3 scripts/product/check-memory-composition-feature.py --repo .",
+        "python3 scripts/product/check-upstream-ownership-registry.py --repo ."
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host native_observe_verifies_real_store_without_writing",
+        "cargo test --locked -p tracedecay --features memory-provider-host native_recall_current_preserves_order_and_projects_native_score_explain_provenance",
+        "cargo test --locked -p tracedecay --features memory-provider-host native_recall_does_not_mutate_authoritative_fact_telemetry_or_history"
+      ],
+      "bead_ids": [
+        "tdmem-0401",
+        "tdmem-0402",
+        "tdmem-0405",
+        "tdmem-1204"
+      ],
+      "line_budget": 12,
+      "rebase_or_removal_plan": "Revert only the constructor visibility change after the Native bridge no longer needs the retained owner's existing MemoryApplication authority; preserve every retained operation and its canonical write path.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Reusing the existing owner-bound application constructor is a small, provider-neutral composition seam that preserves Native authority."
       }
     },
     {
