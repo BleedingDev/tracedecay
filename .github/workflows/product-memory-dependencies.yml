@@ -6,6 +6,7 @@ name: Product memory dependency policy
 on:
   push:
     branches:
+      - master
       - feat/pluggable-memory-providers-v2
   pull_request:
 
@@ -19,6 +20,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Validate workflow trigger contract
+        run: python3 tests/product_memory_dependencies_workflow_test.py
       - name: Validate dependency policy fixtures
         run: python3 tests/product_memory_dependency_policy_test.py
       - name: Validate real workspace dependency graph
