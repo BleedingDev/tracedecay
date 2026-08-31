@@ -112,7 +112,16 @@ class MemoryFabricDisabledModeTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(
             _compact(calls[0]),
-            "tracedecay_memory_provider_registry::NativeProviderActivation::Disabled,",
+            "activation,&cg,canonical_project_path",
+        )
+
+        production_entry = _rust_body(
+            self.composition,
+            "pub(super) async fn production_project_server(",
+        )
+        self.assertIn(
+            "ProjectMemoryProviderActivation::Disabled,",
+            _compact(production_entry),
         )
 
         mount = _rust_body(
