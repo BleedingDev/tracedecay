@@ -36,6 +36,18 @@ pub const NATIVE_PROVIDER_ID: &str = "tracedecay.native";
 /// Provider-neutral contract carried by an admitted observation call.
 pub const OBSERVATION_CONTRACT_ID: &str = "tracedecay.memory.provider.observation.v1";
 
+const HANDSHAKE_CONTRACT_ID: &str = "tracedecay.memory.provider.handshake.v1";
+const HEALTH_CONTRACT_ID: &str = "tracedecay.memory.provider.health.v1";
+const RECALL_CONTRACT_ID: &str = "tracedecay.memory.provider.recall.v1";
+const FEEDBACK_CONTRACT_ID: &str = "tracedecay.memory.provider.feedback.v1";
+const MAINTENANCE_CONTRACT_ID: &str = "tracedecay.memory.provider.maintenance.v1";
+const INSPECTION_CONTRACT_ID: &str = "tracedecay.memory.provider.inspection.v1";
+const CORRECTION_CONTRACT_ID: &str = "tracedecay.memory.provider.correction.v1";
+const DELETE_BY_SOURCE_CONTRACT_ID: &str = "tracedecay.memory.provider.deletion-by-source.v1";
+const SNAPSHOT_EXPORT_CONTRACT_ID: &str = "tracedecay.memory.provider.snapshot-export.v1";
+const SNAPSHOT_RESTORE_CONTRACT_ID: &str = "tracedecay.memory.provider.snapshot-restore.v1";
+const REPLAY_CONTRACT_ID: &str = "tracedecay.memory.provider.replay.v1";
+
 /// Construction failure before a Native adapter can be registered.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeAdapterError {
@@ -100,8 +112,29 @@ pub trait NativeMemoryApplicationPort: Send + Sync + 'static {
     /// evidence, temporal state, and provenance in the canonical payload.
     fn recall(&self, call: &ProviderCall) -> ProviderReply;
 
-    /// Executes one declared optional Native lifecycle or inspection operation.
-    fn lifecycle(&self, call: &ProviderCall) -> ProviderReply;
+    /// Records one declared optional Native feedback operation.
+    fn feedback(&self, call: &ProviderCall) -> ProviderReply;
+
+    /// Runs one declared optional Native maintenance operation.
+    fn maintenance(&self, call: &ProviderCall) -> ProviderReply;
+
+    /// Performs one declared optional redacted Native inspection.
+    fn inspection(&self, call: &ProviderCall) -> ProviderReply;
+
+    /// Applies one declared optional Native correction.
+    fn correction(&self, call: &ProviderCall) -> ProviderReply;
+
+    /// Deletes Native memory admitted under one declared source identity.
+    fn delete_by_source(&self, call: &ProviderCall) -> ProviderReply;
+
+    /// Exports one declared optional Native snapshot.
+    fn snapshot_export(&self, call: &ProviderCall) -> ProviderReply;
+
+    /// Restores one declared optional Native snapshot.
+    fn snapshot_restore(&self, call: &ProviderCall) -> ProviderReply;
+
+    /// Applies one declared optional deterministic Native replay.
+    fn replay(&self, call: &ProviderCall) -> ProviderReply;
 }
 
 /// Provider-neutral TraceDecay Native adapter over one existing application
@@ -202,12 +235,16 @@ impl NativeProvider {
         }
     }
 
-    fn validate_observation(&self, call: &ProviderCall) -> Option<ProviderReply> {
-        if !valid_generic_observation_payload(call) {
+    fn validate_payload_contract(&self, call: &ProviderCall) -> Option<ProviderReply> {
+        if call.payload.contract_id.as_str() != canonical_payload_contract_id(call.operation) {
             return Some(self.reject(
                 call,
                 TerminalCode::InvalidRequest,
-                "native.observation_contract_invalid",
+                if call.operation == ProviderOperation::Observe {
+                    "native.observation_contract_invalid"
+                } else {
+                    "native.payload_contract_invalid"
+                },
             ));
         }
         None
@@ -301,17 +338,15 @@ impl MemoryProvider for NativeProvider {
                 "native.handshake_requires_handshake_port",
             );
         }
-        if call.operation == ProviderOperation::Observe
-            && let Some(rejection) = self.validate_observation(call)
-        {
-            return rejection;
-        }
         if !self.descriptor.supports(call.operation.capability_id()) {
             return self.reject(
                 call,
                 TerminalCode::CapabilityUnsupported,
                 "native.capability_unsupported",
             );
+        }
+        if let Some(rejection) = self.validate_payload_contract(call) {
+            return rejection;
         }
         match self.refresh_descriptor() {
             Some(_) => {}
@@ -327,14 +362,14 @@ impl MemoryProvider for NativeProvider {
             ProviderOperation::Health => self.port.health(call),
             ProviderOperation::Observe => self.port.observe(call),
             ProviderOperation::Recall => self.port.recall(call),
-            ProviderOperation::Feedback
-            | ProviderOperation::Maintenance
-            | ProviderOperation::Inspection
-            | ProviderOperation::Correction
-            | ProviderOperation::DeleteBySource
-            | ProviderOperation::SnapshotExport
-            | ProviderOperation::SnapshotRestore
-            | ProviderOperation::Replay => self.port.lifecycle(call),
+            ProviderOperation::Feedback => self.port.feedback(call),
+            ProviderOperation::Maintenance => self.port.maintenance(call),
+            ProviderOperation::Inspection => self.port.inspection(call),
+            ProviderOperation::Correction => self.port.correction(call),
+            ProviderOperation::DeleteBySource => self.port.delete_by_source(call),
+            ProviderOperation::SnapshotExport => self.port.snapshot_export(call),
+            ProviderOperation::SnapshotRestore => self.port.snapshot_restore(call),
+            ProviderOperation::Replay => self.port.replay(call),
             ProviderOperation::Handshake => self.reject(
                 call,
                 TerminalCode::InvalidRequest,
@@ -354,6 +389,19 @@ fn same_immutable_descriptor(left: &ProviderDescriptor, right: &ProviderDescript
         && left.limits == right.limits
 }
 
-fn valid_generic_observation_payload(call: &ProviderCall) -> bool {
-    call.payload.contract_id.as_str() == OBSERVATION_CONTRACT_ID && call.validate().is_ok()
+const fn canonical_payload_contract_id(operation: ProviderOperation) -> &'static str {
+    match operation {
+        ProviderOperation::Handshake => HANDSHAKE_CONTRACT_ID,
+        ProviderOperation::Health => HEALTH_CONTRACT_ID,
+        ProviderOperation::Observe => OBSERVATION_CONTRACT_ID,
+        ProviderOperation::Recall => RECALL_CONTRACT_ID,
+        ProviderOperation::Feedback => FEEDBACK_CONTRACT_ID,
+        ProviderOperation::Maintenance => MAINTENANCE_CONTRACT_ID,
+        ProviderOperation::Inspection => INSPECTION_CONTRACT_ID,
+        ProviderOperation::Correction => CORRECTION_CONTRACT_ID,
+        ProviderOperation::DeleteBySource => DELETE_BY_SOURCE_CONTRACT_ID,
+        ProviderOperation::SnapshotExport => SNAPSHOT_EXPORT_CONTRACT_ID,
+        ProviderOperation::SnapshotRestore => SNAPSHOT_RESTORE_CONTRACT_ID,
+        ProviderOperation::Replay => REPLAY_CONTRACT_ID,
+    }
 }

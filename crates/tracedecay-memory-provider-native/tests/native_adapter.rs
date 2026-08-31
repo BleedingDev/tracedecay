@@ -33,7 +33,33 @@ struct Counters {
     health: AtomicUsize,
     observe: AtomicUsize,
     recall: AtomicUsize,
-    lifecycle: AtomicUsize,
+    feedback: AtomicUsize,
+    maintenance: AtomicUsize,
+    inspection: AtomicUsize,
+    correction: AtomicUsize,
+    delete_by_source: AtomicUsize,
+    snapshot_export: AtomicUsize,
+    snapshot_restore: AtomicUsize,
+    replay: AtomicUsize,
+}
+
+impl Counters {
+    fn operation_calls(&self, operation: ProviderOperation) -> usize {
+        match operation {
+            ProviderOperation::Handshake => self.handshake.load(Ordering::Relaxed),
+            ProviderOperation::Health => self.health.load(Ordering::Relaxed),
+            ProviderOperation::Observe => self.observe.load(Ordering::Relaxed),
+            ProviderOperation::Recall => self.recall.load(Ordering::Relaxed),
+            ProviderOperation::Feedback => self.feedback.load(Ordering::Relaxed),
+            ProviderOperation::Maintenance => self.maintenance.load(Ordering::Relaxed),
+            ProviderOperation::Inspection => self.inspection.load(Ordering::Relaxed),
+            ProviderOperation::Correction => self.correction.load(Ordering::Relaxed),
+            ProviderOperation::DeleteBySource => self.delete_by_source.load(Ordering::Relaxed),
+            ProviderOperation::SnapshotExport => self.snapshot_export.load(Ordering::Relaxed),
+            ProviderOperation::SnapshotRestore => self.snapshot_restore.load(Ordering::Relaxed),
+            ProviderOperation::Replay => self.replay.load(Ordering::Relaxed),
+        }
+    }
 }
 
 struct MockNativePort {
@@ -196,8 +222,56 @@ impl NativeMemoryApplicationPort for MockNativePort {
         self.terminal(call, TerminalCode::Success)
     }
 
-    fn lifecycle(&self, call: &ProviderCall) -> ProviderReply {
-        self.counters.lifecycle.fetch_add(1, Ordering::Relaxed);
+    fn feedback(&self, call: &ProviderCall) -> ProviderReply {
+        self.counters.feedback.fetch_add(1, Ordering::Relaxed);
+        self.record(call);
+        self.terminal(call, TerminalCode::Success)
+    }
+
+    fn maintenance(&self, call: &ProviderCall) -> ProviderReply {
+        self.counters.maintenance.fetch_add(1, Ordering::Relaxed);
+        self.record(call);
+        self.terminal(call, TerminalCode::Success)
+    }
+
+    fn inspection(&self, call: &ProviderCall) -> ProviderReply {
+        self.counters.inspection.fetch_add(1, Ordering::Relaxed);
+        self.record(call);
+        self.terminal(call, TerminalCode::Success)
+    }
+
+    fn correction(&self, call: &ProviderCall) -> ProviderReply {
+        self.counters.correction.fetch_add(1, Ordering::Relaxed);
+        self.record(call);
+        self.terminal(call, TerminalCode::Success)
+    }
+
+    fn delete_by_source(&self, call: &ProviderCall) -> ProviderReply {
+        self.counters
+            .delete_by_source
+            .fetch_add(1, Ordering::Relaxed);
+        self.record(call);
+        self.terminal(call, TerminalCode::Success)
+    }
+
+    fn snapshot_export(&self, call: &ProviderCall) -> ProviderReply {
+        self.counters
+            .snapshot_export
+            .fetch_add(1, Ordering::Relaxed);
+        self.record(call);
+        self.terminal(call, TerminalCode::Success)
+    }
+
+    fn snapshot_restore(&self, call: &ProviderCall) -> ProviderReply {
+        self.counters
+            .snapshot_restore
+            .fetch_add(1, Ordering::Relaxed);
+        self.record(call);
+        self.terminal(call, TerminalCode::Success)
+    }
+
+    fn replay(&self, call: &ProviderCall) -> ProviderReply {
+        self.counters.replay.fetch_add(1, Ordering::Relaxed);
         self.record(call);
         self.terminal(call, TerminalCode::Success)
     }
@@ -244,6 +318,36 @@ fn operation_contract_id(operation: ProviderOperation) -> &'static str {
         ProviderOperation::SnapshotRestore => "tracedecay.memory.provider.snapshot-restore.v1",
         ProviderOperation::Replay => "tracedecay.memory.provider.replay.v1",
     }
+}
+
+fn optional_provider_operations() -> [(ProviderOperation, &'static str); 8] {
+    [
+        (ProviderOperation::Feedback, "feedback.record.v1"),
+        (ProviderOperation::Maintenance, "maintenance.run.v1"),
+        (ProviderOperation::Inspection, "inspection.read.v1"),
+        (ProviderOperation::Correction, "correction.apply.v1"),
+        (ProviderOperation::DeleteBySource, "deletion.by_source.v1"),
+        (ProviderOperation::SnapshotExport, "snapshot.export.v1"),
+        (ProviderOperation::SnapshotRestore, "snapshot.restore.v1"),
+        (ProviderOperation::Replay, "replay.apply.v1"),
+    ]
+}
+
+fn all_provider_operations() -> [ProviderOperation; 12] {
+    [
+        ProviderOperation::Handshake,
+        ProviderOperation::Health,
+        ProviderOperation::Observe,
+        ProviderOperation::Recall,
+        ProviderOperation::Feedback,
+        ProviderOperation::Maintenance,
+        ProviderOperation::Inspection,
+        ProviderOperation::Correction,
+        ProviderOperation::DeleteBySource,
+        ProviderOperation::SnapshotExport,
+        ProviderOperation::SnapshotRestore,
+        ProviderOperation::Replay,
+    ]
 }
 
 fn call(provider_id: &str, operation: ProviderOperation) -> ProviderCall {
@@ -340,7 +444,10 @@ fn descriptor_generation_advances_without_changing_immutable_fields() {
     let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Feedback);
     let reply = provider.invoke(&request);
     assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
-    assert_eq!(port.counters.lifecycle.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        port.counters.operation_calls(ProviderOperation::Feedback),
+        1
+    );
     assert_eq!(port.counters.descriptor.load(Ordering::Relaxed), 3);
 }
 
@@ -379,7 +486,10 @@ fn descriptor_immutable_drift_is_blocked_before_operation_dispatch() {
             reply.terminal.diagnostic_id(),
             Some("native.descriptor_drift")
         );
-        assert_eq!(port.counters.lifecycle.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            port.counters.operation_calls(ProviderOperation::Feedback),
+            0
+        );
     }
 }
 
@@ -620,8 +730,70 @@ fn mutated_operation_envelopes_fail_before_all_native_contact() {
     assert_eq!(port.counters.health.load(Ordering::Relaxed), 0);
     assert_eq!(port.counters.observe.load(Ordering::Relaxed), 0);
     assert_eq!(port.counters.recall.load(Ordering::Relaxed), 0);
-    assert_eq!(port.counters.lifecycle.load(Ordering::Relaxed), 0);
+    for operation in all_provider_operations() {
+        assert_eq!(port.counters.operation_calls(operation), 0);
+    }
     assert!(port.last_call.lock().expect("last call lock").is_none());
+}
+
+#[test]
+fn wrong_payload_contract_for_every_invokable_operation_is_invalid_without_port_contact() {
+    let optional_operations = optional_provider_operations();
+    let capabilities = optional_operations
+        .iter()
+        .map(|(_, capability)| *capability)
+        .collect::<Vec<_>>();
+    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &capabilities));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+    let descriptor_calls = port.counters.descriptor.load(Ordering::Relaxed);
+
+    for operation in all_provider_operations()
+        .into_iter()
+        .filter(|operation| *operation != ProviderOperation::Handshake)
+    {
+        let mut request = call(NATIVE_PROVIDER_ID, operation);
+        let wrong_contract_id =
+            if operation_contract_id(operation) == "tracedecay.memory.provider.recall.v1" {
+                "tracedecay.memory.provider.health.v1"
+            } else {
+                "tracedecay.memory.provider.recall.v1"
+            };
+        request.payload.contract_id =
+            OwnedVersionedId::new(wrong_contract_id).expect("wrong payload contract");
+
+        let reply = provider.invoke(&request);
+        assert_eq!(reply.terminal.operation(), operation);
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
+        assert_eq!(
+            reply.terminal.diagnostic_id(),
+            Some(if operation == ProviderOperation::Observe {
+                "native.observation_contract_invalid"
+            } else {
+                "native.payload_contract_invalid"
+            })
+        );
+        assert_eq!(
+            reply.terminal.committed_effect().state(),
+            CommittedEffectState::None
+        );
+        assert_eq!(reply.terminal.provider_receipt_sha256(), None);
+        assert_eq!(reply.payload, None);
+    }
+
+    for operation in all_provider_operations() {
+        assert_eq!(port.counters.operation_calls(operation), 0);
+    }
+    assert_eq!(
+        port.counters.descriptor.load(Ordering::Relaxed),
+        descriptor_calls
+    );
+    assert!(port.last_call.lock().expect("last call lock").is_none());
+    assert!(
+        port.last_handshake
+            .lock()
+            .expect("last handshake lock")
+            .is_none()
+    );
 }
 
 #[test]
@@ -695,94 +867,129 @@ fn supported_mandatory_operations_route_without_payload_transformation() {
 }
 
 #[test]
-fn declared_optional_operation_routes_to_lifecycle_port() {
-    let port = Arc::new(MockNativePort::new(
-        NATIVE_PROVIDER_ID,
-        &["feedback.record.v1"],
-    ));
+fn declared_optional_operations_route_only_to_their_dedicated_ports() {
+    let optional_operations = optional_provider_operations();
+    let capabilities = optional_operations
+        .iter()
+        .map(|(_, capability)| *capability)
+        .collect::<Vec<_>>();
+    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &capabilities));
     let provider = NativeProvider::new(port.clone()).expect("adapter");
-    let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Feedback);
-    let reply = provider.invoke(&request);
-    assert_eq!(reply.terminal.operation(), request.operation);
-    assert_eq!(reply.terminal.provider_id().as_str(), NATIVE_PROVIDER_ID);
-    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
-    assert_eq!(
-        reply.terminal.committed_effect().state(),
-        CommittedEffectState::Committed
-    );
-    assert_eq!(
-        reply.terminal.committed_effect().state_generation_before(),
-        Some(request.expected_state_generation)
-    );
-    assert_eq!(
-        reply.terminal.committed_effect().state_generation_after(),
-        Some(request.expected_state_generation + 1)
-    );
-    assert_eq!(
-        reply.terminal.committed_effect().committed_item_refs(),
-        std::slice::from_ref(&request.operation_id)
-    );
-    assert_eq!(reply.terminal.provider_receipt_sha256(), Some(ONE_SHA));
-    assert_eq!(
-        reply.terminal.committed_effect().verification_sha256(),
-        Some(ONE_SHA)
-    );
-    assert_eq!(
-        reply.state_generation,
-        request.expected_state_generation + 1
-    );
-    assert_eq!(
-        reply.terminal.fallback().eligibility(),
-        FallbackEligibility::Forbidden
-    );
-    assert_eq!(port.counters.lifecycle.load(Ordering::Relaxed), 1);
+
+    for (operation_index, (operation, _)) in optional_operations.into_iter().enumerate() {
+        let request = call(NATIVE_PROVIDER_ID, operation);
+        let reply = provider.invoke(&request);
+        assert_eq!(reply.terminal.operation(), request.operation);
+        assert_eq!(reply.terminal.provider_id().as_str(), NATIVE_PROVIDER_ID);
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+        if operation.mutates_provider_state() {
+            assert_eq!(
+                reply.terminal.committed_effect().state(),
+                CommittedEffectState::Committed
+            );
+            assert_eq!(
+                reply.terminal.committed_effect().state_generation_after(),
+                Some(request.expected_state_generation + 1)
+            );
+            assert_eq!(reply.terminal.provider_receipt_sha256(), Some(ONE_SHA));
+        } else {
+            assert_eq!(
+                reply.terminal.committed_effect().state(),
+                CommittedEffectState::None
+            );
+            assert_eq!(
+                reply.terminal.committed_effect().state_generation_after(),
+                Some(request.expected_state_generation)
+            );
+            assert_eq!(reply.terminal.provider_receipt_sha256(), None);
+        }
+        assert_eq!(
+            reply.terminal.committed_effect().state_generation_before(),
+            Some(request.expected_state_generation)
+        );
+        assert_eq!(
+            reply.terminal.fallback().eligibility(),
+            FallbackEligibility::Forbidden
+        );
+
+        for (counter_index, (routed_operation, _)) in
+            optional_provider_operations().into_iter().enumerate()
+        {
+            assert_eq!(
+                port.counters.operation_calls(routed_operation),
+                usize::from(counter_index <= operation_index),
+                "{operation:?} reached the wrong application-port method"
+            );
+        }
+    }
 }
 
 #[test]
-fn undeclared_optional_operation_is_explicitly_unsupported() {
+fn undeclared_optional_operations_are_unsupported_without_port_contact() {
     let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
     let provider = NativeProvider::new(port.clone()).expect("adapter");
-    let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Maintenance);
     let descriptor_calls = port.counters.descriptor.load(Ordering::Relaxed);
-    let reply = provider.invoke(&request);
-    assert_eq!(reply.terminal.operation(), request.operation);
-    assert_eq!(reply.terminal.provider_id().as_str(), NATIVE_PROVIDER_ID);
-    assert_eq!(
-        reply.terminal.terminal_code(),
-        TerminalCode::CapabilityUnsupported
-    );
-    assert_eq!(
-        reply.terminal.committed_effect().state(),
-        CommittedEffectState::None
-    );
-    assert_eq!(
-        reply.terminal.committed_effect().state_generation_before(),
-        None
-    );
-    assert_eq!(
-        reply.terminal.committed_effect().state_generation_after(),
-        None
-    );
-    assert_eq!(
-        reply.terminal.fallback().eligibility(),
-        FallbackEligibility::Forbidden
-    );
-    assert_eq!(reply.terminal.fallback().policy(), None);
-    assert_eq!(reply.terminal.fallback().reason(), None);
-    assert_eq!(
-        reply.terminal.diagnostic_id(),
-        Some("native.capability_unsupported")
-    );
-    assert_eq!(
-        reply.terminal.exact_scope_sha256(),
-        request.exact_scope.exact_scope_sha256()
-    );
-    assert_eq!(reply.state_generation, request.expected_state_generation);
-    assert_eq!(port.counters.lifecycle.load(Ordering::Relaxed), 0);
+
+    for (operation, _) in optional_provider_operations() {
+        let request = call(NATIVE_PROVIDER_ID, operation);
+        let reply = provider.invoke(&request);
+        assert_eq!(reply.terminal.operation(), request.operation);
+        assert_eq!(reply.terminal.provider_id().as_str(), NATIVE_PROVIDER_ID);
+        assert_eq!(
+            reply.terminal.terminal_code(),
+            TerminalCode::CapabilityUnsupported
+        );
+        assert_eq!(
+            reply.terminal.committed_effect().state(),
+            CommittedEffectState::None
+        );
+        assert_eq!(
+            reply.terminal.committed_effect().state_generation_before(),
+            None
+        );
+        assert_eq!(
+            reply.terminal.committed_effect().state_generation_after(),
+            None
+        );
+        assert_eq!(
+            reply.terminal.fallback().eligibility(),
+            FallbackEligibility::Forbidden
+        );
+        assert_eq!(reply.terminal.fallback().policy(), None);
+        assert_eq!(reply.terminal.fallback().reason(), None);
+        assert_eq!(
+            reply.terminal.diagnostic_id(),
+            Some("native.capability_unsupported")
+        );
+        assert_eq!(
+            reply.terminal.exact_scope_sha256(),
+            request.exact_scope.exact_scope_sha256()
+        );
+        assert_eq!(reply.state_generation, request.expected_state_generation);
+
+        let mut wrong_contract = request;
+        wrong_contract.payload.contract_id =
+            OwnedVersionedId::new("tracedecay.memory.provider.health.v1")
+                .expect("wrong payload contract");
+        let wrong_contract_reply = provider.invoke(&wrong_contract);
+        assert_eq!(
+            wrong_contract_reply.terminal.terminal_code(),
+            TerminalCode::CapabilityUnsupported
+        );
+        assert_eq!(
+            wrong_contract_reply.terminal.diagnostic_id(),
+            Some("native.capability_unsupported")
+        );
+    }
+
+    for operation in all_provider_operations() {
+        assert_eq!(port.counters.operation_calls(operation), 0);
+    }
     assert_eq!(
         port.counters.descriptor.load(Ordering::Relaxed),
         descriptor_calls
     );
+    assert!(port.last_call.lock().expect("last call lock").is_none());
 }
 
 #[test]
@@ -813,7 +1020,9 @@ fn wrong_target_identity_is_rejected_before_native_operation() {
 fn handshake_operation_must_use_the_handshake_method() {
     let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
     let provider = NativeProvider::new(port.clone()).expect("adapter");
-    let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Handshake);
+    let mut request = call(NATIVE_PROVIDER_ID, ProviderOperation::Handshake);
+    request.payload.contract_id =
+        OwnedVersionedId::new("tracedecay.memory.provider.recall.v1").expect("wrong contract");
     let reply = provider.invoke(&request);
     assert_eq!(reply.terminal.operation(), ProviderOperation::Handshake);
     assert_eq!(reply.terminal.provider_id().as_str(), NATIVE_PROVIDER_ID);

@@ -66,7 +66,35 @@ impl NativeMemoryApplicationPort for MockNativePort {
         unexpected_provider_contact()
     }
 
-    fn lifecycle(&self, _call: &ProviderCall) -> ProviderReply {
+    fn feedback(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn maintenance(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn inspection(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn correction(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn delete_by_source(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn snapshot_export(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn snapshot_restore(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn replay(&self, _call: &ProviderCall) -> ProviderReply {
         unexpected_provider_contact()
     }
 }
@@ -209,7 +237,35 @@ impl NativeMemoryApplicationPort for EvidenceNativePort {
         unexpected_provider_contact()
     }
 
-    fn lifecycle(&self, _call: &ProviderCall) -> ProviderReply {
+    fn feedback(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn maintenance(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn inspection(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn correction(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn delete_by_source(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn snapshot_export(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn snapshot_restore(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected_provider_contact()
+    }
+
+    fn replay(&self, _call: &ProviderCall) -> ProviderReply {
         unexpected_provider_contact()
     }
 }
@@ -278,8 +334,18 @@ fn call_after_handshake(
         .expect("successful handshake descriptor")
         .state_generation;
     let payload_contract = match operation {
+        ProviderOperation::Handshake => "tracedecay.memory.provider.handshake.v1",
+        ProviderOperation::Health => "tracedecay.memory.provider.health.v1",
         ProviderOperation::Observe => "tracedecay.memory.provider.observation.v1",
-        _ => "tracedecay.memory.registry-test.request.v1",
+        ProviderOperation::Recall => "tracedecay.memory.provider.recall.v1",
+        ProviderOperation::Feedback => "tracedecay.memory.provider.feedback.v1",
+        ProviderOperation::Maintenance => "tracedecay.memory.provider.maintenance.v1",
+        ProviderOperation::Inspection => "tracedecay.memory.provider.inspection.v1",
+        ProviderOperation::Correction => "tracedecay.memory.provider.correction.v1",
+        ProviderOperation::DeleteBySource => "tracedecay.memory.provider.deletion-by-source.v1",
+        ProviderOperation::SnapshotExport => "tracedecay.memory.provider.snapshot-export.v1",
+        ProviderOperation::SnapshotRestore => "tracedecay.memory.provider.snapshot-restore.v1",
+        ProviderOperation::Replay => "tracedecay.memory.provider.replay.v1",
     };
 
     ProviderCall::new(ProviderCallParts {

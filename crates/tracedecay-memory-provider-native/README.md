@@ -6,11 +6,11 @@ The adapter:
 
 - accepts only a port that declares the stable `tracedecay.native` identity;
 - retains validated immutable identity, schema, protocol, capability, and limit fields while refreshing only monotonic Native state generation;
-- revalidates complete public handshake and operation envelopes before any Native application-port contact;
+- revalidates complete public handshake and operation envelopes, including the exact canonical payload contract for every operation, before any Native application-port contact;
 - routes mandatory health and recall calls without rewriting canonical payload or exact scope;
 - validates generic observation envelopes before forwarding them unchanged to the trusted Native application port;
 - requires that application authority to reject or stage non-equivalent observations and authorize promotion only through a typed Native path that preserves owner, provenance, trust, temporal state, idempotency, and durable receipts;
-- routes only declared optional lifecycle capabilities;
+- routes only declared optional lifecycle capabilities through operation-specific feedback, maintenance, inspection, correction, deletion-by-source, snapshot, and replay methods;
 - delegates dispatched-operation terminal records, provenance, receipts, scoring, and temporal state to the Native application authority while constructing zero-contact boundary rejections locally;
 - contains no TraceDecay database, store, graph, code-index, daemon, host, dashboard, transport, NCM, or OCEAN dependency.
 
