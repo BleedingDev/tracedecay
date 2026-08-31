@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "contract_id": "tracedecay.external-lesson-intake.v1",
+  "bead_id": "tdmem-1207",
+  "title": "Source-linked intake decisions for external implementation lessons",
+  "policy": {
+    "statuses": [
+      "accepted",
+      "rejected"
+    ],
+    "target_kinds": [
+      "capability",
+      "policy"
+    ],
+    "accepted_requires_neutral_regression_tests": true,
+    "source_specific_assumptions_boundary": "adapter_only",
+    "copied_external_code_policy": "recorded_license_and_provenance_required"
+  },
+  "lessons": [
+    {
+      "lesson_id": "biomem-side-effect-free-recall",
+      "status": "accepted",
+      "source": {
+        "repository": "https://github.com/bleedingDev/biomem",
+        "commit": "500847ff65b5d9548b3826fa29bf3ccf8d221147",
+        "identifiers": [
+          "biomem",
+          "ncm"
+        ],
+        "license": {
+          "identity": "MIT",
+          "provenance_statement": "The repository-local licensed-surface audit records the pinned source revision, package version, and MIT identity; this intake does not independently relicense or recertify the source.",
+          "evidence_path": "crates/tracedecay-memory-provider-ncm/audits/tdmem-0701-capability-matrix.json"
+        },
+        "evidence": [
+          {
+            "source_path": "src/memory_module/text_memory.py",
+            "source_url": "https://github.com/bleedingDev/biomem/blob/500847ff65b5d9548b3826fa29bf3ccf8d221147/src/memory_module/text_memory.py#L523-L573",
+            "local_evidence_path": "crates/tracedecay-memory-provider-ncm/audits/tdmem-0701-licensed-surface-audit.md",
+            "claim": "The audited search primitive is bounded and returns stable IDs, native scores, content, and provenance without recall-stat mutation."
+          }
+        ]
+      },
+      "extracted_generic_invariant": "Provider recall is a bounded advisory read and must not mutate provider state, host authority, or final context.",
+      "target": {
+        "kind": "capability",
+        "id": "recall.query.v1",
+        "contract_path": "product/contracts/memory-provider-v1/provider-recall-contract.json",
+        "mapping": "Choose an adapter-visible recall primitive only when its read semantics preserve the provider-neutral no-mutation contract."
+      },
+      "source_assumptions": [
+        {
+          "assumption": "The pinned source's search primitive avoids the recall-stat and session-cache effects present in its retrieve primitive.",
+          "adapter_boundary": "NcmCognitiveSurface",
+          "adapter_path": "crates/tracedecay-memory-provider-ncm/src/lib.rs"
+        }
+      ],
+      "neutral_regression_tests": [
+        {
+          "path": "tests/product_provider_recall_contract_test.py",
+          "proves": "The provider-neutral recall contract remains a bounded advisory read and forbids provider mutation authority and direct context injection."
+        }
+      ],
+      "implementation_bead": "tdmem-0705",
+      "code_use": {
+        "mode": "clean_reimplementation",
+        "external_code_copied": false,
+        "copy_records": [],
+        "note": "Only the generic invariant and the audited operation choice are accepted; no external implementation code is copied by this intake."
+      },
+      "decision": {
+        "rationale": "The audited operation shape preserves the already accepted provider-neutral recall semantics while leaving source-specific dispatch and result adaptation behind the concrete adapter.",
+        "rejection_rationale": null
+      }
+    },
+    {
+      "lesson_id": "biomem-retrieve-as-provider-recall",
+      "status": "rejected",
+      "source": {
+        "repository": "https://github.com/bleedingDev/biomem",
+        "commit": "500847ff65b5d9548b3826fa29bf3ccf8d221147",
+        "identifiers": [
+          "biomem",
+          "ncm"
+        ],
+        "license": {
+          "identity": "MIT",
+          "provenance_statement": "The repository-local licensed-surface audit records the pinned source revision, package version, and MIT identity; this intake does not independently relicense or recertify the source.",
+          "evidence_path": "crates/tracedecay-memory-provider-ncm/audits/tdmem-0701-capability-matrix.json"
+        },
+        "evidence": [
+          {
+            "source_path": "src/memory_module/text_memory.py",
+            "source_url": "https://github.com/bleedingDev/biomem/blob/500847ff65b5d9548b3826fa29bf3ccf8d221147/src/memory_module/text_memory.py#L437-L518",
+            "local_evidence_path": "crates/tracedecay-memory-provider-ncm/audits/tdmem-0701-licensed-surface-audit.md",
+            "claim": "The audited retrieve path writes session cache and increments recall statistics, so it is not a provider-neutral advisory read."
+          }
+        ]
+      },
+      "extracted_generic_invariant": "A provider recall primitive that mutates usage or session state cannot satisfy a no-mutation advisory-read capability.",
+      "target": {
+        "kind": "capability",
+        "id": "recall.query.v1",
+        "contract_path": "product/contracts/memory-provider-v1/provider-recall-contract.json",
+        "mapping": "Reject operation-name similarity when the candidate primitive has effects forbidden by the target capability."
+      },
+      "source_assumptions": [
+        {
+          "assumption": "The pinned source's retrieve operation has session-cache and usage-stat effects that are not part of the provider recall contract.",
+          "adapter_boundary": "NcmCognitiveSurface",
+          "adapter_path": "crates/tracedecay-memory-provider-ncm/src/lib.rs"
+        }
+      ],
+      "neutral_regression_tests": [],
+      "implementation_bead": "tdmem-0705",
+      "code_use": {
+        "mode": "none_rejected",
+        "external_code_copied": false,
+        "copy_records": [],
+        "note": "The source-specific operation mapping is rejected and no external implementation code is copied."
+      },
+      "decision": {
+        "rationale": "A similarly named source operation is not sufficient evidence that its effects match the target capability.",
+        "rejection_rationale": "The audited retrieve path mutates session and usage state, which violates the generic bounded advisory-read invariant and would weaken the common contract."
+      }
+    }
+  ]
+}
