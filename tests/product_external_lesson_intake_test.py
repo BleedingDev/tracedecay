@@ -170,6 +170,18 @@ class ExternalLessonIntakeTest(unittest.TestCase):
             "extracted_generic_invariant is source-specific", intake=intake
         )
 
+    def test_source_identifiers_are_derived_not_self_declared(self) -> None:
+        intake = self.mutate_lesson(
+            0,
+            lambda lesson: lesson["source"].__setitem__(
+                "identifiers", ["external-source"]
+            ),
+        )
+        self.assert_rejected(
+            "identifiers must exactly match repository and adapter identifiers",
+            intake=intake,
+        )
+
     def test_target_must_be_provider_neutral(self) -> None:
         intake = self.mutate_lesson(
             0,
@@ -183,6 +195,44 @@ class ExternalLessonIntakeTest(unittest.TestCase):
             lambda lesson: lesson["target"].__setitem__("id", "recall.unknown.v1"),
         )
         self.assert_rejected("contract_path does not record target id", intake=intake)
+
+    def test_capability_target_rejects_contract_readme(self) -> None:
+        intake = self.mutate_lesson(
+            0,
+            lambda lesson: lesson["target"].__setitem__(
+                "contract_path", "product/contracts/memory-provider-v1/README.md"
+            ),
+        )
+        self.assert_rejected(
+            "must name a canonical *-contract.json capability authority",
+            intake=intake,
+        )
+
+    def test_policy_target_rejects_unrelated_architecture_file(self) -> None:
+        def mutate(lesson: dict[str, Any]) -> None:
+            lesson["target"]["kind"] = "policy"
+            lesson["target"]["id"] = "native_explicit_fact_log"
+            lesson["target"]["contract_path"] = (
+                "product/architecture/native-memory-surface-map.json"
+            )
+
+        intake = self.mutate_lesson(0, mutate)
+        self.assert_rejected(
+            "must name a canonical *-policy artifact or ADR authority",
+            intake=intake,
+        )
+
+    def test_target_cannot_self_reference_the_intake(self) -> None:
+        def mutate(lesson: dict[str, Any]) -> None:
+            lesson["target"]["kind"] = "policy"
+            lesson["target"]["contract_path"] = (
+                "product/upstream/external-lesson-intake.json"
+            )
+
+        intake = self.mutate_lesson(0, mutate)
+        self.assert_rejected(
+            "contract_path cannot reference the intake itself", intake=intake
+        )
 
     def test_source_assumption_must_stay_in_external_adapter(self) -> None:
         intake = self.mutate_lesson(
@@ -239,6 +289,17 @@ class ExternalLessonIntakeTest(unittest.TestCase):
             ),
         )
         self.assert_rejected("regression tests must be provider-neutral", intake=intake)
+
+    def test_regression_test_path_must_be_executable_test_source(self) -> None:
+        intake = self.mutate_lesson(
+            0,
+            lambda lesson: lesson["neutral_regression_tests"][0].__setitem__(
+                "path", "tests/fixtures/context_eval_labeled.json"
+            ),
+        )
+        self.assert_rejected(
+            "must name an executable behavioral test file", intake=intake
+        )
 
     def test_implementation_bead_must_exist(self) -> None:
         intake = self.mutate_lesson(
@@ -312,6 +373,23 @@ class ExternalLessonIntakeTest(unittest.TestCase):
             intake=intake,
         )
 
+    def test_copy_record_notice_must_bind_the_destination(self) -> None:
+        def mutate(lesson: dict[str, Any]) -> None:
+            lesson["code_use"]["mode"] = "copied_external_code"
+            lesson["code_use"]["external_code_copied"] = True
+            lesson["code_use"]["copy_records"] = [
+                {
+                    "source_path": "src/memory_module/text_memory.py",
+                    "destination_path": "product/upstream/external-lesson-intake.md",
+                    "license_notice_path": "crates/tracedecay-memory-provider-ncm/audits/tdmem-0701-capability-matrix.json",
+                }
+            ]
+
+        intake = self.mutate_lesson(0, mutate)
+        self.assert_rejected(
+            "license_notice_path does not bind copied destination path", intake=intake
+        )
+
     def test_rejected_lesson_cannot_copy_external_code(self) -> None:
         def mutate(lesson: dict[str, Any]) -> None:
             lesson["code_use"]["mode"] = "copied_external_code"
@@ -357,6 +435,16 @@ class ExternalLessonIntakeTest(unittest.TestCase):
         self.assert_rejected(
             "source definition must reject additional properties", schema=schema
         )
+
+    def test_schema_keeps_exact_decision_conditions(self) -> None:
+        schema = copy.deepcopy(self.schema)
+        schema["$defs"]["lesson"]["allOf"] = [{}, {}]
+        self.assert_rejected("accepted/rejected conditions drifted", schema=schema)
+
+    def test_schema_keeps_neutral_test_path_constraint(self) -> None:
+        schema = copy.deepcopy(self.schema)
+        schema["$defs"]["regression_test"]["properties"]["path"]["pattern"] = ".*"
+        self.assert_rejected("regression_test.path pattern drifted", schema=schema)
 
 
 if __name__ == "__main__":

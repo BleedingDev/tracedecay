@@ -28,6 +28,13 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 LESSON_ID_RE = re.compile(r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$")
 IDENTIFIER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
 TARGET_ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$")
+SAFE_PATH_PATTERN = r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$))[^\\]+$"
+TARGET_PATH_PATTERN = r"^product/(?!.*(?:^|/)\.\.(?:/|$))[^\\]+$"
+ADAPTER_PATH_PATTERN = (
+    r"^crates/tracedecay-memory-provider-"
+    r"(?!api(?:/|$)|native(?:/|$)|registry(?:/|$))[^/]+/.+$"
+)
+TEST_PATH_PATTERN = r"^tests/(?!.*(?:^|/)\.\.(?:/|$))[^\\]+$"
 
 EXPECTED_ROOT_FIELDS = {
     "schema_version",
@@ -242,6 +249,32 @@ def is_external_adapter_path(path: str) -> bool:
     }
 
 
+def is_behavioral_test_path(path: str) -> bool:
+    name = Path(path).name
+    return (
+        (name.endswith("_test.py") or name.startswith("test_") and name.endswith(".py"))
+        or name.endswith("_test.sh")
+        or name.endswith(".rs")
+    )
+
+
+def is_canonical_target_authority(kind: str, path: str) -> bool:
+    candidate = Path(path)
+    if kind == "capability":
+        return (
+            path.startswith("product/contracts/")
+            and candidate.name.endswith("-contract.json")
+            and not {"generated", "goldens"}.intersection(candidate.parts)
+        )
+    if kind != "policy":
+        return False
+    if path.startswith("product/architecture/adr/"):
+        return re.fullmatch(r"ADR-[0-9]{4}-[a-z0-9-]+\.md", candidate.name) is not None
+    return path.startswith(("product/architecture/", "product/upstream/")) and (
+        candidate.name.endswith("-policy.json") or candidate.name.endswith("-policy.md")
+    )
+
+
 def validate_schema(schema: dict[str, Any], errors: list[str]) -> None:
     expected_root = {
         "$schema",
@@ -343,11 +376,72 @@ def validate_schema(schema: dict[str, Any], errors: list[str]) -> None:
         errors.append(
             "intake schema source commit must require an exact lowercase SHA-1"
         )
-    accepted_rule = lesson.get("allOf")
-    if not isinstance(accepted_rule, list) or len(accepted_rule) < 2:
-        errors.append(
-            "intake schema must encode accepted and rejected decision conditions"
-        )
+    expected_lesson_conditions = [
+        {
+            "if": {"properties": {"status": {"const": "accepted"}}},
+            "then": {
+                "properties": {
+                    "neutral_regression_tests": {"minItems": 1},
+                    "decision": {
+                        "properties": {"rejection_rationale": {"type": "null"}}
+                    },
+                }
+            },
+        },
+        {
+            "if": {"properties": {"status": {"const": "rejected"}}},
+            "then": {
+                "properties": {
+                    "code_use": {
+                        "properties": {
+                            "mode": {"const": "none_rejected"},
+                            "external_code_copied": {"const": False},
+                            "copy_records": {"maxItems": 0},
+                        }
+                    },
+                    "decision": {
+                        "properties": {
+                            "rejection_rationale": {
+                                "type": "string",
+                                "minLength": 1,
+                            }
+                        }
+                    },
+                }
+            },
+        },
+    ]
+    if lesson.get("allOf") != expected_lesson_conditions:
+        errors.append("intake schema accepted/rejected conditions drifted")
+    expected_code_conditions = [
+        {
+            "if": {"properties": {"external_code_copied": {"const": True}}},
+            "then": {
+                "properties": {
+                    "mode": {"const": "copied_external_code"},
+                    "copy_records": {"minItems": 1},
+                }
+            },
+            "else": {"properties": {"copy_records": {"maxItems": 0}}},
+        }
+    ]
+    if definitions["code_use"].get("allOf") != expected_code_conditions:
+        errors.append("intake schema copied-code conditions drifted")
+    pattern_checks = (
+        ("license", "evidence_path", SAFE_PATH_PATTERN),
+        ("evidence", "source_path", SAFE_PATH_PATTERN),
+        ("evidence", "local_evidence_path", SAFE_PATH_PATTERN),
+        ("target", "contract_path", TARGET_PATH_PATTERN),
+        ("assumption", "adapter_path", ADAPTER_PATH_PATTERN),
+        ("regression_test", "path", TEST_PATH_PATTERN),
+        ("copy_record", "source_path", SAFE_PATH_PATTERN),
+        ("copy_record", "destination_path", SAFE_PATH_PATTERN),
+        ("copy_record", "license_notice_path", SAFE_PATH_PATTERN),
+    )
+    for definition, field, expected in pattern_checks:
+        actual = definitions[definition]["properties"][field].get("pattern")
+        if actual != expected:
+            errors.append(f"intake schema {definition}.{field} pattern drifted")
 
 
 def validate_license(
@@ -386,9 +480,10 @@ def validate_license(
 
 def validate_source(
     repo: Path, value: Any, label: str, errors: list[str]
-) -> tuple[list[str], set[str], str]:
+) -> tuple[list[str], set[str], str, str]:
     source = exact_fields(value, EXPECTED_SOURCE_FIELDS, label, errors)
     repository = nonempty(source.get("repository"), f"{label}.repository", errors)
+    repository_identifier = ""
     if repository:
         parsed = urlsplit(repository)
         path_parts = [part for part in parsed.path.split("/") if part]
@@ -403,6 +498,8 @@ def validate_source(
             or repository.endswith("/")
         ):
             errors.append(f"{label}.repository must be a stable https repository URL")
+        elif path_parts:
+            repository_identifier = path_parts[-1].removesuffix(".git").casefold()
     commit = nonempty(source.get("commit"), f"{label}.commit", errors)
     if commit and not COMMIT_RE.fullmatch(commit):
         errors.append(f"{label}.commit must be an exact 40-character lowercase commit")
@@ -480,7 +577,12 @@ def validate_source(
                     )
     if len(set(evidence_keys)) != len(evidence_keys):
         errors.append(f"{label}.evidence must not contain duplicate source links")
-    return identifiers, linked_source_paths, str(license_identity)
+    return (
+        identifiers,
+        linked_source_paths,
+        str(license_identity),
+        repository_identifier,
+    )
 
 
 def validate_target(
@@ -501,6 +603,18 @@ def validate_target(
         target.get("contract_path"), f"{label}.contract_path", errors
     )
     if contract_path:
+        if kind == "capability" and not is_canonical_target_authority(
+            kind, contract_path
+        ):
+            errors.append(
+                f"{label}.contract_path must name a canonical *-contract.json capability authority"
+            )
+        if kind == "policy" and not is_canonical_target_authority(kind, contract_path):
+            errors.append(
+                f"{label}.contract_path must name a canonical *-policy artifact or ADR authority"
+            )
+        if Path(contract_path).name.startswith("external-lesson-intake"):
+            errors.append(f"{label}.contract_path cannot reference the intake itself")
         contract = require_repo_file(
             repo, contract_path, f"{label}.contract_path", errors, prefix="product/"
         )
@@ -525,8 +639,11 @@ def validate_target(
             )
 
 
-def validate_assumptions(repo: Path, value: Any, label: str, errors: list[str]) -> None:
+def validate_assumptions(
+    repo: Path, value: Any, label: str, errors: list[str]
+) -> set[str]:
     assumptions = array(value, label, errors)
+    adapter_identifiers: set[str] = set()
     if not assumptions:
         errors.append(f"{label} must record at least one source-specific assumption")
     for index, raw in enumerate(assumptions):
@@ -555,6 +672,11 @@ def validate_assumptions(repo: Path, value: Any, label: str, errors: list[str]) 
             require_repo_file(
                 repo, adapter_path, f"{assumption_label}.adapter_path", errors
             )
+            crate = Path(adapter_path).parts[1]
+            adapter_identifiers.add(
+                crate.removeprefix("tracedecay-memory-provider-").casefold()
+            )
+    return adapter_identifiers
 
 
 def validate_regression_tests(
@@ -580,6 +702,10 @@ def validate_regression_tests(
             if path in seen:
                 errors.append(f"{label} contains duplicate test path {path}")
             seen.add(path)
+            if not is_behavioral_test_path(path):
+                errors.append(
+                    f"{test_label}.path must name an executable behavioral test file"
+                )
             require_repo_file(repo, path, f"{test_label}.path", errors, prefix="tests/")
         for field, text in (("path", path), ("proves", proves)):
             source_name = has_identifier(text, identifiers)
@@ -669,6 +795,15 @@ def validate_code_use(
                     errors.append(
                         f"{record_label}.license_notice_path does not record the source license identity"
                     )
+                destination_path = str(record.get("destination_path", ""))
+                if source_path and source_path not in notice_contents:
+                    errors.append(
+                        f"{record_label}.license_notice_path does not bind copied source path"
+                    )
+                if destination_path and destination_path not in notice_contents:
+                    errors.append(
+                        f"{record_label}.license_notice_path does not bind copied destination path"
+                    )
     if len(set(record_keys)) != len(record_keys):
         errors.append(f"{label}.copy_records must be unique")
 
@@ -701,9 +836,20 @@ def validate_lesson(
     if status and status not in STATUSES:
         errors.append(f"{label}.status must be one of {STATUSES}")
 
-    identifiers, linked_source_paths, license_identity = validate_source(
-        repo, lesson.get("source"), f"{label}.source", errors
+    identifiers, linked_source_paths, license_identity, repository_identifier = (
+        validate_source(repo, lesson.get("source"), f"{label}.source", errors)
     )
+    adapter_identifiers = validate_assumptions(
+        repo, lesson.get("source_assumptions"), f"{label}.source_assumptions", errors
+    )
+    derived_identifiers = adapter_identifiers
+    if repository_identifier:
+        derived_identifiers.add(repository_identifier)
+    if set(identifiers) != derived_identifiers:
+        errors.append(
+            f"{label}.source.identifiers must exactly match repository and adapter identifiers {sorted(derived_identifiers)}"
+        )
+    identifiers = sorted(derived_identifiers)
     invariant = substantive(
         lesson.get("extracted_generic_invariant"),
         f"{label}.extracted_generic_invariant",
@@ -715,9 +861,6 @@ def validate_lesson(
             f"{label}.extracted_generic_invariant is source-specific ({source_name})"
         )
     validate_target(repo, lesson.get("target"), f"{label}.target", identifiers, errors)
-    validate_assumptions(
-        repo, lesson.get("source_assumptions"), f"{label}.source_assumptions", errors
-    )
     validate_regression_tests(
         repo,
         lesson.get("neutral_regression_tests"),

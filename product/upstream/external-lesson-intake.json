@@ -93,7 +93,13 @@
             "source_path": "src/memory_module/text_memory.py",
             "source_url": "https://github.com/bleedingDev/biomem/blob/500847ff65b5d9548b3826fa29bf3ccf8d221147/src/memory_module/text_memory.py#L437-L518",
             "local_evidence_path": "crates/tracedecay-memory-provider-ncm/audits/tdmem-0701-licensed-surface-audit.md",
-            "claim": "The audited retrieve path writes session cache and increments recall statistics, so it is not a provider-neutral advisory read."
+            "claim": "The audited core recall path increments read and usage statistics, so it is not a provider-neutral advisory read."
+          },
+          {
+            "source_path": "src/memory_module/protocol.py",
+            "source_url": "https://github.com/bleedingDev/biomem/blob/500847ff65b5d9548b3826fa29bf3ccf8d221147/src/memory_module/protocol.py#L1131-L1169",
+            "local_evidence_path": "crates/tracedecay-memory-provider-ncm/audits/tdmem-0701-licensed-surface-audit.md",
+            "claim": "The audited retrieve handler writes the query into session cache before returning recalled results."
           }
         ]
       },
