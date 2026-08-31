@@ -502,7 +502,7 @@ impl PayloadVariantProvider {
             replacement: CanonicalPayload::new(
                 OwnedVersionedId::new("tracedecay.memory.provider.terminal.v1")?,
                 b"[]".to_vec(),
-                "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e7b66bd8c2ad4ce7b16fc33",
+                "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
             )?,
         })
     }
