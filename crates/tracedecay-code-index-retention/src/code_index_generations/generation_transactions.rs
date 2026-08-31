@@ -17,7 +17,7 @@ use super::graph_replay_release;
 use super::journal::{
     BoundedJournalSpec, clear_journal, journal_path, load_journal, persist_journal,
 };
-use super::locking::{CodeGenerationStoreLockV1, acquire_code_generation_store_lock};
+use super::locking::{CodeGenerationStoreLockV1, try_acquire_code_generation_store_lock};
 use super::receipt_store;
 use super::receipt_store::ReceiptStoreSpec;
 use super::{
@@ -229,8 +229,33 @@ pub(super) struct GraphReplayPoolLockV1 {
 pub(super) fn acquire_graph_replay_pool_lock(
     pool_root: &Path,
 ) -> Result<GraphReplayPoolLockV1, CodeGenerationRetentionErrorV1> {
+    acquire_graph_replay_pool_lock_cancellable(pool_root, &|| false)
+}
+
+/// Acquire the replay-pool authority without parking on another process's
+/// filesystem lock. Daemon retention already performs an early availability
+/// probe, but a publisher can win the pool after that probe and before the
+/// fully verified plan reaches apply. That race is ordinary contention, not a
+/// reason to retain the daemon writer admission behind a deadline-free flock.
+pub(super) fn acquire_graph_replay_pool_lock_cancellable(
+    pool_root: &Path,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<GraphReplayPoolLockV1, CodeGenerationRetentionErrorV1> {
+    if observe_cancel(is_cancelled) {
+        return Err(CodeGenerationRetentionErrorV1::Cancelled);
+    }
     ensure_private_graph_replay_pool_root(pool_root)?;
-    let guard = acquire_code_generation_store_lock(pool_root)?;
+    if observe_cancel(is_cancelled) {
+        return Err(CodeGenerationRetentionErrorV1::Cancelled);
+    }
+    let Some(guard) = try_acquire_code_generation_store_lock(pool_root)? else {
+        return Err(CodeGenerationRetentionErrorV1::Busy(
+            "graph replay pool lock is held".to_owned(),
+        ));
+    };
+    if observe_cancel(is_cancelled) {
+        return Err(CodeGenerationRetentionErrorV1::Cancelled);
+    }
     Ok(GraphReplayPoolLockV1 {
         root: guard.generation_store_root()?.to_path_buf(),
         _guard: guard,
@@ -622,7 +647,7 @@ pub(super) fn withdraw_generations_from_graph_replay_pool(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(storage(error)),
     }
-    let _pool_lock = acquire_code_generation_store_lock(pool_root)?;
+    let _pool_lock = acquire_graph_replay_pool_lock(pool_root)?;
     let generations_root = store_root.join(GENERATIONS_DIRECTORY);
     let mut removed = false;
     for generation in &transaction.receipt.deleted_generations {

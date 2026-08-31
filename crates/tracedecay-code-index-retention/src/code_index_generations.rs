@@ -66,15 +66,17 @@ pub use text_artifacts::{
 };
 
 use generation_transactions::{
-    GENERATION_RECEIPT_STORE, acquire_graph_replay_pool_lock, cleanup_committed_transaction,
-    cleanup_committed_transaction_under_graph_replay_pool_lock, clear_transaction,
-    expose_staged_generations_under_graph_replay_pool_lock, load_transaction,
+    GENERATION_RECEIPT_STORE, acquire_graph_replay_pool_lock_cancellable,
+    cleanup_committed_transaction, cleanup_committed_transaction_under_graph_replay_pool_lock,
+    clear_transaction, expose_staged_generations_under_graph_replay_pool_lock, load_transaction,
     open_file_sha256_hex_cancellable, path_still_names_open_file, persist_transaction,
     receipt_is_durable, regular_file_exists, remove_empty_stage_root, rollback_staged_transaction,
     stage_collectable_generations, transaction_path, write_receipt,
 };
 #[cfg(test)]
-use generation_transactions::{transaction_stage_root, verify_existing_graph_replay_pool_entry};
+use generation_transactions::{
+    acquire_graph_replay_pool_lock, transaction_stage_root, verify_existing_graph_replay_pool_entry,
+};
 use receipt_store::receipt_digest_file_component;
 use scope_roots::is_code_index_scope_hash;
 #[cfg(test)]
@@ -331,6 +333,8 @@ pub enum CodeGenerationRetentionErrorV1 {
     UnsafeState(String),
     #[error("code-generation retention conflict: {0}")]
     Conflict(String),
+    #[error("code-generation retention busy: {0}")]
+    Busy(String),
     #[error("code-generation retention cancelled")]
     Cancelled,
 }
@@ -1012,7 +1016,7 @@ pub fn execute_code_generation_retention_cancellable(
         // pool. Hold the pool lock through durable release publication and
         // committed cleanup so the reconciler cannot race an orphaning unlink.
         let graph_replay_pool_lock = graph_replay_pool_root
-            .map(acquire_graph_replay_pool_lock)
+            .map(|pool_root| acquire_graph_replay_pool_lock_cancellable(pool_root, is_cancelled))
             .transpose()?;
         persist_transaction(store_root, &transaction)?;
 

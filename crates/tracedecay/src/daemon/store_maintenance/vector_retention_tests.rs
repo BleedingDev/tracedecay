@@ -5,6 +5,8 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -23,8 +25,9 @@ use tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::
 
 use super::{
     CodeGenerationRetentionOutcomeV1, VectorRetentionInventoryV1, apply_code_generation_retention,
-    classify_vector_readable_sources, code_index_store_root, resolve_vector_retention_inventory,
-    run_code_generation_retention, run_semantic_vector_generation_retention,
+    apply_code_generation_retention_after_replay_pool_preflight, classify_vector_readable_sources,
+    code_index_store_root, resolve_vector_retention_inventory, run_code_generation_retention,
+    run_semantic_vector_generation_retention,
 };
 
 const FIXTURE_GENERATION_COUNT: usize = 6;
@@ -43,6 +46,12 @@ struct UnseatedGraphFixture {
 /// live default-off state — with a sealed code-index store that has
 /// collectable superseded generations.
 async fn open_unseated_graph_fixture() -> UnseatedGraphFixture {
+    open_unseated_graph_fixture_with_generation_count(FIXTURE_GENERATION_COUNT).await
+}
+
+async fn open_unseated_graph_fixture_with_generation_count(
+    generation_count: usize,
+) -> UnseatedGraphFixture {
     let pinned_home = tracedecay_runtime_core::config::PinnedUserDataDir::new();
     let project = TempDir::new().expect("isolated project root");
     let graph = TraceDecay::open(project.path())
@@ -57,7 +66,7 @@ async fn open_unseated_graph_fixture() -> UnseatedGraphFixture {
     );
     let layout = graph.hook_store_layout();
     let store_root = code_index_store_root(&layout.data_root, &layout.project_root);
-    seed_sealed_generation_store(&store_root, FIXTURE_GENERATION_COUNT);
+    seed_sealed_generation_store(&store_root, generation_count);
     UnseatedGraphFixture {
         _pinned_home: pinned_home,
         _project: project,
@@ -602,7 +611,7 @@ async fn held_replay_pool_defers_then_backs_off_then_recovers() {
             &fixture.cancellation,
         )
         .await,
-        CodeGenerationRetentionOutcomeV1::Failed,
+        CodeGenerationRetentionOutcomeV1::Deferred,
         "a held replay pool defers the pass without blocking on the holder"
     );
     assert_eq!(
@@ -668,5 +677,136 @@ async fn held_replay_pool_defers_then_backs_off_then_recovers() {
             .observations
             .graph_replay_release_attempt_admitted(&project_root),
         "a served reconcile closes the backoff window"
+    );
+}
+
+/// A pool holder can arrive after the cheap preflight and before the fully
+/// verified plan reaches apply. The authoritative acquisition must still
+/// defer promptly, before any journal or unlink, and return the daemon writer
+/// admission. Once the competing holder leaves, the next bounded pass removes
+/// the only obsolete generation and drains its release evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_preflight_replay_pool_contention_defers_without_retaining_writer() {
+    let fixture = open_unseated_graph_fixture_with_generation_count(2).await;
+    let UnseatedGraphFixture {
+        _pinned_home,
+        _project,
+        graph,
+        store_root,
+        schedulers,
+        observations,
+        cancellation,
+    } = fixture;
+    let graph = Arc::new(graph);
+    let schedulers = Arc::new(schedulers);
+    let observations = Arc::new(observations);
+    let administration = crate::daemon::branch_admin::StoreAdministration::default();
+    let replay_root = graph.db().database_path().with_extension("graph-replay");
+    tracedecay_runtime_core::storage::PrivateStoreIo::create_private_directory(&replay_root)
+        .expect("create owner-private replay pool");
+
+    let preflight_reached = Arc::new(tokio::sync::Notify::new());
+    let resume_retention = Arc::new(tokio::sync::Notify::new());
+    let task_graph = Arc::clone(&graph);
+    let task_schedulers = Arc::clone(&schedulers);
+    let task_observations = Arc::clone(&observations);
+    let task_cancellation = cancellation.clone();
+    let task_administration = administration.clone();
+    let task_preflight_reached = Arc::clone(&preflight_reached);
+    let task_resume_retention = Arc::clone(&resume_retention);
+    let mut retention = tokio::spawn(async move {
+        task_administration
+            .try_with_writer(|| async {
+                apply_code_generation_retention_after_replay_pool_preflight(
+                    task_graph.as_ref(),
+                    task_schedulers.as_ref(),
+                    task_observations.as_ref(),
+                    VectorRetentionInventoryV1::SemanticUnseated,
+                    &task_cancellation,
+                    || async move {
+                        task_preflight_reached.notify_one();
+                        task_resume_retention.notified().await;
+                    },
+                )
+                .await
+            })
+            .await
+    });
+
+    preflight_reached.notified().await;
+    let held_pool = try_acquire_code_generation_store_lock(&replay_root)
+        .expect("probe the replay pool after preflight")
+        .expect("competing publisher acquires the replay pool after preflight");
+    resume_retention.notify_one();
+
+    let outcome = match tokio::time::timeout(Duration::from_secs(2), &mut retention).await {
+        Ok(joined) => joined
+            .expect("post-preflight retention task must not panic")
+            .expect("the test writer admission must be available"),
+        Err(_) => {
+            drop(held_pool);
+            let _ = retention.await;
+            panic!("post-preflight replay-pool contention must defer promptly");
+        }
+    };
+    assert_eq!(outcome, CodeGenerationRetentionOutcomeV1::Deferred);
+    assert_eq!(
+        sealed_generation_files(&store_root).len(),
+        2,
+        "a busy authoritative acquisition must not unlink a generation"
+    );
+    assert_eq!(
+        release_queue_files(&store_root),
+        0,
+        "a busy authoritative acquisition must not publish release evidence"
+    );
+    assert!(
+        !store_root
+            .join(".code-generation-retention-transaction-v1.json")
+            .exists(),
+        "a busy authoritative acquisition must not publish a transaction"
+    );
+    assert!(
+        administration.try_with_writer(|| async {}).await.is_some(),
+        "deferral must return the daemon writer admission while the pool remains held"
+    );
+
+    drop(held_pool);
+    assert_eq!(
+        administration
+            .try_with_writer(|| async {
+                run_code_generation_retention(
+                    graph.as_ref(),
+                    schedulers.as_ref(),
+                    observations.as_ref(),
+                    &cancellation,
+                )
+                .await
+            })
+            .await
+            .expect("the recovered pass acquires writer admission"),
+        CodeGenerationRetentionOutcomeV1::MoreWork,
+        "the next bounded pass removes the final obsolete generation"
+    );
+    assert_eq!(
+        sealed_generation_files(&store_root),
+        BTreeSet::from([active_generation_file(&store_root)]),
+        "the recovered pass converges the generation store to its active head"
+    );
+    assert_eq!(
+        release_queue_files(&store_root),
+        0,
+        "the recovered pass drains the release it publishes"
+    );
+    assert_eq!(
+        run_code_generation_retention(
+            graph.as_ref(),
+            schedulers.as_ref(),
+            observations.as_ref(),
+            &cancellation,
+        )
+        .await,
+        CodeGenerationRetentionOutcomeV1::Complete,
+        "the following metadata-only census confirms convergence"
     );
 }

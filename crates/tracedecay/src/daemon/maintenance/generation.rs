@@ -67,6 +67,9 @@ pub(in crate::daemon) async fn run_project_generation_maintenance(
                 MaintenanceContinuation::CodeGenerationRetention,
             ));
         }
+        CodeGenerationRetentionOutcomeV1::Deferred => {
+            outcome = outcome.combine(MaintenanceTickOutcome::Retry);
+        }
         CodeGenerationRetentionOutcomeV1::Failed => {
             if !cancellation.is_cancelled() {
                 outcome = MaintenanceTickOutcome::Retry;

@@ -426,6 +426,7 @@ fn classify_vector_readable_sources(
 pub(in crate::daemon) enum CodeGenerationRetentionOutcomeV1 {
     Complete,
     MoreWork,
+    Deferred,
     Failed,
 }
 
@@ -512,6 +513,32 @@ async fn apply_code_generation_retention(
     vector_inventory: VectorRetentionInventoryV1,
     cancellation: &tracedecay_session_memory::context::CancellationToken,
 ) -> CodeGenerationRetentionOutcomeV1 {
+    apply_code_generation_retention_after_replay_pool_preflight(
+        graph,
+        schedulers,
+        observations,
+        vector_inventory,
+        cancellation,
+        || std::future::ready(()),
+    )
+    .await
+}
+
+async fn apply_code_generation_retention_after_replay_pool_preflight<
+    PostPreflight,
+    PostPreflightFuture,
+>(
+    graph: &TraceDecay,
+    schedulers: &CodeIndexSchedulerRegistryV1,
+    observations: &crate::daemon::maintenance::StoreTelemetrySamplingRegistry,
+    vector_inventory: VectorRetentionInventoryV1,
+    cancellation: &tracedecay_session_memory::context::CancellationToken,
+    post_preflight: PostPreflight,
+) -> CodeGenerationRetentionOutcomeV1
+where
+    PostPreflight: FnOnce() -> PostPreflightFuture,
+    PostPreflightFuture: std::future::Future<Output = ()>,
+{
     use tracedecay_code_index_retention::code_index_generations::{
         CodeGenerationRetentionErrorV1, CodeGenerationRetentionModeV1,
         DEFAULT_SUPERSEDED_GENERATION_FLOOR, execute_code_generation_retention_cancellable,
@@ -567,8 +594,9 @@ async fn apply_code_generation_retention(
         observations.record_graph_replay_release_unhealthy(graph.project_root());
         hotpath::gauge!("daemon.git.maintenance.replay_pool_busy_total").inc(1_u64);
         log_code_generation_retention_degraded("graph_replay_pool_busy");
-        return CodeGenerationRetentionOutcomeV1::Failed;
+        return CodeGenerationRetentionOutcomeV1::Deferred;
     }
+    post_preflight().await;
     // Full digest verification routinely reads several GiB. Run it before
     // entering the graph transaction and preserve the daemon shutdown token
     // through the blocking boundary; the planner checks it after every bounded
@@ -594,6 +622,13 @@ async fn apply_code_generation_retention(
         )) => {
             log_code_generation_retention_degraded("retention_cancelled");
             return CodeGenerationRetentionOutcomeV1::Failed;
+        }
+        Ok(Err(
+            tracedecay_code_index_retention::code_index_generations::CodeGenerationRetentionErrorV1::Busy(_),
+        )) => {
+            hotpath::gauge!("daemon.git.maintenance.replay_pool_busy_total").inc(1_u64);
+            log_code_generation_retention_degraded("graph_replay_pool_busy");
+            return CodeGenerationRetentionOutcomeV1::Deferred;
         }
         Ok(Err(error)) => {
             // The bare label proved undiagnosable on a live profile: without
@@ -905,6 +940,11 @@ async fn apply_code_generation_retention(
         Ok(Err(CodeGenerationRetentionErrorV1::Cancelled)) => {
             log_code_generation_retention_degraded("retention_cancelled");
             CodeGenerationRetentionOutcomeV1::Failed
+        }
+        Ok(Err(CodeGenerationRetentionErrorV1::Busy(_))) => {
+            hotpath::gauge!("daemon.git.maintenance.replay_pool_busy_total").inc(1_u64);
+            log_code_generation_retention_degraded("graph_replay_pool_busy");
+            CodeGenerationRetentionOutcomeV1::Deferred
         }
         Ok(Err(error)) => {
             // Same diagnosability contract as the plan failure above: the
