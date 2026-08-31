@@ -28,16 +28,10 @@ pub const MAX_COGNITIVE_RECALL_CANDIDATE_BYTES: usize = 64 * 1024;
 
 /// Maximum UTF-8 byte length of an opaque candidate identity or source
 /// reference.  These are labels, not provider-row or retrieval-anchor IDs.
-pub const MAX_COGNITIVE_RECALL_REFERENCE_BYTES: usize = 1 * 1024;
+pub const MAX_COGNITIVE_RECALL_REFERENCE_BYTES: usize = 1024;
 
 /// Maximum UTF-8 byte length of an optional provider explanation summary.
 pub const MAX_COGNITIVE_RECALL_EXPLANATION_BYTES: usize = 8 * 1024;
-
-// Keep V1-style aliases available to callers that expose versioned catalog
-// names while retaining the short names used by the application port.
-pub const MAX_COGNITIVE_RECALL_CANDIDATES_V1: usize = MAX_COGNITIVE_RECALL_CANDIDATES;
-pub const MAX_COGNITIVE_RECALL_QUERY_BYTES_V1: usize = MAX_COGNITIVE_RECALL_QUERY_BYTES;
-pub const MAX_COGNITIVE_RECALL_CANDIDATE_BYTES_V1: usize = MAX_COGNITIVE_RECALL_CANDIDATE_BYTES;
 
 /// Immutable request for one bounded advisory recall attempt.
 ///
@@ -134,12 +128,6 @@ impl CognitiveRecallRequest {
     pub const fn maximum_candidates(&self) -> usize {
         self.maximum_candidates
     }
-
-    /// Alias for callers that use the shorter budget terminology.
-    #[must_use]
-    pub const fn max_candidates(&self) -> usize {
-        self.maximum_candidates
-    }
 }
 
 /// Explicit provenance state for one advisory candidate.
@@ -226,15 +214,14 @@ impl CognitiveRecallCandidate {
                 "cognitive recall candidate stable reference",
             )?;
         }
-        if let Some(explanation) = &self.explanation {
-            if explanation.is_empty()
+        if let Some(explanation) = &self.explanation
+            && (explanation.is_empty()
                 || explanation.len() > MAX_COGNITIVE_RECALL_EXPLANATION_BYTES
-                || explanation.chars().any(char::is_control)
-            {
-                return Err(ApplicationContractError::InvalidRange {
-                    field: "cognitive recall candidate explanation",
-                });
-            }
+                || explanation.chars().any(char::is_control))
+        {
+            return Err(ApplicationContractError::InvalidRange {
+                field: "cognitive recall candidate explanation",
+            });
         }
         validate_provenance(&self.provenance)
     }
