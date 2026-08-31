@@ -220,6 +220,21 @@ class PatchFootprintPolicyTest(unittest.TestCase):
             policy=policy,
         )
 
+    def test_administrative_footprint_exclusion_is_exact(self) -> None:
+        policy = copy.deepcopy(self.policy)
+        policy["administrative_paths_excluded_from_footprint"] = []
+        self.assert_rejected(
+            "administrative footprint exclusions missing: ['.codex/**']",
+            policy=policy,
+        )
+
+        policy = copy.deepcopy(self.policy)
+        policy["administrative_paths_excluded_from_footprint"].append("crates/**")
+        self.assert_rejected(
+            "unexpected/broad administrative footprint exclusions: ['crates/**']",
+            policy=policy,
+        )
+
     def test_missing_allowed_touch_point_is_rejected(self) -> None:
         policy = copy.deepcopy(self.policy)
         policy["allowed_touch_points"] = [
@@ -228,6 +243,81 @@ class PatchFootprintPolicyTest(unittest.TestCase):
             if row["id"] != "recall_context_mount"
         ]
         self.assert_rejected("allowed touch points missing", policy=policy)
+
+    def test_shutdown_and_harness_touch_points_cannot_be_removed(self) -> None:
+        for touch_id in (
+            "daemon_shutdown_deadline",
+            "integration_test_runtime_isolation",
+        ):
+            with self.subTest(touch_id=touch_id):
+                policy = copy.deepcopy(self.policy)
+                policy["allowed_touch_points"] = [
+                    row
+                    for row in policy["allowed_touch_points"]
+                    if row["id"] != touch_id
+                ]
+                self.assert_rejected(
+                    f"allowed touch points missing: ['{touch_id}']",
+                    policy=policy,
+                )
+
+    def test_shutdown_and_harness_live_paths_have_exact_authority(self) -> None:
+        expected = {
+            "crates/tracedecay/src/daemon/bootstrap.rs": (
+                "daemon_shutdown_deadline",
+                "shutdown_deadline",
+            ),
+            "crates/tracedecay/src/daemon/engine/shutdown.rs": (
+                "daemon_shutdown_deadline",
+                "shutdown_deadline",
+            ),
+            "crates/tracedecay/src/daemon/invocation_state.rs": (
+                "daemon_shutdown_deadline",
+                "shutdown_deadline",
+            ),
+            "crates/tracedecay/src/daemon/service/invocation/lsp.rs": (
+                "daemon_shutdown_deadline",
+                "shutdown_deadline",
+            ),
+            "crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs": (
+                "daemon_shutdown_deadline",
+                "shutdown_deadline",
+            ),
+            "crates/tracedecay/tests/common/mod.rs": (
+                "integration_test_runtime_isolation",
+                "integration_test_harness",
+            ),
+            "crates/tracedecay/tests/memory_suite/memory_eval_test.rs": (
+                "integration_test_runtime_isolation",
+                "integration_test_harness",
+            ),
+        }
+        touches = {
+            row["id"]: row for row in self.policy["allowed_touch_points"]
+        }
+        areas = {row["id"]: row for row in self.convergence_map["areas"]}
+        entries = {
+            row["path"]: row for row in self.convergence_map["entries"]
+        }
+        errors: list[str] = []
+        live_diff = CHECKER_MODULE.diff_numstat(
+            REPO, CHECKER_MODULE.EXPECTED_FLOOR, errors
+        )
+        self.assertEqual(errors, [])
+        for path, (touch_id, area_id) in expected.items():
+            with self.subTest(path=path):
+                self.assertIn(path, live_diff)
+                self.assertEqual(
+                    CHECKER_MODULE.matching_touch_points(path, touches), [touch_id]
+                )
+                self.assertEqual(
+                    CHECKER_MODULE.matching_active_area_ids(
+                        path, areas, "upstream_owned"
+                    ),
+                    [area_id],
+                )
+                self.assertEqual(entries[path]["touch_point"], touch_id)
+                self.assertEqual(entries[path]["area_id"], area_id)
 
     def test_missing_dependency_direction_rule_is_rejected(self) -> None:
         policy = copy.deepcopy(self.policy)
@@ -1434,6 +1524,81 @@ class PatchFootprintPolicyTest(unittest.TestCase):
             self.assertEqual(stats["unstaged.rs"], (1, 1))
             self.assertEqual(stats["cancelled.rs"], (1, 1))
             self.assertEqual(stats["untracked.rs"], (2, 0))
+
+    def test_codex_administration_is_measured_but_not_classified(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+
+            def run_git(*args: str) -> str:
+                result = subprocess.run(
+                    ["git", *args],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return result.stdout.strip()
+
+            run_git("init", "--quiet")
+            run_git("config", "user.name", "Patch Footprint Test")
+            run_git("config", "user.email", "patch-footprint@example.invalid")
+            (repo / "README.md").write_text("floor\n", encoding="utf-8")
+            run_git("add", ".")
+            run_git("commit", "--quiet", "-m", "floor")
+            floor = run_git("rev-parse", "HEAD")
+
+            plan = repo / ".codex" / "plans" / "bead.plan.md"
+            plan.parent.mkdir(parents=True)
+            plan.write_text("committed plan\n", encoding="utf-8")
+            run_git("add", ".codex/plans/bead.plan.md")
+            run_git("commit", "--quiet", "-m", "add administrative plan")
+            snapshot = repo / ".codex" / "plan-graphs" / "snapshot.json"
+            snapshot.parent.mkdir(parents=True)
+            snapshot.write_text("{}\n", encoding="utf-8")
+
+            errors: list[str] = []
+            measured = CHECKER_MODULE.diff_numstat(repo, floor, errors)
+            self.assertEqual(errors, [])
+            self.assertEqual(
+                set(measured),
+                {
+                    ".codex/plan-graphs/snapshot.json",
+                    ".codex/plans/bead.plan.md",
+                },
+            )
+            footprint = CHECKER_MODULE.validate_actual_footprint(
+                repo,
+                floor,
+                copy.deepcopy(self.policy),
+                {},
+                {},
+                {},
+                {},
+                errors,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(footprint["total_upstream_changed_lines"], 0)
+            self.assertEqual(footprint["upstream_existing_production_files"], 0)
+
+            nearby_source = repo / ".codex-source.rs"
+            nearby_source.write_text("fn main() {}\n", encoding="utf-8")
+            errors = []
+            CHECKER_MODULE.validate_actual_footprint(
+                repo,
+                floor,
+                copy.deepcopy(self.policy),
+                {},
+                {},
+                {},
+                {},
+                errors,
+            )
+            self.assertIn(
+                "upstream-owned changed file lacks active convergence entry: .codex-source.rs",
+                errors,
+            )
+            self.assertNotIn(".codex/plans/bead.plan.md", "\n".join(errors))
+            self.assertNotIn(".codex/plan-graphs/snapshot.json", "\n".join(errors))
 
     def test_v2_product_area_classifies_dirty_product_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

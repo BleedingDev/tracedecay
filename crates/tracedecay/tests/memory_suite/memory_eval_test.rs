@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tracedecay::tracedecay::{TraceDecay, TraceDecayOpenOptions};
 use tracedecay_application::retained_surfaces::{
     FactCategoryV1, FactProjectionV1, FactSearchHitV1, FactStoreAddCommitV1, FactStoreAddResultV1,
     FactStoreGetResultV1, FactStoreListResultV1, FactStoreSearchResultV1, FactV1,
     MemoryStatusResultV1,
 };
+use tracedecay_application::{ApplicationEnvelope, ApplicationOutcome};
 use tracedecay_domain::FactId;
 
 use crate::common;
@@ -107,23 +107,17 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(crate::common::tracedecay_bin());
+        let mut command = common::tracedecay_command_with_home(&self.home_path);
         command
             .current_dir(&self.project_path)
-            .env("HOME", &self.home_path)
-            .env("USERPROFILE", &self.home_path)
-            .env("XDG_CONFIG_HOME", self.home_path.join(".config"))
-            .env(
-                tracedecay::config::USER_DATA_DIR_ENV,
-                self.home_path.join(".tracedecay"),
-            )
-            .env(
-                "TRACEDECAY_GLOBAL_DB",
-                self.home_path.join(".tracedecay/global.db"),
-            )
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.env(
+            tracedecay_daemon_protocol::SOCKET_ENV,
+            common::daemon_socket_path(&self.home_path),
+        );
         command
     }
 }
@@ -214,9 +208,18 @@ fn run_exact_value(fixture: &Fixture, tool: &str, args: Value) -> Value {
 
 fn run_exact<T: serde::de::DeserializeOwned>(fixture: &Fixture, tool: &str, args: Value) -> T {
     let response = run_exact_value(fixture, tool, args);
-    serde_json::from_value(response).unwrap_or_else(|error| {
-        panic!("{tool} output violated its retained result schema: {error}")
-    })
+    let envelope: ApplicationEnvelope<T> =
+        serde_json::from_value(response).unwrap_or_else(|error| {
+            panic!("{tool} output violated its retained result schema: {error}")
+        });
+    let payload = match envelope.outcome {
+        ApplicationOutcome::Evidence(evidence) => evidence.payload,
+        ApplicationOutcome::Effect(effect) => effect.payload,
+        ApplicationOutcome::Preview(_) => {
+            panic!("{tool} unexpectedly returned a preview for an exact retained operation")
+        }
+    };
+    payload.unwrap_or_else(|| panic!("{tool} returned no exact retained result payload"))
 }
 
 fn canonical_test_dir(path: &Path) -> PathBuf {
@@ -228,29 +231,6 @@ fn canonical_test_dir(path: &Path) -> PathBuf {
             path.display()
         )
     })
-}
-
-fn initialize_fixture_project(fixture: &Fixture) {
-    let profile_root = fixture.home_path.join(".tracedecay");
-    let options = TraceDecayOpenOptions {
-        profile_root: Some(profile_root.clone()),
-        global_db_path: Some(profile_root.join("global.db")),
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    runtime.block_on(async {
-        common::write_empty_global_db_schema(&profile_root.join("global.db")).await;
-        let tracedecay = TraceDecay::init_with_options(&fixture.project_path, options)
-            .await
-            .unwrap_or_else(|error| panic!("initialize fixture project: {error}"));
-        tracedecay
-            .checkpoint()
-            .await
-            .unwrap_or_else(|error| panic!("checkpoint fixture project: {error}"));
-        tracedecay.close();
-    });
 }
 
 fn seed_setup_facts(fixture: &Fixture, facts: &[SeedFact]) -> FactIndex {
@@ -339,8 +319,8 @@ fn build_fixture(setup: &Setup) -> (Fixture, FactIndex) {
         std::fs::write(fixture.project_path.join(name), contents)
             .unwrap_or_else(|error| panic!("write fixture file {name}: {error}"));
     }
-    initialize_fixture_project(&fixture);
     fixture.start_daemon();
+    common::initialize_tracedecay_cli_project(&fixture.home_path, &fixture.project_path);
     let index = seed_setup_facts(&fixture, &setup.facts);
     wait_for_memory_ready(&fixture, setup.facts.len());
     (fixture, index)
@@ -843,6 +823,95 @@ fn eval_memory_ranking_retrieval_reinforcement() {
 #[test]
 fn eval_memory_ranking_feedback_promotes() {
     run_scenario("memory-ranking-feedback-promotes");
+}
+
+#[test]
+fn harness_binary_resolution_never_guesses_a_sibling_profile_binary() {
+    let explicit = std::ffi::OsString::from("/checkout/target/debug/tracedecay");
+    let cargo = std::ffi::OsString::from("/cargo/provided/tracedecay");
+
+    assert_eq!(
+        common::select_tracedecay_bin(Some(explicit.clone()), Some(cargo.clone())),
+        Some(PathBuf::from(explicit))
+    );
+    assert_eq!(
+        common::select_tracedecay_bin(None, Some(cargo.clone())),
+        Some(PathBuf::from(cargo))
+    );
+    assert_eq!(common::select_tracedecay_bin(None, None), None);
+    assert_eq!(
+        common::select_tracedecay_bin(Some(std::ffi::OsString::new()), None),
+        None
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn harness_relative_explicit_binary_survives_command_cwd_change() {
+    let selection_cwd = std::env::current_dir().expect("selection cwd");
+    let relative_root = TempDir::new_in(&selection_cwd).expect("relative binary tempdir");
+    let relative_binary = relative_root
+        .path()
+        .strip_prefix(&selection_cwd)
+        .expect("tempdir should be relative to selection cwd")
+        .join("tracedecay-test-bin");
+    std::os::unix::fs::symlink("/bin/sh", selection_cwd.join(&relative_binary))
+        .expect("relative test binary symlink");
+
+    let selected = common::select_tracedecay_bin(
+        Some(relative_binary.into_os_string()),
+        Some(std::ffi::OsString::from("unused-cargo-binary")),
+    )
+    .expect("explicit binary should be selected");
+
+    assert!(selected.is_absolute());
+    let launch_cwd = TempDir::new().expect("command cwd tempdir");
+    let status = Command::new(selected)
+        .args(["-c", "exit 0"])
+        .current_dir(launch_cwd.path())
+        .status()
+        .expect("canonical selected binary should launch after cwd change");
+    assert!(status.success());
+}
+
+#[test]
+fn harness_home_environment_clears_an_inherited_daemon_socket() {
+    let home = TempDir::new().expect("home tempdir");
+    let mut command = Command::new("unused-test-program");
+    command.env(
+        tracedecay_daemon_protocol::SOCKET_ENV,
+        "/unrelated/daemon.sock",
+    );
+
+    common::apply_tracedecay_home_env(&mut command, home.path());
+
+    let socket_setting = command
+        .get_envs()
+        .find(|(key, _)| *key == std::ffi::OsStr::new(tracedecay_daemon_protocol::SOCKET_ENV))
+        .map(|(_, value)| value);
+    assert_eq!(socket_setting, Some(None));
+}
+
+#[cfg(unix)]
+#[test]
+fn harness_socket_path_uses_the_bounded_production_fallback() {
+    let root = TempDir::new().expect("socket root tempdir");
+    let home = root.path().join("h".repeat(160));
+    std::fs::create_dir_all(&home).expect("long test home");
+
+    let socket = common::daemon_socket_path(&home);
+
+    assert!(tracedecay_daemon_protocol::unix_socket_path_within_limit(
+        &socket
+    ));
+    assert_ne!(
+        socket,
+        common::canonical_existing_path(&home).join(".tracedecay/daemon.sock")
+    );
+    assert_eq!(
+        socket.file_name().and_then(|name| name.to_str()),
+        Some("daemon.sock")
+    );
 }
 
 /// Every scenario file must have a matching test so an unwired JSON scenario

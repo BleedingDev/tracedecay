@@ -390,6 +390,72 @@
         "kind": "minimal_mount",
         "rationale": "These five exact files form the smallest current host patch and can be removed with the optional feature."
       }
+    },
+    {
+      "id": "shutdown_deadline",
+      "status": "active",
+      "owner": "ScriptedAlchemy",
+      "ownership_class": "upstream_owned",
+      "feature": "shutdown-deadline",
+      "path_patterns": [
+        "crates/tracedecay/src/daemon/bootstrap.rs",
+        "crates/tracedecay/src/daemon/engine/shutdown.rs",
+        "crates/tracedecay/src/daemon/invocation_state.rs",
+        "crates/tracedecay/src/daemon/service/invocation/lsp.rs",
+        "crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs"
+      ],
+      "touch_points": [
+        "daemon_shutdown_deadline"
+      ],
+      "bead_ids": [
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "rationale": "Constrain the five existing daemon shutdown layers that must share one caller deadline and expose incomplete blocking drain truthfully.",
+      "semantic_invariants": [
+        "Upstream behavior: daemon shutdown preserves lifecycle ordering and always completes terminal teardown after reporting the observed outcome.",
+        "Product behavior: one caller-supplied absolute deadline bounds every nested shutdown and blocking-drain step without refresh."
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification",
+        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+      ],
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "The absolute-deadline shutdown correction is provider-neutral and can converge independently as an upstream lifecycle fix."
+      }
+    },
+    {
+      "id": "integration_test_harness",
+      "status": "active",
+      "owner": "ScriptedAlchemy",
+      "ownership_class": "upstream_owned",
+      "feature": "integration-test-harness",
+      "path_patterns": [
+        "crates/tracedecay/tests/common/mod.rs",
+        "crates/tracedecay/tests/memory_suite/memory_eval_test.rs"
+      ],
+      "touch_points": [
+        "integration_test_runtime_isolation"
+      ],
+      "bead_ids": [
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "rationale": "Constrain the two existing integration-test harness paths that select the checkout CLI and isolate daemon routing for memory-suite execution.",
+      "semantic_invariants": [
+        "Upstream behavior: integration tests use one bounded production-equivalent daemon socket and never inherit an installed daemon or global profile.",
+        "Product behavior: the memory suite executes a CLI built from the same checkout or fails closed before mixing revisions."
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1"
+      ],
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Deterministic same-checkout integration-test isolation is provider-neutral and can be proposed upstream without product runtime changes."
+      }
     }
   ],
   "entries": [
@@ -621,6 +687,225 @@
       "upstreamability": {
         "kind": "minimal_mount",
         "rationale": "The optional construction field is a bounded transport for project ownership and can be removed atomically."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/bootstrap.rs",
+      "area_id": "shutdown_deadline",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_shutdown_deadline",
+      "rationale": "Seed daemon shutdown with the caller's absolute deadline so lower layers consume one bounded budget rather than independent timeouts.",
+      "semantic_invariants": [
+        "Upstream behavior: daemon bootstrap preserves its existing shutdown sequence and terminal cleanup responsibilities.",
+        "Product behavior: bootstrap passes one caller-owned absolute deadline into the engine without refreshing its budget."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+      ],
+      "bead_ids": [
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "line_budget": 84,
+      "rebase_or_removal_plan": "Drop the deadline argument only if upstream daemon shutdown already exposes and propagates an equivalent absolute-deadline contract.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "The bootstrap handoff is a provider-neutral correctness fix that can be upstreamed with the shutdown deadline chain."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/engine/shutdown.rs",
+      "area_id": "shutdown_deadline",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_shutdown_deadline",
+      "rationale": "Carry the caller's deadline through engine shutdown so project runtime teardown cannot receive a newly extended budget.",
+      "semantic_invariants": [
+        "Upstream behavior: engine shutdown retains its current ownership and teardown ordering across managed project runtimes.",
+        "Product behavior: the engine forwards the unchanged absolute deadline to every nested shutdown operation."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+      ],
+      "bead_ids": [
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "line_budget": 8,
+      "rebase_or_removal_plan": "Remove the engine forwarding delta when upstream engine shutdown accepts the same caller-owned absolute deadline.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "The engine signature and forwarding change are the narrow upstream bridge for deadline conservation."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/invocation_state.rs",
+      "area_id": "shutdown_deadline",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_shutdown_deadline",
+      "rationale": "Forward the shared deadline through invocation shutdown to LSP and project-runtime owners without extending either nested operation.",
+      "semantic_invariants": [
+        "Upstream behavior: invocation-state teardown continues to retire LSP and project-runtime resources in the established order.",
+        "Product behavior: invocation-state shutdown forwards one unchanged deadline and reports any incomplete nested teardown."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+      ],
+      "bead_ids": [
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "line_budget": 16,
+      "rebase_or_removal_plan": "Remove the invocation-state forwarding patch after upstream accepts an equivalent shared-deadline shutdown signature.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "The invocation-state bridge preserves upstream authority while closing the nested deadline-refresh gap."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/service/invocation/lsp.rs",
+      "area_id": "shutdown_deadline",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_shutdown_deadline",
+      "rationale": "Bound LSP shutdown by the remaining caller budget so process teardown cannot silently outlive the daemon's absolute deadline.",
+      "semantic_invariants": [
+        "Upstream behavior: LSP teardown retains its existing process ownership and reports the real shutdown outcome.",
+        "Product behavior: LSP shutdown consumes only the remaining shared deadline and never creates a fresh timeout."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+      ],
+      "bead_ids": [
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "line_budget": 16,
+      "rebase_or_removal_plan": "Delete the local LSP deadline adaptation when upstream LSP shutdown consumes the caller's absolute deadline directly.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Bounded LSP teardown is an upstream daemon-lifecycle correction independent of memory-provider behavior."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs",
+      "area_id": "shutdown_deadline",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_shutdown_deadline",
+      "rationale": "Bound blocking project-runtime drain by the shared deadline, expose incomplete drain as Failed, and still perform terminal teardown.",
+      "semantic_invariants": [
+        "Upstream behavior: project-runtime shutdown reaches terminal teardown and truthfully reports an incomplete blocking drain as Failed.",
+        "Product behavior: blocking drain is bounded by the caller deadline and cannot extend shutdown through an internal replacement budget."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification",
+        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification",
+        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+      ],
+      "bead_ids": [
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "line_budget": 180,
+      "rebase_or_removal_plan": "Remove the bounded-drain implementation when upstream project-runtime shutdown provides the same deadline conservation and truthful terminal outcome.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Bounded blocking drain and truthful failure reporting are provider-neutral upstream lifecycle fixes."
+      }
+    },
+    {
+      "path": "crates/tracedecay/tests/common/mod.rs",
+      "area_id": "integration_test_harness",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "integration_test_runtime_isolation",
+      "rationale": "Resolve an explicit same-checkout CLI, clear inherited daemon routing, and construct one isolated bounded test socket in the shared harness.",
+      "semantic_invariants": [
+        "Upstream behavior: the common harness isolates daemon socket and profile state without changing production command behavior.",
+        "Product behavior: integration tests use an explicit or Cargo-provided same-checkout CLI and fail closed instead of guessing sibling binaries."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1"
+      ],
+      "bead_ids": [
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "line_budget": 69,
+      "rebase_or_removal_plan": "Remove the local harness resolver and isolation helpers when upstream provides equivalent fail-closed same-checkout command construction.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Same-checkout integration-test execution and daemon isolation are broadly useful upstream test-harness corrections."
+      }
+    },
+    {
+      "path": "crates/tracedecay/tests/memory_suite/memory_eval_test.rs",
+      "area_id": "integration_test_harness",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "integration_test_runtime_isolation",
+      "rationale": "Make the memory evaluation journey reuse the shared isolated command environment and one production-equivalent bounded socket path.",
+      "semantic_invariants": [
+        "Upstream behavior: the memory evaluation test exercises the production daemon protocol through one isolated socket and profile.",
+        "Product behavior: memory-suite setup shares the common same-checkout CLI environment and cannot attach to an inherited daemon."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1"
+      ],
+      "bead_ids": [
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "line_budget": 149,
+      "rebase_or_removal_plan": "Drop the memory-suite-specific wiring when upstream memory evaluation uses the common isolated command and socket contract directly.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "The memory-suite harness reuse is a deterministic integration-test correction suitable for upstream convergence."
       }
     }
   ],

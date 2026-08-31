@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::Ordering};
 
+use futures_util::FutureExt;
+
 use super::{ProjectRuntime, ProjectRuntimeRegistryV1};
 use crate::daemon::service::invocation::UnavailableFeedbackCycleRuntimeV1;
 
@@ -10,6 +12,11 @@ pub(super) enum ShutdownState {
     Pending,
     Complete,
     Failed,
+}
+
+enum BlockingDrainOutcome {
+    Drained(BTreeMap<PathBuf, ProjectRuntime>),
+    TimedOut,
 }
 
 impl ProjectRuntimeRegistryV1 {
@@ -115,11 +122,12 @@ impl ProjectRuntimeRegistryV1 {
     /// # Cancelling here is safe on a retried shutdown
     ///
     /// `shut_down_all` is retryable: a failed drain stores `shutdown_started =
-    /// false` so a later attempt re-runs it. Cancelling owners at prepare time
-    /// would be wrong if such a retry could be expected to keep them running —
-    /// but it cannot. `closed` is one-way: it is set true here and nothing in
-    /// the workspace ever stores false, and every admission path (`reserve`,
-    /// `publish`, `register_or_reconcile`, request admission) refuses with
+    /// false` after publishing its failed result so a later attempt can re-run
+    /// it. Cancelling owners at prepare time would be wrong if such a retry
+    /// could be expected to keep them running — but it cannot. `closed` is
+    /// one-way: it is set true here and nothing in the workspace ever stores
+    /// false, and every admission path (`reserve`, `publish`,
+    /// `register_or_reconcile`, request admission) refuses with
     /// `ProjectRuntimeRegistryError::Closed` once it is set. So the runtimes a
     /// retry can observe are always a subset of the ones live at the first
     /// call, never a superset: no owner cancelled here can be one a retry is
@@ -158,37 +166,72 @@ impl ProjectRuntimeRegistryV1 {
     ///
     /// Routers become unavailable before feedback owners drop, Work providers
     /// are joined, and process-wide semantic handles are unregistered.
-    #[hotpath::measure(label = "daemon.service.project_runtime.shutdown", future = true)]
+    #[cfg(test)]
     pub(crate) async fn shut_down_all(&self) -> bool {
+        self.shut_down_all_until(
+            tokio::time::Instant::now() + crate::daemon::core_lifecycle::DAEMON_SHUTDOWN_DEADLINE,
+        )
+        .await
+    }
+
+    /// Shut every project runtime down within the caller's absolute daemon shutdown budget.
+    /// One deadline bounds both blocking admission drain and runtime finish.
+    #[hotpath::measure(label = "daemon.service.project_runtime.shutdown", future = true)]
+    pub(crate) async fn shut_down_all_until(&self, deadline: tokio::time::Instant) -> bool {
         self.begin_shutdown();
         let mut shutdown_complete = self.shutdown_complete.subscribe();
         let mut shutdown_task = self.shutdown_task.lock().await;
         if !self.shutdown_started.swap(true, Ordering::AcqRel) {
             let registry = self.clone();
+            let now = tokio::time::Instant::now();
+            let drain_deadline = if deadline.saturating_duration_since(now)
+                > super::super::super::DAEMON_TASK_ABORT_DEADLINE
+            {
+                deadline
+                    .checked_sub(super::super::super::DAEMON_TASK_ABORT_DEADLINE)
+                    .unwrap_or(now)
+            } else {
+                now
+            };
             self.shutdown_complete.send_replace(ShutdownState::Pending);
             let task = tokio::spawn(async move {
                 let drain_registry = registry.clone();
                 let drained = tokio::task::spawn_blocking(move || {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        drain_registry.take_all_blocking()
+                        drain_registry.take_all_blocking(drain_deadline)
                     }))
                 })
                 .await;
                 let state = match drained {
-                    Ok(Ok(runtimes)) => {
-                        if registry.finish_drained_runtimes(runtimes).await {
+                    Ok(Ok(BlockingDrainOutcome::Drained(runtimes))) => {
+                        let finished = std::panic::AssertUnwindSafe(
+                            registry.finish_drained_runtimes(runtimes, deadline),
+                        )
+                        .catch_unwind()
+                        .await;
+                        if matches!(finished, Ok(true)) {
                             ShutdownState::Complete
                         } else {
-                            registry.shutdown_started.store(false, Ordering::Release);
                             ShutdownState::Failed
                         }
                     }
-                    _ => {
-                        registry.shutdown_started.store(false, Ordering::Release);
+                    Ok(Ok(BlockingDrainOutcome::TimedOut)) | Ok(Err(_)) | Err(_) => {
                         ShutdownState::Failed
                     }
                 };
+                if state == ShutdownState::Failed {
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        registry.force_drop_failed_shutdown_runtimes();
+                    }))
+                    .is_err()
+                    {
+                        tracing::error!("project runtime terminal shutdown teardown panicked");
+                    }
+                }
                 registry.shutdown_complete.send_replace(state);
+                if state == ShutdownState::Failed {
+                    registry.shutdown_started.store(false, Ordering::Release);
+                }
             });
             *shutdown_task = Some(task);
         }
@@ -232,13 +275,14 @@ impl ProjectRuntimeRegistryV1 {
             result
         };
         if let Err(error) = result {
-            self.shutdown_started.store(false, Ordering::Release);
             self.shutdown_complete.send_replace(ShutdownState::Failed);
+            self.shutdown_started.store(false, Ordering::Release);
             tracing::error!(%error, "project runtime shutdown drain task failed");
         }
     }
 
-    fn take_all_blocking(&self) -> BTreeMap<PathBuf, ProjectRuntime> {
+    fn take_all_blocking(&self, deadline: tokio::time::Instant) -> BlockingDrainOutcome {
+        let deadline = deadline.into_std();
         loop {
             let (version, changed) = &*self.reservation_blocking_changed;
             let observed_version = *version
@@ -251,7 +295,7 @@ impl ProjectRuntimeRegistryV1 {
                     .values()
                     .all(|runtime| runtime.reservations.is_empty())
             {
-                break std::mem::take(&mut *runtimes);
+                return BlockingDrainOutcome::Drained(std::mem::take(&mut *runtimes));
             }
             drop(runtimes);
             drop(fences);
@@ -268,9 +312,17 @@ impl ProjectRuntimeRegistryV1 {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             while *current_version == observed_version {
-                current_version = changed
-                    .wait(current_version)
+                let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
+                else {
+                    return BlockingDrainOutcome::TimedOut;
+                };
+                let (next_version, timeout) = changed
+                    .wait_timeout(current_version, remaining)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                current_version = next_version;
+                if timeout.timed_out() && *current_version == observed_version {
+                    return BlockingDrainOutcome::TimedOut;
+                }
             }
         }
     }
@@ -278,15 +330,88 @@ impl ProjectRuntimeRegistryV1 {
     async fn finish_drained_runtimes(
         &self,
         mut runtimes: BTreeMap<PathBuf, ProjectRuntime>,
+        deadline: tokio::time::Instant,
     ) -> bool {
-        let deadline =
-            tokio::time::Instant::now() + crate::daemon::core_lifecycle::DAEMON_SHUTDOWN_DEADLINE;
-        let mut clean = shut_down_advisory(&runtimes).await;
-        clean &= shut_down_feedback(&runtimes).await;
-        clean &= shut_down_semantic(&mut runtimes, deadline).await;
-        clean &= shut_down_observability(&mut runtimes).await;
-        shut_down_runtimes(runtimes);
-        clean
+        if deadline <= tokio::time::Instant::now() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                shut_down_runtimes(runtimes);
+            }));
+            return false;
+        }
+        let finished = std::panic::AssertUnwindSafe(tokio::time::timeout_at(deadline, async {
+            let mut clean = shut_down_advisory(&runtimes).await;
+            clean &= shut_down_feedback(&runtimes).await;
+            clean &= shut_down_semantic(&mut runtimes, deadline).await;
+            clean &= shut_down_observability(&mut runtimes).await;
+            clean
+        }))
+        .catch_unwind()
+        .await;
+        let clean = matches!(finished, Ok(Ok(true)));
+        let terminal_drop_clean = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shut_down_runtimes(runtimes);
+        }))
+        .is_ok();
+        clean && terminal_drop_clean
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn blocking_drain_deadline_reports_incomplete_without_a_notification() {
+        let registry = ProjectRuntimeRegistryV1::default();
+        registry
+            .lock_root_fences()
+            .request_leases
+            .insert(PathBuf::from("never-released"), 1);
+        registry
+            .lock_runtimes()
+            .insert(PathBuf::from("never-released"), ProjectRuntime::default());
+
+        assert!(
+            !registry
+                .shut_down_all_until(
+                    tokio::time::Instant::now()
+                        + super::super::super::super::DAEMON_TASK_ABORT_DEADLINE,
+                )
+                .await,
+            "an exhausted drain budget must report incomplete shutdown"
+        );
+        assert!(
+            registry.is_empty().await,
+            "the retained shutdown task must perform terminal teardown even if its caller is gone"
+        );
+        registry.lock_root_fences().request_leases.clear();
+        assert!(
+            registry
+                .shut_down_all_until(
+                    tokio::time::Instant::now()
+                        + super::super::super::super::DAEMON_TASK_ABORT_DEADLINE,
+                )
+                .await,
+            "after the blocking lease settles, a retry must truthfully complete the empty closed registry"
+        );
+        assert!(matches!(
+            *registry.shutdown_complete.borrow(),
+            ShutdownState::Complete
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_finish_does_not_refresh_an_exhausted_deadline() {
+        let registry = ProjectRuntimeRegistryV1::default();
+        let runtimes =
+            BTreeMap::from([(PathBuf::from("already-drained"), ProjectRuntime::default())]);
+
+        assert!(
+            !registry
+                .finish_drained_runtimes(runtimes, tokio::time::Instant::now())
+                .await,
+            "runtime finish must consume the drain's original deadline"
+        );
     }
 }
 

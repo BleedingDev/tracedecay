@@ -72,7 +72,6 @@
         "crates/tracedecay/src/daemon/project_open_owners.rs",
         "crates/tracedecay/src/daemon/retained_owner.rs",
         "crates/tracedecay/src/daemon/service/project_runtime.rs",
-        "crates/tracedecay/src/daemon/invocation_state.rs",
         "crates/tracedecay/src/runtime_ports.rs",
         "crates/tracedecay/src/daemon/tests/ownership.rs",
         "crates/tracedecay/src/mcp/server.rs",
@@ -82,6 +81,61 @@
         "daemon composition/restart tests",
         "scope-isolation journey",
         "provider unavailable and shutdown tests"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "propagate one caller-supplied absolute deadline through daemon shutdown layers",
+        "bound blocking drain work by the caller deadline's remaining budget",
+        "report Failed for incomplete shutdown while completing terminal teardown"
+      ],
+      "category": "shutdown",
+      "forbidden_changes": [
+        "creating a fresh deadline budget in a nested shutdown layer",
+        "hiding incomplete shutdown behind a successful terminal",
+        "reordering unrelated daemon lifecycle phases",
+        "adding provider or memory integration logic"
+      ],
+      "id": "daemon_shutdown_deadline",
+      "max_changed_lines": 287,
+      "max_files": 5,
+      "paths": [
+        "crates/tracedecay/src/daemon/bootstrap.rs",
+        "crates/tracedecay/src/daemon/engine/shutdown.rs",
+        "crates/tracedecay/src/daemon/invocation_state.rs",
+        "crates/tracedecay/src/daemon/service/invocation/lsp.rs",
+        "crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs"
+      ],
+      "required_verification": [
+        "blocking drain deadline regression test",
+        "exhausted runtime deadline regression test",
+        "feature ownership shutdown journey"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "select an explicit or Cargo-provided same-checkout CLI and otherwise fail closed",
+        "clear inherited daemon routing and use one bounded production-equivalent socket path",
+        "share the common isolated command environment across the memory integration suite"
+      ],
+      "category": "integration_test",
+      "forbidden_changes": [
+        "guessing a sibling profile binary",
+        "reusing an installed daemon or global profile",
+        "silently mixing checkout revisions",
+        "changing production behavior"
+      ],
+      "id": "integration_test_runtime_isolation",
+      "max_changed_lines": 218,
+      "max_files": 2,
+      "paths": [
+        "crates/tracedecay/tests/common/mod.rs",
+        "crates/tracedecay/tests/memory_suite/memory_eval_test.rs"
+      ],
+      "required_verification": [
+        "memory-suite harness isolation tests",
+        "same-checkout CLI resolution tests",
+        "daemon socket isolation tests"
       ]
     },
     {
@@ -186,6 +240,9 @@
         "provider selection and no-silent-fallback tests"
       ]
     }
+  ],
+  "administrative_paths_excluded_from_footprint": [
+    ".codex/**"
   ],
   "bead_id": "tdmem-0105",
   "convergence_map": {

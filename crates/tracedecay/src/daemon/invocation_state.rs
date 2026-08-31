@@ -1015,13 +1015,21 @@ impl DaemonInvocationState {
         self.github_credential_lifecycle.shutdown();
     }
 
-    #[hotpath::measure(label = "daemon.invocation_state.shutdown", future = true)]
+    #[cfg(test)]
     pub(super) async fn shutdown(&self) -> bool {
+        self.shutdown_until(
+            tokio::time::Instant::now() + crate::daemon::core_lifecycle::DAEMON_SHUTDOWN_DEADLINE,
+        )
+        .await
+    }
+
+    #[hotpath::measure(label = "daemon.invocation_state.shutdown", future = true)]
+    pub(super) async fn shutdown_until(&self, deadline: tokio::time::Instant) -> bool {
         self.service.begin_shutdown().await;
         self.github_credential_lifecycle.shutdown();
         self.code_index_schedulers.shutdown().await;
         self.lsp_session_registry.lock().await.expire_at(u64::MAX);
-        let expired = self.service.expire_all().await;
+        let expired = self.service.expire_all_until(deadline).await;
         if !expired {
             // A false expire-all means invocation sessions survived the
             // drain; record the incomplete shutdown instead of hiding it

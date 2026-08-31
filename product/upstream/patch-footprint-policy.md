@@ -29,6 +29,11 @@ This budget covers the initial provider contract, Native parity, and NCM observe
 
 Additive files under the declared product-owned paths are excluded. Git additions plus deletions determine changed lines. Renames count at source and destination. `Cargo.lock` may change only as pinned-toolchain output accompanying a workspace-manifest change and build/metadata receipt.
 
+Administrative Codex orchestration state under `.codex/**` is measured by the
+dirty-state diff but excluded before product/upstream ownership classification.
+This exclusion is exact: it does not grant product ownership or hide source,
+test, product, workflow, or similarly named paths outside `.codex/`.
+
 Current snapshot through this bead: **zero Zack-owned existing-file edits**. The branch currently adds only product-owned planning, receipts, validators, workflows, and architecture artifacts.
 
 ## Product-owned zones
@@ -68,7 +73,7 @@ Forbidden: concrete provider types or names in public contracts, silent fallback
 
 ### Daemon composition mount
 
-Allowed roots include project composition, retained-owner/runtime ports, and invocation state. They may construct and retain capability registries and provider-neutral lifecycle ports.
+Allowed roots include project composition and retained-owner/runtime ports. They may construct and retain capability registries and provider-neutral lifecycle ports.
 
 The default-off M2 provider-host mount is limited to these additional exact
 files:
@@ -79,6 +84,18 @@ files:
 - `crates/tracedecay/src/mcp/server/construction.rs`
 
 Provider logic, global mutable provider singletons, unbounded workers, or authority over source/session/Native/configuration state are prohibited.
+
+### Daemon shutdown deadline
+
+Allowed files are the five exact daemon shutdown call-chain paths named in the machine-readable policy. They may propagate one caller-supplied absolute deadline, bound blocking drain by its remaining budget, and report an incomplete shutdown as `Failed` while still reaching terminal teardown.
+
+Nested layers cannot refresh the deadline, hide incomplete shutdown, reorder unrelated lifecycle phases, or add provider behavior.
+
+### Integration-test runtime isolation
+
+Allowed files are the common integration-test command harness and the memory-suite evaluation test. They may require an explicit or Cargo-provided CLI from the same checkout, clear inherited daemon routing, and share one bounded production-equivalent socket and isolated profile environment.
+
+Sibling-profile guessing, installed-daemon or global-profile reuse, silent mixed revisions, and production behavior changes are prohibited.
 
 ### Normalized observation mount
 

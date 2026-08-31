@@ -12,6 +12,8 @@ use std::net::TcpListener;
 #[cfg(not(unix))]
 use std::net::TcpStream;
 #[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -20,6 +22,8 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
 #[cfg(not(windows))]
 use tempfile::NamedTempFile;
 use tempfile::TempDir;
@@ -706,23 +710,43 @@ pub fn apply_tracedecay_home_env(command: &mut Command, home: &Path) {
         .env("USERPROFILE", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env(USER_DATA_DIR_ENV, home.join(".tracedecay"))
-        .env(GLOBAL_DB_ENV, home.join(".tracedecay/global.db"));
+        .env(GLOBAL_DB_ENV, home.join(".tracedecay/global.db"))
+        .env_remove(tracedecay_daemon_protocol::SOCKET_ENV);
     detach_from_test_process_group(command);
 }
 
-pub fn tracedecay_bin() -> PathBuf {
-    let binary = std::env::var_os("TRACEDECAY_TEST_BIN")
+pub(crate) fn select_tracedecay_bin(
+    explicit: Option<OsString>,
+    cargo_provided: Option<OsString>,
+) -> Option<PathBuf> {
+    explicit
+        .filter(|path| !path.is_empty())
+        .or_else(|| cargo_provided.filter(|path| !path.is_empty()))
         .map(PathBuf::from)
-        .or_else(|| option_env!("CARGO_BIN_EXE_tracedecay").map(PathBuf::from))
-        .unwrap_or_else(|| {
-            let test_executable =
-                std::env::current_exe().expect("test executable path should resolve");
-            let profile_dir = test_executable
-                .parent()
-                .and_then(Path::parent)
-                .expect("integration test should run from a Cargo profile directory");
-            profile_dir.join(format!("tracedecay{}", std::env::consts::EXE_SUFFIX))
-        });
+        .map(|binary| {
+            if binary.is_file() {
+                binary.canonicalize().unwrap_or_else(|error| {
+                    panic!(
+                        "failed to canonicalize selected tracedecay binary at {}: {error}",
+                        binary.display()
+                    )
+                })
+            } else {
+                binary
+            }
+        })
+}
+
+pub fn tracedecay_bin() -> PathBuf {
+    let binary = select_tracedecay_bin(
+        std::env::var_os("TRACEDECAY_TEST_BIN"),
+        option_env!("CARGO_BIN_EXE_tracedecay").map(OsString::from),
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "Cargo did not provide CARGO_BIN_EXE_tracedecay for this integration test; set TRACEDECAY_TEST_BIN to the tracedecay CLI built from this checkout (for example, run `cargo build -p tracedecay-cli --bin tracedecay` and set TRACEDECAY_TEST_BIN to target/debug/tracedecay)"
+        )
+    });
     assert!(
         binary.is_file(),
         "workspace tracedecay binary is missing at {}; build it with `cargo build -p tracedecay-cli --bin tracedecay` or set TRACEDECAY_TEST_BIN",
@@ -871,7 +895,20 @@ pub fn git_program() -> std::ffi::OsString {
 
 #[cfg(unix)]
 pub fn daemon_socket_path(home: &Path) -> PathBuf {
-    canonical_existing_path(home).join(".tracedecay/daemon.sock")
+    let profile_root = canonical_existing_path(home).join(".tracedecay");
+    let profile_scoped = profile_root.join("daemon.sock");
+    if tracedecay_daemon_protocol::unix_socket_path_within_limit(&profile_scoped) {
+        return profile_scoped;
+    }
+
+    // Keep this test resolver identical to the production fallback in
+    // `daemon::service`: daemon spawn, readiness checks, and clients must all
+    // name the same endpoint even when the profile path exceeds `sockaddr_un`.
+    let digest = Sha256::digest(profile_root.as_os_str().as_bytes());
+    PathBuf::from(format!(
+        "/tmp/tracedecay-{}/daemon.sock",
+        hex::encode(&digest[..8])
+    ))
 }
 
 pub fn daemon_authority_path(profile_root: &Path) -> PathBuf {
@@ -947,8 +984,10 @@ fn spawn_tracedecay_daemon_process(
 
     let mut command = Command::new(tracedecay_bin());
     apply_tracedecay_home_env(&mut command, home);
+    command.args(["daemon", "run"]);
+    #[cfg(unix)]
+    command.args(["--socket"]).arg(&socket_path);
     command
-        .args(["daemon", "run"])
         .env("TRACEDECAY_TEST_ALLOW_INCOMPLETE_HOLDER_SCAN", "1")
         .current_dir(home)
         .stdin(Stdio::null())

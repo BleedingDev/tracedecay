@@ -346,15 +346,23 @@ impl DaemonInvocationService {
         Some((scope, ApplicationOutcome::Evidence(packet)))
     }
 
-    #[hotpath::measure(label = "daemon.service.lsp.expire_all", future = true)]
+    #[cfg(test)]
     pub(crate) async fn expire_all(&self) -> bool {
+        self.expire_all_until(
+            tokio::time::Instant::now() + crate::daemon::core_lifecycle::DAEMON_SHUTDOWN_DEADLINE,
+        )
+        .await
+    }
+
+    #[hotpath::measure(label = "daemon.service.lsp.expire_all", future = true)]
+    pub(crate) async fn expire_all_until(&self, deadline: tokio::time::Instant) -> bool {
         self.begin_shutdown().await;
         let lease_shutdown = self.lsp_lease_tasks.shutdown().await;
         let work_attempts_clean = self.work_attempt_processes.shutdown().await;
         self.lsp_sessions.lock().await.clear();
         self.authorized_lsp_workspaces.lock().await.clear();
         self.context_scout_registries.lock().await.clear();
-        let project_runtimes_clean = self.project_runtimes.shut_down_all().await;
+        let project_runtimes_clean = self.project_runtimes.shut_down_all_until(deadline).await;
         self.session_holder_databases.lock().await.clear();
         self.operation_events.expire_all().await;
         let lease_shutdown_clean = lease_shutdown.is_ok();

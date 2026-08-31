@@ -62,8 +62,8 @@ impl DaemonEngine {
                     let invocation_cancel = self.invocation.clone();
                     move || invocation_cancel.cancel_admissions()
                 },
-                move |_| async move {
-                    if invocation_join.shutdown().await {
+                move |deadline| async move {
+                    if invocation_join.shutdown_until(deadline).await {
                         ShutdownStatus::Clean
                     } else {
                         ShutdownStatus::Failed(

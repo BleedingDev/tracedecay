@@ -64,10 +64,13 @@ EXPECTED_PRODUCT_PATTERNS = {
     "crates/tracedecay/tests/product_memory_provider/**",
     "crates/tracedecay/tests/product_memory_provider_*.rs",
 }
+EXPECTED_ADMINISTRATIVE_EXCLUSIONS = {".codex/**"}
 EXPECTED_TOUCH_POINTS = {
     "workspace_wiring",
     "application_contract_mount",
     "daemon_composition_mount",
+    "daemon_shutdown_deadline",
+    "integration_test_runtime_isolation",
     "normalized_observation_mount",
     "recall_context_mount",
     "post_settlement_feedback_mount",
@@ -691,6 +694,35 @@ def validate_policy_structure(
                 f"product-owned paths must not hide upstream tree {forbidden_broad!r}"
             )
 
+    administrative_patterns = require_list(
+        policy.get("administrative_paths_excluded_from_footprint"),
+        "administrative_paths_excluded_from_footprint",
+        errors,
+    )
+    if any(not isinstance(value, str) for value in administrative_patterns):
+        errors.append(
+            "administrative_paths_excluded_from_footprint entries must be strings"
+        )
+    administrative_pattern_set = {
+        value for value in administrative_patterns if isinstance(value, str)
+    }
+    missing_administrative = (
+        EXPECTED_ADMINISTRATIVE_EXCLUSIONS - administrative_pattern_set
+    )
+    extra_administrative = (
+        administrative_pattern_set - EXPECTED_ADMINISTRATIVE_EXCLUSIONS
+    )
+    if missing_administrative:
+        errors.append(
+            "administrative footprint exclusions missing: "
+            f"{sorted(missing_administrative)}"
+        )
+    if extra_administrative:
+        errors.append(
+            "unexpected/broad administrative footprint exclusions: "
+            f"{sorted(extra_administrative)}"
+        )
+
     budget = policy.get("initial_budget")
     if not isinstance(budget, dict):
         errors.append("initial_budget must be an object")
@@ -1242,6 +1274,11 @@ def validate_actual_footprint(
         for value in policy.get("product_owned_paths", [])
         if isinstance(value, str)
     ]
+    administrative_patterns = [
+        value
+        for value in policy.get("administrative_paths_excluded_from_footprint", [])
+        if isinstance(value, str)
+    ]
     active_entries = {
         path: row for path, row in entries.items() if row.get("status") == "active"
     }
@@ -1250,6 +1287,8 @@ def validate_actual_footprint(
     }
     upstream: dict[str, tuple[int, int]] = {}
     for path, counts in stats.items():
+        if matches_any(path, administrative_patterns):
+            continue
         if path in active_entries:
             upstream[path] = counts
             continue

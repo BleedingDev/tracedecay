@@ -17,6 +17,24 @@ use super::*;
 pub(super) const DAEMON_SHUTDOWN_RECEIPT_LOG_RESERVE: tokio::time::Duration =
     tokio::time::Duration::from_millis(100);
 
+async fn cancel_retained_session_history_until<F>(deadline: tokio::time::Instant, cancellation: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    if tokio::time::timeout_at(deadline, cancellation)
+        .await
+        .is_err()
+    {
+        log_daemon_event(
+            "daemon_shutdown",
+            &[(
+                "outcome",
+                "retained_session_history_cancellation_timeout".to_owned(),
+            )],
+        );
+    }
+}
+
 /// Explicit network boundary for serving the canonical enrolled Remote Brain
 /// protocol over TLS. Local daemon application traffic keeps its independent
 /// loopback-only HTTP listener.
@@ -267,10 +285,14 @@ async fn run_foreground_loopback(
         ));
     }
     lifecycle.begin_draining();
-    drop(listener);
-    cancel_retained_session_history(&store_administration).await;
     let shutdown_deadline = tokio::time::Instant::now() + DAEMON_SHUTDOWN_DEADLINE
         - DAEMON_SHUTDOWN_RECEIPT_LOG_RESERVE;
+    drop(listener);
+    cancel_retained_session_history_until(
+        shutdown_deadline,
+        cancel_retained_session_history(&store_administration),
+    )
+    .await;
     let endpoint_cleanup = authority.cleanup_owned_endpoint();
     let semantic_artifact_gc_cancel = semantic_artifact_gc.clone();
     let semantic_artifact_gc_join = semantic_artifact_gc;
@@ -333,14 +355,18 @@ async fn run_foreground_loopback(
         // after the producer owners settle, so nothing can admit a provider
         // process after the execution registry is emptied and leave it
         // running past shutdown.
-        vec![shutdown_coordination::ShutdownOwner::new(
+        vec![shutdown_coordination::ShutdownOwner::with_deadline_status(
             "invocation",
             {
                 let invocation_cancel = invocation.clone();
                 move || invocation_cancel.cancel_admissions()
             },
-            async move {
-                invocation_join.shutdown().await;
+            move |deadline| async move {
+                if invocation_join.shutdown_until(deadline).await {
+                    ShutdownStatus::Clean
+                } else {
+                    ShutdownStatus::Failed("invocation runtime shutdown was incomplete".to_owned())
+                }
             },
         )],
         vec![shutdown_coordination::ShutdownOwner::new(
@@ -732,15 +758,19 @@ async fn run_foreground_unix(
         ));
     }
     engine.lifecycle.begin_draining();
+    let shutdown_deadline = tokio::time::Instant::now() + DAEMON_SHUTDOWN_DEADLINE
+        - DAEMON_SHUTDOWN_RECEIPT_LOG_RESERVE;
     // Stop accepting and unlink the socket before draining so clients that
     // connect during shutdown get NotFound/ConnectionRefused (which they retry
     // via `connect_with_restart_grace`) instead of a queued connection that
     // will never be served.
     drop(listener);
     let endpoint_cleanup = authority.cleanup_owned_endpoint();
-    cancel_retained_session_history(&engine.store_administration).await;
-    let shutdown_deadline = tokio::time::Instant::now() + DAEMON_SHUTDOWN_DEADLINE
-        - DAEMON_SHUTDOWN_RECEIPT_LOG_RESERVE;
+    cancel_retained_session_history_until(
+        shutdown_deadline,
+        cancel_retained_session_history(&engine.store_administration),
+    )
+    .await;
     // Keep auxiliary process creation blocked until every scheduler and client
     // task is drained or abandoned. A killed app-server call may retry before
     // unwinding, so a shorter guard leaves a shutdown-time respawn race. The
@@ -929,6 +959,44 @@ async fn prepare_socket_path(authority: &authority::DaemonAuthority) -> Result<(
 mod tests {
     #[cfg(unix)]
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn retained_session_history_cancellation_cannot_overrun_shutdown_deadline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct CancellationDropProbe(Arc<AtomicBool>);
+
+        impl Drop for CancellationDropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let contention = Arc::new(tokio::sync::Mutex::new(()));
+        let held = contention.lock().await;
+        let contended_cancellation_lock = Arc::clone(&contention);
+        let cancellation_dropped = Arc::new(AtomicBool::new(false));
+        let cancellation_dropped_by_task = Arc::clone(&cancellation_dropped);
+        let contended_cancellation = async move {
+            let _drop_probe = CancellationDropProbe(cancellation_dropped_by_task);
+            let _guard = contended_cancellation_lock.lock().await;
+        };
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(25);
+
+        cancel_retained_session_history_until(deadline, contended_cancellation).await;
+
+        assert_eq!(
+            tokio::time::Instant::now(),
+            deadline,
+            "the contended cancellation prefix must stop at the absolute shutdown deadline"
+        );
+        assert!(
+            cancellation_dropped.load(Ordering::Acquire),
+            "timing out must cancel the pending cancellation future"
+        );
+        drop(held);
+    }
 
     #[cfg(unix)]
     #[test]
