@@ -23,6 +23,9 @@ mod memory_target;
 mod memory_tracking;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod native_provider;
+#[cfg(all(test, feature = "memory-provider-host"))]
+#[path = "retained_owner/native_provider_parity_tests.rs"]
+mod native_provider_parity_tests;
 mod profile;
 pub(crate) mod receipts;
 mod session;
