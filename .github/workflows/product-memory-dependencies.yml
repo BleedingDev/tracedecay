@@ -1,36 +1,13 @@
 name: Product memory dependency policy
 
+# No path filter: the footprint checker classifies every diffed path against
+# the convergence map, so the lane must run on every change — a path filter
+# would let an unmapped edit to an upstream-owned source file skip detection.
 on:
   push:
     branches:
       - feat/pluggable-memory-providers-v2
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - crates/*/Cargo.toml
-      - product/upstream/patch-footprint-policy.json
-      - product/upstream/convergence-map.json
-      - product/architecture/adr/**
-      - product/architecture/memory-dependency-policy.md
-      - scripts/product/check-memory-dependency-policy.py
-      - scripts/product/check-patch-footprint-policy.py
-      - tests/product_memory_dependency_policy_test.py
-      - tests/product_patch_footprint_policy_test.py
-      - .github/workflows/product-memory-dependencies.yml
   pull_request:
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - crates/*/Cargo.toml
-      - product/upstream/patch-footprint-policy.json
-      - product/upstream/convergence-map.json
-      - product/architecture/adr/**
-      - product/architecture/memory-dependency-policy.md
-      - scripts/product/check-memory-dependency-policy.py
-      - scripts/product/check-patch-footprint-policy.py
-      - tests/product_memory_dependency_policy_test.py
-      - tests/product_patch_footprint_policy_test.py
-      - .github/workflows/product-memory-dependencies.yml
 
 permissions:
   contents: read
