@@ -290,7 +290,7 @@
         "configuration bypassing transactional revision and audit"
       ],
       "id": "configuration_registry_mount",
-      "max_changed_lines": 360,
+      "max_changed_lines": 540,
       "max_files": 5,
       "paths": [
         "crates/tracedecay/src/config.rs",

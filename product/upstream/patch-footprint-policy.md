@@ -118,6 +118,8 @@ Allowed seams may emit idempotent provider outcome/feedback observations after c
 
 Allowed seams may register provider-neutral keys and explicit observer/active selection. Configuration stays transactional, revisioned, authorized, audited, and credential-safe. Providers cannot activate or configure themselves.
 
+This category's line cap is 540 rather than the 360 carried before the PR #707 floor: upstream 5749e4fc moved the config module into `crates/tracedecay-configuration`, so the moved seam and its non-vacuous in-crate tests (219 lines) now count inside this touch point instead of the crate the seam used to live in. No other cap and no file count changed.
+
 ## Zero-touch exception zones
 
 Default cap: zero files.

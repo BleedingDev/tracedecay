@@ -10,7 +10,7 @@ from pathlib import Path
 core = Path(__file__).with_name("check-coding-memory-authority-matrix-core.py")
 namespace = runpy.run_path(str(core))
 namespace["SOURCE_MARKERS"][
-    "crates/tracedecay-usecases/src/configuration/runtime.rs"
+    "crates/tracedecay-configuration/src/configuration/runtime.rs"
 ] = [
     "pub struct ProjectConfigurationRuntime",
     "transactional store handle",

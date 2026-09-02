@@ -98,13 +98,13 @@ SOURCE_MARKERS = {
         "current_authority",
         "SourceEditEffectControlV1",
     ],
-    "crates/tracedecay-usecases/src/context/registered_scope.rs": [
+    "crates/tracedecay-session-memory/src/context/registered_scope.rs": [
         "pub struct RegisteredScopeResolver",
         "read_repository_identity_marker",
         "current_branch",
         "UnauthorizedSiblingRoot",
     ],
-    "crates/tracedecay-usecases/src/context/mod.rs": [
+    "crates/tracedecay-session-memory/src/context/mod.rs": [
         "pub struct ResolvedGitRoute",
         "pub struct ResolvedSessionIdentity",
         "RepositoryId",
@@ -116,11 +116,11 @@ SOURCE_MARKERS = {
         "HostAdmissionFacade",
         "transcript_capture_kernel",
     ],
-    "crates/tracedecay/src/daemon/session_retrieval/admitted.rs": [
+    "crates/tracedecay-session-runtime/src/session_retrieval/admitted.rs": [
         "SessionApplicationRetrievalPortV1",
         "retrieve_admitted_with_cancellation",
     ],
-    "crates/tracedecay-usecases/src/memory/mod.rs": [
+    "crates/tracedecay-session-memory/src/memory/mod.rs": [
         "pub struct MemoryApplication",
         "memory_application_for_db",
         "DatabaseFactStore",
@@ -130,10 +130,11 @@ SOURCE_MARKERS = {
         "impl ProjectMemoryFactStore",
         "schedule_project_memory_graph_reconciliation",
     ],
-    "crates/tracedecay-usecases/src/configuration/runtime.rs": [
+    "crates/tracedecay-configuration/src/configuration/runtime.rs": [
         "pub struct ProjectConfigurationRuntime",
         "transactional store handle",
-        "sole runtime configuration authority",
+        "retained store remains the sole",
+        "runtime configuration authority",
     ],
 }
 
