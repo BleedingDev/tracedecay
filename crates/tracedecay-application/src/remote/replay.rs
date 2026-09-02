@@ -213,6 +213,7 @@ pub enum RemoteReplayStateV1 {
 }
 
 impl RemoteReplayStateV1 {
+    #[hotpath::skip]
     pub const fn permits_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),

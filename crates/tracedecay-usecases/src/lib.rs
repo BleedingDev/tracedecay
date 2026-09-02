@@ -27,15 +27,16 @@
 //! [`tracedecay::apply_source_edit_plan`], and
 //! [`tracedecay::capture_planned_source_edit`]. Callers should use these
 //! rather than create a second root-owned plan.
-//! - [`config::RuntimeConfigurationAuthorityPort`], installed via
-//!   [`config::install_runtime_configuration_authority`] before opening any
-//!   configuration-backed use case. Configuration value/persistence contracts
-//!   are re-exported from `tracedecay_global_db::configuration::contracts`
-//!   through [`configuration::ports`]/[`configuration::types`], not
-//!   duplicated here.
+//! - [`tracedecay_configuration::RuntimeConfigurationAuthorityPort`], installed
+//!   via [`tracedecay_configuration::install_runtime_configuration_authority`]
+//!   before opening any configuration-backed use case. Configuration
+//!   value/persistence contracts live in `tracedecay-configuration` (re-exported
+//!   from `tracedecay_global_db::configuration::contracts`), not duplicated here.
+//!   [`config::retrieval`] stays in this crate because it is production-load-bearing
+//!   on search-eval.
 //! - Transport-independent response handles live in
-//!   [`response_handles`]; MCP adapters should call that module rather than
-//!   keep a parallel handle store.
+//!   `tracedecay_session_memory::response_handles`; MCP adapters should call
+//!   that module rather than keep a parallel handle store.
 //!
 //! ## Packaging
 //!
@@ -64,53 +65,42 @@ pub(crate) fn register_test_schema_installer() {
 }
 
 pub mod advisory;
-pub mod anchor_resolution;
 pub mod code_index;
 pub mod config;
 pub mod configuration;
-pub mod context;
 pub mod dashboard_diagnostics;
 pub mod delivery;
 pub mod diagnose;
 pub mod diagnostics_publication;
 pub mod diagnostics_query;
 pub mod diagnostics_store;
-// Public because the root shim re-exports this crate, and root adapters
-// (`src/mcp`, `src/daemon`, `src/store`) publish onto the event lane.
-pub mod event_lane;
 // Public because `tracedecay-global-db` reaches the runtime external-source
 // store through the root shim.
 pub mod analytics_bridge;
-pub mod external_source_store;
 pub mod feedback;
 pub mod git_intelligence;
 pub mod git_query;
 pub mod git_reads;
-pub mod graph;
+pub mod graph_health_delta;
 mod hotpath_observe;
 pub mod lsp_runtime;
 mod lsp_support;
-pub mod memory;
 pub mod native_integration;
 pub mod observability;
 pub mod observation;
 pub mod operation_stream;
 pub mod primitives;
-pub mod provider_pricing;
-pub mod provider_usage;
-pub mod request_identity;
-pub mod response_handles;
 pub mod semantic_runtime;
-pub mod session;
 pub mod settings_control;
 pub mod source_authorization;
 pub mod stack_coordinator;
 pub mod store;
 pub mod tracedecay;
-pub mod user_config;
+pub mod work;
 
 pub use lsp_support::analyzer_runtime_config_error;
 pub use source_authorization::{
+    CallableCodeAuthorizationSourcePort, CurrentCallableCodeAccessFuture,
     ProjectSourceAccessDenial, ProjectSourceAccessOutcome, ProjectSourceAccessSnapshot,
-    project_source_access_snapshot_for_request,
+    ProjectSourceAccessSnapshotPort, project_source_access_snapshot_for_request,
 };

@@ -12,8 +12,10 @@
 //! `/api/capabilities` advertises which current TraceDecay authorities are
 //! mounted for the selected project.
 
+pub use tracedecay_application::request_identity;
+pub(crate) use tracedecay_graph_query as graph;
 pub use tracedecay_usecases as application;
-pub use tracedecay_usecases::{git_query, graph, request_identity, user_config};
+pub use tracedecay_usecases::git_query;
 pub mod tracedecay;
 // Crate-root re-exports the composition root reaches through its
 // `crate::dashboard::*` shim: the application-surface injection contract and
@@ -70,7 +72,7 @@ pub use automation_run_service::{
 };
 mod automation_scheduler_api;
 mod automation_skills_api;
-mod cloud;
+pub mod cloud;
 mod code_diagnostics_api;
 pub mod code_index_freshness_api;
 pub mod config;
@@ -115,7 +117,7 @@ mod projects;
 mod read_model;
 mod request_deadline;
 mod savings_api;
-use tracedecay_usecases::provider_pricing as savings_pricing;
+use tracedecay_session_memory::provider_pricing as savings_pricing;
 pub mod scope;
 mod settings_api;
 pub use settings_api::{
@@ -129,8 +131,6 @@ mod storage_findings_api;
 mod storage_telemetry_api;
 mod token_count;
 mod util;
-mod version;
-pub use version::install_build_version;
 mod work_api;
 
 use request_deadline::dashboard_http_request_deadline_micros;
@@ -156,12 +156,12 @@ use tracedecay_api::{WorkOperation, WorkflowOperation};
 use crate::tracedecay::TraceDecay;
 use tracedecay_automation_runtime::automation::backend;
 use tracedecay_automation_runtime::automation::config::{AutomationBackend, AutomationHostMode};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{FactOwnerV1, ProjectId};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_runtime_core::db::{
     Database, DatabaseEngineReadConnection, DatabaseStorageTelemetryHandle,
 };
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 use tracedecay_runtime_core::storage::{StorageMode, StoreLayout};
 
 /// Default port for `tracedecay dashboard` (chosen to avoid common dev-server
@@ -254,6 +254,11 @@ pub type RemoteOperationalStatusReader = Arc<
 /// choose every optional authority and the automation writer for each state.
 #[derive(Clone)]
 pub struct DashboardStateCompositionV1 {
+    /// The owning binary's composed build version. The dashboard crate's own
+    /// package version is an implementation detail; the composition root
+    /// passes this from its registered product runtime so every version
+    /// surface reports the shipped product build.
+    pub build_version: &'static str,
     pub project_graph_resolver: Option<crate::project_graph::RetainedProjectGraphResolver>,
     /// Exact-project admission for generation-pinned code-graph reads. This
     /// stays separate from the projection port so the HTTP boundary must
@@ -334,6 +339,8 @@ impl AdmittedDoctorReportV1 {
 /// project or user profile.
 #[derive(Clone)]
 pub struct DashboardState {
+    /// The owning binary's composed build version, from the composition.
+    pub build_version: &'static str,
     /// Registered project id for profile-backed stores, when known.
     pub project_id: Option<String>,
     /// Exact application scope resolved ONCE when this state was constructed.
@@ -416,7 +423,7 @@ pub struct DashboardState {
     pub retention_config: crate::config::RetentionConfig,
     /// Daemon-owned user-profile settings authority. Dashboard routes never
     /// load or mutate `config.toml` directly.
-    pub user_settings: Arc<dyn crate::application::configuration::UserSettingsDaemonClient>,
+    pub user_settings: Arc<dyn tracedecay_configuration::UserSettingsDaemonClient>,
     /// Root-injected ProfileSessions worker preference authority. It remains
     /// separate from `user_settings`, whose revision belongs to the ordinary
     /// profile settings resource.
@@ -704,6 +711,7 @@ async fn build_state_inner(
     composition: DashboardStateCompositionV1,
 ) -> Result<DashboardState> {
     let DashboardStateCompositionV1 {
+        build_version,
         project_graph_resolver,
         code_graph_read_admission,
         code_graph_projection_read_port,
@@ -761,6 +769,7 @@ async fn build_state_inner(
         &delivery_settlements,
     );
     let mut state = DashboardState {
+        build_version,
         project_id: cg.store_layout().identity.project_id.clone(),
         resolved_scope: scope::resolve_dashboard_scope(
             cg.project_root(),
@@ -842,6 +851,7 @@ pub async fn build_selected_project_state(
         Some(Arc::clone(&cg)),
         false,
         DashboardStateCompositionV1 {
+            build_version: active.build_version,
             project_graph_resolver: active.project_graph_resolver.clone(),
             // Both verified code-graph ports are exact-project authorities;
             // the active project's admission must never be reused for a
@@ -910,6 +920,7 @@ pub async fn run_until_shutdown_for_tests_with_host_admission<F>(
     project_graphs: DashboardTestProjectGraphsV1,
     host: &str,
     port: u16,
+    build_version: &'static str,
     spa_routes: Router,
     shutdown: F,
 ) -> Result<()>
@@ -922,6 +933,7 @@ where
         DashboardRunRequest {
             host,
             port,
+            build_version,
             spa_routes,
             test_authority: Some(&authority),
             test_project_graph_resolver: Some(project_graph_resolver),
@@ -936,6 +948,9 @@ where
 struct DashboardRunRequest<'a> {
     host: &'a str,
     port: u16,
+    /// The owning composition's build version; served surfaces must report the
+    /// caller's product runtime, never a crate-local substitute.
+    build_version: &'static str,
     spa_routes: Router,
     test_authority: Option<&'a DashboardHostAdmissionTestAuthorityV1>,
     test_project_graph_resolver: Option<crate::project_graph::RetainedProjectGraphResolver>,
@@ -954,6 +969,7 @@ where
     let DashboardRunRequest {
         host,
         port,
+        build_version,
         spa_routes,
         test_authority,
         test_project_graph_resolver,
@@ -977,6 +993,7 @@ where
         // token counts through its own composition.
         false,
         DashboardStateCompositionV1 {
+            build_version,
             project_graph_resolver: test_project_graph_resolver,
             code_graph_read_admission: test_authority
                 .and_then(|authority| authority.code_graph_read_admission.clone()),
@@ -1118,7 +1135,7 @@ impl Drop for DashboardHttpCancellationGuard {
         if !self.completed {
             let _ = self
                 .cancellation
-                .cancel(crate::application::context::application_observed_at());
+                .cancel(tracedecay_session_memory::context::application_observed_at());
         }
     }
 }
@@ -1208,7 +1225,7 @@ fn admit_dashboard_http_control(
         }
     }
 
-    let observed_at = crate::application::context::application_observed_at();
+    let observed_at = tracedecay_session_memory::context::application_observed_at();
     let sequence = DASHBOARD_HTTP_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let identity = format!("dashboard.http.{}.{}", observed_at.0, sequence);
     let request_id = match tracedecay_application::RequestId::new(format!("request.{identity}")) {
@@ -1653,9 +1670,11 @@ async fn project_scoped_api_gateway(
             .into_response();
     }
     let application_read = selected_project_application_read(req.method(), &tail);
+    let event_delivery_ack = is_selected_project_event_delivery_ack(req.method(), &tail);
     if runtime.active_project_id() != Some(project_id.as_str())
         && !matches!(req.method(), &Method::GET | &Method::HEAD)
         && application_read.is_none()
+        && !event_delivery_ack
     {
         return (
             StatusCode::METHOD_NOT_ALLOWED,
@@ -1866,6 +1885,10 @@ fn selected_project_application_read(
     }
 }
 
+fn is_selected_project_event_delivery_ack(method: &Method, tail: &str) -> bool {
+    method == Method::POST && tail == "events/delivery-ack"
+}
+
 async fn forward_project_request(
     project_api: Router<DashboardState>,
     state: DashboardState,
@@ -1959,7 +1982,7 @@ async fn capabilities(
     .await;
     Json(json!({
         "name": "tracedecay-dashboard",
-        "version": crate::version::build_version(),
+        "version": state.build_version,
         "mode": "standalone",
         "project_id": state.project_id,
         "project_root": state.project_root.display().to_string(),
@@ -2274,6 +2297,7 @@ mod authority_tests {
             let memory_owner =
                 project_memory_owner_for_layout(&layout).expect("dashboard project memory owner");
             let state = DashboardState {
+                build_version: "0.0.0-fixture+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 project_id: layout.identity.project_id.clone(),
                 resolved_scope: scope::resolve_dashboard_scope(
                     &project_root,
@@ -2308,8 +2332,7 @@ mod authority_tests {
                 dashboard_root: layout.dashboard_root.clone(),
                 retention_config: crate::config::RetentionConfig::default(),
                 user_settings: Arc::new(
-                    crate::application::configuration::ProductionUserSettingsDaemonClient::default(
-                    ),
+                    tracedecay_configuration::ProductionUserSettingsDaemonClient::default(),
                 ),
                 profile_code_index_worker_settings: None,
                 token_counts: Arc::new(token_count::TokenCountCache::new()),
@@ -2346,7 +2369,7 @@ mod authority_tests {
                 .expect("registered project id"),
         )
         .expect("valid project id");
-        let expected = crate::application::context::RegisteredScopeResolver::resolve(
+        let expected = tracedecay_session_memory::context::RegisteredScopeResolver::resolve(
             &fixture.layout.project_root,
             &fixture.layout.project_root,
             &project_id,
@@ -2513,7 +2536,7 @@ mod authority_tests {
         fn apply_configuration_batch(
             &self,
             _request_id: tracedecay_application::RequestId,
-            _mutations: Vec<tracedecay_usecases::configuration::DirectConfigurationMutation>,
+            _mutations: Vec<tracedecay_configuration::DirectConfigurationMutation>,
             _expected_revision: tracedecay_domain::configuration::ConfigurationRevisionId,
             _idempotency_key: tracedecay_domain::configuration::ConfigurationIdempotencyKey,
         ) -> DashboardConfigurationApplyFuture<'_> {
@@ -3338,6 +3361,14 @@ mod authority_tests {
 
     #[test]
     fn a_selected_project_answers_feedback_and_work_reads_and_nothing_else_by_post() {
+        assert!(is_selected_project_event_delivery_ack(
+            &Method::POST,
+            "events/delivery-ack"
+        ));
+        assert!(!is_selected_project_event_delivery_ack(
+            &Method::GET,
+            "events/delivery-ack"
+        ));
         for tail in ["feedback/get", "feedback/expand", "feedback/list"] {
             assert_eq!(
                 selected_project_application_read(&Method::POST, tail),

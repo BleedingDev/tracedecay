@@ -11,20 +11,21 @@ use tracedecay_application::{
     WorkProductSelectionScopeV1,
 };
 use tracedecay_domain::UtcMicros;
+use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
 use super::{
     enter_test_daemon_database_scope, initialize_test_project, test_client_identity_for,
     test_daemon_engine_for_profile, test_handshake_defaults,
 };
-use crate::application_surface::ApplicationSurfaceOperation;
-use crate::daemon::service::invocation::DaemonInvocationProblem;
 use crate::daemon::{
     DaemonEngine, DaemonHandshake, DaemonInvocationOutcome, DaemonInvocationRequest,
     execute_daemon_invocation,
 };
+use tracedecay_application::retrieval::PrimitiveRequest;
 use tracedecay_application::{ConfigurationListRequestV1, ConfigurationWireRequestV1};
 use tracedecay_daemon_protocol::WorkApplicationInvocationV1;
-use tracedecay_usecases::primitives::{PrimitiveRequest, StorageStatusPrimitiveRequest};
+use tracedecay_daemon_service::DaemonInvocationProblem;
+use tracedecay_usecases::primitives::StorageStatusPrimitiveRequest;
 
 fn git(root: &Path, args: &[&str]) {
     let status = Command::new("git")

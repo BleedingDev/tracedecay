@@ -120,6 +120,7 @@ pub enum WorkDuplicateAttemptClassificationReadV1 {
 }
 
 impl WorkDuplicateAttemptClassificationReadV1 {
+    #[hotpath::skip]
     pub const fn complete(&self) -> Option<&WorkDuplicateAttemptClassificationV1> {
         match self {
             Self::Complete { classification } => Some(classification),
@@ -144,12 +145,14 @@ pub enum WorkDuplicateAdjudicationAppendOutcomeV1 {
 }
 
 impl WorkDuplicateAdjudicationAppendOutcomeV1 {
+    #[hotpath::skip]
     pub const fn receipt(&self) -> &WorkDuplicateAdjudicationReceiptV1 {
         match self {
             Self::Appended(receipt) | Self::Replayed(receipt) => receipt,
         }
     }
 
+    #[hotpath::skip]
     pub const fn replayed(&self) -> bool {
         matches!(self, Self::Replayed(_))
     }
@@ -186,6 +189,7 @@ impl<S> WorkDuplicateAdjudicationServiceV1<S>
 where
     S: WorkDuplicateAdjudicationPortV1,
 {
+    #[hotpath::skip]
     pub const fn new(storage: S) -> Self {
         Self { storage }
     }

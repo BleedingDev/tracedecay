@@ -8,8 +8,8 @@ use std::sync::{
 
 use serde_json::json;
 
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_mcp::{ErrorCode, JsonRpcRequest, JsonRpcResponse, McpTransport};
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 
 #[cfg(any(unix, test))]
 use super::ProjectServerKey;
@@ -20,11 +20,13 @@ use super::profile_host_admission_replay::{
 };
 #[cfg(unix)]
 use super::scheduler::{AutomationSchedulerHandle, MaintenanceTaskTermination};
-use super::session_temporal_refresh_scheduler::SessionTemporalRefreshSchedulerRegistry;
 use super::store_writer_gate::StoreWriterGates;
 pub(super) use super::store_writer_gate::{StoreWriterClass, WriterScope};
-use super::{DaemonHandshake, DatabaseOwnerRegistry, authority, write_json_rpc_response};
+use super::{DaemonHandshake, DatabaseOwnerRegistry, write_json_rpc_response};
 use tracedecay_code_index_runtime::git_transactions::DaemonGitIndexTransactionServiceRegistry;
+use tracedecay_daemon_identity::{authority, profile_identity};
+use tracedecay_daemon_service::DaemonNativeIntegrationRuntimeRegistrar;
+use tracedecay_session_runtime::session_temporal_refresh_scheduler::SessionTemporalRefreshSchedulerRegistry;
 
 const BRANCH_ADMIN_TOOL_NAME: &str = "tracedecay_admin_branch";
 mod project_retirement;
@@ -313,12 +315,9 @@ impl Drop for RetirementReaperRegistrationBarrier {
 
 #[derive(Clone)]
 pub(super) struct SessionRuntimeRegistryEntryV1 {
-    pub(super) identity: crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1,
-    pub(super) registry: Arc<
-        tokio::sync::OnceCell<
-            Arc<crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1>,
-        >,
-    >,
+    pub(super) identity: profile_identity::LocalProfileIdentityAuthorityV1,
+    pub(super) registry:
+        Arc<tokio::sync::OnceCell<Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>>>,
 }
 type SessionRuntimeRegistries = HashMap<PathBuf, SessionRuntimeRegistryEntryV1>;
 pub(super) type SharedSessionRuntimeRegistries = Arc<ProfiledTokioMutex<SessionRuntimeRegistries>>;
@@ -326,28 +325,24 @@ pub(super) type SharedSessionRuntimeRegistries = Arc<ProfiledTokioMutex<SessionR
 #[derive(Clone)]
 struct ProfileHostAdmissionBootstrapContext {
     profile_root: PathBuf,
-    profile_identity: crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1,
-    session_runtime_registry: Arc<
-        tokio::sync::OnceCell<
-            Arc<crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1>,
-        >,
-    >,
+    profile_identity: profile_identity::LocalProfileIdentityAuthorityV1,
+    session_runtime_registry:
+        Arc<tokio::sync::OnceCell<Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>>>,
     host_admission_brokers: HostAdmissionBrokers,
     host_admission_broker_gate: Arc<ProfiledTokioMutex<()>>,
     profile_host_admission_replay: Weak<ProfileHostAdmissionReplayRegistry>,
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure_all)]
 impl ProfileHostAdmissionBootstrapContext {
     async fn ensure(&self) -> Result<()> {
         let profile_identity = self.profile_identity.clone();
         let session_runtime_registry = self
             .session_runtime_registry
             .get_or_try_init(|| async move {
-                crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-                    profile_identity,
-                )
-                .await
-                .map(Arc::new)
+                tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(profile_identity)
+                    .await
+                    .map(Arc::new)
             })
             .await
             .map(Arc::clone)
@@ -442,7 +437,7 @@ impl ProfileHostAdmissionBootstrapContext {
 /// A parked the first request for project B behind it, unbounded.
 #[derive(Clone)]
 pub(super) struct StoreAdministration {
-    profile_identity: Option<crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1>,
+    profile_identity: Option<profile_identity::LocalProfileIdentityAuthorityV1>,
     authenticated_profile_database_scopes:
         Arc<ProfiledTokioMutex<HashMap<PathBuf, tracedecay_runtime_core::db::DaemonDatabaseScope>>>,
     session_runtime_registries: SharedSessionRuntimeRegistries,
@@ -457,19 +452,49 @@ pub(super) struct StoreAdministration {
     host_admission_brokers: HostAdmissionBrokers,
     host_admission_broker_gate: Arc<ProfiledTokioMutex<()>>,
     profile_host_admission_replay: Arc<ProfileHostAdmissionReplayRegistry>,
-    session_sync_service: Arc<crate::daemon::session_sync::DaemonSessionSyncService>,
+    session_sync_service: Arc<tracedecay_session_runtime::session_sync::DaemonSessionSyncService>,
     store_telemetry_sampling: super::maintenance::StoreTelemetrySamplingRegistry,
     #[cfg(unix)]
     automation_schedulers:
         Arc<tokio::sync::Mutex<HashMap<ProjectServerKey, AutomationSchedulerHandle>>>,
     session_temporal_refresh_schedulers: Arc<SessionTemporalRefreshSchedulerRegistry>,
     git_index_transaction_services: Arc<DaemonGitIndexTransactionServiceRegistry>,
-    native_integration_services:
-        Arc<crate::daemon::service::invocation::DaemonNativeIntegrationRuntimeRegistrar>,
+    native_integration_services: Arc<DaemonNativeIntegrationRuntimeRegistrar>,
     remote_recovery_project_lifecycles:
         remote_recovery_lifecycle::SharedRemoteRecoveryProjectLifecyclesV1,
     #[cfg(unix)]
     retirement_reapers: Arc<MaintenanceReaperRegistry>,
+    /// Settles when an account-deletion tombstone is durably recorded, before
+    /// admitted opens are joined. Waiters observe this receipt instead of
+    /// polling the profile database through the writer that still holds the
+    /// remainder of the deletion.
+    remote_account_deletion_tombstone_persist:
+        Arc<tokio::sync::watch::Sender<Option<tracedecay_global_db::RemoteDeletionTombstone>>>,
+}
+
+/// Waitable receipt for the durable account-deletion tombstone persist.
+///
+/// Subscribe before starting deletion. `wait` fails closed if the
+/// administration is dropped without settling the tombstone.
+#[cfg(test)]
+pub(super) struct RemoteAccountDeletionTombstonePersistReceipt {
+    receiver: tokio::sync::watch::Receiver<Option<tracedecay_global_db::RemoteDeletionTombstone>>,
+}
+
+#[cfg(test)]
+impl RemoteAccountDeletionTombstonePersistReceipt {
+    pub(super) async fn wait(mut self) -> Result<tracedecay_global_db::RemoteDeletionTombstone> {
+        loop {
+            if let Some(tombstone) = self.receiver.borrow().clone() {
+                return Ok(tombstone);
+            }
+            self.receiver.changed().await.map_err(|_| TraceDecayError::Config {
+                message:
+                    "remote account deletion tombstone persist receipt was dropped before it settled"
+                        .to_owned(),
+            })?;
+        }
+    }
 }
 
 /// Retry ownership for a timed-out server, or a terminal failure receipt that
@@ -507,7 +532,7 @@ impl Default for StoreAdministration {
             )),
             profile_host_admission_replay: Arc::new(ProfileHostAdmissionReplayRegistry::default()),
             session_sync_service: Arc::new(
-                crate::daemon::session_sync::DaemonSessionSyncService::default(),
+                tracedecay_session_runtime::session_sync::DaemonSessionSyncService::default(),
             ),
             store_telemetry_sampling: super::maintenance::StoreTelemetrySamplingRegistry::default(),
             #[cfg(unix)]
@@ -519,12 +544,15 @@ impl Default for StoreAdministration {
                 DaemonGitIndexTransactionServiceRegistry::default(),
             ),
             native_integration_services: Arc::new(
-                crate::daemon::service::invocation::DaemonNativeIntegrationRuntimeRegistrar::default(
-                ),
+                DaemonNativeIntegrationRuntimeRegistrar::default(),
             ),
             remote_recovery_project_lifecycles: Arc::default(),
             #[cfg(unix)]
             retirement_reapers: Arc::new(MaintenanceReaperRegistry::default()),
+            remote_account_deletion_tombstone_persist: Arc::new({
+                let (sender, _) = tokio::sync::watch::channel(None);
+                sender
+            }),
         }
     }
 }
@@ -550,7 +578,7 @@ impl StoreAdministration {
 
     pub(super) fn with_profile_identity(
         mut self,
-        profile_identity: crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1,
+        profile_identity: profile_identity::LocalProfileIdentityAuthorityV1,
     ) -> Self {
         self.profile_identity = Some(profile_identity);
         self
@@ -558,7 +586,7 @@ impl StoreAdministration {
 
     pub(super) fn profile_identity(
         &self,
-    ) -> Result<&crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1> {
+    ) -> Result<&profile_identity::LocalProfileIdentityAuthorityV1> {
         self.profile_identity
             .as_ref()
             .ok_or_else(|| TraceDecayError::Config {
@@ -599,11 +627,11 @@ impl StoreAdministration {
     pub(super) async fn registered_profile_session_database(
         &self,
     ) -> Result<tracedecay_global_db::RegisteredGlobalDbLeaseV1> {
-        self.ensure_account_active().await?;
-        self.session_runtime_registry()
-            .await?
-            .profile_sessions()
-            .await
+        // Boxed per-await: the measured wrapper embeds this body by value, so
+        // an inline registry-mount future here overflows 2MB runtime stacks.
+        Box::pin(self.ensure_account_active()).await?;
+        let registry = Box::pin(self.session_runtime_registry()).await?;
+        Box::pin(registry.profile_sessions()).await
     }
 
     #[hotpath::measure(
@@ -613,7 +641,7 @@ impl StoreAdministration {
     pub(super) async fn registered_profile_database(
         &self,
     ) -> Result<tracedecay_global_db::RegisteredGlobalDbLeaseV1> {
-        let database = self.raw_registered_profile_database().await?;
+        let database = Box::pin(self.raw_registered_profile_database()).await?;
         let profile_id = self.profile_identity()?.profile_id().as_str();
         if database
             .remote_account_deletion_tombstone(profile_id)
@@ -629,18 +657,17 @@ impl StoreAdministration {
         Ok(database)
     }
 
+    #[hotpath::skip]
     async fn raw_registered_profile_database(
         &self,
     ) -> Result<tracedecay_global_db::RegisteredGlobalDbLeaseV1> {
-        self.session_runtime_registry()
-            .await?
-            .profile_database()
-            .await
+        let registry = Box::pin(self.session_runtime_registry()).await?;
+        Box::pin(registry.profile_database()).await
     }
 
     #[hotpath::measure(label = "daemon.branch_admin.ensure_account_active", future = true)]
     pub(super) async fn ensure_account_active(&self) -> Result<()> {
-        let database = self.raw_registered_profile_database().await?;
+        let database = Box::pin(self.raw_registered_profile_database()).await?;
         let profile_id = self.profile_identity()?.profile_id().as_str();
         if database
             .remote_account_deletion_tombstone(profile_id)
@@ -667,6 +694,28 @@ impl StoreAdministration {
         database
             .remote_account_deletion_tombstone(self.profile_identity()?.profile_id().as_str())
             .await
+    }
+
+    /// Subscribe to the durable account-tombstone persist receipt.
+    ///
+    /// The receipt settles when remote account deletion records or replays a
+    /// tombstone — before admitted project opens are joined. If the
+    /// administration is dropped without settling, wait fails closed.
+    #[cfg(test)]
+    pub(super) fn remote_account_deletion_tombstone_persist_receipt(
+        &self,
+    ) -> RemoteAccountDeletionTombstonePersistReceipt {
+        RemoteAccountDeletionTombstonePersistReceipt {
+            receiver: self.remote_account_deletion_tombstone_persist.subscribe(),
+        }
+    }
+
+    fn settle_remote_account_deletion_tombstone_persist(
+        &self,
+        tombstone: &tracedecay_global_db::RemoteDeletionTombstone,
+    ) {
+        self.remote_account_deletion_tombstone_persist
+            .send_replace(Some(tombstone.clone()));
     }
 
     #[hotpath::measure(label = "daemon.branch_admin.mounted_session_databases", future = true)]
@@ -725,7 +774,7 @@ impl StoreAdministration {
     pub(super) async fn registered_project_session_database(
         &self,
         project_root: &Path,
-        store_layout: &crate::storage::StoreLayout,
+        store_layout: &tracedecay_runtime_core::storage::StoreLayout,
     ) -> Result<tracedecay_global_db::RegisteredGlobalDbLeaseV1> {
         let project_id = store_layout
             .identity
@@ -744,8 +793,8 @@ impl StoreAdministration {
                     }
                 })
             })?;
-        let registry = self.session_runtime_registry().await?;
-        let profile_database = self.registered_profile_database().await?;
+        let registry = Box::pin(self.session_runtime_registry()).await?;
+        let profile_database = Box::pin(self.registered_profile_database()).await?;
         let profile_id = self.profile_identity()?.profile_id().as_str();
         if profile_database
             .remote_deletion_tombstone_for_project(profile_id, project_id.as_str())
@@ -764,16 +813,15 @@ impl StoreAdministration {
         if let Some(database) = registry.mounted_project_sessions(&project_id).await {
             return Ok(database);
         }
-        let enrollment_roots = crate::tracedecay::TraceDecay::registered_enrollment_roots(
-            project_root,
-            store_layout,
-            &project_id,
-            profile_database.as_ref(),
-        )
-        .await?;
-        registry
-            .project_sessions(project_id, enrollment_roots)
-            .await
+        let enrollment_roots =
+            Box::pin(crate::tracedecay::TraceDecay::registered_enrollment_roots(
+                project_root,
+                store_layout,
+                &project_id,
+                profile_database.as_ref(),
+            ))
+            .await?;
+        Box::pin(registry.project_sessions(project_id, enrollment_roots)).await
     }
 
     #[cfg(test)]
@@ -946,6 +994,7 @@ impl StoreAdministration {
         Ok(())
     }
 
+    #[hotpath::skip]
     pub(super) async fn profile_host_admission_bootstrap_status(
         &self,
         profile_root: &Path,
@@ -964,6 +1013,7 @@ impl StoreAdministration {
             .await)
     }
 
+    #[hotpath::skip]
     async fn maybe_ensure_user_profile_host_admission_replay(
         &self,
         broker_path: &Path,
@@ -1005,7 +1055,7 @@ impl StoreAdministration {
 
     pub(super) fn session_sync_service(
         &self,
-    ) -> Arc<crate::daemon::session_sync::DaemonSessionSyncService> {
+    ) -> Arc<tracedecay_session_runtime::session_sync::DaemonSessionSyncService> {
         Arc::clone(&self.session_sync_service)
     }
 
@@ -1038,7 +1088,7 @@ impl StoreAdministration {
 
     pub(super) fn native_integration_services(
         &self,
-    ) -> &Arc<crate::daemon::service::invocation::DaemonNativeIntegrationRuntimeRegistrar> {
+    ) -> &Arc<DaemonNativeIntegrationRuntimeRegistrar> {
         &self.native_integration_services
     }
 
@@ -1174,12 +1224,14 @@ impl StoreAdministration {
     }
 
     #[cfg(unix)]
+    #[hotpath::skip]
     pub(super) async fn settle_retirement_reapers(&self, timeout: std::time::Duration) -> bool {
         self.settle_retirement_reapers_for_owner(None, timeout, true)
             .await
     }
 
     #[cfg(unix)]
+    #[hotpath::skip]
     pub(super) async fn settle_retirement_reapers_for_project(
         &self,
         profile_root: &Path,
@@ -1256,11 +1308,13 @@ impl StoreAdministration {
     }
 
     #[cfg(all(test, unix))]
+    #[hotpath::skip]
     pub(super) async fn retirement_reaper_count(&self) -> usize {
         self.retirement_reapers.state().reapers.len()
     }
 
     #[cfg(all(test, unix))]
+    #[hotpath::skip]
     pub(super) async fn wait_for_retirement_reaper_count_for_test(&self, expected: usize) {
         loop {
             let changed = self.retirement_reapers.changed.notified();
@@ -1292,6 +1346,7 @@ impl StoreAdministration {
     }
 
     #[cfg(all(test, unix))]
+    #[hotpath::skip]
     pub(super) async fn wait_for_retirement_reaper_shutdown_pass_for_test(&self, after: u64) {
         loop {
             let changed = self.retirement_reapers.shutdown_changed.notified();
@@ -1311,7 +1366,7 @@ impl StoreAdministration {
     pub(super) async fn reconcile_cached_automation_for_profile(
         &self,
         profile_root: &Path,
-    ) -> Result<Vec<crate::dashboard::AutomationSchedulerOwnerReconcileOutcome>> {
+    ) -> Result<Vec<tracedecay_dashboard_api::AutomationSchedulerOwnerReconcileOutcome>> {
         self.ensure_account_active().await?;
         let profile_root = authority::canonical_identity_path(profile_root)?;
         let servers = {
@@ -1325,13 +1380,15 @@ impl StoreAdministration {
         };
         let mut outcomes = Vec::with_capacity(servers.len());
         for (key, server) in servers {
-            outcomes.push(crate::dashboard::AutomationSchedulerOwnerReconcileOutcome {
-                project_id: key.owner.project_id,
-                store_root: key.owner.store_root,
-                graph_db_path: key.owner.graph_db_path,
-                scope_prefix: key.scope_prefix,
-                outcome: server.reconcile_automation_scheduler().await,
-            });
+            outcomes.push(
+                tracedecay_dashboard_api::AutomationSchedulerOwnerReconcileOutcome {
+                    project_id: key.owner.project_id,
+                    store_root: key.owner.store_root,
+                    graph_db_path: key.owner.graph_db_path,
+                    scope_prefix: key.scope_prefix,
+                    outcome: server.reconcile_automation_scheduler().await,
+                },
+            );
         }
         Ok(outcomes)
     }
@@ -1341,6 +1398,7 @@ impl StoreAdministration {
     ///
     /// Prefer [`Self::with_writer_in`] with a store scope. This lane excludes
     /// every store and is reserved for operations that sweep all of them.
+    #[hotpath::skip]
     pub(super) async fn with_writer<Operation, OperationFuture, Output>(
         &self,
         operation: Operation,
@@ -1354,6 +1412,7 @@ impl StoreAdministration {
 
     /// Acquires writer administration for `scope` before constructing the
     /// supplied future and holds it until that future completes.
+    #[hotpath::skip]
     pub(super) async fn with_writer_in<Operation, OperationFuture, Output>(
         &self,
         scope: WriterScope,
@@ -1374,6 +1433,7 @@ impl StoreAdministration {
         operation().await
     }
 
+    #[hotpath::skip]
     pub(super) async fn try_with_writer<Operation, OperationFuture, Output>(
         &self,
         operation: Operation,
@@ -1395,8 +1455,8 @@ impl StoreAdministration {
         &self,
         schedulers: &tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1,
         handshake: &DaemonHandshake,
-        action: crate::branch::BranchAdminAction,
-    ) -> Result<crate::branch::BranchAdminReport> {
+        action: tracedecay_runtime_core::branch::BranchAdminAction,
+    ) -> Result<tracedecay_runtime_core::branch::BranchAdminReport> {
         let project_root =
             handshake
                 .project_path
@@ -1404,7 +1464,7 @@ impl StoreAdministration {
                 .ok_or_else(|| TraceDecayError::Config {
                     message: "branch administration requires a project path".to_string(),
                 })?;
-        let layout = crate::storage::resolve_persisted_layout(
+        let layout = tracedecay_runtime_core::storage::resolve_persisted_layout(
             project_root,
             &handshake.client_identity.profile_root,
         )?
@@ -1456,11 +1516,11 @@ impl StoreAdministration {
         schedulers: &tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1,
         project_root: &Path,
         data_root: &Path,
-        action: crate::branch::BranchAdminAction,
+        action: tracedecay_runtime_core::branch::BranchAdminAction,
         branch_gc_days: u64,
         orphan_db_gc_days: u64,
-    ) -> Result<crate::branch::BranchAdminReport> {
-        let prepared = crate::branch::prepare_branch_admin_mutation(
+    ) -> Result<tracedecay_runtime_core::branch::BranchAdminReport> {
+        let prepared = tracedecay_runtime_core::branch::prepare_branch_admin_mutation(
             project_root,
             data_root,
             action,
@@ -1555,7 +1615,7 @@ impl StoreAdministration {
 #[hotpath::measure(label = "daemon.branch_admin.acquire_retirement_leases")]
 fn acquire_manual_branch_retirement_leases(
     data_root: &Path,
-    retirements: &[crate::branch::SingleStoreBranchRetirementV1],
+    retirements: &[tracedecay_runtime_core::branch::SingleStoreBranchRetirementV1],
 ) -> Result<Vec<super::pr_autotrack::ManualBranchLifecycleLeaseV1>> {
     retirements
         .iter()
@@ -1576,7 +1636,7 @@ async fn cleanup_manual_branch_retirements(
     project_root: &Path,
     data_root: &Path,
     schedulers: &tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1,
-    retirements: &[crate::branch::SingleStoreBranchRetirementV1],
+    retirements: &[tracedecay_runtime_core::branch::SingleStoreBranchRetirementV1],
     lifecycle_leases: Vec<super::pr_autotrack::ManualBranchLifecycleLeaseV1>,
 ) -> Result<Vec<super::pr_autotrack::ManualBranchLifecycleLeaseV1>> {
     if retirements.len() != lifecycle_leases.len() {
@@ -1609,7 +1669,8 @@ async fn cleanup_manual_branch_retirements(
 
 pub(super) struct BranchAdminRequest {
     pub(super) id: serde_json::Value,
-    pub(super) action: std::result::Result<crate::branch::BranchAdminAction, String>,
+    pub(super) action:
+        std::result::Result<tracedecay_runtime_core::branch::BranchAdminAction, String>,
 }
 
 pub(super) fn parse_branch_admin_request(line: &str) -> Option<BranchAdminRequest> {
@@ -1692,7 +1753,7 @@ fn destructive_reservation_error(
 }
 
 fn branch_admin_tool_result(
-    report: &crate::branch::BranchAdminReport,
+    report: &tracedecay_runtime_core::branch::BranchAdminReport,
 ) -> Result<serde_json::Value> {
     Ok(json!({
         "content": [{
@@ -1723,7 +1784,7 @@ fn branch_admin_error_response(id: serde_json::Value, error: &TraceDecayError) -
 pub(super) async fn write_branch_admin_response(
     transport: &mut impl McpTransport,
     request: BranchAdminRequest,
-    result: Result<crate::branch::BranchAdminReport>,
+    result: Result<tracedecay_runtime_core::branch::BranchAdminReport>,
 ) -> Result<()> {
     let response = match (request.action, result) {
         (Err(message), _) => JsonRpcResponse::error(request.id, ErrorCode::InvalidParams, message),
@@ -1889,39 +1950,46 @@ mod tests {
     #[tokio::test]
     async fn profile_bootstrap_preserves_future_spool_reset_without_retry_mapping() {
         let temp = tempfile::tempdir().unwrap();
-        let profile_identity =
-            crate::daemon::profile_identity::load_or_create(temp.path()).unwrap();
-        let database_path = tracedecay_sessions::runtime::user_sessions_db_path(temp.path());
+        // The profile identity root must be a directory `load_or_create`
+        // creates (and restricts to 0700) itself; a umask-default tempdir
+        // trips the fail-closed private-root validation.
+        let profile_root = temp.path().join("profile");
+        let profile_identity = profile_identity::load_or_create(&profile_root).unwrap();
+        let database_path = tracedecay_sessions::runtime::user_sessions_db_path(&profile_root);
         let (meta_path, bytes_before) = write_future_spool_metadata(&database_path);
         let administration = StoreAdministration::default().with_profile_identity(profile_identity);
 
         administration
-            .ensure_profile_host_admission_bootstrap(temp.path())
+            .ensure_profile_host_admission_bootstrap(&profile_root)
             .await
             .unwrap();
+        // The worker performs a real session-runtime-registry open before it
+        // can surface the spool error, so give it a generous (still bounded)
+        // wait; completion notifies immediately, so a healthy run never
+        // sleeps this long.
         assert!(
             administration
                 .profile_host_admission_replay
-                .wait_bootstrap_completed(temp.path(), Duration::from_secs(1))
+                .wait_bootstrap_completed(&profile_root, Duration::from_mins(1))
                 .await,
             "production bootstrap worker must publish its terminal state"
         );
         assert_eq!(
             administration
                 .profile_host_admission_replay
-                .bootstrap_attempt_count(temp.path())
+                .bootstrap_attempt_count(&profile_root)
                 .await,
             1
         );
         assert_eq!(
             administration
                 .profile_host_admission_replay
-                .bootstrap_backoff_count(temp.path())
+                .bootstrap_backoff_count(&profile_root)
                 .await,
             0
         );
         let Some(ProfileHostAdmissionBootstrapStatus::Terminal(error)) = administration
-            .profile_host_admission_bootstrap_status(temp.path())
+            .profile_host_admission_bootstrap_status(&profile_root)
             .await
             .unwrap()
         else {
@@ -1937,8 +2005,8 @@ mod tests {
         assert_eq!(std::fs::read(meta_path).unwrap(), bytes_before);
 
         let client_identity = tracedecay_daemon_protocol::DaemonClientIdentity {
-            profile_root: temp.path().to_path_buf(),
-            global_db_path: temp.path().join("global.db"),
+            profile_root: profile_root.clone(),
+            global_db_path: profile_root.join("global.db"),
         };
         let Some(ProfileHostAdmissionBootstrapStatus::Terminal(observed_error)) =
             super::super::project_server_lifecycle::schedule_user_profile_host_admission_replay_for_identity(
@@ -1956,7 +2024,7 @@ mod tests {
         assert_eq!(
             administration
                 .profile_host_admission_replay
-                .bootstrap_attempt_count(temp.path())
+                .bootstrap_attempt_count(&profile_root)
                 .await,
             1,
             "reading cached terminal status must not start another attempt"
@@ -2145,7 +2213,7 @@ mod tests {
         assert_eq!(request.id, json!(7));
         assert_eq!(
             request.action.expect("valid action"),
-            crate::branch::BranchAdminAction::Remove {
+            tracedecay_runtime_core::branch::BranchAdminAction::Remove {
                 branch: "feature/a".to_string()
             }
         );

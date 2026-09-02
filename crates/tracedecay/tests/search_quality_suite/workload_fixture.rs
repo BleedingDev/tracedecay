@@ -1,14 +1,14 @@
 //! query/semantic candidate-workload fixture integrity.
 //!
-//! This test validates the checked-in workload against the root-owned
-//! `search_eval` module and the root-checked-in fixture corpus, so it stays
-//! with the root crate while the query lane regressions live in
+//! This test validates the checked-in workload against `tracedecay-search-eval`
+//! and the root-checked-in fixture corpus, so it stays with the root crate
+//! while the query lane regressions live in
 //! `crates/tracedecay-query/tests/search_quality_suite`.
 
 use std::fs;
 
 use sha2::{Digest, Sha256};
-use tracedecay::search_eval::{
+use tracedecay_search_eval::{
     compute_workload_digest, load_candidate_workload, validate_direct_workload,
 };
 
@@ -23,7 +23,7 @@ fn semantic_workload_and_incremental_fixture_are_byte_exact() {
 
     assert_eq!(
         compute_workload_digest(&workload).expect("workload digest"),
-        "sha256:068eeb1726539df4575f0b0b516403c7123dbd157acfb22aa2a89c4fcfbb5610"
+        "sha256:c0bcabaab7ea81312a6468262003d865e6ca293b2328b6c6332c731e5c1785d3"
     );
     assert_eq!(
         summary.workload_digest,

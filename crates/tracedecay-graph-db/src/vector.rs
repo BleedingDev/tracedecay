@@ -33,6 +33,7 @@ impl VectorMetric {
         }
     }
 
+    #[hotpath::skip]
     pub(crate) const fn engine_name(self) -> &'static str {
         match self {
             Self::Cosine => "cosine",
@@ -41,6 +42,7 @@ impl VectorMetric {
         }
     }
 
+    #[hotpath::skip]
     pub(crate) const fn storage_tag(self) -> &'static str {
         match self {
             Self::Cosine => "cos",
@@ -102,8 +104,10 @@ impl fmt::Debug for GraphVectorIndexRequest {
 /// What the store can currently answer for one exact-projection index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GraphVectorIndexStatus {
-    /// The index exists and covers vectors. Searches can be served.
-    Available,
+    /// The index exists and covers `vectors` rows. Searches can be served;
+    /// callers that require complete coverage compare `vectors` against the
+    /// row set they serve.
+    Available { vectors: usize },
     /// No index exists for this label and property. A build is needed and
     /// nothing is being answered wrongly in the meantime: `vector_search`
     /// reports the index as absent rather than returning an empty result.
@@ -127,6 +131,7 @@ pub enum GraphVectorIndexStatus {
 impl GraphVectorIndexStatus {
     /// Whether a caller should build or rebuild before trusting searches.
     #[must_use]
+    #[hotpath::skip]
     pub const fn needs_build(self) -> bool {
         matches!(self, Self::Missing | Self::Stale)
     }
@@ -176,7 +181,9 @@ pub(crate) fn classify_vector_index(
     match vector_index_census(database, label, property) {
         Some(census) if census.vectors > 0 => {
             crate::hotpath_observe::record_vector_index_size(census.vectors, census.bytes);
-            GraphVectorIndexStatus::Available
+            GraphVectorIndexStatus::Available {
+                vectors: census.vectors,
+            }
         }
         // Registered but covering nothing, or registered somewhere the
         // census cannot see it. Either way a search would answer empty

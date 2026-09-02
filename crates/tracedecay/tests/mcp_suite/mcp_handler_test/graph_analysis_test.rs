@@ -10,10 +10,10 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use tracedecay::daemon::ProductionProjectCompositionHarnessV1;
-use tracedecay::mcp::ToolResult;
-use tracedecay::storage::resolve_layout_for_current_profile;
 use tracedecay::tracedecay::TraceDecay;
-use tracedecay_runtime_core::errors::{Result as TraceDecayResult, TraceDecayError};
+use tracedecay_domain::errors::{Result as TraceDecayResult, TraceDecayError};
+use tracedecay_mcp::ToolResult;
+use tracedecay_runtime_core::storage::resolve_layout_for_current_profile;
 
 struct MountedProductionProject {
     harness: ProductionProjectCompositionHarnessV1,
@@ -40,7 +40,7 @@ async fn call_production_tool(
     tool_name: &str,
     mut arguments: Value,
 ) -> TraceDecayResult<ToolResult> {
-    if !tracedecay::mcp::tools::tool_defaults_to_markdown(tool_name)
+    if !tracedecay_mcp::tool_defaults_to_markdown(tool_name)
         && let Some(arguments) = arguments.as_object_mut()
     {
         arguments
@@ -262,13 +262,12 @@ async fn init_test_project(project: &Path) -> (MountedProductionProject, ()) {
         ProductionProjectCompositionHarnessV1::open(isolation_root, [project.to_path_buf()])
             .await
             .expect("production graph-analysis composition");
-    (
-        MountedProductionProject {
-            harness,
-            project_root: project.to_path_buf(),
-        },
-        (),
-    )
+    let mounted = MountedProductionProject {
+        harness,
+        project_root: project.to_path_buf(),
+    };
+    wait_for_current_graph(&mounted).await;
+    (mounted, ())
 }
 
 #[tokio::test]
@@ -554,8 +553,11 @@ async fn test_recursion() {
 #[tokio::test]
 async fn test_changelog_no_git() {
     let (cg, _env, _dir) = setup_empty_project().await;
-    // The temp dir is not a git repo, so this should return a structured git
-    // error in the tool payload rather than success-looking prose.
+    // Fixture enrollment pins a repository identity, which initializes an
+    // empty git repository with an unborn HEAD and no commits. The tree diff
+    // must surface a structured git error naming the unresolvable ref in the
+    // tool payload rather than success-looking prose (a project that is not a
+    // repository at all is covered by the git shell's own open refusal test).
     let result = handle_tool_call(
         &cg,
         "tracedecay_changelog",
@@ -573,7 +575,8 @@ async fn test_changelog_no_git() {
         output["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("failed to open git repo")
+            .contains("cannot resolve 'HEAD~1'"),
+        "the unborn-HEAD refusal must name the unresolvable ref: {output}"
     );
 }
 

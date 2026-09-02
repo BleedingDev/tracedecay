@@ -1969,7 +1969,7 @@ mod tests {
 
     use super::*;
     use crate::host_admission::HostAdmissionTestRuntimeV1;
-    use crate::store::GlobalDbObservationStore;
+    use tracedecay_global_db::GlobalDbObservationStore;
 
     const READY_RECEIPT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const PROVIDER_RECEIPT: &str =

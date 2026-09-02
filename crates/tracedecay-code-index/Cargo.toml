@@ -98,7 +98,7 @@ hotpath.workspace = true
 ignore = "0.4"
 rayon = "1"
 regex = "1"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.11"
 thiserror = "2"
@@ -112,21 +112,29 @@ tracedecay-private-fs = { path = "../tracedecay-private-fs", version = "0.1.0" }
 criterion = { version = "0.5", features = ["html_reports"] }
 rusqlite = { version = "0.40.1", default-features = false, features = ["backup"] }
 tempfile = "3"
-tracedecay-code-extraction = { path = "../tracedecay-code-extraction", version = "0.1.0", features = ["test-helpers"] }
+tracedecay-code-extraction = { path = "../tracedecay-code-extraction", version = "0.1.0", default-features = false, features = ["lite", "test-helpers"] }
 tracedecay-graph-db = { path = "../tracedecay-graph-db", version = "0.1.0", features = ["test-helpers"] }
 tracedecay-rusqlite-runtime = { path = "../tracedecay-rusqlite-runtime", version = "0.1.0" }
 tracedecay-store = { path = "../tracedecay-store", version = "0.1.0" }
 tree-sitter = "0.26"
 
+# Profiling benches: built only under the opt-in `hotpath` feature so a
+# default `cargo bench` / `cargo test --all-targets` never compiles hotpath
+# instrumentation. Run with `cargo bench -p tracedecay-code-index
+# --features hotpath --bench <name>`. A `--no-default-features` retained-parse
+# reproduction must keep `hotpath` selected (for example
+# `--features lite,hotpath`) or Cargo cannot select the target.
 [[bench]]
 name = "code_index_chunks"
 harness = false
 test = false
+required-features = ["hotpath"]
 
 [[bench]]
 name = "retained_parse"
 harness = false
 test = false
+required-features = ["hotpath"]
 
 [[bench]]
 name = "source_search"

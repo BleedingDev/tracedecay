@@ -5,20 +5,20 @@ use std::collections::BTreeSet;
 use tracedecay_application::RequestContext;
 use tracedecay_domain::{RetrievalGrainV1, SessionId, TemporalModeV1};
 use tracedecay_global_db::RegisteredGlobalDb;
+use tracedecay_session_memory::session::{
+    SessionRefreshConfiguration, SessionRefreshOutcome, SessionRefreshService,
+    SessionRefreshTarget, SessionRequestBinding, SessionRetrievalOutcome, SessionRetrievalScope,
+    SessionTemporalQuery,
+};
 use tracedecay_store::{
     SessionRefreshCompletionRequestV1, SessionRefreshFrontierV1, SessionRefreshProgressV1,
 };
 use tracedecay_temporal_query::context::ContextBudget;
 use tracedecay_temporal_query::ports::ExecutionControl;
 use tracedecay_temporal_query::ranking::DiversityLimits;
-use tracedecay_usecases::session::{
-    SessionRefreshConfiguration, SessionRefreshOutcome, SessionRefreshService,
-    SessionRefreshTarget, SessionRequestBinding, SessionRetrievalOutcome, SessionRetrievalScope,
-    SessionTemporalQuery,
-};
 
 use super::{AllowAuthorizer, BenchResult, CONFIG_VERSION, NoopWake, PROJECTOR_VERSION};
-use crate::store::GlobalDbSessionTemporalStore;
+use tracedecay_session_temporal_store::GlobalDbSessionTemporalStore;
 
 pub(super) const ROOT_RELATION_PARTICIPANT_COUNT: usize = 64;
 

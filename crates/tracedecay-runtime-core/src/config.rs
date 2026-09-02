@@ -16,8 +16,14 @@ pub const TRACEDECAY_DIR: &str = ".tracedecay";
 /// Environment variable that pins the user-level `TraceDecay` data directory.
 pub const USER_DATA_DIR_ENV: &str = "TRACEDECAY_DATA_DIR";
 
+/// Environment variable that pins the user-level global database path.
+pub const GLOBAL_DB_PATH_ENV: &str = "TRACEDECAY_GLOBAL_DB";
+
 /// Project graph database filename inside a `.tracedecay/` data dir.
 pub const DB_FILENAME: &str = "tracedecay.db";
+
+/// Filename of the user-level global database inside the profile root.
+pub const GLOBAL_DB_FILENAME: &str = "global.db";
 
 /// New runtime storage lives in the user-level profile shard. The project root
 /// only carries lightweight marker/config files under `.tracedecay/`.
@@ -59,6 +65,30 @@ pub fn user_data_dir() -> Option<PathBuf> {
     }
     let home = dirs::home_dir()?;
     Some(canonicalize_data_dir(home.join(TRACEDECAY_DIR)))
+}
+
+fn global_db_path_override() -> Option<PathBuf> {
+    std::env::var_os(GLOBAL_DB_PATH_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Path to the user-level global database.
+///
+/// Default is `global.db` inside [`user_data_dir`]. `TRACEDECAY_GLOBAL_DB`
+/// pins an explicit path. This is the same formula `tracedecay-global-db`
+/// previously owned; the helper lives here so handshake identity can resolve
+/// the path without taking that crate as a dependency.
+pub fn global_db_path() -> Option<PathBuf> {
+    if let Some(path) = global_db_path_override() {
+        return Some(path);
+    }
+    user_data_dir().map(|dir| dir.join(GLOBAL_DB_FILENAME))
+}
+
+/// True when `TRACEDECAY_GLOBAL_DB` pins the global DB to an explicit path.
+pub fn global_db_path_is_overridden() -> bool {
+    global_db_path_override().is_some()
 }
 
 fn nextest_isolated_user_data_dir(path: PathBuf) -> PathBuf {
@@ -181,12 +211,12 @@ fn paths_same(left: &Path, right: &Path) -> bool {
 pub use tracedecay_domain::source_path_policy::{GENERATED_DIR_SEGMENTS, is_generated_dir_segment};
 
 // Deliberately unconditional (not gated behind `cfg(test)` /
-// `feature = "test-helpers"`): some non-test call sites — e.g. the root
-// crate's `src/session_temporal_benchmark.rs`, which backs
-// `cargo bench` and is always compiled as part of the lib — need this lock
-// outside a test build. The mutex and accessor are trivial and side-effect
-// free, so keeping them unconditional costs nothing while guaranteeing every
-// consumer, test or not, serializes on the same lock.
+// `feature = "test-helpers"`): some call sites reach it from a non-test build
+// — e.g. the root crate's `session_temporal_benchmark`, which backs
+// `cargo bench` and compiles as an optimized bench profile, not under
+// `cfg(test)`. The mutex and accessor are trivial and side-effect free, so
+// keeping them unconditional costs nothing while guaranteeing every consumer,
+// test or not, serializes on the same lock.
 static USER_DATA_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Serializes tests (and benchmark harnesses) that mutate process-wide

@@ -14,11 +14,11 @@ use crate::mcp::server::{
     SourceEditRollbackInvocationV1,
 };
 use crate::tracedecay::TraceDecay;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
-use super::super::ToolResult;
-use super::super::render;
 use super::support::{generic_tool_result, rendered_tool_result};
+use tracedecay_mcp::ToolResult;
+use tracedecay_mcp::tools::render;
 
 fn missing_required_param(name: &str) -> TraceDecayError {
     TraceDecayError::Config {
@@ -555,7 +555,7 @@ pub(super) async fn handle_rename_symbol(
 
 /// Human-readable markdown for a move result: the outcome line, applied
 /// imports, the impact report (the centerpiece), and the preview diff.
-fn move_result_md(result: &crate::types::MoveResult) -> String {
+fn move_result_md(result: &tracedecay_application::source_edit::MoveResult) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let verb = if result.dry_run {
@@ -631,7 +631,7 @@ mod tests {
 
     use super::*;
     use crate::tracedecay::TraceDecayOpenOptions;
-    use crate::types::EditResult;
+    use tracedecay_application::source_edit::EditResult;
     use tracedecay_application::source_edit::{
         SourceEditSurfaceOutcomeV1, SourceEditSurfaceResultV1,
     };
@@ -668,7 +668,8 @@ mod tests {
             profile_root: Some(profile_root.clone()),
             global_db_path: Some(profile_root.join("global.db")),
         };
-        let identity = crate::daemon::profile_identity::load_or_create(&profile_root).unwrap();
+        let identity =
+            tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root).unwrap();
         let database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
             identity.profile_root(),
             1,
@@ -676,11 +677,9 @@ mod tests {
         )
         .unwrap();
         let runtime_registry = Arc::new(
-            crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-                identity,
-            )
-            .await
-            .unwrap(),
+            tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity)
+                .await
+                .unwrap(),
         );
         let profile_database = runtime_registry.profile_database().await.unwrap();
         let store_layout = TraceDecay::resolve_first_touch_configuration_layout(
@@ -698,7 +697,11 @@ mod tests {
                 .expect("fixture layout has a project identity"),
         )
         .unwrap();
-        crate::storage::pin_fixture_repository_identity(project_root, project_id.as_str()).unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            project_root,
+            project_id.as_str(),
+        )
+        .unwrap();
         let configuration_database = runtime_registry
             .project_sessions(
                 project_id,

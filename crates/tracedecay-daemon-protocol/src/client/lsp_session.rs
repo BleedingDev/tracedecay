@@ -3,8 +3,8 @@
 //! Relocated verbatim from `daemon_client.rs` as a pure structural split; no
 //! logic, naming, or visibility changes beyond the imports this file needs.
 
+use crate::lsp_wire::{FramePoll, FrameSend};
 use tracedecay_application::{CancellationSignal, Deadline};
-use tracedecay_lsp::{FramePoll, FrameSend};
 
 use super::{
     ConnectionLocalRequestSequence, DaemonInvocationClient, InvocationCancellationPolicy,
@@ -74,6 +74,7 @@ impl DaemonLspSessionClient {
         self.scope_set_digest.as_ref()
     }
 
+    #[hotpath::skip]
     pub async fn try_send_client_frame(
         &mut self,
         frame: &str,
@@ -110,6 +111,7 @@ impl DaemonLspSessionClient {
         }
     }
 
+    #[hotpath::skip]
     pub async fn poll_daemon_frame(
         &mut self,
         deadline: Deadline,
@@ -141,6 +143,7 @@ impl DaemonLspSessionClient {
         }
     }
 
+    #[hotpath::skip]
     pub async fn acknowledge_daemon_frame(
         &mut self,
         deadline: Deadline,
@@ -166,6 +169,7 @@ impl DaemonLspSessionClient {
         }
     }
 
+    #[hotpath::skip]
     pub async fn reconnect(
         &mut self,
         deadline: Deadline,
@@ -194,6 +198,7 @@ impl DaemonLspSessionClient {
         }
     }
 
+    #[hotpath::skip]
     pub async fn detach(
         &mut self,
         deadline: Deadline,
@@ -219,6 +224,7 @@ impl DaemonLspSessionClient {
         }
     }
 
+    #[hotpath::skip]
     async fn invoke(
         &self,
         request: crate::contract::DaemonInvocationRequest,

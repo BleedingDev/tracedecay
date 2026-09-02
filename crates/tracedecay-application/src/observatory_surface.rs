@@ -53,6 +53,7 @@ impl Default for ObservatoryReadRequestV1 {
 }
 
 impl ObservatoryReadRequestV1 {
+    #[hotpath::skip]
     pub const fn since_seconds(self) -> i64 {
         self.window_days as i64 * 24 * 60 * 60
     }
@@ -83,6 +84,7 @@ impl<P> ObservatoryReadServiceV1<P>
 where
     P: ObservatoryReadPortV1,
 {
+    #[hotpath::skip]
     pub const fn new(port: P) -> Self {
         Self { port }
     }

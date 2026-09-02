@@ -35,8 +35,8 @@ impl tracedecay_dashboard_api::hooks::HookReadinessProjectionPort for RootHookRe
 }
 
 #[hotpath::measure(label = "hints.hook_install")]
-pub(crate) fn install_dashboard_hook_readiness_projection()
--> tracedecay_runtime_core::errors::Result<()> {
+pub(crate) fn install_dashboard_hook_readiness_projection() -> tracedecay_domain::errors::Result<()>
+{
     static INSTALLATION: std::sync::LazyLock<std::result::Result<(), String>> =
         std::sync::LazyLock::new(|| {
             tracedecay_dashboard_api::hooks::install_hook_readiness_projection(std::sync::Arc::new(
@@ -47,20 +47,9 @@ pub(crate) fn install_dashboard_hook_readiness_projection()
     INSTALLATION
         .as_ref()
         .map_err(
-            |message| tracedecay_runtime_core::errors::TraceDecayError::Config {
+            |message| tracedecay_domain::errors::TraceDecayError::Config {
                 message: message.clone(),
             },
         )
         .copied()
-}
-
-#[cfg(test)]
-pub(crate) fn run_with_test_env_lock<T>(future: impl std::future::Future<Output = T>) -> T {
-    let _lock = crate::config::lock_user_data_dir_test_env();
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build hook test runtime")
-        .block_on(future)
 }

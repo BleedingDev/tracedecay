@@ -42,6 +42,7 @@ pub enum WorkAttemptEffectDispatchOutcomeV1 {
 }
 
 impl WorkAttemptEffectDispatchOutcomeV1 {
+    #[hotpath::skip]
     pub const fn holder(&self) -> &WorkAttemptEffectHolderV1 {
         match self {
             Self::Recorded(holder) | Self::Replayed(holder) => holder,
@@ -88,22 +89,27 @@ impl WorkAttemptEffectHolderV1 {
         &self.attempt
     }
 
+    #[hotpath::skip]
     pub const fn effect_state(&self) -> WorkEffectStateV1 {
         self.effect_state
     }
 
+    #[hotpath::skip]
     pub const fn dispatched_at(&self) -> UtcMicros {
         self.dispatched_at
     }
 
+    #[hotpath::skip]
     pub const fn deadline(&self) -> UtcMicros {
         self.deadline
     }
 
+    #[hotpath::skip]
     pub const fn resolution(&self) -> Option<WorkAttemptEffectResolutionV1> {
         self.resolution
     }
 
+    #[hotpath::skip]
     pub const fn resolved_at(&self) -> Option<UtcMicros> {
         self.resolved_at
     }
@@ -196,6 +202,7 @@ impl<S> WorkAttemptEffectServiceV1<S>
 where
     S: WorkAttemptEffectStoragePortV1,
 {
+    #[hotpath::skip]
     pub const fn new(storage: S) -> Self {
         Self { storage }
     }

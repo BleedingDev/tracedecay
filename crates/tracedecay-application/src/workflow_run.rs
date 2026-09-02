@@ -183,6 +183,7 @@ impl<P> WorkflowRunService<P>
 where
     P: WorkflowRunStoragePort,
 {
+    #[hotpath::skip]
     pub const fn new(storage: P) -> Self {
         Self { storage }
     }

@@ -49,7 +49,13 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+#[cfg(any(test, feature = "semantic-fastembed"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(test, feature = "semantic-fastembed"))]
+use std::thread;
+#[cfg(any(test, feature = "semantic-fastembed"))]
+use std::time::Duration;
 
 #[cfg(any(test, feature = "semantic-fastembed"))]
 use tracedecay_domain::canonical_text::sha256_hex;
@@ -58,13 +64,14 @@ use tracedecay_domain::{
     EmbeddingNormalizationV1, EmbeddingPoolingV1, EmbeddingPrecisionV1, EmbeddingProjectionKeyV1,
     EmbeddingTruncationSideV1, ManifestDigest, PrivacyDomainId,
 };
+use tracedecay_semantic_contracts::{
+    ArtifactMemberRoleV1, ArtifactProfileKindV1, SemanticResourceCeilings, Sha256DigestHex,
+};
 
 use super::artifact_store::{
     AdmittedArtifactV1, FASTEMBED_RUNTIME_BUILD_REVISION_V1, FASTEMBED_RUNTIME_FAMILY_V1,
 };
-use super::manifest::{ArtifactMemberRoleV1, ArtifactProfileKindV1, Sha256DigestHex};
 use super::model_catalog::{CatalogMemberPinV1, CatalogedFastEmbedModelV1, catalog_package_digest};
-use crate::SemanticResourceCeilings;
 
 mod pins;
 pub use pins::ProjectionArtifactPinV1;
@@ -931,6 +938,31 @@ fn check_execution_authority(authority: &dyn SemanticExecutionAuthority) -> Resu
     }
 }
 
+#[cfg(any(test, feature = "semantic-fastembed"))]
+const MODEL_LOAD_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// Bridge the request's typed interruption authority to ORT's in-progress
+/// session-load canceler. The monitor is active only while the constructor is
+/// executing and returns the exact interruption that fired.
+#[cfg(any(test, feature = "semantic-fastembed"))]
+#[hotpath::measure(label = "semantic.model.load.cancel_monitor")]
+fn monitor_model_load(
+    load_finished: &AtomicBool,
+    authority: &dyn SemanticExecutionAuthority,
+    cancel: impl FnOnce() -> Result<(), EmbedError>,
+) -> Result<Option<SemanticExecutionInterruptionV1>, EmbedError> {
+    loop {
+        if load_finished.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if let Some(interruption) = authority.interruption() {
+            cancel()?;
+            return Ok(Some(interruption));
+        }
+        thread::sleep(MODEL_LOAD_CANCELLATION_POLL_INTERVAL);
+    }
+}
+
 /// A manually flipped cancellation flag.
 #[cfg(test)]
 #[derive(Debug, Default)]
@@ -1030,9 +1062,16 @@ pub trait EmbeddingRuntime {
     /// artifact bytes are already installed and verified by the artifact
     /// packet; this performs no download, import, extraction, cache
     /// discovery, or trust decision.
+    ///
+    /// `interruption` is the caller's typed cancellation/deadline authority.
+    /// Implementations must honor it at every load stage boundary (between
+    /// member-byte reads and before the runtime graph build) and return
+    /// [`EmbedError::Cancelled`] / [`EmbedError::DeadlineExceeded`] instead of
+    /// continuing to hold memory for a load whose caller already abandoned it.
     fn open_session(
         &self,
         authority: &AdmittedProjectionArtifactV1,
+        interruption: &dyn SemanticExecutionAuthority,
     ) -> Result<Self::Session, EmbedError>;
 }
 
@@ -1118,6 +1157,7 @@ impl EmbeddingRuntime for FastEmbedEmbeddingRuntime {
     fn open_session(
         &self,
         _authority: &AdmittedProjectionArtifactV1,
+        _interruption: &dyn SemanticExecutionAuthority,
     ) -> Result<Self::Session, EmbedError> {
         Err(fastembed_failure(
             RuntimeFailureKindV1::IncompatibleRuntime,
@@ -1179,7 +1219,9 @@ impl EmbeddingRuntime for FastEmbedEmbeddingRuntime {
     fn open_session(
         &self,
         authority: &AdmittedProjectionArtifactV1,
+        interruption: &dyn SemanticExecutionAuthority,
     ) -> Result<Self::Session, EmbedError> {
+        check_execution_authority(interruption)?;
         self.verify_artifact_compatibility(authority)?;
         let artifact = authority.runtime_artifact();
         // Disk read + digest recheck of the model and tokenizer members,
@@ -1187,23 +1229,71 @@ impl EmbeddingRuntime for FastEmbedEmbeddingRuntime {
         // `semantic.model.load` below. FastEmbed parses the tokenizer and
         // builds the graph inside one constructor, so those two costs are
         // not separable further at this boundary.
-        let model =
-            hotpath::measure_block!("semantic.model.member_bytes", fastembed_model(artifact))?;
+        let model = hotpath::measure_block!(
+            "semantic.model.member_bytes",
+            fastembed_model(artifact, interruption)
+        )?;
         hotpath::gauge!("semantic_model_member_bytes").set(model.onnx_file.len());
         let intra_threads = authority.embedding_execution_plan().intra_threads;
         let options = InitOptionsUserDefined::new()
             .with_max_length(artifact.truncation_length() as usize)
             .with_intra_threads(intra_threads)
             .with_execution_providers(crate::execution_provider::requested_execution_providers());
+        // Last boundary before the ORT constructor: an abandoned load drops
+        // the buffered member bytes here instead of parsing and optimizing a
+        // graph nobody will use.
+        check_execution_authority(interruption)?;
+        let load_finished = AtomicBool::new(false);
         let embedding = hotpath::measure_block!("semantic.model.load", {
-            TextEmbedding::try_new_from_user_defined(model, options).map_err(|error| {
-                let failure = fastembed_error(
-                    RuntimeFailureKindV1::LoadFailed,
-                    "FastEmbed could not initialize the verified artifact",
-                    &error,
+            thread::scope(|scope| {
+                let mut monitor = None;
+                let monitor_load_finished = &load_finished;
+                let monitor_interruption = interruption;
+                let embedding = TextEmbedding::try_new_from_user_defined_with_load_canceler(
+                    model,
+                    options,
+                    |canceler| {
+                        monitor = Some(scope.spawn(move || {
+                            monitor_model_load(monitor_load_finished, monitor_interruption, || {
+                                canceler.cancel().map_err(|error| {
+                                    fastembed_error(
+                                        RuntimeFailureKindV1::LoadFailed,
+                                        "ONNX Runtime refused model-load cancellation",
+                                        &error,
+                                    )
+                                })
+                            })
+                        }));
+                    },
                 );
-                crate::hotpath_observe::record_embed_error(&failure);
-                failure
+                load_finished.store(true, Ordering::Release);
+                let observed_interruption = match monitor {
+                    Some(monitor) => monitor.join().map_err(|_| {
+                        fastembed_failure(
+                            RuntimeFailureKindV1::LoadFailed,
+                            "the model-load cancellation monitor panicked",
+                        )
+                    })??,
+                    None => None,
+                };
+                match observed_interruption {
+                    Some(SemanticExecutionInterruptionV1::Cancelled) => {
+                        return Err(EmbedError::Cancelled);
+                    }
+                    Some(SemanticExecutionInterruptionV1::DeadlineExceeded) => {
+                        return Err(EmbedError::DeadlineExceeded);
+                    }
+                    None => {}
+                }
+                embedding.map_err(|error| {
+                    let failure = fastembed_error(
+                        RuntimeFailureKindV1::LoadFailed,
+                        "FastEmbed could not initialize the verified artifact",
+                        &error,
+                    );
+                    crate::hotpath_observe::record_embed_error(&failure);
+                    failure
+                })
             })
         })?;
         crate::hotpath_observe::record_model_state("ready");
@@ -1291,24 +1381,29 @@ impl EmbeddingSession for FastEmbedEmbeddingSession {
     }
 }
 
+/// Buffer the verified member bytes, honoring the caller's interruption
+/// authority between member reads so an abandoned load stops before the next
+/// disk read + digest recheck (the model member alone is hundreds of MB).
 #[cfg(feature = "semantic-fastembed")]
 fn fastembed_model(
     artifact: &VerifiedEmbeddingArtifactV1,
+    interruption: &dyn SemanticExecutionAuthority,
 ) -> Result<UserDefinedEmbeddingModel, EmbedError> {
-    let tokenizer_files = TokenizerFiles {
-        tokenizer_file: artifact.required_member_bytes(ArtifactMemberRoleV1::Tokenizer)?,
-        config_file: artifact.required_member_bytes(ArtifactMemberRoleV1::Config)?,
-        special_tokens_map_file: artifact
-            .required_member_bytes(ArtifactMemberRoleV1::SpecialTokensMap)?,
-        tokenizer_config_file: artifact
-            .required_member_bytes(ArtifactMemberRoleV1::TokenizerConfig)?,
+    let member_bytes = |role: ArtifactMemberRoleV1| {
+        check_execution_authority(interruption)?;
+        artifact.required_member_bytes(role)
     };
-    Ok(UserDefinedEmbeddingModel::new(
-        artifact.required_member_bytes(ArtifactMemberRoleV1::Model)?,
-        tokenizer_files,
+    let tokenizer_files = TokenizerFiles {
+        tokenizer_file: member_bytes(ArtifactMemberRoleV1::Tokenizer)?,
+        config_file: member_bytes(ArtifactMemberRoleV1::Config)?,
+        special_tokens_map_file: member_bytes(ArtifactMemberRoleV1::SpecialTokensMap)?,
+        tokenizer_config_file: member_bytes(ArtifactMemberRoleV1::TokenizerConfig)?,
+    };
+    Ok(
+        UserDefinedEmbeddingModel::new(member_bytes(ArtifactMemberRoleV1::Model)?, tokenizer_files)
+            .with_pooling(fastembed_pooling(artifact.pooling())?)
+            .with_quantization(fastembed_quantization(artifact.precision())),
     )
-    .with_pooling(fastembed_pooling(artifact.pooling())?)
-    .with_quantization(fastembed_quantization(artifact.precision())))
 }
 
 #[cfg(feature = "semantic-fastembed")]
@@ -1447,7 +1542,9 @@ impl EmbeddingRuntime for FakeEmbeddingRuntime {
     fn open_session(
         &self,
         authority: &AdmittedProjectionArtifactV1,
+        interruption: &dyn SemanticExecutionAuthority,
     ) -> Result<Self::Session, EmbedError> {
+        check_execution_authority(interruption)?;
         if let Some(kind) = self.open_failure {
             return Err(EmbedError::Runtime(RuntimeFailureV1 {
                 kind,
@@ -1456,7 +1553,8 @@ impl EmbeddingRuntime for FakeEmbeddingRuntime {
         }
         // Production parity: a session open consumes member bytes, so a
         // lifecycle-backed authority is length- and digest-verified here
-        // exactly as the FastEmbed runtime is when it reads the bytes.
+        // exactly as the FastEmbed runtime is when it reads the bytes,
+        // honoring the interruption authority between member reads.
         if let Some(lifecycle) = authority.runtime_artifact().lifecycle_install.as_ref() {
             for role in [
                 ArtifactMemberRoleV1::Model,
@@ -1465,6 +1563,7 @@ impl EmbeddingRuntime for FakeEmbeddingRuntime {
                 ArtifactMemberRoleV1::SpecialTokensMap,
                 ArtifactMemberRoleV1::TokenizerConfig,
             ] {
+                check_execution_authority(interruption)?;
                 lifecycle.read_member_bytes(role)?;
             }
         }
@@ -1610,13 +1709,13 @@ pub(crate) mod lifecycle_test_support {
 
     use sha2::{Digest, Sha256};
     use tracedecay_domain::{ChunkerRevision, PrivacyDomainId};
+    use tracedecay_semantic_contracts::SemanticResourceCeilings;
 
     use super::super::model_catalog::{
         CatalogMemberPinV1, CatalogSourceV1, CatalogedFastEmbedModelV1,
     };
     use super::AdmittedProjectionArtifactV1;
     use super::EmbedError;
-    use crate::SemanticResourceCeilings;
 
     pub(crate) struct LifecycleInstallFixtureV1 {
         pub(crate) install: tempfile::TempDir,
@@ -1936,7 +2035,7 @@ mod tests {
                 .verify_artifact_compatibility(&authority)
                 .expect("production runtime admits the verified lifecycle install");
             assert!(matches!(
-                runtime.open_session(&authority),
+                runtime.open_session(&authority, &never_cancelled()),
                 Err(EmbedError::Runtime(RuntimeFailureV1 {
                     kind: RuntimeFailureKindV1::LoadFailed,
                     ..
@@ -1976,7 +2075,7 @@ mod tests {
         );
         assert!(
             matches!(
-                FakeEmbeddingRuntime::new().open_session(&authority),
+                FakeEmbeddingRuntime::new().open_session(&authority, &never_cancelled()),
                 Err(EmbedError::Runtime(RuntimeFailureV1 {
                     kind: RuntimeFailureKindV1::CorruptArtifact,
                     ..
@@ -1987,13 +2086,75 @@ mod tests {
         #[cfg(feature = "semantic-fastembed")]
         assert!(
             matches!(
-                FastEmbedEmbeddingRuntime.open_session(&authority),
+                FastEmbedEmbeddingRuntime.open_session(&authority, &never_cancelled()),
                 Err(EmbedError::Runtime(RuntimeFailureV1 {
                     kind: RuntimeFailureKindV1::CorruptArtifact,
                     ..
                 }))
             ),
             "no session can open over digest-mismatched member bytes"
+        );
+    }
+
+    #[test]
+    fn open_session_honors_interruption_before_member_bytes() {
+        // The fixture's member bytes are digest-mismatched, so any byte read
+        // would fail with CorruptArtifact. A fired interruption must win
+        // instead: the typed Cancelled proves the stage-boundary check runs
+        // before the first member read.
+        let cancelled = ManualCancellation::new();
+        cancelled.cancel();
+        let mismatched = digest_mismatched_lifecycle_authority();
+        let authority = mismatched.authority;
+
+        assert!(
+            matches!(
+                FakeEmbeddingRuntime::new().open_session(&authority, &cancelled),
+                Err(EmbedError::Cancelled)
+            ),
+            "cancellation must be observed before any member byte is read"
+        );
+        #[cfg(feature = "semantic-fastembed")]
+        assert!(
+            matches!(
+                FastEmbedEmbeddingRuntime.open_session(&authority, &cancelled),
+                Err(EmbedError::Cancelled)
+            ),
+            "the production adapter must abandon the open before buffering members"
+        );
+    }
+
+    #[test]
+    fn model_load_monitor_cancels_promptly_when_authority_fires() {
+        let cancellation = ManualCancellation::new();
+        let load_finished = AtomicBool::new(false);
+        let cancel_called = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+
+        let interruption = std::thread::scope(|scope| {
+            let monitor = scope.spawn(|| {
+                monitor_model_load(&load_finished, &cancellation, || {
+                    cancel_called.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cancellation.cancel();
+            monitor.join().expect("model-load monitor must not panic")
+        })
+        .expect("the cancellation handle succeeds");
+
+        assert_eq!(
+            interruption,
+            Some(SemanticExecutionInterruptionV1::Cancelled)
+        );
+        assert!(
+            cancel_called.load(Ordering::SeqCst),
+            "token fire must reach the runtime load canceler"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "load cancellation must not wait for the constructor to finish"
         );
     }
 
@@ -2152,7 +2313,9 @@ mod tests {
             EmbeddingMetricV1::DotProduct,
             EmbeddingNormalizationV1::L2,
         );
-        let mut session = runtime.open_session(&authority).expect("session");
+        let mut session = runtime
+            .open_session(&authority, &never_cancelled())
+            .expect("session");
         let vectors = session
             .embed_batch(&batch(&["echo me"]), &never_cancelled())
             .expect("embed");
@@ -2178,7 +2341,9 @@ mod tests {
             EmbeddingMetricV1::Cosine,
             EmbeddingNormalizationV1::None,
         );
-        let mut session = runtime.open_session(&authority).expect("session");
+        let mut session = runtime
+            .open_session(&authority, &never_cancelled())
+            .expect("session");
         let vectors = session
             .embed_batch(&batch(&["raw values"]), &never_cancelled())
             .expect("embed");
@@ -2192,7 +2357,9 @@ mod tests {
     #[test]
     fn cancellation_before_embed_aborts() {
         let runtime = FakeEmbeddingRuntime::new();
-        let mut session = runtime.open_session(&authority(8)).expect("session");
+        let mut session = runtime
+            .open_session(&authority(8), &never_cancelled())
+            .expect("session");
         let cancel = ManualCancellation::new();
         cancel.cancel();
         let result = session.embed_batch(&batch(&["a", "b"]), &cancel);
@@ -2215,7 +2382,9 @@ mod tests {
         }
 
         let runtime = FakeEmbeddingRuntime::new();
-        let mut session = runtime.open_session(&authority(8)).expect("session");
+        let mut session = runtime
+            .open_session(&authority(8), &never_cancelled())
+            .expect("session");
         let result = session.embed_batch(&batch(&["a", "b"]), &ExpiredAuthority);
 
         assert_eq!(result, Err(EmbedError::DeadlineExceeded));
@@ -2229,7 +2398,9 @@ mod tests {
     #[test]
     fn cancellation_mid_embed_discards_partial_batch() {
         let runtime = FakeEmbeddingRuntime::new();
-        let mut session = runtime.open_session(&authority(8)).expect("session");
+        let mut session = runtime
+            .open_session(&authority(8), &never_cancelled())
+            .expect("session");
         // First poll (before text 1) passes, second poll cancels.
         let cancel = ScriptedCancellation::new(1);
         let result = session.embed_batch(&batch(&["a", "b", "c", "d"]), &cancel);
@@ -2246,7 +2417,9 @@ mod tests {
         let runtime = FakeEmbeddingRuntime::new();
         let mut authority = authority(8);
         authority.runtime_artifact.max_batch_texts = 1;
-        let mut session = runtime.open_session(&authority).expect("session");
+        let mut session = runtime
+            .open_session(&authority, &never_cancelled())
+            .expect("session");
         let result = session.embed_batch(&batch(&["a", "b"]), &never_cancelled());
         assert!(matches!(
             result,
@@ -2296,7 +2469,7 @@ mod tests {
             RuntimeFailureKindV1::EmbedFailed,
         ] {
             let runtime = FakeEmbeddingRuntime::new().with_open_failure(kind);
-            let result = runtime.open_session(&authority(8));
+            let result = runtime.open_session(&authority(8), &never_cancelled());
             match result {
                 Err(EmbedError::Runtime(failure)) => assert_eq!(failure.kind, kind),
                 other => panic!("expected typed runtime failure, got {other:?}"),
@@ -2356,7 +2529,9 @@ mod tests {
         let runtime = FakeEmbeddingRuntime::new().with_resident_bytes_per_session(4096);
         let counters = runtime.counters();
         {
-            let session = runtime.open_session(&authority(8)).expect("session");
+            let session = runtime
+                .open_session(&authority(8), &never_cancelled())
+                .expect("session");
             assert_eq!(session.resident_bytes_estimate(), 4096);
             assert_eq!(counters.sessions_opened.load(Ordering::SeqCst), 1);
             assert_eq!(counters.sessions_closed.load(Ordering::SeqCst), 0);

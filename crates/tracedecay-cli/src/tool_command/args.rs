@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use serde_json::{Map, Value};
 
-use tracedecay::mcp::tools::{ToolDefinition, short_tool_name};
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_mcp::{ToolDefinition, resolve_property_schema, short_tool_name};
 
 /// Legacy CLI command names that do not match the MCP tool name. The right-hand
 /// side is the canonical MCP suffix (without the `tracedecay_` prefix).
@@ -55,6 +55,109 @@ pub(crate) fn parse_invocation(def: &ToolDefinition, args: &[String]) -> Result<
         cached = Some(input.clone());
         Ok(input)
     })
+}
+
+/// Parse the schema-independent `--args <object>` form used by reviewed
+/// application operations.
+///
+/// Per-property flags, help, and CLI-only dry runs still require the selected
+/// tool definition and therefore return `None` to retain the schema-driven
+/// parser. Whole-payload application requests are validated by their canonical
+/// request parser before dispatch, so assembling every MCP schema first adds
+/// no validation authority.
+pub(crate) fn parse_whole_payload_invocation(args: &[String]) -> Result<Option<ParsedInvocation>> {
+    let mut cached: Option<String> = None;
+    parse_whole_payload_invocation_with_stdin(args, || {
+        if let Some(cached) = &cached {
+            return Ok(cached.clone());
+        }
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|e| TraceDecayError::Config {
+                message: format!("failed to read stdin: {e}"),
+            })?;
+        cached = Some(input.clone());
+        Ok(input)
+    })
+}
+
+pub(super) fn parse_whole_payload_invocation_with_stdin(
+    args: &[String],
+    mut read_stdin: impl FnMut() -> Result<String>,
+) -> Result<Option<ParsedInvocation>> {
+    // Classify the complete argument shape before resolving a file or stdin
+    // payload. A schema-dependent flag can follow `--args -`; consuming stdin
+    // before deferring would leave the authoritative parser an empty stream.
+    let mut preflight = args.iter();
+    while let Some(raw) = preflight.next() {
+        let (flag_part, inline_value): (&str, Option<&str>) = if raw.starts_with("--") {
+            match raw.split_once('=') {
+                Some((flag, value)) => (flag, Some(value)),
+                None => (raw.as_str(), None),
+            }
+        } else {
+            (raw.as_str(), None)
+        };
+        match flag_part {
+            "--json" => {}
+            "--project" | "--args" => {
+                let _ = take_flag_value(&mut preflight, flag_part, inline_value)?;
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    let mut out = ParsedInvocation {
+        tool_args: Value::Object(Map::new()),
+        project: None,
+        raw_json: false,
+        dry_run: false,
+        show_help: false,
+    };
+    let mut explicit_args = None;
+    let mut iter = args.iter();
+    while let Some(raw) = iter.next() {
+        let (flag_part, inline_value): (&str, Option<&str>) = if raw.starts_with("--") {
+            match raw.split_once('=') {
+                Some((flag, value)) => (flag, Some(value)),
+                None => (raw.as_str(), None),
+            }
+        } else {
+            (raw.as_str(), None)
+        };
+        match flag_part {
+            "--json" => out.raw_json = true,
+            "--project" => {
+                out.project = Some(take_flag_value(&mut iter, "--project", inline_value)?);
+            }
+            "--args" => {
+                let raw_args = take_flag_value(&mut iter, "--args", inline_value)?;
+                let json_str = resolve_args_payload(&raw_args, &mut read_stdin)?;
+                let value: Value =
+                    serde_json::from_str(&json_str).map_err(|e| TraceDecayError::Config {
+                        message: format!(
+                            "--args: invalid JSON: {e} — if the payload contains quotes or \
+                             newlines, pipe it: tracedecay tool <name> --args - <<'JSON' … JSON"
+                        ),
+                    })?;
+                if !value.is_object() {
+                    return Err(TraceDecayError::Config {
+                        message: "--args must be a JSON object — the same object you would \
+                                  pass as MCP arguments, e.g. {\"query\":\"…\"}"
+                            .to_string(),
+                    });
+                }
+                explicit_args = Some(value);
+            }
+            _ => return Ok(None),
+        }
+    }
+    let Some(explicit_args) = explicit_args else {
+        return Ok(None);
+    };
+    out.tool_args = explicit_args;
+    Ok(Some(out))
 }
 
 pub(super) fn parse_invocation_with_stdin(
@@ -231,12 +334,15 @@ fn validate_tool_args(def: &ToolDefinition, args: &Map<String, Value>) -> Result
     let required = schema_required_keys(def);
 
     for (key, value) in args {
-        let Some(schema) = props.get(key) else {
+        let Some(declared) = props.get(key) else {
             if DISPATCH_ROUTING_KEYS.contains(&key.as_str()) {
                 continue;
             }
             return Err(unknown_key_error(key, short, props, &required));
         };
+        // Optional typed fields arrive as `anyOf: [$ref, null]`; resolve to
+        // the referenced schema so enum and type checks see the real contract.
+        let schema = resolve_property_schema(&def.input_schema, declared);
 
         if value.is_null() && !required.contains(key) {
             continue;

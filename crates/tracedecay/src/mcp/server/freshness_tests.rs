@@ -1,14 +1,13 @@
-use super::{
-    DatabaseOwnerReconciler, McpServer, McpServerConstructionContext, tool_error_response,
-};
+use super::{DatabaseOwnerReconciler, McpServer, McpServerConstructionContext};
 use crate::config::PinnedUserDataDir;
-use crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1;
 use crate::tracedecay::TraceDecay;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_mcp::tool_error_response;
+use tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1;
 
 struct FreshnessRuntime {
     registry: DaemonSessionRuntimeRegistryV1,
@@ -18,9 +17,9 @@ struct FreshnessRuntime {
 impl FreshnessRuntime {
     async fn open(profile_root: &std::path::Path) -> Self {
         std::fs::create_dir_all(profile_root).expect("freshness profile root");
-        crate::storage::set_private_dir_permissions(profile_root)
+        tracedecay_runtime_core::storage::set_private_dir_permissions(profile_root)
             .expect("restrict freshness profile root");
-        let identity = crate::daemon::profile_identity::load_or_create(profile_root)
+        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(profile_root)
             .expect("freshness profile identity");
         let scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
             identity.profile_root(),
@@ -46,13 +45,16 @@ impl FreshnessRuntime {
 }
 
 fn git(root: &std::path::Path, args: &[&str]) {
-    let ok = std::process::Command::new(tracedecay_runtime_core::git::git_program())
-        .current_dir(root)
-        .args(args)
-        .output()
-        .expect("git runs")
-        .status
-        .success();
+    let ok = std::process::Command::new(
+        tracedecay_runtime_core::git::try_git_program()
+            .expect("absolute git executable should resolve"),
+    )
+    .current_dir(root)
+    .args(args)
+    .output()
+    .expect("git runs")
+    .status
+    .success();
     assert!(ok, "git {args:?} failed");
 }
 
@@ -248,7 +250,7 @@ async fn direct_server_keeps_configured_profile_root_with_overridden_registry_db
 
 #[test]
 fn hook_runtime_failures_keep_structured_retry_data_at_json_rpc_boundary() {
-    let error = tracedecay_runtime_core::errors::TraceDecayError::hook_runtime_with_status(
+    let error = tracedecay_domain::errors::TraceDecayError::hook_runtime_with_status(
         "observation_cursor_conflict",
         true,
         "Claude observation store operation failed",
@@ -268,7 +270,7 @@ fn hook_runtime_failures_keep_structured_retry_data_at_json_rpc_boundary() {
 
 #[test]
 fn project_route_error_messages_keep_retry_authority_when_clients_hide_error_data() {
-    let error = tracedecay_runtime_core::errors::TraceDecayError::ProjectRoute {
+    let error = tracedecay_domain::errors::TraceDecayError::ProjectRoute {
         reason_code: "code-graph-unavailable".to_owned(),
         retryable: true,
         detail: "the verified code graph is not ready for the exact project root".to_owned(),

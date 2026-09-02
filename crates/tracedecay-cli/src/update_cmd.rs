@@ -18,13 +18,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::upgrade::UpgradeOutcome;
-use tracedecay_usecases::user_config::UserConfig;
+use tracedecay_daemon_control as daemon_control;
+use tracedecay_session_memory::user_config::UserConfig;
 
 // Exceeds the daemon's sequential 15s client drain, 2s task abort, and 45s
 // server-shutdown bounds with margin for service-manager/process-exit latency.
 const DAEMON_RESTART_LEASE_TIMEOUT: Duration = Duration::from_secs(90);
 
-pub(crate) async fn refresh_generated_plugins() -> tracedecay_runtime_core::errors::Result<()> {
+pub(crate) async fn refresh_generated_plugins() -> tracedecay_domain::errors::Result<()> {
     let home = tracedecay_home_dir()?;
     let tracedecay_bin = tracedecay_bin_for_generated_artifacts()?;
     refresh_generated_plugins_at(
@@ -60,7 +61,7 @@ fn refresh_generated_plugins_at(
     integrations: Vec<Box<dyn tracedecay::agents::AgentIntegration>>,
     home: &Path,
     tracedecay_bin: &str,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     eprintln!(
         "Refreshing tracedecay-generated plugin artifacts (supported user configs are preserved)"
     );
@@ -121,7 +122,7 @@ fn refresh_generated_plugins_at(
         eprintln!("No generated plugin installs detected — nothing to update.");
     }
     if !failures.is_empty() {
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: format!("update-plugin failed for {}", failures.join("; ")),
         });
     }
@@ -132,29 +133,33 @@ fn refresh_generated_plugins_at(
 /// Rewrites and restarts the installed daemon service, returning the service
 /// path and its socket, or `None` when no service is installed.
 fn refresh_daemon_service(
-    previous_state: tracedecay::daemon::DaemonServiceState,
-) -> tracedecay_runtime_core::errors::Result<Option<(PathBuf, PathBuf)>> {
+    previous_state: daemon_control::DaemonServiceState,
+) -> tracedecay_domain::errors::Result<Option<(PathBuf, PathBuf)>> {
     if !cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         return Ok(None);
     }
     let tracedecay_bin = tracedecay::agents::which_tracedecay_path().ok_or_else(|| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: "tracedecay not found on PATH".to_string(),
         }
     })?;
-    let spec = tracedecay::daemon::service_spec(tracedecay_bin, None)?;
+    let spec = daemon_control::service_spec(tracedecay_bin, None)?;
     refresh_daemon_service_with_spec(previous_state, &spec)
 }
 
 fn refresh_daemon_service_with_spec(
-    previous_state: tracedecay::daemon::DaemonServiceState,
-    spec: &tracedecay::daemon::DaemonServiceSpec,
-) -> tracedecay_runtime_core::errors::Result<Option<(PathBuf, PathBuf)>> {
-    let socket_path = tracedecay::daemon::installed_service_socket_path()?
+    previous_state: daemon_control::DaemonServiceState,
+    spec: &daemon_control::DaemonServiceSpec,
+) -> tracedecay_domain::errors::Result<Option<(PathBuf, PathBuf)>> {
+    let socket_path = daemon_control::installed_service_socket_path()?
         .unwrap_or_else(|| spec.socket_path.clone());
     Ok(
-        tracedecay::daemon::refresh_installed_service_under_lease_with_state(spec, previous_state)?
-            .map(|service_path| (service_path, socket_path)),
+        daemon_control::refresh_installed_service_under_lease_with_state(
+            spec,
+            previous_state,
+            crate::product_runtime::PRODUCT_BUILD_VERSION,
+        )?
+        .map(|service_path| (service_path, socket_path)),
     )
 }
 
@@ -170,8 +175,8 @@ fn print_daemon_transport_location(socket_path: &Path) {
 }
 
 fn refresh_daemon_service_after_update(
-    previous_state: tracedecay::daemon::DaemonServiceState,
-) -> tracedecay_runtime_core::errors::Result<()> {
+    previous_state: daemon_control::DaemonServiceState,
+) -> tracedecay_domain::errors::Result<()> {
     match refresh_daemon_service(previous_state)? {
         Some((service_path, socket_path)) => {
             eprintln!(
@@ -180,7 +185,7 @@ fn refresh_daemon_service_after_update(
             );
             print_daemon_transport_location(&socket_path);
         }
-        None if tracedecay::daemon::daemon_reachable() => {
+        None if daemon_control::daemon_reachable() => {
             eprintln!(
                 "  \x1b[33mwarning:\x1b[0m a TraceDecay daemon is running without an installed service; \
                  it keeps serving the previous version until its `tracedecay daemon run` process is restarted."
@@ -199,17 +204,14 @@ fn restart_daemon_service_with<Lease, Quiesce, Acquire, Refresh, Restore>(
     acquire: Acquire,
     refresh: Refresh,
     restore: Restore,
-) -> tracedecay_runtime_core::errors::Result<Option<(PathBuf, PathBuf)>>
+) -> tracedecay_domain::errors::Result<Option<(PathBuf, PathBuf)>>
 where
-    Quiesce:
-        FnOnce() -> tracedecay_runtime_core::errors::Result<tracedecay::daemon::DaemonServiceState>,
-    Acquire: FnOnce() -> tracedecay_runtime_core::errors::Result<Lease>,
+    Quiesce: FnOnce() -> tracedecay_domain::errors::Result<daemon_control::DaemonServiceState>,
+    Acquire: FnOnce() -> tracedecay_domain::errors::Result<Lease>,
     Refresh: FnOnce(
-        tracedecay::daemon::DaemonServiceState,
-    ) -> tracedecay_runtime_core::errors::Result<Option<(PathBuf, PathBuf)>>,
-    Restore: FnOnce(
-        tracedecay::daemon::DaemonServiceState,
-    ) -> tracedecay_runtime_core::errors::Result<()>,
+        daemon_control::DaemonServiceState,
+    ) -> tracedecay_domain::errors::Result<Option<(PathBuf, PathBuf)>>,
+    Restore: FnOnce(daemon_control::DaemonServiceState) -> tracedecay_domain::errors::Result<()>,
 {
     let previous_state = quiesce()?;
     let _lifecycle_lease = match acquire() {
@@ -217,11 +219,11 @@ where
         Err(acquire_error) => {
             if matches!(
                 previous_state,
-                tracedecay::daemon::DaemonServiceState::RunningEnabled
-                    | tracedecay::daemon::DaemonServiceState::RunningDisabled
+                daemon_control::DaemonServiceState::RunningEnabled
+                    | daemon_control::DaemonServiceState::RunningDisabled
             ) && let Err(restore_error) = restore(previous_state)
             {
-                return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                return Err(tracedecay_domain::errors::TraceDecayError::Config {
                     message: format!(
                         "{acquire_error}; additionally failed to restore the managed daemon service: {restore_error}"
                     ),
@@ -230,32 +232,33 @@ where
             return Err(acquire_error);
         }
     };
-    refresh(tracedecay::daemon::DaemonServiceState::RunningEnabled)
+    refresh(daemon_control::DaemonServiceState::RunningEnabled)
 }
 
-pub(crate) fn restart_daemon_service() -> tracedecay_runtime_core::errors::Result<()> {
-    let guard = tracedecay::daemon::QuiescedDaemonLifecycle::acquire_with_timeout(
+pub(crate) fn restart_daemon_service() -> tracedecay_domain::errors::Result<()> {
+    let guard = daemon_control::QuiescedDaemonLifecycle::acquire_with_timeout(
         "daemon restart",
         DAEMON_RESTART_LEASE_TIMEOUT,
+        crate::product_runtime::PRODUCT_BUILD_VERSION,
     )?;
     let (stopped_state, desired_state) = match guard.previous_state() {
-        tracedecay::daemon::DaemonServiceState::RunningEnabled
-        | tracedecay::daemon::DaemonServiceState::StoppedEnabled => (
-            tracedecay::daemon::DaemonServiceState::StoppedEnabled,
-            tracedecay::daemon::DaemonServiceState::RunningEnabled,
+        daemon_control::DaemonServiceState::RunningEnabled
+        | daemon_control::DaemonServiceState::StoppedEnabled => (
+            daemon_control::DaemonServiceState::StoppedEnabled,
+            daemon_control::DaemonServiceState::RunningEnabled,
         ),
-        tracedecay::daemon::DaemonServiceState::RunningDisabled
-        | tracedecay::daemon::DaemonServiceState::StoppedDisabled => (
-            tracedecay::daemon::DaemonServiceState::StoppedDisabled,
-            tracedecay::daemon::DaemonServiceState::RunningDisabled,
+        daemon_control::DaemonServiceState::RunningDisabled
+        | daemon_control::DaemonServiceState::StoppedDisabled => (
+            daemon_control::DaemonServiceState::StoppedDisabled,
+            daemon_control::DaemonServiceState::RunningDisabled,
         ),
-        tracedecay::daemon::DaemonServiceState::Missing => {
-            return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        daemon_control::DaemonServiceState::Missing => {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: "no TraceDecay daemon service is installed — restart your `tracedecay daemon run` process manually, or run `tracedecay daemon install-service` to manage it as a service".to_string(),
             });
         }
-        tracedecay::daemon::DaemonServiceState::Masked => {
-            return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        daemon_control::DaemonServiceState::Masked => {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: "TraceDecay daemon service is masked; unmask it before restarting"
                     .to_string(),
             });
@@ -276,23 +279,23 @@ pub(crate) fn restart_daemon_service() -> tracedecay_runtime_core::errors::Resul
     }
 }
 
-fn tracedecay_home_dir() -> tracedecay_runtime_core::errors::Result<PathBuf> {
+fn tracedecay_home_dir() -> tracedecay_domain::errors::Result<PathBuf> {
     tracedecay::agents::home_dir().ok_or_else(|| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: "could not determine home directory".to_string(),
         }
     })
 }
 
-pub(crate) fn tracedecay_bin_on_path() -> tracedecay_runtime_core::errors::Result<String> {
+pub(crate) fn tracedecay_bin_on_path() -> tracedecay_domain::errors::Result<String> {
     tracedecay::agents::which_tracedecay().ok_or_else(|| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: "tracedecay not found on PATH".to_string(),
         }
     })
 }
 
-fn tracedecay_bin_for_generated_artifacts() -> tracedecay_runtime_core::errors::Result<String> {
+fn tracedecay_bin_for_generated_artifacts() -> tracedecay_domain::errors::Result<String> {
     current_tracedecay_exe().map_or_else(tracedecay_bin_on_path, Ok)
 }
 
@@ -327,26 +330,35 @@ pub(crate) enum RefreshPolicy {
 /// binary path, when known — so the plugin refresh, daemon refresh, and
 /// health pass run on the new version. `policy` decides whether the refresh
 /// runs on a no-op upgrade and whether a refresh failure is fatal.
+///
+/// Returns the installed binary's version when an install happened and its
+/// version is known, so the surrounding maintenance window restores the
+/// daemon validating the binary that actually starts. A tolerated
+/// ([`RefreshPolicy::AfterInstall`]) refresh failure does not erase that
+/// version: the new binary is installed regardless.
 pub(crate) fn run_install_then_refresh<U, P>(
     policy: RefreshPolicy,
     upgrade: U,
     post_update: P,
-) -> tracedecay_runtime_core::errors::Result<()>
+) -> tracedecay_domain::errors::Result<Option<String>>
 where
-    U: FnOnce() -> tracedecay_runtime_core::errors::Result<UpgradeOutcome>,
-    P: FnOnce(Option<&Path>) -> tracedecay_runtime_core::errors::Result<()>,
+    U: FnOnce() -> tracedecay_domain::errors::Result<UpgradeOutcome>,
+    P: FnOnce(Option<&Path>) -> tracedecay_domain::errors::Result<()>,
 {
     let outcome = upgrade()?;
     match policy {
         RefreshPolicy::Always => {
-            let binary = match &outcome {
-                UpgradeOutcome::Installed { binary } => binary.as_deref(),
-                UpgradeOutcome::AlreadyCurrent => None,
+            let (binary, installed_version) = match &outcome {
+                UpgradeOutcome::Installed { binary, version } => {
+                    (binary.as_deref(), version.clone())
+                }
+                UpgradeOutcome::AlreadyCurrent => (None, None),
             };
-            post_update(binary)
+            post_update(binary)?;
+            Ok(installed_version)
         }
         RefreshPolicy::AfterInstall => match outcome {
-            UpgradeOutcome::Installed { binary } => {
+            UpgradeOutcome::Installed { binary, version } => {
                 if let Err(error) = post_update(binary.as_deref()) {
                     // Point the retry at the installed binary when we know
                     // where it lives — a bare `tracedecay` may not be on PATH.
@@ -360,30 +372,26 @@ where
                          plugin and agent-integration refresh."
                     );
                 }
-                Ok(())
+                Ok(version)
             }
             UpgradeOutcome::AlreadyCurrent => {
                 eprintln!(
                     "Nothing was installed, so plugins were left untouched — \
                      run `tracedecay update` to refresh generated plugins anyway."
                 );
-                Ok(())
+                Ok(None)
             }
         },
     }
 }
 
 #[hotpath::measure(label = "cli.update.run")]
-pub(crate) fn run_update_command(
-    no_reinstall: bool,
-) -> tracedecay_runtime_core::errors::Result<()> {
+pub(crate) fn run_update_command(no_reinstall: bool) -> tracedecay_domain::errors::Result<()> {
     run_update_flow("update", RefreshPolicy::Always, no_reinstall)
 }
 
 #[hotpath::measure(label = "cli.upgrade.run")]
-pub(crate) fn run_upgrade_command(
-    no_reinstall: bool,
-) -> tracedecay_runtime_core::errors::Result<()> {
+pub(crate) fn run_upgrade_command(no_reinstall: bool) -> tracedecay_domain::errors::Result<()> {
     run_update_flow("upgrade", RefreshPolicy::AfterInstall, no_reinstall)
 }
 
@@ -391,25 +399,37 @@ fn run_update_flow(
     operation: &str,
     refresh_policy: RefreshPolicy,
     no_reinstall: bool,
-) -> tracedecay_runtime_core::errors::Result<()> {
-    tracedecay::daemon::with_exclusive_maintenance_window(operation, |lease_token| {
-        run_install_then_refresh(refresh_policy, crate::upgrade::run_upgrade, |binary| {
-            run_post_update_subcommand(no_reinstall, binary, lease_token)
-        })
-    })
+) -> tracedecay_domain::errors::Result<()> {
+    daemon_control::with_exclusive_maintenance_window(
+        operation,
+        crate::product_runtime::PRODUCT_BUILD_VERSION,
+        |lease_token| {
+            let installed_version =
+                run_install_then_refresh(refresh_policy, crate::upgrade::run_upgrade, |binary| {
+                    run_post_update_subcommand(no_reinstall, binary, lease_token)
+                })?;
+            // Report the installed version so the window's daemon restore
+            // validates the binary it actually starts, not the one that was
+            // running before the upgrade.
+            Ok(daemon_control::MaintenanceWindowOutcome {
+                value: (),
+                installed_version,
+            })
+        },
+    )
 }
 
 fn combine_operation_and_restore<T>(
     operation: &str,
-    operation_result: tracedecay_runtime_core::errors::Result<T>,
-    restore_result: tracedecay_runtime_core::errors::Result<()>,
-) -> tracedecay_runtime_core::errors::Result<T> {
+    operation_result: tracedecay_domain::errors::Result<T>,
+    restore_result: tracedecay_domain::errors::Result<()>,
+) -> tracedecay_domain::errors::Result<T> {
     match (operation_result, restore_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(error)) => Err(error),
         (Err(operation_error), Err(restore_error)) => {
-            Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!(
                     "{operation} failed: {operation_error}; daemon state restoration also failed: {restore_error}"
                 ),
@@ -422,7 +442,7 @@ fn combine_operation_and_restore<T>(
 pub(crate) async fn run_post_update_command(
     no_reinstall: bool,
     lifecycle_lease_token: Option<&str>,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     if let Some(token) = lifecycle_lease_token {
         let lifecycle_lease =
             tracedecay_runtime_core::lifecycle_lease::acquire_exclusive_or_inherited(
@@ -432,7 +452,10 @@ pub(crate) async fn run_post_update_command(
         return run_post_update_tasks(no_reinstall, &lifecycle_lease).await;
     }
 
-    let guard = tracedecay::daemon::QuiescedDaemonLifecycle::acquire("post-update")?;
+    let guard = daemon_control::QuiescedDaemonLifecycle::acquire(
+        "post-update",
+        crate::product_runtime::PRODUCT_BUILD_VERSION,
+    )?;
     let operation_result = match guard.lifecycle_lease() {
         Ok(lifecycle_lease) => run_post_update_tasks(no_reinstall, lifecycle_lease).await,
         Err(error) => Err(error),
@@ -461,7 +484,7 @@ fn prepare_post_update_lease(
 
 /// The binary to re-exec for `post-update`: freshly installed when reported,
 /// otherwise the currently running binary.
-fn post_update_binary(installed: Option<&Path>) -> tracedecay_runtime_core::errors::Result<String> {
+fn post_update_binary(installed: Option<&Path>) -> tracedecay_domain::errors::Result<String> {
     let current = std::env::current_exe().ok();
     post_update_binary_from(installed, current.as_deref()).map_or_else(tracedecay_bin_on_path, Ok)
 }
@@ -477,7 +500,7 @@ fn run_post_update_subcommand(
     no_reinstall: bool,
     installed: Option<&Path>,
     lifecycle_lease_token: &str,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     let tracedecay_bin = post_update_binary(installed)?;
     let mut command = std::process::Command::new(&tracedecay_bin);
     command
@@ -488,15 +511,15 @@ fn run_post_update_subcommand(
         command.arg("--no-reinstall");
     }
     let status =
-        command.status().map_err(
-            |e| tracedecay_runtime_core::errors::TraceDecayError::Config {
+        command
+            .status()
+            .map_err(|e| tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!("failed to run post-update with '{tracedecay_bin}': {e}"),
-            },
-        )?;
+            })?;
     if status.success() {
         return Ok(());
     }
-    Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+    Err(tracedecay_domain::errors::TraceDecayError::Config {
         message: format!("post-update failed with status: {status}"),
     })
 }
@@ -519,7 +542,7 @@ pub(crate) enum ReinstallOutcome {
 pub(crate) fn partition_reinstall_results(
     results: Vec<(
         String,
-        tracedecay_runtime_core::errors::Result<crate::agent_cmd::AgentReinstallOutcome>,
+        tracedecay_domain::errors::Result<crate::agent_cmd::AgentReinstallOutcome>,
     )>,
 ) -> ReinstallOutcome {
     // Carry the reason, not just the name, so the operator can diagnose a
@@ -549,13 +572,13 @@ pub(crate) fn partition_reinstall_results(
 /// durably recorded.
 pub(crate) fn record_completed_reinstall_pass(
     config: &mut UserConfig,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     if config.mark_version_installed(env!("CARGO_PKG_VERSION")) {
-        config.save().map_err(
-            |err| tracedecay_runtime_core::errors::TraceDecayError::Config {
+        config
+            .save()
+            .map_err(|err| tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!("could not save tracedecay config: {err}"),
-            },
-        )?;
+            })?;
     }
     Ok(())
 }
@@ -614,11 +637,10 @@ async fn reinstall_tracked_agents_under_lease(
 pub(crate) async fn run_post_update_tasks(
     no_reinstall: bool,
     lifecycle_lease: &tracedecay_runtime_core::lifecycle_lease::LifecycleLease,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     eprintln!("\nPreparing safe post-update maintenance.");
     eprintln!("  Waiting for TraceDecay writers to shut down cleanly — do not interrupt.");
-    let previous_daemon_state =
-        tracedecay::daemon::verify_installed_service_quiesced_under_lease()?;
+    let previous_daemon_state = daemon_control::verify_installed_service_quiesced_under_lease()?;
     eprintln!("\x1b[32m✔\x1b[0m TraceDecay writers stopped; exclusive maintenance window active.");
     let mutation_result = run_post_update_mutations(no_reinstall, lifecycle_lease).await;
     let restart_result = refresh_daemon_service_after_update(previous_daemon_state);
@@ -628,7 +650,7 @@ pub(crate) async fn run_post_update_tasks(
 async fn run_post_update_mutations(
     no_reinstall: bool,
     lifecycle_lease: &tracedecay_runtime_core::lifecycle_lease::LifecycleLease,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     refresh_generated_plugins().await?;
 
     if no_reinstall {
@@ -698,7 +720,7 @@ async fn run_post_update_mutations(
 /// a real, host-loadable `SKILL.md`. Fork-protected and best-effort: a failure
 /// here never fails the update.
 fn reconcile_materialized_managed_skills_after_update() {
-    let Ok(profile_root) = tracedecay::storage::default_profile_root() else {
+    let Ok(profile_root) = tracedecay_runtime_core::storage::default_profile_root() else {
         return;
     };
     let start = std::env::current_dir()
@@ -729,6 +751,7 @@ mod tests {
     };
     use crate::upgrade::UpgradeOutcome;
     use tempfile::TempDir;
+    use tracedecay_daemon_control as daemon_control;
 
     #[test]
     fn daemon_restart_quiesces_service_before_acquiring_exclusive_lease() {
@@ -736,7 +759,7 @@ mod tests {
         let result = restart_daemon_service_with(
             || {
                 order.borrow_mut().push("quiesce");
-                Ok(tracedecay::daemon::DaemonServiceState::RunningEnabled)
+                Ok(daemon_control::DaemonServiceState::RunningEnabled)
             },
             || {
                 assert_eq!(order.borrow().as_slice(), ["quiesce"]);
@@ -744,10 +767,7 @@ mod tests {
                 Ok(())
             },
             |state| {
-                assert_eq!(
-                    state,
-                    tracedecay::daemon::DaemonServiceState::RunningEnabled
-                );
+                assert_eq!(state, daemon_control::DaemonServiceState::RunningEnabled);
                 order.borrow_mut().push("refresh");
                 Ok(Some((PathBuf::from("service"), PathBuf::from("socket"))))
             },
@@ -765,13 +785,10 @@ mod tests {
     #[test]
     fn daemon_restart_forces_stopped_service_running() {
         let result = restart_daemon_service_with(
-            || Ok(tracedecay::daemon::DaemonServiceState::StoppedEnabled),
+            || Ok(daemon_control::DaemonServiceState::StoppedEnabled),
             || Ok(()),
             |state| {
-                assert_eq!(
-                    state,
-                    tracedecay::daemon::DaemonServiceState::RunningEnabled
-                );
+                assert_eq!(state, daemon_control::DaemonServiceState::RunningEnabled);
                 Ok(Some((PathBuf::from("service"), PathBuf::from("socket"))))
             },
             |_| panic!("successful lease acquisition must not restore the old service"),
@@ -787,9 +804,9 @@ mod tests {
         let result = restart_daemon_service_with(
             || {
                 order.borrow_mut().push("quiesce");
-                Ok(tracedecay::daemon::DaemonServiceState::RunningEnabled)
+                Ok(daemon_control::DaemonServiceState::RunningEnabled)
             },
-            || -> tracedecay_runtime_core::errors::Result<()> {
+            || -> tracedecay_domain::errors::Result<()> {
                 order.borrow_mut().push("acquire");
                 Err(config_err("lifecycle lease busy"))
             },
@@ -798,10 +815,7 @@ mod tests {
                 Ok(None)
             },
             |state| {
-                assert_eq!(
-                    state,
-                    tracedecay::daemon::DaemonServiceState::RunningEnabled
-                );
+                assert_eq!(state, daemon_control::DaemonServiceState::RunningEnabled);
                 order.borrow_mut().push("restore");
                 Ok(())
             },
@@ -838,10 +852,10 @@ mod tests {
         drop(held);
     }
 
-    use tracedecay_usecases::user_config::UserConfig;
+    use tracedecay_session_memory::user_config::UserConfig;
 
-    fn config_err(message: &str) -> tracedecay_runtime_core::errors::TraceDecayError {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+    fn config_err(message: &str) -> tracedecay_domain::errors::TraceDecayError {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: message.to_string(),
         }
     }
@@ -850,7 +864,7 @@ mod tests {
         id: &str,
     ) -> (
         String,
-        tracedecay_runtime_core::errors::Result<crate::agent_cmd::AgentReinstallOutcome>,
+        tracedecay_domain::errors::Result<crate::agent_cmd::AgentReinstallOutcome>,
     ) {
         (
             id.to_string(),
@@ -862,7 +876,7 @@ mod tests {
         id: &str,
     ) -> (
         String,
-        tracedecay_runtime_core::errors::Result<crate::agent_cmd::AgentReinstallOutcome>,
+        tracedecay_domain::errors::Result<crate::agent_cmd::AgentReinstallOutcome>,
     ) {
         (id.to_string(), Err(config_err("install failed")))
     }
@@ -1122,8 +1136,8 @@ mod tests {
     fn record_upgrade<'a>(
         calls: &'a RefCell<Vec<&'static str>>,
         label: &'static str,
-        result: tracedecay_runtime_core::errors::Result<UpgradeOutcome>,
-    ) -> impl FnOnce() -> tracedecay_runtime_core::errors::Result<UpgradeOutcome> + 'a {
+        result: tracedecay_domain::errors::Result<UpgradeOutcome>,
+    ) -> impl FnOnce() -> tracedecay_domain::errors::Result<UpgradeOutcome> + 'a {
         move || {
             calls.borrow_mut().push(label);
             result
@@ -1134,8 +1148,8 @@ mod tests {
         calls: &'a RefCell<Vec<&'static str>>,
         label: &'static str,
         seen_binary: &'a RefCell<Option<Option<PathBuf>>>,
-        result: tracedecay_runtime_core::errors::Result<()>,
-    ) -> impl FnOnce(Option<&Path>) -> tracedecay_runtime_core::errors::Result<()> + 'a {
+        result: tracedecay_domain::errors::Result<()>,
+    ) -> impl FnOnce(Option<&Path>) -> tracedecay_domain::errors::Result<()> + 'a {
         move |binary| {
             calls.borrow_mut().push(label);
             *seen_binary.borrow_mut() = Some(binary.map(Path::to_path_buf));
@@ -1148,7 +1162,7 @@ mod tests {
         let calls = RefCell::new(Vec::new());
         let seen_binary = RefCell::new(None);
 
-        run_install_then_refresh(
+        let installed_version = run_install_then_refresh(
             RefreshPolicy::Always,
             record_upgrade(&calls, "upgrade", Ok(UpgradeOutcome::AlreadyCurrent)),
             record_post_update(&calls, "post-update", &seen_binary, Ok(())),
@@ -1157,6 +1171,10 @@ mod tests {
 
         assert_eq!(calls.into_inner(), vec!["upgrade", "post-update"]);
         assert_eq!(seen_binary.into_inner(), Some(None));
+        assert_eq!(
+            installed_version, None,
+            "no install must leave daemon restore validating the running version"
+        );
     }
 
     #[test]
@@ -1207,6 +1225,7 @@ mod tests {
                 "upgrade",
                 Ok(UpgradeOutcome::Installed {
                     binary: Some(installed.clone()),
+                    version: None,
                 }),
             ),
             record_post_update(&calls, "post-update", &seen_binary, Ok(())),
@@ -1217,12 +1236,62 @@ mod tests {
         assert_eq!(seen_binary.into_inner(), Some(Some(installed)));
     }
 
+    /// An upgrade that replaced the binary (old ≠ new) must hand the NEW
+    /// version to the surrounding maintenance window, so the daemon restore
+    /// validates the binary it actually starts rather than the pre-upgrade
+    /// one it quiesced.
+    #[test]
+    fn upgrade_policy_reports_installed_version_for_restore_validation() {
+        let calls = RefCell::new(Vec::new());
+        let seen_binary = RefCell::new(None);
+
+        let installed_version = run_install_then_refresh(
+            RefreshPolicy::AfterInstall,
+            record_upgrade(
+                &calls,
+                "upgrade",
+                Ok(UpgradeOutcome::Installed {
+                    binary: Some(PathBuf::from("/usr/local/bin/tracedecay")),
+                    version: Some("9.9.9".to_string()),
+                }),
+            ),
+            record_post_update(&calls, "post-update", &seen_binary, Ok(())),
+        )
+        .expect("upgrade steps should succeed");
+
+        assert_eq!(installed_version.as_deref(), Some("9.9.9"));
+    }
+
+    /// `update` (fatal-refresh policy) threads the installed version the same
+    /// way once its refresh succeeds.
+    #[test]
+    fn update_policy_reports_installed_version_for_restore_validation() {
+        let calls = RefCell::new(Vec::new());
+        let seen_binary = RefCell::new(None);
+
+        let installed_version = run_install_then_refresh(
+            RefreshPolicy::Always,
+            record_upgrade(
+                &calls,
+                "upgrade",
+                Ok(UpgradeOutcome::Installed {
+                    binary: None,
+                    version: Some("9.9.9".to_string()),
+                }),
+            ),
+            record_post_update(&calls, "post-update", &seen_binary, Ok(())),
+        )
+        .expect("update steps should succeed");
+
+        assert_eq!(installed_version.as_deref(), Some("9.9.9"));
+    }
+
     #[test]
     fn upgrade_policy_skips_post_update_when_already_current() {
         let calls = RefCell::new(Vec::new());
         let seen_binary = RefCell::new(None);
 
-        run_install_then_refresh(
+        let installed_version = run_install_then_refresh(
             RefreshPolicy::AfterInstall,
             record_upgrade(&calls, "upgrade", Ok(UpgradeOutcome::AlreadyCurrent)),
             record_post_update(&calls, "post-update", &seen_binary, Ok(())),
@@ -1231,6 +1300,10 @@ mod tests {
 
         assert_eq!(calls.into_inner(), vec!["upgrade"]);
         assert_eq!(seen_binary.into_inner(), None);
+        assert_eq!(
+            installed_version, None,
+            "no install must leave daemon restore validating the running version"
+        );
     }
 
     #[test]
@@ -1243,7 +1316,10 @@ mod tests {
             record_upgrade(
                 &calls,
                 "upgrade",
-                Ok(UpgradeOutcome::Installed { binary: None }),
+                Ok(UpgradeOutcome::Installed {
+                    binary: None,
+                    version: Some("9.9.9".to_string()),
+                }),
             ),
             record_post_update(
                 &calls,
@@ -1253,7 +1329,13 @@ mod tests {
             ),
         );
 
-        assert!(result.is_ok());
+        // The warn-only refresh failure neither fails the upgrade nor erases
+        // the installed version: the new binary is on disk, so the daemon
+        // restore must still validate it.
+        assert_eq!(
+            result.expect("tolerated refresh failure").as_deref(),
+            Some("9.9.9")
+        );
         assert_eq!(calls.into_inner(), vec!["upgrade", "post-update"]);
     }
 

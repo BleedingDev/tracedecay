@@ -37,6 +37,7 @@ impl RemoteSpoolKeyV1 {
         })
     }
 
+    #[hotpath::skip]
     pub const fn revision(&self) -> u64 {
         self.revision
     }

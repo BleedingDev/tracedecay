@@ -2,6 +2,7 @@
 
 use super::*;
 
+mod graph_replay_pool_lock_tests;
 mod graph_replay_release_tests;
 
 const TEST_ROLLBACK_FLOOR: usize = 3;
@@ -17,6 +18,7 @@ fn indexed_generation(
         snapshot_content_identity: format!("sha256:{sequence:064x}"),
         sealed_at_micros,
         size_bytes,
+        segment_bytes: 0,
         generation_file: format!("generation-{sequence:064x}.json"),
         state_digest: format!("sha256:{sequence:064x}"),
         source_reference: exact.then(|| format!("refs/heads/branch-{sequence}")),
@@ -95,6 +97,8 @@ fn attach_fixture_text_artifact(
 fn durable_index_bounds_clean_and_dirty_history_by_ttl_bytes_and_count() {
     let now = MAX_DURABLE_GENERATION_INDEX_TTL_MICROS_V1 * 2;
     let active = indexed_generation(99, now, 32, true);
+    let mut segment_heavy = indexed_generation(1, now - 3, 1, true);
+    segment_heavy.segment_bytes = MAX_DURABLE_GENERATION_INDEX_BYTES_V1;
     let mut entries = vec![
         indexed_generation(
             0,
@@ -102,7 +106,7 @@ fn durable_index_bounds_clean_and_dirty_history_by_ttl_bytes_and_count() {
             1,
             false,
         ),
-        indexed_generation(1, now - 3, MAX_DURABLE_GENERATION_INDEX_BYTES_V1, true),
+        segment_heavy,
         indexed_generation(2, now - 2, 32, false),
         active.clone(),
     ];
@@ -120,7 +124,10 @@ fn durable_index_bounds_clean_and_dirty_history_by_ttl_bytes_and_count() {
     assert!(entries.iter().any(|entry| entry == &active));
     assert!(entries.len() <= MAX_DURABLE_GENERATION_INDEX_ENTRIES_V1);
     assert!(
-        entries.iter().map(|entry| entry.size_bytes).sum::<u64>()
+        entries
+            .iter()
+            .map(|entry| entry.size_bytes.saturating_add(entry.segment_bytes))
+            .sum::<u64>()
             <= MAX_DURABLE_GENERATION_INDEX_BYTES_V1
     );
     assert!(
@@ -209,6 +216,7 @@ fn fixture_store(count: usize) -> (tempfile::TempDir, Vec<FixtureGeneration>) {
         snapshot_content_identity: "snapshot.fixture".to_owned(),
         sealed_at_micros: i64::try_from(count - 1).expect("fixture sequence fits i64"),
         size_bytes: active.size_bytes,
+        segment_bytes: 0,
         generation_file: active.file.clone(),
         state_digest: active.state_digest.clone(),
         source_reference: None,
@@ -293,6 +301,7 @@ fn verified_text_artifact_attachment_retires_history_before_enforcing_byte_bound
             snapshot_content_identity: "snapshot.prior".to_owned(),
             sealed_at_micros: 0,
             size_bytes: prior.size_bytes,
+            segment_bytes: 0,
             generation_file: prior.file.clone(),
             state_digest: prior.state_digest.clone(),
             source_reference: None,
@@ -521,6 +530,88 @@ fn text_artifact_retention_preserves_references_and_collects_orphans() {
 }
 
 #[test]
+fn text_artifact_retention_collects_empty_publish_crash_placeholder() {
+    let (store, generations) = fixture_store(1);
+    let active = generations.last().expect("active generation");
+    let referenced = attach_fixture_text_artifact(&store, active, b"durably referenced");
+    let artifacts_root = code_text_artifacts_root(store.path());
+    let placeholder_name = format!("text-artifact-{}.bin", "5".repeat(64));
+    let placeholder_path = artifacts_root.join(&placeholder_name);
+    std::fs::write(&placeholder_path, []).expect("write interrupted publish placeholder");
+
+    let plan = plan_code_generation_retention(
+        store.path(),
+        &BTreeSet::new(),
+        DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+    )
+    .expect("an empty daemon-owned publish placeholder is collectable crash debris");
+    assert_eq!(plan.collectable_text_artifacts.len(), 1);
+    assert_eq!(
+        plan.collectable_text_artifacts[0].artifact_file,
+        placeholder_name
+    );
+    assert_eq!(plan.collectable_text_artifacts[0].size_bytes, 0);
+
+    let report = execute_code_generation_retention(
+        store.path(),
+        plan,
+        CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(11),
+        None,
+    )
+    .expect("collect interrupted publish placeholder");
+    assert_eq!(report.deleted_text_artifacts.len(), 1);
+    assert!(!placeholder_path.exists());
+    assert!(
+        artifacts_root.join(referenced.artifact_file).is_file(),
+        "the exact referenced artifact must survive placeholder recovery"
+    );
+}
+
+#[test]
+fn text_artifact_retention_collects_staging_database_sidecars_with_their_owner() {
+    let (store, _generations) = fixture_store(1);
+    let artifacts_root = code_text_artifacts_root(store.path());
+    std::fs::create_dir_all(&artifacts_root).expect("create artifact root");
+    let staging_name = format!(".text-artifact-{}.staging", "c".repeat(64));
+    let paths = [
+        artifacts_root.join(&staging_name),
+        artifacts_root.join(format!("{staging_name}-journal")),
+        artifacts_root.join(format!("{staging_name}-wal")),
+        artifacts_root.join(format!("{staging_name}-shm")),
+    ];
+    for (path, bytes) in paths
+        .iter()
+        .zip([b"stage".as_slice(), b"journal", b"wal", b"shm"])
+    {
+        std::fs::write(path, bytes).expect("write staging database evidence");
+    }
+
+    let plan = plan_code_generation_retention(
+        store.path(),
+        &BTreeSet::new(),
+        DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+    )
+    .expect("plan staging database retention");
+    assert_eq!(plan.collectable_text_artifacts.len(), 4);
+
+    let report = execute_code_generation_retention(
+        store.path(),
+        plan,
+        CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(11),
+        None,
+    )
+    .expect("collect staging database and sidecars");
+
+    assert_eq!(report.deleted_text_artifacts.len(), 4);
+    assert!(
+        paths.iter().all(|path| !path.exists()),
+        "the staging database and every SQLite sidecar must be collected together"
+    );
+}
+
+#[test]
 fn cancellable_artifact_apply_stops_rehash_before_quarantine_and_retries() {
     let (store, generations) = fixture_store(1);
     let active = generations.last().expect("active generation");
@@ -646,7 +737,7 @@ fn text_artifact_inventory_honors_cancellation_before_marking_or_mutation() {
     let checks = std::sync::atomic::AtomicUsize::new(0);
     let error = plan_collectable_text_artifacts_cancellable(
         store.path(),
-        &pointer,
+        Some(&pointer),
         GenerationDigestVerificationV1::Full,
         &|| checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0,
     )
@@ -906,6 +997,38 @@ fn next_retention_plan_limits_collection_to_one_generation() {
 }
 
 #[test]
+fn unpublished_store_collects_sealed_crash_debris_under_the_absent_pointer() {
+    let (store, generations) = fixture_store(2);
+    std::fs::remove_file(store.path().join(ACTIVE_POINTER_FILE))
+        .expect("remove publication pointer to model an interrupted first publish");
+
+    let plan = plan_code_generation_retention(store.path(), &BTreeSet::new(), 0)
+        .expect("plan unpublished crash-debris retention");
+    assert_eq!(plan.collectable_generations.len(), 2);
+
+    let report = execute_code_generation_retention(
+        store.path(),
+        plan,
+        CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(98),
+        None,
+    )
+    .expect("collect unpublished sealed generations");
+
+    assert_eq!(report.deleted_generations.len(), 2);
+    let generations_root = store.path().join(GENERATIONS_DIRECTORY);
+    assert!(
+        generations
+            .iter()
+            .all(|generation| { !generations_root.join(&generation.file).exists() })
+    );
+    assert!(
+        !store.path().join(ACTIVE_POINTER_FILE).exists(),
+        "retention must not fabricate a publication pointer"
+    );
+}
+
+#[test]
 fn idle_maintenance_preparation_stays_metadata_only() {
     let (store, _generations) = fixture_store(1);
 
@@ -1001,7 +1124,10 @@ fn apply_preserves_collectable_generations_when_receipt_commit_fails() {
         .expect("plan retention");
     assert_eq!(plan.collectable_generations.len(), 1);
     let collectable = plan.collectable_generations[0].clone();
-    let active_file = plan.active_generation_file().to_owned();
+    let active_file = plan
+        .active_generation_file()
+        .expect("published fixture has an active generation")
+        .to_owned();
     let rollback_files = plan
         .superseded_generations
         .iter()
@@ -1353,7 +1479,7 @@ fn plan_keeps_active_vector_pinned_and_rollback_generations() {
         plan_code_generation_retention(store.path(), &vector_readable_sources, TEST_ROLLBACK_FLOOR)
             .expect("plan retention");
 
-    assert_eq!(plan.active_generation_id, generations[6].id);
+    assert_eq!(plan.active_generation_id, Some(generations[6].id.clone()));
     assert!(
         plan.collectable_generations
             .iter()
@@ -1885,4 +2011,159 @@ fn applied_retention_refuses_a_metadata_only_plan() {
         error,
         CodeGenerationRetentionErrorV1::UnsafeState(_)
     ));
+}
+
+/// The OOM-crash debris shape: sealed generation files and derived artifacts
+/// exist, but the publish never reached its pointer write, so no active
+/// pointer file exists. The pass must reclaim everything through the ordinary
+/// journal/receipt/release machinery — before this, such stores were
+/// unreachable by every retention pass while their worktree root stayed live.
+#[test]
+fn unpublished_store_retention_reclaims_orphaned_partial_generations() {
+    let (store, generations) = fixture_store(2);
+    std::fs::remove_file(store.path().join(ACTIVE_POINTER_FILE)).expect("sever the active pointer");
+    let artifacts_root = code_text_artifacts_root(store.path());
+    let orphan = text_artifact_for_bytes(&generations[0].id, b"orphan completed bytes");
+    let orphan_path = write_text_artifact(&store, &orphan, b"orphan completed bytes");
+    let staging_name = format!(".text-artifact-{}.staging", "a".repeat(64));
+    let staging_path = artifacts_root.join(&staging_name);
+    std::fs::write(&staging_path, b"abandoned staging").expect("write orphan staging");
+    let sidecar_name = format!(".text-artifact-{}.staging-journal", "a".repeat(64));
+    let sidecar_path = artifacts_root.join(&sidecar_name);
+    std::fs::write(&sidecar_path, b"abandoned staging journal").expect("write orphan sidecar");
+    let pool_root = store.path().join("graph-replay-pool");
+
+    let report = run_code_generation_retention(
+        store.path(),
+        &BTreeSet::new(),
+        DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+        CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(99),
+        Some(&pool_root),
+    )
+    .expect("apply unpublished-store retention");
+
+    assert_eq!(report.deleted_generations.len(), generations.len());
+    let receipt = report.receipt.expect("durable retention receipt");
+    assert_eq!(receipt.active_generation_id, None);
+    assert_eq!(
+        receipt.reclaimed_bytes,
+        generations
+            .iter()
+            .map(|generation| generation.size_bytes)
+            .sum::<u64>()
+    );
+    assert!(
+        store
+            .path()
+            .join(RECEIPTS_DIRECTORY)
+            .join(format!("receipt-{}.json", receipt.receipt_digest))
+            .is_file(),
+        "the deletion journal must record the unpublished-store sweep"
+    );
+    assert_eq!(
+        queued_release_count(store.path()),
+        generations.len(),
+        "every reclaimed generation must queue its graph replay release"
+    );
+    let generations_root = store.path().join(GENERATIONS_DIRECTORY);
+    for generation in &generations {
+        assert!(!generations_root.join(&generation.file).exists());
+        assert!(
+            pool_root.join(&generation.file).is_file(),
+            "the replay pool must retain the sealed bytes until the graph confirms release"
+        );
+    }
+    let text_receipt = report
+        .text_artifact_receipt
+        .expect("text artifact retention receipt");
+    assert_eq!(text_receipt.active_generation_id, None);
+    assert_eq!(report.deleted_text_artifacts.len(), 3);
+    assert!(!orphan_path.exists());
+    assert!(!staging_path.exists());
+    assert!(!sidecar_path.exists());
+    assert!(!transaction_path(store.path()).exists());
+    assert!(!text_artifact_transaction_path(store.path()).exists());
+}
+
+#[test]
+fn unpublished_store_execution_refuses_when_a_pointer_appears() {
+    let (store, generations) = fixture_store(1);
+    let pointer_path = store.path().join(ACTIVE_POINTER_FILE);
+    let pointer_bytes = std::fs::read(&pointer_path).expect("read fixture pointer");
+    std::fs::remove_file(&pointer_path).expect("sever the active pointer");
+
+    let plan = plan_code_generation_retention(
+        store.path(),
+        &BTreeSet::new(),
+        DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+    )
+    .expect("plan unpublished-store retention");
+    assert_eq!(plan.active_generation_id, None);
+    assert_eq!(plan.collectable_generations.len(), 1);
+
+    // A publisher lands the first pointer between the mark phase and apply:
+    // the absent-pointer compare-and-swap must refuse under the store lock.
+    std::fs::write(&pointer_path, &pointer_bytes).expect("republish the pointer");
+    let error = execute_code_generation_retention(
+        store.path(),
+        plan,
+        CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(7),
+        None,
+    )
+    .expect_err("a published pointer must fail the unpublished-store CAS");
+
+    assert!(matches!(
+        error,
+        CodeGenerationRetentionErrorV1::UnsafeState(_)
+    ));
+    let generations_root = store.path().join(GENERATIONS_DIRECTORY);
+    assert!(
+        generations_root
+            .join(&generations.last().expect("fixture generation").file)
+            .is_file(),
+        "no generation may be unlinked after the CAS refusal"
+    );
+    assert!(!transaction_path(store.path()).exists());
+}
+
+#[test]
+fn staging_sidecars_share_their_staging_artifact_liveness() {
+    let (store, generations) = fixture_store(1);
+    let active = generations.last().expect("active generation");
+    let artifacts_root = code_text_artifacts_root(store.path());
+    std::fs::create_dir_all(&artifacts_root).expect("create artifact root");
+    let active_digest = active
+        .state_digest
+        .strip_prefix("sha256:")
+        .expect("active sealed digest");
+    let active_staging = artifacts_root.join(format!(".text-artifact-{active_digest}.staging"));
+    std::fs::write(&active_staging, b"resumable active staging").expect("write active staging");
+    let active_sidecar =
+        artifacts_root.join(format!(".text-artifact-{active_digest}.staging-journal"));
+    std::fs::write(&active_sidecar, b"active staging journal").expect("write active sidecar");
+    let orphan_staging = artifacts_root.join(format!(".text-artifact-{}.staging", "c".repeat(64)));
+    std::fs::write(&orphan_staging, b"abandoned staging").expect("write orphan staging");
+    let orphan_sidecar =
+        artifacts_root.join(format!(".text-artifact-{}.staging-journal", "c".repeat(64)));
+    std::fs::write(&orphan_sidecar, b"abandoned staging journal").expect("write orphan sidecar");
+
+    let report = run_code_generation_retention(
+        store.path(),
+        &BTreeSet::new(),
+        DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+        CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(21),
+        None,
+    )
+    .expect("apply sidecar-aware retention");
+
+    assert_eq!(report.deleted_text_artifacts.len(), 2);
+    assert!(
+        active_staging.is_file() && active_sidecar.is_file(),
+        "the active build's staging file and its sidecar must survive"
+    );
+    assert!(!orphan_staging.exists());
+    assert!(!orphan_sidecar.exists());
 }

@@ -12,9 +12,9 @@
 use std::future::Future;
 use std::path::Path;
 
+use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_runtime_core::db::DatabaseEngineReadSnapshot;
 use tracedecay_runtime_core::db::engine::{Error as EngineError, IntoParams, Rows};
-use tracedecay_runtime_core::errors::TraceDecayError;
 use tracedecay_runtime_core::store_runtime::VerifiedGraphRuntimeWeakProxyV1;
 
 use crate::relations::{SessionRelationGraphStore, SessionRelationScope};
@@ -94,10 +94,12 @@ pub trait SessionTemporalRegisteredDb: Sync {
 pub struct SessionTemporalAccess<'a, D: SessionTemporalRegisteredDb + ?Sized>(&'a D);
 
 impl<'a, D: SessionTemporalRegisteredDb + ?Sized> SessionTemporalAccess<'a, D> {
+    #[hotpath::skip]
     pub const fn new(db: &'a D) -> Self {
         Self(db)
     }
 
+    #[hotpath::skip]
     pub const fn inner(&self) -> &'a D {
         self.0
     }

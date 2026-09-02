@@ -6,8 +6,8 @@ use tracedecay_domain::{
 };
 use tracedecay_runtime_core::db::engine::params;
 
-use tracedecay_sessions::retrieval_content::projected_content_hash;
-use tracedecay_sessions::runtime::lcm::{
+use tracedecay_lcm::retrieval_content::projected_content_hash;
+use tracedecay_lcm::{
     dag::LcmSummaryPublicationPort,
     types::{
         LcmError, LcmImmutableSummaryPublication, LcmSummaryNode, LcmSummaryPublicationDisposition,
@@ -40,6 +40,7 @@ impl<E> LcmSummaryPublicationPort for GlobalDbLcmSummaryPublication<'_, E>
 where
     E: crate::handle::SessionTemporalExec,
 {
+    #[hotpath::skip]
     async fn publish_immutable_summary(
         &self,
         publication: LcmImmutableSummaryPublication,

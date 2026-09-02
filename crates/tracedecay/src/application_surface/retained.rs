@@ -187,7 +187,7 @@ async fn invoke_operation(
         controls,
         body,
     } = request;
-    let Some(request) = decode_request(operation, body) else {
+    let Ok(request) = decode_request(operation, body) else {
         return tracedecay_api::retained_invalid_request_response(request_id);
     };
     let invocation = DaemonInvocationRequest::retained_application(
@@ -220,16 +220,22 @@ async fn invoke_operation(
     .await
 }
 
+/// Decode one retained operation body into its typed request.
+///
+/// The returned error carries the exact serde diagnostic (unknown field,
+/// unknown enum variant with the admitted values, wrong type) so every
+/// dispatch surface can hand the caller a corrective message instead of a
+/// blank "invalid request".
 #[hotpath::measure(label = "application_surface.retained.decode")]
 pub(crate) fn decode_request(
     operation: RetainedSurfaceOperation,
     body: serde_json::Value,
-) -> Option<RetainedSurfaceRequestV1> {
+) -> Result<RetainedSurfaceRequestV1, serde_json::Error> {
     macro_rules! decode {
         ($request:ty, $variant:ident) => {
-            serde_json::from_value::<$request>(body)
-                .ok()
+            serde_path_to_error::deserialize::<_, $request>(body)
                 .map(RetainedSurfaceRequestV1::$variant)
+                .map_err(named_argument_error)
         };
     }
     match operation {
@@ -291,18 +297,34 @@ pub(crate) fn decode_request(
         RetainedSurfaceOperation::LcmExpandQuery => {
             decode!(LcmExpandQueryRequestV1, LcmExpandQuery)
         }
-        RetainedSurfaceOperation::SessionRefresh => None,
+        RetainedSurfaceOperation::SessionRefresh => Err(serde::de::Error::custom(
+            "session_refresh is dispatched through its action-specific operations",
+        )),
     }
 }
 
 fn decode_session_refresh(
     body: serde_json::Value,
     action: SessionRefreshActionV1,
-) -> Option<RetainedSurfaceRequestV1> {
-    serde_json::from_value::<SessionRefreshActionRequestV1>(body)
-        .ok()
-        .map(|request| SessionRefreshRequestV1::with_action(action, request))
-        .map(RetainedSurfaceRequestV1::SessionRefresh)
+) -> Result<RetainedSurfaceRequestV1, serde_json::Error> {
+    let request = serde_path_to_error::deserialize::<_, SessionRefreshActionRequestV1>(body)
+        .map_err(named_argument_error)?;
+    Ok(RetainedSurfaceRequestV1::SessionRefresh(
+        SessionRefreshRequestV1::with_action(action, request),
+    ))
+}
+
+/// Prefix the serde diagnostic with the offending argument path, so the
+/// corrective message names the argument even for wrong-type errors, which
+/// serde alone reports without the field.
+fn named_argument_error(error: serde_path_to_error::Error<serde_json::Error>) -> serde_json::Error {
+    let path = error.path().to_string();
+    let inner = error.into_inner();
+    if path == "." {
+        inner
+    } else {
+        serde::de::Error::custom(format!("{path}: {inner}"))
+    }
 }
 
 pub(crate) fn result_value(
@@ -394,7 +416,7 @@ mod tests {
                 RetainedSurfaceOperation::SessionRefreshStatus,
                 json!({ "action": "status" }),
             )
-            .is_none()
+            .is_err()
         );
     }
 
@@ -415,8 +437,47 @@ mod tests {
                     RetainedSurfaceOperation::FactStoreCurate,
                     serde_json::Value::Object(value),
                 )
-                .is_none()
+                .is_err()
             );
         }
+    }
+
+    /// A closed-vocabulary decode rejection must carry the admitted values so
+    /// every dispatch surface can hand the caller a corrective message.
+    #[test]
+    fn decode_rejection_names_admitted_enum_values() {
+        let error = decode_request(
+            RetainedSurfaceOperation::FactStoreAdd,
+            json!({ "content": "categorized", "category": "pitfall" }),
+        )
+        .expect_err("unknown category must be rejected");
+        let message = error.to_string();
+        for admitted in [
+            "general",
+            "user_pref",
+            "project",
+            "tool",
+            "decision",
+            "code_area",
+        ] {
+            assert!(
+                message.contains(admitted),
+                "decode rejection must name `{admitted}`: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejection_names_wrong_type_argument() {
+        let error = decode_request(
+            RetainedSurfaceOperation::FactStoreAdd,
+            json!({ "content": 17, "category": "general" }),
+        )
+        .expect_err("non-string content must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("content"),
+            "wrong-type rejection must name the offending argument: {message}"
+        );
     }
 }

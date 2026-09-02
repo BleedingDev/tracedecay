@@ -10,6 +10,10 @@ use tracedecay_store::{
 };
 
 use crate::RegisteredGlobalDb;
+use crate::sqlite_persist::{
+    ReplayPresence, commit_outcome, replay_if_equal, require_absent_or_equal,
+    require_single_cas_row,
+};
 use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, Row, params};
 
 use crate::git_index_transactions::database::{
@@ -28,6 +32,7 @@ pub struct GlobalDbNativeIntegrationStore<'db> {
 }
 
 impl<'db> GlobalDbNativeIntegrationStore<'db> {
+    #[hotpath::skip]
     pub const fn new(db: &'db RegisteredGlobalDb) -> Self {
         Self {
             db: GitMutationDatabase::Registered(db),
@@ -43,9 +48,15 @@ impl<'db> GlobalDbNativeIntegrationStore<'db> {
         preview.validate().map_err(invalid_domain)?;
         let transaction = self.begin_write().await?;
         let outcome = insert_preview_if_absent(&transaction, &preview).await;
-        commit_outcome(transaction, outcome).await
+        commit_outcome(
+            transaction,
+            outcome,
+            NativeIntegrationStoreError::Unavailable,
+        )
+        .await
     }
 
+    #[hotpath::skip]
     pub async fn read_preview(
         &self,
         preview_id: &NativeIntegrationPreviewId,
@@ -69,9 +80,15 @@ impl<'db> GlobalDbNativeIntegrationStore<'db> {
         approval.validate().map_err(invalid_domain)?;
         let transaction = self.begin_write().await?;
         let outcome = insert_approval_if_absent(&transaction, &approval).await;
-        commit_outcome(transaction, outcome).await
+        commit_outcome(
+            transaction,
+            outcome,
+            NativeIntegrationStoreError::Unavailable,
+        )
+        .await
     }
 
+    #[hotpath::skip]
     pub async fn read_approval(
         &self,
         approval_id: &NativeIntegrationApprovalId,
@@ -154,9 +171,15 @@ impl<'db> GlobalDbNativeIntegrationStore<'db> {
             Ok(NativeIntegrationBeginResultV1::Started(Box::new(record)))
         }
         .await;
-        commit_outcome(transaction, outcome).await
+        commit_outcome(
+            transaction,
+            outcome,
+            NativeIntegrationStoreError::Unavailable,
+        )
+        .await
     }
 
+    #[hotpath::skip]
     pub async fn read_status(
         &self,
         transaction_id: &NativeIntegrationTransactionId,
@@ -166,6 +189,7 @@ impl<'db> GlobalDbNativeIntegrationStore<'db> {
         read_status_from_transaction(&snapshot, transaction_id).await
     }
 
+    #[hotpath::skip]
     pub async fn read_record(
         &self,
         transaction_id: &NativeIntegrationTransactionId,
@@ -175,6 +199,7 @@ impl<'db> GlobalDbNativeIntegrationStore<'db> {
         read_record_from_transaction(&snapshot, transaction_id).await
     }
 
+    #[hotpath::skip]
     pub async fn read_receipt(
         &self,
         transaction_id: &NativeIntegrationTransactionId,
@@ -211,13 +236,16 @@ impl<'db> GlobalDbNativeIntegrationStore<'db> {
             }
             let updated =
                 update_status_row(&transaction, &replacement, expected_phase_revision).await?;
-            if updated != 1 {
-                return Err(NativeIntegrationStoreError::StatusConflict);
-            }
+            require_single_cas_row(updated, NativeIntegrationStoreError::StatusConflict)?;
             Ok(replacement)
         }
         .await;
-        commit_outcome(transaction, outcome).await
+        commit_outcome(
+            transaction,
+            outcome,
+            NativeIntegrationStoreError::Unavailable,
+        )
+        .await
     }
 
     /// Publishes the terminal status transition and its receipt in one
@@ -245,11 +273,11 @@ impl<'db> GlobalDbNativeIntegrationStore<'db> {
                 .await?
                 .ok_or(NativeIntegrationStoreError::ReceiptConflict)?;
             if let Some(existing) = record.terminal_receipt {
-                return if existing == receipt {
-                    Ok(existing)
-                } else {
-                    Err(NativeIntegrationStoreError::ReceiptConflict)
-                };
+                return replay_if_equal(
+                    existing,
+                    &receipt,
+                    NativeIntegrationStoreError::ReceiptConflict,
+                );
             }
             if !status_transition_matches(&record.status, expected_phase_revision, &receipt.status)
             {
@@ -268,9 +296,7 @@ impl<'db> GlobalDbNativeIntegrationStore<'db> {
             }
             let updated =
                 update_status_row(&transaction, &receipt.status, expected_phase_revision).await?;
-            if updated != 1 {
-                return Err(NativeIntegrationStoreError::StatusConflict);
-            }
+            require_single_cas_row(updated, NativeIntegrationStoreError::StatusConflict)?;
             transaction
                 .execute(
                     "INSERT INTO native_integration_receipts
@@ -291,11 +317,12 @@ impl<'db> GlobalDbNativeIntegrationStore<'db> {
             Ok(receipt)
         }
         .await;
-        commit_outcome(transaction, write).await
+        commit_outcome(transaction, write, NativeIntegrationStoreError::Unavailable).await
     }
 
     /// Every transaction that has not reached its terminal receipt, oldest
     /// first. Restart recovery replays these through the coordinator.
+    #[hotpath::skip]
     pub async fn pending_transactions(
         &self,
         repository_id: Option<&RepositoryId>,
@@ -323,6 +350,7 @@ impl<'db> GlobalDbNativeIntegrationStore<'db> {
         Ok(records)
     }
 
+    #[hotpath::skip]
     pub async fn approval_consumed(
         &self,
         approval_id: &NativeIntegrationApprovalId,
@@ -366,15 +394,22 @@ impl<'db> GlobalDbNativeIntegrationStore<'db> {
             .await
         }
         .await;
-        commit_outcome(transaction, outcome).await
+        commit_outcome(
+            transaction,
+            outcome,
+            NativeIntegrationStoreError::Unavailable,
+        )
+        .await
     }
 
+    #[hotpath::skip]
     pub(super) async fn begin_write(
         &self,
     ) -> NativeIntegrationStoreResult<GitMutationWriteTransaction<'_>> {
         self.db.begin_write().await.map_err(unavailable)
     }
 
+    #[hotpath::skip]
     pub(super) async fn read_snapshot(
         &self,
     ) -> NativeIntegrationStoreResult<GitMutationReadSnapshot> {
@@ -391,23 +426,6 @@ const RECORD_SELECT: &str = "SELECT preview.preview_json, txn.approval_json, txn
        ON preview.preview_id = txn.preview_id
      LEFT JOIN native_integration_receipts AS receipt
        ON receipt.transaction_id = txn.transaction_id";
-
-pub(super) async fn commit_outcome<T>(
-    transaction: GitMutationWriteTransaction<'_>,
-    outcome: NativeIntegrationStoreResult<T>,
-) -> NativeIntegrationStoreResult<T> {
-    match outcome {
-        Ok(value) => transaction
-            .commit()
-            .await
-            .map(|()| value)
-            .map_err(unavailable),
-        Err(error) => match transaction.rollback().await {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(unavailable(rollback_error)),
-        },
-    }
-}
 
 async fn insert_preview_if_absent<E>(
     transaction: &E,
@@ -430,13 +448,21 @@ where
         existing.push(text(&row, 0, "preview commitment")?);
     }
     drop(rows);
-    if !existing.is_empty() {
-        let stored: NativeIntegrationPreviewV1 = decode(&existing[0])?;
-        return if existing.len() == 1 && stored == *preview {
-            Ok(())
-        } else {
-            Err(NativeIntegrationStoreError::PreviewConflict)
-        };
+    if existing.len() > 1 {
+        return Err(NativeIntegrationStoreError::PreviewConflict);
+    }
+    let stored = existing
+        .into_iter()
+        .next()
+        .map(|payload| decode(&payload))
+        .transpose()?;
+    match require_absent_or_equal(
+        stored,
+        preview,
+        NativeIntegrationStoreError::PreviewConflict,
+    )? {
+        ReplayPresence::Equal => return Ok(()),
+        ReplayPresence::Absent => {}
     }
     transaction
         .execute(
@@ -483,13 +509,21 @@ where
         existing.push(text(&row, 0, "approval commitment")?);
     }
     drop(rows);
-    if !existing.is_empty() {
-        let stored: NativeIntegrationApprovalV1 = decode(&existing[0])?;
-        return if existing.len() == 1 && stored == *approval {
-            Ok(())
-        } else {
-            Err(NativeIntegrationStoreError::ApprovalConflict)
-        };
+    if existing.len() > 1 {
+        return Err(NativeIntegrationStoreError::ApprovalConflict);
+    }
+    let stored = existing
+        .into_iter()
+        .next()
+        .map(|payload| decode(&payload))
+        .transpose()?;
+    match require_absent_or_equal(
+        stored,
+        approval,
+        NativeIntegrationStoreError::ApprovalConflict,
+    )? {
+        ReplayPresence::Equal => return Ok(()),
+        ReplayPresence::Absent => {}
     }
     transaction
         .execute(
@@ -855,6 +889,6 @@ pub(super) fn invalid_domain(error: tracedecay_domain::DomainError) -> NativeInt
     NativeIntegrationStoreError::InvalidData(error.to_string())
 }
 
-pub(super) fn unavailable<T>(_error: T) -> NativeIntegrationStoreError {
-    NativeIntegrationStoreError::Unavailable
+pub(super) fn unavailable(error: impl std::fmt::Display) -> NativeIntegrationStoreError {
+    NativeIntegrationStoreError::unavailable(error)
 }

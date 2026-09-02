@@ -13,8 +13,8 @@ use tracedecay_store::{
     WorkflowFactRecord, derive_canonical_projection, workflow_semantic_kind,
 };
 
+use tracedecay_lcm::contracts::LcmError;
 use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, params};
-use tracedecay_sessions::lcm::contracts::LcmError;
 use tracedecay_sessions::runtime::claude::{
     ClaudeRecordContext, ClaudeRecordDisposition, map_sanitized_claude_record,
 };
@@ -531,7 +531,7 @@ async fn upsert_projected_raw_message(
     conn: &impl Executor,
     message: &SessionMessageRecord,
 ) -> ProjectionStoreResult<()> {
-    tracedecay_sessions::runtime::lcm::raw::upsert_projection_raw_message(conn, message)
+    tracedecay_lcm::raw::upsert_projection_raw_message(conn, message)
         .await
         .map_err(|error| match error {
             LcmError::SanitizationRefused { reason } => {
@@ -1568,9 +1568,18 @@ pub(super) async fn apply_effect(
     effect: &ObservationProjection,
 ) -> ProjectionStoreResult<()> {
     apply_provider_usage_effects(conn, sequence, observation).await?;
+    // Boxed message-effect futures: this apply sits at the bottom of the
+    // session-sync ingest chain, and its many-statement state machine inlined
+    // into that already-deep composition overflows the base-opt worker stack.
     match effect {
         ObservationProjection::Message(projection) => {
-            apply_message_effect(conn, sequence, observation, projection).await
+            Box::pin(apply_message_effect(
+                conn,
+                sequence,
+                observation,
+                projection,
+            ))
+            .await
         }
         ObservationProjection::Composite {
             message,
@@ -1578,10 +1587,10 @@ pub(super) async fn apply_effect(
             workflow_facts,
         } => {
             if let Some(message) = message {
-                apply_message_effect(conn, sequence, observation, message).await?;
+                Box::pin(apply_message_effect(conn, sequence, observation, message)).await?;
             }
             for message in derived_messages {
-                apply_message_effect(conn, sequence, observation, message).await?;
+                Box::pin(apply_message_effect(conn, sequence, observation, message)).await?;
             }
             for projection in workflow_facts {
                 apply_workflow_fact(conn, sequence, projection).await?;

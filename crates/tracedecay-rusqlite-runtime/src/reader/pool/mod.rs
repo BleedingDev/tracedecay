@@ -85,6 +85,7 @@ impl LaneAdmission {
         }
     }
 
+    #[hotpath::skip]
     const fn interactive(lane: ReaderLane) -> Self {
         Self {
             lane,
@@ -151,6 +152,7 @@ impl PoolState {
         self.workers(lane).saturating_sub(self.limbo(lane))
     }
 
+    #[hotpath::skip]
     pub(super) const fn limbo(&self, lane: ReaderLane) -> u16 {
         match lane {
             ReaderLane::General => self.limbo_general,
@@ -158,6 +160,7 @@ impl PoolState {
         }
     }
 
+    #[hotpath::skip]
     pub(super) const fn limbo_mut(&mut self, lane: ReaderLane) -> &mut u16 {
         match lane {
             ReaderLane::General => &mut self.limbo_general,
@@ -165,6 +168,7 @@ impl PoolState {
         }
     }
 
+    #[hotpath::skip]
     const fn waiting(&self, lane: ReaderLane) -> u16 {
         match lane {
             ReaderLane::General => self.waiting_general,
@@ -172,6 +176,7 @@ impl PoolState {
         }
     }
 
+    #[hotpath::skip]
     const fn waiting_mut(&mut self, lane: ReaderLane) -> &mut u16 {
         match lane {
             ReaderLane::General => &mut self.waiting_general,
@@ -221,6 +226,7 @@ struct WaitingGuard<'pool, E: ReaderQueryExecutor> {
 }
 
 impl<'pool, E: ReaderQueryExecutor> WaitingGuard<'pool, E> {
+    #[hotpath::skip]
     const fn new(inner: &'pool PoolInner<E>, lane: ReaderLane) -> Self {
         Self {
             inner,
@@ -229,6 +235,7 @@ impl<'pool, E: ReaderQueryExecutor> WaitingGuard<'pool, E> {
         }
     }
 
+    #[hotpath::skip]
     const fn was_counted(&self) -> bool {
         self.counted
     }
@@ -463,7 +470,9 @@ impl<E: ReaderQueryExecutor> ReaderPool<E> {
             max_wait,
             interrupted,
         )?;
-        lease.read_store_size()
+        // `max_wait` bounds the lane acquisition above and, separately, the
+        // worker reply below, so one call blocks at most twice that budget.
+        lease.read_store_size(max_wait)
     }
 
     pub fn read_table_sizes<F>(
@@ -479,7 +488,9 @@ impl<E: ReaderQueryExecutor> ReaderPool<E> {
             max_wait,
             interrupted,
         )?;
-        lease.read_table_sizes()
+        // `max_wait` bounds the lane acquisition above and, separately, the
+        // worker reply below, so one call blocks at most twice that budget.
+        lease.read_table_sizes(max_wait)
     }
 
     /// Releases page cache on every live reader worker this pool owns.

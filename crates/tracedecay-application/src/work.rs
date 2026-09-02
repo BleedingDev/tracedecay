@@ -254,6 +254,7 @@ impl<P> WorkService<P>
 where
     P: WorkStoragePort,
 {
+    #[hotpath::skip]
     pub const fn new(storage: P) -> Self {
         Self { storage }
     }
@@ -600,6 +601,7 @@ enum ProposalDisposition {
 }
 
 impl ProposalDisposition {
+    #[hotpath::skip]
     const fn operation(self) -> &'static str {
         match self {
             Self::Accepted => "accept_proposal",

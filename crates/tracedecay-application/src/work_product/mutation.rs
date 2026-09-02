@@ -34,6 +34,7 @@ where
     A: WorkProductOwnerAuthorizationPortV1,
     E: WorkProductEventPortV1,
 {
+    #[hotpath::skip]
     pub const fn new(graph: G, owner_authority: A, events: E) -> Self {
         Self {
             graph,

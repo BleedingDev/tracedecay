@@ -16,11 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1;
 use tracedecay_domain::{RelationEdgeKindV1, SymbolOccurrenceId};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_graph_query::VerifiedGraphQuery;
 
 const VERIFIED_GRAPH_MAX_SYMBOLS: usize = 500_000;
 const VERIFIED_GRAPH_MAX_RELATIONS: usize = 2_000_000;
-
-type VerifiedGraphQuery = crate::tracedecay::queries::graph::VerifiedGraphQuery;
 
 fn symbol_path(symbol: &CodeGraphSymbolSummaryV1) -> Result<&str> {
     symbol
@@ -353,11 +352,14 @@ pub(crate) async fn handle_diff_context(
 }
 
 #[hotpath::measure(future = true, label = "mcp.git.changelog.total")]
-pub(crate) async fn handle_changelog(
+pub(crate) async fn handle_changelog<F>(
     cg: &TraceDecay,
-    graph: &VerifiedGraphQuery,
+    graph: F,
     args: Value,
-) -> Result<ToolResult> {
+) -> Result<ToolResult>
+where
+    F: Future<Output = Result<VerifiedGraphQuery>>,
+{
     require_object_args(&args, "tracedecay_changelog")?;
     let from_ref = args
         .get("from_ref")
@@ -373,7 +375,10 @@ pub(crate) async fn handle_changelog(
                 message: "missing required parameter: to_ref".to_string(),
             })?;
 
-    // Use gix to diff the two trees, off the request runtime's workers.
+    // Use gix to diff the two trees, off the request runtime's workers. The
+    // graph admission stays unawaited until the diff succeeds: a repository
+    // that git itself refuses must report its typed git error rather than
+    // whatever state the graph projection mount is in.
     let changes = {
         let project_root = cg.project_root().to_path_buf();
         let from_ref = from_ref.to_owned();
@@ -392,6 +397,7 @@ pub(crate) async fn handle_changelog(
             }
         }
     };
+    let graph = &hotpath::future!(graph, label = "mcp.git.changelog.graph_admission").await?;
     let changed_files: Vec<String> = changes.iter().map(|change| change.path.clone()).collect();
     let changed_paths = changed_files.iter().cloned().collect::<HashSet<_>>();
     let graph_symbols = hotpath::measure_block!(
@@ -1063,9 +1069,14 @@ where
     let mut added = Vec::new();
     let mut modified = Vec::new();
     let mut nodes = Vec::with_capacity(symbol_page.symbols.len());
+    let mut config_key_counts = HashMap::<String, usize>::new();
     for symbol in symbol_page.symbols {
         controls.checkpoint()?;
         let path = symbol_path(&symbol)?;
+        if classify_file_role(path, &files_with_inline_tests) == "config" {
+            *config_key_counts.entry(path.to_owned()).or_default() += 1;
+            continue;
+        }
         let value = symbol_value(&symbol, false)?;
         if added_path_set.contains(path) {
             added.push(value);
@@ -1073,6 +1084,20 @@ where
             modified.push(value);
         }
         nodes.push(symbol);
+    }
+    let mut config_summaries = config_key_counts.into_iter().collect::<Vec<_>>();
+    config_summaries.sort_by(|left, right| left.0.cmp(&right.0));
+    for (path, config_keys) in config_summaries {
+        let summary = json!({
+            "file": path,
+            "kind": "config_summary",
+            "config_keys": config_keys,
+        });
+        if added_path_set.contains(path.as_str()) {
+            added.push(summary);
+        } else {
+            modified.push(summary);
+        }
     }
     let returned_symbols = added.len().saturating_add(modified.len());
     let symbols_added = added.len();

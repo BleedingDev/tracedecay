@@ -7,10 +7,8 @@ use tracedecay_rusqlite_runtime::exact_sql::{
     ExactSqlAttachment, ExactSqlTransaction as RuntimeTransaction,
 };
 
-use crate::profiled_lock::{ProfiledMutex, ProfiledMutexGuard};
-
 use super::{
-    IntoParams, Result, Rows, Value,
+    Error, IntoParams, Result, Rows, Value, WriteStatement,
     connection::{Runtime, statement},
 };
 
@@ -25,8 +23,11 @@ pub struct Transaction {
     /// Serializes every statement issued against one open write transaction.
     /// The lock is held across the blocking rusqlite call, so it is where a
     /// transaction that has already won `BEGIN IMMEDIATE` makes its remaining
-    /// statements queue behind each other.
-    runtime: Arc<ProfiledMutex<Option<RuntimeTransaction>>>,
+    /// statements queue behind each other. Transactions are short-lived and
+    /// created per operation, so per-instance lock profiling would retain two
+    /// HDR histograms for every transaction. The measured statement methods
+    /// provide the stable timing boundary instead.
+    runtime: Arc<Mutex<Option<RuntimeTransaction>>>,
     #[cfg(any(test, feature = "test-helpers"))]
     connection_runtime: Arc<dyn Runtime>,
 }
@@ -39,15 +40,13 @@ impl Transaction {
         #[cfg(not(any(test, feature = "test-helpers")))]
         let _ = connection_runtime;
         Self {
-            runtime: Arc::new(hotpath::mutex!(
-                Mutex::new(Some(runtime)),
-                label = "runtime_core.db.transaction.lock"
-            )),
+            runtime: Arc::new(Mutex::new(Some(runtime))),
             #[cfg(any(test, feature = "test-helpers"))]
             connection_runtime,
         }
     }
 
+    #[hotpath::skip]
     pub async fn execute<P>(&self, sql: &str, params: P) -> Result<u64>
     where
         P: IntoParams,
@@ -66,6 +65,34 @@ impl Transaction {
         .map(|result| result.changed_rows as u64)
     }
 
+    #[hotpath::measure(
+        label = "runtime_core.db.transaction.execute_statements",
+        future = true
+    )]
+    pub async fn execute_statements(&self, statements: Vec<WriteStatement>) -> Result<Vec<u64>> {
+        let runtime = Arc::clone(&self.runtime);
+        let statements = statements
+            .into_iter()
+            .map(WriteStatement::into_exact)
+            .collect::<Vec<_>>();
+        tokio::task::spawn_blocking(move || {
+            let runtime = lock_runtime(&runtime)?;
+            let runtime = runtime.as_ref().ok_or(Error::TransactionClosed)?;
+            let mut results = Vec::with_capacity(statements.len());
+            for (index, statement) in statements.into_iter().enumerate() {
+                let result = runtime
+                    .execute(statement)
+                    .map_err(Error::from)
+                    .map_err(|error| Error::statement_batch(index, error))?;
+                results.push(result.changed_rows as u64);
+            }
+            Ok(results)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    #[hotpath::skip]
     pub async fn attach_database(&self, path: &Path, database_name: &str) -> Result<()> {
         let runtime = Arc::clone(&self.runtime);
         let filename = path.to_str().ok_or_else(|| {
@@ -83,6 +110,7 @@ impl Transaction {
         .map_err(join_error)?
     }
 
+    #[hotpath::skip]
     pub async fn query<P>(&self, sql: &str, params: P) -> Result<Rows>
     where
         P: IntoParams,
@@ -109,6 +137,7 @@ impl Transaction {
         ))
     }
 
+    #[hotpath::skip]
     pub async fn execute_batch(&self, sql: &str) -> Result<()> {
         let runtime = Arc::clone(&self.runtime);
         let sql = sql.to_owned();
@@ -126,6 +155,7 @@ impl Transaction {
 
     /// Executes one separately authorized authority-revalidated batch without the ordinary
     /// statement deadline.
+    #[hotpath::skip]
     pub async fn execute_authority_revalidated_batch(&self, sql: &str) -> Result<()> {
         let runtime = Arc::clone(&self.runtime);
         let sql = sql.to_owned();
@@ -141,6 +171,7 @@ impl Transaction {
         .map_err(join_error)?
     }
 
+    #[hotpath::skip]
     pub async fn validate(&self, sql: &str) -> Result<()> {
         let runtime = Arc::clone(&self.runtime);
         let statement = statement(sql, ())?;
@@ -160,6 +191,7 @@ impl Transaction {
         self.connection_runtime.last_insert_rowid()
     }
 
+    #[hotpath::skip]
     pub async fn commit(self) -> Result<()> {
         let runtime = self.take_runtime()?;
         tokio::task::spawn_blocking(move || {
@@ -169,6 +201,7 @@ impl Transaction {
         .map_err(join_error)?
     }
 
+    #[hotpath::skip]
     pub async fn rollback(self) -> Result<()> {
         let runtime = self.take_runtime()?;
         tokio::task::spawn_blocking(move || {
@@ -185,7 +218,7 @@ impl Transaction {
     }
 }
 
-fn lock_runtime<T>(runtime: &ProfiledMutex<T>) -> Result<ProfiledMutexGuard<'_, T>> {
+fn lock_runtime<T>(runtime: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>> {
     runtime
         .lock()
         .map_err(|_| super::Error::Runtime("exact SQL transaction lock poisoned".to_owned()))
@@ -218,7 +251,7 @@ mod tests {
 
     #[test]
     fn poisoned_transaction_lock_returns_a_typed_error() {
-        let runtime = hotpath::mutex!(Mutex::new(()), label = "runtime_core.db.transaction.lock");
+        let runtime = Mutex::new(());
         let _ = std::panic::catch_unwind(|| {
             let _guard = runtime.lock().unwrap();
             panic!("poison transaction lock");

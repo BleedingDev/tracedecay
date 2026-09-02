@@ -7,14 +7,14 @@ use tracedecay_automation_runtime::automation::AutomationRunControl;
 use tracedecay_domain::ProvenanceId;
 use tracedecay_store::{ProjectMemoryAutomaticFactReceiptV1, ProjectMemoryAutomaticFactStateV1};
 
-use crate::store::memory::DatabaseFactStore;
 use crate::tracedecay::TraceDecay;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDb;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
-use tracedecay_usecases::memory::{MemoryApplication, MemoryApplicationError};
+use tracedecay_runtime_core::store::memory::DatabaseFactStore;
+use tracedecay_session_memory::memory::{MemoryApplication, MemoryApplicationError};
 
-use super::super::ToolResult;
 use super::json_result;
+use tracedecay_mcp::ToolResult;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -36,7 +36,7 @@ enum AdminProjectAction {
         id: String,
     },
     AutomationReconcile {
-        scope: crate::dashboard::AutomationReconcileScope,
+        scope: tracedecay_dashboard_api::AutomationReconcileScope,
     },
 }
 
@@ -142,7 +142,9 @@ pub(super) async fn handle_admin_project(
     cg: &TraceDecay,
     args: Value,
     global_db: Option<&RegisteredGlobalDb>,
-    automation_scheduler_reconciler: Option<crate::dashboard::AutomationSchedulerReconciler>,
+    automation_scheduler_reconciler: Option<
+        tracedecay_dashboard_api::AutomationSchedulerReconciler,
+    >,
     application_deadline: Deadline,
     application_cancellation: CancellationSignal,
 ) -> Result<ToolResult> {
@@ -161,7 +163,7 @@ pub(super) async fn handle_admin_project(
             json!({ "reset": true })
         }
         AdminProjectAction::AutomationReconcile { scope } => {
-            if scope != crate::dashboard::AutomationReconcileScope::Project {
+            if scope != tracedecay_dashboard_api::AutomationReconcileScope::Project {
                 return Err(TraceDecayError::Config {
                     message:
                         "profile automation reconciliation requires a projectless daemon request"
@@ -170,7 +172,9 @@ pub(super) async fn handle_admin_project(
             }
             let outcome = match automation_scheduler_reconciler {
                 Some(reconcile) => reconcile().await,
-                None => crate::dashboard::AutomationSchedulerReconcileOutcome::OwnerUnavailable,
+                None => {
+                    tracedecay_dashboard_api::AutomationSchedulerReconcileOutcome::OwnerUnavailable
+                }
             };
             json!({ "scope": "project", "outcome": outcome })
         }
@@ -179,12 +183,17 @@ pub(super) async fn handle_admin_project(
                 message: "daemon global database is unavailable".to_string(),
             })?;
             let tokens_saved = cg.get_tokens_saved().await?;
-            global_db.upsert(cg.project_root(), tokens_saved).await;
+            // An explicit accounting status action fails closed: a registry
+            // it cannot write or read is an error, not a null total.
+            global_db
+                .try_upsert_project_tokens(cg.project_root(), tokens_saved)
+                .await?;
             let global_tokens_saved = global_db
-                .global_tokens_saved()
+                .try_global_tokens_saved()
                 .await
+                .map_err(|message| TraceDecayError::Config { message })
                 .map(|total| total.saturating_sub(tokens_saved))
-                .filter(|total| *total > 0);
+                .map(|total| (total > 0).then_some(total))?;
             json!({
                 "tokens_saved": tokens_saved,
                 "global_tokens_saved": global_tokens_saved,
@@ -298,13 +307,13 @@ mod tests {
         content: &str,
     ) -> ProjectMemoryAutomaticFactReceiptV1 {
         use tracedecay_domain::{ActorId, Confidence, FactCategoryV1};
-        use tracedecay_usecases::memory::ProjectMemoryFactAddRequest;
+        use tracedecay_session_memory::memory::ProjectMemoryFactAddRequest;
 
         let owner = cg.project_memory_owner().unwrap();
         let db = cg.open_project_store_db().await.unwrap();
         let memory = MemoryApplication::new(owner.clone(), DatabaseFactStore::new(&db)).unwrap();
         let actor = ActorId::new("automation.session-reflector".to_owned()).unwrap();
-        let request = tracedecay_usecases::memory::automatic_fact_add_command(
+        let request = tracedecay_session_memory::memory::automatic_fact_add_command(
             owner,
             ProjectMemoryFactAddRequest {
                 content: content.to_owned(),
@@ -536,7 +545,7 @@ mod tests {
             }))
             .unwrap(),
             AdminProjectAction::AutomationReconcile {
-                scope: crate::dashboard::AutomationReconcileScope::Project
+                scope: tracedecay_dashboard_api::AutomationReconcileScope::Project
             }
         ));
     }

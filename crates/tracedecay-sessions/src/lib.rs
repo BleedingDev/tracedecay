@@ -6,11 +6,11 @@
 //!
 //! ## Must never depend on `tracedecay-global-db`
 //!
-//! `tracedecay-global-db` depends on this crate (session runtime, retrieval
-//! content, `lcm::contracts`); the edge cannot run the other way without a
-//! cycle. The registered database is reached through narrower session-runtime
-//! ports, including [`runtime::ingest::SessionIngestAuthority`], instead of
-//! the concrete `RegisteredGlobalDb` type.
+//! `tracedecay-global-db` depends on this crate (session runtime); the edge
+//! cannot run the other way without a cycle. The registered database is
+//! reached through narrower session-runtime ports, including
+//! [`runtime::ingest::SessionIngestAuthority`], instead of the concrete
+//! `RegisteredGlobalDb` type.
 //!
 //! ## Sealed benchmark provenance
 //!
@@ -36,13 +36,12 @@ pub mod admission;
 mod authorization;
 pub mod host_ports;
 mod ingest;
-pub mod lcm;
 pub mod observation;
 mod orchestration;
 mod provider;
 pub mod repository_provenance;
-pub mod retrieval_content;
 pub mod runtime;
+pub mod serving;
 mod workflow;
 
 pub use authorization::{
@@ -53,6 +52,12 @@ pub use orchestration::{ProviderRunFailure, ProviderRunFold, ProviderRunOutcome}
 pub use provider::{
     EXPECTED_MESSAGE_SEARCH_PROVIDER, MESSAGE_SEARCH_PROVIDER_IDS, ProviderScope, SessionProvider,
     decode_kiro_workspace_path,
+};
+pub use serving::{
+    SessionProjectionServingState, SessionProjectionServingStatus,
+    SessionProjectionServingStatusPort, SessionProjectionStaleReason,
+    SessionProjectionUnavailableReason, SessionProjectionWorkerBlocker,
+    SessionProjectionWorkerRetryClass,
 };
 pub use workflow::{
     WorkflowAgent, WorkflowGitScope, WorkflowIndexReadPort, WorkflowIndexState, WorkflowReadError,

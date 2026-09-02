@@ -3,7 +3,8 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(any(feature = "hotpath", test))]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -21,8 +22,8 @@ use tracedecay_application::{
 use tracedecay_domain::{ManifestDigest, UtcMicros};
 
 use super::branch_admin::StoreAdministration;
+use tracedecay_application::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_runtime_core::db::DatabaseStorageTelemetryHandle;
-use tracedecay_usecases::request_identity::{GlobalRequestSurface, mint_global_request_id};
 
 pub(super) mod generation;
 
@@ -301,6 +302,49 @@ pub(super) struct StoreTelemetrySamplingRegistry {
     ports: Arc<std::sync::Mutex<HashMap<PathBuf, CachedStoreTelemetryPort>>>,
     semantic_vector_retention:
         Arc<std::sync::Mutex<HashMap<PathBuf, SemanticVectorRetentionProgressV1>>>,
+    graph_replay_release: Arc<std::sync::Mutex<HashMap<PathBuf, GraphReplayReleaseProgressV1>>>,
+    /// Last by-design retention operator line per lane and project. A
+    /// persistent unavailable-by-design condition logs once, then counts on
+    /// [`daemon.git.maintenance.retention_quiet_total`]; a state change or a
+    /// genuine anomaly emits again.
+    retention_operator_log: Arc<std::sync::Mutex<HashMap<RetentionOperatorLogKeyV1, String>>>,
+    loud_retention_this_tick: Arc<AtomicBool>,
+}
+
+/// Operator-log lane for the once-then-quiet retention pin.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum RetentionOperatorLogLaneV1 {
+    Semantic,
+    CodeGeneration,
+    Tick,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RetentionOperatorLogKeyV1 {
+    lane: RetentionOperatorLogLaneV1,
+    scope: PathBuf,
+}
+
+/// Longest run of short-cadence ticks a project's graph-replay release
+/// reconcile may be skipped after consecutive unhealthy attempts. At the
+/// one-minute retry cadence this bounds post-recovery release latency to
+/// roughly eight minutes while a wedged runtime is probed a handful of times
+/// per hour instead of once per tick.
+const GRAPH_REPLAY_RELEASE_BACKOFF_CAP_TICKS: u32 = 8;
+
+/// Per-project reconcile state for the graph-replay release queue.
+///
+/// Release evidence is durable on disk, so none of this state guards
+/// correctness: the cursor makes the queue walk incremental across ticks
+/// (retained entries stop blocking later pages), and the backoff window
+/// converts "retry a known-wedged graph runtime every tick" into a bounded
+/// re-probe. Losing the state (restart, project retirement) only means the
+/// next attempt starts from the front of the queue immediately.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct GraphReplayReleaseProgressV1 {
+    consecutive_unhealthy: u32,
+    skip_remaining: u32,
+    cursor: Option<String>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -345,6 +389,7 @@ pub(super) enum SemanticVectorRetentionCensusOutcome {
 }
 
 impl SemanticVectorRetentionCensusOutcome {
+    #[hotpath::skip]
     pub(super) const fn as_failure_label(self) -> Option<&'static str> {
         match self {
             Self::Accepted => None,
@@ -451,6 +496,14 @@ impl StoreTelemetrySamplingRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(path);
+        self.graph_replay_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(path);
+        self.retention_operator_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|key, _| key.scope != path);
     }
 
     pub(super) fn release_retained_handles_for_shutdown(&self) {
@@ -462,6 +515,16 @@ impl StoreTelemetrySamplingRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.graph_replay_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.retention_operator_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.loud_retention_this_tick
+            .store(false, Ordering::Release);
     }
 
     pub(super) fn semantic_vector_retention_cursor(
@@ -475,11 +538,206 @@ impl StoreTelemetrySamplingRegistry {
             .and_then(|progress| progress.cursor.clone())
     }
 
-    fn retain_semantic_vector_projects(&self, active_projects: &BTreeSet<PathBuf>) {
+    fn retain_project_maintenance_state(&self, active_projects: &BTreeSet<PathBuf>) {
         self.semantic_vector_retention
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|project, _| active_projects.contains(project));
+        self.graph_replay_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|project, _| active_projects.contains(project));
+        self.retention_operator_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|key, _| {
+                key.scope.as_os_str().is_empty() || active_projects.contains(&key.scope)
+            });
+    }
+
+    /// Whether this tick may attempt the graph-replay release reconcile.
+    ///
+    /// Consecutive unhealthy attempts open a bounded skip window; each denied
+    /// tick burns one unit of it, so a wedged runtime is re-probed after at
+    /// most [`GRAPH_REPLAY_RELEASE_BACKOFF_CAP_TICKS`] short-cadence ticks
+    /// rather than being polled (and timing out) on every one.
+    pub(super) fn graph_replay_release_attempt_admitted(&self, project_root: &Path) -> bool {
+        let mut progress = self
+            .graph_replay_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(state) = progress.get_mut(project_root) else {
+            return true;
+        };
+        if state.skip_remaining == 0 {
+            return true;
+        }
+        state.skip_remaining -= 1;
+        false
+    }
+
+    /// Record a release attempt the graph runtime could not serve (deadline,
+    /// unavailability, or a held replay pool) and widen the skip window:
+    /// 1, 2, 4, then capped at [`GRAPH_REPLAY_RELEASE_BACKOFF_CAP_TICKS`].
+    pub(super) fn record_graph_replay_release_unhealthy(&self, project_root: &Path) {
+        let mut progress = self
+            .graph_replay_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = progress.entry(project_root.to_path_buf()).or_default();
+        state.consecutive_unhealthy = state.consecutive_unhealthy.saturating_add(1);
+        state.skip_remaining = GRAPH_REPLAY_RELEASE_BACKOFF_CAP_TICKS
+            .min(1_u32 << state.consecutive_unhealthy.saturating_sub(1).min(3));
+    }
+
+    /// Record a served release attempt: close the skip window and advance the
+    /// durable-queue cursor to `continuation` (`None` restarts from the front
+    /// of the queue on the next attempt).
+    pub(super) fn record_graph_replay_release_served(
+        &self,
+        project_root: &Path,
+        continuation: Option<String>,
+    ) {
+        let mut progress = self
+            .graph_replay_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match progress.entry(project_root.to_path_buf()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if continuation.is_none() {
+                    entry.remove();
+                } else {
+                    *entry.get_mut() = GraphReplayReleaseProgressV1 {
+                        consecutive_unhealthy: 0,
+                        skip_remaining: 0,
+                        cursor: continuation,
+                    };
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                if continuation.is_some() {
+                    entry.insert(GraphReplayReleaseProgressV1 {
+                        consecutive_unhealthy: 0,
+                        skip_remaining: 0,
+                        cursor: continuation,
+                    });
+                }
+            }
+        }
+    }
+
+    /// The release-queue cursor recorded by the last served attempt.
+    pub(super) fn graph_replay_release_cursor(&self, project_root: &Path) -> Option<String> {
+        self.graph_replay_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(project_root)
+            .and_then(|state| state.cursor.clone())
+    }
+
+    /// Open a fresh per-tick loud-vs-quiet window before any retention pass
+    /// emits. A genuine anomaly during the tick keeps the tick line loud.
+    pub(super) fn begin_retention_tick_log_window(&self) {
+        self.loud_retention_this_tick
+            .store(false, Ordering::Release);
+    }
+
+    /// Mark that this tick emitted a genuine retention anomaly. By-design
+    /// unavailable pins stay quiet; this forces the tick summary to stay loud.
+    pub(super) fn mark_loud_retention_log(&self) {
+        self.loud_retention_this_tick.store(true, Ordering::Release);
+    }
+
+    /// Whether this (lane, scope, detail) pair should emit an operator line.
+    ///
+    /// Identical repeats of a persistent by-design condition increment
+    /// `daemon.git.maintenance.retention_quiet_total` and stay silent. A
+    /// changed detail logs again.
+    pub(super) fn admit_by_design_retention_log(
+        &self,
+        lane: RetentionOperatorLogLaneV1,
+        scope: &Path,
+        detail: &str,
+    ) -> bool {
+        let key = RetentionOperatorLogKeyV1 {
+            lane,
+            scope: scope.to_path_buf(),
+        };
+        let mut states = self
+            .retention_operator_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if states.get(&key).map(String::as_str) == Some(detail) {
+            hotpath::gauge!("daemon.git.maintenance.retention_quiet_total").inc(1_u64);
+            return false;
+        }
+        states.insert(key, detail.to_owned());
+        true
+    }
+
+    pub(super) fn clear_by_design_retention_log(
+        &self,
+        lane: RetentionOperatorLogLaneV1,
+        scope: &Path,
+    ) {
+        let key = RetentionOperatorLogKeyV1 {
+            lane,
+            scope: scope.to_path_buf(),
+        };
+        self.retention_operator_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key);
+    }
+
+    /// Emit `retention_degraded` once per by-design state, or every time for
+    /// a genuine anomaly. Repeat by-design ticks count on the quiet gauge.
+    pub(super) fn emit_retention_degraded(
+        &self,
+        project_root: &Path,
+        pass: &'static str,
+        failure: &str,
+    ) {
+        let lane = match pass {
+            "semantic_vector_generations" => RetentionOperatorLogLaneV1::Semantic,
+            "code_generations" => RetentionOperatorLogLaneV1::CodeGeneration,
+            _ => {
+                self.mark_loud_retention_log();
+                super::log_daemon_event(
+                    "retention_degraded",
+                    &[("pass", pass.to_owned()), ("failure", failure.to_owned())],
+                );
+                return;
+            }
+        };
+        if retention_failure_is_by_design(lane, failure) {
+            if !self.admit_by_design_retention_log(lane, project_root, failure) {
+                return;
+            }
+        } else {
+            self.mark_loud_retention_log();
+            self.clear_by_design_retention_log(lane, project_root);
+        }
+        super::log_daemon_event(
+            "retention_degraded",
+            &[("pass", pass.to_owned()), ("failure", failure.to_owned())],
+        );
+    }
+
+    /// Whether the tick summary line should be written. Repeated by-design
+    /// `retry` ticks stay quiet; a loud anomaly or an outcome change logs.
+    pub(super) fn admit_retention_tick_log(&self, outcome: MaintenanceTickOutcome) -> bool {
+        let detail = format!("{}:{}", outcome.succeeded(), outcome.label());
+        let loud = self.loud_retention_this_tick.load(Ordering::Acquire);
+        if matches!(outcome, MaintenanceTickOutcome::Retry) && !loud {
+            return self.admit_by_design_retention_log(
+                RetentionOperatorLogLaneV1::Tick,
+                Path::new(""),
+                &detail,
+            );
+        }
+        self.clear_by_design_retention_log(RetentionOperatorLogLaneV1::Tick, Path::new(""));
+        true
     }
 
     pub(super) fn record_semantic_vector_retention_failure(&self, project_root: &Path) {
@@ -605,6 +863,7 @@ impl StoreTelemetrySamplingRegistry {
         )
     }
 
+    #[hotpath::skip]
     async fn advance_registered(
         &self,
         active_paths: &BTreeSet<PathBuf>,
@@ -641,6 +900,23 @@ impl StoreTelemetrySamplingRegistry {
             }
         }
         outcome
+    }
+}
+
+/// Persistent by-design retention conditions log once, then count on gauges.
+/// Corrupt, reset, denied, and cancelled failures stay loud every attempt.
+pub(super) fn retention_failure_is_by_design(
+    lane: RetentionOperatorLogLaneV1,
+    failure: &str,
+) -> bool {
+    match lane {
+        RetentionOperatorLogLaneV1::Semantic => {
+            failure == "configuration_inventory_unavailable" || failure.starts_with("unavailable:")
+        }
+        RetentionOperatorLogLaneV1::CodeGeneration => {
+            failure.starts_with("vector_inventory_offline:")
+        }
+        RetentionOperatorLogLaneV1::Tick => false,
     }
 }
 
@@ -701,6 +977,32 @@ pub(in crate::daemon) enum MaintenanceContinuation {
     /// project identifier is retained in maintenance state, so mounted graphs
     /// continue to receive the same bounded, round-robin service.
     SemanticVectorRetention,
+    /// Resume bounded code-generation retention over the normal graph window:
+    /// a superseded-generation backlog or a partially drained graph-replay
+    /// release queue keeps the short cadence until it converges, instead of
+    /// parking multi-GiB debris behind the full maintenance interval.
+    ///
+    /// A continuation tick for this phase still runs the bounded
+    /// semantic-vector page first, so semantic convergence never starves
+    /// behind a code-generation drain.
+    CodeGenerationRetention,
+}
+
+impl MaintenanceContinuation {
+    /// Two phases asking to continue collapse to the one whose continuation
+    /// tick still advances both: a code-generation continuation re-runs the
+    /// bounded semantic-vector page on every tick, while a semantic-only
+    /// continuation would starve a pending code-generation backlog.
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::CodeGenerationRetention, _) | (_, Self::CodeGenerationRetention) => {
+                Self::CodeGenerationRetention
+            }
+            (Self::SemanticVectorRetention, Self::SemanticVectorRetention) => {
+                Self::SemanticVectorRetention
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -732,6 +1034,9 @@ impl MaintenanceTickOutcome {
             Self::Continue(MaintenanceContinuation::SemanticVectorRetention) => {
                 "semantic_vector_progress"
             }
+            Self::Continue(MaintenanceContinuation::CodeGenerationRetention) => {
+                "code_generation_progress"
+            }
             Self::Retry => "retry",
         }
     }
@@ -743,9 +1048,9 @@ impl MaintenanceTickOutcome {
     fn combine(self, other: Self) -> Self {
         match (self, other) {
             (Self::Retry, _) | (_, Self::Retry) => Self::Retry,
-            (Self::Continue(continuation), _) | (_, Self::Continue(continuation)) => {
-                Self::Continue(continuation)
-            }
+            (Self::Continue(left), Self::Continue(right)) => Self::Continue(left.combine(right)),
+            (Self::Continue(continuation), Self::Complete)
+            | (Self::Complete, Self::Continue(continuation)) => Self::Continue(continuation),
             (Self::Complete, Self::Complete) => Self::Complete,
         }
     }
@@ -817,6 +1122,9 @@ impl MaintenanceLifecycleInstrumentation {
             MaintenanceTickOutcome::Continue(MaintenanceContinuation::SemanticVectorRetention) => {
                 hotpath::gauge!("daemon_maintenance_outcome_semantic_vector_progress").inc(1.0);
             }
+            MaintenanceTickOutcome::Continue(MaintenanceContinuation::CodeGenerationRetention) => {
+                hotpath::gauge!("daemon_maintenance_outcome_code_generation_progress").inc(1.0);
+            }
             MaintenanceTickOutcome::Retry => {
                 hotpath::gauge!("daemon_maintenance_outcome_retry").inc(1.0);
             }
@@ -850,6 +1158,9 @@ impl MaintenancePhaseInstrumentation {
             Some(MaintenanceContinuation::SemanticVectorRetention) => {
                 hotpath::gauge!("daemon_maintenance_phase_semantic_vector_active").inc(1.0);
             }
+            Some(MaintenanceContinuation::CodeGenerationRetention) => {
+                hotpath::gauge!("daemon_maintenance_phase_code_generation_active").inc(1.0);
+            }
             None => {
                 hotpath::gauge!("daemon_maintenance_phase_full_tick_active").inc(1.0);
             }
@@ -864,6 +1175,9 @@ impl Drop for MaintenancePhaseInstrumentation {
             Some(MaintenanceContinuation::SemanticVectorRetention) => {
                 hotpath::gauge!("daemon_maintenance_phase_semantic_vector_active").inc(-1.0);
             }
+            Some(MaintenanceContinuation::CodeGenerationRetention) => {
+                hotpath::gauge!("daemon_maintenance_phase_code_generation_active").inc(-1.0);
+            }
             None => {
                 hotpath::gauge!("daemon_maintenance_phase_full_tick_active").inc(-1.0);
             }
@@ -872,7 +1186,7 @@ impl Drop for MaintenancePhaseInstrumentation {
 }
 
 async fn run_maintenance_loop<F, Fut>(
-    cancellation: &tracedecay_usecases::context::CancellationToken,
+    cancellation: &tracedecay_session_memory::context::CancellationToken,
     wake: &Notify,
     interval: Duration,
     mut run_tick: F,
@@ -973,7 +1287,7 @@ const BRANCH_STORE_GC_PERIOD: Duration = Duration::from_hours(24);
 
 #[derive(Clone)]
 pub(super) struct MaintenanceCoordinator {
-    cancellation: tracedecay_usecases::context::CancellationToken,
+    cancellation: tracedecay_session_memory::context::CancellationToken,
     wake: Arc<Notify>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
     metrics: Arc<Mutex<MaintenanceMetricsV1>>,
@@ -989,7 +1303,7 @@ pub(super) struct MaintenanceCoordinator {
 impl Default for MaintenanceCoordinator {
     fn default() -> Self {
         Self {
-            cancellation: tracedecay_usecases::context::CancellationToken::new(),
+            cancellation: tracedecay_session_memory::context::CancellationToken::new(),
             wake: Arc::new(Notify::new()),
             task: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(MaintenanceMetricsV1::default())),
@@ -1060,6 +1374,7 @@ fn cursor_after_attempted_units(
 }
 
 impl MaintenanceCoordinator {
+    #[hotpath::skip]
     pub(super) async fn spawn(
         profile_root: PathBuf,
         profile_database: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
@@ -1113,6 +1428,7 @@ impl MaintenanceCoordinator {
         self.wake.notify_waiters();
     }
 
+    #[hotpath::skip]
     pub(super) async fn shutdown(&self) {
         self.cancel();
         if let Some(task) = self.task.lock().await.take() {
@@ -1120,6 +1436,7 @@ impl MaintenanceCoordinator {
         }
     }
 
+    #[hotpath::skip]
     async fn run(
         &self,
         profile_root: PathBuf,
@@ -1160,6 +1477,9 @@ impl MaintenanceCoordinator {
         // periodic loop, so it is where a slow RSS climb toward the
         // admission limit becomes visible between full telemetry snapshots.
         record_process_resident_memory_gauge();
+        administration
+            .store_telemetry_sampling()
+            .begin_retention_tick_log_window();
         let session_databases = if continuation.is_none() {
             administration.mounted_registered_session_databases().await
         } else {
@@ -1213,11 +1533,11 @@ impl MaintenanceCoordinator {
                 .map(|index| work[*index].1.database_path().to_path_buf()),
         );
         let maintenance_observations = administration.store_telemetry_sampling();
-        let active_semantic_vector_projects = project_graphs
+        let active_maintenance_projects = project_graphs
             .iter()
             .map(|graph| graph.project_root().to_path_buf())
             .collect::<BTreeSet<_>>();
-        maintenance_observations.retain_semantic_vector_projects(&active_semantic_vector_projects);
+        maintenance_observations.retain_project_maintenance_state(&active_maintenance_projects);
         let telemetry_sampling = if continuation.is_none() {
             maintenance_observations
                 .advance_registered(&active_telemetry_paths, &sampled_telemetry_paths)
@@ -1398,22 +1718,29 @@ impl MaintenanceCoordinator {
         } else if self.cancellation.is_cancelled() {
             metrics.last_outcome = Some(MaintenanceStoreOutcomeV1::Cancelled);
         }
-        super::log_daemon_event(
-            "retention_maintenance_tick",
-            &[
-                ("succeeded", outcome.succeeded().to_string()),
-                ("outcome", outcome.label().to_owned()),
-                ("processed_stores", metrics.processed_stores.to_string()),
-                ("deferred_stores", metrics.deferred_stores.to_string()),
-                ("unavailable_stores", metrics.unavailable_stores.to_string()),
-                ("reclaimed_bytes", metrics.reclaimed_bytes.to_string()),
-                ("telemetry_samples", telemetry_sampling.observed.to_string()),
-                (
-                    "telemetry_unavailable",
-                    telemetry_sampling.unavailable.to_string(),
-                ),
-            ],
-        );
+        let tick_fields = [
+            ("succeeded", outcome.succeeded().to_string()),
+            ("outcome", outcome.label().to_owned()),
+            ("processed_stores", metrics.processed_stores.to_string()),
+            // The lifetime total reads like a queue depth on a live tail
+            // (a busy writer makes it "climb every tick"); the per-tick
+            // count is the actual deferral pressure of this tick.
+            ("deferred_stores_tick", deferred.to_string()),
+            ("deferred_stores", metrics.deferred_stores.to_string()),
+            ("unavailable_stores", metrics.unavailable_stores.to_string()),
+            ("reclaimed_bytes", metrics.reclaimed_bytes.to_string()),
+            ("telemetry_samples", telemetry_sampling.observed.to_string()),
+            (
+                "telemetry_unavailable",
+                telemetry_sampling.unavailable.to_string(),
+            ),
+        ];
+        if administration
+            .store_telemetry_sampling()
+            .admit_retention_tick_log(outcome)
+        {
+            super::log_daemon_event("retention_maintenance_tick", &tick_fields);
+        }
         outcome
     }
 }
@@ -1431,7 +1758,9 @@ impl MaintenanceCoordinator {
 /// here — the gauge and the admission cell consume the same sample.
 #[cfg(target_os = "linux")]
 fn record_process_resident_memory_gauge() {
-    if let Some(bytes) = read_linux_process_resident_bytes() {
+    if let Some(bytes) =
+        tracedecay_runtime_core::resident_memory::sampled_process_resident_bytes_v1()
+    {
         hotpath::gauge!("daemon.process.resident_bytes").set(bytes);
         let state = tracedecay_runtime_core::resident_memory::process_resident_memory_pressure_v1()
             .publish_observed_resident_bytes(bytes);
@@ -1455,19 +1784,6 @@ fn record_process_resident_memory_gauge() {
 
 #[cfg(not(target_os = "linux"))]
 fn record_process_resident_memory_gauge() {}
-
-#[cfg(target_os = "linux")]
-fn read_linux_process_resident_bytes() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let kib = status
-        .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))?
-        .split_whitespace()
-        .next()?
-        .parse::<u64>()
-        .ok()?;
-    kib.checked_mul(1_024)
-}
 
 #[derive(Debug)]
 struct ColdStorePageMetrics {
@@ -1493,8 +1809,8 @@ async fn run_cold_store_page(
     profile_root: &Path,
     profile_database: &tracedecay_global_db::RegisteredGlobalDb,
     retention: &crate::config::RetentionConfig,
-    cancellation: &tracedecay_usecases::context::CancellationToken,
-) -> tracedecay_runtime_core::errors::Result<ColdStorePageMetrics> {
+    cancellation: &tracedecay_session_memory::context::CancellationToken,
+) -> tracedecay_domain::errors::Result<ColdStorePageMetrics> {
     let checkpoint_path = checkpoint_path(profile_root);
     let cursor = load_cursor(&checkpoint_path).unwrap_or(ColdStoreCursorV1 {
         after_project_id: None,
@@ -1510,7 +1826,7 @@ async fn run_cold_store_page(
         || retention.incident_debris_retention_days.is_some()
     {
         Some(now_secs_i64().map_err(|message| {
-            tracedecay_runtime_core::errors::TraceDecayError::Config {
+            tracedecay_domain::errors::TraceDecayError::Config {
                 message: message.to_owned(),
             }
         })?)
@@ -1545,10 +1861,8 @@ async fn run_cold_store_page(
     if let Some(days) = retention.orphan_store_gc_days {
         let findings = tracedecay_maintenance::retention::orphan_stores::classify_stores(
             &page.entries,
-            retention_now.ok_or_else(|| {
-                tracedecay_runtime_core::errors::TraceDecayError::Config {
-                    message: "maintenance retention clock unavailable".to_owned(),
-                }
+            retention_now.ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                message: "maintenance retention clock unavailable".to_owned(),
             })?,
         );
         let plan = tracedecay_maintenance::retention::orphan_stores::plan_collection(
@@ -1577,10 +1891,8 @@ async fn run_cold_store_page(
             &page.entries,
             profile_root,
             retention_window_secs(days),
-            retention_now.ok_or_else(|| {
-                tracedecay_runtime_core::errors::TraceDecayError::Config {
-                    message: "maintenance retention clock unavailable".to_owned(),
-                }
+            retention_now.ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                message: "maintenance retention clock unavailable".to_owned(),
             })?,
         );
         metrics.reclaimed_bytes = metrics
@@ -1607,7 +1919,7 @@ async fn run_cold_store_page(
         after_project_id: None,
     });
     persist_cursor(&checkpoint_path, &next_cursor).map_err(|error| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: format!("persist maintenance cold-store cursor: {error}"),
         }
     })?;
@@ -1692,10 +2004,11 @@ mod tests {
     use super::{
         CadenceInstant, ColdStoreCursorV1, MAINTENANCE_FUTURES_ACTIVE,
         MAINTENANCE_STORE_PAGE_LIMIT, MaintenanceCadence, MaintenanceContinuation,
-        MaintenanceStoreOutcomeV1, MaintenanceTickOutcome, SemanticVectorRetentionCensusOutcome,
-        SemanticVectorRetentionReadV1, StoreTelemetrySamplingRegistry, TableGrowthObservation,
-        checkpoint_path, classify_cold_store_state, compare_table_growth,
-        cursor_after_attempted_units, load_cursor, next_cold_store_cursor, persist_cursor,
+        MaintenanceStoreOutcomeV1, MaintenanceTickOutcome, RetentionOperatorLogLaneV1,
+        SemanticVectorRetentionCensusOutcome, SemanticVectorRetentionReadV1,
+        StoreTelemetrySamplingRegistry, TableGrowthObservation, checkpoint_path,
+        classify_cold_store_state, compare_table_growth, cursor_after_attempted_units, load_cursor,
+        next_cold_store_cursor, persist_cursor, retention_failure_is_by_design,
         run_maintenance_loop, select_store_window,
     };
 
@@ -1787,6 +2100,188 @@ mod tests {
         );
     }
 
+    #[test]
+    fn code_generation_continuation_dominates_the_semantic_phase() {
+        // A code-generation continuation tick re-runs the bounded semantic
+        // page, so it must win when both phases report bounded progress; the
+        // reverse would starve the code-generation backlog.
+        let semantic =
+            MaintenanceTickOutcome::Continue(MaintenanceContinuation::SemanticVectorRetention);
+        let code_generation =
+            MaintenanceTickOutcome::Continue(MaintenanceContinuation::CodeGenerationRetention);
+
+        assert_eq!(semantic.combine(code_generation), code_generation);
+        assert_eq!(code_generation.combine(semantic), code_generation);
+        assert_eq!(
+            code_generation.combine(MaintenanceTickOutcome::Complete),
+            code_generation
+        );
+        assert_eq!(
+            MaintenanceTickOutcome::Complete.combine(code_generation),
+            code_generation
+        );
+        assert_eq!(
+            code_generation.combine(MaintenanceTickOutcome::Retry),
+            MaintenanceTickOutcome::Retry
+        );
+    }
+
+    #[test]
+    fn graph_replay_release_backoff_widens_and_recovers() {
+        let registry = StoreTelemetrySamplingRegistry::default();
+        let project = std::path::Path::new("/project");
+
+        // No recorded state admits every attempt.
+        assert!(registry.graph_replay_release_attempt_admitted(project));
+        assert!(registry.graph_replay_release_attempt_admitted(project));
+
+        // Consecutive unhealthy attempts widen the skip window 1, 2, 4, and
+        // cap at GRAPH_REPLAY_RELEASE_BACKOFF_CAP_TICKS denied ticks.
+        for expected_skips in [1_usize, 2, 4, 8, 8] {
+            registry.record_graph_replay_release_unhealthy(project);
+            let mut denied = 0_usize;
+            while !registry.graph_replay_release_attempt_admitted(project) {
+                denied += 1;
+                assert!(denied <= 16, "the skip window must stay bounded");
+            }
+            assert_eq!(
+                denied, expected_skips,
+                "the skip window must double per consecutive failure and cap"
+            );
+        }
+
+        // A served attempt closes the window entirely.
+        registry.record_graph_replay_release_served(project, None);
+        assert!(registry.graph_replay_release_attempt_admitted(project));
+        assert_eq!(registry.graph_replay_release_cursor(project), None);
+
+        // The next failure after recovery starts from the narrowest window.
+        registry.record_graph_replay_release_unhealthy(project);
+        assert!(!registry.graph_replay_release_attempt_admitted(project));
+        assert!(registry.graph_replay_release_attempt_admitted(project));
+    }
+
+    #[test]
+    fn by_design_retention_failures_are_the_unavailable_and_offline_lanes() {
+        assert!(retention_failure_is_by_design(
+            RetentionOperatorLogLaneV1::Semantic,
+            "unavailable:semantic retrieval is not calibrated",
+        ));
+        assert!(retention_failure_is_by_design(
+            RetentionOperatorLogLaneV1::Semantic,
+            "configuration_inventory_unavailable",
+        ));
+        assert!(!retention_failure_is_by_design(
+            RetentionOperatorLogLaneV1::Semantic,
+            "corrupt:index page",
+        ));
+        assert!(retention_failure_is_by_design(
+            RetentionOperatorLogLaneV1::CodeGeneration,
+            "vector_inventory_offline:vector_census_incomplete",
+        ));
+        assert!(!retention_failure_is_by_design(
+            RetentionOperatorLogLaneV1::CodeGeneration,
+            "graph_replay_pool_busy",
+        ));
+    }
+
+    #[test]
+    fn by_design_retention_logs_once_then_counts_on_the_quiet_gauge() {
+        let registry = StoreTelemetrySamplingRegistry::default();
+        let project = std::path::Path::new("/project");
+        let failure = "unavailable:semantic retrieval is not calibrated";
+
+        assert!(
+            registry.admit_by_design_retention_log(
+                RetentionOperatorLogLaneV1::Semantic,
+                project,
+                failure,
+            ),
+            "the first by-design state must log"
+        );
+        assert!(
+            !registry.admit_by_design_retention_log(
+                RetentionOperatorLogLaneV1::Semantic,
+                project,
+                failure,
+            ),
+            "an unchanged by-design state must stay quiet"
+        );
+        assert!(
+            registry.admit_by_design_retention_log(
+                RetentionOperatorLogLaneV1::Semantic,
+                project,
+                "unavailable:model missing",
+            ),
+            "a changed by-design reason must log again"
+        );
+
+        registry.mark_loud_retention_log();
+        registry.begin_retention_tick_log_window();
+        assert!(
+            registry.admit_retention_tick_log(MaintenanceTickOutcome::Retry),
+            "the first by-design retry tick must log"
+        );
+        assert!(
+            !registry.admit_retention_tick_log(MaintenanceTickOutcome::Retry),
+            "a repeated by-design retry tick must stay quiet"
+        );
+        registry.mark_loud_retention_log();
+        assert!(
+            registry.admit_retention_tick_log(MaintenanceTickOutcome::Retry),
+            "a genuine anomaly on the same tick must keep the tick line loud"
+        );
+    }
+
+    #[test]
+    fn graph_replay_release_cursor_survives_failures_and_resets_on_wrap() {
+        let registry = StoreTelemetrySamplingRegistry::default();
+        let project = std::path::Path::new("/project");
+
+        registry
+            .record_graph_replay_release_served(project, Some("release-000000ff.json".to_owned()));
+        assert_eq!(
+            registry.graph_replay_release_cursor(project).as_deref(),
+            Some("release-000000ff.json")
+        );
+
+        // An unhealthy attempt keeps the cursor: consumed events are durably
+        // removed, so resuming from the same position loses nothing.
+        registry.record_graph_replay_release_unhealthy(project);
+        assert_eq!(
+            registry.graph_replay_release_cursor(project).as_deref(),
+            Some("release-000000ff.json")
+        );
+
+        // Reaching the end of the queue clears state so the next attempt
+        // starts from the front.
+        registry.record_graph_replay_release_served(project, None);
+        assert_eq!(registry.graph_replay_release_cursor(project), None);
+        assert!(registry.graph_replay_release_attempt_admitted(project));
+    }
+
+    #[test]
+    fn project_maintenance_state_is_pruned_with_the_active_set() {
+        let registry = StoreTelemetrySamplingRegistry::default();
+        let retained = std::path::Path::new("/retained");
+        let retired = std::path::Path::new("/retired");
+        registry.record_graph_replay_release_unhealthy(retained);
+        registry.record_graph_replay_release_unhealthy(retired);
+
+        registry.retain_project_maintenance_state(&std::collections::BTreeSet::from([
+            retained.to_path_buf()
+        ]));
+
+        assert!(
+            !registry.graph_replay_release_attempt_admitted(retained),
+            "the active project's backoff window must survive pruning"
+        );
+        assert!(
+            registry.graph_replay_release_attempt_admitted(retired),
+            "a retired project's backoff state must be dropped"
+        );
+    }
+
     /// `MAINTENANCE_FUTURES_ACTIVE` is a process-wide gauge, so a test that
     /// observes absolute readings must not overlap another test that runs a
     /// maintenance loop. Every test that starts `run_maintenance_loop` holds
@@ -1796,7 +2291,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn repeated_wakes_do_not_move_the_maintenance_due_deadline() {
         let _lifecycle_isolation = MAINTENANCE_LOOP_LIFECYCLE.lock().await;
-        let cancellation = tracedecay_usecases::context::CancellationToken::new();
+        let cancellation = tracedecay_session_memory::context::CancellationToken::new();
         let wake = Arc::new(Notify::new());
         let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let baseline = MAINTENANCE_FUTURES_ACTIVE.load(Ordering::SeqCst);
@@ -1855,7 +2350,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn progress_continuation_reenters_only_the_owning_phase() {
         let _lifecycle_isolation = MAINTENANCE_LOOP_LIFECYCLE.lock().await;
-        let cancellation = tracedecay_usecases::context::CancellationToken::new();
+        let cancellation = tracedecay_session_memory::context::CancellationToken::new();
         let wake = Arc::new(Notify::new());
         let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
         let task_cancellation = cancellation.clone();
@@ -1969,7 +2464,7 @@ mod tests {
         let temporary = tempfile::tempdir().expect("telemetry registry fixture root");
         let database_path = temporary.path().join("project.db");
         let other_database_path = temporary.path().join("other.db");
-        crate::daemon::store_runtime::register_registered_schema_installer();
+        tracedecay_store_runtime::register_registered_schema_installer();
         let authority = tracedecay_runtime_core::db::DatabaseAuthority::acquire_test(
             &database_path,
             "maintenance telemetry shutdown fixture",

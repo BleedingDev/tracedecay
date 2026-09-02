@@ -1,14 +1,14 @@
 //! Process-state factories for the daemon handshake wire contract.
 //!
 //! The handshake type lives in `tracedecay-daemon-protocol`. Construction that
-//! reads this process's identity, build version, and run id stays here.
+//! reads portable process identity lives in `tracedecay-daemon-control`; this
+//! root adapter supplies the registered product runtime's binary version and
+//! root open type.
 
 use std::path::PathBuf;
 
-use tracedecay_daemon_protocol::{DaemonHandshake, MovedStoreAdoption};
-use tracedecay_runtime_core::errors::Result;
-
-use crate::client_identity::current_daemon_client_identity;
+use tracedecay_daemon_protocol::DaemonHandshake;
+use tracedecay_domain::errors::Result;
 
 pub use tracedecay_daemon_protocol::{client_version_skew, version_skew_action};
 
@@ -19,19 +19,13 @@ pub fn handshake_for_current_client(
     timings: bool,
     allow_init: bool,
 ) -> Result<DaemonHandshake> {
-    Ok(DaemonHandshake {
+    tracedecay_daemon_control::handshake_for_current_client(
+        binary_version()?,
         project_path,
         scope_prefix,
         timings,
         allow_init,
-        allow_initialize_root_routing: false,
-        client_identity: current_daemon_client_identity()?,
-        client_version: binary_version().to_string(),
-        client_instance_id: tracedecay_runtime_core::runtime_identity::process_run_id().to_string(),
-        tool_list_changed_capable: false,
-        catalog_version: String::new(),
-        moved_store_adoption: MovedStoreAdoption::Never,
-    })
+    )
 }
 
 pub fn handshake_open_options(
@@ -48,7 +42,10 @@ pub fn handshake_open_options(
 ///
 /// This is the build version, not the released one: two checkout builds of
 /// the same release differ only by commit, and a daemon left running from the
-/// previous build is exactly the skew this comparison exists to catch.
-pub(crate) fn binary_version() -> &'static str {
+/// previous build is exactly the skew this comparison exists to catch. It is
+/// fallible because it reads the registered product runtime: a process whose
+/// entry point never registered one has no truthful version to advertise.
+pub(crate) fn binary_version()
+-> std::result::Result<&'static str, crate::product_runtime::ProductRuntimeError> {
     crate::version::build_version()
 }

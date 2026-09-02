@@ -14,7 +14,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
-EXPECTED_FLOOR = "08fbe33a7c7f403191fd5d6e356c7b6681b96403"
+EXPECTED_FLOOR = "5749e4fcfe268e17bd19a0e6ef90c646f7b37289"
 EXPECTED_POLICY_REVISION = "patch-footprint.v2"
 EXPECTED_CONVERGENCE_SCHEMA = "product/upstream/convergence-map.schema.json"
 EXPECTED_CONVERGENCE_SCHEMA_VERSION = 2

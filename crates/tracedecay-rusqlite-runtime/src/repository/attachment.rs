@@ -447,6 +447,7 @@ impl RepositoryRuntimePhysicalAttachment {
         }
     }
 
+    #[hotpath::skip]
     pub async fn dispatch_submit(
         &self,
         request: RuntimeSubmitRequestV1,
@@ -469,6 +470,7 @@ impl RepositoryRuntimePhysicalAttachment {
             .map_err(|error| RepositoryDispatchError::Writer(error.to_string()))
     }
 
+    #[hotpath::skip]
     pub async fn run_bounded_incremental_compaction(
         &self,
         max_pages: u32,
@@ -490,6 +492,7 @@ impl RepositoryRuntimePhysicalAttachment {
             .map_err(|error| RepositoryDispatchError::Writer(error.to_string()))
     }
 
+    #[hotpath::skip]
     pub async fn run_checkpoint(
         &self,
         request: CheckpointRequest,
@@ -607,6 +610,7 @@ impl RepositoryRuntimePhysicalAttachment {
             .map_err(RepositoryDispatchError::Checkpoint)
     }
 
+    #[hotpath::skip]
     pub async fn snapshot_to(
         &self,
         destination: PathBuf,
@@ -628,6 +632,7 @@ impl RepositoryRuntimePhysicalAttachment {
             .map_err(|error| RepositoryDispatchError::Writer(error.to_string()))
     }
 
+    #[hotpath::skip]
     pub async fn snapshot_to_interruptible(
         &self,
         destination: PathBuf,

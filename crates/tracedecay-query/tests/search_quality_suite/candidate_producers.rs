@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 use tracedecay_code_index::chunks::{
@@ -53,12 +54,14 @@ use tracedecay_query::retrieval::lexical::{
     CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CodeLexicalArtifactBatchLimitV1,
     CodeLexicalArtifactBuilderV1, CodeLexicalArtifactErrorV1,
     CodeLexicalArtifactFinalizationStepV1, CodeLexicalArtifactReaderV1,
-    CodeLexicalProjectionAdapterV1, CodeLexicalProjectionBuildStepV1, CodeLexicalProjectionBuildV1,
+    CodeLexicalArtifactWriterRevisionV1, CodeLexicalProjectionAdapterV1,
+    CodeLexicalProjectionBuildStepV1, CodeLexicalProjectionBuildV1,
     CodeLexicalProjectionMetadataV1, LexicalFieldFilterV1, LexicalFieldV1, LexicalLane,
     LexicalLaneRequest, LexicalLaneRetriever, MAX_FUZZY_TERM_EXPANSIONS_V1,
     MAX_LEXICAL_QUERY_TERM_BYTES_V1, VerifiedCodeLexicalArtifactV1,
 };
 use tracedecay_query::retrieval::ports::{ExactTermPostingReadPort, LexicalPostingReadPort};
+use tracedecay_query::retrieval::{QUERY_EXACT_SCORE_DOMAIN_V1, QUERY_LEXICAL_SCORE_DOMAIN_V1};
 
 struct ArtifactControl {
     cancelled: bool,
@@ -518,7 +521,7 @@ fn real_lexical_source_fixture_from_sources(
         freshness: freshness(FreshnessCompatibilityV1::Current),
         exact_retriever_revision: id::<ComponentRevision>("retriever.exact.v1"),
         lexical_retriever_revision: id::<ComponentRevision>("retriever.lexical.v1"),
-        exact_score_domain: id::<ScoreDomainId>("score.exact.v1"),
+        exact_score_domain: id::<ScoreDomainId>(QUERY_EXACT_SCORE_DOMAIN_V1),
     };
     RealLexicalSourceFixture {
         sealed,
@@ -858,7 +861,7 @@ pub(crate) fn projection_metadata(
         freshness: freshness(compatibility),
         exact_retriever_revision: id::<ComponentRevision>("retriever.exact.v1"),
         lexical_retriever_revision: id::<ComponentRevision>("retriever.lexical.v1"),
-        exact_score_domain: id::<ScoreDomainId>("score.exact.v1"),
+        exact_score_domain: id::<ScoreDomainId>(QUERY_EXACT_SCORE_DOMAIN_V1),
     }
 }
 
@@ -1396,6 +1399,368 @@ fn reader_rejects_revision_four_artifact_before_indexed_queries() {
 }
 
 #[test]
+fn reader_rejects_unsupported_open_revisions_and_accepts_current() {
+    let (fixture, pages, source_receipt) = real_verified_pages();
+    let directory = tempfile::tempdir().expect("artifact tempdir");
+    let artifact_path = directory.path().join("open-revision.sqlite");
+    let control = ArtifactControl { cancelled: false };
+    let mut builder = CodeLexicalArtifactBuilderV1::create(&artifact_path, fixture.metadata)
+        .expect("create artifact");
+    for page in &pages {
+        builder.append_page(page, &control).expect("append page");
+    }
+    let verified = finish_staged_artifact(&mut builder, &source_receipt, &control);
+    CodeLexicalArtifactReaderV1::open_with_control(
+        &artifact_path,
+        &verified,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+        &control,
+    )
+    .expect("revision 12 must open");
+
+    for revision in [9i64, 13] {
+        let connection =
+            rusqlite::Connection::open(&artifact_path).expect("open artifact mutation");
+        connection
+            .execute(
+                "UPDATE artifact_state SET format_revision = ?1 WHERE singleton = 1",
+                [revision],
+            )
+            .expect("write unsupported revision");
+        drop(connection);
+        assert!(
+            matches!(
+                CodeLexicalArtifactReaderV1::open_with_control(
+                    &artifact_path,
+                    &verified,
+                    CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+                    &control,
+                ),
+                Err(CodeLexicalArtifactErrorV1::Incompatible(_))
+            ),
+            "revision {revision} must fail closed"
+        );
+    }
+}
+
+#[test]
+fn writer_revision_toggle_preserves_v11_v12_lexical_results() {
+    let (fixture, pages, source_receipt) = real_verified_pages();
+    let directory = tempfile::tempdir().expect("artifact tempdir");
+    let v11_path = directory.path().join("writer-v11.sqlite");
+    let v12_path = directory.path().join("writer-v12.sqlite");
+    let control = ArtifactControl { cancelled: false };
+    let mut v11_builder = CodeLexicalArtifactBuilderV1::create_with_format_revision(
+        &v11_path,
+        fixture.metadata.clone(),
+        CodeLexicalArtifactWriterRevisionV1::V11,
+    )
+    .expect("create revision 11 artifact");
+    for page in &pages {
+        v11_builder
+            .append_page(page, &control)
+            .expect("append v11 page");
+    }
+    let v11 = finish_staged_artifact(&mut v11_builder, &source_receipt, &control);
+    let connection = rusqlite::Connection::open(&v11_path).expect("inspect v11 artifact");
+    let revision: i64 = connection
+        .query_row(
+            "SELECT format_revision FROM artifact_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read v11 revision");
+    assert_eq!(revision, 11);
+    let legacy_ngram_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM ngram_postings WHERE substr(documents, 1, 4) = x'54444e31'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count v11 ngram rows");
+    assert!(legacy_ngram_rows > 0);
+    let exact_term_column: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_xinfo('exact_postings') WHERE name = 'term' AND type = 'BLOB'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read v11 exact schema");
+    assert_eq!(exact_term_column, 1);
+    drop(connection);
+    let v11_reader = CodeLexicalArtifactReaderV1::open_with_control(
+        &v11_path,
+        &v11,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+        &control,
+    )
+    .expect("reopen revision 11 artifact");
+
+    let mut v12_builder = CodeLexicalArtifactBuilderV1::create_with_format_revision(
+        &v12_path,
+        fixture.metadata,
+        CodeLexicalArtifactWriterRevisionV1::V12,
+    )
+    .expect("create revision 12 artifact");
+    for page in &pages {
+        v12_builder
+            .append_page(page, &control)
+            .expect("append v12 page");
+    }
+    let v12 = finish_staged_artifact(&mut v12_builder, &source_receipt, &control);
+    let v12_reader = CodeLexicalArtifactReaderV1::open_with_control(
+        &v12_path,
+        &v12,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+        &control,
+    )
+    .expect("reopen revision 12 artifact");
+
+    let mut request = lexical_request("widget return", &["widget"], &[], &["return"], 2, 8);
+    request.generation = v11.generation().clone();
+    let v11_result = v11_reader
+        .read_lexical_postings(&request)
+        .expect("read v11 lexical postings");
+    request.generation = v12.generation().clone();
+    let v12_result = v12_reader
+        .read_lexical_postings(&request)
+        .expect("read v12 lexical postings");
+    assert_eq!(v12_result, v11_result);
+}
+
+/// Historical revision-10 artifact sealed by the pre-interning writer
+/// (`tests/fixtures/lexical-artifact-v10.sqlite`). Readers must serve it;
+/// a raw `term_id` SQL error is not an upgrade path.
+#[test]
+fn reader_serves_historical_v10_writer_artifact() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let checked_in =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lexical-artifact-v10.sqlite");
+    let control = ArtifactControl { cancelled: false };
+    let on_disk_revision: i64 = rusqlite::Connection::open(&checked_in)
+        .expect("inspect v10 fixture")
+        .query_row(
+            "SELECT format_revision FROM artifact_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read v10 format revision");
+    assert_eq!(on_disk_revision, 10);
+
+    let directory = tempfile::tempdir().expect("private v10 reopen dir");
+    let artifact_path = directory.path().join("lexical-artifact-v10.sqlite");
+    std::fs::copy(&checked_in, &artifact_path).expect("copy historical v10 fixture");
+    std::fs::set_permissions(&artifact_path, std::fs::Permissions::from_mode(0o600))
+        .expect("restore private-file mode for content-addressed open");
+    let bytes = std::fs::read(&artifact_path).expect("read historical v10 fixture");
+    let file_size_bytes = u64::try_from(bytes.len()).expect("v10 fixture length");
+    let digest = ManifestDigest::new(format!("sha256:{}", hex::encode(Sha256::digest(&bytes))))
+        .expect("v10 fixture digest");
+
+    let reader = CodeLexicalArtifactReaderV1::open_content_addressed(
+        &artifact_path,
+        &digest,
+        file_size_bytes,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+        &control,
+    )
+    .expect("readers accept sealed revision 10");
+    let mut request = lexical_request("widget", &["widget"], &[], &[], 0, 8);
+    request.generation = reader.metadata().generation.clone();
+    let RetrieverOutcome::Complete(batch) = reader
+        .read_lexical_postings(&request)
+        .expect("v10 lexical serving")
+    else {
+        panic!("v10 lexical read must complete, not stale or rebuild");
+    };
+    assert!(
+        batch.coverage.eligible > 0,
+        "served v10 artifact must return widget candidates"
+    );
+}
+
+#[test]
+fn sealed_v12_artifact_uses_compact_postings_and_reports_dbstat() {
+    let (fixture, pages, source_receipt) = real_verified_pages();
+    let directory = tempfile::tempdir().expect("artifact tempdir");
+    let artifact_path = directory.path().join("v12-plans.sqlite");
+    let control = ArtifactControl { cancelled: false };
+    let started = Instant::now();
+    let mut builder = CodeLexicalArtifactBuilderV1::create(&artifact_path, fixture.metadata)
+        .expect("create artifact");
+    for page in &pages {
+        builder.append_page(page, &control).expect("append page");
+    }
+    let verified = finish_staged_artifact(&mut builder, &source_receipt, &control);
+    let build_ms = started.elapsed().as_millis();
+    let file_bytes = std::fs::metadata(&artifact_path)
+        .expect("artifact metadata")
+        .len();
+    let connection = rusqlite::Connection::open(&artifact_path).expect("inspect sealed artifact");
+    let format_revision: i64 = connection
+        .query_row(
+            "SELECT format_revision FROM artifact_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read current format revision");
+    assert_eq!(format_revision, 12);
+    let uncompressed_ngram_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM ngram_postings WHERE substr(documents, 1, 4) = x'54444e31' OR length(documents) > cardinality + 4",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count non-delta ngram rows");
+    assert_eq!(
+        uncompressed_ngram_rows, 0,
+        "revision 12 ngram shards must use canonical delta varints"
+    );
+    let exact_columns = connection
+        .prepare(
+            "SELECT name, type FROM pragma_table_xinfo('exact_postings') WHERE hidden = 0 ORDER BY cid",
+        )
+        .expect("prepare exact columns")
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .expect("query exact columns")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect exact columns");
+    assert_eq!(
+        exact_columns,
+        [
+            ("term_id".to_owned(), "INTEGER".to_owned()),
+            ("field".to_owned(), "INTEGER".to_owned()),
+            ("document_id".to_owned(), "INTEGER".to_owned()),
+        ]
+    );
+    let term_plan = connection
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT document_id FROM term_postings WHERE field = ?1 AND term_id = ?2",
+        )
+        .expect("prepare term plan")
+        .query_map(rusqlite::params![4i64, 1i64], |row| row.get::<_, String>(3))
+        .expect("query term plan")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect term plan");
+    assert!(
+        term_plan.iter().any(|detail| {
+            detail.contains("PRIMARY KEY")
+                || detail.contains("term_postings") && !detail.contains("term_postings_by_term")
+        }),
+        "term equality must use the interned primary key, got {term_plan:?}"
+    );
+    let frequency_plan = connection
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT posting.field, posting.frequency \
+             FROM term_postings AS posting INDEXED BY term_postings_by_document \
+             WHERE posting.document_id = 0 AND posting.term_id IN (1)",
+        )
+        .expect("prepare frequency plan")
+        .query_map([], |row| row.get::<_, String>(3))
+        .expect("query frequency plan")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect frequency plan");
+    assert!(
+        frequency_plan
+            .iter()
+            .any(|detail| detail.contains("term_postings_by_document")),
+        "frequency probe must use term_postings_by_document, got {frequency_plan:?}"
+    );
+    let missing_dropped: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name IN \
+             ('term_postings_by_term', 'term_postings_by_document_term', 'term_stats_by_term')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count dropped indexes");
+    assert_eq!(
+        missing_dropped, 0,
+        "revision 12 must not keep redundant indexes"
+    );
+    let compact_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM rows WHERE substr(row, 1, 7) = x'54444c52313100'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count compact rows");
+    let total_rows: i64 = connection
+        .query_row("SELECT COUNT(*) FROM rows", [], |row| row.get(0))
+        .expect("count rows");
+    assert_eq!(
+        compact_rows, total_rows,
+        "every v12 row carries the compact tag"
+    );
+    {
+        let dbstat = connection.prepare(
+            "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC",
+        );
+        if let Ok(mut statement) = dbstat {
+            let sizes: BTreeMap<String, i64> = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query dbstat")
+                .collect::<Result<_, _>>()
+                .expect("read dbstat");
+            assert!(
+                sizes.contains_key("term_postings"),
+                "dbstat must account interned postings: {sizes:?}"
+            );
+            assert!(
+                !sizes.keys().any(|name| name == "term_postings_by_term"),
+                "dbstat must not retain the dropped term-text index: {sizes:?}"
+            );
+            assert!(
+                sizes.contains_key("exact_vocabulary"),
+                "dbstat must account the exact-term collision authority: {sizes:?}"
+            );
+            eprintln!(
+                "lexical v12 dbstat file_bytes={file_bytes} build_ms={build_ms} pages={} digest={} sizes={sizes:?}",
+                verified.page_count(),
+                verified.artifact_digest().as_str(),
+            );
+        } else {
+            eprintln!(
+                "lexical v12 size file_bytes={file_bytes} build_ms={build_ms} pages={} digest={} (dbstat unavailable)",
+                verified.page_count(),
+                verified.artifact_digest().as_str(),
+            );
+        }
+    }
+    drop(connection);
+
+    let reader = CodeLexicalArtifactReaderV1::open_with_control(
+        &artifact_path,
+        &verified,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+        &control,
+    )
+    .expect("open v12 artifact");
+    let mut request = lexical_request(
+        "rendre return value",
+        &["rendre"],
+        &[],
+        &["return value"],
+        2,
+        8,
+    );
+    request.generation = verified.generation().clone();
+    let lane = LexicalLane::new(reader);
+    let mut latencies = Vec::new();
+    for _ in 0..16 {
+        let started = Instant::now();
+        let _ = lane.retrieve_lexical(&request).expect("v12 lexical query");
+        latencies.push(started.elapsed().as_micros());
+    }
+    latencies.sort_unstable();
+    let p50 = latencies[latencies.len() / 2];
+    let p95 = latencies[(latencies.len() * 95) / 100];
+    eprintln!("lexical v12 query_us p50={p50} p95={p95} samples={latencies:?}");
+    assert!(p50 > 0 || file_bytes > 0);
+}
+
+#[test]
 fn reader_rejects_current_artifact_missing_required_term_statistics_index() {
     let (fixture, pages, source_receipt) = real_verified_pages();
     let directory = tempfile::tempdir().expect("artifact tempdir");
@@ -1411,8 +1776,8 @@ fn reader_rejects_current_artifact_missing_required_term_statistics_index() {
     let verified = finish_staged_artifact(&mut builder, &source_receipt, &control);
     let connection = rusqlite::Connection::open(&artifact_path).expect("open artifact mutation");
     connection
-        .execute_batch("DROP INDEX term_stats_by_term;")
-        .expect("remove required term-statistics index");
+        .execute_batch("DROP INDEX term_postings_by_document;")
+        .expect("remove required document-leading posting index");
     drop(connection);
 
     assert!(matches!(
@@ -1449,7 +1814,7 @@ fn disk_artifact_defers_statistics_and_serving_indexes_until_freeze() {
         .collect::<Result<_, _>>()
         .expect("read index inventory");
     assert_eq!(staging_indexes, Vec::<String>::new());
-    for table in ["field_stats", "term_stats", "vocabulary"] {
+    for table in ["field_stats", "term_stats"] {
         let rows: i64 = connection
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                 row.get(0)
@@ -1457,6 +1822,13 @@ fn disk_artifact_defers_statistics_and_serving_indexes_until_freeze() {
             .expect("count deferred statistic rows");
         assert_eq!(rows, 0, "{table} must be derived after the base freeze");
     }
+    let vocabulary_rows: i64 = connection
+        .query_row("SELECT COUNT(*) FROM vocabulary", [], |row| row.get(0))
+        .expect("count interned vocabulary");
+    assert!(
+        vocabulary_rows > 0,
+        "revision 11 interns terms during append, before statistics freeze"
+    );
     let authority_rows: i64 = connection
         .query_row(
             "SELECT (SELECT COUNT(*) FROM source_pages) + \
@@ -1514,9 +1886,6 @@ fn disk_artifact_defers_statistics_and_serving_indexes_until_freeze() {
             "ngram_postings_by_ngram",
             "rows_by_chunk",
             "term_postings_by_document",
-            "term_postings_by_document_term",
-            "term_postings_by_term",
-            "term_stats_by_term",
         ]
     );
     let incorrect_field_stats: i64 = connection
@@ -1528,7 +1897,7 @@ fn disk_artifact_defers_statistics_and_serving_indexes_until_freeze() {
         .expect("compare field statistics");
     let incorrect_term_stats: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM term_stats AS actual LEFT JOIN (SELECT field, term, COUNT(*) AS document_frequency FROM term_postings GROUP BY field, term) AS expected USING(field, term) WHERE actual.document_frequency != expected.document_frequency",
+            "SELECT COUNT(*) FROM term_stats AS actual LEFT JOIN (SELECT term_id, field, COUNT(*) AS document_frequency FROM term_postings GROUP BY term_id, field) AS expected USING(term_id, field) WHERE actual.document_frequency != expected.document_frequency",
             [],
             |row| row.get(0),
         )
@@ -1626,7 +1995,7 @@ fn disk_artifact_production_wake_commits_one_restartable_setwise_step() {
     drop(resumed);
 
     let mut expected_indexes = 0i64;
-    for expected_position in 0..=7u64 {
+    for expected_position in 0..=5u64 {
         let mut resumed =
             CodeLexicalArtifactBuilderV1::open_or_resume_with_memory_budget_and_control(
                 &artifact_path,
@@ -1646,16 +2015,39 @@ fn disk_artifact_production_wake_commits_one_restartable_setwise_step() {
                 ("indexes".to_owned(), 0),
                 "the vocabulary step alone transitions to index construction"
             );
-        } else {
-            expected_indexes += 1;
-            let expected_state = if expected_position == 7 {
-                ("digest".to_owned(), 0)
-            } else {
-                ("indexes".to_owned(), expected_position)
-            };
+        } else if expected_position == 5 {
             assert_eq!(
                 persisted_finalization_position(&artifact_path),
-                expected_state
+                ("digest".to_owned(), 0),
+                "the ngram-statistics step alone transitions to digest verification"
+            );
+            let connection = rusqlite::Connection::open(&artifact_path)
+                .expect("inspect derived ngram statistics");
+            let ngram_statistics: i64 = connection
+                .query_row("SELECT COUNT(*) FROM ngram_statistics", [], |row| {
+                    row.get(0)
+                })
+                .expect("count derived ngram statistics");
+            assert!(
+                ngram_statistics > 0,
+                "the final index-phase wake derives ngram statistics from committed postings"
+            );
+            let indexes: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count committed serving indexes");
+            assert_eq!(
+                indexes, expected_indexes,
+                "the ngram-statistics wake adds no serving index"
+            );
+        } else {
+            expected_indexes += 1;
+            assert_eq!(
+                persisted_finalization_position(&artifact_path),
+                ("indexes".to_owned(), expected_position)
             );
             let connection =
                 rusqlite::Connection::open(&artifact_path).expect("inspect serving indexes");
@@ -1792,13 +2184,13 @@ fn disk_artifact_term_insert_execution_is_monotone_by_primary_key() {
         .execute_batch(
             "CREATE TABLE term_insert_trace (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                field TEXT NOT NULL,
-                term TEXT NOT NULL,
+                term_id INTEGER NOT NULL,
+                field INTEGER NOT NULL,
                 document_id INTEGER NOT NULL
             );
             CREATE TRIGGER trace_term_insert AFTER INSERT ON term_postings BEGIN
-                INSERT INTO term_insert_trace(field, term, document_id)
-                VALUES (NEW.field, NEW.term, NEW.document_id);
+                INSERT INTO term_insert_trace(term_id, field, document_id)
+                VALUES (NEW.term_id, NEW.field, NEW.document_id);
             END;",
         )
         .expect("install term insert observer");
@@ -1809,12 +2201,12 @@ fn disk_artifact_term_insert_execution_is_monotone_by_primary_key() {
         .expect("append observed term postings");
     let trace = rusqlite::Connection::open(&artifact_path).expect("read term insert observer");
     let keys = trace
-        .prepare("SELECT field, term, document_id FROM term_insert_trace ORDER BY sequence")
+        .prepare("SELECT term_id, field, document_id FROM term_insert_trace ORDER BY sequence")
         .expect("prepare term insert trace")
         .query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
             ))
         })
@@ -1830,59 +2222,78 @@ fn disk_artifact_term_insert_execution_is_monotone_by_primary_key() {
 }
 
 #[test]
-fn disk_artifact_term_insert_plan_obeys_exact_memory_boundary_before_mutation() {
-    const TERM_INSERT_PLAN_BYTES_PER_REF: usize = 3 * std::mem::size_of::<usize>();
+fn disk_artifact_posting_insert_plans_obey_exact_memory_boundary_before_mutation() {
+    const TERM_INSERT_PLAN_BYTES_PER_REF: usize = 4 * std::mem::size_of::<usize>();
     const TERM_INSERT_SORT_RUN_ROWS: usize = 4_096;
+    const EXACT_INSERT_PLAN_BYTES_PER_REF: usize = 8 * std::mem::size_of::<usize>();
+    const EXACT_INSERT_SORT_RUN_ROWS: usize = TERM_INSERT_SORT_RUN_ROWS;
 
     let (fixture, pages, _) = real_verified_pages();
     let pages = &pages[..1];
     let metadata = fixture.metadata;
     let directory = tempfile::tempdir().expect("artifact tempdir");
-    let probe_path = directory.path().join("term-plan-probe.sqlite");
+    let probe_path = directory.path().join("posting-plans-probe.sqlite");
     let mut probe = CodeLexicalArtifactBuilderV1::create(&probe_path, metadata.clone())
-        .expect("create term plan probe");
+        .expect("create posting plans probe");
     let control = ArtifactControl { cancelled: false };
     let prepared = probe
         .prepare_pages(pages, &control)
-        .expect("prepare term plan fixture");
+        .expect("prepare posting plans fixture");
     let prepared_ledger = prepared[0]
         .ledger_charge_bytes()
         .expect("prepared page ledger charge");
     let fixed_ledger = probe.fixed_ledger_charge_bytes();
     probe
         .append_prepared_pages(&prepared, &control)
-        .expect("append term plan probe");
+        .expect("append posting plans probe");
     let term_rows = rusqlite::Connection::open(&probe_path)
-        .expect("open term plan probe")
+        .expect("open posting plans probe for term rows")
         .query_row("SELECT COUNT(*) FROM term_postings", [], |row| {
             row.get::<_, i64>(0)
         })
         .expect("count prepared term rows");
     let term_rows = usize::try_from(term_rows).expect("term row count");
     assert!(term_rows > 0, "fixture must emit term postings");
+    let exact_rows = rusqlite::Connection::open(&probe_path)
+        .expect("open exact plan probe")
+        .query_row("SELECT COUNT(*) FROM exact_postings", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count prepared exact rows");
+    let exact_rows = usize::try_from(exact_rows).expect("exact row count");
+    assert!(exact_rows > 0, "fixture must emit exact postings");
     let entry_ledger = term_rows
         .checked_mul(TERM_INSERT_PLAN_BYTES_PER_REF)
         .expect("term plan ledger charge");
     let merge_heap_ledger = term_rows
         .div_ceil(TERM_INSERT_SORT_RUN_ROWS)
-        .checked_mul(std::mem::size_of::<(i64, usize, usize, usize)>())
+        .checked_mul(std::mem::size_of::<(i64, i64, i64, usize, usize, usize)>())
         .expect("term merge heap ledger charge");
+    let exact_entry_ledger = exact_rows
+        .checked_mul(EXACT_INSERT_PLAN_BYTES_PER_REF)
+        .expect("exact plan ledger charge");
+    let exact_merge_heap_ledger = exact_rows
+        .div_ceil(EXACT_INSERT_SORT_RUN_ROWS)
+        .checked_mul(std::mem::size_of::<[usize; 10]>())
+        .expect("exact merge heap ledger charge");
     let plan_ledger = entry_ledger
         .checked_add(merge_heap_ledger)
-        .expect("complete term plan ledger charge");
+        .and_then(|bytes| bytes.checked_add(exact_entry_ledger))
+        .and_then(|bytes| bytes.checked_add(exact_merge_heap_ledger))
+        .expect("complete posting plan ledger charge");
     let exact_budget = fixed_ledger
         .checked_add(prepared_ledger)
         .and_then(|bytes| bytes.checked_add(plan_ledger))
-        .expect("exact term plan budget");
+        .expect("exact posting plans budget");
     drop(probe);
 
-    let refused_path = directory.path().join("term-plan-refused.sqlite");
+    let refused_path = directory.path().join("posting-plans-refused.sqlite");
     let mut refused = CodeLexicalArtifactBuilderV1::create_with_memory_budget(
         &refused_path,
         metadata.clone(),
         exact_budget - 1,
     )
-    .expect("create one-byte-under term plan builder");
+    .expect("create one-byte-under posting plans builder");
     assert_eq!(refused.fixed_ledger_charge_bytes(), fixed_ledger);
     assert!(matches!(
         refused.append_prepared_pages(&prepared, &control),
@@ -1895,21 +2306,29 @@ fn disk_artifact_term_insert_plan_obeys_exact_memory_boundary_before_mutation() 
     assert_eq!(
         refused
             .progress()
-            .expect("progress after term plan refusal")
+            .expect("progress after posting plans refusal")
             .next_page_ordinal,
         0
     );
     assert_eq!(staged_row_cardinality(&refused_path), (0, 0));
     let refused_term_rows: i64 = rusqlite::Connection::open(&refused_path)
-        .expect("open refused term plan artifact")
+        .expect("open refused posting plans artifact")
         .query_row("SELECT COUNT(*) FROM term_postings", [], |row| row.get(0))
         .expect("count refused term rows");
     assert_eq!(refused_term_rows, 0);
+    let refused_exact_rows: i64 = rusqlite::Connection::open(&refused_path)
+        .expect("open refused posting plans artifact for exact rows")
+        .query_row("SELECT COUNT(*) FROM exact_postings", [], |row| row.get(0))
+        .expect("count refused exact rows");
+    assert_eq!(
+        refused_exact_rows, 0,
+        "memory refusal must not write exact postings"
+    );
     drop(refused);
 
-    let interrupted_path = directory.path().join("term-plan-interrupted.sqlite");
+    let interrupted_path = directory.path().join("posting-plans-interrupted.sqlite");
     let mut interrupted = CodeLexicalArtifactBuilderV1::create(&interrupted_path, metadata.clone())
-        .expect("create interrupted term plan builder");
+        .expect("create interrupted posting plans builder");
     let documents = usize::try_from(prepared[0].chunk_count()).expect("prepared document count");
     // Append entry + plan entry + both page/document passes + checkpoints
     // before and after the single bounded run + the post-run checkpoint.
@@ -1925,7 +2344,7 @@ fn disk_artifact_term_insert_plan_obeys_exact_memory_boundary_before_mutation() 
     assert_eq!(
         interrupted
             .progress()
-            .expect("progress after term plan interruption")
+            .expect("progress after posting plans interruption")
             .next_page_ordinal,
         0,
         "post-sort cancellation must precede transaction entry"
@@ -1938,7 +2357,7 @@ fn disk_artifact_term_insert_plan_obeys_exact_memory_boundary_before_mutation() 
         CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
         &control,
     )
-    .expect("resume after term plan interruption");
+    .expect("resume after posting plans interruption");
     assert_eq!(
         resumed
             .append_prepared_pages(&prepared, &control)
@@ -1948,16 +2367,16 @@ fn disk_artifact_term_insert_plan_obeys_exact_memory_boundary_before_mutation() 
     );
     drop(resumed);
 
-    let exact_path = directory.path().join("term-plan-exact.sqlite");
+    let exact_path = directory.path().join("posting-plans-exact.sqlite");
     let mut exact = CodeLexicalArtifactBuilderV1::create_with_memory_budget(
         &exact_path,
         metadata,
         exact_budget,
     )
-    .expect("create exact term plan builder");
+    .expect("create exact posting plans builder");
     let progress = exact
         .append_prepared_pages(&prepared, &control)
-        .expect("accept exact term plan boundary");
+        .expect("accept exact posting plans boundary");
     assert_eq!(progress.next_page_ordinal, 1);
 }
 
@@ -1977,6 +2396,10 @@ fn disk_artifact_term_run_sort_observes_cancellation_before_transaction_entry() 
         source.into_bytes(),
     )]);
     let (pages, _) = drain_verified_pages(&fixture, 128);
+    assert!(
+        !pages.is_empty(),
+        "term-run fixture must emit at least one lexical page"
+    );
     assert!(
         pages.iter().all(|page| page.imports().is_empty()),
         "term-run fixture must reach document writes without import checkpoints"
@@ -2463,11 +2886,11 @@ fn disk_artifact_resume_rejects_current_revision_with_wrong_term_index_shape() {
             .expect("freeze current artifact"),
         CodeLexicalArtifactFinalizationStepV1::Pending { .. }
     ));
-    for _ in 0..10 {
+    for _ in 0..8 {
         assert!(matches!(
             builder
                 .advance_finalization(&source_receipt, 4_096, &control)
-                .expect("advance one statistics or serving-index step"),
+                .expect("advance one bounded pre-digest step"),
             CodeLexicalArtifactFinalizationStepV1::Pending { .. }
         ));
     }
@@ -2476,10 +2899,10 @@ fn disk_artifact_resume_rejects_current_revision_with_wrong_term_index_shape() {
     let connection = rusqlite::Connection::open(&artifact_path).expect("open index mutation");
     connection
         .execute_batch(
-            "DROP INDEX term_stats_by_term;
-             CREATE INDEX term_stats_by_term ON term_stats(field, term);",
+            "DROP INDEX term_postings_by_document;
+             CREATE INDEX term_postings_by_document ON term_postings(document_id, field, term_id);",
         )
-        .expect("replace term-statistics index with wrong column order");
+        .expect("replace document-leading posting index with wrong column order");
     drop(connection);
 
     assert!(matches!(
@@ -4173,7 +4596,7 @@ pub(crate) fn lexical_request(
         field_filters: Vec::<LexicalFieldFilterV1>::new(),
         fuzzy_budget,
         lexical_profile_revision: id("lexical-profile.v1"),
-        score_domain: id("score.lexical.v1"),
+        score_domain: id(QUERY_LEXICAL_SCORE_DOMAIN_V1),
         budget: budget(max_candidates),
     }
 }

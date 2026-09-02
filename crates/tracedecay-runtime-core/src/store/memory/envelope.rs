@@ -167,6 +167,7 @@ pub(super) fn project_memory_receipt_u64(
 }
 
 impl DatabaseFactStore<'_> {
+    #[hotpath::skip]
     pub(super) async fn project_memory_read<T>(
         &self,
         work: impl for<'tx> FnOnce(
@@ -200,6 +201,7 @@ impl DatabaseFactStore<'_> {
         }
     }
 
+    #[hotpath::skip]
     pub(super) async fn project_memory_write<T: Send + 'static>(
         &self,
         write_control: &FactWriteControl,

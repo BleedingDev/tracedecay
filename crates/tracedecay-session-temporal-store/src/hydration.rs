@@ -16,6 +16,8 @@ use crate::relations::{
     SessionRelationError, SessionRelationGraphStore, SessionRelationScope, SummarySourceVisitKind,
 };
 use crate::support::derive_projection;
+use tracedecay_lcm::payload::read_verified_payload_content;
+use tracedecay_lcm::{LcmStorageKind, raw};
 use tracedecay_query::temporal::hydration::{
     HydrationAuthorization, HydrationDenial, HydrationError, HydrationFuture, HydrationGrant,
     HydrationSink, TemporalHydrationPort,
@@ -24,8 +26,6 @@ use tracedecay_query::temporal::ports::{
     ExecutionControl, TemporalExecutionSnapshot, TemporalPortError, TemporalRetrievalScope,
     TemporalSourceAccess,
 };
-use tracedecay_sessions::runtime::lcm::payload::read_verified_payload_content;
-use tracedecay_sessions::runtime::lcm::{LcmStorageKind, raw};
 
 use super::operations::CanonicalPublicationManifest;
 use super::sql::TemporalSqlRead;
@@ -120,6 +120,7 @@ pub struct SessionTemporalHydrationAdapter<B> {
 }
 
 impl<B> SessionTemporalHydrationAdapter<B> {
+    #[hotpath::skip]
     pub const fn new(backend: B) -> Self {
         Self { backend }
     }
@@ -142,6 +143,7 @@ impl<B: TemporalHydrationBackend> SessionTemporalHydrationAdapter<B> {
         }
     }
 
+    #[hotpath::skip]
     async fn read_after_recheck(
         &self,
         snapshot: &TemporalExecutionSnapshot,
@@ -293,6 +295,7 @@ struct SessionHydrationRelationAuthority<'snapshot> {
 
 impl<'snapshot> GlobalDbHydrationBackend<'snapshot> {
     #[cfg(test)]
+    #[hotpath::skip]
     pub const fn new_registered(
         read: &'snapshot DatabaseEngineReadSnapshot,
         storage_root: &'snapshot Path,
@@ -304,6 +307,7 @@ impl<'snapshot> GlobalDbHydrationBackend<'snapshot> {
         }
     }
 
+    #[hotpath::skip]
     pub const fn new_registered_with_relations(
         read: &'snapshot DatabaseEngineReadSnapshot,
         storage_root: &'snapshot Path,
@@ -323,6 +327,7 @@ pub type GlobalDbTemporalHydrationPort<'snapshot> =
 
 impl<'snapshot> SessionTemporalHydrationAdapter<GlobalDbHydrationBackend<'snapshot>> {
     #[cfg(test)]
+    #[hotpath::skip]
     pub const fn for_registered_snapshot(
         read: &'snapshot DatabaseEngineReadSnapshot,
         storage_root: &'snapshot Path,
@@ -330,6 +335,7 @@ impl<'snapshot> SessionTemporalHydrationAdapter<GlobalDbHydrationBackend<'snapsh
         Self::new(GlobalDbHydrationBackend::new_registered(read, storage_root))
     }
 
+    #[hotpath::skip]
     pub const fn for_registered_snapshot_with_relations(
         read: &'snapshot DatabaseEngineReadSnapshot,
         storage_root: &'snapshot Path,

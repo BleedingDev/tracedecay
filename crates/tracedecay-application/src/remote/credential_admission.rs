@@ -43,6 +43,7 @@ pub enum RemoteCredentialUseV1 {
 }
 
 impl RemoteCredentialUseV1 {
+    #[hotpath::skip]
     pub const fn credential_class(self) -> RemoteCredentialClassV1 {
         match self {
             Self::InitialEnrollment => RemoteCredentialClassV1::EnrollmentGrant,
@@ -56,6 +57,7 @@ impl RemoteCredentialUseV1 {
         }
     }
 
+    #[hotpath::skip]
     pub const fn required_capability(self) -> Option<RemoteCapabilityV1> {
         match self {
             Self::InitialEnrollment => None,
@@ -228,6 +230,7 @@ pub struct RemoteAuthenticatedSessionV1 {
 }
 
 impl RemoteAuthenticatedSessionV1 {
+    #[hotpath::skip]
     pub const fn use_case(&self) -> RemoteCredentialUseV1 {
         self.use_case
     }
@@ -244,6 +247,7 @@ impl RemoteAuthenticatedSessionV1 {
         self.record.scope()
     }
 
+    #[hotpath::skip]
     pub const fn admitted_at(&self) -> UtcMicros {
         self.admitted_at
     }
@@ -587,6 +591,7 @@ pub struct RemoteCredentialAdmissionServiceV1<S> {
 }
 
 impl<S> RemoteCredentialAdmissionServiceV1<S> {
+    #[hotpath::skip]
     pub const fn new(store: S) -> Self {
         Self { store }
     }

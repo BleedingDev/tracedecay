@@ -55,6 +55,7 @@ impl StoreRuntimeRegistryConfig {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(crate) const fn project_code_open_runtime_budget(self) -> usize {
         self.project_code_open_runtime_budget
     }
@@ -76,10 +77,12 @@ impl StoreRuntimeRegistryConfig {
         Ok(())
     }
 
+    #[hotpath::skip]
     pub(super) const fn project_budget(self) -> usize {
         self.project_code_open_runtime_budget
     }
 
+    #[hotpath::skip]
     pub(super) const fn eviction_idle(self) -> Duration {
         self.eviction_idle
     }

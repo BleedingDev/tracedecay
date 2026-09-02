@@ -497,12 +497,12 @@ async fn cancelled_authoritative_transaction_isolated_from_reads_and_cleans_payl
             .await
             .unwrap();
         let mut payload_rollback =
-            tracedecay_sessions::runtime::lcm::payload::PayloadFileRollback::begin_cancellation_safe(
+            tracedecay_lcm::payload::PayloadFileRollback::begin_cancellation_safe(
                 &task_storage_root,
             );
-        let payload = tracedecay_sessions::runtime::lcm::payload::write_external_payload_tracked(
+        let payload = tracedecay_lcm::payload::write_external_payload_tracked(
             &task_storage_root,
-            tracedecay_sessions::runtime::lcm::payload::ExternalPayloadWrite {
+            tracedecay_lcm::payload::ExternalPayloadWrite {
                 provider: "codex",
                 session_id: "cancelled-transaction",
                 message_id: "cancelled-message",
@@ -518,8 +518,7 @@ async fn cancelled_authoritative_transaction_isolated_from_reads_and_cleans_payl
     });
 
     let payload_ref = created_rx.await.expect("payload creation signal");
-    let payload_path =
-        tracedecay_sessions::runtime::lcm::payload::payload_dir(&storage_root).join(&payload_ref);
+    let payload_path = tracedecay_lcm::payload::payload_dir(&storage_root).join(&payload_ref);
     assert!(payload_path.is_file());
 
     let snapshot = db.read_snapshot().await.unwrap();
@@ -589,26 +588,24 @@ async fn cancelled_authoritative_transaction_isolated_from_reads_and_cleans_payl
 async fn cancelled_lcm_lifecycle_mutation_rolls_back_and_releases_writer() {
     let harness = RegisteredGlobalDbHarness::open("cancelled-lcm-lifecycle").await;
     let db = harness.registered.clone();
-    let update = tracedecay_sessions::runtime::lcm::LcmLifecycleUpdate {
+    let update = tracedecay_lcm::LcmLifecycleUpdate {
         provider: "cursor".to_string(),
         conversation_id: "cancelled-lifecycle".to_string(),
         current_session_id: "cancelled-lifecycle".to_string(),
         current_frontier_store_id: None,
         last_finalized_session_id: None,
         last_finalized_frontier_store_id: None,
-        maintenance_debt: vec![
-            tracedecay_sessions::runtime::lcm::LcmMaintenanceDebt::RawBacklog {
-                from_store_id: 1,
-                to_store_id: 2,
-            },
-        ],
+        maintenance_debt: vec![tracedecay_lcm::LcmMaintenanceDebt::RawBacklog {
+            from_store_id: 1,
+            to_store_id: 2,
+        }],
     };
     let (written_tx, written_rx) = tokio::sync::oneshot::channel();
     let task_db = db.clone();
     let task_update = update.clone();
     let task = tokio::spawn(async move {
         let transaction = task_db.begin_write_transaction().await.unwrap();
-        tracedecay_sessions::runtime::lcm::compression::update_lifecycle(&transaction, task_update)
+        tracedecay_lcm::compression::update_lifecycle(&transaction, task_update)
             .await
             .unwrap();
         written_tx.send(()).unwrap();
@@ -618,13 +615,9 @@ async fn cancelled_lcm_lifecycle_mutation_rolls_back_and_releases_writer() {
     written_rx.await.expect("lifecycle write signal");
     let snapshot = db.read_snapshot().await.unwrap();
     assert!(
-        tracedecay_sessions::runtime::lcm::compression::lifecycle_state(
-            &snapshot,
-            "cursor",
-            "cancelled-lifecycle",
-        )
-        .await
-        .is_err(),
+        tracedecay_lcm::compression::lifecycle_state(&snapshot, "cursor", "cancelled-lifecycle",)
+            .await
+            .is_err(),
         "retained reader observed uncommitted lifecycle state"
     );
     drop(snapshot);
@@ -633,24 +626,17 @@ async fn cancelled_lcm_lifecycle_mutation_rolls_back_and_releases_writer() {
     assert!(task.await.unwrap_err().is_cancelled());
     let snapshot = db.read_snapshot().await.unwrap();
     assert!(
-        tracedecay_sessions::runtime::lcm::compression::lifecycle_state(
-            &snapshot,
-            "cursor",
-            "cancelled-lifecycle",
-        )
-        .await
-        .is_err(),
+        tracedecay_lcm::compression::lifecycle_state(&snapshot, "cursor", "cancelled-lifecycle",)
+            .await
+            .is_err(),
         "cancellation persisted lifecycle state or maintenance debt"
     );
     drop(snapshot);
 
     let transaction = db.begin_write_transaction().await.unwrap();
-    let state = tracedecay_sessions::runtime::lcm::compression::update_lifecycle(
-        &transaction,
-        update.clone(),
-    )
-    .await
-    .unwrap();
+    let state = tracedecay_lcm::compression::update_lifecycle(&transaction, update.clone())
+        .await
+        .unwrap();
     transaction.commit().await.unwrap();
     assert_eq!(state.provider, update.provider);
     assert_eq!(state.conversation_id, update.conversation_id);
@@ -907,7 +893,7 @@ async fn registered_handles_share_one_serialized_writer() {
         "analytics bypassed the active transaction"
     );
 
-    let savings_write = savings.record_savings("/project", "tracedecay_runtime", 100, 50, 1);
+    let savings_write = savings.try_record_savings("/project", "tracedecay_runtime", 100, 50, 1);
     tokio::pin!(savings_write);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(25), &mut savings_write)
@@ -925,8 +911,9 @@ async fn registered_handles_share_one_serialized_writer() {
     );
     tokio::time::timeout(std::time::Duration::from_secs(1), &mut savings_write)
         .await
-        .expect("savings insert timed out");
-    assert_eq!(first.sum_savings(None, 0).await.calls, 1);
+        .expect("savings insert timed out")
+        .expect("savings insert failed");
+    assert_eq!(first.sum_savings(None, 0).await.unwrap().calls, 1);
 }
 
 #[tokio::test]
@@ -958,21 +945,22 @@ async fn concurrent_registered_writes_remain_isolated() {
     let mut writes = tokio::task::JoinSet::new();
     for (index, db) in handles.iter().cloned().enumerate() {
         writes.spawn(async move {
-            db.record_savings(
+            db.try_record_savings(
                 "/shared/project",
                 &format!("writer-{index}"),
                 10,
                 5,
                 index as i64,
             )
-            .await;
+            .await
+            .expect("concurrent savings insert");
         });
     }
     while let Some(result) = writes.join_next().await {
         result.unwrap();
     }
 
-    assert_eq!(handles[0].sum_savings(None, 0).await.calls, 12);
+    assert_eq!(handles[0].sum_savings(None, 0).await.unwrap().calls, 12);
 }
 
 #[tokio::test]
@@ -1271,7 +1259,11 @@ async fn project_tokens_separate_a_genuine_zero_from_a_failed_read() {
     let harness = RegisteredGlobalDbHarness::open("project-tokens-failed-read").await;
     let project = std::path::Path::new("/tmp/tracedecay-project-tokens");
     let unregistered = std::path::Path::new("/tmp/tracedecay-never-registered");
-    harness.registered.upsert(project, 4_242).await;
+    harness
+        .registered
+        .try_upsert_project_tokens(project, 4_242)
+        .await
+        .expect("seed project token total");
 
     assert_eq!(
         harness.registered.try_get_project_tokens(project).await,
@@ -1316,11 +1308,6 @@ async fn project_tokens_separate_a_genuine_zero_from_a_failed_read() {
     assert!(
         error.contains("failed to query project tokens saved"),
         "{error}"
-    );
-    assert_eq!(
-        harness.registered.get_project_tokens(project).await,
-        None,
-        "the optional form reports unavailable rather than zero"
     );
 }
 
@@ -1377,7 +1364,7 @@ async fn project_store_resolution_rejects_conflicting_common_dir_and_marker_iden
         .unwrap_err();
     assert!(matches!(
         error,
-        tracedecay_runtime_core::errors::TraceDecayError::ProjectRoute {
+        tracedecay_domain::errors::TraceDecayError::ProjectRoute {
             reason_code,
             retryable: false,
             ..

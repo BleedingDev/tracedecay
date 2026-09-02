@@ -46,6 +46,7 @@ impl ObservationCancellation {
 
     /// Wait until this exact operation is cancelled without losing a signal
     /// between the readiness check and waiter registration.
+    #[hotpath::skip]
     pub(crate) async fn cancelled(&self) {
         if self.is_cancelled() {
             return;
@@ -377,10 +378,12 @@ struct PersistedObservationCapture {
 struct ObservationBatchConcurrency(NonZeroUsize);
 
 impl ObservationBatchConcurrency {
+    #[hotpath::skip]
     pub const fn new(max_in_flight: NonZeroUsize) -> Self {
         Self(max_in_flight)
     }
 
+    #[hotpath::skip]
     const fn max_in_flight(self) -> usize {
         self.0.get()
     }
@@ -652,6 +655,7 @@ where
         ))
     }
 
+    #[hotpath::skip]
     pub async fn capture_claude_observation(
         &self,
         request: CaptureClaudeObservationRequest,

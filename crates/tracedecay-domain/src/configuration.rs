@@ -59,6 +59,7 @@ pub const MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY: &str = "memory.provider_re
 pub const DIAGNOSTICS_PREWARM_SETTING_KEY: &str = "diagnostics.prewarm.v1";
 pub const SEMANTIC_RUNTIME_SETTING_KEY: &str = "semantic.runtime.v1";
 pub const SYNC_AUTO_WATCH_SETTING_KEY: &str = "sync.auto_watch.v1";
+pub const SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY: &str = "sync.watch_linked_worktrees.v1";
 pub const SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY: &str = "sync.watch_debounce_ms.v1";
 pub const SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY: &str = "sync.watch_max_delay_ms.v1";
 pub const SYNC_WATCH_MAX_PROJECTS_SETTING_KEY: &str = "sync.watch_max_projects.v1";
@@ -106,6 +107,7 @@ pub const CONFIGURATION_SETTING_KEYS_V1: &[&str] = &[
     DIAGNOSTICS_PREWARM_SETTING_KEY,
     SEMANTIC_RUNTIME_SETTING_KEY,
     SYNC_AUTO_WATCH_SETTING_KEY,
+    SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
     SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY,
     SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY,
     SYNC_WATCH_MAX_PROJECTS_SETTING_KEY,

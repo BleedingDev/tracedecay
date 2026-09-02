@@ -9,15 +9,9 @@ use tracedecay_store::{
 };
 
 use crate::db::engine::{QueryExecutor, params};
-use crate::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 const OPERATION: &str = "retrieval anchor authority";
-
-impl From<RetrievalAnchorStoreError> for TraceDecayError {
-    fn from(error: RetrievalAnchorStoreError) -> Self {
-        authority_error(error.to_string())
-    }
-}
 
 #[cfg(test)]
 fn validate_label(value: &str, field: &str) -> Result<()> {
@@ -346,6 +340,7 @@ impl super::Database {
         Ok(AnchorDispositionAppendOutcomeV1::Appended)
     }
 
+    #[hotpath::skip]
     pub(crate) async fn publish_retrieval_anchor_derivative(
         &self,
         derivative: &RetrievalAnchorDerivativeV1,
@@ -409,6 +404,7 @@ impl super::Database {
         Ok(outcome)
     }
 
+    #[hotpath::skip]
     pub(crate) async fn resolve_retrieval_anchor_derivatives<O>(
         &self,
         owner: &O,
@@ -422,6 +418,7 @@ impl super::Database {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(crate) async fn resolve_retrieval_anchor_derivative(
         &self,
         owner: &FactOwnerV1,
@@ -432,6 +429,7 @@ impl super::Database {
         resolve_anchor_derivative(&connection, owner, kind, derivative_id).await
     }
 
+    #[hotpath::skip]
     pub(crate) async fn retrieval_anchor_disposition_history(
         &self,
         owner: &impl serde::Serialize,

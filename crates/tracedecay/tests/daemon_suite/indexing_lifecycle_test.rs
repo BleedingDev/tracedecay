@@ -585,8 +585,9 @@ async fn wait_for_refreshing_old_generation(
 }
 
 fn read_active_generation(home: &Path, project: &Path) -> CodeIndexPublishedGenerationV1 {
-    let layout = tracedecay::storage::resolve_layout(project, &home.join(".tracedecay"))
-        .expect("profile-sharded project layout");
+    let layout =
+        tracedecay_runtime_core::storage::resolve_layout(project, &home.join(".tracedecay"))
+            .expect("profile-sharded project layout");
     let scope = scoped_code_index_store_root(&layout.data_root.join("code-index-v1"), project);
     let pointer: DurablePublicationPointerV1 = serde_json::from_slice(
         &fs::read(scope.join("active-code-generation-v1.json"))
@@ -687,6 +688,7 @@ async fn ignored_dependency_admission_survives_physical_daemon_restart_without_w
     let mut daemon = spawn_tracedecay_daemon_with(environment.home(), |_| {});
     let project_id = initialize_tracedecay(environment.home(), &project);
     let identity = exact_identity(&project, project_id);
+    tracedecay::product_runtime::register_fixture_product_runtime();
     let handshake =
         tracedecay::daemon::handshake_for_current_client(Some(project.clone()), None, false, false)
             .expect("production daemon handshake");
@@ -806,11 +808,12 @@ async fn mounted_incremental_lifecycle_preserves_only_complete_compatible_genera
     let mut daemon = spawn_tracedecay_daemon_with(environment.home(), |command| {
         command.env(
             "RUST_LOG",
-            "tracedecay::daemon::code_index_scheduler::registry=debug",
+            "tracedecay_code_index_runtime::code_index_scheduler::registry=debug",
         );
     });
     let project_id = initialize_tracedecay(environment.home(), &project);
     let identity = exact_identity(&project, project_id);
+    tracedecay::product_runtime::register_fixture_product_runtime();
     let handshake =
         tracedecay::daemon::handshake_for_current_client(Some(project.clone()), None, false, false)
             .expect("production daemon handshake");
@@ -1010,7 +1013,7 @@ async fn mounted_incremental_lifecycle_preserves_only_complete_compatible_genera
     daemon = spawn_tracedecay_daemon_with(environment.home(), |command| {
         command.env(
             "RUST_LOG",
-            "tracedecay::daemon::code_index_scheduler::registry=debug",
+            "tracedecay_code_index_runtime::code_index_scheduler::registry=debug",
         );
     });
     let restarted = wait_for_terminal_generation(
@@ -1045,6 +1048,52 @@ async fn mounted_incremental_lifecycle_preserves_only_complete_compatible_genera
                     .ends_with("cancellation_probe_0000_000")
         }),
         "restart did not seal the recovered cancellation batch"
+    );
+
+    let killed = daemon
+        .kill_and_wait()
+        .expect("hard-kill the graph-serving daemon");
+    assert!(
+        !killed.success(),
+        "hard-kill fault injection must not become a graceful daemon exit"
+    );
+    daemon = spawn_tracedecay_daemon_with(environment.home(), |command| {
+        command.env(
+            "RUST_LOG",
+            "tracedecay_code_index_runtime::code_index_scheduler::registry=debug",
+        );
+    });
+    let hard_restarted = wait_for_terminal_generation(
+        &socket,
+        &handshake,
+        &project,
+        &identity,
+        "refs/heads/feature/lifecycle",
+        None,
+        None,
+        "cancellation_probe_0000_000",
+        Some("src/cancelled_batch/file_0000.rs"),
+    )
+    .await;
+    let runtime = tool(
+        &socket,
+        &handshake,
+        "tracedecay_runtime",
+        json!({ "format": "json" }),
+    )
+    .await;
+    let census = &runtime["database"]["generation_census"];
+    assert_eq!(
+        census["state"], "observed",
+        "hard-kill restart status must match the serving graph generation: {census}"
+    );
+    assert_eq!(
+        census["generation_id"], hard_restarted.generation_id,
+        "hard-kill restart census attributed the serving graph to another generation: {census}"
+    );
+    assert_eq!(
+        census["freshness"]["state"], "current",
+        "hard-kill restart census must report the current serving projection: {census}"
     );
 
     let signal_result = unsafe { libc::kill(daemon.id() as libc::pid_t, libc::SIGTERM) };

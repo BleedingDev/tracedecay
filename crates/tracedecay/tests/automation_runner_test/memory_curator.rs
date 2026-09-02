@@ -1069,9 +1069,9 @@ async fn memory_curator_stops_before_backend_or_apply_when_caller_is_interrupted
     let facts = seed_duplicate_facts(&cg).await;
     let backend = JsonBackend::new(json!({"ops": [normalize_tags_op(&facts)]}));
     let owner = project_memory_owner(&cg);
-    let memory = tracedecay_usecases::memory::MemoryApplication::new(
+    let memory = tracedecay_session_memory::memory::MemoryApplication::new(
         owner.clone(),
-        tracedecay::store::memory::DatabaseFactStore::new(cg.db()),
+        tracedecay_runtime_core::store::memory::DatabaseFactStore::new(cg.db()),
     )
     .unwrap();
     let winner_tags_before = memory

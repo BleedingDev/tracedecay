@@ -18,7 +18,7 @@ use tracedecay_store::{
 use super::{
     HostAdmissionOutcome, HostAdmissionScope, HostAdmissionStatus, HostAdmissionTestRuntimeV1,
 };
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 impl HostAdmissionTestRuntimeV1 {
     #[doc(hidden)]
@@ -29,7 +29,7 @@ impl HostAdmissionTestRuntimeV1 {
         arguments: serde_json::Value,
         server_stats: Option<serde_json::Value>,
         scope_prefix: Option<&str>,
-    ) -> Result<crate::mcp::ToolResult> {
+    ) -> Result<tracedecay_mcp::ToolResult> {
         let project_registry_reads = crate::mcp::server::DaemonProjectRegistryReadService::new(
             self.profile_database.clone(),
         );
@@ -57,8 +57,13 @@ impl HostAdmissionTestRuntimeV1 {
     pub fn session_temporal_store(
         &self,
         scope: HostAdmissionScope,
-    ) -> std::result::Result<crate::store::GlobalDbSessionTemporalStore<'_>, HostAdmissionOutcome>
-    {
+    ) -> std::result::Result<
+        tracedecay_session_temporal_store::GlobalDbSessionTemporalStore<
+            '_,
+            tracedecay_global_db::RegisteredGlobalDb,
+        >,
+        HostAdmissionOutcome,
+    > {
         self.session_temporal_store_for_test(scope).map_err(|_| {
             HostAdmissionOutcome::retained_unavailable("registered_authority_unavailable")
         })
@@ -83,7 +88,7 @@ impl HostAdmissionTestRuntimeV1 {
                 tracedecay_sessions::runtime::workflow_ingest::WorkflowIngestStats::default(),
             );
         };
-        let store = crate::store::GlobalDbWorkflowStore::new(database);
+        let store = tracedecay_global_db::GlobalDbWorkflowStore::new(database);
         Ok(
             tracedecay_sessions::runtime::workflow_ingest::ingest_workflow_runs_with_sink(
                 &store,
@@ -102,7 +107,7 @@ impl HostAdmissionTestRuntimeV1 {
         observation: &tracedecay_sessions::runtime::git_correlation::SpanObservation,
         merge_gap_secs: i64,
     ) -> Result<i64> {
-        crate::store::GlobalDbGitCorrelationStore::new(self.project_database_for_test()?)
+        tracedecay_global_db::GlobalDbGitCorrelationStore::new(self.project_database_for_test()?)
             .record_span_observation(observation, merge_gap_secs)
             .await
             .map_err(|error| TraceDecayError::Database {
@@ -118,13 +123,15 @@ impl HostAdmissionTestRuntimeV1 {
         observation: &tracedecay_sessions::runtime::git_correlation::SpanObservation,
         merge_gap_secs: i64,
     ) -> Result<i64> {
-        crate::store::GlobalDbGitCorrelationStore::new(self.session_database_for_test(scope)?)
-            .record_span_observation(observation, merge_gap_secs)
-            .await
-            .map_err(|error| TraceDecayError::Database {
-                operation: "record registered session span".to_owned(),
-                message: error.to_string(),
-            })
+        tracedecay_global_db::GlobalDbGitCorrelationStore::new(
+            self.session_database_for_test(scope)?,
+        )
+        .record_span_observation(observation, merge_gap_secs)
+        .await
+        .map_err(|error| TraceDecayError::Database {
+            operation: "record registered session span".to_owned(),
+            message: error.to_string(),
+        })
     }
 
     #[doc(hidden)]
@@ -155,7 +162,7 @@ impl HostAdmissionTestRuntimeV1 {
         &self,
         query: &tracedecay_sessions::runtime::git_correlation::SessionsForQuery,
     ) -> Result<Vec<tracedecay_sessions::runtime::git_correlation::SessionGitCorrelationHit>> {
-        crate::store::GlobalDbGitCorrelationStore::new(self.project_database_for_test()?)
+        tracedecay_global_db::GlobalDbGitCorrelationStore::new(self.project_database_for_test()?)
             .sessions_for_with_relation(
                 query,
                 tracedecay_sessions::runtime::git_correlation::CommitRelationFilter::Produced,
@@ -182,7 +189,7 @@ impl HostAdmissionTestRuntimeV1 {
                 error.to_string(),
             )
         })?;
-        crate::store::GlobalDbGitCorrelationStore::new(database)
+        tracedecay_global_db::GlobalDbGitCorrelationStore::new(database)
             .run_backfill(analytics_events, git, options)
             .await
     }
@@ -201,7 +208,7 @@ impl HostAdmissionTestRuntimeV1 {
                 error.to_string(),
             )
         })?;
-        crate::store::GlobalDbGitCorrelationStore::new(database)
+        tracedecay_global_db::GlobalDbGitCorrelationStore::new(database)
             .run_incremental_backfill(git, limit_sessions)
             .await
     }
@@ -219,7 +226,7 @@ impl HostAdmissionTestRuntimeV1 {
                 error.to_string(),
             )
         })?;
-        let snapshot = crate::store::GlobalDbGitCorrelationStore::new(database)
+        let snapshot = tracedecay_global_db::GlobalDbGitCorrelationStore::new(database)
             .read_snapshot()
             .await?;
         tracedecay_sessions::runtime::git_correlation::read_meta_value(&snapshot, key).await
@@ -317,8 +324,8 @@ impl HostAdmissionTestRuntimeV1 {
         let binding_identity = binding
             .immutable_identity()
             .map_err(external_source_read_failed)?;
-        let idempotency_key = tracedecay_usecases::request_identity::derive_logical_effect_idempotency(
-            tracedecay_usecases::request_identity::LogicalEffectIdempotencyDomain::HostObservation,
+        let idempotency_key = tracedecay_application::request_identity::derive_logical_effect_idempotency(
+            tracedecay_application::request_identity::LogicalEffectIdempotencyDomain::HostObservation,
             observation.observation().observation_id(),
         )
         .map_err(external_source_read_failed)?;

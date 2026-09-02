@@ -4,6 +4,8 @@ use super::*;
 use crate::runtime::shared::read_new_rows;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 #[derive(Clone, Copy)]
 enum ReadFailure {
@@ -19,6 +21,22 @@ struct SinglePathSource;
 struct CountingStore(AtomicUsize);
 
 struct MixedPathSource;
+
+#[derive(Default)]
+struct ParseConcurrencyState {
+    active: usize,
+    observed_overlap: bool,
+}
+
+#[derive(Default)]
+struct ParseConcurrencyProbe {
+    state: Mutex<ParseConcurrencyState>,
+    changed: Condvar,
+}
+
+struct ConcurrentParseSource {
+    probe: Arc<ParseConcurrencyProbe>,
+}
 
 impl TranscriptSource for SinglePathSource {
     fn provider(&self) -> &'static str {
@@ -95,6 +113,65 @@ impl TranscriptSource for MixedPathSource {
                 file_id: 1,
             },
         }))
+    }
+}
+
+impl TranscriptSource for ConcurrentParseSource {
+    fn provider(&self) -> &'static str {
+        "concurrent"
+    }
+
+    fn transcript_paths(&self, _project_root: &Path) -> Vec<PathBuf> {
+        (0..4)
+            .map(|index| PathBuf::from(format!("concurrent-{index}.jsonl")))
+            .collect()
+    }
+
+    fn parse_new(
+        &self,
+        path: &Path,
+        _prev: StoredCursor,
+        _project_root: &Path,
+        _max_new_bytes: Option<u64>,
+    ) -> Option<ParsedTranscript> {
+        let mut state = self.probe.state.lock().unwrap();
+        state.active += 1;
+        self.probe.changed.notify_all();
+        if state.active < 2 {
+            let (next, _) = self
+                .probe
+                .changed
+                .wait_timeout_while(state, Duration::from_millis(200), |state| state.active < 2)
+                .unwrap();
+            state = next;
+        }
+        if state.active >= 2 {
+            state.observed_overlap = true;
+        }
+        state.active -= 1;
+        self.probe.changed.notify_all();
+        drop(state);
+
+        let session_id = path.to_string_lossy().into_owned();
+        Some(ParsedTranscript {
+            draft: SessionDraft {
+                session_id: session_id.clone(),
+                project_key: "concurrent-project".to_owned(),
+                project_path: "concurrent-project".to_owned(),
+                title: None,
+                metadata_json: None,
+                parent_session_id: None,
+                is_subagent: false,
+                agent_id: None,
+                parent_tool_use_id: None,
+            },
+            messages: Vec::new(),
+            new_cursor: StoredCursor {
+                position: 1,
+                mtime: 1,
+                file_id: 1,
+            },
+        })
     }
 }
 
@@ -203,6 +280,25 @@ async fn fail_fast_ingest_stops_at_first_bad_path_after_persisting_earlier_paths
         .is_err()
     );
     assert_eq!(fail_fast_store.0.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_prepares_multiple_transcript_files_concurrently() {
+    let probe = Arc::new(ParseConcurrencyProbe::default());
+    let source = ConcurrentParseSource {
+        probe: Arc::clone(&probe),
+    };
+    let store = CountingStore::default();
+
+    try_ingest_source_with_store(&store, &source, Path::new("concurrent-project"), None)
+        .await
+        .unwrap();
+
+    assert!(
+        probe.state.lock().unwrap().observed_overlap,
+        "at least two independent transcript files must parse concurrently"
+    );
+    assert_eq!(store.0.load(Ordering::Relaxed), 4);
 }
 
 #[test]
@@ -1465,4 +1561,67 @@ fn parsed_transcript_structural_ids_are_protected_before_store_writes() {
     );
     assert_eq!(parsed.messages[0].message_id, protected);
     assert_eq!(parsed.messages[0].session_id, protected);
+}
+
+#[test]
+fn jsonl_file_identity_is_stable_for_an_unchanged_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    std::fs::write(&path, "{\"role\":\"user\"}\n").unwrap();
+    let first = jsonl_file_identity(&path).expect("file identity");
+    let second = jsonl_file_identity(&path).expect("file identity");
+    assert_eq!(first, second);
+    assert_ne!(first, 0);
+}
+
+#[test]
+fn content_hash_stays_inside_the_persisted_cursor_domain() {
+    let probes = ["", "a", "cline ui_messages", "{\"ts\":1}", "kiro chat"];
+    for content in probes {
+        assert!(
+            content_hash64(content) <= i64::MAX as u64,
+            "hash for {content:?} must fit the typed non-negative cursor column"
+        );
+    }
+    // Anti-vacuity: at least one probe's raw digest sets the top bit, so this
+    // test fails if the 63-bit mask is removed.
+    assert!(
+        probes.iter().any(|content| {
+            let digest = Sha256::digest(content.as_bytes());
+            digest[0] & 0x80 != 0
+        }),
+        "probe set must include a digest with the top bit set"
+    );
+}
+
+/// The offload helper must hand the worker's run queue to another thread:
+/// with a single-worker multi-thread runtime, a task spawned *from inside*
+/// the blocking section can only run if `block_in_place` released the
+/// worker. Running the section inline would deadlock this test until the
+/// receive timeout fails it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn blocking_transcript_section_yields_the_worker_queue() {
+    let handle = tokio::runtime::Handle::current();
+    let value = tokio::spawn(async move {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        run_blocking_transcript_section(move || {
+            handle.spawn(async move {
+                let _ = sender.send(());
+            });
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map(|()| 7)
+                .expect("a task spawned during the blocking section must run")
+        })
+    })
+    .await
+    .expect("join blocking section");
+    assert_eq!(value, 7);
+}
+
+/// On a current-thread runtime `block_in_place` would panic, so the helper
+/// must run the section inline and still return its value.
+#[tokio::test]
+async fn blocking_transcript_section_runs_inline_on_current_thread() {
+    assert_eq!(run_blocking_transcript_section(|| 11), 11);
 }

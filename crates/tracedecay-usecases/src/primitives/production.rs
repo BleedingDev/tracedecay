@@ -60,16 +60,10 @@ use crate::diagnostics_query::{
     CurrentDiagnosticGeneration, DiagnosticPageRequest, DiagnosticQueryCoverage,
     DiagnosticQueryCursor, DiagnosticsQuery,
 };
-use crate::graph::health_delta::compute_verified_health_delta;
-use crate::graph::queries::{GraphQueryManager, is_test_marker};
-use crate::graph::{
-    CodeGraphProjectionReadPort, CodeGraphReadError, CodeGraphReadRequest,
-    request_graph_cancellation,
-};
+use crate::graph_health_delta::compute_verified_health_delta;
 use crate::lsp_runtime::LspCodeIndexProjectionIdentityPort;
 use crate::operation_stream::OperationEventAuthority;
 use crate::source_authorization::ProjectSourceAccessSnapshot;
-use crate::tracedecay::SourceReadRuntime;
 use tracedecay_code_index::graph_projection::{
     CodeGraphInteractiveReader, CodeGraphSymbolSummaryV1,
 };
@@ -84,6 +78,12 @@ use tracedecay_code_index::test_attribution::{
 };
 use tracedecay_domain::code_intelligence::NodeKind;
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_graph_query::SourceReadRuntime;
+use tracedecay_graph_query::queries::{GraphQueryManager, is_test_marker};
+use tracedecay_graph_query::{
+    CodeGraphProjectionReadPort, CodeGraphReadError, CodeGraphReadRequest,
+    request_graph_cancellation,
+};
 use tracedecay_runtime_core::db::Database;
 use tracedecay_session_temporal_store::GlobalDbCursorKeyProvider;
 use tracedecay_temporal_query::cursor::{
@@ -1301,14 +1301,31 @@ fn update_storage_status_history(
     database_bytes: u64,
     observed_at: i64,
 ) -> (Vec<StorageStatusHistoryPointV1>, String) {
-    let Ok(_guard) = storage_status_history_lock().lock() else {
-        return (
-            vec![StorageStatusHistoryPointV1 {
-                observed_at,
-                database_bytes,
-            }],
-            "current_sample_only_history_lock_failed".to_owned(),
-        );
+    // The lock serializes the read-modify-write of one history file, but it is
+    // process-global: every project's storage-status read funnels through it.
+    // A blocking acquire let one stalled write convoy every concurrent status
+    // read daemon-wide, so contention degrades to the current sample as a
+    // typed bounded state instead of waiting.
+    let _guard = match storage_status_history_lock().try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return (
+                vec![StorageStatusHistoryPointV1 {
+                    observed_at,
+                    database_bytes,
+                }],
+                "current_sample_only_history_lock_contended".to_owned(),
+            );
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return (
+                vec![StorageStatusHistoryPointV1 {
+                    observed_at,
+                    database_bytes,
+                }],
+                "current_sample_only_history_lock_failed".to_owned(),
+            );
+        }
     };
     let stored = std::fs::read(history_path).ok();
     let restored = stored
@@ -1394,7 +1411,12 @@ pub(crate) async fn canonical_storage_status(
     let database_path = database.canonical_database_path();
     let store_path = database_path.display().to_string();
     let file_bytes = database_path.metadata().ok().map(|metadata| metadata.len());
-    let page_counts = database.storage_page_counts().await.ok();
+    let page_counts = hotpath::future!(
+        database.storage_page_counts(),
+        label = "usecases.primitives.storage_status.page_counts"
+    )
+    .await
+    .ok();
     let page_size_bytes = page_counts.and_then(|(page_size, _, _)| u32::try_from(page_size).ok());
     let page_count = page_counts.map(|(_, page_count, _)| page_count);
     let freelist_pages = page_counts.map(|(_, _, freelist_pages)| freelist_pages);
@@ -1418,18 +1440,39 @@ pub(crate) async fn canonical_storage_status(
         project_id.as_deref(),
         &store_path,
     );
-    let (history, history_coverage) = database_bytes.map_or_else(
-        || (Vec::new(), "current_sample_unavailable".to_owned()),
-        |bytes| {
-            update_storage_status_history(
-                &history_path,
-                project_id.clone(),
-                store_path.clone(),
-                bytes,
-                now_observed().0,
+    let (history, history_coverage) = match database_bytes {
+        None => (Vec::new(), "current_sample_unavailable".to_owned()),
+        Some(bytes) => {
+            let history_project_id = project_id.clone();
+            let history_store_path = store_path.clone();
+            let observed_at = now_observed().0;
+            // History persistence is file I/O into the store directory; run it
+            // on the blocking pool so a stalled filesystem cannot capture an
+            // async executor thread for the daemon.
+            hotpath::future!(
+                tokio::task::spawn_blocking(move || {
+                    update_storage_status_history(
+                        &history_path,
+                        history_project_id,
+                        history_store_path,
+                        bytes,
+                        observed_at,
+                    )
+                }),
+                label = "usecases.primitives.storage_status.history"
             )
-        },
-    );
+            .await
+            .unwrap_or_else(|_| {
+                (
+                    vec![StorageStatusHistoryPointV1 {
+                        observed_at,
+                        database_bytes: bytes,
+                    }],
+                    "current_sample_only_history_task_failed".to_owned(),
+                )
+            })
+        }
+    };
     StorageStatusPrimitiveResult {
         status: status.to_owned(),
         read_only,
@@ -2320,7 +2363,7 @@ const STORAGE_TABLE_DETAIL_LIMIT: usize = 10;
 /// or zero line that would read as "no table holds any bytes".
 #[cfg(test)]
 fn largest_table_details(
-    tables: tracedecay_runtime_core::errors::Result<Vec<(String, u64)>>,
+    tables: tracedecay_domain::errors::Result<Vec<(String, u64)>>,
 ) -> Vec<String> {
     let mut tables = match tables {
         Ok(tables) => tables,
@@ -2656,7 +2699,7 @@ fn affected_tests_evidence(
 /// Owned authorities and admitted project state required to open the complete
 /// application primitive runtime.
 pub struct ProductionPrimitiveCodeAuthoritiesV1 {
-    pub code_graph: Arc<dyn crate::graph::CodeGraphProjectionReadPort>,
+    pub code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
     pub ignored_dependency_admission: Option<Arc<dyn CodeIndexIgnoredDependencyAdmissionPortV1>>,
     pub code_index: Arc<dyn LspCodeIndexProjectionIdentityPort>,
     pub diagnostic_identity: Arc<dyn CodeIndexPublicationIdentityPortV1>,
@@ -2664,7 +2707,7 @@ pub struct ProductionPrimitiveCodeAuthoritiesV1 {
 
 pub struct ProductionPrimitiveOpenRequestV1 {
     source_runtime: Arc<SourceReadRuntime>,
-    code_graph: Arc<dyn crate::graph::CodeGraphProjectionReadPort>,
+    code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
     ignored_dependency_admission: Option<Arc<dyn CodeIndexIgnoredDependencyAdmissionPortV1>>,
     session_db: RegisteredGlobalDbLeaseV1,
     temporal: Arc<dyn TemporalRetrievalPort + Send + Sync>,
@@ -2810,82 +2853,11 @@ pub fn admitted_root_uri_for_project(
 pub fn locator_digest_for_project(
     project_root: &Path,
 ) -> Result<ManifestDigest, ApplicationContractError> {
-    // Linked worktrees share one retained project/configuration authority.
-    // Bind that authority to their canonical Git common directory, while
-    // independent clones retain distinct locators. Non-Git projects fall back
-    // to their canonical root.
-    let repository_locator = tracedecay_runtime_core::worktree::git_common_dir(project_root)
-        .unwrap_or_else(|| {
-            project_root
-                .canonicalize()
-                .unwrap_or_else(|_| project_root.to_path_buf())
-        });
-    canonical_sha256(&(
-        "tracedecay.project-open.repository-locator.v2",
-        repository_locator.to_string_lossy().as_ref(),
-    ))
-    .map_err(|_| ApplicationContractError::Inconsistent {
-        field: "application primitive project locator digest",
+    tracedecay_runtime_core::worktree::locator_digest_for_project(project_root).map_err(|_| {
+        ApplicationContractError::Inconsistent {
+            field: "application primitive project locator digest",
+        }
     })
-}
-
-#[cfg(test)]
-mod locator_digest_tests {
-    use super::*;
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    fn git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .env("GIT_AUTHOR_NAME", "TraceDecay Test")
-            .env("GIT_AUTHOR_EMAIL", "test@tracedecay.local")
-            .env("GIT_COMMITTER_NAME", "TraceDecay Test")
-            .env("GIT_COMMITTER_EMAIL", "test@tracedecay.local")
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[test]
-    fn linked_worktrees_share_repository_locator_but_independent_repositories_do_not() {
-        let temporary = TempDir::new().expect("temporary root");
-        let primary = temporary.path().join("primary");
-        let linked = temporary.path().join("linked");
-        let independent = temporary.path().join("independent");
-        std::fs::create_dir_all(&primary).expect("primary root");
-        std::fs::create_dir_all(&independent).expect("independent root");
-
-        git(&primary, &["init", "-b", "main", "--quiet"]);
-        std::fs::write(primary.join("README.md"), "primary\n").expect("fixture");
-        git(&primary, &["add", "README.md"]);
-        git(&primary, &["commit", "-m", "fixture", "--quiet"]);
-        git(
-            &primary,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "feature/linked",
-                linked.to_str().expect("linked path"),
-                "HEAD",
-            ],
-        );
-        git(&independent, &["init", "-b", "main", "--quiet"]);
-
-        let primary_digest = locator_digest_for_project(&primary).expect("primary locator digest");
-        let linked_digest = locator_digest_for_project(&linked).expect("linked locator digest");
-        let independent_digest =
-            locator_digest_for_project(&independent).expect("independent locator digest");
-
-        assert_eq!(linked_digest, primary_digest);
-        assert_ne!(independent_digest, primary_digest);
-    }
 }
 
 #[cfg(test)]
@@ -2992,12 +2964,11 @@ mod storage_table_detail_tests {
 
     #[test]
     fn an_unsampled_store_says_so_instead_of_reporting_no_bytes() {
-        let details = largest_table_details(Err(
-            tracedecay_runtime_core::errors::TraceDecayError::Database {
+        let details =
+            largest_table_details(Err(tracedecay_domain::errors::TraceDecayError::Database {
                 message: "reader lease timed out".to_owned(),
                 operation: "sample graph-store table sizes".to_owned(),
-            },
-        ));
+            }));
 
         assert_eq!(details.len(), 1);
         assert!(
@@ -3381,15 +3352,15 @@ mod affected_tests_tests {
             AuthenticatedSymbolGraphCursorAdapter::new(Arc::new(snapshots), authenticator);
 
         let issuing = symbol_graph_context(
-            crate::request_identity::mcp_connection_request_id(
+            tracedecay_application::request_identity::mcp_connection_request_id(
                 &serde_json::json!(1),
                 "connection.symbol-graph",
             )
             .expect("mcp connection request id"),
         );
         let resuming = symbol_graph_context(
-            crate::request_identity::mint_global_request_id(
-                crate::request_identity::GlobalRequestSurface::McpFallback,
+            tracedecay_application::request_identity::mint_global_request_id(
+                tracedecay_application::request_identity::GlobalRequestSurface::McpFallback,
             )
             .expect("mcp fallback request id"),
         );
@@ -3442,8 +3413,8 @@ mod affected_tests_tests {
         let adapter =
             AuthenticatedSymbolGraphCursorAdapter::new(Arc::new(snapshots), authenticator);
         let context = symbol_graph_context(
-            crate::request_identity::mint_global_request_id(
-                crate::request_identity::GlobalRequestSurface::McpFallback,
+            tracedecay_application::request_identity::mint_global_request_id(
+                tracedecay_application::request_identity::GlobalRequestSurface::McpFallback,
             )
             .expect("mcp fallback request id"),
         );
@@ -3892,6 +3863,50 @@ mod affected_tests_tests {
         assert_eq!(changed.len(), 2);
         assert_eq!(changed[1].database_bytes, 8192);
         assert_eq!(changed[1].observed_at, 3);
+    }
+
+    /// The history lock is process-global across every project's storage
+    /// status read. Contention must degrade to the current sample as a typed
+    /// bounded state; the prior blocking acquire convoyed every concurrent
+    /// status read behind one stalled history write, which is how a metadata
+    /// status tool timed out its admitted deadline on a busy profile.
+    #[test]
+    fn storage_status_history_lock_contention_is_a_typed_bounded_state() {
+        let directory = tempfile::tempdir().expect("history tempdir");
+        let history_path = directory.path().join("storage-status-history-v1.json");
+
+        let held = storage_status_history_lock()
+            .lock()
+            .expect("hold the global history lock");
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = update_storage_status_history(
+                &history_path,
+                Some("project.storage-status".to_owned()),
+                "/project/.tracedecay/graph.db".to_owned(),
+                4096,
+                1,
+            );
+            let _ = result_sender.send(result);
+        });
+
+        // The old path parked here until the holder released the lock; the
+        // bounded contract answers while the lock is provably still held.
+        let (history, coverage) = result_receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a contended history read must answer without the lock");
+        drop(held);
+        reader.join().expect("join contended reader");
+
+        assert_eq!(coverage, "current_sample_only_history_lock_contended");
+        assert_eq!(
+            history,
+            vec![StorageStatusHistoryPointV1 {
+                observed_at: 1,
+                database_bytes: 4096,
+            }],
+            "contention reports exactly the live sample, never a partial file read"
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ use tracedecay_domain::{
     EphemeralSanitizedQueryViewV1, OptionalStagePublicStatus, RetrievalRequest, RetrieverKind,
     SemanticRetrievalContinuationV1,
 };
+use tracedecay_semantic_contracts::RerankCompatibilityPinsV1;
 
 use super::CodeIndexSchedulerRegistryV1;
 use super::query_runtime::{
@@ -20,7 +21,7 @@ use super::query_runtime::{
 };
 use super::registry::unique_mounted_for_scope;
 use crate::code_index::production::CodeIndexPublishedGenerationV1;
-use crate::config::retrieval::{RerankCompatibilityPinsV1, SemanticCompatibilityPinsV1};
+use crate::config::retrieval::SemanticCompatibilityPinsV1;
 use crate::semantic_code::rerank_adapter::ProductionCodeRerankAuthorityV1;
 use tracedecay_query::retrieval::AuthorizedQueryFallbackV1;
 use tracedecay_query::retrieval::QueryAuthorityV1;
@@ -180,7 +181,7 @@ pub struct SemanticAugmentedCompositionV1 {
     pub cursor: Option<tracedecay_domain::RetrievalCursor>,
     pub hydration_budget: tracedecay_domain::RetrievalBudget,
     /// Shared query fallback carried for test identity assertions only.
-    pub _fallback: Arc<tracedecay_domain::QueryFallbackSubpayload>,
+    pub fallback: Arc<tracedecay_domain::QueryFallbackSubpayload>,
 }
 
 pub enum SemanticAugmentationOutcomeV1 {
@@ -195,7 +196,7 @@ pub enum SemanticAugmentationOutcomeV1 {
 impl SemanticAugmentationOutcomeV1 {
     fn fallback(&self) -> &Arc<tracedecay_domain::QueryFallbackSubpayload> {
         match self {
-            Self::Augmented(augmented) => &augmented._fallback,
+            Self::Augmented(augmented) => &augmented.fallback,
             Self::Fallback { fallback, .. } => fallback,
         }
     }
@@ -328,18 +329,25 @@ impl CodeIndexSchedulerRegistryV1 {
         &self,
         scope: &ResolvedScope,
     ) -> Option<Arc<SemanticQueryAuthorityV1>> {
-        let mounted = self.mounted.try_lock().ok()?;
-        let (project_root, worktree) = unique_mounted_for_scope(&mounted, scope).unique()?;
+        let (project_root, scope_digest, authority) = {
+            let mounted = self.mounted.lock().await;
+            let (project_root, worktree) = unique_mounted_for_scope(&mounted, scope).unique()?;
+            let (scope_digest, authority) = worktree.semantic_query_authority.as_ref()?;
+            (
+                project_root.clone(),
+                scope_digest.clone(),
+                Arc::clone(authority),
+            )
+        };
         let activation =
-            tracedecay_usecases::semantic_runtime::project_semantic_activation_gate(project_root);
+            tracedecay_usecases::semantic_runtime::project_semantic_activation_gate(&project_root);
         let _activation = activation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (scope_digest, authority) = worktree.semantic_query_authority.as_ref()?;
-        if scope_digest != &scope.scope_digest {
+        if scope_digest != scope.scope_digest {
             return None;
         }
-        Some(Arc::clone(authority))
+        Some(authority)
     }
 
     /// Run canonical query first, then attempt semantic influence against the
@@ -590,7 +598,7 @@ impl CodeIndexSchedulerRegistryV1 {
                         composition,
                         cursor,
                         hydration_budget: authority.execution.profile().retrieval_budget,
-                        _fallback: executed.fallback,
+                        fallback: executed.fallback,
                     },
                 )))
             }

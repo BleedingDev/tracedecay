@@ -94,14 +94,17 @@ impl SessionRefreshRecoveryV1 {
         &self.coverage_request
     }
 
+    #[hotpath::skip]
     pub const fn target_frontier(&self) -> SessionRefreshFrontierV1 {
         self.target_frontier
     }
 
+    #[hotpath::skip]
     pub const fn source_frontier(&self) -> u64 {
         self.source_frontier
     }
 
+    #[hotpath::skip]
     pub const fn candidate_generation(&self) -> SessionProjectionGenerationV1 {
         self.candidate_generation
     }
@@ -126,6 +129,7 @@ impl SessionRefreshRecoveryV1 {
         self.progress.as_ref()
     }
 
+    #[hotpath::skip]
     pub const fn restart_state(&self) -> SessionRefreshRestartStateV1 {
         self.restart_state
     }
@@ -315,6 +319,7 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         ))
     }
 
+    #[hotpath::skip]
     pub async fn persist_session_refresh_projection_batch_result(
         &self,
         progress: SessionRefreshProgressV1,

@@ -13,18 +13,21 @@ pub(in crate::runtime) use hosts::{opencode_frontier, opencode_part_scan, openco
 pub mod git_correlation;
 mod host_scan;
 pub mod ingest;
-pub mod lcm;
 mod observation;
 pub use observation::snapshot_observation;
 pub(in crate::runtime) use observation::{ingest_byte_budget, jsonl_observation_admission};
 mod pipeline_metrics;
+pub mod registered_db;
 pub mod shared;
 pub mod source;
+pub mod store_access;
 pub mod store_port;
 mod workflow;
 pub use workflow::{workflow_index, workflow_ingest, workflow_state};
 
 pub use crate::{ProviderScope, SessionProvider};
+// Shared full-text/LCM retrieval filters are owned by the LCM engine crate;
+// the session search surface re-imports them so both sides filter identically.
 pub use ingest::{
     IngestPassCoverage, TranscriptCatchUpFailure, TranscriptIngestDisposition,
     TranscriptIngestOutcome, classify_claude_observation_failure,
@@ -38,9 +41,17 @@ pub use ingest::{
     try_ingest_user_codex_sessions_with_db_and_admission, with_transcript_source_home,
 };
 pub use ingest::{USER_SESSIONS_DB_FILENAME, user_sessions_db_path};
+pub use registered_db::{
+    SessionExec, SessionQuery, SessionRegisteredDb, SessionStoreAccess, SessionWriteTxn,
+};
 pub use shared::SESSION_TRANSCRIPT_STALLED_INGEST_WARNING_BYTES;
 /// Public because the snapshot capture entry points that return it are public.
 pub use snapshot_observation::SnapshotCaptureOutcome;
+pub use store_access::{
+    SessionActivityRow, SessionIngestHealth, SessionProviderCoverage, SessionProviderCoverageState,
+    TranscriptBatch, TranscriptPersistenceError,
+};
+pub use tracedecay_lcm::{SessionMessageType, SessionSearchScope};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMessageSearchResult {
@@ -71,62 +82,6 @@ impl Default for SessionSearchFilters<'_> {
             message_type: SessionMessageType::All,
             parent_session_id: None,
             time_range: SessionSearchTimeRange::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionSearchScope {
-    All,
-    ParentsOnly,
-    SubagentsOnly,
-}
-
-impl SessionSearchScope {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
-            "all" => Some(Self::All),
-            "parents_only" => Some(Self::ParentsOnly),
-            "subagents_only" => Some(Self::SubagentsOnly),
-            _ => None,
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::ParentsOnly => "parents_only",
-            Self::SubagentsOnly => "subagents_only",
-        }
-    }
-}
-
-/// Semantic message filter shared by full-text and LCM retrieval. Providers
-/// sometimes encode tool results with role `user`, so this is intentionally
-/// stronger than the raw role filter.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionMessageType {
-    #[default]
-    All,
-    DirectUser,
-    ToolResult,
-}
-
-impl SessionMessageType {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
-            "all" => Some(Self::All),
-            "direct_user" => Some(Self::DirectUser),
-            "tool_result" => Some(Self::ToolResult),
-            _ => None,
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::DirectUser => "direct_user",
-            Self::ToolResult => "tool_result",
         }
     }
 }

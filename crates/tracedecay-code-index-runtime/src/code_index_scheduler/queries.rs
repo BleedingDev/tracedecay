@@ -9,7 +9,7 @@ use std::future::Future;
 #[cfg(test)]
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use tracedecay_application::retrieval::{
@@ -36,6 +36,8 @@ use tracedecay_domain::{
     RetrievalSnapshot, SanitizerRevision, ScoreDomainId, SingleRootScopeV1, SourceOccurrenceId,
     SymbolOccurrenceId, TemporalModeV1, UtcMicros, VectorWatermark, canonical_sha256,
 };
+#[cfg(test)]
+use tracedecay_semantic_contracts::SemanticFallbackReasonV1;
 use tracedecay_tool_catalog::SortContractId;
 
 use super::{
@@ -62,6 +64,9 @@ use tracedecay_query::retrieval::{
 
 const CALLABLE_CODE_SORT: &str = "sort.application.code-index.v1";
 const MAX_GENERATION_RESOLUTION_WAIT: Duration = Duration::from_secs(30);
+/// Leave enough of the carried dispatch budget for timeout projection and the
+/// typed response to cross the enclosing boundary.
+const GENERATION_RESOLUTION_SETTLEMENT_MARGIN: Duration = Duration::from_secs(1);
 
 type GenerationResolutionResultV1<T> =
     Result<Option<T>, code_search::CodeIndexSearchUnavailableReasonV1>;
@@ -189,27 +194,15 @@ pub fn semantic_mcp_reason(
         Some(tracedecay_usecases::semantic_runtime::SemanticRuntimeStateV1::Unavailable {
             reason,
         }) => match reason {
-            tracedecay_usecases::semantic_runtime::SemanticFallbackReasonV1::ConfigurationUnavailable => {
+            SemanticFallbackReasonV1::ConfigurationUnavailable => {
                 "semantic_configuration_unavailable"
             }
-            tracedecay_usecases::semantic_runtime::SemanticFallbackReasonV1::Downloading => {
-                "semantic_model_downloading"
-            }
-            tracedecay_usecases::semantic_runtime::SemanticFallbackReasonV1::Verifying => {
-                "semantic_model_verifying"
-            }
-            tracedecay_usecases::semantic_runtime::SemanticFallbackReasonV1::Loading => {
-                "semantic_model_loading"
-            }
-            tracedecay_usecases::semantic_runtime::SemanticFallbackReasonV1::SelectedNotDownloaded => {
-                "semantic_model_not_downloaded"
-            }
-            tracedecay_usecases::semantic_runtime::SemanticFallbackReasonV1::ModelFailed => {
-                "semantic_failed"
-            }
-            tracedecay_usecases::semantic_runtime::SemanticFallbackReasonV1::Indexing => {
-                "semantic_indexing"
-            }
+            SemanticFallbackReasonV1::Downloading => "semantic_model_downloading",
+            SemanticFallbackReasonV1::Verifying => "semantic_model_verifying",
+            SemanticFallbackReasonV1::Loading => "semantic_model_loading",
+            SemanticFallbackReasonV1::SelectedNotDownloaded => "semantic_model_not_downloaded",
+            SemanticFallbackReasonV1::ModelFailed => "semantic_failed",
+            SemanticFallbackReasonV1::Indexing => "semantic_indexing",
             _ => "semantic_runtime_unavailable",
         },
         Some(
@@ -601,6 +594,12 @@ fn query_finished_at() -> UtcMicros {
     current_utc_micros().unwrap_or(UtcMicros(0))
 }
 
+fn generation_resolution_wait_from_remaining(remaining: Duration) -> Duration {
+    remaining
+        .saturating_sub(GENERATION_RESOLUTION_SETTLEMENT_MARGIN)
+        .min(MAX_GENERATION_RESOLUTION_WAIT)
+}
+
 fn remaining_generation_resolution_wait(request: &RequestContext) -> Option<Duration> {
     let now = current_utc_micros().ok()?;
     if request.admission_at(now) != RequestAdmission::Admitted {
@@ -608,7 +607,7 @@ fn remaining_generation_resolution_wait(request: &RequestContext) -> Option<Dura
     }
     let remaining = request.deadline().expires_at.0.checked_sub(now.0)?;
     let remaining = u64::try_from(remaining).ok().map(Duration::from_micros)?;
-    Some(remaining.min(MAX_GENERATION_RESOLUTION_WAIT))
+    Some(generation_resolution_wait_from_remaining(remaining))
 }
 
 fn base_request(
@@ -1051,7 +1050,7 @@ impl GenerationRecordIndexV1 {
     /// Canonical symbol positions whose full qualified name equals `selector`.
     pub fn qualified_name_positions<'a>(
         &'a self,
-        symbols: &'a [tracedecay_code_index::lineage::LineageSymbolRecordV1],
+        symbols: &'a [Arc<tracedecay_code_index::lineage::LineageSymbolRecordV1>],
         selector: &str,
     ) -> &'a [usize] {
         sorted_positions_for(&self.qualified_name_order, selector, |position| {
@@ -1062,7 +1061,7 @@ impl GenerationRecordIndexV1 {
     /// Canonical symbol positions whose last qualified segment equals `selector`.
     pub fn last_segment_positions<'a>(
         &'a self,
-        symbols: &'a [tracedecay_code_index::lineage::LineageSymbolRecordV1],
+        symbols: &'a [Arc<tracedecay_code_index::lineage::LineageSymbolRecordV1>],
         selector: &str,
     ) -> &'a [usize] {
         sorted_positions_for(&self.last_segment_order, selector, |position| {
@@ -3017,6 +3016,41 @@ fn navigation_symbol_query<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_resolution_wait_reserves_outer_settlement_margin() {
+        assert_eq!(
+            generation_resolution_wait_from_remaining(Duration::ZERO),
+            Duration::ZERO
+        );
+        assert_eq!(
+            generation_resolution_wait_from_remaining(Duration::from_millis(999)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            generation_resolution_wait_from_remaining(Duration::from_secs(11)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            generation_resolution_wait_from_remaining(Duration::from_secs(90)),
+            MAX_GENERATION_RESOLUTION_WAIT
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn generation_resolution_inner_timeout_precedes_outer_dispatch_expiry() {
+        let remaining = Duration::from_secs(5);
+        let inner = generation_resolution_wait_from_remaining(remaining);
+        let settled = tokio::time::timeout(remaining, async move {
+            tokio::time::timeout(inner, std::future::pending::<()>()).await
+        })
+        .await;
+
+        assert!(
+            matches!(settled, Ok(Err(_))),
+            "the inner typed timeout must settle before the outer dispatch horizon"
+        );
+    }
 
     #[test]
     fn generation_resolution_terminal_projection_records_exactly_one_outcome() {

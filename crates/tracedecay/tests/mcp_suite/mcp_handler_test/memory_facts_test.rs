@@ -37,21 +37,21 @@ async fn invoke_exact_tool(
     server: &tracedecay::mcp::McpServer,
     tool_name: &str,
     mut arguments: Value,
-) -> tracedecay_runtime_core::errors::Result<Value> {
+) -> tracedecay_domain::errors::Result<Value> {
     arguments
         .as_object_mut()
         .expect("exact MCP request object")
         .insert("format".to_owned(), json!("json"));
     let response = handle_real_server_tool_call_raw(server, tool_name, arguments).await;
     if !response["error"].is_null() {
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: response["error"].to_string(),
         });
     }
     let mcp_result = response["result"].clone();
     let text = extract_real_server_text(&mcp_result);
     let response_value: Value = serde_json::from_str(text).map_err(|error| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: format!("{tool_name} returned invalid application JSON: {error}"),
         }
     })?;
@@ -61,16 +61,14 @@ async fn invoke_exact_tool(
             .and_then(Value::as_str)
             .unwrap_or(text)
             .to_owned();
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config { message });
+        return Err(tracedecay_domain::errors::TraceDecayError::Config { message });
     }
     let payload = response_value
         .pointer("/outcome/value/payload")
         .cloned()
-        .ok_or_else(
-            || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: format!("{tool_name} omitted its canonical application payload"),
-            },
-        )?;
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!("{tool_name} omitted its canonical application payload"),
+        })?;
     Ok(payload)
 }
 
@@ -78,7 +76,7 @@ pub(super) async fn invoke_production_tool(
     fixture: &FactStoreMcpFixture,
     tool_name: &str,
     arguments: Value,
-) -> tracedecay_runtime_core::errors::Result<Value> {
+) -> tracedecay_domain::errors::Result<Value> {
     invoke_exact_tool(&fixture.server, tool_name, arguments).await
 }
 
@@ -222,8 +220,8 @@ async fn fact_search_ranks_exact_operational_evidence_and_tracks_once() {
         "exact operational evidence must outrank unrelated V2 facts: {first}"
     );
 
-    let context = invoke_production_tool(
-        &cg,
+    let context = handle_real_server_tool_call(
+        &cg.server,
         "tracedecay_context",
         json!({
             "task": "stale tracedecay serve processes versions open database file descriptors doctor upgrade",
@@ -231,8 +229,9 @@ async fn fact_search_ranks_exact_operational_evidence_and_tracks_once() {
             "memory_min_trust": 0.0
         })
     )
-    .await
-    .unwrap();
+    .await;
+    let context: Value = serde_json::from_str(extract_real_server_text(&context))
+        .expect("context should return canonical JSON");
     assert!(context["memory_matches"].as_array().is_some_and(|matches| {
         matches
             .iter()
@@ -729,7 +728,7 @@ async fn user_memory_scope_is_profile_level_and_isolated_from_project_memory() {
 }
 
 #[tokio::test]
-async fn memory_fact_store_update_rejects_secret_like_content_without_mutating_fact() {
+async fn memory_fact_store_update_redacts_secret_like_content() {
     let cg = setup_project().await;
     let added = invoke_production_tool(
         &cg,
@@ -746,18 +745,25 @@ async fn memory_fact_store_update_rejects_secret_like_content_without_mutating_f
         .expect("fact-store add should return a canonical fact id")
         .to_owned();
 
-    let rejected = invoke_production_tool(
+    let secret = "api_key=sk-test-742913 must not be persisted";
+    let redacted = invoke_production_tool(
         &cg,
         "tracedecay_fact_store_update",
         json!({
             "fact_id": fact_id.clone(),
-            "content": "api_key=sk-test-742913 must not be persisted"
+            "content": secret
         }),
     )
-    .await;
+    .await
+    .expect("secret-like updates commit a canonical redaction transition");
+    assert_eq!(redacted["commit"]["disposition"], "committed");
+    assert_eq!(redacted["commit"]["fact_id"], fact_id);
+    assert_eq!(redacted["fact"]["kind"], "unavailable");
+    assert_eq!(redacted["fact"]["status"]["fact_id"], fact_id);
+    assert_eq!(redacted["fact"]["status"]["payload_access"], "redacted");
     assert!(
-        rejected.is_err(),
-        "the exact update route must reject secret-like content"
+        !redacted.to_string().contains(secret),
+        "redaction receipt must not expose the rejected secret: {redacted}"
     );
 
     let stored = invoke_production_tool(
@@ -767,16 +773,12 @@ async fn memory_fact_store_update_rejects_secret_like_content_without_mutating_f
     )
     .await
     .unwrap();
-    let stored_fact = available_fact(&stored["fact"]);
-    assert_eq!(
-        stored_fact["content"],
-        "Project preference: never store provider API keys"
-    );
+    assert_eq!(stored["fact"]["kind"], "unavailable");
+    assert_eq!(stored["fact"]["status"]["fact_id"], fact_id);
+    assert_eq!(stored["fact"]["status"]["payload_access"], "redacted");
     assert!(
-        !stored_fact["content"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("sk-test-742913")
+        !stored.to_string().contains(secret),
+        "redacted fact reads must not expose the rejected secret: {stored}"
     );
     close_test_graph(cg).await;
 }
@@ -896,6 +898,99 @@ async fn fact_store_reason_requires_an_entity_selection() {
     assert!(
         result.is_err(),
         "the exact reason route must reject an empty entity selection"
+    );
+    close_test_graph(cg).await;
+}
+
+/// A closed-vocabulary rejection must name the admitted values: the decode
+/// error is the caller's only feedback loop on the MCP and CLI routes.
+#[tokio::test]
+async fn fact_store_add_rejection_names_the_admitted_categories() {
+    let cg = setup_project().await;
+
+    let result = invoke_production_tool(
+        &cg,
+        "tracedecay_fact_store_add",
+        json!({
+            "content": "Category outside the closed vocabulary must be rejected",
+            "category": "pitfall"
+        }),
+    )
+    .await;
+    let message = result
+        .expect_err("an unknown category must be rejected")
+        .to_string();
+    assert!(
+        message.contains("pitfall"),
+        "the rejection must echo the offending category: {message}"
+    );
+    for admitted in [
+        "general",
+        "user_pref",
+        "project",
+        "tool",
+        "decision",
+        "code_area",
+    ] {
+        assert!(
+            message.contains(admitted),
+            "the rejection must name admitted category `{admitted}`: {message}"
+        );
+    }
+    close_test_graph(cg).await;
+}
+
+/// Explicit search reports its retrieval-telemetry lane as a typed state on
+/// the wire: recorded for tracked hits, not-applicable for a zero-hit result.
+#[tokio::test]
+async fn fact_search_reports_typed_retrieval_telemetry() {
+    let cg = setup_project().await;
+    invoke_production_tool(
+        &cg,
+        "tracedecay_fact_store_add",
+        json!({
+            "content": "Telemetry lane state is part of the search contract",
+            "entities": ["Telemetry Entity"]
+        }),
+    )
+    .await
+    .unwrap();
+
+    let hit_page = invoke_production_tool(
+        &cg,
+        "tracedecay_fact_store_search",
+        json!({"query": "telemetry lane state contract", "limit": 5, "min_trust": 0.0}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !hit_page["hits"].as_array().unwrap().is_empty(),
+        "the fixture fact must be retrievable: {hit_page}"
+    );
+    assert_eq!(
+        hit_page["retrieval_telemetry"]["kind"], "recorded",
+        "tracked hits must report recorded telemetry: {hit_page}"
+    );
+    assert_eq!(
+        hit_page["retrieval_telemetry"]["fact_count"].as_u64(),
+        Some(hit_page["hits"].as_array().unwrap().len() as u64),
+        "recorded telemetry must count the tracked hits: {hit_page}"
+    );
+
+    let empty_page = invoke_production_tool(
+        &cg,
+        "tracedecay_fact_store_search",
+        json!({"query": "zzz nothing matches this query zzz", "limit": 5}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        empty_page["hits"].as_array().unwrap().is_empty(),
+        "the control query must return no hits: {empty_page}"
+    );
+    assert_eq!(
+        empty_page["retrieval_telemetry"]["kind"], "not_applicable",
+        "a zero-hit search records nothing: {empty_page}"
     );
     close_test_graph(cg).await;
 }

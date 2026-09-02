@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 use tracedecay_application::{CancellationContext, Deadline, try_now_micros};
-use tracedecay_runtime_core::errors::Result;
+use tracedecay_domain::errors::Result;
 
 const SOURCE_SEARCH_CEILING: Duration = Duration::from_secs(10);
 static SOURCE_SEARCH_CAPACITY: LazyLock<Arc<Semaphore>> =
@@ -141,7 +141,7 @@ pub const fn affected_test_proximity(distance: usize) -> &'static str {
 
 #[hotpath::measure(label = "usecases.primitives.affected_tests_traverse", future = true)]
 pub(crate) async fn collect_affected_test_files(
-    graph: &crate::graph::queries::GraphQueryManager<'_>,
+    graph: &tracedecay_graph_query::queries::GraphQueryManager<'_>,
     files: &[String],
     max_depth: usize,
     custom_glob: Option<&glob::Pattern>,

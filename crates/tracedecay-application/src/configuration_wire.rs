@@ -64,6 +64,7 @@ impl ConfigurationWireSchemaV1 {
         &self.binding_id
     }
 
+    #[hotpath::skip]
     pub const fn surface(&self) -> BindingSurface {
         self.surface
     }

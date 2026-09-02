@@ -12,7 +12,7 @@ use super::*;
 /// Session-store mounts retain the registered database authority for the
 /// lifetime of each maintenance task. One-shot commands never enable it.
 pub fn mark_process_long_lived_for_session_maintenance() {
-    store_runtime::session_registry::mark_process_long_lived_for_session_maintenance();
+    tracedecay_store_runtime::mark_process_long_lived_for_session_maintenance();
 }
 
 const SEMANTIC_ARTIFACT_GC_PERIOD: Duration = Duration::from_hours(24);
@@ -31,6 +31,7 @@ impl SemanticArtifactGcMaintenanceTask {
         }
     }
 
+    #[hotpath::skip]
     pub(super) async fn shutdown(self) -> std::result::Result<(), String> {
         let mut retained = self.task.lock().await;
         let Some(task) = retained.as_mut() else {
@@ -60,7 +61,7 @@ pub(super) fn spawn_semantic_artifact_gc_maintenance() -> SemanticArtifactGcMain
             loop {
                 interval.tick().await;
                 let Some(owner) =
-                    crate::semantic_code::SemanticModelLifecycleOwnerV1::mounted_shared()
+                    tracedecay_semantic::SemanticModelLifecycleOwnerV1::mounted_shared()
                 else {
                     continue;
                 };

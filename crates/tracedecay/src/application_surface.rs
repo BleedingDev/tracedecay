@@ -21,18 +21,15 @@ use thiserror::Error;
 use tokio_stream::StreamExt;
 use tracedecay_api::{
     CanonicalInvocationResult, HandoffOperation, HttpApplicationControls,
-    HttpApplicationInvocationFuture, HttpApplicationOperation, HttpApplicationRequest,
-    WorkOperation, WorkflowOperation, application_problem_response, sse_response,
+    HttpApplicationInvocationFuture, HttpApplicationRequest, WorkOperation, WorkflowOperation,
+    application_problem_response, is_http_application_operation_exposed, sse_response,
 };
 pub use tracedecay_application::git::{GitApplySurfaceRequest, GitPreviewSurfaceRequest};
 use tracedecay_application::git::{
     GitHubStackSignalExpandSurfaceRequest, NativeWorktreeSurfaceRequest,
 };
 use tracedecay_application::handlers::CanonicalApplicationDispatcher;
-use tracedecay_application::retrieval::{
-    GraphRelationRequest, HealthDeltaRequest, ImplementationsRequest, SignatureSearchRequest,
-    TypeHierarchyRequest,
-};
+use tracedecay_application::retrieval::{HealthDeltaRequest, PrimitiveRequest};
 use tracedecay_application::{
     APPLICATION_DEFAULT_PROFILE_ID, ApplicationContractError, ApplicationEnvelope,
     ApplicationOperation, ApplicationProblem, ApplicationProblemEnvelope, ApplicationProblemKind,
@@ -50,19 +47,22 @@ pub use tracedecay_daemon_protocol::{
     ContextScoutFeedbackSurfaceRequest, ContextScoutRecentSurfaceRequest,
     ContextScoutSurfaceRequest, GitReadSurfaceRequest,
 };
-use tracedecay_domain::{
-    ManifestDigest, ProjectId, QueryNormalizationRevision, SanitizerRevision, UtcMicros,
-    canonical_sha256,
-};
+use tracedecay_domain::{ManifestDigest, ProjectId, UtcMicros, canonical_sha256};
 use tracedecay_tool_catalog::{
-    BindingSurface, CapabilityId, CatalogSnapshotV1, CatalogValidationError, FeatureId,
-    IdentifierError, ProfileId, RouteExposureV1, SchemaId, SurfaceOperationName, UseCaseId,
+    ApplicationSurfaceOperation, BindingSurface, CapabilityId, CatalogSnapshotV1,
+    CatalogValidationError, FeatureId, IdentifierError, ProfileId, RouteExposureV1, SchemaId,
+    SurfaceOperationName, UseCaseId,
 };
 
 use crate::catalog_composition::{
     ApplicationCatalogComposition, CatalogCompositionError, build_application_catalog_snapshot,
     compose_application_catalog_with,
 };
+use tracedecay_application::feedback::observations::{
+    FeedbackArgumentRejectionClassV1, FeedbackDeliveryRouteV1, FeedbackOperationV1,
+    FeedbackOutcomeV1, FeedbackRejectedArgumentV1, FeedbackSourceEventV1, FeedbackSseLifecycleV1,
+};
+use tracedecay_application::request_identity::{GlobalRequestSurface, mint_global_request_id};
 pub use tracedecay_application::{
     CallableCodeSurfaceMeta, CallableCodeSurfaceRequest, CodeCalleesSurfaceRequest,
     CodeCallersSurfaceRequest, CodeExactOccurrenceSurfaceRequest, CodeFacetSurfaceRequest,
@@ -76,22 +76,16 @@ use tracedecay_daemon_protocol::{
     DispatchError, DispatchInput, DispatchedInvocation, InvocationCancellationPolicy,
     InvocationControls, ResolvedBinding, ScopeSelector, resolve_dispatch,
 };
-pub use tracedecay_mcp::{RequestedOutputFormat, requested_output_format};
-use tracedecay_usecases::feedback::observations::{
-    FeedbackArgumentRejectionClassV1, FeedbackDeliveryRouteV1, FeedbackOperationV1,
-    FeedbackOutcomeV1, FeedbackRejectedArgumentV1, FeedbackSourceEventV1, FeedbackSseLifecycleV1,
-};
+use tracedecay_daemon_protocol::{RequestedOutputFormat, requested_output_format};
 use tracedecay_usecases::operation_stream::{
     OperationCancelOutcome, OperationEventAuthority, OperationEventError, OperationId,
     OperationRequestControls,
 };
 use tracedecay_usecases::primitives::{
     CallChainPrimitiveRequest, DiagnosticsPrimitiveRequest, FileDependentsPrimitiveRequest,
-    FileMetadataPrimitiveRequest, ModuleApiPrimitiveRequest, PrimitiveRequest,
-    QualifiedNamePrimitiveRequest, SourceBodyPrimitiveRequest, SourceOutlinePrimitiveRequest,
-    StorageStatusPrimitiveRequest,
+    FileMetadataPrimitiveRequest, ModuleApiPrimitiveRequest, QualifiedNamePrimitiveRequest,
+    SourceBodyPrimitiveRequest, SourceOutlinePrimitiveRequest, StorageStatusPrimitiveRequest,
 };
-use tracedecay_usecases::request_identity::{GlobalRequestSurface, mint_global_request_id};
 
 mod configuration_wire;
 mod handoff;
@@ -123,11 +117,6 @@ const APPLICATION_PROTOCOL_REVISION: u32 = 1;
 const HTTP_DEADLINE_HEADER: &str = "x-tracedecay-deadline-micros";
 const MAX_REQUEST_HANDLE_BYTES: usize = 256;
 
-/// Canonical operation identity shared by HTTP, MCP, CLI, LSP, SSE, and
-/// dashboard adapters. The API crate owns the names and complete operation
-/// family; surface bindings decide which transports expose each operation.
-pub use tracedecay_api::HttpApplicationOperation as ApplicationSurfaceOperation;
-
 /// Transport keys every surface adapter accepts but no reviewed application
 /// request schema declares. `format` selects the rendered output and
 /// `__mcp_request_id` carries protocol identity; both are stripped here so
@@ -149,6 +138,11 @@ pub fn normalize_application_tool_args(
     tool_name: &str,
     mut args: Value,
 ) -> Result<NormalizedApplicationToolArgs, ApplicationSurfaceAdapterError> {
+    if let Some(format) = args.get("format")
+        && !matches!(format.as_str(), Some("markdown" | "json"))
+    {
+        return Err(ApplicationSurfaceAdapterError::InvalidSurfaceRequest);
+    }
     let requested_format = requested_output_format(&args);
     if let Some(object) = args.as_object_mut() {
         for key in SURFACE_TRANSPORT_ARGUMENT_KEYS {
@@ -234,94 +228,6 @@ pub struct FeedbackImpactSurfaceRequest {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TestResultsSurfaceRequest {}
-
-pub(crate) fn primitive_code_into_primitive(
-    request: PrimitiveCodeSurfaceRequest,
-    sanitizer_revision: SanitizerRevision,
-    normalization_revision: QueryNormalizationRevision,
-    page: PageRequest,
-) -> Result<PrimitiveRequest, ApplicationContractError> {
-    Ok(match request {
-        PrimitiveCodeSurfaceRequest::SymbolSearch(request) => PrimitiveRequest::SymbolSearch(
-            request.into_primitive_request(sanitizer_revision, normalization_revision, page)?,
-        ),
-        PrimitiveCodeSurfaceRequest::SignatureSearch(request) => {
-            PrimitiveRequest::SignatureSearch(SignatureSearchRequest {
-                returns: request.returns,
-                params: request.params,
-                is_async: request.is_async,
-                scope: request.scope,
-                meta: request.meta.into_application(page),
-            })
-        }
-        PrimitiveCodeSurfaceRequest::Implementations(request) => {
-            PrimitiveRequest::Implementations(ImplementationsRequest {
-                selector: request.selector,
-                scope: request.scope,
-                meta: request.meta.into_application(page),
-            })
-        }
-        PrimitiveCodeSurfaceRequest::TypeHierarchy(request) => {
-            PrimitiveRequest::TypeHierarchy(TypeHierarchyRequest {
-                node_id: request.node_id,
-                maximum_depth: request.maximum_depth,
-                scope: request.scope,
-                meta: request.meta.into_application(page),
-            })
-        }
-        PrimitiveCodeSurfaceRequest::Callers(request) => {
-            PrimitiveRequest::Callers(GraphRelationRequest {
-                node_id: request.node_id,
-                maximum_depth: request.maximum_depth,
-                resolve_trait_dispatch: request.resolve_trait_dispatch,
-                scope: request.scope,
-                meta: request.meta.into_application(page),
-            })
-        }
-    })
-}
-
-pub(crate) const fn native_integration_operation(
-    request: &NativeIntegrationSurfaceRequest,
-) -> ApplicationSurfaceOperation {
-    match request {
-        NativeIntegrationSurfaceRequest::StackSnapshot(_) => {
-            ApplicationSurfaceOperation::NativeIntegrationStackSnapshot
-        }
-        NativeIntegrationSurfaceRequest::Preflight(_) => {
-            ApplicationSurfaceOperation::NativeIntegrationPreflight
-        }
-        NativeIntegrationSurfaceRequest::Approve(_) => {
-            ApplicationSurfaceOperation::NativeIntegrationApprove
-        }
-        NativeIntegrationSurfaceRequest::Apply(_) => {
-            ApplicationSurfaceOperation::NativeIntegrationApply
-        }
-        NativeIntegrationSurfaceRequest::Status(_) => {
-            ApplicationSurfaceOperation::NativeIntegrationStatus
-        }
-        NativeIntegrationSurfaceRequest::Cancel(_) => {
-            ApplicationSurfaceOperation::NativeIntegrationCancel
-        }
-        NativeIntegrationSurfaceRequest::Worktree(request) => match request {
-            NativeWorktreeSurfaceRequest::Inventory(_) => {
-                ApplicationSurfaceOperation::NativeIntegrationWorktreeInventory
-            }
-            NativeWorktreeSurfaceRequest::Inspect(_) => {
-                ApplicationSurfaceOperation::NativeIntegrationWorktreeInspect
-            }
-            NativeWorktreeSurfaceRequest::Confirm(_) => {
-                ApplicationSurfaceOperation::NativeIntegrationWorktreeConfirm
-            }
-            NativeWorktreeSurfaceRequest::Remove(_) => {
-                ApplicationSurfaceOperation::NativeIntegrationWorktreeRemove
-            }
-            NativeWorktreeSurfaceRequest::Reconcile(_) => {
-                ApplicationSurfaceOperation::NativeIntegrationWorktreeReconcile
-            }
-        },
-    }
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ApplicationSurfaceRequest {
@@ -416,14 +322,14 @@ fn application_invoker_for_surface(
     // it validates the authority's own list and ignores the caller's; every
     // other surface validates exactly the operations its caller declared.
     let operations: &[ApplicationSurfaceOperation] = if surface == BindingSurface::Http {
-        &HttpApplicationOperation::ALL
+        &ApplicationSurfaceOperation::ALL
     } else {
         required_operations
     };
     for &operation in operations {
         // Only the HTTP enumeration walks operations the mount is not meant to
         // publish; a caller-supplied list is required exactly as it was given.
-        if surface == BindingSurface::Http && !operation.is_http_exposed() {
+        if surface == BindingSurface::Http && !is_http_application_operation_exposed(operation) {
             continue;
         }
         let Some(binding) = resolve_application_binding(&resolver, surface, operation) else {
@@ -905,7 +811,7 @@ pub(crate) fn assemble_http_application_router(
         tracedecay_api::application_router(application_invoker_for_surface(
             executor,
             BindingSurface::Http,
-            &HttpApplicationOperation::ALL,
+            &ApplicationSurfaceOperation::ALL,
         )?)
         .merge(work_router)
         .merge(workflow_router)
@@ -1349,7 +1255,8 @@ fn operation_event_failure_from_invocation(
             OperationEventInvocationFailure::Stream(OperationEventError::InvalidFrontier)
         }
         tracedecay_application::InvocationError::InvalidRequest
-        | tracedecay_application::InvocationError::Unavailable => {
+        | tracedecay_application::InvocationError::Unavailable
+        | tracedecay_application::InvocationError::Unreachable { .. } => {
             OperationEventInvocationFailure::Stream(OperationEventError::ResumeUnavailable)
         }
         tracedecay_application::InvocationError::Problem(problem) => match problem.kind() {
@@ -1976,6 +1883,12 @@ pub enum ApplicationSurfaceAdapterError {
     InvalidSurfaceRequest,
     #[error("owning daemon application service is unavailable")]
     DaemonUnavailable,
+    /// No daemon accepted the connection after the transport's restart grace;
+    /// the request was never sent. Surfaced as a dispatch error — not a
+    /// retryable problem envelope — so dispatchers fail fast with the typed
+    /// connect diagnostic instead of re-dispatching until their deadline.
+    #[error("{detail}")]
+    DaemonUnreachable { reason_code: String, detail: String },
     #[error("application surface was not found or is not authorized")]
     UnknownOrNotAuthorized,
 }
@@ -2801,6 +2714,18 @@ pub async fn execute_application_surface(
                     }),
                 )?),
             },
+            // Same dispatch-failure contract as the non-migrated arm below: an
+            // unreachable daemon never saw the request, so it is an error, not
+            // a retryable problem envelope.
+            Err(tracedecay_application::InvocationError::Unreachable {
+                reason_code,
+                detail,
+            }) => {
+                return Err(ApplicationSurfaceAdapterError::DaemonUnreachable {
+                    reason_code,
+                    detail,
+                });
+            }
             Err(error) => Err(ApplicationProblemEnvelope::new(
                 result_contract,
                 request_id,
@@ -2906,9 +2831,7 @@ pub async fn execute_application_surface(
                 tracedecay_daemon_protocol::DaemonInvocationRequest::primitive(
                     request_id.as_str(),
                     operation,
-                    tracedecay_usecases::primitives::PrimitiveRequest::RecentTestResults(
-                        invocation.page,
-                    ),
+                    PrimitiveRequest::RecentTestResults(invocation.page),
                     observed_at,
                     deadline,
                     cancellation_context,
@@ -3029,6 +2952,24 @@ pub async fn execute_application_surface(
     let response = match response {
         Ok(response) => response,
         Err(error) => {
+            // An unreachable daemon is a dispatch failure, not an answer:
+            // wrapping it in a retryable problem envelope made every CLI
+            // surface re-dispatch (and re-pay the connect grace) until its
+            // deadline — 128 s against a dead socket — while sibling
+            // compatibility tools failed typed in one grace. The feedback
+            // observation below rides the same dead transport, so it is
+            // skipped too: it would pay one more full connect grace to
+            // observe that the daemon it reports to is down.
+            if let DaemonInvocationError::Unreachable {
+                reason_code,
+                detail,
+            } = error
+            {
+                return Err(ApplicationSurfaceAdapterError::DaemonUnreachable {
+                    reason_code,
+                    detail,
+                });
+            }
             if feedback_surface_is_observable(operation)
                 && let Ok(subject_digest) = canonical_sha256(&(
                     "tracedecay.feedback.transport-observation.v1",
@@ -3049,13 +2990,16 @@ pub async fn execute_application_surface(
                         operation: feedback_surface_operation(operation),
                         outcome: FeedbackOutcomeV1::TimedOut,
                     },
-                    DaemonInvocationError::Unavailable => FeedbackSourceEventV1::Delivery {
-                        operation: feedback_surface_operation(operation),
-                        route: delivery_route,
-                        outcome: FeedbackOutcomeV1::Unavailable,
-                        item_count: 0,
-                        duration_micros: None,
-                    },
+                    DaemonInvocationError::Unavailable
+                    | DaemonInvocationError::Unreachable { .. } => {
+                        FeedbackSourceEventV1::Delivery {
+                            operation: feedback_surface_operation(operation),
+                            route: delivery_route,
+                            outcome: FeedbackOutcomeV1::Unavailable,
+                            item_count: 0,
+                            duration_micros: None,
+                        }
+                    }
                 };
                 let _ = executor
                     .observe_feedback(subject_digest, observed_at, event)
@@ -3396,7 +3340,8 @@ fn surface_rejection_metadata(
         | ApplicationSurfaceAdapterError::Contract(_)
         | ApplicationSurfaceAdapterError::Identifier(_)
         | ApplicationSurfaceAdapterError::CatalogValidation(_)
-        | ApplicationSurfaceAdapterError::DaemonUnavailable => None,
+        | ApplicationSurfaceAdapterError::DaemonUnavailable
+        | ApplicationSurfaceAdapterError::DaemonUnreachable { .. } => None,
     }
 }
 
@@ -3811,6 +3756,15 @@ fn http_adapter_problem(
                 message: "The application service for this operation is unavailable".to_owned(),
             })
         }
+        // Also transient, with the connect diagnostic preserved: no daemon
+        // accepted the connection, so the request was never sent.
+        ApplicationSurfaceAdapterError::DaemonUnreachable {
+            reason_code,
+            detail,
+        } => ApplicationProblem::unavailable(SafeDiagnostic {
+            code: reason_code,
+            message: detail,
+        }),
     };
     ApplicationProblemEnvelope::new(contract, request_id, problem)
         .map(|problem| problem.with_owning_layer(ProblemOwningLayer::Adapter))
@@ -3843,7 +3797,7 @@ pub(crate) fn mcp_project_open_reset_refusal(
         .map(|envelope| envelope.with_owning_layer(ProblemOwningLayer::Runtime))
 }
 
-fn current_micros() -> Result<UtcMicros, ApplicationSurfaceAdapterError> {
+pub(crate) fn current_micros() -> Result<UtcMicros, ApplicationSurfaceAdapterError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| ApplicationSurfaceAdapterError::InvalidSurfaceRequest)?;
@@ -3927,6 +3881,16 @@ fn invocation_contract_problem(
                 "The application service for this operation is unavailable",
             )?)
         }
+        // Dispatchers intercept unreachable before republishing problems; this
+        // projection keeps the connect diagnostic for any caller that still
+        // renders it as a problem.
+        tracedecay_application::InvocationError::Unreachable {
+            reason_code,
+            detail,
+        } => ApplicationProblem::unavailable(SafeDiagnostic {
+            code: reason_code,
+            message: detail,
+        }),
         // The daemon's typed problem is the authority; republishing it keeps
         // its diagnostic (e.g. `configuration.conflict`) intact instead of
         // substituting a generic surface code.

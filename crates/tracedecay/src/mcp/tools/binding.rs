@@ -212,7 +212,7 @@ const MCP_TOOL_BINDING_SPECS: &[McpToolBinding] = &[
     McpToolBinding { name: "tracedecay_context_scout_resume", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_context_scout_status", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_diagnostics_read", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
-    McpToolBinding { name: "tracedecay_fact_feedback", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
+    McpToolBinding { name: "tracedecay_fact_feedback", group: None, project: RegisteredProjectAccess::SelectorOnly },
     McpToolBinding { name: "tracedecay_feedback_advisory_cycle", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_feedback_diagnostics", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_feedback_expand", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
@@ -291,12 +291,11 @@ fn assemble_mcp_tool_bindings() -> Vec<McpToolBinding> {
     let bindings = MCP_TOOL_BINDING_SPECS
         .iter()
         .map(|spec| {
-            if spec.project == RegisteredProjectAccess::Reader {
-                panic!(
-                    "MCP_TOOL_BINDING_SPECS must not encode Reader for '{}'; list it in tracedecay-mcp::project_access",
-                    spec.name
-                );
-            }
+            assert!(
+                spec.project != RegisteredProjectAccess::Reader,
+                "MCP_TOOL_BINDING_SPECS must not encode Reader for '{}'; list it in tracedecay-mcp::project_access",
+                spec.name
+            );
             let project = if readers.contains(spec.name) {
                 assigned.insert(spec.name);
                 RegisteredProjectAccess::Reader
@@ -364,6 +363,7 @@ pub(crate) fn tool_dispatches_registered_project_reader(tool_name: &str) -> bool
 /// Selector-bound effects accept a project selector but must not open the
 /// selected project's store. The calling session stays admitted; the retained
 /// owner denies a foreign selector as `NotFoundOrNotAuthorized`.
+#[cfg(test)]
 pub(super) fn tool_is_selector_bound_effect(tool_name: &str) -> bool {
     matches!(
         binding(tool_name).map(|binding| binding.project),
@@ -584,6 +584,7 @@ fn compute_tool_supports_live_cancellation(tool_name: &str) -> bool {
             tool_name,
             "tracedecay_admin_cli"
                 | "tracedecay_search"
+                | "tracedecay_grep"
                 | "tracedecay_run_affected_tests"
                 | "tracedecay_pr_context"
                 | "tracedecay_dead_code"
@@ -870,9 +871,9 @@ pub(super) fn registered_project_reader_tool_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use tracedecay_application::RetainedSurfaceOperation;
+    use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
     use super::*;
-    use crate::application_surface::ApplicationSurfaceOperation;
 
     #[test]
     fn every_tool_is_bound_once() {

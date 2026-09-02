@@ -164,14 +164,17 @@ impl DiagnosticPublicationReceiptV1 {
         &self.generation_id
     }
 
+    #[hotpath::skip]
     pub const fn inserted_records(&self) -> u64 {
         self.inserted_records
     }
 
+    #[hotpath::skip]
     pub const fn cleared_records(&self) -> u64 {
         self.cleared_records
     }
 
+    #[hotpath::skip]
     pub const fn disposition(&self) -> DiagnosticPublicationDispositionV1 {
         self.disposition
     }

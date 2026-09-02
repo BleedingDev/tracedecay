@@ -19,9 +19,8 @@ compiles.
   global DB, sessions, code index, application services). Its integration
   suites are `crates/tracedecay/tests/`, and the ones that use the fixture
   surface in `tests/common/` declare `required-features = ["test-helpers"]`.
-- `crates/tracedecay-cli/` — the shipped `tracedecay` binary. Build it with
-  `kache cargo -- build -p tracedecay-cli --bin tracedecay`, never
-  `-p tracedecay`.
+- `crates/tracedecay-cli/` — the package that produces the shipped
+  `tracedecay` binary.
 - `crates/` — the remaining workspace member crates (`tracedecay-api`,
   `-application`, `-domain`, `-store`, `-hooks`, `-policy`, `-tool-catalog`,
   rusqlite parity/runtime crates).
@@ -39,70 +38,31 @@ compiles.
 
 ## Build & test
 
-- Invoke Cargo as `kache cargo -- <args>` instead of bare `cargo`
-  (e.g. `kache cargo -- check -p tracedecay-store`). It execs the real Cargo
-  after collapsing the duplicate `$CARGO_HOME` rustflags source and isolating
-  the per-worktree build dir, so builds hit the shared compile cache;
-  commands other than `build`/`check` pass through verbatim. Edition 2024,
-  resolver 3. Scope checks to the smallest touched package/target during
-  development.
-- Before handoff, run a broader gate from the repo root, e.g.
-  `kache cargo -- check --all-features` or `kache cargo -- test-all` (alias
-  for `cargo nextest run --workspace --all-features --no-fail-fast
-  --cargo-profile perf`).
+- Edition 2024, resolver 3.
 - Dashboard: `npm run build` (rsbuild), `npm run typecheck` (`tsc --noEmit`),
   `npm test` (vitest) from `dashboard/`.
-- Default `build` / `test` runs compile every package at the base
-  dev/test opt-level. The critical-path kernel `opt-level` overrides
-  (code index, graph, sha2, …) live in the opt-in `perf` profile in the root
-  `Cargo.toml`; run generation-scale suites with
-  `kache cargo -- test --profile perf` (or `kache cargo -- build
-  --profile perf`) when they need production-like speed.
 - libtest `--exact` requires the full module path and exits 0 when a filter
   matches nothing — a vacuous "0 passed" green. For name-filtered runs prefer
   the ad-hoc anti-vacuity helper `scripts/require-exact-test.sh`; it is not a
   reason to ossify CI or test names. Otherwise pass the full path
   (`module::path::test_name`) and confirm the reported count is non-zero before
   treating a run as evidence.
-- `dashboard/app-dist/` is gitignored build output but required by `build.rs`;
-  a fresh checkout/worktree must build the dashboard (or seed the directory)
-  before Rust compiles. `TRACEDECAY_SKIP_DASHBOARD_BUILD=1` only skips a
-  stale rebuild. Create linked worktrees with `scripts/agent-worktree.sh` so
-  `app-dist` and `node_modules` are seeded from the primary checkout.
-- This machine shares one compile cache (kache, keyed on
-  profile × features × RUSTFLAGS × source); the `kache cargo -- <args>`
-  front-end above keeps that key stable, which is why bare `cargo` is
-  avoided. `CARGO_TARGET_DIR` and worktree
-  paths do not affect the key. Novel feature
-  permutations do: each one recompiles the workspace spine (~7 min for
-  `tracedecay`) instead of hitting the cache. Stick to the standard lanes —
-  default features (add `test-helpers` only when the suite requires it), plain
-  `--no-default-features` for lean lib iteration, `--all-features` for the
-  handoff gate, and the fixed hotpath profiling combos — rather than toggling
-  individual features (e.g. `semantic-fastembed`) per task.
-- The CLI build lane (`build -p tracedecay-cli --bin tracedecay`) and any test
-  compile of the root crate resolve different spine features: dev-dependency
-  unification activates `test-helpers`/`test-transport` on ~13 spine crates
-  (usecases, sessions, runtime-core, global-db, graph-db, query, semantic,
-  code-index, agent-hosts, dashboard-api, …) that a plain CLI build resolves
-  without. That is the typed test-feature design working as intended — the
-  fixture surfaces live in-crate and stay out of the shipped binary — and
-  Cargo keeps both feature variants side by side in one target dir, so
-  alternating the two standard build and test lanes does not recompile at
-  steady state (measured: no-ops in both directions once each lane has
-  populated; the first test compile after a plain build pays a one-time extra
-  spine compile). The recurring cost is per edit: a change in a flipped crate
-  compiles it and its dependents once per lane. What actually costs is a
-  novel feature combination (new cache key, full spine rebuild) or a
-  needless fresh `CARGO_TARGET_DIR` for a big crate. Do not "fix" the flip
-  by enabling test features in the build lane (that ships fixture surface in
-  the CLI), and do not invent a per-lane target dir — the variants coexist.
-  Pick one `CARGO_TARGET_DIR` for the task so you reuse the populated
-  artifacts.
-- Start long cargo runs in the background and check back in minutes, not
-  10–30s polls. Never run `--workspace` suites mid-task — those are handoff
-  gates only. Never re-run tests that are known-red under another active
-  lane; cite the owner instead.
+- `dashboard/app-dist/` is gitignored build output; only the CLI build script
+  (`crates/tracedecay-cli/build.rs`) embeds it, so a fresh checkout/worktree
+  must build the dashboard (or seed the directory) before building
+  `tracedecay-cli` — library crates no longer touch it.
+  `TRACEDECAY_SKIP_DASHBOARD_BUILD=1` skips the npm rebuild only when
+  `TRACEDECAY_DASHBOARD_BUNDLE_SHA256` carries the existing bundle's digest
+  (`python3 scripts/check-dashboard-bundle.py dashboard/app-dist
+  --print-digest`); a missing or mismatched digest fails the build.
+  Create linked worktrees with `scripts/agent-worktree.sh`
+  (it locks the lane). Clean up only via `scripts/worktree-gc.sh` or by the
+  owning lane unlocking and removing its own exact absolute path; never
+  `git worktree remove` / `git branch -D` another lane's tree or any path
+  you did not create, and never use name prefixes. A clean tree at the
+  integration tip may be a FRESH lane, not garbage.
+- Never re-run tests that are known-red under another active lane; cite the
+  owner instead.
 
 ## Conventions
 
@@ -131,7 +91,11 @@ compiles.
   and keep the limit. Change a budget only when the measured cost is genuinely
   irreducible, in its own commit, with the measurement attached. A temporary
   override that keeps an investigation moving is scaffolding: label it and
-  remove it before the work merges.
+  remove it before the work merges. Keep the observability layers distinct:
+  `tracing` events are the always-compiled operator log surface, Hotpath
+  macros the compile-to-no-op measurement surface (tracing bridges exist only
+  for third-party emitters like sqlx — see the skill), and `eprintln!`
+  scaffolds never merge.
 - Reuse canonical TraceDecay authorities and maintained libraries first.
   Custom parsers, cursors, caches, retries, transports, registries, schedulers,
   crypto/auth/policy stores, or filesystem durability layers require a concrete
@@ -181,9 +145,6 @@ compiles.
 
 - In shared checkouts, honor active file ownership: re-read before editing,
   commit only self-consistent owned paths, and never sweep in peer work.
-- Before launching Cargo, check for an equivalent active run; reuse or wait,
-  batch narrow local checks, prefer CI for aggregate verification when the
-  shared target is contended, and never kill peer build processes.
 - Require measured, falsifiable verification and root-cause fixes; preserve
   byte-exact identity contracts, and never weaken assertions, raise timeouts,
   ignore tests, or mask gate failures.

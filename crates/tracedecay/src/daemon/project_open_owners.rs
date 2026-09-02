@@ -25,27 +25,29 @@ use tracedecay_domain::configuration::{
 };
 use tracedecay_domain::feedback::GitHubPullRequestIdV1;
 use tracedecay_domain::{
-    ActorId, CapabilityId as DomainCapabilityId, LocatorDigest, ProjectId, RefId, UtcMicros,
+    ActorId, CapabilityId as DomainCapabilityId, LocatorDigest, ProjectId, UtcMicros,
     canonical_sha256,
 };
 use tracedecay_tool_catalog::{CapabilityId, UseCaseId};
 use tracedecay_usecases::advisory::GitHubRepositoryTargetV1;
 
-use super::{
-    DaemonContextScoutRuntimeRegistrationError, DaemonFeedbackRuntimeRegistrationError,
-    DaemonInvocationState,
-};
-use tracedecay_usecases::request_identity::{PreviewIdentityDomain, derive_preview_identity};
+use super::DaemonInvocationState;
+use tracedecay_application::request_identity::{PreviewIdentityDomain, derive_preview_identity};
 
 const SOURCE_EDIT_PRIVACY_KEY_EPOCH_V1: u64 = 1;
-use crate::daemon::service::invocation::DaemonNativeIntegrationRuntimeRegistrar;
+use crate::daemon::callable_code_authorization::DaemonCallableCodeAuthorizationSource;
 use crate::mcp::McpServer;
 use tracedecay_code_index_runtime::git_transactions::DaemonGitIndexTransactionServiceRegistry;
+use tracedecay_daemon_service::{
+    DaemonContextScoutRuntimeRegistrationError, DaemonFeedbackRuntimeRegistrationError,
+    DaemonNativeIntegrationRuntimeRegistrar, DaemonWorkProposalRoutingAuthorityV1,
+};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_lsp::analyzer::broker::AdmittedLspProvider;
 use tracedecay_lsp::analyzer::client::LspRefreshTimeouts;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 use tracedecay_usecases::lsp_runtime::DaemonLspSessionFactory;
 use tracedecay_usecases::primitives::{admitted_root_uri_for_project, locator_digest_for_project};
+use tracedecay_usecases::semantic_runtime::ProjectSemanticActivationExt;
 use tracedecay_usecases::source_authorization::ProjectSourceAccessSnapshot;
 
 mod advisory_runtime;
@@ -78,15 +80,15 @@ const DAEMON_BINDING: &str = "binding.tracedecay-daemon.project-open";
 const GRANT_HORIZON: Duration = Duration::from_hours(24);
 const POLICY_REVISION_V1: u64 = 1;
 const LSP_DIAGNOSTICS_QUIET: Duration = Duration::from_secs(2);
-pub(super) const LSP_WORKSPACE_CAPABILITY_ID_V1: &str =
-    "capability.application.lsp.workspace-folders";
-pub(super) const LSP_WORKSPACE_USE_CASE_ID_V1: &str = "use-case.application.lsp.workspace-folders";
+pub(super) use tracedecay_daemon_service::{
+    LSP_WORKSPACE_CAPABILITY_ID_V1, LSP_WORKSPACE_USE_CASE_ID_V1,
+};
 
 #[derive(Clone)]
 struct ProjectOpenSourceEditAuthorizationV1 {
     project_root: std::path::PathBuf,
     scope: ResolvedScope,
-    configuration: Arc<tracedecay_usecases::configuration::ProjectConfigurationRuntime>,
+    configuration: Arc<tracedecay_configuration::ProjectConfigurationRuntime>,
 }
 
 struct CurrentSourceEditAuthorityV1 {
@@ -95,6 +97,7 @@ struct CurrentSourceEditAuthorityV1 {
 }
 
 impl ProjectOpenSourceEditAuthorizationV1 {
+    #[hotpath::skip]
     async fn current_access(
         &self,
         observed_at: UtcMicros,
@@ -115,6 +118,7 @@ impl ProjectOpenSourceEditAuthorizationV1 {
         .map_err(|_| concealed_source_edit_problem())
     }
 
+    #[hotpath::skip]
     async fn current_authority(
         &self,
         context: &tracedecay_application::RequestContext,
@@ -254,7 +258,7 @@ fn concealed_source_edit_problem() -> tracedecay_application::ApplicationProblem
 
 async fn invoke_project_open_source_edit(
     graph: Arc<crate::tracedecay::TraceDecay>,
-    code_graph: Arc<dyn tracedecay_usecases::graph::CodeGraphProjectionReadPort>,
+    code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
     authorization: ProjectOpenSourceEditAuthorizationV1,
     invocation: crate::mcp::server::SourceEditInvocationV1,
 ) -> Result<tracedecay_application::source_edit::SourceEditSurfaceResultV1> {
@@ -469,7 +473,7 @@ impl SourceEditMutationGate {
 fn install_project_open_source_edit_owners(
     server: &McpServer,
     graph: Arc<crate::tracedecay::TraceDecay>,
-    code_graph: Arc<dyn tracedecay_usecases::graph::CodeGraphProjectionReadPort>,
+    code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
     authorization: ProjectOpenSourceEditAuthorizationV1,
     mutation: Arc<SourceEditMutationGate>,
 ) -> Result<()> {
@@ -520,7 +524,7 @@ fn install_project_open_source_edit_owners(
 pub(crate) async fn install_project_open_source_edit_preview_owner(
     server: &McpServer,
     graph: Arc<crate::tracedecay::TraceDecay>,
-    code_graph: Arc<dyn tracedecay_usecases::graph::CodeGraphProjectionReadPort>,
+    code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
     project_root: &Path,
     project_id: &str,
 ) -> Result<Arc<SourceEditMutationGate>> {
@@ -529,11 +533,11 @@ pub(crate) async fn install_project_open_source_edit_preview_owner(
             message: "project-open source edit preview requires authoritative project identity"
                 .to_owned(),
         })?;
-    let scope = resolved_scope_for_project(project_root, &project_id).map_err(|error| {
-        TraceDecayError::Config {
-            message: format!("project-open source edit preview scope denied: {error}"),
-        }
-    })?;
+    let scope =
+        tracedecay_code_index_runtime::resolved_scope_for_project(project_root, &project_id)
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("project-open source edit preview scope denied: {error}"),
+            })?;
     let authorization = ProjectOpenSourceEditAuthorizationV1 {
         project_root: project_root.to_path_buf(),
         scope,
@@ -553,27 +557,28 @@ pub(crate) async fn install_project_open_source_edit_preview_owner(
 #[cfg(feature = "test-transport")]
 pub(crate) async fn install_project_open_source_edit_owners_for_test(
     server: &McpServer,
-) -> Result<()> {
+) -> Result<bool> {
     let graph = server.cg().await;
-    let code_graph =
-        server
-            .code_graph_projection_read_port()
-            .ok_or_else(|| TraceDecayError::Config {
-                message:
-                    "test source-edit owner requires the production code-graph projection port"
-                        .to_owned(),
-            })?;
+    let Some(code_graph) = server.code_graph_projection_read_port() else {
+        // A directly constructed test server carries no production code-graph
+        // projection port, so the daemon-owned source-edit authority cannot
+        // mount. Report that typed state instead of failing: the dispatch
+        // boundary (selector rejection, argument validation) is still the
+        // production path, and an actual edit then reports its typed
+        // executor-unavailable refusal rather than dying here before dispatch.
+        return Ok(false);
+    };
     let project_root = graph.project_root().to_path_buf();
     let project_id = graph
         .configuration_runtime()
         .configuration_target()
         .project_id
         .clone();
-    let scope = resolved_scope_for_project(&project_root, &project_id).map_err(|error| {
-        TraceDecayError::Config {
-            message: format!("test project-open resolved scope denied: {error}"),
-        }
-    })?;
+    let scope =
+        tracedecay_code_index_runtime::resolved_scope_for_project(&project_root, &project_id)
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("test project-open resolved scope denied: {error}"),
+            })?;
     let authorization = ProjectOpenSourceEditAuthorizationV1 {
         project_root,
         scope,
@@ -585,7 +590,8 @@ pub(crate) async fn install_project_open_source_edit_owners_for_test(
         code_graph,
         authorization,
         SourceEditMutationGate::ready(),
-    )
+    )?;
+    Ok(true)
 }
 
 /// Registers code-index-independent owners for one newly inserted project.
@@ -628,11 +634,11 @@ pub(super) async fn register_project_open_production_owners(
             message: "project-open owners require the daemon-owned project session database"
                 .to_owned(),
         })?;
-    let scope = resolved_scope_for_project(project_root, &project_id).map_err(|error| {
-        TraceDecayError::Config {
-            message: format!("project-open resolved scope denied: {error}"),
-        }
-    })?;
+    let scope =
+        tracedecay_code_index_runtime::resolved_scope_for_project(project_root, &project_id)
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("project-open resolved scope denied: {error}"),
+            })?;
     tracing::info!(
         event = "project_open_owner_phase",
         project = %project_root.display(),
@@ -657,7 +663,7 @@ pub(super) async fn register_project_open_production_owners(
         elapsed_ms = owner_registration_started.elapsed().as_millis(),
     );
     owner_phase_started = Instant::now();
-    let scout_configuration = tracedecay_usecases::configuration::ConfigurationCurrentStateV1 {
+    let scout_configuration = tracedecay_configuration::ConfigurationCurrentStateV1 {
         revision_id: configuration.revision_id.clone(),
         snapshot: configuration.snapshot.clone(),
     };
@@ -848,21 +854,22 @@ pub(super) async fn register_project_open_production_owners(
         message: format!("project-open Work authority is invalid: {error}"),
     })?;
     let work_topology_policy =
-        crate::config::topology::resolved_work_topology_policy(&configuration.snapshot)
-            .map_err(|error| TraceDecayError::Config {
-                message: format!("project-open work topology policy is unavailable: {error}"),
-            })?
-            .clone();
-    let work_proposal_routing =
-        crate::daemon::service::invocation::DaemonWorkProposalRoutingAuthorityV1::mount(
-            scope.clone(),
-            configuration.revision_id.clone(),
+        tracedecay_configuration::config::topology::resolved_work_topology_policy(
             &configuration.snapshot,
-            &access.configuration_digest,
         )
         .map_err(|error| TraceDecayError::Config {
-            message: format!("project-open Work proposal routing is unavailable: {error}"),
-        })?;
+            message: format!("project-open work topology policy is unavailable: {error}"),
+        })?
+        .clone();
+    let work_proposal_routing = DaemonWorkProposalRoutingAuthorityV1::mount(
+        scope.clone(),
+        configuration.revision_id.clone(),
+        &configuration.snapshot,
+        &access.configuration_digest,
+    )
+    .map_err(|error| TraceDecayError::Config {
+        message: format!("project-open Work proposal routing is unavailable: {error}"),
+    })?;
     // Project-open has no authenticated GitHub response or persisted source
     // record. It mounts policy and delivery only; the review refresh owner is
     // the sole producer of canonical provider observations and anchors.
@@ -959,7 +966,11 @@ pub(super) async fn register_project_open_production_owners(
             project_root.to_path_buf(),
             scope.clone(),
             access.clone(),
-            Arc::clone(graph.configuration_runtime()),
+            Arc::new(DaemonCallableCodeAuthorizationSource::production(
+                project_root.to_path_buf(),
+                scope.clone(),
+                Arc::clone(graph.configuration_runtime()),
+            )),
         ),
         label = "daemon.project.open.owners.feedback"
     )
@@ -1204,7 +1215,7 @@ async fn register_semantic_activation_owner(
     graph: &Arc<crate::tracedecay::TraceDecay>,
     session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
     scope: ResolvedScope,
-    configuration: &tracedecay_usecases::configuration::ConfigurationCurrentStateV1,
+    configuration: &tracedecay_configuration::ConfigurationCurrentStateV1,
 ) -> Result<()> {
     let configuration_pin =
         tracedecay_usecases::semantic_runtime::SemanticConfigurationPinV1::from_current(
@@ -1539,7 +1550,7 @@ fn github_repository_from_remote(remote: &str) -> Option<(String, String)> {
 pub(super) fn daemon_owned_project_source_access_at(
     scope: &ResolvedScope,
     project_root: &Path,
-    configuration: &tracedecay_usecases::config::PinnedRuntimeConfiguration,
+    configuration: &tracedecay_configuration::config::PinnedRuntimeConfiguration,
     observed_at: UtcMicros,
 ) -> std::result::Result<ProjectSourceAccessSnapshot, ApplicationContractError> {
     let locator = locator_digest_for_project(project_root)?;
@@ -1671,6 +1682,20 @@ pub(super) fn daemon_owned_project_source_access_at(
                 .saturating_add(i64::try_from(GRANT_HORIZON.as_micros()).unwrap_or(i64::MAX)),
         ),
     })
+}
+
+pub(crate) struct DaemonOwnedProjectSourceAccess;
+
+impl tracedecay_usecases::ProjectSourceAccessSnapshotPort for DaemonOwnedProjectSourceAccess {
+    fn source_access_at(
+        &self,
+        scope: &ResolvedScope,
+        project_root: &Path,
+        configuration: &tracedecay_configuration::config::PinnedRuntimeConfiguration,
+        observed_at: UtcMicros,
+    ) -> std::result::Result<ProjectSourceAccessSnapshot, ApplicationContractError> {
+        daemon_owned_project_source_access_at(scope, project_root, configuration, observed_at)
+    }
 }
 
 fn project_open_work_grant(
@@ -1926,36 +1951,13 @@ impl tracedecay_code_index_runtime::mcp_admission::CodeIndexScopeResolverV1
         &self,
         project_root: &Path,
         project_id: &ProjectId,
-    ) -> std::result::Result<ResolvedScope, ()> {
-        resolved_scope_for_project(project_root, project_id).map_err(|_| ())
+    ) -> std::result::Result<
+        ResolvedScope,
+        tracedecay_code_index_runtime::mcp_admission::CodeIndexScopeUnavailableV1,
+    > {
+        tracedecay_code_index_runtime::resolved_scope_for_project(project_root, project_id)
+            .map_err(|_| tracedecay_code_index_runtime::mcp_admission::CodeIndexScopeUnavailableV1)
     }
-}
-
-pub(crate) fn resolved_scope_for_project(
-    project_root: &Path,
-    project_id: &ProjectId,
-) -> std::result::Result<ResolvedScope, ApplicationContractError> {
-    let repository_id =
-        tracedecay_code_index_runtime::code_index_scheduler::identity::repository_id_for(
-            project_root,
-        )
-        .map_err(|_| ApplicationContractError::Inconsistent {
-            field: "project-open repository id",
-        })?;
-    let worktree_id =
-        tracedecay_code_index_runtime::code_index_scheduler::identity::worktree_id_for(
-            project_root,
-        )
-        .map_err(|_| ApplicationContractError::Inconsistent {
-            field: "project-open worktree id",
-        })?;
-    let reference = crate::branch::current_branch(project_root)
-        .and_then(|branch| RefId::new(format!("refs/heads/{branch}")).ok());
-    ResolvedScope::new(project_id.clone(), repository_id, worktree_id, reference).map_err(|_| {
-        ApplicationContractError::Inconsistent {
-            field: "project-open resolved scope",
-        }
-    })
 }
 
 #[cfg(test)]

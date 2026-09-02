@@ -8,11 +8,14 @@ use super::*;
 use std::collections::HashSet;
 #[cfg(unix)]
 use tracedecay_code_index_runtime::{GitWatchSyncConfigV1, git_watch};
+#[cfg(unix)]
+use tracedecay_daemon_identity::profile_identity;
 
 #[cfg(unix)]
 fn git_watch_sync_config(config: &crate::config::SyncConfig) -> GitWatchSyncConfigV1 {
     GitWatchSyncConfigV1 {
         auto_watch: config.auto_watch,
+        watch_linked_worktrees: config.watch_linked_worktrees,
         watch_debounce_ms: config.watch_debounce_ms,
         watch_max_delay_ms: config.watch_max_delay_ms,
         watch_max_projects: config.watch_max_projects,
@@ -213,6 +216,7 @@ impl DaemonEngine {
 
     /// A doctor-facing read of one project's watch coverage; `git_watcher` is
     /// module-private, so the core Doctor route reads through this accessor.
+    #[hotpath::skip]
     pub(super) async fn git_watcher_health(
         &self,
         project_root: Option<&std::path::Path>,
@@ -235,6 +239,7 @@ impl DaemonEngine {
         self
     }
 
+    #[hotpath::skip]
     pub(super) async fn with_pr_autotrack_task(
         self,
         task: crate::daemon::pr_autotrack::PrAutotrackTask,
@@ -243,6 +248,7 @@ impl DaemonEngine {
         self
     }
 
+    #[hotpath::skip]
     pub(super) async fn maintenance_transition_gate(
         &self,
         key: &ProjectServerKey,
@@ -256,17 +262,22 @@ impl DaemonEngine {
     pub(super) async fn execute_branch_admin(
         &self,
         handshake: &DaemonHandshake,
-        action: crate::branch::BranchAdminAction,
-    ) -> Result<crate::branch::BranchAdminReport> {
+        action: tracedecay_runtime_core::branch::BranchAdminAction,
+    ) -> Result<tracedecay_runtime_core::branch::BranchAdminReport> {
         self.execute_branch_admin_inner(handshake, action).await
     }
 
     fn execute_branch_admin_inner<'a>(
         &'a self,
         handshake: &'a DaemonHandshake,
-        action: crate::branch::BranchAdminAction,
+        action: tracedecay_runtime_core::branch::BranchAdminAction,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<crate::branch::BranchAdminReport>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<
+                    Output = Result<tracedecay_runtime_core::branch::BranchAdminReport>,
+                > + Send
+                + 'a,
+        >,
     > {
         // Erase the deeply nested future before it reaches the measured
         // wrapper so every profiling feature can compute its layout.
@@ -283,30 +294,36 @@ impl DaemonEngine {
 
     /// Returns the client version to log for this handshake, once per distinct
     /// skewed version; repeat connections from the same client return `None`.
+    #[hotpath::skip]
     pub(super) async fn client_version_skew_to_log(
         &self,
         handshake: &DaemonHandshake,
-    ) -> Option<String> {
-        let skew = client_version_skew(&handshake.client_version, binary_version())?;
+    ) -> Result<Option<String>> {
+        let Some(skew) = client_version_skew(&handshake.client_version, binary_version()?) else {
+            return Ok(None);
+        };
         let mut logged = self.logged_client_version_skews.lock().await;
-        logged.insert(skew.clone()).then_some(skew)
+        Ok(logged.insert(skew.clone()).then_some(skew))
     }
 
     /// Logs a `daemon_version_skew` event when this handshake's client runs a
     /// different binary version, deduped per distinct client version.
-    pub(super) async fn log_client_version_skew(&self, handshake: &DaemonHandshake) {
-        let Some(client_version) = self.client_version_skew_to_log(handshake).await else {
-            return;
+    #[hotpath::skip]
+    pub(super) async fn log_client_version_skew(&self, handshake: &DaemonHandshake) -> Result<()> {
+        let Some(client_version) = self.client_version_skew_to_log(handshake).await? else {
+            return Ok(());
         };
-        let hint = version_skew_action(binary_version(), &client_version).to_string();
+        let daemon_version = binary_version()?;
+        let hint = version_skew_action(daemon_version, &client_version).to_string();
         log_daemon_event(
             "daemon_version_skew",
             &[
-                ("daemon_version", binary_version().to_string()),
+                ("daemon_version", daemon_version.to_string()),
                 ("client_version", client_version),
                 ("hint", hint),
             ],
         );
+        Ok(())
     }
 
     /// Claims the one catalog-refresh notification for this client in the
@@ -323,6 +340,7 @@ impl DaemonEngine {
     /// exactly what arms its notification for the first request after warm-up
     /// completes; marking it would strand the provisional catalog for the rest
     /// of the daemon's life, because this set is never otherwise cleared.
+    #[hotpath::skip]
     pub(super) async fn claim_catalog_refresh(
         &self,
         handshake: &DaemonHandshake,
@@ -378,6 +396,7 @@ impl DaemonEngine {
         Some(key)
     }
 
+    #[hotpath::skip]
     pub(super) async fn release_catalog_refresh(&self, key: CatalogRefreshClientKey) {
         self.catalog_refresh_notified_clients
             .lock()
@@ -386,6 +405,7 @@ impl DaemonEngine {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn project_server(
         &self,
         handshake: &DaemonHandshake,
@@ -428,6 +448,7 @@ impl DaemonEngine {
         })
     }
 
+    #[hotpath::skip]
     pub(super) async fn cached_project_server(
         &self,
         handshake: &DaemonHandshake,
@@ -455,19 +476,25 @@ impl DaemonEngine {
         // wrapper so every profiling feature can compute its layout.
         Box::pin(async move {
             let (project_path, route) = Self::project_route(handshake)?;
-            let exact = {
+            // A route-alias hit returns the mounted server without re-running
+            // registry admission: enrollment was proven when this route was
+            // bound, and a mounted server's continued validity is owned by the
+            // retirement/revocation lifecycle (a retired owner drops its
+            // aliases, so the next request re-enters the admission path
+            // below). Re-checking enrollment per request re-derived registry
+            // and repository identity on every tool call.
+            if let Some(server) = {
                 let mut servers = self.store_administration.project_servers().lock().await;
                 servers
                     .get_route_and_touch_for(&route, requirement)
                     .map(|(_, server)| Arc::clone(server))
-            };
-            self.ensure_registered_project_route(&project_path, handshake.allow_init)
-                .await?;
-            if let Some(server) = exact {
+            } {
                 return Ok(Some(
                     self.activate_project_server(project_path, server).await,
                 ));
             }
+            self.ensure_registered_project_route(&project_path, handshake.allow_init)
+                .await?;
             let Some(key) =
                 resolved_project_server_key(&self.store_administration, &project_path, handshake)
                     .await?
@@ -488,6 +515,34 @@ impl DaemonEngine {
                 self.activate_project_server(project_path, server).await,
             ))
         })
+    }
+
+    /// Route-alias-only lookup for waiters that already hold an in-flight
+    /// open claim. The open composition binds `route -> key` before any heavy
+    /// work and `mark_ready` upgrades the publication in place, so polling
+    /// the alias is sufficient to observe publication. Re-running the full
+    /// resolution (`ensure_registered_project_route` +
+    /// `resolved_project_server_key`) on every wait iteration re-derived
+    /// registry and repository identity dozens of times per warming request.
+    #[hotpath::measure(label = "daemon.engine.route_bound_project_server", future = true)]
+    async fn route_bound_project_server(
+        &self,
+        handshake: &DaemonHandshake,
+        requirement: ProjectServerRequirement,
+    ) -> Result<Option<Arc<crate::mcp::McpServer>>> {
+        let (project_path, route) = Self::project_route(handshake)?;
+        let bound = {
+            let mut servers = self.store_administration.project_servers().lock().await;
+            servers
+                .get_route_and_touch_for(&route, requirement)
+                .map(|(_, server)| Arc::clone(server))
+        };
+        match bound {
+            Some(server) => Ok(Some(
+                self.activate_project_server(project_path, server).await,
+            )),
+            None => Ok(None),
+        }
     }
 
     #[hotpath::measure(label = "daemon.engine.begin_project_open", future = true)]
@@ -542,6 +597,7 @@ impl DaemonEngine {
     /// work before session-store resolution eventually notices the missing
     /// enrollment. Registry alias and repository-identity lookups preserve
     /// linked-worktree routing without manufacturing path-derived authority.
+    #[hotpath::skip]
     pub(super) async fn ensure_registered_project_route(
         &self,
         project_path: &Path,
@@ -614,8 +670,12 @@ impl DaemonEngine {
                 ProjectOpenTaskClaim::InFlight(mut state) => {
                     let publication = async {
                         loop {
+                            // The claim proves an open for this exact route is
+                            // in flight, so each iteration only needs to see
+                            // its publication land on the already-bound route
+                            // alias — never a fresh identity resolution.
                             if let Some(server) = self
-                                .cached_project_server_for_requirement(handshake, requirement)
+                                .route_bound_project_server(handshake, requirement)
                                 .await?
                             {
                                 return Ok(server);
@@ -677,6 +737,7 @@ impl DaemonEngine {
         })
     }
 
+    #[hotpath::skip]
     pub(super) async fn cached_project_open_failure(
         &self,
         handshake: &DaemonHandshake,
@@ -687,6 +748,7 @@ impl DaemonEngine {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn shutdown_project_open_tasks(&self) {
         project_open_tasks(&self.project_open_gates)
             .await
@@ -698,6 +760,7 @@ impl DaemonEngine {
     /// Watcher and scheduler activation happen only after this returns so those
     /// components can acquire the same coordinator without recursive locking.
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn open_project_server(
         &self,
         handshake: &DaemonHandshake,
@@ -802,6 +865,12 @@ impl DaemonEngine {
             {
                 git_watch::GitWatcherAdmission::Ready
                 | git_watch::GitWatcherAdmission::Disabled => {}
+                git_watch::GitWatcherAdmission::LinkedWorktreeDisabled => {
+                    log_daemon_event(
+                        "git_watch_admission_rejected",
+                        &[("reason", "linked_worktree_disabled".to_string())],
+                    );
+                }
                 git_watch::GitWatcherAdmission::ShuttingDown => {
                     log_daemon_event(
                         "git_watch_admission_rejected",
@@ -922,7 +991,7 @@ impl DaemonEngine {
                 .await;
             if matches!(
                 automation_outcome,
-                crate::dashboard::AutomationSchedulerReconcileOutcome::Retiring
+                tracedecay_dashboard_api::AutomationSchedulerReconcileOutcome::Retiring
             ) {
                 MaintenanceRekeyOutcome::Retiring
             } else {

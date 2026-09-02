@@ -10,6 +10,7 @@ mod config_backend;
 mod config_inventory;
 mod config_store;
 mod configuration_operation;
+mod configuration_runtime;
 mod coordinator;
 mod fair_scheduler;
 mod graph_provider;
@@ -48,6 +49,9 @@ pub use configuration_operation::{
     SemanticEvaluationSnapshotPortV1, SemanticProtectedActivationOperationV1,
     SemanticProtectedRollbackOperationV1,
 };
+pub use configuration_runtime::{
+    InstalledSemanticActivationCoordination, ProjectSemanticActivationExt,
+};
 pub use coordinator::{
     ProductionSemanticActivationCoordinatorV1, SemanticActivationCoordinationErrorV1,
 };
@@ -72,7 +76,7 @@ pub use ports::{
     SemanticActivationRequestV1, SemanticConfigurationBackendErrorV1, SemanticConfigurationPinV1,
     SemanticConfigurationSnapshotSourceV1, SemanticConfigurationTransitionV1,
     SemanticCurrentLinkedActivationV1, SemanticExecutableGenerationLeaseV1,
-    SemanticExecutableGenerationV1, SemanticFallbackReasonV1, SemanticLinkedTransitionV1,
+    SemanticExecutableGenerationV1, SemanticLinkedTransitionV1,
     SemanticRetrievalConfigurationPortV1, SemanticRollbackCommandV1, SemanticRollbackReceiptV1,
     SemanticRollbackRequestV1, SemanticRuntimeBackendErrorV1, SemanticRuntimeBackendV1,
     SemanticRuntimeContractErrorV1, SemanticRuntimeControlErrorV1, SemanticRuntimeFuture,
@@ -91,8 +95,9 @@ pub use production::{
     SemanticEvaluationPublicationLeaseV1, SemanticVectorPublicationLeaseV1,
     SemanticVerifiedEvaluationTargetSnapshotV1, lifecycle_to_runtime_state,
     prefer_lifecycle_over_generic_unavailable, production_saved_generation_schedule_hook,
-    project_semantic_application_status, project_semantic_production_runtime,
-    project_semantic_source_generation, register_project_semantic_runtime,
+    project_or_shared_lifecycle_status, project_semantic_application_status,
+    project_semantic_production_runtime, project_semantic_source_generation,
+    register_project_semantic_runtime, resolve_project_semantic_runtime_status,
     resolve_semantic_application_status, unbind_project_semantic_cache_if_current,
     unregister_project_semantic_runtime,
 };

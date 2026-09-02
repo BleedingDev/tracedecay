@@ -142,11 +142,13 @@ impl RetainedSurfaceOperation {
     /// adapter. SDK clients invoke the operation-selected routes.
     pub const SDK_EXECUTABLE: [Self; 26] = Self::ALL;
 
+    #[hotpath::skip]
     pub const fn is_callable(self) -> bool {
         !matches!(self, Self::SessionRefresh)
     }
 
     /// Additional SDK controls that cannot live in the bounds-only operation body.
+    #[hotpath::skip]
     pub const fn sdk_operation_contract(self) -> RetainedSdkOperationContractV1 {
         match self {
             Self::FactStoreCurate => RetainedSdkOperationContractV1 {
@@ -157,6 +159,7 @@ impl RetainedSurfaceOperation {
         }
     }
 
+    #[hotpath::skip]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::FactStoreCurate => "fact_store_curate",

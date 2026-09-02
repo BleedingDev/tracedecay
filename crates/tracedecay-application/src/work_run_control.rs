@@ -280,6 +280,7 @@ impl<S> WorkRunControlService<S>
 where
     S: WorkRunControlStoragePort,
 {
+    #[hotpath::skip]
     pub const fn new(storage: S) -> Self {
         Self { storage }
     }

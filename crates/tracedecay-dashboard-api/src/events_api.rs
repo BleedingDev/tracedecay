@@ -23,7 +23,7 @@
 //!   size (a real change signal that tells the client to refetch
 //!   `/api/storage/telemetry`).
 //!
-//! **Durable activity records** (via [`crate::application::event_lane`]): the daemon
+//! **Durable activity records** (via [`tracedecay_session_memory::event_lane`]): the daemon
 //! observes real agent work continuously — host hooks admitted on the MCP
 //! boundary, transcript messages persisted, touched paths queued for indexing,
 //! tool calls dispatched. Each producer durably publishes its own project
@@ -66,7 +66,7 @@ use super::DashboardState;
 use super::read_model::{
     DashboardCoverageV1, DashboardScopeV1, DashboardWatermarkV1, now_micros, scope_from_state,
 };
-use crate::application::event_lane::{
+use tracedecay_session_memory::event_lane::{
     ActivityFamilyV1, ActivityFrontierV1, ActivityPulseV1, ActivityRecordV1,
 };
 
@@ -519,13 +519,13 @@ pub async fn events(State(state): State<DashboardState>, headers: HeaderMap) -> 
     // Subscribe before reading history. Any event appended between those two
     // steps is either in the replay or the live receiver and is deduplicated by
     // producer sequence.
-    let mut activity = crate::application::event_lane::subscribe();
+    let mut activity = tracedecay_session_memory::event_lane::subscribe();
     let requested = parse_last_event_id(&headers);
     let activity_db = state.lcm_db.clone();
     let activity_project_id = state.project_id.clone();
     let initial_replay = match (activity_db.as_deref(), activity_project_id.as_deref()) {
         (Some(db), Some(project_id)) => {
-            crate::application::event_lane::replay_after(
+            tracedecay_session_memory::event_lane::replay_after(
                 db,
                 project_id,
                 requested.as_ref().map(|resume| resume.sequence),
@@ -561,7 +561,7 @@ pub async fn events(State(state): State<DashboardState>, headers: HeaderMap) -> 
                 && let (Some(db), Some(project_id)) =
                     (activity_db.as_deref(), activity_project_id.as_deref())
                 && let Some(from_start) =
-                    crate::application::event_lane::replay_after(db, project_id, None).await
+                    tracedecay_session_memory::event_lane::replay_after(db, project_id, None).await
             {
                 replay = from_start;
             }
@@ -628,7 +628,7 @@ pub async fn events(State(state): State<DashboardState>, headers: HeaderMap) -> 
                         Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                             if let (Some(db), Some(project_id)) =
                                 (activity_db.as_deref(), activity_project_id.as_deref())
-                                && let Some(replay) = crate::application::event_lane::replay_after(
+                                && let Some(replay) = tracedecay_session_memory::event_lane::replay_after(
                                     db,
                                     project_id,
                                     Some(producer_cursor),
@@ -902,9 +902,9 @@ pub(crate) async fn dashboard_state_fixture(
 ) -> (tempfile::TempDir, DashboardState) {
     use std::sync::Arc;
 
+    use tracedecay_configuration::ProductionUserSettingsDaemonClient;
     use tracedecay_domain::{FactOwnerV1, ProjectId};
     use tracedecay_runtime_core::db::{Database, DatabaseAuthority, TestDatabaseRuntimeMode};
-    use tracedecay_usecases::configuration::ProductionUserSettingsDaemonClient;
 
     let project = tempfile::tempdir().expect("project tempdir");
     std::fs::write(project.path().join("lib.rs"), "pub fn fixture() {}\n").expect("fixture source");
@@ -944,6 +944,7 @@ pub(crate) async fn dashboard_state_fixture(
     std::fs::create_dir_all(&dashboard_root).expect("fixture dashboard root");
 
     let state = DashboardState {
+        build_version: "0.0.0-fixture+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         project_id: Some(project_identity.as_str().to_owned()),
         resolved_scope: crate::scope::resolve_dashboard_scope(
             &project_root,

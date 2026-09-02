@@ -123,7 +123,7 @@ fn clone_scheduler_error(error: &CodeIndexSchedulerErrorV1) -> CodeIndexSchedule
         CodeIndexSchedulerErrorV1::WorkerPlan(error) => {
             CodeIndexSchedulerErrorV1::WorkerPlan(error.clone())
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-helpers")))]
         CodeIndexSchedulerErrorV1::WorkerPlanNotInstalled => {
             CodeIndexSchedulerErrorV1::WorkerPlanNotInstalled
         }
@@ -431,6 +431,7 @@ impl CodeIndexSchedulerRegistryV1 {
             serving_generation_epoch,
             graph_activation,
             publication_gate,
+            build_publication_lock,
             shutting_down,
             wake,
             pending_wake,
@@ -452,6 +453,7 @@ impl CodeIndexSchedulerRegistryV1 {
                 Arc::clone(&worktree.serving_generation_epoch),
                 worktree.graph_activation.clone(),
                 Arc::clone(&worktree.semantic_evaluation_publication_gate),
+                Arc::clone(&worktree.build_publication_lock),
                 Arc::clone(&worktree.shutting_down),
                 Arc::clone(&worktree.wake),
                 Arc::clone(&worktree.pending_wake),
@@ -460,10 +462,13 @@ impl CodeIndexSchedulerRegistryV1 {
             )
         };
         refuse_if_interrupted(control, &shutting_down)?;
-        let _publication =
-            acquire_publication_gate(publication_gate.as_ref(), control, &shutting_down).await?;
         let _daemon_admission =
             acquire_daemon_admission(background_reconcile_admission, control, &shutting_down)
+                .await?;
+        let _publication =
+            acquire_publication_gate(publication_gate.as_ref(), control, &shutting_down).await?;
+        let _build_publication =
+            acquire_publication_gate(build_publication_lock.as_ref(), control, &shutting_down)
                 .await?;
         refuse_if_interrupted(control, &shutting_down)?;
         let _reconcile_pass = ReconcilePassGuard::enter(&reconcile_in_progress);

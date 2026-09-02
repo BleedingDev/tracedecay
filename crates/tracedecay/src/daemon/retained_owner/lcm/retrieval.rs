@@ -14,33 +14,32 @@ use tracedecay_application::{
     ApplicationOutcome, RetainedSurfaceExecutionContextV1, RetainedSurfaceExecutionErrorV1,
 };
 use tracedecay_domain::{HydrationStateV1, RetrievalGrainV1, SessionId, TemporalModeV1};
-use tracedecay_sessions::runtime::git_correlation::GitScopeFilter;
-use tracedecay_sessions::runtime::lcm::{
+use tracedecay_lcm::{
     LcmContentSlice, LcmDescribeTarget, LcmExpandQueryPagination, LcmExpandQueryResponse,
     LcmExpandTarget, LcmSourceRef,
 };
+use tracedecay_session_memory::session::{SessionRetrievalScope, SessionTemporalQuery};
+use tracedecay_sessions::runtime::git_correlation::{GitScopeFilter, git_scope_filter_from_args};
 use tracedecay_sessions::runtime::{
     SessionMessageType, SessionSearchScope, SessionSearchTimeRange,
 };
 use tracedecay_temporal_query::context::ContextBudget;
-use tracedecay_temporal_query::ports::ExecutionLimits;
 use tracedecay_temporal_query::ranking::DiversityLimits;
-use tracedecay_usecases::session::{SessionRetrievalScope, SessionTemporalQuery};
 
 use super::super::receipts::evidence_outcome;
+use super::super::session_retrieval_unavailable_detail;
 use super::output;
 use super::{
-    bounded_text, cursor, message_type, optional_provider, optional_usize, relationship_scope,
-    required, role_name, session_id, specific_provider, temporal_mode, time_filter, trimmed,
-    unsigned_i64,
+    cursor, message_type, optional_provider, optional_usize, relationship_scope, required,
+    role_name, session_id, specific_provider, temporal_mode, time_filter, trimmed, unsigned_i64,
 };
-use crate::daemon::session_retrieval::{
+use tracedecay_runtime_core::timeutil::SearchTimeBound;
+use tracedecay_session_runtime::session_retrieval::{
     LcmDescribeServiceCommand, LcmDescribeServiceOutcome, LcmExpandServiceCommand,
     LcmExpandServiceOutcome, SessionApplicationRetrievalPortV1, SessionRetrievalCommand,
     SessionRetrievalFilters, SessionRetrievalServiceOutcome, SessionRetrievalStoreScope,
     SessionTemporalMetadataView,
 };
-use tracedecay_runtime_core::timeutil::SearchTimeBound;
 
 const MAX_RESULTS: usize = 100;
 const EXPAND_QUERY_CONCURRENCY: usize = 8;
@@ -48,7 +47,7 @@ const EXPAND_QUERY_CONCURRENCY: usize = 8;
 // fail within_request_budgets as a persistent structural budget refusal, so
 // every query built here is sized against the one shared constant.
 const ADMITTED_RETRIEVAL_BYTE_LIMIT: usize =
-    crate::daemon::session_retrieval::APPLICATION_RETRIEVAL_MAX_BYTES as usize;
+    tracedecay_session_runtime::session_retrieval::APPLICATION_RETRIEVAL_MAX_BYTES as usize;
 const DEFAULT_CONTENT_LIMIT: usize = 4_096;
 const MAX_CONTENT_LIMIT: usize = 8_192;
 const MAX_LOAD_CONTENT_LIMIT: usize = 20_000;
@@ -63,7 +62,11 @@ pub(super) async fn execute_load_session(
     context: &RetainedSurfaceExecutionContextV1<'_>,
     request: &LcmLoadSessionRequestV1,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
-    let service = service.ok_or(RetainedSurfaceExecutionErrorV1::Unavailable)?;
+    let service = service.ok_or_else(|| {
+        RetainedSurfaceExecutionErrorV1::unavailable(
+            "the session retrieval authority is not mounted for this scope",
+        )
+    })?;
     let session_id = session_id(&request.session_id)?;
     let provider = optional_provider(request.provider.as_deref())?;
     let requested_content_limit =
@@ -154,7 +157,11 @@ pub(super) async fn execute_grep(
     context: &RetainedSurfaceExecutionContextV1<'_>,
     request: &LcmGrepRequestV1,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
-    let service = service.ok_or(RetainedSurfaceExecutionErrorV1::Unavailable)?;
+    let service = service.ok_or_else(|| {
+        RetainedSurfaceExecutionErrorV1::unavailable(
+            "the session retrieval authority is not mounted for this scope",
+        )
+    })?;
     let query_text = required(&request.query)?;
     if !matches!(request.sort, None | Some(LcmGrepSortV1::Relevance)) {
         return Err(RetainedSurfaceExecutionErrorV1::Unsupported);
@@ -183,7 +190,7 @@ pub(super) async fn execute_grep(
         .unwrap_or_default();
     let start = request.start_time.as_ref().or(request.since.as_ref());
     let end = request.end_time.as_ref().or(request.until.as_ref());
-    let git_filter = GitScopeFilter::from_args(
+    let git_filter = git_scope_filter_from_args(
         trimmed(request.branch.as_deref())?,
         trimmed(request.worktree.as_deref())?,
         trimmed(request.commit.as_deref())?,
@@ -255,7 +262,11 @@ pub(super) async fn execute_describe(
     context: &RetainedSurfaceExecutionContextV1<'_>,
     request: &LcmDescribeRequestV1,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
-    let service = service.ok_or(RetainedSurfaceExecutionErrorV1::Unavailable)?;
+    let service = service.ok_or_else(|| {
+        RetainedSurfaceExecutionErrorV1::unavailable(
+            "the session retrieval authority is not mounted for this scope",
+        )
+    })?;
     let provider = specific_provider(&request.provider)?;
     let session_id = session_id(&request.session_id)?;
     let (target, grain) = match request.target.as_ref() {
@@ -368,7 +379,11 @@ pub(super) async fn execute_expand(
     context: &RetainedSurfaceExecutionContextV1<'_>,
     request: &LcmExpandRequestV1,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
-    let service = service.ok_or(RetainedSurfaceExecutionErrorV1::Unavailable)?;
+    let service = service.ok_or_else(|| {
+        RetainedSurfaceExecutionErrorV1::unavailable(
+            "the session retrieval authority is not mounted for this scope",
+        )
+    })?;
     let provider = specific_provider(&request.provider)?;
     let session_id = session_id(&request.session_id)?;
     let (target, grain, summary) = match &request.target {
@@ -441,15 +456,26 @@ pub(super) async fn execute_expand_query(
     context: &RetainedSurfaceExecutionContextV1<'_>,
     request: &LcmExpandQueryRequestV1,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
-    let service = service.ok_or(RetainedSurfaceExecutionErrorV1::Unavailable)?;
+    let service = service.ok_or_else(|| {
+        RetainedSurfaceExecutionErrorV1::unavailable(
+            "the session retrieval authority is not mounted for this scope",
+        )
+    })?;
     let provider = specific_provider(&request.provider)?;
     let session_id = session_id(&request.session_id)?;
-    let prompt = bounded_text(&request.prompt, MAX_QUERY_PROMPT_CHARS)?;
+    // The synthesis contract clamps oversized prompt and query inputs to the
+    // MCP bound with typed truncation markers instead of refusing, so an
+    // agent's long question still gets a synthesizable answer.
+    let (prompt, prompt_truncated) = clamped_text(&request.prompt, MAX_QUERY_PROMPT_CHARS)?;
     let query = request
         .query
         .as_deref()
-        .map(|value| bounded_text(value, MAX_QUERY_QUERY_CHARS))
+        .map(|value| clamped_text(value, MAX_QUERY_QUERY_CHARS))
         .transpose()?;
+    let (query, query_truncated) = match query {
+        Some((value, truncated)) => (Some(value), truncated),
+        None => (None, false),
+    };
     let node_ids = request
         .node_ids
         .as_deref()
@@ -477,8 +503,8 @@ pub(super) async fn execute_expand_query(
             context,
             provider,
             &session_id,
-            prompt,
-            query,
+            &prompt,
+            query.as_deref(),
             cursor,
             max_results,
             max_tokens,
@@ -491,8 +517,8 @@ pub(super) async fn execute_expand_query(
             context,
             provider,
             &session_id,
-            prompt,
-            query,
+            &prompt,
+            query.as_deref(),
             node_ids,
             cursor,
             max_results,
@@ -501,18 +527,34 @@ pub(super) async fn execute_expand_query(
         )
         .await?
     };
+    let mut result = output::expand_query_result(
+        response,
+        status,
+        omitted,
+        provider,
+        session_id.as_str(),
+        output::temporal_fields(temporal),
+    );
+    output::bound_expand_query_result_for_mcp(&mut result, prompt_truncated, query_truncated);
     evidence_outcome(
         context,
         RetainedSurfaceOperation::LcmExpandQuery,
-        RetainedSurfaceResultV1::LcmExpandQuery(output::expand_query_result(
-            response,
-            status,
-            omitted,
-            provider,
-            session_id.as_str(),
-            output::temporal_fields(temporal),
-        )),
+        RetainedSurfaceResultV1::LcmExpandQuery(result),
     )
+}
+
+/// Requires non-blank text and clamps it to `max` characters, reporting
+/// whether it was truncated — the expand-query synthesis contract clamps
+/// oversized inputs with typed markers instead of refusing them.
+fn clamped_text(
+    value: &str,
+    max: usize,
+) -> Result<(String, bool), RetainedSurfaceExecutionErrorV1> {
+    let value = required(value)?;
+    let mut chars = value.chars();
+    let clamped: String = chars.by_ref().take(max).collect();
+    let truncated = chars.next().is_some();
+    Ok((clamped, truncated))
 }
 
 fn retrieval_query(
@@ -545,7 +587,9 @@ fn retrieval_query(
     )
     .map_err(|_| RetainedSurfaceExecutionErrorV1::InvalidRequest)?
     .with_retrieval_scope(retrieval_scope)
-    .with_execution_limits(admitted_execution_limits(limit));
+    .with_execution_limits(
+        tracedecay_session_runtime::session_retrieval::admitted_execution_limits(limit),
+    );
     Ok(SessionRetrievalCommand::new(
         query,
         SessionRetrievalFilters {
@@ -563,23 +607,6 @@ fn retrieval_query(
         false,
     )
     .into_query())
-}
-
-fn admitted_execution_limits(limit: usize) -> ExecutionLimits {
-    ExecutionLimits {
-        candidate_limit: limit,
-        candidate_total_bytes: ADMITTED_RETRIEVAL_BYTE_LIMIT,
-        candidate_item_bytes: ADMITTED_RETRIEVAL_BYTE_LIMIT,
-        candidate_metadata_field_bytes: 16 * 1024,
-        record_limit: limit,
-        record_total_bytes: ADMITTED_RETRIEVAL_BYTE_LIMIT,
-        record_item_bytes: ADMITTED_RETRIEVAL_BYTE_LIMIT,
-        hydration_limit: limit,
-        hydration_total_bytes: ADMITTED_RETRIEVAL_BYTE_LIMIT,
-        hydration_payload_bytes: ADMITTED_RETRIEVAL_BYTE_LIMIT,
-        hydration_chunk_bytes: 16 * 1024,
-        ..ExecutionLimits::default()
-    }
 }
 
 fn retrieval_page(
@@ -643,13 +670,22 @@ fn retrieval_error(outcome: SessionRetrievalServiceOutcome) -> RetainedSurfaceEx
         SessionRetrievalServiceOutcome::Cancelled => RetainedSurfaceExecutionErrorV1::Cancelled(
             tracedecay_application::CancellationStage::DuringRead,
         ),
-        SessionRetrievalServiceOutcome::Locked
-        | SessionRetrievalServiceOutcome::Unavailable(_)
-        | SessionRetrievalServiceOutcome::Complete { .. }
+        SessionRetrievalServiceOutcome::Locked => RetainedSurfaceExecutionErrorV1::unavailable(
+            "the session store is locked for retrieval",
+        ),
+        SessionRetrievalServiceOutcome::Unavailable(unavailable) => {
+            RetainedSurfaceExecutionErrorV1::unavailable(session_retrieval_unavailable_detail(
+                &unavailable,
+            ))
+        }
+        // Page-shaped outcomes are consumed by the caller before this mapper.
+        SessionRetrievalServiceOutcome::Complete { .. }
         | SessionRetrievalServiceOutcome::CompleteZero { .. }
         | SessionRetrievalServiceOutcome::Partial { .. }
         | SessionRetrievalServiceOutcome::Stale { .. } => {
-            RetainedSurfaceExecutionErrorV1::Unavailable
+            RetainedSurfaceExecutionErrorV1::unavailable(
+                "the session retrieval service returned an unexpected page-shaped outcome",
+            )
         }
     }
 }
@@ -684,11 +720,20 @@ fn describe_error(outcome: LcmDescribeServiceOutcome) -> RetainedSurfaceExecutio
         LcmDescribeServiceOutcome::Cancelled => RetainedSurfaceExecutionErrorV1::Cancelled(
             tracedecay_application::CancellationStage::DuringRead,
         ),
-        LcmDescribeServiceOutcome::Locked
-        | LcmDescribeServiceOutcome::Unavailable(_)
-        | LcmDescribeServiceOutcome::Complete { .. }
+        LcmDescribeServiceOutcome::Locked => RetainedSurfaceExecutionErrorV1::unavailable(
+            "the session store is locked for retrieval",
+        ),
+        LcmDescribeServiceOutcome::Unavailable(unavailable) => {
+            RetainedSurfaceExecutionErrorV1::unavailable(session_retrieval_unavailable_detail(
+                &unavailable,
+            ))
+        }
+        // Page-shaped outcomes are consumed by the caller before this mapper.
+        LcmDescribeServiceOutcome::Complete { .. }
         | LcmDescribeServiceOutcome::Partial { .. }
-        | LcmDescribeServiceOutcome::Stale { .. } => RetainedSurfaceExecutionErrorV1::Unavailable,
+        | LcmDescribeServiceOutcome::Stale { .. } => RetainedSurfaceExecutionErrorV1::unavailable(
+            "the LCM describe service returned an unexpected page-shaped outcome",
+        ),
     }
 }
 
@@ -720,11 +765,20 @@ fn expand_error(outcome: LcmExpandServiceOutcome) -> RetainedSurfaceExecutionErr
         LcmExpandServiceOutcome::Cancelled => RetainedSurfaceExecutionErrorV1::Cancelled(
             tracedecay_application::CancellationStage::DuringRead,
         ),
-        LcmExpandServiceOutcome::Locked
-        | LcmExpandServiceOutcome::Unavailable(_)
-        | LcmExpandServiceOutcome::Complete { .. }
+        LcmExpandServiceOutcome::Locked => RetainedSurfaceExecutionErrorV1::unavailable(
+            "the session store is locked for retrieval",
+        ),
+        LcmExpandServiceOutcome::Unavailable(unavailable) => {
+            RetainedSurfaceExecutionErrorV1::unavailable(session_retrieval_unavailable_detail(
+                &unavailable,
+            ))
+        }
+        // Page-shaped outcomes are consumed by the caller before this mapper.
+        LcmExpandServiceOutcome::Complete { .. }
         | LcmExpandServiceOutcome::Partial { .. }
-        | LcmExpandServiceOutcome::Stale { .. } => RetainedSurfaceExecutionErrorV1::Unavailable,
+        | LcmExpandServiceOutcome::Stale { .. } => RetainedSurfaceExecutionErrorV1::unavailable(
+            "the LCM expand service returned an unexpected page-shaped outcome",
+        ),
     }
 }
 

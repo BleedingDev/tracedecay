@@ -51,9 +51,9 @@ impl HostAdmissionTestRuntimeV1 {
     #[doc(hidden)]
     pub async fn import_profile_hook_analytics_for_test(
         &self,
-        sources: &[crate::analytics_bridge::HookImportSource],
-    ) -> crate::analytics_bridge::HookImportOutcome {
-        crate::analytics_bridge::import_hook_analytics(
+        sources: &[tracedecay_usecases::analytics_bridge::HookImportSource],
+    ) -> tracedecay_usecases::analytics_bridge::HookImportOutcome {
+        tracedecay_usecases::analytics_bridge::import_hook_analytics(
             self.profile_database.as_ref(),
             sources.to_vec(),
         )
@@ -110,11 +110,18 @@ impl HostAdmissionTestRuntimeV1 {
             })
     }
 
+    /// Fails the calling test loudly: an unreadable global total is not a
+    /// total of zero.
     #[doc(hidden)]
-    pub async fn global_tokens_saved(&self) -> Option<u64> {
-        self.profile_database.global_tokens_saved().await
+    pub async fn global_tokens_saved(&self) -> u64 {
+        self.profile_database
+            .try_global_tokens_saved()
+            .await
+            .unwrap_or_else(|error| panic!("could not read global tokens saved: {error}"))
     }
 
+    /// Fails the calling test loudly: a dropped savings write would let the
+    /// test assert against a ledger row that was never stored.
     #[doc(hidden)]
     pub async fn record_savings_for_test(
         &self,
@@ -125,26 +132,37 @@ impl HostAdmissionTestRuntimeV1 {
         timestamp: i64,
     ) {
         self.profile_database
-            .record_savings(project, tool, before, after, timestamp)
-            .await;
+            .try_record_savings(project, tool, before, after, timestamp)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("could not append savings ledger entry for '{project}': {error}")
+            });
     }
 
+    /// Fails the calling test loudly: an unreadable ledger is not a zero total.
     #[doc(hidden)]
     pub async fn sum_savings_for_test(
         &self,
         project: Option<&str>,
         since: i64,
     ) -> tracedecay_global_db::SavingsTotal {
-        self.profile_database.sum_savings(project, since).await
+        self.profile_database
+            .sum_savings(project, since)
+            .await
+            .unwrap_or_else(|error| panic!("could not sum savings ledger: {error}"))
     }
 
+    /// Fails the calling test loudly: an unreadable ledger is not an empty history.
     #[doc(hidden)]
     pub async fn savings_history_for_test(
         &self,
         project: Option<&str>,
         since: i64,
     ) -> Vec<tracedecay_global_db::SavingsDay> {
-        self.profile_database.savings_history(project, since).await
+        self.profile_database
+            .savings_history(project, since)
+            .await
+            .unwrap_or_else(|error| panic!("could not read savings history: {error}"))
     }
 
     /// Reads the registered project's immutable provider-usage observations —
@@ -180,7 +198,7 @@ impl HostAdmissionTestRuntimeV1 {
     #[doc(hidden)]
     pub fn dashboard_test_authority(
         self: &Arc<Self>,
-    ) -> Result<crate::dashboard::DashboardHostAdmissionTestAuthorityV1> {
+    ) -> Result<tracedecay_dashboard_api::DashboardHostAdmissionTestAuthorityV1> {
         let project_sessions =
             self.project_registered
                 .clone()
@@ -189,7 +207,7 @@ impl HostAdmissionTestRuntimeV1 {
                     message: "registered ProjectSessions mount is unavailable".to_owned(),
                 })?;
         Ok(
-            crate::dashboard::DashboardHostAdmissionTestAuthorityV1::new(
+            tracedecay_dashboard_api::DashboardHostAdmissionTestAuthorityV1::new(
                 Arc::clone(self),
                 self.profile_database.clone(),
                 project_sessions,

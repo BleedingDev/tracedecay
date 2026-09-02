@@ -1,8 +1,8 @@
 //! `TraceDecay` runtime kernel.
 //!
 //! This crate owns the load-bearing runtime substrate that every other
-//! `TraceDecay` subsystem sits on: the canonical error type, shared value
-//! types, the storage layout resolver, the `SQLite` database facade and its
+//! `TraceDecay` subsystem sits on: shared value types, the storage layout
+//! resolver, the `SQLite` database facade and its
 //! migrations, the observation/memory/session stores, git and worktree
 //! topology reads, process-level leases, and the privacy detectors.
 //!
@@ -76,28 +76,29 @@
 #![allow(rustdoc::broken_intra_doc_links)]
 #![allow(rustdoc::private_intra_doc_links)]
 
+/// Upper bound for daemon-owned shutdown persistence work.
+pub const DAEMON_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
+/// Grace retained for forced task abort and join during daemon shutdown.
+pub const DAEMON_TASK_ABORT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub mod branch;
 pub mod branch_meta;
 pub mod cancellation;
 pub mod config;
 pub mod db;
-pub mod durability;
-pub mod errors;
 pub mod git;
 pub mod git_discovery;
 pub mod git_repository;
 pub mod lifecycle_lease;
 pub mod memory;
+pub mod monitor_ring;
 pub mod os_str_bytes;
 pub mod path_safety;
 pub mod path_scope;
 pub mod privacy;
 mod profiled_lock;
-pub mod project_registry;
-pub mod redundancy;
 pub mod resident_memory;
 pub mod runtime_identity;
-pub mod serde_util;
 pub mod sqlite_read_snapshot;
 pub mod storage;
 pub mod store;
@@ -106,6 +107,7 @@ pub mod sync;
 pub mod text;
 pub mod timeutil;
 pub mod tracedecay;
+pub mod weak_registry;
 #[cfg(windows)]
 pub use tracedecay_private_fs::windows as windows_security;
 pub mod work_topology;

@@ -13,19 +13,19 @@
     "url": "https://github.com/ScriptedAlchemy/tracedecay/pull/707"
   },
   "pinned_floor": {
-    "sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
-    "selected_at": "2026-08-29T23:13:31Z",
-    "selection_basis": "PR #707 head when the product branch was created",
+    "sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+    "selected_at": "2026-09-02T00:00:00Z",
+    "selection_basis": "PR #707 head codex/tracedecay-total-redesign-plan-reopened observed on 2026-09-02; advanced by the tdmem-1208 sync train from the previous floor 08fbe33a.",
     "must_be_ancestor_of_product_head": true
   },
   "observed_pull_request": {
-    "retrieved_at": "2026-08-30",
+    "retrieved_at": "2026-09-02",
     "state": "open",
     "base_ref": "master",
     "base_sha": "b9204dcf7de8faac4ef05af367a546aa29c32e9f",
     "head_ref": "codex/tracedecay-total-redesign-plan-reopened",
-    "head_sha": "a98f61ca354a2dde6ed2e690d267d99908b30ef8",
-    "pinned_floor_is_current_head": false
+    "head_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+    "pinned_floor_is_current_head": true
   },
   "update_procedure": {
     "observed_pull_request": "Refresh only the observed snapshot after reading PR #707 metadata, then run the verifier and focused test.",

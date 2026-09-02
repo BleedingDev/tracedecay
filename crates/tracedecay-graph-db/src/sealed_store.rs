@@ -57,9 +57,8 @@ use crate::lease::GenerationLocator;
 use crate::location::PersistentGraphStoreState;
 use crate::projection::graph_properties_live_bytes;
 use crate::state::{
-    EndpointIdentityCache, latest_projection, load_entity, load_entity_by_node,
-    load_relation_by_locator_cached, projection_entity_nodes_sorted_checked,
-    projection_relation_nodes_sorted_checked,
+    EndpointIdentityCache, latest_projection, load_entity, load_relation_by_locator_cached,
+    projection_entity_nodes_sorted_checked, projection_relation_nodes_sorted_checked,
 };
 use crate::{
     GraphDb, GraphDbError, GraphDbLocation, GraphDbOpenOptions, GraphDurability, GraphEntity,
@@ -70,12 +69,14 @@ use crate::{
 
 /// Opens and verifies one dependency-free sealed generation without opening
 /// the shared mutable staging database.
+#[hotpath::measure(label = "graph_db.sealed_store.open_direct")]
 pub(crate) fn open_direct_sealed_generation(
     database_path: &Path,
     projection: crate::GraphProjectionIdentity,
     generation: crate::GraphGenerationId,
     expected: &GraphRecoveredGenerationDigestV1,
     authority_lease: Arc<dyn tracedecay_store::RetainedGraphStoreLeaseV1>,
+    check: &dyn Fn() -> Result<(), GraphDbError>,
 ) -> Result<Option<(crate::GraphDbLeaseV1, GraphGenerationManifestIdentity)>, GraphDbError> {
     if sealed_store_disabled() {
         return Ok(None);
@@ -127,12 +128,10 @@ pub(crate) fn open_direct_sealed_generation(
             Vec::new(),
         )
     };
-    let verification = {
-        let guard = database.read_guard()?;
-        let native = guard.as_ref().ok_or(GraphDbError::Closed)?;
-        verify_sealed_copy_generation(native, &identity, expected, &|| Ok(()))
-    };
-    if let Err(error) = verification {
+    // Same marker-aware proof as registry adoption: a boot that reopens the
+    // exact bytes an earlier open already proved resolves by stat, and a
+    // fresh or moved container pays the full row proof and files the marker.
+    if let Err(error) = sealed_copy_proof(&database, &identity, expected, check) {
         let _ = database.close();
         return Err(sealed_store_failure(
             "post-reopen verification failed",
@@ -149,6 +148,12 @@ pub(crate) fn open_direct_sealed_generation(
 /// batch budget the staging path already proves out.
 const MAX_SEALED_COPY_MUTATIONS: usize = crate::limits::MAX_NATIVE_GENERATION_STAGE_MUTATIONS;
 const MAX_SEALED_COPY_LIVE_BYTES: usize = 96 * 1024 * 1024;
+/// Rows loaded from the shared staging database per read-guard hold while a
+/// sealed copy streams. Small enough that a queued writer (and the readers
+/// that pile up behind it under `std::sync::RwLock`'s writer preference)
+/// waits milliseconds, large enough that lock churn stays negligible against
+/// row decode cost.
+const SEALED_COPY_GUARD_CHUNK_ROWS: usize = 4096;
 
 const SEALED_STORE_RECEIPT_VERSION: u32 = 1;
 const SEALED_STORE_DATABASE_FILE: &str = "generation.grafeo";
@@ -158,27 +163,30 @@ const SEALED_STORE_DISABLE_ENV: &str = "TRACEDECAY_GRAPH_SEALED_STORE";
 const SEALED_STORE_FORM_COMPACT: &str = "compact";
 const SEALED_STORE_FORM_REPLAY: &str = "replay";
 
-/// Whether the pinned grafeo revision round-trips `Value::Bytes` through the
-/// columnar `CompactStore` codecs.
+/// Whether Bytes-carrying generations may seal in compact columnar form on
+/// the pinned grafeo revision.
 ///
-/// At rev `019d353b14` it does not: a Bytes column falls back to the
-/// dictionary codec (`compact/builder.rs`, `infer_type_from_values`), and
-/// `Column::value()` restores every dictionary entry as `Value::String`
-/// (`compact/column.rs`). TraceDecay serializes a Bytes payload onto nearly
-/// every code-graph entity, so compacting such a generation would fail its
-/// post-reopen recovered-digest proof. The fork fix exists: branch
-/// `tracedecay/0.5.42-compact-bytes-roundtrip` (rev `0bc27542`, stacked on
-/// the pinned `tracedecay/0.5.42-close-and-overlay`) encodes Bytes entries
-/// losslessly inside the string dictionary, and the full sealed-store
-/// contract passes against it with this constant flipped. Until that branch
-/// is picked up by the workspace pin, a generation whose rows carry any
-/// Bytes property is sealed in **replay form**: still its own isolated
-/// single-generation store — generation-scoped open, retirement by directory
-/// delete, read routing — just without the columnar base. Flip this with the
-/// pin move (and the `bytes_rows_seal_in_replay_form_and_read_exactly`
-/// expectation with it); the post-reopen digest proof will refuse any store
-/// the flip mis-declares.
-const COMPACT_ROUND_TRIPS_BYTES: bool = false;
+/// The pinned rev (`0c4f93a584e9`) carries both compact Bytes dictionary
+/// markers and stable preserved-edge ordering: equal-source edge IDs stay in
+/// the same order as the native CSR topology. A 45,000-entity /
+/// 51,428-relation Bytes generation passed the full post-reopen recovered
+/// digest proof in compact form before this contract was enabled.
+///
+/// Vector-carrying generations never compact regardless of this constant
+/// (`saw_vector_property` in [`seal_generation_store`]): the sealed lane
+/// never serves vector search, so the columnar base buys them nothing, and
+/// mixed-dimension vector columns fall back to the dictionary codec's
+/// `Display` encoding, which does not round-trip.
+const COMPACT_ROUND_TRIPS_BYTES: bool = true;
+
+/// Minimum code-generation row count that may pay eager compact construction.
+///
+/// The first production-shaped comparison (45,000 entities + 51,428
+/// relations) grew from 192.4 MiB in replay form to 204.5 MiB in compact form,
+/// while eager construction added 42% to seal-to-activation time. The next
+/// power of two keeps that measured no-win class on the replay path without
+/// disabling compact Bytes correctness or large-generation eligibility.
+const MIN_EAGER_COMPACT_BYTES_GENERATION_ROWS: usize = 128 * 1024;
 
 /// Receipt binding a sealed store directory to the exact generation and
 /// recovered digest it was built from. Written after the compacted database
@@ -399,6 +407,14 @@ fn properties_carry_bytes(
     properties
         .values()
         .any(|property| matches!(property, crate::GraphProperty::Bytes(_)))
+}
+
+fn properties_carry_vectors(
+    properties: &std::collections::BTreeMap<crate::GraphPropertyName, crate::GraphProperty>,
+) -> bool {
+    properties
+        .values()
+        .any(|property| matches!(property, crate::GraphProperty::Vector(_)))
 }
 
 fn entity_copy_live_bytes(entity: &GraphEntity) -> usize {
@@ -768,7 +784,9 @@ fn copy_compact_and_close(
     let namespace_projection = physical_namespace_projection_map(identity)?;
 
     // Enumerate exactly the digest's row sets from the staging database.
-    let (entity_nodes, relation_rows, dependency_endpoints) = {
+    // Index scans only under this guard; the row loads below reacquire it in
+    // bounded chunks.
+    let (entity_nodes, relation_locators) = {
         let guard = source.read_guard()?;
         let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
         let entity_nodes = projection_entity_nodes_sorted_checked(
@@ -783,21 +801,34 @@ fn copy_compact_and_close(
             &identity.projection.projection,
             check,
         )?;
+        (entity_nodes, relation_locators)
+    };
+    // The staged generation is immutable, so its node handles stay valid
+    // across guard reacquisitions (the per-entity copy below has always
+    // relied on this). Bounding each hold matters because the staging
+    // database is shared: `std::sync::RwLock` blocks new readers once a
+    // writer queues, so one corpus-length read guard here turned every
+    // concurrent write *and every reader arriving behind it* — memory-graph
+    // publication, fact and journey reads — into a build-length stall.
+    let mut endpoint_cache = EndpointIdentityCache::default();
+    let mut relation_rows = Vec::new();
+    relation_rows
+        .try_reserve_exact(relation_locators.len())
+        .map_err(|_| GraphDbError::unavailable("sealed relation copy set is too large"))?;
+    // Endpoint entities living in dependency generations, keyed by the
+    // dependency projection so each copy batch stays namespace-exact.
+    let mut dependency_endpoints: BTreeMap<
+        GraphProjectionIdentity,
+        BTreeMap<GraphEntityId, GraphEntity>,
+    > = BTreeMap::new();
+    for chunk in relation_locators.chunks(SEALED_COPY_GUARD_CHUNK_ROWS) {
+        let guard = source.read_guard()?;
+        let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
         let store = database.graph_store();
-        let mut endpoint_cache = EndpointIdentityCache::default();
-        let mut relation_rows = Vec::new();
-        relation_rows
-            .try_reserve_exact(relation_locators.len())
-            .map_err(|_| GraphDbError::unavailable("sealed relation copy set is too large"))?;
-        // Endpoint entities living in dependency generations, keyed by the
-        // dependency projection so each copy batch stays namespace-exact.
-        let mut dependency_endpoints: BTreeMap<
-            GraphProjectionIdentity,
-            BTreeMap<GraphEntityId, GraphEntity>,
-        > = BTreeMap::new();
-        for (_, locator) in relation_locators {
+        for (_, locator) in chunk {
             check()?;
-            let stored = load_relation_by_locator_cached(database, locator, &mut endpoint_cache)?;
+            let stored =
+                load_relation_by_locator_cached(store.as_ref(), *locator, &mut endpoint_cache)?;
             let from = recovered_entity_ref(store.as_ref(), stored.source, &namespace_projection)?;
             let to = recovered_entity_ref(store.as_ref(), stored.target, &namespace_projection)?;
             for endpoint in [&from, &to] {
@@ -829,13 +860,16 @@ fn copy_compact_and_close(
             )?;
             relation_rows.push(relation);
         }
-        (entity_nodes, relation_rows, dependency_endpoints)
-    };
+    }
+    drop(endpoint_cache);
     let entity_count = entity_nodes.len();
     let relation_count = relation_rows.len();
     let mut saw_bytes_property = relation_rows
         .iter()
         .any(|relation| properties_carry_bytes(&relation.properties));
+    let mut saw_vector_property = relation_rows
+        .iter()
+        .any(|relation| properties_carry_vectors(&relation.properties));
 
     // 1. Dependency endpoint copies, so cross-generation edges resolve.
     for (projection, copies) in dependency_endpoints {
@@ -849,6 +883,7 @@ fn copy_compact_and_close(
         for (_, entity) in copies {
             check()?;
             saw_bytes_property |= properties_carry_bytes(&entity.properties);
+            saw_vector_property |= properties_carry_vectors(&entity.properties);
             let live_bytes = entity_copy_live_bytes(&entity);
             pager.push(
                 &sealed,
@@ -867,22 +902,36 @@ fn copy_compact_and_close(
         identity.projection.projection.clone(),
         identity,
     );
-    for (_, node) in entity_nodes {
-        check()?;
-        let entity = {
+    for chunk in entity_nodes.chunks(SEALED_COPY_GUARD_CHUNK_ROWS) {
+        let mut loaded = Vec::with_capacity(chunk.len());
+        {
             let guard = source.read_guard()?;
             let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
-            load_entity_by_node(database, node)?.entity
-        };
-        saw_bytes_property |= properties_carry_bytes(&entity.properties);
-        let live_bytes = entity_copy_live_bytes(&entity);
-        pager.push(
-            &sealed,
-            GraphMutation::UpsertEntity(entity),
-            None,
-            live_bytes,
-            check,
-        )?;
+            let store = database.graph_store();
+            for (_, node) in chunk {
+                check()?;
+                // Decode straight from the enumerated node: the sorted
+                // enumeration already proved identity uniqueness, so the
+                // unique-key index round-trip `load_entity_by_node` pays
+                // per row contributes nothing here.
+                let record = store.get_node(*node).ok_or_else(|| GraphDbError::Corrupt {
+                    message: "sealed copy entity disappeared during enumeration".to_owned(),
+                })?;
+                loaded.push(crate::schema::decode_entity(&record)?);
+            }
+        }
+        for entity in loaded {
+            saw_bytes_property |= properties_carry_bytes(&entity.properties);
+            saw_vector_property |= properties_carry_vectors(&entity.properties);
+            let live_bytes = entity_copy_live_bytes(&entity);
+            pager.push(
+                &sealed,
+                GraphMutation::UpsertEntity(entity),
+                None,
+                live_bytes,
+                check,
+            )?;
+        }
     }
     pager.flush(&sealed, check)?;
 
@@ -946,12 +995,20 @@ fn copy_compact_and_close(
         check,
     )?;
 
-    // Compact only when the pinned engine round-trips every scalar the rows
-    // carry; otherwise the artifact stays in replay form, still isolated per
-    // generation. The post-reopen digest proof checks the exact durable form
-    // before installation, so copy, compaction, or persistence corruption all
-    // surface as typed refusal rather than silently wrong reads.
-    let form = if saw_bytes_property && !COMPACT_ROUND_TRIPS_BYTES {
+    // Compact only when the pinned engine round-trips every scalar and the
+    // measured form policy justifies paying eager construction. Small
+    // Bytes-carrying code generations stay in replay form because compacting
+    // the measured 96,428-row shape made the artifact larger and delayed
+    // activation. Vector-carrying generations always stay in replay form:
+    // mixed-dimension vectors still use a lossy display dictionary in compact
+    // form. The post-reopen digest proof checks whichever durable form was
+    // selected before installation.
+    let generation_rows = entity_count.saturating_add(relation_count);
+    let compact_bytes_generation = saw_bytes_property
+        && COMPACT_ROUND_TRIPS_BYTES
+        && generation_rows >= MIN_EAGER_COMPACT_BYTES_GENERATION_ROWS;
+    let should_compact = !saw_vector_property && (!saw_bytes_property || compact_bytes_generation);
+    let form = if !should_compact {
         SEALED_STORE_FORM_REPLAY
     } else {
         sealed
@@ -1001,22 +1058,22 @@ fn open_sealed_store(
         Some(PersistentGraphStoreState::Existing),
     )
     .map_err(|error| sealed_store_failure("reopen failed", error))?;
-    // Prove the compacted, reopened store serves exactly the sealed rows.
-    // This runs once per install (build or recovery adoption), so a corrupt
-    // or truncated artifact is discarded before it answers a single read.
-    let canonical_bytes = {
-        let guard = database.read_guard()?;
-        let native = guard.as_ref().ok_or(GraphDbError::Closed)?;
-        match verify_sealed_copy_generation(native, identity, expected, &|| Ok(())) {
-            Ok((_, canonical_bytes)) => canonical_bytes,
-            Err(error) => {
-                drop(guard);
-                let _ = database.close();
-                return Err(sealed_store_failure(
-                    "post-reopen verification failed",
-                    error,
-                ));
-            }
+    // Prove the compacted, reopened store serves exactly the sealed rows
+    // before it answers a single read. The artifact is immutable after its
+    // build, so a proof established by an earlier open of these exact
+    // container bytes stands: the marker beside the artifact resolves it by
+    // stat, and anything else — a missing or foreign marker, or a container
+    // whose file identity moved — falls back to the full row proof and files
+    // the marker for the next open. `expected` still comes from the
+    // relational authority, exactly as on the staging container.
+    let canonical_bytes = match sealed_copy_proof(&database, identity, expected, &|| Ok(())) {
+        Ok(canonical_bytes) => canonical_bytes,
+        Err(error) => {
+            let _ = database.close();
+            return Err(sealed_store_failure(
+                "post-reopen verification failed",
+                error,
+            ));
         }
     };
     database.mark_sealed_read_only();
@@ -1027,4 +1084,408 @@ fn open_sealed_store(
         directory: directory.to_path_buf(),
         database,
     })))
+}
+
+/// Resolves the recovered-digest proof for a reopened sealed copy: by the
+/// artifact's own verify-once marker when the container bytes are the ones an
+/// earlier proof ran over, by the full row-streaming proof otherwise. A full
+/// proof files the marker so the next open of unchanged bytes resolves by
+/// stat. Returns the canonical byte count the proof covers.
+fn sealed_copy_proof(
+    database: &GraphDb,
+    identity: &GraphGenerationManifestIdentity,
+    expected: &GraphRecoveredGenerationDigestV1,
+    check: &dyn Fn() -> Result<(), GraphDbError>,
+) -> Result<u64, GraphDbError> {
+    let locator = GenerationLocator::new(identity.projection.clone(), identity.generation.clone());
+    if let Some(canonical_bytes) = database.inner.markers.lookup(&locator, expected.as_str()) {
+        database.inner.markers.record_fresh(&locator);
+        #[cfg(test)]
+        crate::generation::record_sealed_copy_marker_hit();
+        crate::hotpath_observe::record_sealed_copy_verification(
+            crate::verified_marker::GenerationVerification::VerifiedFresh,
+            canonical_bytes,
+        );
+        return Ok(canonical_bytes);
+    }
+    let canonical_bytes = {
+        let guard = database.read_guard()?;
+        let native = guard.as_ref().ok_or(GraphDbError::Closed)?;
+        let (_, canonical_bytes) =
+            verify_sealed_copy_generation(native, identity, expected, check)?;
+        canonical_bytes
+    };
+    database
+        .inner
+        .markers
+        .record_proven(&locator, expected.as_str(), canonical_bytes);
+    // Published now as well as at close, because both identities matter. An
+    // open session writes only the sidecar WAL (index catalog entries), so
+    // the container bytes stay exactly the ones this proof ran over for as
+    // long as this process serves them: publishing here lets every further
+    // open of the artifact in the same boot — the direct-sealed recover and
+    // the registry adoption were each paying this proof — resolve by stat.
+    // The close-time publish then re-records the checkpointed container for
+    // the next boot. A marker is a cache of completed proofs; failing to
+    // write one costs the next open a re-proof and nothing else.
+    if let Err(error) = database.inner.markers.publish() {
+        let _ = error;
+    }
+    crate::hotpath_observe::record_sealed_copy_verification(
+        crate::verified_marker::GenerationVerification::Reverified,
+        canonical_bytes,
+    );
+    Ok(canonical_bytes)
+}
+
+/// Measurement harness for the sealed-store verification path, phase by
+/// phase, against production-shaped rows (a Bytes payload on every entity by
+/// default, or a String payload when `TRACEDECAY_VERIFY_PROBE_FORM=compact`).
+///
+/// ```text
+/// TRACEDECAY_VERIFY_PROBE_ROWS=50000 TRACEDECAY_VERIFY_PROBE_PAYLOAD=700 \
+///   cargo test -p tracedecay-graph-db --features graph-sealed-store \
+///   --profile perf --lib -- --ignored --nocapture \
+///   sealed_store::cost_probe::sealed_verification_cost_probe
+/// ```
+#[cfg(test)]
+mod cost_probe {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use super::{build_or_open_sealed_store, open_sealed_store};
+    use crate::generation::verify_recovered_generation;
+    use crate::{
+        GraphDbLocation, GraphDbOpenOptions, GraphDbOwner, GraphDurability, GraphEntity,
+        GraphEntityId, GraphEntityRef, GraphFormatVersion, GraphGenerationId,
+        GraphGenerationManifest, GraphGenerationRelation, GraphLabel, GraphNamespace,
+        GraphProjectionId, GraphProjectionIdentity, GraphProperty, GraphPropertyName,
+        GraphRelationId, GraphRelationKind, GraphWatermark, NeverCancelled, SourceGeneration,
+    };
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn property_name(name: &str) -> GraphPropertyName {
+        GraphPropertyName::new(name).unwrap()
+    }
+
+    fn entity_identity(index: usize) -> GraphEntityId {
+        GraphEntityId::new(format!("symbol:{index:07}")).unwrap()
+    }
+
+    /// Deterministic pseudo-random payload so runs are reproducible and the
+    /// JSON number-array encoding sees realistic digit-length dispersion.
+    fn payload_bytes(seed: usize, len: usize) -> Vec<u8> {
+        let mut state = seed as u64 ^ 0x9e37_79b9_7f4a_7c15;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect()
+    }
+
+    fn probe_manifest(
+        entities: usize,
+        relations: usize,
+        payload: usize,
+        bytes_payload: bool,
+    ) -> GraphGenerationManifest {
+        let projection = GraphProjectionIdentity::new(
+            GraphNamespace::new("sealed-cost-probe").unwrap(),
+            GraphProjectionId::new("code").unwrap(),
+        );
+        let entity_rows = (0..entities)
+            .map(|index| {
+                let payload_property = if bytes_payload {
+                    GraphProperty::Bytes(payload_bytes(index, payload))
+                } else {
+                    // Sized so the canonical JSON frame roughly matches the
+                    // Bytes number-array encoding (~3.7 chars per byte).
+                    GraphProperty::String("x".repeat(payload.saturating_mul(37) / 10))
+                };
+                GraphEntity::new(
+                    entity_identity(index),
+                    BTreeSet::from([
+                        GraphLabel::new("function").unwrap(),
+                        GraphLabel::new(format!("bucket-{}", index % 7)).unwrap(),
+                    ]),
+                    BTreeMap::from([
+                        (
+                            property_name("name"),
+                            GraphProperty::String(format!("fn_symbol_{index:07}")),
+                        ),
+                        (
+                            property_name("path"),
+                            GraphProperty::String(format!(
+                                "crates/probe/src/module_{:03}/file_{:04}.rs",
+                                index % 251,
+                                index % 4093
+                            )),
+                        ),
+                        (
+                            property_name("arity"),
+                            GraphProperty::I64((index % 9) as i64),
+                        ),
+                        (
+                            property_name("exported"),
+                            GraphProperty::Bool(index % 3 == 0),
+                        ),
+                        (property_name("payload"), payload_property),
+                    ]),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let entity_ref =
+            |index: usize| GraphEntityRef::new(projection.clone(), entity_identity(index));
+        let relation_rows = (0..relations)
+            .map(|index| {
+                let from = index % entities.max(1);
+                // Hub-heavy mix: every eighth edge points at entity 0, the
+                // rest chain, mirroring call-graph endpoint reuse.
+                let to = if index % 8 == 0 {
+                    0
+                } else {
+                    (from + 1) % entities.max(1)
+                };
+                GraphGenerationRelation::new(
+                    GraphRelationId::new(format!("call:{index:07}")).unwrap(),
+                    entity_ref(from),
+                    entity_ref(to),
+                    GraphRelationKind::new("calls").unwrap(),
+                    BTreeMap::from([(property_name("weight"), GraphProperty::I64(index as i64))]),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        GraphGenerationManifest::new(
+            projection,
+            GraphGenerationId::new("generation:cost-probe").unwrap(),
+            SourceGeneration::new("source:cost-probe").unwrap(),
+            GraphWatermark::new("watermark:cost-probe").unwrap(),
+            Vec::new(),
+            entity_rows,
+            relation_rows,
+        )
+        .unwrap()
+    }
+
+    fn directory_bytes(path: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    directory_bytes(&path)
+                } else {
+                    std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0)
+                }
+            })
+            .sum()
+    }
+
+    fn gib_per_second(bytes: u64, seconds: f64) -> f64 {
+        if seconds <= 0.0 {
+            return 0.0;
+        }
+        bytes as f64 / (1024.0 * 1024.0 * 1024.0) / seconds
+    }
+
+    fn seconds_per_gib(bytes: u64, seconds: f64) -> f64 {
+        let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        if gib <= 0.0 {
+            return 0.0;
+        }
+        seconds / gib
+    }
+
+    #[test]
+    #[ignore = "measurement harness; see module doc"]
+    fn sealed_verification_cost_probe() {
+        #[cfg(feature = "hotpath")]
+        let _hotpath = hotpath::HotpathGuardBuilder::new("sealed_verification_cost_probe")
+            .functions_limit(0)
+            .report("functions-timing")
+            .build();
+
+        let entities = env_usize("TRACEDECAY_VERIFY_PROBE_ROWS", 50_000);
+        let relations = entities.saturating_mul(8) / 7;
+        let payload = env_usize("TRACEDECAY_VERIFY_PROBE_PAYLOAD", 700);
+        let bytes_payload = std::env::var("TRACEDECAY_VERIFY_PROBE_FORM")
+            .map(|form| form != "compact")
+            .unwrap_or(true);
+        let check: &dyn Fn() -> Result<(), crate::GraphDbError> = &|| Ok(());
+
+        let temp = tempfile::tempdir().unwrap();
+        let database_path = temp.path().join("probe.grafeo");
+        let owner = GraphDbOwner::open(GraphDbOpenOptions {
+            location: GraphDbLocation::Persistent(database_path.clone()),
+            expected_format: GraphFormatVersion::current(),
+            durability: GraphDurability::WalSync,
+            cancellation: Arc::new(NeverCancelled),
+        })
+        .unwrap();
+        let database = owner.issue_lease().unwrap();
+
+        let built = Instant::now();
+        let manifest = probe_manifest(entities, relations, payload, bytes_payload);
+        let identity = manifest.identity();
+        let manifest_build_s = built.elapsed().as_secs_f64();
+
+        let started = Instant::now();
+        let expected = manifest.expected_recovered_digest(check).unwrap();
+        let manifest_digest_s = started.elapsed().as_secs_f64();
+
+        let started = Instant::now();
+        database
+            .apply_generation_unverified_with_digest(Arc::new(manifest), &expected, check)
+            .unwrap();
+        let stage_s = started.elapsed().as_secs_f64();
+        // Capture the whole disposable store directory here, before the
+        // sealed artifact exists, so Grafeo sidecars/WAL bytes are included.
+        let staging_bytes = directory_bytes(temp.path());
+
+        // The serial full proof, exactly as every open before the parallel
+        // pipeline streamed it.
+        let started = Instant::now();
+        let serial_bytes = {
+            let guard = database.read_guard().unwrap();
+            let native = guard.as_ref().unwrap();
+            crate::generation::recovered_generation_digest_chunked(
+                native,
+                &identity,
+                check,
+                usize::MAX,
+            )
+            .unwrap()
+            .1
+        };
+        let serial_proof_s = started.elapsed().as_secs_f64();
+
+        // The pure full proof through the production entry, exactly as the
+        // publication path streams it over the staging rows.
+        let started = Instant::now();
+        let canonical_bytes = {
+            let guard = database.read_guard().unwrap();
+            let native = guard.as_ref().unwrap();
+            verify_recovered_generation(native, &identity, &expected, check)
+                .unwrap()
+                .1
+        };
+        let staging_proof_s = started.elapsed().as_secs_f64();
+        assert_eq!(serial_bytes, canonical_bytes);
+
+        // The sealed build: copy + (compact | replay) + durable close +
+        // reopen + full post-reopen proof.
+        let started = Instant::now();
+        let (store, staging_proof) =
+            build_or_open_sealed_store(&database, &identity, &expected, &database_path, check)
+                .unwrap();
+        let build_s = started.elapsed().as_secs_f64();
+        assert!(staging_proof.is_some(), "fresh build must carry its proof");
+        let directory = store.directory.clone();
+        let _ = store.database().close();
+        drop(store);
+
+        // Reopen + full proof in isolation: drop the verify-once marker so
+        // the open pays the entire row proof, as a foreign host adopting the
+        // artifact (or any container whose identity moved) would.
+        std::fs::remove_file(directory.join("generation.verified")).unwrap();
+        let started = Instant::now();
+        let reopened = open_sealed_store(&directory, &identity, &expected)
+            .unwrap()
+            .unwrap();
+        let reopen_full_proof_s = started.elapsed().as_secs_f64();
+        let _ = reopened.database().close();
+        drop(reopened);
+
+        // Reopen resolved by marker: what every later boot of unchanged
+        // bytes pays.
+        let started = Instant::now();
+        let marker_hit = open_sealed_store(&directory, &identity, &expected)
+            .unwrap()
+            .unwrap();
+        let marker_reopen_s = started.elapsed().as_secs_f64();
+        let _ = marker_hit.database().close();
+        drop(marker_hit);
+
+        let staging_bytes = directory_bytes(&database_path)
+            + directory_bytes(&database_path.with_extension("grafeo.wal"));
+        let artifact_bytes = directory_bytes(&directory);
+        let receipt = std::fs::read_to_string(directory.join("sealed.json")).unwrap();
+        let form = receipt
+            .split("\"form\": \"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("unknown");
+
+        println!("=== sealed verification cost probe ===");
+        println!(
+            "rows                    : {entities} entities + {relations} relations \
+             (payload {payload}B, form {form})"
+        );
+        println!(
+            "canonical proof stream  : {canonical_bytes} bytes ({:.2} GiB)",
+            canonical_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+        println!(
+            "staging store           : {:.1} MiB; sealed artifact: {:.1} MiB",
+            staging_bytes as f64 / (1024.0 * 1024.0),
+            artifact_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!("manifest build          : {manifest_build_s:.2}s");
+        println!(
+            "manifest digest (seal)  : {manifest_digest_s:.2}s ({:.3} GiB/s canonical)",
+            gib_per_second(canonical_bytes, manifest_digest_s)
+        );
+        println!("stage (durable pages)   : {stage_s:.2}s");
+        println!(
+            "staging proof (serial)  : {serial_proof_s:.2}s ({:.3} GiB/s canonical, \
+             {:.0} rows/s)",
+            gib_per_second(canonical_bytes, serial_proof_s),
+            (entities + relations) as f64 / serial_proof_s
+        );
+        println!(
+            "staging full proof      : {staging_proof_s:.2}s ({:.3} GiB/s canonical, \
+             {:.0} rows/s)",
+            gib_per_second(canonical_bytes, staging_proof_s),
+            (entities + relations) as f64 / staging_proof_s
+        );
+        println!("sealed build (copy+close+reopen+proof): {build_s:.2}s");
+        println!(
+            "reopen + full proof     : {reopen_full_proof_s:.2}s ({:.3} GiB/s canonical, \
+             {:.0} rows/s)",
+            gib_per_second(canonical_bytes, reopen_full_proof_s),
+            (entities + relations) as f64 / reopen_full_proof_s
+        );
+        println!("reopen via marker       : {marker_reopen_s:.3}s");
+        println!(
+            "seconds/canonical GiB (parallel staging proof): {:.1}",
+            staging_proof_s / (canonical_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        );
+        println!(
+            "seconds/physical GiB  (serial staging proof): {:.1}",
+            seconds_per_gib(staging_bytes, serial_proof_s)
+        );
+        println!(
+            "seconds/physical GiB  (parallel staging proof): {:.1}",
+            seconds_per_gib(staging_bytes, staging_proof_s)
+        );
+        println!(
+            "seconds/physical GiB  (sealed reopen proof): {:.1}",
+            seconds_per_gib(artifact_bytes, reopen_full_proof_s)
+        );
+    }
 }

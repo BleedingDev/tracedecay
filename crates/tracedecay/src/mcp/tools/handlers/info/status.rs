@@ -53,20 +53,106 @@ fn status_arg_flag(args: &Value, key: &str, default: bool) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
 
-fn attach_compact_branch_summary(cg: &TraceDecay, output: &mut Value) {
+/// Whether exact-scope code retrieval can serve at all, derived from the same
+/// sealed-generation census the retrieval lanes enforce.
+///
+/// `serving_branch` is store provenance, but readers take it as a serving
+/// claim — on a fresh daemon it named a branch seconds into enrollment while
+/// every retrieval lane truthfully refused `generation_rebuilding`. Status
+/// must report the same serving truth the lanes enforce: the branch claim is
+/// gated on a sealed complete generation existing, and the typed
+/// `retrieval_serving` field carries the lane-level answer either way.
+enum CodeIndexRetrievalServingV1 {
+    /// A sealed complete generation exists for the exact worktree. The ages
+    /// distinguish a routine rebuild window from a wedged route: a seat
+    /// sealed days ago whose last reconcile observation is equally old is a
+    /// daemon serving stale answers with nothing progressing, and "serving"
+    /// alone must not mask that.
+    Serving {
+        freshness: &'static str,
+        condition: Option<&'static str>,
+        seated_generation_age_seconds: Option<i64>,
+        last_reconcile_age_seconds: Option<i64>,
+    },
+    /// The daemon census answered and nothing is servable yet.
+    NotServing { reason: &'static str },
+    /// No census authority is attached (non-daemon server); status cannot
+    /// claim or deny lane-serving truth.
+    AuthorityUnattached,
+}
+
+impl CodeIndexRetrievalServingV1 {
+    fn attach(&self, output: &mut Value) -> bool {
+        match self {
+            Self::Serving {
+                freshness,
+                condition,
+                seated_generation_age_seconds,
+                last_reconcile_age_seconds,
+            } => {
+                let mut serving = json!({
+                    "status": "serving",
+                    "freshness": freshness,
+                });
+                if let Some(condition) = condition {
+                    serving["condition"] = json!(condition);
+                }
+                if let Some(age) = seated_generation_age_seconds {
+                    serving["seated_generation_age_seconds"] = json!(age);
+                }
+                if let Some(age) = last_reconcile_age_seconds {
+                    serving["last_reconcile_age_seconds"] = json!(age);
+                }
+                output["retrieval_serving"] = serving;
+                true
+            }
+            Self::NotServing { reason } => {
+                output["retrieval_serving"] = json!({
+                    "status": "unavailable",
+                    "reason": reason,
+                });
+                false
+            }
+            Self::AuthorityUnattached => true,
+        }
+    }
+}
+
+/// Whole seconds elapsed since a recorded microsecond timestamp, clamped at
+/// zero. `None` when the source never recorded the observation.
+fn age_seconds(recorded_at_micros: Option<i64>) -> Option<i64> {
+    let recorded = recorded_at_micros?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_micros() as i64)
+        .unwrap_or(recorded);
+    Some(now.saturating_sub(recorded).max(0) / 1_000_000)
+}
+
+fn attach_compact_branch_summary(
+    cg: &TraceDecay,
+    output: &mut Value,
+    retrieval_serving: &CodeIndexRetrievalServingV1,
+) {
     // Avoid `branch_diagnostics()` — compact CLI status only needs the
     // already-resolved serving identity retained on TraceDecay.
     // Do not alias open/active into current/live: those are distinct under drift.
     if let Some(active) = cg.active_branch() {
         output["active_branch"] = json!(active);
     }
-    if let Some(serving) = cg.serving_branch() {
+    let branch_servable = retrieval_serving.attach(output);
+    if branch_servable && let Some(serving) = cg.serving_branch() {
         output["serving_branch"] = json!(serving);
     }
 }
 
-fn attach_full_branch_status(cg: &TraceDecay, output: &mut Value) {
+fn attach_full_branch_status(
+    cg: &TraceDecay,
+    output: &mut Value,
+    retrieval_serving: &CodeIndexRetrievalServingV1,
+) {
     let branch_diagnostics = cg.branch_diagnostics();
+    output["branch_diagnostics"] = json!(&branch_diagnostics);
     if let Some(open_branch) = branch_diagnostics.open_active_branch.as_deref() {
         output["active_branch"] = json!(open_branch);
     }
@@ -74,7 +160,8 @@ fn attach_full_branch_status(cg: &TraceDecay, output: &mut Value) {
         output["current_branch"] = json!(current_branch);
         output["live_branch"] = json!(current_branch);
     }
-    if let Some(serving_branch) = branch_diagnostics.serving_branch.as_deref() {
+    let branch_servable = retrieval_serving.attach(output);
+    if branch_servable && let Some(serving_branch) = branch_diagnostics.serving_branch.as_deref() {
         output["serving_branch"] = json!(serving_branch);
     }
     if let Some(parent) = branch_diagnostics
@@ -102,18 +189,20 @@ fn attach_full_branch_status(cg: &TraceDecay, output: &mut Value) {
 
 /// Serialize the generation census exactly as the CLI decoder reads it back.
 ///
-/// [`crate::runtime_telemetry::GenerationCensusSnapshot`] is the single wire
+/// [`tracedecay_session_memory::runtime_telemetry::GenerationCensusSnapshot`] is the single wire
 /// authority for the `graph_statistics` field: this route serializes it and
 /// `tracedecay status` deserializes the same Rust type, so the two sides
 /// cannot drift.
 pub(crate) async fn graph_statistics_value(
-    generation_census_reader: Option<&crate::runtime_telemetry::GenerationCensusReader>,
+    generation_census_reader: Option<
+        &tracedecay_session_memory::runtime_telemetry::GenerationCensusReader,
+    >,
 ) -> Result<Value> {
     let census = match generation_census_reader {
         Some(reader) => reader().await,
-        None => crate::runtime_telemetry::GenerationCensusSnapshot::Unavailable {
+        None => tracedecay_session_memory::runtime_telemetry::GenerationCensusSnapshot::Unavailable {
             reason:
-                crate::runtime_telemetry::GenerationCensusUnavailableReason::AuthorityUnavailable,
+                tracedecay_session_memory::runtime_telemetry::GenerationCensusUnavailableReason::AuthorityUnavailable,
         },
     };
     Ok(serde_json::to_value(&census)?)
@@ -127,9 +216,11 @@ pub(crate) async fn handle_status(
     scope_prefix: Option<&str>,
     project_session_db: Option<&RegisteredGlobalDb>,
     code_index_freshness_reader: Option<
-        &crate::dashboard::code_index_freshness_api::CodeIndexFreshnessReader,
+        &tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader,
     >,
-    generation_census_reader: Option<&crate::runtime_telemetry::GenerationCensusReader>,
+    generation_census_reader: Option<
+        &tracedecay_session_memory::runtime_telemetry::GenerationCensusReader,
+    >,
 ) -> Result<ToolResult> {
     if status_arg_flag(&args, "admission_only", false) {
         let mut output = json!({
@@ -164,7 +255,7 @@ pub(crate) async fn handle_status(
         "project_root": cg.project_root(),
         "graph_statistics": graph_statistics,
     });
-    let code_index_freshness = match code_index_freshness_reader {
+    let (code_index_freshness, retrieval_serving) = match code_index_freshness_reader {
         Some(reader) => match hotpath::future!(
             reader(cg.project_root().to_path_buf()),
             label = "mcp.info.status.code_index_freshness"
@@ -172,28 +263,59 @@ pub(crate) async fn handle_status(
         .await
         {
             Some(freshness) => {
-                let authoritative = freshness.latest_generation_id.is_some()
-                    && freshness.coverage == "complete"
-                    && freshness.staleness_state.as_deref() == Some("fresh");
-                if !authoritative {
-                    output["code_index_freshness_warning"] = json!(
-                        "graph counts are not authoritative until the scheduler seals a complete fresh generation"
-                    );
+                let (status, warning) = code_index_freshness_projection(&freshness);
+                if let Some(warning) = warning {
+                    output["code_index_freshness_warning"] = json!(warning);
                 }
-                json!({
-                    "status": if authoritative { "current" } else { "warming" },
-                    "worktree": freshness,
-                })
+                // The lanes serve exactly when a sealed complete generation
+                // exists for the worktree; until the first seal every
+                // retrieval lane refuses `generation_rebuilding`.
+                let retrieval_serving = if freshness.latest_generation_id.is_some() {
+                    let (serving_freshness, condition) = match freshness.staleness_state.as_deref()
+                    {
+                        Some("fresh") => ("current", None),
+                        Some(_) if freshness.rebuild_in_flight => {
+                            ("last_complete_stale", Some("rebuilding"))
+                        }
+                        Some(_) => ("last_complete_stale", Some("stalled")),
+                        None => ("unknown", None),
+                    };
+                    CodeIndexRetrievalServingV1::Serving {
+                        freshness: serving_freshness,
+                        condition,
+                        seated_generation_age_seconds: age_seconds(freshness.sealed_at_micros),
+                        last_reconcile_age_seconds: age_seconds(freshness.last_reconcile_micros),
+                    }
+                } else {
+                    CodeIndexRetrievalServingV1::NotServing {
+                        reason: "generation_rebuilding",
+                    }
+                };
+                (
+                    json!({
+                        "status": status,
+                        "worktree": freshness,
+                    }),
+                    retrieval_serving,
+                )
             }
-            None => json!({
-                "status": "unavailable",
-                "reason": "code_index_scheduler_not_mounted",
-            }),
+            None => (
+                json!({
+                    "status": "unavailable",
+                    "reason": "code_index_scheduler_not_mounted",
+                }),
+                CodeIndexRetrievalServingV1::NotServing {
+                    reason: "code_index_scheduler_not_mounted",
+                },
+            ),
         },
-        None => json!({
-            "status": "unavailable",
-            "reason": "code_index_scheduler_authority_not_attached",
-        }),
+        None => (
+            json!({
+                "status": "unavailable",
+                "reason": "code_index_scheduler_authority_not_attached",
+            }),
+            CodeIndexRetrievalServingV1::AuthorityUnattached,
+        ),
     };
     output["code_index_freshness"] = code_index_freshness;
     if include_storage_health {
@@ -217,9 +339,9 @@ pub(crate) async fn handle_status(
     }
 
     if include_branch_diagnostics {
-        attach_full_branch_status(cg, &mut output);
+        attach_full_branch_status(cg, &mut output, &retrieval_serving);
     } else {
-        attach_compact_branch_summary(cg, &mut output);
+        attach_compact_branch_summary(cg, &mut output, &retrieval_serving);
     }
 
     // Session-transcript ingest health (recall trust): last ingest time and
@@ -296,6 +418,47 @@ pub(crate) async fn handle_status(
         vec![],
         || render_status_md(&output),
     ))
+}
+
+/// Project one freshness reading into the operator-facing status label and
+/// optional warning.
+///
+/// Only the first is retryable-by-waiting: a `warming` read converges on its
+/// own, while a `parked` read names a deterministic contract violation the
+/// background worker re-checks every wake but can never fix by waiting — so
+/// the warning carries the exact reason and remediation instead of a
+/// wait-longer message.
+fn code_index_freshness_projection(
+    freshness: &tracedecay_dashboard_api::code_index_freshness_api::CodeIndexWorktreeFreshnessV1,
+) -> (&'static str, Option<String>) {
+    let authoritative = freshness.latest_generation_id.is_some()
+        && freshness.coverage == "complete"
+        && freshness.staleness_state.as_deref() == Some("fresh");
+    if let Some(parked) = freshness.parked.as_ref() {
+        let warning = format!(
+            "code-index background convergence is parked: {}; {}",
+            parked.reason, parked.remediation
+        );
+        let status = if freshness.staleness_state.as_deref() == Some("parked") {
+            "parked"
+        } else if authoritative {
+            "current"
+        } else {
+            "warming"
+        };
+        return (status, Some(warning));
+    }
+    if authoritative {
+        ("current", None)
+    } else {
+        (
+            "warming",
+            Some(
+                "graph counts are not authoritative until the scheduler seals a complete fresh generation"
+                    .to_owned(),
+            ),
+        )
+    }
 }
 
 /// Reports daemon-owned historical warming when any provider's backlog exceeds
@@ -506,14 +669,17 @@ pub(crate) fn handle_active_project(
 mod tests {
     use std::sync::Arc;
 
-    use crate::runtime_telemetry::{
-        GenerationCensusReader, GenerationCensusSnapshot, GenerationCensusUnavailableReason,
-    };
     use tracedecay_global_db::{
         SessionIngestHealth, SessionProviderCoverage, SessionProviderCoverageState,
     };
+    use tracedecay_session_memory::runtime_telemetry::{
+        GenerationCensusReader, GenerationCensusServingFreshness, GenerationCensusSnapshot,
+        GenerationCensusStatistics, GenerationCensusUnavailableReason,
+    };
 
-    use super::{graph_statistics_value, historical_session_catch_up_state};
+    use super::{
+        code_index_freshness_projection, graph_statistics_value, historical_session_catch_up_state,
+    };
 
     /// The daemon serializes `graph_statistics` and `tracedecay status`
     /// deserializes it as the same Rust type. This round-trip is the wire
@@ -534,7 +700,12 @@ mod tests {
         );
 
         let observed = GenerationCensusSnapshot::Observed {
-            statistics: crate::code_index::production::CodeIndexGenerationStatisticsV1 {
+            generation_id: "generation.fixture".to_owned(),
+            freshness: GenerationCensusServingFreshness::LastCompleteStale {
+                sealed_at_micros: 42,
+                rebuild_in_flight: true,
+            },
+            statistics: GenerationCensusStatistics {
                 source_total_bytes: 1_024,
                 symbol_count: 12,
                 edge_count: 7,
@@ -551,6 +722,98 @@ mod tests {
         let decoded: GenerationCensusSnapshot =
             serde_json::from_value(value).expect("CLI decodes observed census");
         assert_eq!(decoded, observed);
+    }
+
+    #[test]
+    fn a_parked_deterministic_violation_reports_parked_not_warming() {
+        let freshness =
+            tracedecay_dashboard_api::code_index_freshness_api::CodeIndexWorktreeFreshnessV1 {
+                worktree_root: "/project".to_owned(),
+                staleness_state: Some("parked".to_owned()),
+                coverage: "complete".to_owned(),
+                parked: Some(
+                    tracedecay_dashboard_api::code_index_freshness_api::CodeIndexConvergenceParkedV1 {
+                        reason: "code text artifacts root is not owner-private (mode 775, need 700)"
+                            .to_owned(),
+                        remediation: "restore owner-only access".to_owned(),
+                        parked_at_micros: 42,
+                        observed_passes: 3,
+                        retries_on_wake: true,
+                    },
+                ),
+                ..Default::default()
+            };
+
+        let (status, warning) = code_index_freshness_projection(&freshness);
+
+        assert_eq!(status, "parked");
+        let warning = warning.expect("a parked read carries the reason");
+        assert!(warning.contains("not owner-private (mode 775, need 700)"));
+        assert!(warning.contains("restore owner-only access"));
+    }
+
+    #[test]
+    fn status_freshness_preserves_typed_graph_serving_readiness() {
+        let freshness =
+            tracedecay_dashboard_api::code_index_freshness_api::CodeIndexWorktreeFreshnessV1 {
+                worktree_root: "/project".to_owned(),
+                code_graph_serving: Some(
+                    tracedecay_dashboard_api::code_index_freshness_api::CodeGraphServingReadinessV1::Ready,
+                ),
+                ..Default::default()
+            };
+
+        let value = serde_json::to_value(freshness).expect("freshness serializes");
+        assert_eq!(
+            value["code_graph_serving"],
+            serde_json::json!({ "state": "ready" })
+        );
+    }
+
+    #[test]
+    fn a_serving_worktree_with_a_parked_newer_build_stays_current_but_warns() {
+        let freshness =
+            tracedecay_dashboard_api::code_index_freshness_api::CodeIndexWorktreeFreshnessV1 {
+                worktree_root: "/project".to_owned(),
+                latest_generation_id: Some("generation.fixture".to_owned()),
+                staleness_state: Some("fresh".to_owned()),
+                coverage: "complete".to_owned(),
+                parked: Some(
+                    tracedecay_dashboard_api::code_index_freshness_api::CodeIndexConvergenceParkedV1 {
+                        reason: "code text artifacts root is not owner-private".to_owned(),
+                        remediation: "restore owner-only access".to_owned(),
+                        parked_at_micros: 42,
+                        observed_passes: 1,
+                        retries_on_wake: true,
+                    },
+                ),
+                ..Default::default()
+            };
+
+        let (status, warning) = code_index_freshness_projection(&freshness);
+
+        assert_eq!(status, "current");
+        assert!(warning.expect("the park stays visible").contains("parked"));
+    }
+
+    #[test]
+    fn an_unparked_incomplete_read_stays_warming() {
+        let freshness =
+            tracedecay_dashboard_api::code_index_freshness_api::CodeIndexWorktreeFreshnessV1 {
+                worktree_root: "/project".to_owned(),
+                staleness_state: Some("indexing".to_owned()),
+                coverage: "complete".to_owned(),
+                ..Default::default()
+            };
+
+        let (status, warning) = code_index_freshness_projection(&freshness);
+
+        assert_eq!(status, "warming");
+        assert!(
+            warning
+                .expect("warming names itself")
+                .contains("not authoritative")
+        );
     }
 
     #[test]

@@ -49,8 +49,56 @@ def _group_alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
+        # Some BSD kernels return EPERM for a group whose only remaining
+        # member is a zombie.  Permission confirms that the group exists,
+        # not that it still contains work capable of running.
+        pass
+    return _group_has_runnable_member(pid)
+
+
+def _group_has_runnable_member(pgid: int) -> bool:
+    """Whether the group still holds a member that can execute.
+
+    killpg(pgid, 0) keeps succeeding while an exited leader is an unreaped
+    zombie of the calling shell — a process this helper can never reap.
+    Counting that zombie as live would burn the entire stop grace period and
+    misreport a graceful shutdown as forced cleanup.
+    """
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat_fields = (
+                    (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                )
+            except (OSError, IndexError):
+                continue
+            # Fields after the command name: state, ppid, pgrp, ...
+            if (
+                len(stat_fields) >= 3
+                and stat_fields[2] == str(pgid)
+                and stat_fields[0] != "Z"
+            ):
+                return True
+        return False
+    try:
+        listing = subprocess.run(
+            ["ps", "-A", "-o", "pgid=", "-o", "state="],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        # Without process states we cannot tell zombies apart; keep the
+        # signal-based answer rather than fabricating a shutdown.
         return True
-    return True
+    for line in listing.splitlines():
+        columns = line.split()
+        if len(columns) >= 2 and columns[0] == str(pgid) and not columns[1].startswith("Z"):
+            return True
+    return False
 
 
 def _signal_group(pid: int, sig: signal.Signals) -> None:

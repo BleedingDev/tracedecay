@@ -7,6 +7,7 @@ use tracedecay_domain::{
     AttemptId, ObservationSourceIdentityV1, PrivacyDomainId, ProjectId, ProviderId, RepositoryId,
     RunId, SessionId, TaskId, TemporalModeV1, UtcMicros, WorkAttemptIdentityV1, WorktreeId,
 };
+use tracedecay_session_memory::context::{BranchId, ProfileId, SessionRootId, SessionStoreId};
 
 use super::tests::{
     CountingReauthorization, StaticFederatedAuthority, context, federated_authority, id,
@@ -76,10 +77,18 @@ async fn continuation_resumes_the_same_provider_session_without_repeating_eviden
     .expect("materialize provider session temporal projection");
 
     let root =
-        crate::daemon::session_retrieval::DaemonSessionRetrievalRoot::project_identity_for_test(
+        tracedecay_session_runtime::session_retrieval::DaemonSessionRetrievalRoot::project_identity_for_test(
+            ProfileId::new(database.binding().shard_id.profile_id.as_str().to_owned())
+                .expect("profile identity"),
+            SessionStoreId::new("store.project.work-task-session-continuation")
+                .expect("session store identity"),
+            SessionRootId::new("root.project.work-task-session-continuation")
+                .expect("session root identity"),
+            database.binding().shard_id.clone(),
             project_id,
             repository_id,
             worktree_id,
+            BranchId::new("branch.work-task-session-continuation").expect("branch identity"),
             project.display().to_string(),
         );
     let scope = root
@@ -87,8 +96,10 @@ async fn continuation_resumes_the_same_provider_session_without_repeating_eviden
         .session_request_scope()
         .expect("resolved Work scope");
     let retrieval =
-        crate::daemon::session_retrieval::DaemonSessionRetrievalService::new(database, root, None)
-            .expect("mounted project retrieval service");
+        tracedecay_session_runtime::session_retrieval::DaemonSessionRetrievalService::new(
+            database, root, None,
+        )
+        .expect("mounted project retrieval service");
     let adapter = DaemonWorkEvidenceRetrievalV1::new(Arc::new(retrieval)).with_federated_authority(
         Arc::new(StaticFederatedAuthority(Arc::new(federated_authority(
             id::<PrivacyDomainId>("privacy.work-task-session-continuation"),

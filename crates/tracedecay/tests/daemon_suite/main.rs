@@ -16,6 +16,8 @@
 mod common;
 
 mod advanced_workflow_journey_test;
+#[cfg(unix)]
+mod authentication_refusal_test;
 mod fixture_authority_test;
 #[cfg(feature = "test-transport")]
 mod git_watch_test;
@@ -23,4 +25,6 @@ mod git_watch_test;
 mod indexing_lifecycle_test;
 #[cfg(unix)]
 mod pr_autotrack_test;
+#[cfg(unix)]
+mod stale_client_resilience_test;
 mod workflow_handoff_test;

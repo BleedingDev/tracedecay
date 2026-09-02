@@ -57,7 +57,6 @@ pub mod git_watch;
 pub(crate) mod logging;
 pub mod mcp_admission;
 pub(crate) mod ports;
-pub(crate) mod runtime_telemetry;
 pub mod semantic_activation_reconciler;
 pub(crate) mod semantic_code;
 pub mod semantic_evaluation;
@@ -65,17 +64,17 @@ pub mod semantic_evaluation_shutdown;
 
 /// Historical `crate::code_index` / `crate::query` paths from the root move.
 pub(crate) use tracedecay_code_index as code_index;
-pub(crate) use tracedecay_dashboard_api as dashboard;
 pub(crate) use tracedecay_query as query;
 pub(crate) use tracedecay_search_eval as search_eval;
 
-/// Same two-second abort bound the daemon shutdown path uses.
-pub const DAEMON_TASK_ABORT_DEADLINE: tokio::time::Duration = tokio::time::Duration::from_secs(2);
+/// Same abort authority re-exported by `tracedecay-daemon-service`.
+pub use tracedecay_runtime_core::DAEMON_TASK_ABORT_DEADLINE;
 
 pub use code_graph_seat::{
     CodeGraphReplayBindingV1, CodeGraphSeatLeaseV1, CodeGraphSeatRuntimePortV1,
 };
 pub use code_index_scheduler::CodeIndexSchedulerRegistryV1;
+pub use code_index_scheduler::identity::resolved_scope_for_project;
 pub use ports::{
     AdmissionParkLeaseV1, ApplicationCatalogSnapshotErrorV1, ApplicationCatalogSnapshotFn,
     CONNECTION_ADMISSION, GitWatchMaintenanceWakeV1, GitWatchSyncConfigV1,

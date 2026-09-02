@@ -14,6 +14,12 @@ use tracedecay_domain::{
 
 use super::super::{CodeLexicalProjectionMetadataV1, LexicalFieldV1, ProjectedChunkV1};
 use super::CodeLexicalArtifactErrorV1;
+use super::schema::{LexicalArtifactLayoutV1, digest_domain_for_revision};
+
+pub(super) use super::schema::{
+    CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V1, SERVING_INDEX_STEP_COUNT_V11,
+    STATISTICS_STEP_COUNT_V11,
+};
 
 /// Revision 2 adds durable finalization/integrity state. Revision 1 artifacts
 /// are branch-only staging files and must fail as incompatible rather than be
@@ -31,38 +37,12 @@ use super::CodeLexicalArtifactErrorV1;
 // graph-independent result hydration never needs the full sealed generation.
 // Revision 10 adds a finalized n-gram selectivity projection so phrase reads
 // can choose and page-prune by the rarest predicate without rescanning every
-// source-page shard.
-pub(super) const CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V1: u32 = 10;
-const ARTIFACT_DIGEST_DOMAIN: &[u8] = b"tracedecay.code-lexical-artifact.v10\0";
-const REQUIRED_ARTIFACT_INDEXES_V8: [(&str, &str, &[&str]); 7] = [
-    ("rows", "rows_by_chunk", &["chunk_id"]),
-    (
-        "term_postings",
-        "term_postings_by_term",
-        &["term", "field", "document_id"],
-    ),
-    (
-        "term_postings",
-        "term_postings_by_document",
-        &["document_id", "field", "term", "frequency"],
-    ),
-    (
-        "term_postings",
-        "term_postings_by_document_term",
-        &["document_id", "term", "field", "frequency"],
-    ),
-    ("term_stats", "term_stats_by_term", &["term", "field"]),
-    (
-        "exact_postings",
-        "exact_postings_by_document",
-        &["document_id", "field", "term"],
-    ),
-    (
-        "ngram_postings",
-        "ngram_postings_by_ngram",
-        &["kind", "ngram", "page_ordinal"],
-    ),
-];
+// source-page shard. Revision 11 interns terms to integer IDs, stores
+// integer field codes, drops serving indexes that EXPLAIN QUERY PLAN never
+// uses, and writes compact row payloads that omit identities already stored
+// as columns or generation metadata. Revision 12 replaces the page-local
+// n-gram shard header/fixed-width values with canonical delta varints and
+// stores exact posting keys as collision-checked content-addressed term IDs.
 pub(super) const RECEIPT_RESERVATION_BYTES: usize = 16 * 1024;
 pub(super) const SECTION_NAMES: [&str; 11] = [
     "source_pages",
@@ -323,8 +303,9 @@ fn validate_page_base_sections(
 
 pub(super) fn verify_required_artifact_indexes(
     connection: &Connection,
+    layout: LexicalArtifactLayoutV1,
 ) -> Result<(), CodeLexicalArtifactErrorV1> {
-    verify_artifact_table_layout(connection)?;
+    verify_artifact_table_layout(connection, layout)?;
     let mut statement = connection
         .prepare("SELECT name, desc, coll FROM pragma_index_xinfo(?1) WHERE key = 1 ORDER BY seqno")
         .map_err(|error| {
@@ -332,7 +313,7 @@ pub(super) fn verify_required_artifact_indexes(
                 "artifact index schema is unreadable: {error}"
             ))
         })?;
-    for (table, index, expected_columns) in REQUIRED_ARTIFACT_INDEXES_V8 {
+    for (table, index, expected_columns) in layout.required_indexes() {
         let partial: Option<i64> = connection
             .query_row(
                 "SELECT partial FROM pragma_index_list(?1) WHERE name = ?2",
@@ -373,7 +354,8 @@ pub(super) fn verify_required_artifact_indexes(
                 .eq(expected_columns.iter().map(|column| (*column, 0, "BINARY")))
         {
             return Err(CodeLexicalArtifactErrorV1::Incompatible(format!(
-                "artifact index {index} has columns {columns:?}; revision {CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V1} requires {expected_columns:?}"
+                "artifact index {index} has columns {columns:?}; revision {} requires {expected_columns:?}",
+                layout.revision()
             )));
         }
     }
@@ -382,6 +364,7 @@ pub(super) fn verify_required_artifact_indexes(
 
 pub(super) fn verify_artifact_table_layout(
     connection: &Connection,
+    layout: LexicalArtifactLayoutV1,
 ) -> Result<(), CodeLexicalArtifactErrorV1> {
     let source_columns = connection
         .prepare(
@@ -535,10 +518,141 @@ pub(super) fn verify_artifact_table_layout(
             .eq(expected_statistics)
     {
         return Err(CodeLexicalArtifactErrorV1::Incompatible(format!(
-            "artifact ngram statistics table has columns {statistics_columns:?} and without-rowid state {statistics_without_rowid:?}; revision {CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V1} requires finalized selectivity statistics"
+            "artifact ngram statistics table has columns {statistics_columns:?} and without-rowid state {statistics_without_rowid:?}; revision {} requires finalized selectivity statistics",
+            layout.revision()
         )));
     }
+    if layout != LexicalArtifactLayoutV1::V10 {
+        verify_interned_term_layout(connection, layout)?;
+    }
     Ok(())
+}
+
+fn verify_interned_term_layout(
+    connection: &Connection,
+    layout: LexicalArtifactLayoutV1,
+) -> Result<(), CodeLexicalArtifactErrorV1> {
+    let without_rowid: Option<i64> = connection
+        .query_row(
+            "SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = 'term_postings' AND type = 'table'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            CodeLexicalArtifactErrorV1::Incompatible(format!(
+                "artifact term posting schema is unreadable: {error}"
+            ))
+        })?;
+    let columns = table_columns(connection, "term_postings")?;
+    let expected = [
+        ("term_id", "INTEGER", 1, 1),
+        ("field", "INTEGER", 1, 2),
+        ("document_id", "INTEGER", 1, 3),
+        ("frequency", "INTEGER", 1, 0),
+    ];
+    if without_rowid != Some(1)
+        || !columns
+            .iter()
+            .map(|(name, column_type, not_null, primary_key)| {
+                (name.as_str(), column_type.as_str(), *not_null, *primary_key)
+            })
+            .eq(expected)
+    {
+        return Err(CodeLexicalArtifactErrorV1::Incompatible(format!(
+            "artifact term posting table has columns {columns:?}; revision 11 requires interned term identifiers"
+        )));
+    }
+    let vocabulary = table_columns(connection, "vocabulary")?;
+    let expected_vocabulary = [
+        ("term_id", "INTEGER", 0, 1),
+        ("term", "TEXT", 1, 0),
+        ("in_fuzzy", "INTEGER", 1, 0),
+    ];
+    if !vocabulary
+        .iter()
+        .map(|(name, column_type, not_null, primary_key)| {
+            (name.as_str(), column_type.as_str(), *not_null, *primary_key)
+        })
+        .eq(expected_vocabulary)
+    {
+        return Err(CodeLexicalArtifactErrorV1::Incompatible(format!(
+            "artifact vocabulary table has columns {vocabulary:?}; revision 11 requires interned terms"
+        )));
+    }
+    if layout == LexicalArtifactLayoutV1::V12 {
+        let exact_without_rowid: Option<i64> = connection
+            .query_row(
+                "SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = 'exact_postings' AND type = 'table'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                CodeLexicalArtifactErrorV1::Incompatible(format!(
+                    "artifact exact posting schema is unreadable: {error}"
+                ))
+            })?;
+        let exact_columns = table_columns(connection, "exact_postings")?;
+        let expected_exact = [
+            ("term_id", "INTEGER", 1, 1),
+            ("field", "INTEGER", 1, 2),
+            ("document_id", "INTEGER", 1, 3),
+        ];
+        if exact_without_rowid != Some(1)
+            || !exact_columns
+                .iter()
+                .map(|(name, column_type, not_null, primary_key)| {
+                    (name.as_str(), column_type.as_str(), *not_null, *primary_key)
+                })
+                .eq(expected_exact)
+        {
+            return Err(CodeLexicalArtifactErrorV1::Incompatible(format!(
+                "artifact exact posting table has columns {exact_columns:?}; revision 12 requires interned exact term identifiers"
+            )));
+        }
+        let exact_vocabulary = table_columns(connection, "exact_vocabulary")?;
+        let expected_exact_vocabulary = [("term_id", "INTEGER", 0, 1), ("term", "BLOB", 1, 0)];
+        if !exact_vocabulary
+            .iter()
+            .map(|(name, column_type, not_null, primary_key)| {
+                (name.as_str(), column_type.as_str(), *not_null, *primary_key)
+            })
+            .eq(expected_exact_vocabulary)
+        {
+            return Err(CodeLexicalArtifactErrorV1::Incompatible(format!(
+                "artifact exact vocabulary table has columns {exact_vocabulary:?}; revision 12 requires exact term collision authority"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn table_columns(
+    connection: &Connection,
+    table: &str,
+) -> Result<Vec<(String, String, i64, i64)>, CodeLexicalArtifactErrorV1> {
+    connection
+        .prepare(&format!(
+            "SELECT name, type, [notnull], pk FROM pragma_table_xinfo('{table}') WHERE hidden = 0 ORDER BY cid"
+        ))
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| {
+            CodeLexicalArtifactErrorV1::Incompatible(format!(
+                "artifact {table} columns are unreadable: {error}"
+            ))
+        })
 }
 
 pub(super) fn ngram_page_digest<'a>(
@@ -573,8 +687,18 @@ pub(super) fn ngram_page_digest<'a>(
 }
 
 pub(super) fn encode_ngram_bitmap(
+    layout: LexicalArtifactLayoutV1,
     bitmap: &RoaringBitmap,
 ) -> Result<Vec<u8>, CodeLexicalArtifactErrorV1> {
+    match layout {
+        LexicalArtifactLayoutV1::V10 | LexicalArtifactLayoutV1::V11 => {
+            encode_ngram_bitmap_v11(bitmap)
+        }
+        LexicalArtifactLayoutV1::V12 => encode_ngram_delta_varints_v12(bitmap),
+    }
+}
+
+fn encode_ngram_bitmap_v11(bitmap: &RoaringBitmap) -> Result<Vec<u8>, CodeLexicalArtifactErrorV1> {
     let cardinality = bitmap.len();
     let mut range_count = 0u64;
     let mut previous: Option<u32> = None;
@@ -649,8 +773,18 @@ pub(super) fn encode_ngram_bitmap(
 }
 
 pub(super) fn decode_ngram_bitmap(
+    layout: LexicalArtifactLayoutV1,
     encoded: &[u8],
 ) -> Result<RoaringBitmap, CodeLexicalArtifactErrorV1> {
+    match layout {
+        LexicalArtifactLayoutV1::V10 | LexicalArtifactLayoutV1::V11 => {
+            decode_ngram_bitmap_v11(encoded)
+        }
+        LexicalArtifactLayoutV1::V12 => decode_ngram_delta_varints_v12(encoded),
+    }
+}
+
+fn decode_ngram_bitmap_v11(encoded: &[u8]) -> Result<RoaringBitmap, CodeLexicalArtifactErrorV1> {
     let header = encoded.get(..16).ok_or_else(|| {
         CodeLexicalArtifactErrorV1::Corrupt(
             "lexical artifact ngram bitmap header is truncated".to_owned(),
@@ -708,6 +842,103 @@ pub(super) fn decode_ngram_bitmap(
         ));
     }
     Ok(bitmap)
+}
+
+fn encode_ngram_delta_varints_v12(
+    bitmap: &RoaringBitmap,
+) -> Result<Vec<u8>, CodeLexicalArtifactErrorV1> {
+    if bitmap.is_empty() {
+        return Err(CodeLexicalArtifactErrorV1::Contract(
+            "lexical artifact ngram shard is empty".to_owned(),
+        ));
+    }
+    let mut encoded = Vec::with_capacity(
+        usize::try_from(bitmap.len())
+            .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?,
+    );
+    let mut previous: Option<u32> = None;
+    for document in bitmap.iter() {
+        let value = previous.map_or(document, |prior| document - prior);
+        encode_u32_varint(value, &mut encoded);
+        previous = Some(document);
+    }
+    Ok(encoded)
+}
+
+fn decode_ngram_delta_varints_v12(
+    encoded: &[u8],
+) -> Result<RoaringBitmap, CodeLexicalArtifactErrorV1> {
+    if encoded.is_empty() {
+        return Err(CodeLexicalArtifactErrorV1::Corrupt(
+            "lexical artifact ngram delta list is empty".to_owned(),
+        ));
+    }
+    let mut bitmap = RoaringBitmap::new();
+    let mut offset = 0usize;
+    let mut previous: Option<u32> = None;
+    while offset < encoded.len() {
+        let (value, consumed) = decode_u32_varint(&encoded[offset..])?;
+        offset = offset.checked_add(consumed).ok_or_else(|| {
+            CodeLexicalArtifactErrorV1::Corrupt(
+                "lexical artifact ngram delta offset overflowed".to_owned(),
+            )
+        })?;
+        let document = match previous {
+            None => value,
+            Some(_) if value == 0 => {
+                return Err(CodeLexicalArtifactErrorV1::Corrupt(
+                    "lexical artifact ngram delta is zero".to_owned(),
+                ));
+            }
+            Some(prior) => prior.checked_add(value).ok_or_else(|| {
+                CodeLexicalArtifactErrorV1::Corrupt(
+                    "lexical artifact ngram delta overflowed".to_owned(),
+                )
+            })?,
+        };
+        bitmap.insert(document);
+        previous = Some(document);
+    }
+    Ok(bitmap)
+}
+
+fn encode_u32_varint(mut value: u32, encoded: &mut Vec<u8>) {
+    while value >= 0x80 {
+        encoded.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    encoded.push(value as u8);
+}
+
+fn decode_u32_varint(encoded: &[u8]) -> Result<(u32, usize), CodeLexicalArtifactErrorV1> {
+    let mut value = 0u32;
+    for (ordinal, byte) in encoded.iter().copied().take(5).enumerate() {
+        let payload = u32::from(byte & 0x7f);
+        if ordinal == 4 && payload > 0x0f {
+            return Err(CodeLexicalArtifactErrorV1::Corrupt(
+                "lexical artifact ngram varint overflows u32".to_owned(),
+            ));
+        }
+        value |= payload << (ordinal * 7);
+        if byte & 0x80 == 0 {
+            let consumed = ordinal + 1;
+            let canonical = if value == 0 {
+                1
+            } else {
+                usize::try_from((value.ilog2() / 7) + 1)
+                    .map_err(|error| CodeLexicalArtifactErrorV1::Corrupt(error.to_string()))?
+            };
+            if consumed != canonical {
+                return Err(CodeLexicalArtifactErrorV1::Corrupt(
+                    "lexical artifact ngram varint is not canonical".to_owned(),
+                ));
+            }
+            return Ok((value, consumed));
+        }
+    }
+    Err(CodeLexicalArtifactErrorV1::Corrupt(
+        "lexical artifact ngram varint is truncated".to_owned(),
+    ))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -831,7 +1062,7 @@ pub struct CodeLexicalImportMembershipWitnessV1 {
     pub evidence: CodeIndexImportEvidenceV1,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ArtifactRowV1 {
     pub id: CodeSearchChunkId,
@@ -902,9 +1133,10 @@ pub(super) fn artifact_digest(
     import_dictionary_digest: &ManifestDigest,
     source_cumulative_digest: &ManifestDigest,
     sections: &[CodeLexicalArtifactSectionDigestV1],
+    format_revision: u32,
 ) -> Result<ManifestDigest, CodeLexicalArtifactErrorV1> {
     manifest_digest(
-        ARTIFACT_DIGEST_DOMAIN,
+        digest_domain_for_revision(format_revision)?,
         &(
             metadata_digest.as_str(),
             source_state_digest.as_str(),
@@ -917,7 +1149,7 @@ pub(super) fn artifact_digest(
             import_dictionary_digest.as_str(),
             source_cumulative_digest.as_str(),
             sections,
-            CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V1,
+            format_revision,
         ),
     )
 }
@@ -1039,9 +1271,10 @@ pub(super) fn new_verified_receipt(
     artifact_digest: ManifestDigest,
     section_digests: Vec<CodeLexicalArtifactSectionDigestV1>,
     file_size_bytes: u64,
+    layout: LexicalArtifactLayoutV1,
 ) -> VerifiedCodeLexicalArtifactV1 {
     VerifiedCodeLexicalArtifactV1 {
-        format_revision: CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V1,
+        format_revision: layout.revision(),
         generation: metadata.generation,
         repository_id: metadata.repository_id,
         freshness: metadata.freshness,
@@ -1058,5 +1291,61 @@ pub(super) fn new_verified_receipt(
         artifact_digest,
         section_digests,
         file_size_bytes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use roaring::RoaringBitmap;
+
+    use super::{LexicalArtifactLayoutV1, decode_ngram_bitmap, encode_ngram_bitmap};
+
+    #[test]
+    fn v12_ngram_delta_varints_round_trip_sparse_and_dense_shards() {
+        for documents in [
+            vec![0],
+            vec![63],
+            vec![64, 65, 127],
+            (400_000..400_064).collect::<Vec<_>>(),
+        ] {
+            let bitmap = RoaringBitmap::from_iter(documents);
+            let encoded =
+                encode_ngram_bitmap(LexicalArtifactLayoutV1::V12, &bitmap).expect("encode");
+            let decoded =
+                decode_ngram_bitmap(LexicalArtifactLayoutV1::V12, &encoded).expect("decode");
+            assert_eq!(decoded, bitmap);
+        }
+    }
+
+    #[test]
+    fn v12_ngram_delta_varints_are_compact_for_measured_shard_shapes() {
+        let singleton = RoaringBitmap::from_iter([400_000]);
+        let dense = RoaringBitmap::from_iter(400_000..400_064);
+
+        assert_eq!(
+            encode_ngram_bitmap(LexicalArtifactLayoutV1::V12, &singleton).expect("singleton"),
+            vec![0x80, 0xb5, 0x18]
+        );
+        assert_eq!(
+            encode_ngram_bitmap(LexicalArtifactLayoutV1::V12, &dense)
+                .expect("dense")
+                .len(),
+            66
+        );
+    }
+
+    #[test]
+    fn v12_ngram_delta_varints_fail_closed_on_noncanonical_or_overflowing_input() {
+        for malformed in [
+            vec![],
+            vec![0x80, 0x00],
+            vec![0xff, 0xff, 0xff, 0xff, 0x10],
+            vec![0x01, 0x00],
+        ] {
+            assert!(
+                decode_ngram_bitmap(LexicalArtifactLayoutV1::V12, &malformed).is_err(),
+                "accepted malformed delta-varint payload {malformed:?}"
+            );
+        }
     }
 }

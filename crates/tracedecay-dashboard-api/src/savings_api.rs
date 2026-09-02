@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracedecay_application::CostsReadModelV1;
 use tracedecay_domain::{CoverageStateV1, ObservationScopeV1};
-use tracedecay_usecases::provider_usage::{
+use tracedecay_session_memory::provider_usage::{
     AggregatedProviderUsageCountersV1, ProviderUsageAggregateV1, ProviderUsageCoverageV1,
     ProviderUsageDeltaV1, price_provider_usage, provider_usage_aggregate,
     provider_usage_range_start,
@@ -341,8 +341,8 @@ fn actual_for_deltas<'a>(
 
 fn price_deltas<'a>(
     deltas: impl Iterator<Item = &'a ProviderUsageDeltaV1>,
-    prices: &tracedecay_usecases::provider_pricing::PriceTable,
-) -> tracedecay_usecases::provider_usage::ProviderUsageCostSummaryV1 {
+    prices: &tracedecay_session_memory::provider_pricing::PriceTable,
+) -> tracedecay_session_memory::provider_usage::ProviderUsageCostSummaryV1 {
     let deltas = deltas.cloned().collect::<Vec<_>>();
     let observations_seen = deltas.len() as u64;
     let aggregate = ProviderUsageAggregateV1 {
@@ -670,10 +670,26 @@ async fn savings_overview(gdb: &RegisteredGlobalDb, db_path: &str) -> Value {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let today = gdb.sum_savings(None, now - (now % 86_400)).await;
-    let week = gdb.sum_savings(None, now - 7 * 86_400).await;
-    let month = gdb.sum_savings(None, now - 30 * 86_400).await;
-    let all_time = gdb.sum_savings(None, 0).await;
+    // An unreadable ledger renders as an unavailable block naming the failed
+    // read — the same honest degrade the sibling blocks below already use —
+    // never as a page of zero totals.
+    let windows = async {
+        Ok::<_, String>((
+            gdb.sum_savings(None, now - (now % 86_400)).await?,
+            gdb.sum_savings(None, now - 7 * 86_400).await?,
+            gdb.sum_savings(None, now - 30 * 86_400).await?,
+            gdb.sum_savings(None, 0).await?,
+        ))
+    };
+    let (today, week, month, all_time) = match windows.await {
+        Ok(windows) => windows,
+        Err(error) => {
+            return merge(
+                json!({ "db": db_path, "recording": recording_block() }),
+                read_failed_block(error),
+            );
+        }
+    };
 
     // Legacy lifetime counters (`projects.tokens_saved`) predate the ledger
     // and often carry history the event log does not — surface both.
@@ -870,8 +886,24 @@ pub async fn ledger(
             }));
         };
 
-        let total = gdb.sum_savings(None, since).await;
-        let history = gdb.savings_history(None, since).await;
+        // The ledger route fails closed to its typed read_failed block: an
+        // unreadable ledger is not an empty ledger with zero totals.
+        let (total, history) = match async {
+            Ok::<_, String>((
+                gdb.sum_savings(None, since).await?,
+                gdb.savings_history(None, since).await?,
+            ))
+        }
+        .await
+        {
+            Ok(read) => read,
+            Err(error) => {
+                return Json(merge(
+                    json!({ "db": state.savings_db_path, "range": range, "since": since }),
+                    read_failed_block(error),
+                ));
+            }
+        };
         let conn = gdb.read_connection();
         const SAVED_TOKENS_EXPR: &str = "COALESCE(SUM(CASE WHEN before_tokens > after_tokens THEN before_tokens - after_tokens ELSE 0 END), 0)";
         let by_tool = query_rows(
@@ -1373,7 +1405,7 @@ pub async fn pricing() -> Json<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tracedecay_usecases::provider_usage::{
+    use tracedecay_session_memory::provider_usage::{
         AggregatedProviderUsageCountersV1, ProviderUsageAggregateV1, ProviderUsageCoverageV1,
     };
 

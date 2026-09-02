@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use grafeo_common::types::{ArcStr, EdgeId, NodeId, Value};
-use grafeo_core::graph::Direction;
 use grafeo_core::graph::lpg::Node;
+use grafeo_core::graph::{Direction, GraphStore};
 use grafeo_engine::GrafeoDB;
 
 use crate::limits::{
@@ -56,6 +56,7 @@ pub(crate) struct StoredPublication {
 
 pub(crate) struct ExistingBatchState {
     pub(crate) entities: BTreeMap<String, StoredEntity>,
+    pub(crate) entity_locators: BTreeMap<String, EntityLocator>,
     pub(crate) relations: BTreeMap<String, StoredRelation>,
 }
 
@@ -65,48 +66,95 @@ impl ExistingBatchState {
             return Err(GraphDbError::Cancelled);
         }
         let encoded_namespace = encoded_namespace_key(&batch.namespace);
-        let mut entity_keys = BTreeMap::new();
-        let mut relation_keys = BTreeMap::new();
+        let physical_generation =
+            crate::generation::is_physical_generation_namespace(&batch.namespace);
+        let (entity_count, relation_count, relation_endpoint_count) =
+            batch
+                .mutations
+                .iter()
+                .fold((0usize, 0usize, 0usize), |counts, mutation| {
+                    let (entities, relations, endpoints) = counts;
+                    match mutation {
+                        GraphMutation::DeleteEntity(_) | GraphMutation::UpsertEntity(_) => {
+                            (entities.saturating_add(1), relations, endpoints)
+                        }
+                        GraphMutation::DeleteRelation(_) => {
+                            (entities, relations.saturating_add(1), endpoints)
+                        }
+                        GraphMutation::UpsertRelation(_) => (
+                            entities,
+                            relations.saturating_add(1),
+                            endpoints.saturating_add(2),
+                        ),
+                    }
+                });
+        let local_endpoint_count = (!physical_generation)
+            .then_some(relation_endpoint_count)
+            .unwrap_or(0);
+        let locator_count = physical_generation
+            .then_some(relation_endpoint_count)
+            .unwrap_or(0);
+        let mut entity_keys =
+            HashMap::with_capacity(entity_count.saturating_add(local_endpoint_count));
+        let mut entity_locator_keys = HashMap::with_capacity(locator_count);
+        let mut relation_keys = HashMap::with_capacity(relation_count);
         for mutation in &batch.mutations {
             match mutation {
                 GraphMutation::DeleteEntity(identity) => {
                     entity_keys.insert(
                         stable_key_from_encoded(&encoded_namespace, identity.as_str()),
-                        identity.clone(),
+                        identity,
                     );
                 }
                 GraphMutation::UpsertEntity(entity) => {
                     entity_keys.insert(
                         stable_key_from_encoded(&encoded_namespace, entity.identity.as_str()),
-                        entity.identity.clone(),
+                        &entity.identity,
                     );
                 }
                 GraphMutation::DeleteRelation(identity) => {
                     relation_keys.insert(
                         stable_key_from_encoded(&encoded_namespace, identity.as_str()),
-                        identity.clone(),
+                        identity,
                     );
                 }
                 GraphMutation::UpsertRelation(relation) => {
                     relation_keys.insert(
                         stable_key_from_encoded(&encoded_namespace, relation.identity.as_str()),
-                        relation.identity.clone(),
+                        &relation.identity,
                     );
-                    entity_keys.insert(
+                    let endpoint_keys = if physical_generation {
+                        &mut entity_locator_keys
+                    } else {
+                        &mut entity_keys
+                    };
+                    endpoint_keys.insert(
                         stable_key_from_encoded(&encoded_namespace, relation.from.as_str()),
-                        relation.from.clone(),
+                        &relation.from,
                     );
-                    entity_keys.insert(
+                    endpoint_keys.insert(
                         stable_key_from_encoded(&encoded_namespace, relation.to.as_str()),
-                        relation.to.clone(),
+                        &relation.to,
                     );
                 }
             }
         }
-        let entities = load_requested_entities(database, &batch.namespace, entity_keys, batch)?;
-        let relations = load_requested_relations(database, &batch.namespace, relation_keys, batch)?;
+        entity_locator_keys.retain(|key, _| !entity_keys.contains_key(key));
+        let entities = hotpath::measure_block!(
+            "graph_db.mutation.existing_state.entity_records",
+            load_requested_entities(database, &batch.namespace, entity_keys, batch)
+        )?;
+        let entity_locators = hotpath::measure_block!(
+            "graph_db.mutation.existing_state.endpoint_locators",
+            load_requested_entity_locators(database, &batch.namespace, entity_locator_keys, batch,)
+        )?;
+        let relations = hotpath::measure_block!(
+            "graph_db.mutation.existing_state.relation_records",
+            load_requested_relations(database, &batch.namespace, relation_keys, batch)
+        )?;
         Ok(Self {
             entities,
+            entity_locators,
             relations,
         })
     }
@@ -167,15 +215,18 @@ pub(crate) struct EndpointIdentityCache {
 }
 
 impl EndpointIdentityCache {
+    /// Takes the graph store rather than the database handle so bulk
+    /// enumerations — the recovered-generation proof in particular — can
+    /// resolve endpoints from worker threads that share only the store.
     pub(crate) fn identity(
         &mut self,
-        database: &GrafeoDB,
+        store: &dyn GraphStore,
         node_id: NodeId,
     ) -> Result<(GraphNamespace, GraphEntityId), GraphDbError> {
         if let Some(cached) = self.identities.get(&node_id) {
             return Ok(cached.clone());
         }
-        let identity = entity_endpoint_identity(database, node_id)?;
+        let identity = entity_endpoint_identity(store, node_id)?;
         self.identities.insert(node_id, identity.clone());
         Ok(identity)
     }
@@ -184,11 +235,10 @@ impl EndpointIdentityCache {
 /// Identity + owner fields from one already-loaded node, without decoding
 /// labels or graph properties.
 fn entity_endpoint_identity(
-    database: &GrafeoDB,
+    store: &dyn GraphStore,
     node_id: NodeId,
 ) -> Result<(GraphNamespace, GraphEntityId), GraphDbError> {
-    let node = database
-        .graph_store()
+    let node = store
         .get_node(node_id)
         .ok_or_else(|| GraphDbError::Corrupt {
             message: "entity node is unreadable".to_owned(),
@@ -287,7 +337,7 @@ pub(crate) fn load_entity(
 fn load_requested_entities(
     database: &GrafeoDB,
     namespace: &GraphNamespace,
-    requested: BTreeMap<String, GraphEntityId>,
+    requested: HashMap<String, &GraphEntityId>,
     batch: &GraphWriteBatch,
 ) -> Result<BTreeMap<String, StoredEntity>, GraphDbError> {
     let mut loaded = BTreeMap::new();
@@ -295,7 +345,25 @@ fn load_requested_entities(
         if index % 256 == 0 && batch.cancellation.is_cancelled() {
             return Err(GraphDbError::Cancelled);
         }
-        if let Some(entity) = load_entity(database, namespace, &identity)? {
+        if let Some(entity) = load_entity(database, namespace, identity)? {
+            loaded.insert(key, entity);
+        }
+    }
+    Ok(loaded)
+}
+
+fn load_requested_entity_locators(
+    database: &GrafeoDB,
+    namespace: &GraphNamespace,
+    requested: HashMap<String, &GraphEntityId>,
+    batch: &GraphWriteBatch,
+) -> Result<BTreeMap<String, EntityLocator>, GraphDbError> {
+    let mut loaded = BTreeMap::new();
+    for (index, (key, identity)) in requested.into_iter().enumerate() {
+        if index % 256 == 0 && batch.cancellation.is_cancelled() {
+            return Err(GraphDbError::Cancelled);
+        }
+        if let Some(entity) = load_entity_locator(database, namespace, identity)? {
             loaded.insert(key, entity);
         }
     }
@@ -305,7 +373,7 @@ fn load_requested_entities(
 fn load_requested_relations(
     database: &GrafeoDB,
     namespace: &GraphNamespace,
-    requested: BTreeMap<String, GraphRelationId>,
+    requested: HashMap<String, &GraphRelationId>,
     batch: &GraphWriteBatch,
 ) -> Result<BTreeMap<String, StoredRelation>, GraphDbError> {
     let mut loaded = BTreeMap::new();
@@ -314,8 +382,7 @@ fn load_requested_relations(
         if index % 256 == 0 && batch.cancellation.is_cancelled() {
             return Err(GraphDbError::Cancelled);
         }
-        if let Some(relation) =
-            load_relation_cached(database, namespace, &identity, &mut endpoints)?
+        if let Some(relation) = load_relation_cached(database, namespace, identity, &mut endpoints)?
         {
             loaded.insert(key, relation);
         }
@@ -392,7 +459,7 @@ pub(crate) fn load_relation_by_edge_cached(
     else {
         return Ok(None);
     };
-    load_relation_by_locator_cached(database, locator, cache).map(Some)
+    load_relation_by_locator_cached(database.graph_store().as_ref(), locator, cache).map(Some)
 }
 
 fn load_relation_by_key(
@@ -411,15 +478,16 @@ fn load_relation_by_key(
     else {
         return Ok(None);
     };
-    load_relation_by_locator_cached(database, locator, cache).map(Some)
+    load_relation_by_locator_cached(database.graph_store().as_ref(), locator, cache).map(Some)
 }
 
+/// Takes the graph store rather than the database handle so the recovered
+/// proof's worker threads can load relations while sharing only the store.
 pub(crate) fn load_relation_by_locator_cached(
-    database: &GrafeoDB,
+    store: &dyn GraphStore,
     locator_id: NodeId,
     cache: &mut EndpointIdentityCache,
 ) -> Result<StoredRelation, GraphDbError> {
-    let store = database.graph_store();
     let locator = store
         .get_node(locator_id)
         .ok_or_else(|| GraphDbError::Corrupt {
@@ -449,8 +517,8 @@ pub(crate) fn load_relation_by_locator_cached(
     )?)
     .map_err(|error| persisted_validation_error("relation projection", error))?;
     let relation = decode_relation(&locator, &edge)?;
-    let (source_namespace, source_identity) = cache.identity(database, edge.src)?;
-    let (target_namespace, target_identity) = cache.identity(database, edge.dst)?;
+    let (source_namespace, source_identity) = cache.identity(store, edge.src)?;
+    let (target_namespace, target_identity) = cache.identity(store, edge.dst)?;
     let same_namespace = source_namespace == namespace && target_namespace == namespace;
     let generation_scoped = crate::generation::is_physical_generation_namespace(&namespace)
         && crate::generation::is_physical_generation_namespace(&source_namespace)
@@ -676,10 +744,11 @@ pub(crate) fn projection_relations(
         &relation_projection_label(namespace, projection),
         RELATION_LABEL,
     )?;
+    let store = database.graph_store();
     let mut endpoints = EndpointIdentityCache::default();
     locators
         .into_iter()
-        .map(|locator| load_relation_by_locator_cached(database, locator, &mut endpoints))
+        .map(|locator| load_relation_by_locator_cached(store.as_ref(), locator, &mut endpoints))
         .collect()
 }
 
@@ -698,11 +767,12 @@ pub(crate) fn projection_relations_checked(
         check,
     )?;
     let mut relations = Vec::with_capacity(locators.len());
+    let store = database.graph_store();
     let mut endpoints = EndpointIdentityCache::default();
     for locator in locators {
         check()?;
         relations.push(load_relation_by_locator_cached(
-            database,
+            store.as_ref(),
             locator,
             &mut endpoints,
         )?);
@@ -1170,15 +1240,118 @@ fn persisted_validation_error(description: &str, error: GraphDbError) -> GraphDb
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
 
     use grafeo_common::types::Value;
     use grafeo_engine::GrafeoDB;
 
-    use super::{projection_entities_checked, projection_relations_checked};
+    use super::{ExistingBatchState, projection_entities_checked, projection_relations_checked};
     use crate::schema::{
-        ENTITY_LABEL, RELATION_LABEL, entity_projection_label, relation_projection_label,
+        ENTITY_KEY_PROPERTY, ENTITY_LABEL, RELATION_LABEL, entity_labels, entity_projection_label,
+        entity_properties, relation_projection_label,
     };
-    use crate::{GraphDbError, GraphNamespace, GraphProjectionId};
+    use crate::{
+        GraphDbError, GraphEntity, GraphEntityId, GraphGenerationId, GraphMutation, GraphNamespace,
+        GraphProjectionId, GraphRelation, GraphRelationId, GraphRelationKind, GraphWatermark,
+        GraphWriteBatch, NeverCancelled, SourceGeneration,
+    };
+
+    #[test]
+    fn physical_relation_stage_loads_endpoint_identity_without_decoding_payload() {
+        let database = GrafeoDB::new_in_memory();
+        database.create_property_index(ENTITY_KEY_PROPERTY);
+        let logical_namespace = GraphNamespace::new("project").unwrap();
+        let projection = GraphProjectionId::new("code").unwrap();
+        let physical_namespace = crate::generation::physical_namespace(
+            &logical_namespace,
+            &projection,
+            &GraphGenerationId::new("generation").unwrap(),
+        )
+        .unwrap();
+        let endpoint = GraphEntity::new(
+            GraphEntityId::new("endpoint").unwrap(),
+            BTreeSet::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let labels = entity_labels(&physical_namespace, &projection, &endpoint.labels);
+        let mut properties = entity_properties(&physical_namespace, &projection, &endpoint);
+        properties.push((
+            "__tracedecay_graph_db_property_str_zz".to_owned(),
+            Value::from("payload whose malformed property name must not be decoded"),
+        ));
+        let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
+        database
+            .session()
+            .create_node_with_props(
+                &label_refs,
+                properties
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.clone())),
+            )
+            .unwrap();
+        let relation = GraphRelation::new(
+            GraphRelationId::new("edge").unwrap(),
+            endpoint.identity.clone(),
+            endpoint.identity.clone(),
+            GraphRelationKind::new("calls").unwrap(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let batch = GraphWriteBatch::new(
+            physical_namespace,
+            projection.clone(),
+            SourceGeneration::new("source").unwrap(),
+            GraphWatermark::new("watermark").unwrap(),
+            vec![GraphMutation::UpsertRelation(relation)],
+            Arc::new(NeverCancelled),
+        )
+        .unwrap();
+
+        let loaded = ExistingBatchState::load(&database, &batch).unwrap();
+
+        assert!(loaded.entities.is_empty());
+
+        let labels = entity_labels(&logical_namespace, &projection, &endpoint.labels);
+        let mut properties = entity_properties(&logical_namespace, &projection, &endpoint);
+        properties.push((
+            "__tracedecay_graph_db_property_str_zz".to_owned(),
+            Value::from("ordinary mutable graphs must still validate endpoint payloads"),
+        ));
+        let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
+        database
+            .session()
+            .create_node_with_props(
+                &label_refs,
+                properties
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.clone())),
+            )
+            .unwrap();
+        let relation = GraphRelation::new(
+            GraphRelationId::new("ordinary-edge").unwrap(),
+            endpoint.identity.clone(),
+            endpoint.identity.clone(),
+            GraphRelationKind::new("calls").unwrap(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let ordinary_batch = GraphWriteBatch::new(
+            logical_namespace,
+            projection,
+            SourceGeneration::new("ordinary-source").unwrap(),
+            GraphWatermark::new("ordinary-watermark").unwrap(),
+            vec![GraphMutation::UpsertRelation(relation)],
+            Arc::new(NeverCancelled),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            ExistingBatchState::load(&database, &ordinary_batch),
+            Err(GraphDbError::Corrupt { .. })
+        ));
+    }
 
     #[test]
     fn checked_projection_extraction_cancels_before_decoding_rows() {

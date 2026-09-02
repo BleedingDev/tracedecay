@@ -13,18 +13,18 @@ use tracedecay_code_index::graph_projection::{
     CodeGraphProjectionStore, HermeticCodeGraphProjectionStore,
 };
 use tracedecay_code_index::lineage::GenerationSymbolIndexV1;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{ActorId, CodeGenerationId, ManifestDigest, ProjectId};
 use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
 use tracedecay_graph_db::NeverCancelled;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
-use tracedecay_sessions::admission::HostAdmissionScope;
-use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
-use tracedecay_usecases::context::RegisteredScopeResolver;
-use tracedecay_usecases::graph::{
+use tracedecay_graph_query::{
     CodeGraphProjectionReadPort, CodeGraphReadAdmissionFuture, CodeGraphReadAdmissionPort,
     CodeGraphReadAdmissionRequest, CodeGraphReadError, CodeGraphReadFuture, CodeGraphReadRequest,
     VerifiedCodeGraphRead,
 };
+use tracedecay_session_memory::context::RegisteredScopeResolver;
+use tracedecay_sessions::admission::HostAdmissionScope;
+use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
 
 #[derive(Clone)]
 struct DashboardTestCodeGraphProjectionV1 {
@@ -48,9 +48,11 @@ impl CodeGraphProjectionReadPort for DashboardTestCodeGraphProjectionV1 {
                 return Err(CodeGraphReadError::Cancelled);
             }
             match request.context.admission_at(request.observed_at) {
-                RequestAdmission::Admitted => {
-                    VerifiedCodeGraphRead::new(self.scope.clone(), Arc::clone(&self.store))
-                }
+                RequestAdmission::Admitted => VerifiedCodeGraphRead::new(
+                    self.scope.clone(),
+                    Arc::clone(&self.store),
+                    tracedecay_graph_query::CodeGraphReadFreshnessV1::Current,
+                ),
                 RequestAdmission::Cancelled => Err(CodeGraphReadError::Cancelled),
                 RequestAdmission::TimedOut => Err(CodeGraphReadError::TimedOut),
             }
@@ -396,14 +398,16 @@ impl DashboardTestRuntimeV1 {
         timestamp: i64,
     ) {
         self.profile_database
-            .record_savings(project, tool, before, after, timestamp)
-            .await;
+            .try_record_savings(project, tool, before, after, timestamp)
+            .await
+            .expect("seed dashboard savings ledger entry");
     }
 
     pub(crate) async fn upsert(&self, project_path: &Path, tokens_saved: u64) {
         self.profile_database
-            .upsert(project_path, tokens_saved)
-            .await;
+            .try_upsert_project_tokens(project_path, tokens_saved)
+            .await
+            .expect("seed dashboard project token total");
     }
 
     pub(crate) async fn upsert_session_for_test(
@@ -506,12 +510,12 @@ impl DashboardTestRuntimeV1 {
         &self,
         scope: HostAdmissionScope,
         message: &SessionMessageRecord,
-    ) -> std::result::Result<(), tracedecay_sessions::runtime::lcm::LcmError> {
+    ) -> std::result::Result<(), tracedecay_lcm::LcmError> {
         let database = self
             .database(scope)
-            .map_err(|error| tracedecay_sessions::runtime::lcm::LcmError::Db(error.to_string()))?;
+            .map_err(|error| tracedecay_lcm::LcmError::Db(error.to_string()))?;
         let storage_root = database.db_path().parent().ok_or_else(|| {
-            tracedecay_sessions::runtime::lcm::LcmError::Db(
+            tracedecay_lcm::LcmError::Db(
                 "registered session database has no storage root".to_owned(),
             )
         })?;
@@ -557,17 +561,14 @@ impl DashboardTestRuntimeV1 {
     pub(crate) async fn lcm_insert_summary_node_for_test(
         &self,
         scope: HostAdmissionScope,
-        draft: tracedecay_sessions::runtime::lcm::LcmSummaryNodeDraft,
-    ) -> std::result::Result<
-        tracedecay_sessions::runtime::lcm::LcmSummaryNode,
-        tracedecay_sessions::runtime::lcm::LcmError,
-    > {
+        draft: tracedecay_lcm::LcmSummaryNodeDraft,
+    ) -> std::result::Result<tracedecay_lcm::LcmSummaryNode, tracedecay_lcm::LcmError> {
         let database = self
             .database(scope)
-            .map_err(|error| tracedecay_sessions::runtime::lcm::LcmError::Db(error.to_string()))?;
+            .map_err(|error| tracedecay_lcm::LcmError::Db(error.to_string()))?;
         let summary_hash =
-            tracedecay_sessions::retrieval_content::projected_content_hash(&draft.summary_text);
-        let summary_id = tracedecay_sessions::runtime::lcm::dag::summary_node_id(
+            tracedecay_lcm::retrieval_content::projected_content_hash(&draft.summary_text);
+        let summary_id = tracedecay_lcm::dag::summary_node_id(
             &draft.provider,
             &draft.session_id,
             draft.depth,
@@ -577,7 +578,7 @@ impl DashboardTestRuntimeV1 {
         let control = tracedecay_temporal_query::ports::ExecutionControl::default();
         database
             .lcm_publish_immutable_summary_guarded(
-                tracedecay_sessions::runtime::lcm::types::LcmImmutableSummaryPublication {
+                tracedecay_lcm::types::LcmImmutableSummaryPublication {
                     summary_id,
                     predecessor_summary_id: None,
                     draft,
@@ -640,12 +641,12 @@ async fn load_registered_raw_message(
     database: &RegisteredGlobalDb,
     provider: &str,
     message_id: &str,
-) -> Option<tracedecay_sessions::runtime::lcm::LcmRawMessage> {
+) -> Option<tracedecay_lcm::LcmRawMessage> {
     let snapshot = database
         .read_snapshot()
         .await
         .expect("dashboard test raw-message snapshot must remain registered");
-    tracedecay_sessions::runtime::lcm::schema::load_raw_message(&snapshot, provider, message_id)
+    tracedecay_lcm::schema::load_raw_message(&snapshot, provider, message_id)
         .await
         .expect("dashboard test raw-message load must not hide database or receipt failure")
 }
@@ -677,7 +678,10 @@ fn initialize_fixture_repository_identity(
             });
         }
     }
-    if !tracedecay::storage::write_repository_identity_marker(project_root, project_id.as_str())? {
+    if !tracedecay_runtime_core::storage::write_repository_identity_marker(
+        project_root,
+        project_id.as_str(),
+    )? {
         return Err(TraceDecayError::Config {
             message: format!(
                 "dashboard fixture repository identity marker was not written for '{}'",

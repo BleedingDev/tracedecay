@@ -9,6 +9,7 @@ use std::future::Future;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracedecay_domain::canonical_text::{CANONICAL_TEXT_MAX_BYTES, is_canonical_text_within};
+use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_domain::{
     AnchorOwnerBindingV1, FactOwnerV1, ProjectionGenerationId, RetrievalAnchorId,
     RetrievalAnchorRecordV2, RetrievalAnchorRecordV3, UtcMicros,
@@ -25,6 +26,15 @@ pub enum RetrievalAnchorStoreError {
 }
 
 pub type RetrievalAnchorStoreResult<T> = Result<T, RetrievalAnchorStoreError>;
+
+impl From<RetrievalAnchorStoreError> for TraceDecayError {
+    fn from(error: RetrievalAnchorStoreError) -> Self {
+        Self::Database {
+            message: error.to_string(),
+            operation: "retrieval anchor authority".to_owned(),
+        }
+    }
+}
 
 /// Exact physical owner encoding for both byte-compatible V2 anchors and V3
 /// profile/privacy-bound anchors. Untagged serialization preserves the
@@ -124,6 +134,7 @@ pub enum AnchorDispositionStateV1 {
 }
 
 impl AnchorDispositionStateV1 {
+    #[hotpath::skip]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",
@@ -180,6 +191,7 @@ impl AnchorDispositionStateV1 {
     /// recoverable, and tombstoning their derivatives would make the recovery
     /// lossy. The complementary read-side rule is
     /// [`serves_derivatives`](Self::serves_derivatives).
+    #[hotpath::skip]
     pub const fn suppresses_derivatives(self) -> bool {
         matches!(
             self,
@@ -209,6 +221,7 @@ pub enum AnchorDispositionReasonClassV1 {
 }
 
 impl AnchorDispositionReasonClassV1 {
+    #[hotpath::skip]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UserRequest => "user_request",
@@ -231,6 +244,7 @@ pub enum AnchorDerivativeKindV1 {
 }
 
 impl AnchorDerivativeKindV1 {
+    #[hotpath::skip]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Span => "span",
@@ -297,6 +311,7 @@ impl RetrievalAnchorDispositionRecordV1 {
         &self.owner
     }
 
+    #[hotpath::skip]
     pub const fn state(&self) -> AnchorDispositionStateV1 {
         self.state
     }
@@ -305,10 +320,12 @@ impl RetrievalAnchorDispositionRecordV1 {
         self.superseded_by.as_ref()
     }
 
+    #[hotpath::skip]
     pub const fn reason_class(&self) -> AnchorDispositionReasonClassV1 {
         self.reason_class
     }
 
+    #[hotpath::skip]
     pub const fn effective_at(&self) -> UtcMicros {
         self.effective_at
     }
@@ -369,6 +386,7 @@ impl RetrievalAnchorDerivativeV1 {
         &self.owner
     }
 
+    #[hotpath::skip]
     pub const fn kind(&self) -> AnchorDerivativeKindV1 {
         self.kind
     }
@@ -377,6 +395,7 @@ impl RetrievalAnchorDerivativeV1 {
         &self.derivative_id
     }
 
+    #[hotpath::skip]
     pub const fn is_direct_evidence(&self) -> bool {
         self.direct_evidence
     }
@@ -442,14 +461,17 @@ impl RetrievalAnchorTombstoneV1 {
         &self.owner
     }
 
+    #[hotpath::skip]
     pub const fn terminal_state(&self) -> AnchorDispositionStateV1 {
         self.terminal_state
     }
 
+    #[hotpath::skip]
     pub const fn reason_class(&self) -> AnchorDispositionReasonClassV1 {
         self.reason_class
     }
 
+    #[hotpath::skip]
     pub const fn effective_at(&self) -> UtcMicros {
         self.effective_at
     }

@@ -69,6 +69,7 @@ pub struct SessionFrozenWatermarksV1 {
 }
 
 impl SessionFrozenWatermarksV1 {
+    #[hotpath::skip]
     pub const fn new(
         active_generation: SessionProjectionGenerationV1,
         source_frontier: u64,
@@ -89,18 +90,22 @@ impl SessionFrozenWatermarksV1 {
         self
     }
 
+    #[hotpath::skip]
     pub const fn active_generation(&self) -> SessionProjectionGenerationV1 {
         self.active_generation
     }
 
+    #[hotpath::skip]
     pub const fn source_frontier(&self) -> u64 {
         self.source_frontier
     }
 
+    #[hotpath::skip]
     pub const fn projection_frontier(&self) -> u64 {
         self.projection_frontier
     }
 
+    #[hotpath::skip]
     pub const fn summary_frontier(&self) -> u64 {
         self.summary_frontier
     }
@@ -145,6 +150,7 @@ impl SessionTemporalSnapshotV1 {
         &self.session_id
     }
 
+    #[hotpath::skip]
     pub const fn frozen_at(&self) -> UtcMicros {
         self.frozen_at
     }
@@ -301,7 +307,7 @@ pub enum SessionStoreError {
     },
     #[error("session-temporal contract validation failed")]
     Contract(#[from] SessionContractError),
-    #[error("session-temporal storage operation {operation} failed")]
+    #[error("session-temporal storage operation {operation} failed: {source}")]
     Storage {
         operation: &'static str,
         #[source]
@@ -319,6 +325,7 @@ impl SessionStoreError {
         }
     }
 
+    #[hotpath::skip]
     pub const fn is_storage(&self) -> bool {
         matches!(self, Self::Storage { .. })
     }

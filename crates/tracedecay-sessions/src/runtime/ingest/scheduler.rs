@@ -17,6 +17,13 @@ use super::failure::{
 pub const USER_INGEST_PROVIDER_FRONTIER_KEY: &str =
     "tracedecay-internal:user-ingest-provider-frontier:v1";
 
+/// Durable fair-rotation cursor for project-scoped provider catch-up passes.
+/// Lives in the project's transcript store, so a daemon restart resumes the
+/// sweep at the provider after the last persisted pass instead of restarting
+/// the rotation at the first provider.
+pub const PROJECT_INGEST_PROVIDER_FRONTIER_KEY: &str =
+    "tracedecay-internal:project-ingest-provider-frontier:v1";
+
 /// Durable versioned Codex discovery frontier for the profile corpus.
 pub const USER_INGEST_CODEX_HISTORY_FRONTIER_KEY: &str =
     "tracedecay-internal:user-ingest-codex-history-frontier:v2";
@@ -87,7 +94,7 @@ pub(super) const USER_CATCH_UP_PROVIDERS: &[SessionProvider] = &[
     SessionProvider::Vibe,
 ];
 
-pub(super) fn plan_user_provider_admission(
+pub(super) fn plan_provider_rotation_admission(
     selected_count: usize,
     frontier: u64,
     bounds: IngestPassBounds,
@@ -388,13 +395,49 @@ mod tests {
             .expect("restart discovery");
         assert!(idle.report.paths.is_empty());
         assert!(idle.next_frontier.is_complete());
+        // Production consumers acknowledge every delivered pass (idle ones
+        // included); an unacknowledged pass replays verbatim on the next
+        // discovery, which would mask the addition below.
+        discovery_state.acknowledge();
 
         let added = write_dated_rollout(temp.path(), "after-restart");
-        let awakened = codex::CodexSource::with_home(temp.path())
+        // Change detection restarts discovery through a validation sweep that
+        // measures the corpus before it emits, so the addition is delivered
+        // across the following bounded passes, not in the detection pass
+        // itself.
+        let awakened_source = codex::CodexSource::with_home(temp.path());
+        let detection = awakened_source
             .discover_transcript_paths_with_state(bounds, reloaded, &mut discovery_state)
-            .expect("addition discovery");
-        assert!(awakened.report.paths.contains(&added));
-        assert!(!awakened.next_frontier.is_complete());
+            .expect("addition detection");
+        assert!(!detection.next_frontier.is_complete());
+        write_codex_discovery_frontier(&store, reloaded, detection.next_frontier)
+            .await
+            .expect("persist detection frontier");
+        discovery_state.acknowledge();
+        let mut awakened_paths: BTreeSet<_> = detection.report.paths.iter().cloned().collect();
+        for _ in 0..128 {
+            let frontier = read_codex_discovery_frontier(&store)
+                .await
+                .expect("read awakened frontier");
+            let pass = awakened_source
+                .discover_transcript_paths_with_state(bounds, frontier, &mut discovery_state)
+                .expect("addition discovery");
+            awakened_paths.extend(pass.report.paths.iter().cloned());
+            write_codex_discovery_frontier(&store, frontier, pass.next_frontier)
+                .await
+                .expect("persist awakened frontier");
+            discovery_state.acknowledge();
+            if pass.next_frontier.is_complete() {
+                break;
+            }
+        }
+        assert!(awakened_paths.contains(&added));
+        assert!(
+            read_codex_discovery_frontier(&store)
+                .await
+                .expect("final frontier")
+                .is_complete()
+        );
     }
 
     #[tokio::test]

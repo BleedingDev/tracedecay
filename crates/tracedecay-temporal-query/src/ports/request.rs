@@ -12,6 +12,7 @@ pub enum TemporalRetrievalScope {
 }
 
 impl TemporalRetrievalScope {
+    #[hotpath::skip]
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Session(_) => "session",
@@ -356,10 +357,12 @@ impl TemporalSnapshotRequest {
         &self.access_digest
     }
 
+    #[hotpath::skip]
     pub const fn temporal_mode(&self) -> TemporalModeV1 {
         self.temporal_mode
     }
 
+    #[hotpath::skip]
     pub const fn grain(&self) -> RetrievalGrainV1 {
         self.grain
     }
@@ -368,6 +371,7 @@ impl TemporalSnapshotRequest {
         &self.semantic_filter
     }
 
+    #[hotpath::skip]
     pub const fn limits(&self) -> ExecutionLimits {
         self.limits
     }

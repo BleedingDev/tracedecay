@@ -13,11 +13,11 @@ use tracedecay_application::{CancellationSignal, Deadline, IdempotencyKey, Reque
 use tracedecay_domain::{ObservationScopeV1, ProjectId};
 
 use crate::tracedecay::TraceDecay;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 
-use super::super::ToolResult;
 use super::json_result;
+use tracedecay_mcp::ToolResult;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -89,7 +89,7 @@ struct AdminCliContext<'a> {
     project: Option<&'a TraceDecay>,
     registered_project_session_db: Option<&'a RegisteredGlobalDbLeaseV1>,
     registered_user_session_db: Option<&'a RegisteredGlobalDbLeaseV1>,
-    profile_identity: Option<&'a crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1>,
+    profile_identity: Option<std::sync::Arc<dyn tracedecay_application::ProfileIdentityReadPort>>,
     session_sync: Option<&'a dyn SessionSyncServicePort>,
     request_id: Option<RequestId>,
     deadline: Option<Deadline>,
@@ -194,8 +194,9 @@ impl<'a> AdminCliContext<'a> {
 
     fn require_profile_identity(
         &self,
-    ) -> Result<&'a crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1> {
+    ) -> Result<&dyn tracedecay_application::ProfileIdentityReadPort> {
         self.profile_identity
+            .as_deref()
             .ok_or_else(|| TraceDecayError::Config {
                 message: "daemon durable profile identity is unavailable".to_string(),
             })
@@ -308,14 +309,14 @@ async fn dispatch_admin_cli(
             sessions_unfinished(context.require_registered_project_session_db()?, limit).await?
         }
         AdminCliAction::AnalyticsSync => {
-            crate::analytics_bridge::analytics_sync_with_db(
+            tracedecay_usecases::analytics_bridge::analytics_sync_with_db(
                 context.require_accounting_db()?,
                 context.project_root(),
             )
             .await
         }
         AdminCliAction::AnalyticsDiagnostics { all, no_sync } => {
-            crate::analytics_bridge::analytics_diagnostics_with_db(
+            tracedecay_usecases::analytics_bridge::analytics_diagnostics_with_db(
                 context.require_accounting_db()?,
                 context
                     .registered_project_session_db
@@ -331,9 +332,21 @@ async fn dispatch_admin_cli(
         }
         AdminCliAction::RegistryUpdate { tokens } => {
             let cg = context.require_project()?;
-            let previous = global_db.get_project_tokens(cg.project_root()).await;
-            global_db.upsert(cg.project_root(), tokens).await;
-            json!({ "previous": previous, "current": tokens })
+            // The previous total is informational; an unreadable ledger is
+            // reported beside the update rather than blocking the write or
+            // being shown as zero. The write itself fails closed.
+            let previous = global_db.try_get_project_tokens(cg.project_root()).await;
+            global_db
+                .try_upsert_project_tokens(cg.project_root(), tokens)
+                .await?;
+            match previous {
+                Ok(previous) => json!({ "previous": previous, "current": tokens }),
+                Err(error) => json!({
+                    "previous": Value::Null,
+                    "previous_error": error,
+                    "current": tokens,
+                }),
+            }
         }
         AdminCliAction::RegistryList { limit, query } => {
             registry_list(context.project, global_db, limit, query.as_deref()).await?
@@ -409,7 +422,7 @@ async fn dispatch_admin_cli(
             project_arg,
             since,
             history,
-        } => gain_query(global_db, project_arg.as_deref(), since, history).await,
+        } => gain_query(global_db, project_arg.as_deref(), since, history).await?,
     };
     Ok(json_result(&value))
 }
@@ -438,25 +451,34 @@ async fn registry_project_tokens(
     json!({ "projects": projects })
 }
 
+/// Gain queries fail closed: an unreadable savings ledger is an error the
+/// caller sees, never an empty history or a measured zero.
 async fn gain_query(
     global_db: &RegisteredGlobalDb,
     project_arg: Option<&Path>,
     since: i64,
     history: bool,
-) -> Value {
+) -> Result<Value> {
+    let accounting_error = |message| TraceDecayError::Config { message };
     let project = project_arg.map(|path| path.to_string_lossy().to_string());
     if history {
-        let rows = global_db.savings_history(project.as_deref(), since).await;
-        return json!({
+        let rows = global_db
+            .savings_history(project.as_deref(), since)
+            .await
+            .map_err(accounting_error)?;
+        return Ok(json!({
             "history": rows.iter().map(|row| json!({
                 "day": row.day,
                 "saved_tokens": row.saved_tokens,
                 "calls": row.calls,
             })).collect::<Vec<_>>(),
-        });
+        }));
     }
-    let total = global_db.sum_savings(project.as_deref(), since).await;
-    json!({ "saved_tokens": total.saved_tokens, "calls": total.calls })
+    let total = global_db
+        .sum_savings(project.as_deref(), since)
+        .await
+        .map_err(accounting_error)?;
+    Ok(json!({ "saved_tokens": total.saved_tokens, "calls": total.calls }))
 }
 
 async fn registry_list(
@@ -465,7 +487,9 @@ async fn registry_list(
     limit: usize,
     query: Option<&str>,
 ) -> Result<Value> {
-    use crate::project_registry::{PublicCodeProject, build_project_registry_view};
+    use tracedecay_dashboard_api::project_registry::{
+        build_project_registry_view, public_code_project_from_record,
+    };
 
     let limit = limit.clamp(1, 100_000);
     let mut projects = match query {
@@ -484,7 +508,7 @@ async fn registry_list(
     let view = build_project_registry_view(&contexts, active_id.as_deref(), truncated);
     let public = projects
         .iter()
-        .map(|project| PublicCodeProject::from_record(project, active_id.as_deref()))
+        .map(|project| public_code_project_from_record(project, active_id.as_deref()))
         .collect::<Vec<_>>();
     Ok(json!({
         "status": "ok",
@@ -513,36 +537,15 @@ async fn registry_context(
     global_db: &RegisteredGlobalDb,
     project_arg: Option<&Path>,
 ) -> Result<Value> {
-    use crate::project_registry::PublicProjectRegistryContext;
+    use tracedecay_dashboard_api::project_registry::PublicProjectRegistryContext;
 
     let Some(selector) = project_arg.or_else(|| cg.map(TraceDecay::project_root)) else {
         return Ok(json!({ "status": "invalid", "project": null }));
     };
-    let selector_text = selector.to_string_lossy();
-    let context = if RegisteredGlobalDb::is_explicit_project_path_selector(&selector_text) {
-        None
-    } else {
-        global_db
-            .project_registry_context_by_id(&selector_text)
-            .await?
-    };
-    let context = match context {
-        Some(context) => Some(context),
-        None => match global_db
-            .project_registry_context_by_alias(selector)
-            .await?
-        {
-            Some(context) => Some(context),
-            None if RegisteredGlobalDb::is_explicit_project_path_selector(&selector_text) => {
-                let git_common_dir = tracedecay_runtime_core::worktree::git_common_dir(selector);
-                global_db
-                    .project_registry_context_by_identity(selector, git_common_dir.as_deref())
-                    .await?
-            }
-            None => None,
-        },
-    };
-    let Some(context) = context else {
+    let Some(context) = global_db
+        .project_registry_context_by_selector(selector)
+        .await?
+    else {
         return Ok(json!({ "status": "not_found", "project": null }));
     };
     let active_id = match cg {
@@ -567,7 +570,7 @@ async fn cost_summary(
     range: &str,
 ) -> Result<Value> {
     let accounting_error = |message| TraceDecayError::Config { message };
-    let since = tracedecay_usecases::provider_usage::provider_usage_range_start(range)
+    let since = tracedecay_session_memory::provider_usage::provider_usage_range_start(range)
         .map_err(accounting_error)?;
     let since_seconds = i64::try_from(since).map_err(|_| TraceDecayError::Config {
         message: "provider usage range exceeds the supported timestamp domain".to_owned(),
@@ -584,7 +587,7 @@ async fn cost_summary(
     };
     let summary = match (provider_usage_db, provider_scope) {
         (Some(db), Some(scope)) => {
-            tracedecay_usecases::provider_usage::provider_usage_cost_summary(
+            tracedecay_session_memory::provider_usage::provider_usage_cost_summary(
                 db,
                 scope,
                 None,
@@ -603,14 +606,15 @@ async fn cost_summary(
         let denominator = tokens_saved.checked_add(consumed)?;
         (denominator > 0).then_some(tokens_saved as f64 / denominator as f64)
     });
-    let today_since = tracedecay_usecases::provider_usage::provider_usage_range_start("today")
-        .map_err(accounting_error)?;
+    let today_since =
+        tracedecay_session_memory::provider_usage::provider_usage_range_start("today")
+            .map_err(accounting_error)?;
     let today_since_seconds = i64::try_from(today_since).map_err(|_| TraceDecayError::Config {
         message: "provider usage range exceeds the supported timestamp domain".to_owned(),
     })?;
     let today = match (provider_usage_db, provider_scope) {
         (Some(db), Some(scope)) => {
-            tracedecay_usecases::provider_usage::provider_usage_cost_summary(
+            tracedecay_session_memory::provider_usage::provider_usage_cost_summary(
                 db,
                 scope,
                 None,
@@ -635,10 +639,10 @@ async fn cost_summary(
 }
 
 fn unavailable_provider_usage_cost_summary()
--> tracedecay_usecases::provider_usage::ProviderUsageCostSummaryV1 {
-    tracedecay_usecases::provider_usage::ProviderUsageCostSummaryV1 {
-        coverage: tracedecay_usecases::provider_usage::ProviderUsageCoverageV1::Unavailable,
-        pricing_revision: tracedecay_usecases::provider_pricing::load_table()
+-> tracedecay_session_memory::provider_usage::ProviderUsageCostSummaryV1 {
+    tracedecay_session_memory::provider_usage::ProviderUsageCostSummaryV1 {
+        coverage: tracedecay_session_memory::provider_usage::ProviderUsageCoverageV1::Unavailable,
+        pricing_revision: tracedecay_session_memory::provider_pricing::load_table()
             .revision
             .clone(),
         usage_events: 0,
@@ -816,7 +820,7 @@ fn render_session_sync_outcome(outcome: SessionSyncOutcomeV1) -> Value {
 }
 
 async fn sessions_unfinished(db: &RegisteredGlobalDbLeaseV1, limit: usize) -> Result<Value> {
-    let items = crate::store::GlobalDbWorkflowStore::new(db.clone())
+    let items = tracedecay_global_db::GlobalDbWorkflowStore::new(db.clone())
         .list_unfinished_workflows(limit)
         .await
         .map_err(|message| TraceDecayError::Config { message })?;

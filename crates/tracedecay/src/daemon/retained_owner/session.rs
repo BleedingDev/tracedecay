@@ -23,8 +23,12 @@ use tracedecay_domain::{
     SessionSourceCoverageV1, TemporalCoverageCountsV1, TemporalModeV1, UserProfileId,
     ValidCoverageIntervalV1 as DomainValidCoverageIntervalV1, canonical_sha256,
 };
+use tracedecay_session_memory::context::{ResolvedSessionIdentity, SessionRootId, SessionStoreId};
+use tracedecay_session_memory::session::{
+    SessionDataFreshness, SessionFreshnessPolicy, SessionRetrievalScope, SessionTemporalQuery,
+};
 use tracedecay_sessions::WorkflowIndexReadPort;
-use tracedecay_sessions::runtime::git_correlation::GitScopeFilter;
+use tracedecay_sessions::runtime::git_correlation::{GitScopeFilter, git_scope_filter_from_args};
 use tracedecay_sessions::runtime::{
     ProviderScope, SessionMessageRecord, SessionMessageSearchResult, SessionMessageType,
     SessionRecord, SessionSearchScope,
@@ -34,21 +38,17 @@ use tracedecay_temporal_query::ports::{
     TemporalCandidateFilterV1, TemporalMessageTypeFilterV1, TemporalSessionScopeFilterV1,
 };
 use tracedecay_temporal_query::ranking::DiversityLimits;
-use tracedecay_usecases::context::{ResolvedSessionIdentity, SessionRootId, SessionStoreId};
-use tracedecay_usecases::session::{
-    SessionDataFreshness, SessionFreshnessPolicy, SessionRetrievalScope, SessionTemporalQuery,
-};
 
 use super::receipts::{evidence_outcome, session_refresh_effect_outcome};
 use super::session_refresh::{RetainedSessionRefreshPortV1, admitted_session_refresh_command};
-use crate::daemon::session_retrieval::{
+use tracedecay_domain::errors::TraceDecayError;
+use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_runtime_core::timeutil::{SearchTimeBound, parse_search_time_filter_bound};
+use tracedecay_session_runtime::session_retrieval::{
     DaemonSessionRetrievalService, SessionApplicationRetrievalPortV1, SessionRetrievalPageView,
     SessionRetrievalServiceOutcome, SessionRetrievalStoreScope, SessionTemporalMetadataView,
 };
-use crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1;
-use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
-use tracedecay_runtime_core::errors::TraceDecayError;
-use tracedecay_runtime_core::timeutil::{SearchTimeBound, parse_search_time_filter_bound};
+use tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1;
 
 mod refresh;
 #[cfg(test)]
@@ -58,7 +58,7 @@ const MESSAGE_SEARCH_ROOT_SESSION_ID: &str = "session.message-search.root";
 /// The admitted retrieval ceiling; a larger context budget is refused rather
 /// than trimmed.
 const MESSAGE_SEARCH_CONTEXT_BYTES: u64 =
-    crate::daemon::session_retrieval::APPLICATION_RETRIEVAL_MAX_BYTES;
+    tracedecay_session_runtime::session_retrieval::APPLICATION_RETRIEVAL_MAX_BYTES;
 
 pub(super) struct ProjectRetainedSessionAuthoritiesV1 {
     pub(super) project_root: PathBuf,
@@ -83,6 +83,7 @@ pub(super) struct DirectProfileRetainedSessionPortV1<'a> {
 }
 
 impl<'a> DirectProfileRetainedSessionPortV1<'a> {
+    #[hotpath::skip]
     pub(super) const fn profile(
         registry: &'a DaemonSessionRuntimeRegistryV1,
         identity: ResolvedSessionIdentity,
@@ -110,7 +111,11 @@ impl<'a> DirectProfileRetainedSessionPortV1<'a> {
             .await?;
         let retrieval =
             DaemonSessionRetrievalService::new_admitted_profile(database, self.identity.clone())
-                .ok_or(RetainedSurfaceExecutionErrorV1::Unavailable)?;
+                .ok_or_else(|| {
+                    RetainedSurfaceExecutionErrorV1::unavailable(
+                        "the profile session retrieval service could not be admitted",
+                    )
+                })?;
         let outcome = retrieve_bounded(context, &retrieval, query).await?;
         let result = input.result(outcome, SessionRetrievalStoreScope::Profile)?;
         evidence_outcome(
@@ -120,6 +125,7 @@ impl<'a> DirectProfileRetainedSessionPortV1<'a> {
         )
     }
 
+    #[hotpath::skip]
     async fn bounded<T, F>(
         &self,
         context: &RetainedSurfaceExecutionContextV1<'_>,
@@ -137,6 +143,7 @@ impl<'a> DirectProfileRetainedSessionPortV1<'a> {
 }
 
 impl DirectRetainedSessionPortV1 {
+    #[hotpath::skip]
     pub(super) const fn project(authorities: ProjectRetainedSessionAuthoritiesV1) -> Self {
         Self { authorities }
     }
@@ -266,6 +273,19 @@ impl DirectRetainedSessionPortV1 {
                 )
             })
             .await??;
+        if result.status == RetainedOutcomeStatusV1::Unavailable {
+            let detail = result.error.as_ref().map_or_else(
+                || "workflow index unavailable".to_owned(),
+                |error| {
+                    format!(
+                        "{}: {}",
+                        error.reason.as_deref().unwrap_or(error.code.as_str()),
+                        error.message
+                    )
+                },
+            );
+            return Err(RetainedSurfaceExecutionErrorV1::unavailable(detail));
+        }
         evidence_outcome(
             context,
             RetainedSurfaceOperation::Workflows,
@@ -273,6 +293,7 @@ impl DirectRetainedSessionPortV1 {
         )
     }
 
+    #[hotpath::skip]
     async fn bounded<T, F>(
         &self,
         context: &RetainedSurfaceExecutionContextV1<'_>,
@@ -362,8 +383,32 @@ impl MessageSearchInput {
             None if goals => String::new(),
             None => return Err(RetainedSurfaceExecutionErrorV1::InvalidRequest),
         };
-        let provider = ProviderScope::parse_optional(request.provider.as_deref())
-            .map_err(|_| RetainedSurfaceExecutionErrorV1::InvalidRequest)?;
+        // The provider parser names the offending value and the accepted set;
+        // keep that corrective diagnostic in the refusal instead of collapsing
+        // it to the generic invalid-request problem. A value the sanitized
+        // diagnostic cannot carry (oversized or control characters) still
+        // refuses with the generic problem.
+        let provider =
+            ProviderScope::parse_optional(request.provider.as_deref()).map_err(|error| {
+                tracedecay_application::SafeDiagnostic::new(
+                    "application.retained.message-search-provider-invalid",
+                    error.to_string(),
+                )
+                .map_or(
+                    RetainedSurfaceExecutionErrorV1::InvalidRequest,
+                    |diagnostic| {
+                        RetainedSurfaceExecutionErrorV1::ApplicationProblem(
+                            tracedecay_application::ApplicationProblem::InvalidRequest {
+                                diagnostic,
+                                retry: tracedecay_application::RetryDirective::Never,
+                                legal_actions: vec![
+                                    tracedecay_application::LegalAction::CorrectRequest,
+                                ],
+                            },
+                        )
+                    },
+                )
+            })?;
         let include_subagents = request.include_subagents.unwrap_or(true);
         let mut scope = match request.scope.unwrap_or(MessageRelationshipScopeV1::All) {
             MessageRelationshipScopeV1::All => SessionSearchScope::All,
@@ -401,7 +446,7 @@ impl MessageSearchInput {
         let worktree = optional_string(request.worktree.as_deref())?;
         let commit = optional_string(request.commit.as_deref())?;
         let git =
-            GitScopeFilter::from_args(branch.as_deref(), worktree.as_deref(), commit.as_deref())
+            git_scope_filter_from_args(branch.as_deref(), worktree.as_deref(), commit.as_deref())
                 .map_err(|_| RetainedSurfaceExecutionErrorV1::InvalidRequest)?;
         Ok(Self {
             query,
@@ -455,8 +500,11 @@ impl MessageSearchInput {
         ))
         .map_err(|_| RetainedSurfaceExecutionErrorV1::InvalidRequest)?;
         SessionTemporalQuery::new(
-            SessionId::new(MESSAGE_SEARCH_ROOT_SESSION_ID)
-                .map_err(|_| RetainedSurfaceExecutionErrorV1::Unavailable)?,
+            SessionId::new(MESSAGE_SEARCH_ROOT_SESSION_ID).map_err(|_| {
+                RetainedSurfaceExecutionErrorV1::unavailable(
+                    "the message-search root session anchor could not be constructed",
+                )
+            })?,
             self.provider.provider_id().map(str::to_owned),
             &self.query,
             self.cursor.clone(),
@@ -485,9 +533,11 @@ impl MessageSearchInput {
                 // `ExecutionLimits::default()`, which the admitted binding
                 // refuses terminally — every message search would answer
                 // a structural budget refusal instead of searching.
-                .with_execution_limits(crate::daemon::session_retrieval::admitted_execution_limits(
-                    self.limit,
-                ))
+                .with_execution_limits(
+                    tracedecay_session_runtime::session_retrieval::admitted_execution_limits(
+                        self.limit,
+                    ),
+                )
         })
     }
 
@@ -548,9 +598,15 @@ impl MessageSearchInput {
                     }
                 });
             }
-            SessionRetrievalServiceOutcome::Locked
-            | SessionRetrievalServiceOutcome::Unavailable(_) => {
-                return Err(RetainedSurfaceExecutionErrorV1::Unavailable);
+            SessionRetrievalServiceOutcome::Locked => {
+                return Err(RetainedSurfaceExecutionErrorV1::unavailable(
+                    "the session store is locked for retrieval",
+                ));
+            }
+            SessionRetrievalServiceOutcome::Unavailable(unavailable) => {
+                return Err(RetainedSurfaceExecutionErrorV1::unavailable(
+                    super::session_retrieval_unavailable_detail(&unavailable),
+                ));
             }
             SessionRetrievalServiceOutcome::CursorStale => {
                 return Err(RetainedSurfaceExecutionErrorV1::cursor_stale_refusal());
@@ -843,7 +899,9 @@ fn message_search_hit(
     result: SessionMessageSearchResult,
 ) -> Result<MessageSearchHitV1, RetainedSurfaceExecutionErrorV1> {
     if !result.score.is_finite() {
-        return Err(RetainedSurfaceExecutionErrorV1::Unavailable);
+        return Err(RetainedSurfaceExecutionErrorV1::unavailable(
+            "message search produced a non-finite relevance score",
+        ));
     }
     Ok(MessageSearchHitV1 {
         session: session_record(result.session),

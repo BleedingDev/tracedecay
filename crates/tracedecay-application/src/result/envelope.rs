@@ -77,6 +77,7 @@ impl ResultContractRef {
         &self.schema_id
     }
 
+    #[hotpath::skip]
     pub const fn schema_revision(&self) -> u32 {
         self.schema_revision
     }

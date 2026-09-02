@@ -26,7 +26,6 @@ fn assert_ready_verified_generation(body: &Value) {
 use tracedecay::config::USER_DATA_DIR_ENV;
 use tracedecay::dashboard;
 use tracedecay::tracedecay::TraceDecay;
-use tracedecay::types::{Edge, EdgeKind, FileRecord, Node, NodeKind, Visibility};
 use tracedecay_application::{
     CapabilityGrantId, CapabilityGrantSnapshot, DisclosureClass, RequestAdmission, RequestContext,
     ResolvedScope,
@@ -35,6 +34,7 @@ use tracedecay_code_index::graph_projection::{
     CodeGraphProjectionStore, HermeticCodeGraphProjectionStore,
 };
 use tracedecay_code_index::lineage::{GenerationSymbolIndexV1, LineageSymbolRecordV1};
+use tracedecay_domain::code_intelligence::{Edge, EdgeKind, Node, NodeKind, Visibility};
 use tracedecay_domain::{
     ActorId, BoundedSanitizedText, CanonicalRelationEdgeV1, ChunkerRevision, CodeGenerationId,
     CodeSearchChunkAnchorV1, CodeSearchChunkGrainV1, CodeSearchChunkId, CodeSearchChunkV1,
@@ -45,12 +45,12 @@ use tracedecay_domain::{
     SymbolOccurrenceId, canonical_sha256,
 };
 use tracedecay_graph_db::NeverCancelled;
-use tracedecay_usecases::context::RegisteredScopeResolver;
-use tracedecay_usecases::graph::{
+use tracedecay_graph_query::{
     CodeGraphProjectionReadPort, CodeGraphReadAdmissionFuture, CodeGraphReadAdmissionPort,
     CodeGraphReadAdmissionRequest, CodeGraphReadError, CodeGraphReadFuture, CodeGraphReadRequest,
     VerifiedCodeGraphRead,
 };
+use tracedecay_session_memory::context::RegisteredScopeResolver;
 
 struct DashboardFixture {
     _tmp: TempDir,
@@ -64,13 +64,16 @@ struct DashboardFixture {
 struct GraphFixtureSeedV1 {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
-    files: Vec<FileRecord>,
+    /// Logical paths of the seeded files; the snapshot derives per-file
+    /// occurrence ids, digests, and languages from the path alone.
+    files: Vec<String>,
 }
 
 #[derive(Clone)]
 struct FixtureGraphProjectionV1 {
     scope: ResolvedScope,
     store: Arc<CodeGraphProjectionStore>,
+    freshness: tracedecay_graph_query::CodeGraphReadFreshnessV1,
 }
 
 impl CodeGraphProjectionReadPort for FixtureGraphProjectionV1 {
@@ -83,9 +86,11 @@ impl CodeGraphProjectionReadPort for FixtureGraphProjectionV1 {
                 return Err(CodeGraphReadError::Denied);
             }
             match request.context.admission_at(request.observed_at) {
-                RequestAdmission::Admitted => {
-                    VerifiedCodeGraphRead::new(self.scope.clone(), Arc::clone(&self.store))
-                }
+                RequestAdmission::Admitted => VerifiedCodeGraphRead::new(
+                    self.scope.clone(),
+                    Arc::clone(&self.store),
+                    self.freshness,
+                ),
                 RequestAdmission::Cancelled => Err(CodeGraphReadError::Cancelled),
                 RequestAdmission::TimedOut => Err(CodeGraphReadError::TimedOut),
             }
@@ -155,7 +160,7 @@ fn make_node(id: &str, kind: NodeKind, name: &str, file_path: &str, start_line: 
         id: id.to_string(),
         kind,
         name: name.to_string(),
-        qualified_name: format!("crate::dashboard::{name}"),
+        qualified_name: format!("tracedecay_dashboard_api::{name}"),
         file_path: file_path.to_string(),
         start_line,
         attrs_start_line: start_line,
@@ -225,14 +230,7 @@ fn seed_orphan_node(seed: &mut GraphFixtureSeedV1) {
         "src/dashboard/orphan.rs",
         1,
     ));
-    seed.files.push(FileRecord {
-        path: "src/dashboard/orphan.rs".to_owned(),
-        content_hash: "hash-orphan".to_owned(),
-        size: 32,
-        modified_at: 1_700_000_000,
-        indexed_at: 1_700_000_010,
-        node_count: 1,
-    });
+    seed.files.push("src/dashboard/orphan.rs".to_owned());
 }
 
 fn seed_graph_fixture() -> GraphFixtureSeedV1 {
@@ -289,22 +287,8 @@ fn seed_graph_fixture() -> GraphFixtureSeedV1 {
     ];
 
     let files = vec![
-        FileRecord {
-            path: "src/dashboard/mod.rs".to_string(),
-            content_hash: "hash-rust".to_string(),
-            size: 128,
-            modified_at: 1_700_000_000,
-            indexed_at: 1_700_000_010,
-            node_count: 3,
-        },
-        FileRecord {
-            path: "src/dashboard/view.tsx".to_string(),
-            content_hash: "hash-tsx".to_string(),
-            size: 96,
-            modified_at: 1_700_000_000,
-            indexed_at: 1_700_000_010,
-            node_count: 1,
-        },
+        "src/dashboard/mod.rs".to_string(),
+        "src/dashboard/view.tsx".to_string(),
     ];
     GraphFixtureSeedV1 {
         nodes,
@@ -344,14 +328,7 @@ fn seed_neighbor_symmetry_fixture(seed: &mut GraphFixtureSeedV1) {
             60,
         ),
     ]);
-    seed.files.push(FileRecord {
-        path: "src/dashboard/symmetry.rs".to_owned(),
-        content_hash: "hash-symmetry".to_owned(),
-        size: 128,
-        modified_at: 1_700_000_000,
-        indexed_at: 1_700_000_010,
-        node_count: 4,
-    });
+    seed.files.push("src/dashboard/symmetry.rs".to_owned());
 
     seed.edges.extend(
         [
@@ -386,14 +363,7 @@ fn seed_structure_fixture(seed: &mut GraphFixtureSeedV1) {
         line: Some(13),
     });
     seed.nodes.push(test_node);
-    seed.files.push(FileRecord {
-        path: "tests/dashboard_graph.rs".to_string(),
-        content_hash: "hash-test".to_string(),
-        size: 64,
-        modified_at: 1_700_000_000,
-        indexed_at: 1_700_000_010,
-        node_count: 1,
-    });
+    seed.files.push("tests/dashboard_graph.rs".to_string());
 }
 
 fn fixture_digest(domain: &str, value: &str) -> String {
@@ -429,6 +399,7 @@ fn relation_kind(kind: &EdgeKind) -> RelationEdgeKindV1 {
 fn compose_graph_authority(
     cg: &TraceDecay,
     seed: GraphFixtureSeedV1,
+    freshness: tracedecay_graph_query::CodeGraphReadFreshnessV1,
 ) -> (
     Arc<dyn CodeGraphReadAdmissionPort>,
     Arc<dyn CodeGraphProjectionReadPort>,
@@ -448,12 +419,12 @@ fn compose_graph_authority(
     let files: Vec<_> = seed
         .files
         .iter()
-        .map(|file| SanitizedCodeFileV1 {
-            file_occurrence_id: FileOccurrenceId::new(format!("file:dashboard:{}", file.path))
+        .map(|path| SanitizedCodeFileV1 {
+            file_occurrence_id: FileOccurrenceId::new(format!("file:dashboard:{path}"))
                 .unwrap_or_else(|error| panic!("fixture file occurrence: {error}")),
-            logical_path: file.path.clone(),
-            language: Some(fixture_language(&file.path)),
-            content_digest: ContentDigest::new(fixture_digest("dashboard-file", &file.path))
+            logical_path: path.clone(),
+            language: Some(fixture_language(path)),
+            content_digest: ContentDigest::new(fixture_digest("dashboard-file", path))
                 .unwrap_or_else(|error| panic!("fixture file digest: {error}")),
             disposition: SnapshotFileDispositionV1::Present,
         })
@@ -466,38 +437,40 @@ fn compose_graph_authority(
         generation.clone(),
         seed.nodes
             .iter()
-            .map(|node| LineageSymbolRecordV1 {
-                occurrence: SymbolOccurrenceId::new(node.id.clone())
-                    .unwrap_or_else(|error| panic!("fixture symbol occurrence: {error}")),
-                identity: SymbolIdentityDigest::new(fixture_digest(
-                    "dashboard-symbol-identity",
-                    &node.id,
-                ))
-                .unwrap_or_else(|error| panic!("fixture symbol identity: {error}")),
-                qualified_name: node.qualified_name.clone(),
-                simple_name: node.name.clone(),
-                kind: node.kind.as_str().to_owned(),
-                visibility: node.visibility.as_str().to_owned(),
-                branches: node.branches,
-                loops: node.loops,
-                max_nesting: node.max_nesting,
-                line_span: node
-                    .end_line
-                    .saturating_sub(node.start_line)
-                    .saturating_add(1),
-                start_line: node.start_line,
-                signature: node.signature.clone(),
-                skip_test_coverage: false,
-                file_identity: FileIdentityDigest::new(fixture_digest(
-                    "dashboard-file-identity",
-                    &node.file_path,
-                ))
-                .unwrap_or_else(|error| panic!("fixture file identity: {error}")),
-                content_digest: ContentDigest::new(fixture_digest(
-                    "dashboard-symbol-content",
-                    &node.id,
-                ))
-                .unwrap_or_else(|error| panic!("fixture symbol digest: {error}")),
+            .map(|node| {
+                Arc::new(LineageSymbolRecordV1 {
+                    occurrence: SymbolOccurrenceId::new(node.id.clone())
+                        .unwrap_or_else(|error| panic!("fixture symbol occurrence: {error}")),
+                    identity: SymbolIdentityDigest::new(fixture_digest(
+                        "dashboard-symbol-identity",
+                        &node.id,
+                    ))
+                    .unwrap_or_else(|error| panic!("fixture symbol identity: {error}")),
+                    qualified_name: node.qualified_name.clone(),
+                    simple_name: node.name.clone(),
+                    kind: node.kind.as_str().to_owned(),
+                    visibility: node.visibility.as_str().to_owned(),
+                    branches: node.branches,
+                    loops: node.loops,
+                    max_nesting: node.max_nesting,
+                    line_span: node
+                        .end_line
+                        .saturating_sub(node.start_line)
+                        .saturating_add(1),
+                    start_line: node.start_line,
+                    signature: node.signature.clone(),
+                    skip_test_coverage: false,
+                    file_identity: FileIdentityDigest::new(fixture_digest(
+                        "dashboard-file-identity",
+                        &node.file_path,
+                    ))
+                    .unwrap_or_else(|error| panic!("fixture file identity: {error}")),
+                    content_digest: ContentDigest::new(fixture_digest(
+                        "dashboard-symbol-content",
+                        &node.id,
+                    ))
+                    .unwrap_or_else(|error| panic!("fixture symbol digest: {error}")),
+                })
             })
             .collect(),
     )
@@ -512,7 +485,7 @@ fn compose_graph_authority(
             let file = file_occurrences
                 .get(&node.file_path)
                 .unwrap_or_else(|| panic!("fixture node file is registered: {}", node.file_path));
-            CodeSearchChunkV1 {
+            Arc::new(CodeSearchChunkV1 {
                 id: CodeSearchChunkId::new(format!("chunk:dashboard:{}", node.id))
                     .unwrap_or_else(|error| panic!("fixture chunk identity: {error}")),
                 anchor: CodeSearchChunkAnchorV1 {
@@ -546,7 +519,7 @@ fn compose_graph_authority(
                 subtokens: Vec::new(),
                 sanitized_text: BoundedSanitizedText::new("fixture")
                     .unwrap_or_else(|error| panic!("fixture sanitized text: {error}")),
-            }
+            })
         })
         .collect();
     let edges: Vec<_> = seed
@@ -589,7 +562,11 @@ fn compose_graph_authority(
         Arc::new(FixtureGraphAdmissionV1 {
             scope: scope.clone(),
         }),
-        Arc::new(FixtureGraphProjectionV1 { scope, store }),
+        Arc::new(FixtureGraphProjectionV1 {
+            scope,
+            store,
+            freshness,
+        }),
     )
 }
 
@@ -597,10 +574,41 @@ async fn start_dashboard_fixture() -> DashboardFixture {
     start_dashboard_fixture_with(false, false, false).await
 }
 
+/// [`start_dashboard_fixture`] whose graph port serves the last complete
+/// generation typed stale, the rebuild-window shape the envelope freshness
+/// marker must expose.
+async fn start_stale_serving_dashboard_fixture() -> DashboardFixture {
+    start_dashboard_fixture_full(
+        false,
+        false,
+        false,
+        tracedecay_graph_query::CodeGraphReadFreshnessV1::LastCompleteStale {
+            sealed_at: tracedecay_domain::UtcMicros(1),
+            rebuild_in_flight: true,
+        },
+    )
+    .await
+}
+
 async fn start_dashboard_fixture_with(
     with_orphan: bool,
     with_structure_fixture: bool,
     with_neighbor_symmetry_fixture: bool,
+) -> DashboardFixture {
+    start_dashboard_fixture_full(
+        with_orphan,
+        with_structure_fixture,
+        with_neighbor_symmetry_fixture,
+        tracedecay_graph_query::CodeGraphReadFreshnessV1::Current,
+    )
+    .await
+}
+
+async fn start_dashboard_fixture_full(
+    with_orphan: bool,
+    with_structure_fixture: bool,
+    with_neighbor_symmetry_fixture: bool,
+    freshness: tracedecay_graph_query::CodeGraphReadFreshnessV1,
 ) -> DashboardFixture {
     let tmp = tempdir_or_panic();
     let project_root = tmp.path().join("project");
@@ -619,7 +627,8 @@ async fn start_dashboard_fixture_with(
     if with_neighbor_symmetry_fixture {
         seed_neighbor_symmetry_fixture(&mut graph_seed);
     }
-    let (code_graph_admission, code_graph_projection) = compose_graph_authority(&cg, graph_seed);
+    let (code_graph_admission, code_graph_projection) =
+        compose_graph_authority(&cg, graph_seed, freshness);
 
     let port = pick_free_port();
     let base_url = format!("http://127.0.0.1:{port}");
@@ -636,7 +645,8 @@ async fn start_dashboard_fixture_with(
             dashboard::DashboardTestProjectGraphsV1::default(),
             "127.0.0.1",
             port,
-            dashboard::spa_router(),
+            tracedecay::product_runtime::register_fixture_product_runtime().build_version(),
+            dashboard::spa_router(tracedecay::product_runtime::FIXTURE_DASHBOARD_ASSETS),
             std::future::pending(),
         )
         .await;
@@ -723,7 +733,7 @@ fn graph_api_returns_seeded_overview_search_detail_and_subgraph() {
         assert_eq!(status, 200);
         assert_eq!(
             node["payload"]["node"]["qualified_name"],
-            "crate::dashboard::route_graph"
+            "tracedecay_dashboard_api::route_graph"
         );
         assert_eq!(node["payload"]["node"]["span"]["start_line"], 8);
         assert_eq!(
@@ -804,6 +814,52 @@ fn graph_api_returns_seeded_overview_search_detail_and_subgraph() {
                 .iter()
                 .any(|node| node["id"] == "n-route" && node["degree"] == 3),
             "subgraph nodes should carry total degree counts (n-route has 3 edges)"
+        );
+    });
+}
+
+#[test]
+fn graph_api_marks_stale_served_reads_in_the_envelope_freshness() {
+    let _env_lock = GLOBAL_DB_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let runtime = create_runtime();
+    runtime.block_on(async {
+        let fixture = start_stale_serving_dashboard_fixture().await;
+        let agent = http_agent();
+
+        let (status, overview) = get_json(
+            &agent,
+            &format!("{}/api/plugins/graph/overview", fixture.base_url),
+        );
+        assert_eq!(status, 200);
+        assert_ready_verified_generation(&overview);
+        assert_eq!(
+            overview["freshness"]["state"], "stale",
+            "stale-served graph reads must carry the stale freshness marker: {overview}"
+        );
+
+        let (status, search) = get_json(
+            &agent,
+            &format!(
+                "{}/api/plugins/graph/search?q=dashboard&limit=10",
+                fixture.base_url
+            ),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            search["freshness"]["state"], "stale",
+            "stale-served graph search must carry the stale freshness marker: {search}"
+        );
+
+        let (status, node) = get_json(
+            &agent,
+            &format!("{}/api/plugins/graph/node/n-route", fixture.base_url),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            node["freshness"]["state"], "stale",
+            "stale-served node detail must carry the stale freshness marker: {node}"
         );
     });
 }

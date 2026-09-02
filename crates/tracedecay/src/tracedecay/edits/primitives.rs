@@ -11,8 +11,8 @@ use std::path::Path;
 use same_file::Handle;
 use tracedecay_usecases::tracedecay::SourceEditGraphReadV1;
 
-use crate::types::*;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_application::source_edit::{EditResult, InsertResult, MultiEditResult};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 use super::super::TraceDecay;
 
@@ -67,6 +67,7 @@ impl TraceDecay {
     /// callers can review before committing. Centralizing the write here keeps
     /// the dry-run gate in one place around each primitive's own validation and
     /// span logic.
+    #[hotpath::skip]
     pub(super) async fn commit_or_preview_edit(
         &self,
         rel_path: &str,

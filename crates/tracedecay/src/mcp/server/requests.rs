@@ -1,12 +1,19 @@
 //! Request routing and handlers: per-method JSON-RPC dispatch,
 //! handshake handling, resources, and `tools/call` execution.
 
+use std::path::Component;
+
 use super::dispatch_settlement::{
-    ApplicationCancellationRegistration, DispatchControl, PreparedDispatchControl,
+    ApplicationCancellationRegistration, DispatchControl, DispatchSettlement,
+    PreparedDispatchControl, dispatch_cancelled_error,
 };
 use super::*;
-use crate::mcp::ToolResult;
 use tracedecay_global_db::RegisteredGlobalDb;
+use tracedecay_mcp::{
+    ToolResult, mark_semantic_tool_error, semantic_failure_reason, tool_error_response,
+    tool_result_has_semantic_error,
+};
+use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
 mod tool_dispatch;
 
@@ -129,7 +136,7 @@ struct ApplicationSurfaceDispatch<'a> {
 /// Canonical application and retained operations require the daemon invocation
 /// executor before the request is admitted to its typed owner.
 fn requires_application_invocation_executor(tool_name: &str) -> bool {
-    crate::application_surface::ApplicationSurfaceOperation::from_tool_name(tool_name).is_some()
+    ApplicationSurfaceOperation::from_tool_name(tool_name).is_some()
         || crate::mcp::tools::binding::work_operation_for_tool(tool_name).is_some()
         || tracedecay_application::RetainedSurfaceOperation::from_tool_name(tool_name).is_some()
 }
@@ -153,13 +160,13 @@ pub(super) fn is_source_edit_tool(tool_name: &str) -> bool {
 /// inherits the bound instead of silently running unbounded.
 pub(super) fn is_controlled_read_tool(tool_name: &str) -> bool {
     matches!(
-        crate::application_surface::ApplicationSurfaceOperation::from_tool_name(tool_name),
+        ApplicationSurfaceOperation::from_tool_name(tool_name),
         Some(
-            crate::application_surface::ApplicationSurfaceOperation::GitStatus
-                | crate::application_surface::ApplicationSurfaceOperation::GitDiff
-                | crate::application_surface::ApplicationSurfaceOperation::GitHistory
-                | crate::application_surface::ApplicationSurfaceOperation::GitBlame
-                | crate::application_surface::ApplicationSurfaceOperation::GitHunks
+            ApplicationSurfaceOperation::GitStatus
+                | ApplicationSurfaceOperation::GitDiff
+                | ApplicationSurfaceOperation::GitHistory
+                | ApplicationSurfaceOperation::GitBlame
+                | ApplicationSurfaceOperation::GitHunks
         )
     ) || crate::mcp::tools::handlers::tool_dispatches_git_reads(tool_name)
         || tool_name == "tracedecay_search"
@@ -170,7 +177,10 @@ pub(super) fn tool_supports_live_cancellation(tool_name: &str) -> bool {
 }
 
 pub(super) fn dispatch_deadline_horizon_micros(bounded_operation: bool) -> Option<i64> {
-    bounded_operation.then_some(30_000_000)
+    if !bounded_operation {
+        return None;
+    }
+    i64::try_from(tracedecay_daemon_protocol::DEFAULT_DAEMON_OPERATION_DEADLINE.as_micros()).ok()
 }
 
 /// Hand-maintained schema documentation for the `tracedecay://schema` resource.
@@ -294,6 +304,7 @@ impl McpServer {
     }
 
     /// Returns `None` for notifications (requests without an `id`).
+    #[hotpath::skip]
     pub(crate) async fn handle_request(&self, request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
         // The initialize-replay entry point builds its own per-connection
         // context so replay dispatches carry a real memory-request scope,
@@ -507,13 +518,13 @@ impl McpServer {
         // project's own registered id. The application lane retains it even
         // without a connected dashboard; the SSE adapter coalesces the burst.
         let activity_project_id =
-            tracedecay_usecases::event_lane::enabled(dispatch_server.session_db.as_deref())
+            tracedecay_session_memory::event_lane::enabled(dispatch_server.session_db.as_deref())
                 .then(|| cg.store_layout().identity.project_id.clone())
                 .flatten();
         if let Some(activity_db) = dispatch_server.session_db.as_deref() {
-            tracedecay_usecases::event_lane::publish(
+            tracedecay_session_memory::event_lane::publish(
                 activity_db,
-                tracedecay_usecases::event_lane::ActivityFamilyV1::Hook,
+                tracedecay_session_memory::event_lane::ActivityFamilyV1::Hook,
                 &root,
                 activity_project_id.as_deref(),
                 1,
@@ -535,9 +546,9 @@ impl McpServer {
             if sink(root.clone(), event.rel_paths.clone()).await
                 && let Some(activity_db) = dispatch_server.session_db.as_deref()
             {
-                tracedecay_usecases::event_lane::publish(
+                tracedecay_session_memory::event_lane::publish(
                     activity_db,
-                    tracedecay_usecases::event_lane::ActivityFamilyV1::CodeIndex,
+                    tracedecay_session_memory::event_lane::ActivityFamilyV1::CodeIndex,
                     &root,
                     activity_project_id.as_deref(),
                     event.rel_paths.len() as u64,
@@ -609,7 +620,10 @@ impl McpServer {
         if client_name.is_some() {
             *recover_lock(&self.client_name) = client_name;
         }
-        JsonRpcResponse::success(id, initialize_result(SERVER_INSTRUCTIONS))
+        match initialize_result(SERVER_INSTRUCTIONS) {
+            Ok(result) => JsonRpcResponse::success(id, result),
+            Err(error) => JsonRpcResponse::error(id, ErrorCode::InternalError, error.to_string()),
+        }
     }
 
     /// The negotiated MCP client name recorded by the most recent
@@ -738,6 +752,7 @@ impl McpServer {
     /// graph. Until that resource-specific admission exists, exposing files
     /// from another store would make an unverified or stale inventory look
     /// authoritative.
+    #[hotpath::skip]
     pub(crate) async fn read_resource_files(&self, id: Value) -> JsonRpcResponse {
         Self::resource_contents(
             id,
@@ -748,6 +763,7 @@ impl McpServer {
     }
 
     /// Returns a high-level project overview as a text resource.
+    #[hotpath::skip]
     pub(crate) async fn read_resource_overview(&self, id: Value) -> JsonRpcResponse {
         let cg = self.cg_snapshot().await;
         let mut lines = Vec::new();
@@ -761,6 +777,7 @@ impl McpServer {
         Self::resource_contents(id, "tracedecay://overview", "text/plain", &text)
     }
 
+    #[hotpath::skip]
     pub(crate) async fn read_resource_branches(&self, id: Value) -> JsonRpcResponse {
         let cg = self.cg_snapshot().await;
         let tracedecay_dir = &cg.store_layout().data_root;
@@ -831,9 +848,7 @@ impl McpServer {
             analytics_arguments: analytics_arguments_snapshot(tool_name, &arguments),
             analytics_session_id: mcp_analytics_session_id(&arguments),
             arguments,
-            caller_deadline: crate::mcp::tool_call_deadline::caller_tool_call_deadline(Some(
-                params,
-            )),
+            caller_deadline: tracedecay_mcp::caller_tool_call_deadline(Some(params)),
         })
     }
 
@@ -844,7 +859,7 @@ impl McpServer {
         &self,
         tool_name: &str,
         cg: &Arc<TraceDecay>,
-        live_branch: &crate::branch::BranchMemo,
+        live_branch: &tracedecay_runtime_core::branch::BranchMemo,
         project_reader_preselected: bool,
         publish_activity: bool,
     ) {
@@ -878,6 +893,7 @@ impl McpServer {
     /// Prepare the application-surface plumbing for a single dispatch. Returns
     /// the typed request id, deadline, cancellation, and daemon invocation
     /// executor, plus the RAII registration guard that must outlive the dispatch.
+    #[hotpath::skip]
     async fn prepare_application_surface_dispatch<'a>(
         &'a self,
         cg: &TraceDecay,
@@ -895,7 +911,7 @@ impl McpServer {
                             false,
                             false,
                         )?;
-                        crate::daemon::invocation_client_for_current(handshake)
+                        tracedecay_daemon_identity::invocation_client_for_current(handshake)
                     })
                     .await
                     .ok()
@@ -937,6 +953,56 @@ impl McpServer {
             })
     }
 
+    /// Resolves the raw-read counterfactual from the retained cache, falling
+    /// back to bounded metadata reads for files owned by the current response.
+    ///
+    /// The daemon code-index cutover intentionally stopped reading the legacy
+    /// graph database's file table, so a cache miss is not evidence that a
+    /// touched source file costs zero tokens.
+    #[hotpath::measure(label = "mcp.server.accounting.raw_file_tokens", future = true)]
+    async fn raw_file_tokens(&self, project_root: &Path, touched_files: &[String]) -> u64 {
+        let cached_tokens = self.estimate_raw_file_tokens(touched_files);
+        let uncached_files = {
+            let token_map = recover_lock(&self.file_token_map);
+            touched_files
+                .iter()
+                .filter(|path| !path.is_empty() && !token_map.contains_key(path.as_str()))
+                .cloned()
+                .collect::<HashSet<_>>()
+        };
+        if uncached_files.is_empty() {
+            return cached_tokens;
+        }
+
+        let project_root = project_root.to_path_buf();
+        let uncached_tokens = tokio::task::spawn_blocking(move || {
+            uncached_files
+                .into_iter()
+                .filter_map(|path| {
+                    let relative = Path::new(&path);
+                    if relative.is_absolute()
+                        || relative
+                            .components()
+                            .any(|component| matches!(component, Component::ParentDir))
+                    {
+                        return None;
+                    }
+                    std::fs::metadata(project_root.join(relative))
+                        .ok()
+                        .filter(|metadata| metadata.is_file())
+                        .map(|metadata| metadata.len() / 4)
+                })
+                .fold(0_u64, u64::saturating_add)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "raw-file token estimation task failed");
+            0
+        });
+        cached_tokens.saturating_add(uncached_tokens)
+    }
+
+    #[hotpath::skip]
     async fn apply_token_accounting(
         &self,
         cg: &TraceDecay,
@@ -949,7 +1015,9 @@ impl McpServer {
         // "Before" counterfactual: reading every referenced file raw,
         // in full. Counters credit only the net saving per call —
         // before minus what this response actually delivered.
-        let raw_file_tokens = self.estimate_raw_file_tokens(&result.touched_files);
+        let raw_file_tokens = self
+            .raw_file_tokens(cg.project_root(), &result.touched_files)
+            .await;
         let net_saved_tokens = raw_file_tokens.saturating_sub(response_tokens);
         self.spawn_token_accounting_persist(
             cg.project_root(),
@@ -1003,7 +1071,9 @@ impl McpServer {
         // and notify make the write's completion observable to
         // [`Self::ledger_writes_settled`] without making it awaited
         // anywhere on the request path.
-        if let Some(registered) = self.accounting_db.clone() {
+        let savings_db = self.accounting_db.clone();
+        let analytics_db = self.global_db.clone();
+        if savings_db.is_some() || analytics_db.is_some() {
             let ToolTokenAccounting {
                 raw_file_tokens,
                 response_tokens,
@@ -1034,16 +1104,22 @@ impl McpServer {
                 failure_reason: failure_reason.as_deref(),
             });
             self.spawn_observed_ledger_write(async move {
-                registered
-                    .record_savings(
-                        &project_path_str,
-                        &tool_name_owned,
-                        raw_file_tokens,
-                        response_tokens,
-                        ts,
-                    )
-                    .await;
-                if let Err(e) = registered.append_analytics_event(&analytics_event).await {
+                if let Some(registered) = savings_db
+                    && let Err(e) = registered
+                        .try_record_savings(
+                            &project_path_str,
+                            &tool_name_owned,
+                            raw_file_tokens,
+                            response_tokens,
+                            ts,
+                        )
+                        .await
+                {
+                    tracing::warn!(error = %e, "MCP savings ledger append failed");
+                }
+                if let Some(registered) = analytics_db
+                    && let Err(e) = registered.append_analytics_event(&analytics_event).await
+                {
                     tracing::warn!(error = %e, "MCP analytics event insert failed");
                 }
             });
@@ -1087,8 +1163,9 @@ impl McpServer {
         connection_notifications: &std::sync::Mutex<Vec<Value>>,
     ) {
         // Prepend the version-update warning and queue the corresponding
-        // protocol notification.
-        if let Some(warning) = self.check_version_update().await {
+        // protocol notification. The check serves the cached answer and
+        // refreshes in the background, so completion never awaits the fetch.
+        if let Some(warning) = self.check_version_update() {
             if let Some(content) = result
                 .value
                 .get_mut("content")
@@ -1161,8 +1238,8 @@ impl McpServer {
                             &tool_name,
                             &analytics_arguments,
                             selected_owner.is_some(),
-                            self.project_session_refresh_wake.as_ref(),
-                            self.user_session_refresh_wake.as_ref(),
+                            self.project_session_refresh_wake.as_deref(),
+                            self.user_session_refresh_wake.as_deref(),
                         ),
                         label = "mcp.server.tools_call.complete.transcript_refresh"
                     )
@@ -1230,7 +1307,7 @@ impl McpServer {
     }
 
     fn publish_tool_call_activity(&self, tool_name: &str, cg: &TraceDecay) {
-        if !tracedecay_usecases::event_lane::enabled(self.session_db.as_deref()) {
+        if !tracedecay_session_memory::event_lane::enabled(self.session_db.as_deref()) {
             return;
         }
         if self
@@ -1251,9 +1328,9 @@ impl McpServer {
         let tool_name = tool_name.to_owned();
         self.spawn_background_task(async move {
             let _running = running;
-            tracedecay_usecases::event_lane::publish(
+            tracedecay_session_memory::event_lane::publish(
                 &activity_db,
-                tracedecay_usecases::event_lane::ActivityFamilyV1::ToolCall,
+                tracedecay_session_memory::event_lane::ActivityFamilyV1::ToolCall,
                 &project_root,
                 project_id.as_deref(),
                 1,
@@ -1275,7 +1352,7 @@ impl McpServer {
         } else {
             self.project_session_refresh_wake.as_ref()
         };
-        wake.is_some_and(|wake| wake.status().unavailable_reason.is_some())
+        wake.is_some_and(|wake| wake.is_unavailable())
     }
 
     /// Finishes a dispatch that bypassed success accounting because the backing
@@ -1418,11 +1495,29 @@ impl McpServer {
         // lifecycle locks or fall back to the caller's response authority.
         let response_lifecycle = dispatch_server.project_server_lifecycle.clone();
         let response_gate = Arc::clone(response_lifecycle.response_gate());
-        let response_guard = hotpath::future!(
-            response_gate.read_owned(),
-            label = "mcp.server.response_gate.wait"
-        )
-        .await;
+        // The gate wait races the request's own cancellation: a retiring or
+        // replacing project server holds the write side for as long as its
+        // drain takes, and a client that cancels during that wait must read
+        // its typed cancelled terminal instead of hanging on the gate. The
+        // gate arm is polled first so an immediately available lease still
+        // wins over a pre-cancelled signal and settlement stays with the
+        // admitted dispatch authority.
+        let request_cancelled =
+            tracedecay_daemon_protocol::wait_for_cancellation(control.cancellation());
+        let response_guard = tokio::select! {
+            biased;
+            guard = hotpath::future!(
+                response_gate.read_owned(),
+                label = "mcp.server.response_gate.wait"
+            ) => guard,
+            () = request_cancelled => {
+                return tool_error_response(
+                    id,
+                    &tool_name,
+                    &dispatch_cancelled_error(&tool_name, DispatchSettlement::NotStarted),
+                );
+            }
+        };
         if response_lifecycle.response_revoked().is_cancelled() {
             return dispatch_server
                 .project_server_revoked_response(&id, &tool_name)
@@ -1542,6 +1637,7 @@ mod git_read_control_tests {
     #[test]
     fn controlled_operations_receive_live_registration_and_bounded_deadlines() {
         assert!(tool_supports_live_cancellation("tracedecay_search"));
+        assert!(tool_supports_live_cancellation("tracedecay_grep"));
         assert!(tool_supports_live_cancellation(
             "tracedecay_run_affected_tests"
         ));
@@ -1570,8 +1666,7 @@ mod git_read_control_tests {
             "tracedecay_git_hunks",
         ] {
             assert!(tool_supports_live_cancellation(tool_name));
-            let application_surface =
-                crate::application_surface::ApplicationSurfaceOperation::from_tool_name(tool_name);
+            let application_surface = ApplicationSurfaceOperation::from_tool_name(tool_name);
             assert!(
                 application_surface.is_some(),
                 "Git reads must enter the catalog-owned application surface",
@@ -1643,8 +1738,7 @@ mod git_read_control_tests {
             "tracedecay_branch_list",
         ] {
             assert!(
-                crate::application_surface::ApplicationSurfaceOperation::from_tool_name(tool_name)
-                    .is_none(),
+                ApplicationSurfaceOperation::from_tool_name(tool_name).is_none(),
                 "{tool_name} is not an application-surface operation, so only the \
                  git-dispatch predicate can bound it",
             );
@@ -1741,16 +1835,19 @@ mod activity_dispatch_tests {
         .expect("detached activity persistence must settle after writer release");
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let observed =
-                    tracedecay_usecases::event_lane::replay_after(activity_db, &project_id, None)
-                        .await
-                        .is_some_and(|replay| {
-                            replay.records.iter().any(|record| {
-                                record.pulse.family
-                                    == tracedecay_usecases::event_lane::ActivityFamilyV1::ToolCall
-                                    && record.pulse.detail.is_none()
-                            })
-                        });
+                let observed = tracedecay_session_memory::event_lane::replay_after(
+                    activity_db,
+                    &project_id,
+                    None,
+                )
+                .await
+                .is_some_and(|replay| {
+                    replay.records.iter().any(|record| {
+                        record.pulse.family
+                            == tracedecay_session_memory::event_lane::ActivityFamilyV1::ToolCall
+                            && record.pulse.detail.is_none()
+                    })
+                });
                 if observed {
                     break;
                 }

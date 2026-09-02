@@ -11,9 +11,10 @@ use tracedecay_tool_catalog::{BindingId, BindingSurface, ProfileId, SurfaceOpera
 use crate::application_surface::normalize_application_tool_args;
 use crate::catalog_composition::{ApplicationCatalogComposition, compose_application_catalog};
 use crate::tracedecay::TraceDecay;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
-use super::{ToolCallRegistryOptions, ToolResult, application_surface};
+use super::{ToolCallRegistryOptions, application_surface};
+use tracedecay_mcp::ToolResult;
 
 static RETAINED_MCP_COMPOSITION: OnceLock<
     std::result::Result<ApplicationCatalogComposition<()>, String>,
@@ -129,9 +130,9 @@ pub(crate) async fn execute_profile_retained_mcp_tool(
     operation: RetainedSurfaceOperation,
     tool_name: &str,
     mut args: Value,
-    runtime_registry: &crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1,
+    runtime_registry: &tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1,
     authority: &crate::daemon::retained_owner::ProfileRetainedConnectionAuthorityV1,
-    lcm_authority: Option<&dyn crate::daemon::lcm_authority::MountedLcmAuthorityPort>,
+    lcm_authority: Option<&dyn tracedecay_session_runtime::lcm_authority::MountedLcmAuthorityPort>,
     protocol_request_id: Option<tracedecay_application::RequestId>,
     protocol_deadline: Option<tracedecay_application::Deadline>,
     protocol_cancellation: Option<tracedecay_application::CancellationSignal>,
@@ -155,7 +156,9 @@ pub(crate) async fn execute_profile_retained_mcp_tool(
         "mcp.retained.profile.decode",
         crate::application_surface::retained::decode_request(operation, normalized.request)
     )
-    .ok_or_else(|| retained_catalog_error("retained MCP request is invalid"))?;
+    .map_err(|error| TraceDecayError::Config {
+        message: format!("invalid retained application request for {tool_name}: {error}"),
+    })?;
     if typed_request.operation() != operation {
         return Err(retained_catalog_error(
             "retained MCP request does not match its catalog operation",

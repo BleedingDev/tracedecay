@@ -169,6 +169,7 @@ impl StoreWriterGates {
     }
 
     /// Acquires admission for `scope`, waiting as long as necessary.
+    #[hotpath::skip]
     pub(super) async fn acquire(&self, scope: &WriterScope) -> WriterAdmissionGuard {
         match scope {
             WriterScope::Daemon => WriterAdmissionGuard {

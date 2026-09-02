@@ -209,7 +209,9 @@ pub async fn cover_overflowed_repositories(watcher: &GitWatcher) {
                     ],
                 );
             }
-            GitWatcherAdmission::NotRepository | GitWatcherAdmission::Disabled => {
+            GitWatcherAdmission::NotRepository
+            | GitWatcherAdmission::Disabled
+            | GitWatcherAdmission::LinkedWorktreeDisabled => {
                 watcher
                     .inner
                     .overflow

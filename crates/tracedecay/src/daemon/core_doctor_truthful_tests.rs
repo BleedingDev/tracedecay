@@ -13,7 +13,7 @@ static REGISTERED_RUNTIME_NONCE: AtomicU64 = AtomicU64::new(1);
 async fn initialize_test_project(
     project_root: &Path,
     profile_root: &Path,
-) -> crate::storage::StoreLayout {
+) -> tracedecay_runtime_core::storage::StoreLayout {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -82,7 +82,7 @@ async fn live_runtime_snapshot_does_not_fabricate_store_metadata_after_observati
         profile.join("registry.db"),
     );
     let store_administration = StoreAdministration::default().with_profile_identity(
-        crate::daemon::profile_identity::load_or_create(&profile)
+        tracedecay_daemon_identity::profile_identity::load_or_create(&profile)
             .expect("load fixture profile identity"),
     );
     let _database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
@@ -110,7 +110,15 @@ async fn live_runtime_snapshot_does_not_fabricate_store_metadata_after_observati
     std::fs::remove_file(&layout.graph_db_path)
         .expect("remove graph file after its retained route has gone live");
 
-    let value = super::doctor_runtime_value(&handshake, &store_administration, false, None).await;
+    let build_version = crate::product_runtime::register_fixture_product_runtime().build_version();
+    let value = super::doctor_runtime_value(
+        &handshake,
+        &store_administration,
+        false,
+        None,
+        build_version,
+    )
+    .await;
 
     assert_eq!(
         value.pointer("/database/db_size_bytes"),

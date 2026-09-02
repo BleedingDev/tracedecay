@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
+use tracedecay_daemon_identity::profile_identity;
 use tracedecay_domain::UserProfileId;
 use zeroize::Zeroizing;
 
@@ -276,7 +277,7 @@ impl DaemonGitHubReadOnlyCredentialLifecycleV1 {
 
     pub(super) fn configure_profile(
         &self,
-        identity: &super::profile_identity::LocalProfileIdentityAuthorityV1,
+        identity: &profile_identity::LocalProfileIdentityAuthorityV1,
     ) {
         self.configure_profile_with(
             identity,
@@ -288,7 +289,7 @@ impl DaemonGitHubReadOnlyCredentialLifecycleV1 {
     #[hotpath::measure(label = "daemon.github_credential.configure")]
     fn configure_profile_with(
         &self,
-        identity: &super::profile_identity::LocalProfileIdentityAuthorityV1,
+        identity: &profile_identity::LocalProfileIdentityAuthorityV1,
         secrets: Arc<dyn OsSecretReadPortV1>,
         verifier: GitHubProviderPermissionVerifierV1,
     ) {
@@ -406,7 +407,7 @@ fn load_configured_repositories(profile_root: &Path) -> ConfiguredGitHubReposito
     let Ok(contents) = std::fs::read_to_string(&path) else {
         return ConfiguredGitHubRepositoriesV1::default();
     };
-    tracedecay_usecases::user_config::parse_or_warn_default(&path, &contents)
+    tracedecay_session_memory::user_config::parse_or_warn_default(&path, &contents)
 }
 
 fn valid_locator(value: &str) -> bool {
@@ -449,7 +450,7 @@ mod tests {
     async fn production_profile_keyring_configuration_verifies_permissions_and_fails_closed() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let profile_root = temporary.path().join("profile");
-        let identity = super::super::profile_identity::load_or_create(&profile_root)
+        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
             .expect("profile identity");
         std::fs::write(
             profile_root.join("config.toml"),

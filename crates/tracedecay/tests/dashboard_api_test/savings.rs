@@ -465,7 +465,8 @@ async fn start_fixture(seed: FixtureSeed) -> Fixture {
             dashboard::DashboardTestProjectGraphsV1::default(),
             "127.0.0.1",
             port,
-            dashboard::spa_router(),
+            tracedecay::product_runtime::register_fixture_product_runtime().build_version(),
+            dashboard::spa_router(tracedecay::product_runtime::FIXTURE_DASHBOARD_ASSETS),
             std::future::pending(),
         )
         .await;

@@ -93,6 +93,7 @@ impl ProcessBackgroundCpuV1 {
     }
 
     #[must_use]
+    #[hotpath::skip]
     pub const fn width(&self) -> NonZeroUsize {
         self.width
     }

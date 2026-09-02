@@ -168,6 +168,13 @@ async fn replay_assembly_terminates_when_existing_summary_sources_contain_cycle(
 
 #[tokio::test]
 async fn threshold_pressure_summarizes_short_huge_active_context() {
+    // Pin the cursor-agent adapter to a nonexistent binary so the daemon's
+    // registered summarizer refuses deterministically instead of invoking a
+    // live cursor-agent from the operator's PATH.
+    let _cursor_agent = common::EnvVarGuard::set(
+        "TRACEDECAY_CURSOR_AGENT_BIN",
+        "/nonexistent/tracedecay-test-cursor-agent",
+    );
     let tmp = TempDir::new().unwrap();
     let db = open_lcm_db(&tmp).await;
     insert_session(&db, "cursor", "short-huge").await;
@@ -222,10 +229,10 @@ async fn threshold_pressure_summarizes_short_huge_active_context() {
         "response reason: {}",
         response.reason
     );
-    // The daemon authority resolves auxiliary summaries itself; without a
-    // registered authoritative summarizer the pending summary stays typed
-    // unavailable instead of asking the host to fill it.
-    assert_eq!(response.reason, "authoritative_summarizer_unavailable");
+    // The daemon authority resolves auxiliary summaries itself; when the
+    // registered cursor-agent summarizer cannot run, the pending summary
+    // stays typed unavailable instead of asking the host to fill it.
+    assert_eq!(response.reason, "cursor_agent_unavailable");
     let summary_request = response
         .summary_request
         .expect("threshold pressure should select source messages to summarize");
@@ -409,7 +416,11 @@ async fn active_replay_preserves_top_level_fields_that_collide_with_storage_meta
         .await
         .unwrap();
 
-    let mut expected = active_message;
+    // `ingest_active_messages` stamps the authoritative timestamp onto the
+    // ingested message, so the byte-faithful replay carries it too.
+    let mut expected = with_authoritative_timestamps(vec![active_message])
+        .pop()
+        .expect("one expected replay message");
     expected["store_id"] = Value::from(raw.store_id);
     assert_eq!(replay_from_raw.replay_messages, vec![expected]);
 }
@@ -607,13 +618,11 @@ async fn active_replay_tool_calls_apply_ingest_protection_and_externalize_media_
 
     let payload_ref = externalized_ref_from_placeholder(protected_args);
     let expanded = db
-        .lcm_expand(tracedecay_sessions::runtime::lcm::LcmExpandRequest {
+        .lcm_expand(tracedecay_lcm::LcmExpandRequest {
             provider: "cursor".into(),
             session_id: "session-tool-calls-protection".into(),
-            target: tracedecay_sessions::runtime::lcm::LcmExpandTarget::ExternalPayload {
-                payload_ref,
-            },
-            content_slice: Some(tracedecay_sessions::runtime::lcm::LcmContentSlice {
+            target: tracedecay_lcm::LcmExpandTarget::ExternalPayload { payload_ref },
+            content_slice: Some(tracedecay_lcm::LcmContentSlice {
                 offset: 0,
                 limit: media_payload.chars().count(),
             }),
@@ -683,13 +692,11 @@ async fn nested_media_placeholder_remains_inside_structured_active_content() {
 
     let payload_ref = externalized_ref_from_placeholder(&raw.content);
     let expanded = db
-        .lcm_expand(tracedecay_sessions::runtime::lcm::LcmExpandRequest {
+        .lcm_expand(tracedecay_lcm::LcmExpandRequest {
             provider: "cursor".into(),
             session_id: "session-media".into(),
-            target: tracedecay_sessions::runtime::lcm::LcmExpandTarget::ExternalPayload {
-                payload_ref,
-            },
-            content_slice: Some(tracedecay_sessions::runtime::lcm::LcmContentSlice {
+            target: tracedecay_lcm::LcmExpandTarget::ExternalPayload { payload_ref },
+            content_slice: Some(tracedecay_lcm::LcmContentSlice {
                 offset: 0,
                 limit: media_payload.chars().count(),
             }),

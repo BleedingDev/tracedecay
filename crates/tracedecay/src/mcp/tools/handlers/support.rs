@@ -5,167 +5,14 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
 
-use super::super::ToolResult;
-use super::super::render;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::{ProjectRegistryContext, RegisteredGlobalDb};
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
-
-const SEARCH_SCAN_CEILING: Duration = Duration::from_secs(10);
-static SEARCH_SCAN_SEMAPHORE: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(2)));
-
-pub(super) struct CancelSearchOnDrop(Arc<AtomicBool>);
-
-impl CancelSearchOnDrop {
-    #[cfg(test)]
-    pub(super) fn new(cancelled: Arc<AtomicBool>) -> Self {
-        Self(cancelled)
-    }
-}
-
-impl Drop for CancelSearchOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
-}
-
-pub(super) async fn run_bounded_search<T, E, F>(
-    tool_name: &'static str,
-    query: String,
-    deadline: Option<tracedecay_application::Deadline>,
-    cancellation: Option<tracedecay_application::CancellationSignal>,
-    worker: F,
-) -> Result<T>
-where
-    T: Send + 'static,
-    E: std::fmt::Display + Send + 'static,
-    F: FnOnce(
-            Arc<AtomicBool>,
-            Option<tracedecay_application::CancellationSignal>,
-        ) -> std::result::Result<T, E>
-        + Send
-        + 'static,
-{
-    let budget = search_budget(tool_name, deadline.as_ref())?;
-    run_bounded_search_with_capacity(
-        Arc::clone(&SEARCH_SCAN_SEMAPHORE),
-        budget,
-        tool_name,
-        query,
-        cancellation,
-        worker,
-    )
-    .await
-}
-
-#[hotpath::measure(future = true, label = "mcp.search.bounded")]
-async fn run_bounded_search_with_capacity<T, E, F>(
-    capacity: Arc<Semaphore>,
-    budget: Duration,
-    tool_name: &'static str,
-    query: String,
-    cancellation: Option<tracedecay_application::CancellationSignal>,
-    worker: F,
-) -> Result<T>
-where
-    T: Send + 'static,
-    E: std::fmt::Display + Send + 'static,
-    F: FnOnce(
-            Arc<AtomicBool>,
-            Option<tracedecay_application::CancellationSignal>,
-        ) -> std::result::Result<T, E>
-        + Send
-        + 'static,
-{
-    if cancellation
-        .as_ref()
-        .is_some_and(tracedecay_application::CancellationSignal::is_cancelled)
-    {
-        return Err(search_cancelled_error(tool_name));
-    }
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let cancel_on_drop = CancelSearchOnDrop(Arc::clone(&cancelled));
-    let worker_cancellation = cancellation.clone();
-    let outcome = tokio::time::timeout(budget, async move {
-        let permit = capacity
-            .acquire_owned()
-            .await
-            .map_err(|error| TraceDecayError::Search {
-                message: format!("{tool_name} concurrency gate closed: {error}"),
-                query: query.clone(),
-            })?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            worker(cancelled, worker_cancellation)
-        })
-        .await
-        .map_err(|error| TraceDecayError::Search {
-            message: format!("{tool_name} worker failed: {error}"),
-            query,
-        })?
-        .map_err(|error| TraceDecayError::Config {
-            message: error.to_string(),
-        })
-    })
-    .await;
-    drop(cancel_on_drop);
-
-    match outcome {
-        Ok(result) => {
-            if cancellation
-                .as_ref()
-                .is_some_and(tracedecay_application::CancellationSignal::is_cancelled)
-            {
-                Err(search_cancelled_error(tool_name))
-            } else {
-                result
-            }
-        }
-        Err(_) => Err(TraceDecayError::project_route(
-            "source_search_deadline_exceeded",
-            true,
-            format!(
-                "{tool_name} exceeded its {}s source-scan deadline; narrow the request with path_glob",
-                budget.as_secs_f64()
-            ),
-        )),
-    }
-}
-
-fn search_budget(
-    tool_name: &str,
-    deadline: Option<&tracedecay_application::Deadline>,
-) -> Result<Duration> {
-    match deadline {
-        Some(deadline) => tracedecay_daemon_protocol::deadline_remaining(deadline)
-            .map(|remaining| remaining.min(SEARCH_SCAN_CEILING))
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| {
-                TraceDecayError::project_route(
-                    "source_search_deadline_exceeded",
-                    true,
-                    format!("{tool_name} request deadline elapsed before source scanning"),
-                )
-            }),
-        None => Ok(SEARCH_SCAN_CEILING),
-    }
-}
-
-fn search_cancelled_error(tool_name: &str) -> TraceDecayError {
-    TraceDecayError::project_route(
-        "source_search_cancelled",
-        true,
-        format!("{tool_name} was cancelled during source scanning"),
-    )
-}
+use tracedecay_mcp::ToolResult;
+use tracedecay_mcp::tools::render;
 
 /// Builds a `Config` error from a message, for argument-validation failures.
 pub(super) fn argument_error(message: impl Into<String>) -> TraceDecayError {
@@ -300,43 +147,6 @@ pub(crate) fn decode_primitive_request<T: DeserializeOwned>(
     })
 }
 
-/// Rejects a zero result limit with a typed error.
-///
-/// Handlers clamp a caller-supplied limit with `min(max)`, which leaves an
-/// explicit `"limit": 0` intact, so zero is caller input rather than an
-/// invariant the handler can assume away.
-pub(crate) fn require_positive_limit(limit: usize, tool_name: &str) -> Result<()> {
-    if limit == 0 {
-        return Err(TraceDecayError::Config {
-            message: format!("invalid parameter: {tool_name} requires limit to be at least 1"),
-        });
-    }
-    Ok(())
-}
-
-/// Extracts the `node_id` parameter from tool arguments, accepting `id` as a
-/// fallback alias. LLMs occasionally shorten `node_id` to `id`; this avoids a
-/// confusing error when that happens.
-///
-/// A present-but-blank value is rejected here rather than forwarded to the
-/// graph traversal layer; every handler that takes a node id shares this one
-/// guard, so the failure is a typed argument error naming the parameter.
-pub(super) fn require_node_id(args: &Value) -> Result<&str> {
-    let node_id = args
-        .get("node_id")
-        .or_else(|| args.get("id"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| TraceDecayError::Config {
-            message: "missing required parameter: node_id".to_string(),
-        })?;
-    if node_id.trim().is_empty() {
-        return Err(TraceDecayError::Config {
-            message: "invalid parameter: node_id must not be empty".to_string(),
-        });
-    }
-    Ok(node_id)
-}
-
 /// Returns the user-provided `path` argument, falling back to the scope
 /// prefix when the argument is absent. This makes listing tools
 /// automatically scoped to the subdirectory the server was launched from.
@@ -345,24 +155,6 @@ pub(super) fn effective_path<'a>(
     scope_prefix: Option<&'a str>,
 ) -> Option<&'a str> {
     args.get("path").and_then(|v| v.as_str()).or(scope_prefix)
-}
-
-/// Filters a Vec of items by file path prefix when a scope is active.
-/// Returns the vec unchanged when `scope_prefix` is `None`.
-pub(super) fn filter_by_scope<T, F>(
-    items: Vec<T>,
-    scope_prefix: Option<&str>,
-    get_path: F,
-) -> Vec<T>
-where
-    F: Fn(&T) -> &str,
-{
-    items
-        .into_iter()
-        .filter(|item| {
-            tracedecay_runtime_core::path_scope::path_matches_scope(get_path(item), scope_prefix)
-        })
-        .collect()
 }
 
 pub(super) fn unique_file_paths<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<String> {
@@ -376,75 +168,14 @@ pub(super) fn unique_file_paths<'a>(paths: impl Iterator<Item = &'a str>) -> Vec
     result
 }
 
-#[cfg(test)]
-mod bounded_search_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn timeout_includes_waiting_for_the_worker_permit() {
-        let capacity = Arc::new(Semaphore::new(1));
-        let held = Arc::clone(&capacity).acquire_owned().await.unwrap();
-        let worker_started = Arc::new(AtomicBool::new(false));
-        let worker_observer = Arc::clone(&worker_started);
-
-        let error = run_bounded_search_with_capacity(
-            capacity,
-            Duration::from_millis(20),
-            "test_search",
-            "needle".to_owned(),
-            None,
-            move |_, _| -> std::result::Result<(), String> {
-                worker_observer.store(true, Ordering::Release);
-                Ok(())
-            },
-        )
-        .await
-        .unwrap_err();
-        drop(held);
-
-        assert!(!worker_started.load(Ordering::Acquire));
-        assert_eq!(
-            error.project_route_context().map(|problem| problem.0),
-            Some("source_search_deadline_exceeded")
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dropping_the_waiter_cancels_the_blocking_worker() {
-        let capacity = Arc::new(Semaphore::new(1));
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
-        let task = tokio::spawn(run_bounded_search_with_capacity(
-            capacity,
-            Duration::from_secs(5),
-            "test_search",
-            "needle".to_owned(),
-            None,
-            move |cancelled, _| -> std::result::Result<(), String> {
-                started_tx.send(()).unwrap();
-                while !cancelled.load(Ordering::Acquire) {
-                    std::thread::yield_now();
-                }
-                cancelled_tx.send(()).unwrap();
-                Ok(())
-            },
-        ));
-
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        task.abort();
-        cancelled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    }
-}
-
 fn invalid_registered_project_selector(detail: impl Into<String>) -> TraceDecayError {
     TraceDecayError::project_route("project_route_invalid_selector", false, detail.into())
 }
 
-pub(super) async fn registered_project_context(
+pub(super) fn validate_registered_project_selector_aliases(
     args: &Value,
     semantic_top_level_fields: &[&str],
-    global_db: Option<&RegisteredGlobalDb>,
-) -> Result<Option<ProjectRegistryContext>> {
+) -> Result<()> {
     if let Some(alias) = ["project_id", "project_path", "project_root", "root"]
         .into_iter()
         .find(|key| !semantic_top_level_fields.contains(key) && args.get(*key).is_some())
@@ -453,6 +184,15 @@ pub(super) async fn registered_project_context(
             "top-level `{alias}` is not a registered-project selector; use project_selector.project_id"
         )));
     }
+    Ok(())
+}
+
+pub(super) async fn registered_project_context(
+    args: &Value,
+    semantic_top_level_fields: &[&str],
+    global_db: Option<&RegisteredGlobalDb>,
+) -> Result<Option<ProjectRegistryContext>> {
+    validate_registered_project_selector_aliases(args, semantic_top_level_fields)?;
     let Some(selector_value) = args.get("project_selector") else {
         return Ok(None);
     };
@@ -507,11 +247,11 @@ pub(super) fn is_explicit_project_path_selector(selector: &str) -> bool {
 mod tests {
     use serde_json::json;
 
-    use crate::mcp::tools::render;
+    use tracedecay_mcp::tools::render;
 
     use super::{
         CONTEXT_MEMORY_ANALYTICS_KEY, decode_primitive_request, generic_tool_result,
-        is_explicit_project_path_selector, rendered_tool_result, require_node_id,
+        is_explicit_project_path_selector, rendered_tool_result,
     };
     use tracedecay_application::retrieval::NodeSurfaceRequestV1;
 
@@ -579,30 +319,6 @@ mod tests {
     }
 
     #[test]
-    fn test_require_node_id_canonical() {
-        let args = json!({"node_id": "fn:abc123"});
-        assert!(matches!(require_node_id(&args), Ok("fn:abc123")));
-    }
-
-    #[test]
-    fn test_require_node_id_alias() {
-        let args = json!({"id": "trait:def456"});
-        assert!(matches!(require_node_id(&args), Ok("trait:def456")));
-    }
-
-    #[test]
-    fn test_require_node_id_prefers_canonical() {
-        let args = json!({"node_id": "fn:canonical", "id": "fn:alias"});
-        assert!(matches!(require_node_id(&args), Ok("fn:canonical")));
-    }
-
-    #[test]
-    fn test_require_node_id_missing() {
-        let args = json!({"query": "something"});
-        assert!(require_node_id(&args).is_err());
-    }
-
-    #[test]
     fn primitive_request_decode_strips_transport_keys_and_rejects_legacy_aliases() {
         let decoded = decode_primitive_request::<NodeSurfaceRequestV1>(
             &json!({
@@ -629,26 +345,6 @@ mod tests {
         )
         .expect_err("the unreleased id alias is not part of the canonical request");
         assert!(error.to_string().contains("unknown field `id`"));
-    }
-
-    /// Every node-id handler shares this one guard, so a blank value must be
-    /// rejected here — naming the offending parameter — rather than reaching
-    /// graph traversal.
-    #[test]
-    fn require_node_id_rejects_blank_values() {
-        for args in [
-            json!({"node_id": ""}),
-            json!({"node_id": "   "}),
-            json!({"node_id": "\t\n"}),
-            json!({"id": ""}),
-        ] {
-            let error = require_node_id(&args).expect_err(&format!("blank node id: {args}"));
-            let message = error.to_string();
-            assert!(
-                message.contains("node_id must not be empty"),
-                "unexpected message for {args}: {message}"
-            );
-        }
     }
 
     #[test]

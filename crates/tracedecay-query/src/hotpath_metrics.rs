@@ -18,6 +18,7 @@ pub(crate) enum Residency {
 
 impl Residency {
     #[cfg(feature = "hotpath")]
+    #[hotpath::skip]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Cold => "cold",

@@ -14,7 +14,7 @@ pub(in crate::tracedecay) use tracedecay_usecases::tracedecay::{
     PlannedSourceEditFile, capture_planned_source_edit, validate_planned_source_edit,
 };
 
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 use super::super::TraceDecay;
 use super::file_authority::{SourceEditFileAuthority, read_source_edit_candidate};
@@ -25,6 +25,7 @@ impl TraceDecay {
     /// operation, so the graph is resynchronized wholesale rather than
     /// reindexed file by file: a rollback may delete a file the edit created,
     /// and a deleted path has no bytes left to reindex.
+    #[hotpath::skip]
     pub(crate) async fn apply_source_edit_rollback(
         &self,
         files: &[PlannedSourceEditFile],
@@ -32,6 +33,7 @@ impl TraceDecay {
         rollback_planned_source_edit_files(&self.project_root, files)
     }
 
+    #[hotpath::skip]
     pub(crate) async fn recover_source_edit_preimages(
         &self,
         files: &[PlannedSourceEditFile],

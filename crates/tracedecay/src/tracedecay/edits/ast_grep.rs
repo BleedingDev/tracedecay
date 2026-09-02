@@ -8,8 +8,8 @@
 use std::io::Write;
 use std::path::Path;
 
-use crate::types::AstGrepResult;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_application::source_edit::AstGrepResult;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 use super::super::TraceDecay;
 use super::file_authority::SourceEditFileAuthority;
@@ -35,7 +35,7 @@ impl TraceDecay {
 
         let check_output = hotpath::measure_block!(
             "edits.ast_grep.probe",
-            crate::external_tools::ast_grep_command()
+            tracedecay_mcp::host_cli::ast_grep_command()
                 .args(["--version"])
                 .output()
         );
@@ -114,7 +114,7 @@ impl TraceDecay {
         ast_grep_args.push(snapshot_path_arg.as_ref());
         let output = hotpath::measure_block!(
             "edits.ast_grep.match",
-            crate::external_tools::ast_grep_command()
+            tracedecay_mcp::host_cli::ast_grep_command()
                 .args(&ast_grep_args)
                 .output()
         )

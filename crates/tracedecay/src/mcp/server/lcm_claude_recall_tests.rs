@@ -16,8 +16,8 @@ use tracedecay_domain::{ObservationScopeV1, ProjectId, SessionId};
 
 use super::McpServer;
 use crate::host_admission::HostAdmissionTestRuntimeV1;
-use crate::mcp::transport::JsonRpcRequest;
 use crate::tracedecay::TraceDecayOpenOptions;
+use tracedecay_mcp::transport::JsonRpcRequest;
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::runtime::claude::ClaudeSource;
 use tracedecay_usecases::observation::ObservationCancellation;
@@ -30,11 +30,14 @@ const SHARED_TERM: &str = "quicksilver";
 const UNIQUE_TERM: &str = "pangolin";
 
 fn git(root: &std::path::Path, args: &[&str]) {
-    let status = std::process::Command::new(tracedecay_runtime_core::git::git_program())
-        .current_dir(root)
-        .args(args)
-        .status()
-        .expect("git command should run");
+    let status = std::process::Command::new(
+        tracedecay_runtime_core::git::try_git_program()
+            .expect("absolute git executable should resolve"),
+    )
+    .current_dir(root)
+    .args(args)
+    .status()
+    .expect("git command should run");
     assert!(status.success(), "git {args:?} failed");
 }
 

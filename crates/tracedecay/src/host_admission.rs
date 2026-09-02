@@ -5,6 +5,13 @@ use std::sync::{Arc, LazyLock};
 
 use tokio::sync::Mutex as AsyncMutex;
 
+use tracedecay_code_index::parallelism::install_worker_plan;
+use tracedecay_domain::configuration::CodeIndexWorkerSelectionV1;
+use tracedecay_private_fs::background_cpu::process_background_cpu;
+use tracedecay_runtime_core::resident_memory::{
+    ProcessResidentMemoryV1, detected_process_resident_memory_limit_v1,
+};
+
 use tracedecay_host_admission::{HostAdmissionAuthorities, HostAdmissionFacade};
 #[cfg(test)]
 use tracedecay_host_admission::{
@@ -13,17 +20,18 @@ use tracedecay_host_admission::{
 use tracedecay_sessions::admission::{
     HostAdmissionOutcome, HostAdmissionScope, HostAdmissionStatus,
 };
+use tracedecay_sessions::runtime::codex::CodexDiscoveryHub;
 
-use crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1;
-use crate::support::weak_registry::WeakRegistry;
 use crate::tracedecay::{TraceDecay, TraceDecayOpenOptions};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{BrainId, ProjectId, UserProfileId};
 use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
 use tracedecay_runtime_core::db::DaemonDatabaseScope;
 #[cfg(test)]
 use tracedecay_runtime_core::db::DatabaseEngineReadSnapshot;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_runtime_core::weak_registry::WeakRegistry;
 use tracedecay_store::StoreShardScopeV1;
+use tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1;
 
 #[path = "host_admission/accounting_test_support.rs"]
 mod accounting_test_support;
@@ -39,7 +47,7 @@ mod profile_registry_test_support;
 mod session_test_support;
 mod verified_graph_test_support;
 
-#[cfg(feature = "test-transport")]
+#[cfg(any(test, feature = "test-transport"))]
 #[doc(hidden)]
 pub(crate) use verified_graph_test_support::await_bound_graph_runtime;
 
@@ -77,6 +85,48 @@ static SHARED_TEST_SESSION_REGISTRIES: LazyLock<
     AsyncMutex<WeakRegistry<PathBuf, DaemonSessionRuntimeRegistryV1>>,
 > = LazyLock::new(|| AsyncMutex::new(WeakRegistry::new()));
 
+/// Process-scoped scratch-memory authority shared by every host-admission
+/// fixture in this test binary. Its capacity follows the same RAM-derived
+/// production policy; it is not a repository-size limit.
+static SESSION_CAPTURE_TEST_RESIDENT_MEMORY: LazyLock<Arc<ProcessResidentMemoryV1>> =
+    LazyLock::new(|| {
+        Arc::new(ProcessResidentMemoryV1::new(
+            detected_process_resident_memory_limit_v1(),
+        ))
+    });
+
+/// Installs the process worker plan (and with it the background CPU
+/// authority) that host-admission capture requires. Production installs it
+/// during daemon worker-plan admission, which these fixtures never run;
+/// without it every observation capture is refused with
+/// `background_cpu_unavailable`. Going through `install_worker_plan` — the
+/// same authority production and the scheduler's test fallback use — keeps
+/// the background CPU width consistent with any later worker-plan install in
+/// the same test process instead of poisoning it with an ad-hoc width.
+pub(crate) fn ensure_process_background_cpu_authority() -> Result<()> {
+    if process_background_cpu().is_none() {
+        let memory = SESSION_CAPTURE_TEST_RESIDENT_MEMORY.snapshot();
+        if let Err(error) = install_worker_plan(
+            CodeIndexWorkerSelectionV1::Automatic {},
+            memory.limit_bytes.saturating_sub(memory.used_bytes),
+        ) && process_background_cpu().is_none()
+        {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "host-admission test runtime could not install the worker plan: {error}"
+                ),
+            });
+        }
+    }
+    CodexDiscoveryHub::default()
+        .configure_preparation_resources(Arc::clone(&SESSION_CAPTURE_TEST_RESIDENT_MEMORY))
+        .map_err(|error| TraceDecayError::Config {
+            message: format!(
+                "host-admission test runtime could not install JSONL preparation resources: {error}"
+            ),
+        })
+}
+
 /// Registered host-admission fixture assembled by the composition root.
 ///
 /// This retains the canonical daemon scope, registered databases, and
@@ -97,11 +147,13 @@ pub struct HostAdmissionTestRuntimeV1 {
 
 impl HostAdmissionTestRuntimeV1 {
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn profile(profile_root: impl AsRef<Path>) -> Result<Self> {
         Self::open(profile_root.as_ref().to_path_buf(), None).await
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn project(
         profile_root: impl AsRef<Path>,
         project_root: impl AsRef<Path>,
@@ -116,6 +168,7 @@ impl HostAdmissionTestRuntimeV1 {
 
     /// [`Self::project`] returning proof that project authorities are mounted.
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn project_scoped(
         profile_root: impl AsRef<Path>,
         project_root: impl AsRef<Path>,
@@ -133,6 +186,7 @@ impl HostAdmissionTestRuntimeV1 {
     /// cannot exist — the profile session-relation graph has exactly one
     /// writer.
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn sibling_project(
         &self,
         project_root: impl AsRef<Path>,
@@ -143,6 +197,9 @@ impl HostAdmissionTestRuntimeV1 {
         let registered = self
             .session_registry
             .project_sessions(project_id.clone(), [project_root.to_path_buf()])
+            .await?;
+        self.session_registry
+            .settle_project_session_graph(&project_id)
             .await?;
         // The shared registry caches project mounts, so a project that was
         // mounted before (opened, dropped, reopened while a sibling keeps the
@@ -192,13 +249,19 @@ impl HostAdmissionTestRuntimeV1 {
         })
     }
 
+    #[hotpath::skip]
     async fn open(profile_root: PathBuf, project: Option<(PathBuf, ProjectId)>) -> Result<Self> {
+        // Fixture compositions run in-process daemon code that reads the
+        // registered product runtime (handshakes, initialize payloads);
+        // test processes only ever register the canonical fixture.
+        crate::product_runtime::register_fixture_product_runtime();
+        ensure_process_background_cpu_authority()?;
         prepare_host_admission_test_profile_root(&profile_root)?;
         if let Some((project_root, project_id)) = project.as_ref() {
             prepare_host_admission_test_project_root(project_root, project_id)?;
         }
 
-        let identity = crate::daemon::profile_identity::load_or_create(&profile_root)?;
+        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)?;
         let database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
             identity.profile_root(),
             1,
@@ -215,6 +278,7 @@ impl HostAdmissionTestRuntimeV1 {
             match registries.get_live(&profile_key) {
                 Some(registry) => registry,
                 None => {
+                    crate::register_runtime_ports()?;
                     let registry =
                         Arc::new(DaemonSessionRuntimeRegistryV1::open(identity.clone()).await?);
                     registries.insert(profile_key, &registry);
@@ -224,9 +288,18 @@ impl HostAdmissionTestRuntimeV1 {
         };
         let profile_database = session_registry.profile_database().await?;
         let profile_registered = session_registry.profile_sessions().await?;
+        // The session relation graph opens as bounded background work behind
+        // the mounted lease. Production tolerates the warming window through
+        // typed retryable refusals; the deterministic fixture awaits
+        // settlement so graph-dependent operations (LCM compression, relation
+        // projection) do not race the open task.
+        session_registry.settle_profile_session_graph().await?;
         let (project_id, project_registered) = if let Some((project_root, project_id)) = project {
             let registered = session_registry
                 .project_sessions(project_id.clone(), [project_root.clone()])
+                .await?;
+            session_registry
+                .settle_project_session_graph(&project_id)
                 .await?;
             // Production project open binds a weak project graph proxy to
             // the registered project-sessions authority before
@@ -319,6 +392,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(crate) async fn read_snapshot(
         &self,
         scope: HostAdmissionScope,
@@ -333,6 +407,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn checkpoint_session_database_for_test(
         &self,
         scope: HostAdmissionScope,
@@ -366,6 +441,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn session_domain_sha256_for_test(
         &self,
         scope: HostAdmissionScope,
@@ -378,7 +454,8 @@ impl HostAdmissionTestRuntimeV1 {
     pub fn observation_store(
         &self,
         scope: HostAdmissionScope,
-    ) -> std::result::Result<crate::store::GlobalDbObservationStore, HostAdmissionOutcome> {
+    ) -> std::result::Result<tracedecay_global_db::GlobalDbObservationStore, HostAdmissionOutcome>
+    {
         let database = self
             .registered_database(scope)
             .ok_or_else(registered_authority_unavailable_outcome)?;
@@ -386,6 +463,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn replay_observations(
         &self,
         scope: HostAdmissionScope,
@@ -410,13 +488,21 @@ impl HostAdmissionTestRuntimeV1 {
     pub fn session_temporal_store_for_test(
         &self,
         scope: HostAdmissionScope,
-    ) -> Result<crate::store::GlobalDbSessionTemporalStore<'_>> {
-        Ok(crate::store::GlobalDbSessionTemporalStore::new(
-            self.session_database_for_test(scope)?,
-        ))
+    ) -> Result<
+        tracedecay_session_temporal_store::GlobalDbSessionTemporalStore<
+            '_,
+            tracedecay_global_db::RegisteredGlobalDb,
+        >,
+    > {
+        Ok(
+            tracedecay_session_temporal_store::GlobalDbSessionTemporalStore::new(
+                self.session_database_for_test(scope)?,
+            ),
+        )
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn session_temporal_fixture_count_for_test(
         &self,
         scope: HostAdmissionScope,
@@ -471,9 +557,7 @@ impl HostAdmissionTestRuntimeV1 {
     pub(crate) fn into_session_temporal_refresh_test_authority(
         self,
         scope: HostAdmissionScope,
-    ) -> Result<
-        crate::daemon::session_temporal_refresh_scheduler::SessionTemporalRefreshTestAuthority,
-    > {
+    ) -> Result<crate::daemon::session_runtime_tests::SessionTemporalRefreshTestAuthority> {
         let database =
             self.registered_database_arc(scope)
                 .ok_or_else(|| TraceDecayError::Database {
@@ -481,13 +565,14 @@ impl HostAdmissionTestRuntimeV1 {
                     message: "registered session database mount is unavailable".to_owned(),
                 })?;
         Ok(
-            crate::daemon::session_temporal_refresh_scheduler::SessionTemporalRefreshTestAuthority::new(
+            crate::daemon::session_runtime_tests::SessionTemporalRefreshTestAuthority::new(
                 self, database,
             ),
         )
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn upsert_session_for_test(
         &self,
         scope: HostAdmissionScope,
@@ -500,6 +585,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn upsert_session_message_for_test(
         &self,
         scope: HostAdmissionScope,
@@ -530,6 +616,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn session_for_test(
         &self,
         scope: HostAdmissionScope,
@@ -543,19 +630,20 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn session_message_for_test(
         &self,
         scope: HostAdmissionScope,
         provider: &str,
         message_id: &str,
     ) -> Result<Option<tracedecay_sessions::runtime::SessionMessageRecord>> {
-        Ok(self
-            .session_database_for_test(scope)?
+        self.session_database_for_test(scope)?
             .get_session_message(provider, message_id)
-            .await)
+            .await
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn upsert_transcript_batch_for_test(
         &self,
         scope: HostAdmissionScope,
@@ -596,6 +684,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn transcript_store_counts_for_test(
         &self,
         scope: HostAdmissionScope,
@@ -651,6 +740,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn project_session_message_count_for_test(&self) -> Result<i64> {
         self.session_database_for_test(HostAdmissionScope::Project)?
             .session_message_count()
@@ -662,6 +752,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn project_lcm_raw_message_exists_for_test(
         &self,
         provider: &str,
@@ -679,6 +770,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn git_sessions_for_for_test(
         &self,
         query: &tracedecay_sessions::runtime::git_correlation::SessionsForQuery,
@@ -692,19 +784,29 @@ impl HostAdmissionTestRuntimeV1 {
                 error.to_string(),
             )
         })?;
-        crate::store::GlobalDbGitCorrelationStore::new(database)
+        tracedecay_global_db::GlobalDbGitCorrelationStore::new(database)
             .sessions_for_with_relation(query, relation)
             .await
     }
 
+    /// Fails the calling test loudly: a fixture whose accounting write is
+    /// dropped would assert against totals that were never stored.
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn upsert(&self, project_path: &Path, tokens_saved: u64) {
         self.profile_database
-            .upsert(project_path, tokens_saved)
-            .await;
+            .try_upsert_project_tokens(project_path, tokens_saved)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "could not upsert project tokens for '{}': {error}",
+                    project_path.display()
+                )
+            });
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn upsert_code_project(
         &self,
         project_id: &str,
@@ -725,6 +827,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn upsert_project_alias(
         &self,
         alias_path: &Path,
@@ -736,6 +839,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn upsert_store_instance(
         &self,
         upsert: tracedecay_global_db::StoreInstanceUpsert,
@@ -744,6 +848,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn append_profile_analytics_event_for_test(
         &self,
         event: &tracedecay_global_db::AnalyticsEventInsert,
@@ -758,6 +863,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn query_profile_analytics_events_for_test(
         &self,
         query: &tracedecay_global_db::AnalyticsEventQuery,
@@ -776,9 +882,9 @@ impl HostAdmissionTestRuntimeV1 {
     /// authority returned by [`Self::registered_database`] is intentionally a
     /// different shard; callers that correlate analytics with sessions must
     /// bind both explicitly, just as production composition does.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
-    pub(crate) fn profile_database_for_test(&self) -> &RegisteredGlobalDb {
+    pub fn profile_database_for_test(&self) -> &RegisteredGlobalDb {
         self.profile_database.as_ref()
     }
 
@@ -844,7 +950,8 @@ impl HostAdmissionTestRuntimeV1 {
                 })?;
         let profile_database = self.profile_database.clone();
         let profile_sessions = self.profile_registered.clone();
-        let profile_identity = crate::daemon::profile_identity::load_or_create(&profile_root)?;
+        let profile_identity =
+            tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)?;
         let mut context =
             crate::mcp::server::McpServerConstructionContext::direct(cg, scope_prefix)
                 .with_direct_databases(
@@ -854,12 +961,13 @@ impl HostAdmissionTestRuntimeV1 {
                     Some(profile_sessions),
                 );
         context.profile_root = Some(profile_root);
-        context.profile_identity = Some(profile_identity);
+        context.profile_identity = Some(std::sync::Arc::new(profile_identity));
         context.host_admission_test_runtime = Some(self);
         Ok(context)
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(crate) async fn ensure_runtime_configuration_for_test(
         &self,
         project_root: &Path,
@@ -874,6 +982,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(crate) async fn resolve_runtime_configuration_for_test(
         &self,
         project_root: &Path,
@@ -888,6 +997,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(crate) async fn load_runtime_configuration_read_only_for_test(
         &self,
         project_root: &Path,
@@ -948,6 +1058,7 @@ impl HostAdmissionTestRuntimeV1 {
 
     /// Initializes a project graph through this retained registered runtime.
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn initialize_project_graph_for_test(
         &self,
         project_root: &Path,
@@ -991,6 +1102,7 @@ impl HostAdmissionTestRuntimeV1 {
 
     /// Reopens an existing project graph through this retained runtime.
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn open_project_graph_for_test(
         &self,
         project_root: &Path,
@@ -1012,6 +1124,7 @@ impl HostAdmissionTestRuntimeV1 {
 
     /// Opens one tracked branch through this retained registered runtime.
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn open_project_branch_for_test(
         &self,
         project_root: &Path,
@@ -1056,6 +1169,7 @@ impl HostAdmissionTestRuntimeV1 {
 
     /// Reopens an existing graph read-only without inferring authority.
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn open_project_graph_read_only_for_test(
         &self,
         project_root: &Path,
@@ -1075,6 +1189,7 @@ impl HostAdmissionTestRuntimeV1 {
         .await
     }
 
+    #[hotpath::skip]
     async fn registered_project_open_inputs(
         &self,
         project_root: &Path,
@@ -1263,7 +1378,15 @@ fn prepare_host_admission_test_project_root(
         ),
     })?;
     if tracedecay_runtime_core::worktree::git_common_dir(project_root).is_none() {
-        let status = std::process::Command::new("git")
+        let git = tracedecay_runtime_core::git::try_git_program().map_err(|error| {
+            TraceDecayError::Config {
+                message: format!(
+                    "git executable unavailable for host-admission test project '{}': {error}",
+                    project_root.display()
+                ),
+            }
+        })?;
+        let status = std::process::Command::new(git)
             .args(["init", "--quiet"])
             .current_dir(project_root)
             .status()

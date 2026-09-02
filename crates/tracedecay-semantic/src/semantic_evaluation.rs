@@ -10,6 +10,7 @@ use tracedecay_query::retrieval::semantic::{
     EphemeralQueryEmbeddingV1, SemanticExecutionControl, SemanticQueryEmbeddingPort,
     SemanticQueryEmbeddingRequestV1,
 };
+use tracedecay_semantic_contracts::SemanticRuntimeScheduleFailureV1;
 
 use super::fastembed_adapter::{
     AdmittedProjectionArtifactV1, FastEmbedEmbeddingRuntime, SemanticExecutionAuthority,
@@ -20,8 +21,8 @@ use super::projector::{
 };
 use super::runtime_query::{PooledSemanticQueryEmbedder, PooledSemanticQueryEmbedderFactory};
 use super::runtime_service::{
-    SemanticRuntimeScheduleCancellationV1, SemanticRuntimeScheduleFailureV1,
-    SemanticRuntimeService, SharedEmbeddingRuntimeFactory, fastembed_runtime_factory,
+    SemanticRuntimeScheduleCancellationV1, SemanticRuntimeService, SharedEmbeddingRuntimeFactory,
+    fastembed_runtime_factory,
 };
 use super::session_pool::SessionPoolConfigV1;
 use super::{LoadedSemanticArtifactV1, RuntimeChunkVectorEncoderV1};
@@ -415,7 +416,7 @@ pub struct SemanticEvaluationProjectionResourcesV1 {
 pub fn prepare_semantic_evaluation_projection(
     artifact: LoadedSemanticArtifactV1,
     request: ProjectionBatchRequestV1,
-    canonical_chunks: &[CodeSearchChunkV1],
+    canonical_chunks: &[Arc<CodeSearchChunkV1>],
     resources: SemanticEvaluationProjectionResourcesV1,
     cache: &SemanticEvaluationProjectionBatchCacheV1,
     cache_policy: SemanticEvaluationProjectionBatchCachePolicyV1,
@@ -478,7 +479,7 @@ pub fn prepare_semantic_evaluation_projection(
 pub fn measure_semantic_evaluation_projection_cancellation(
     artifact: LoadedSemanticArtifactV1,
     request: ProjectionBatchRequestV1,
-    canonical_chunks: &[CodeSearchChunkV1],
+    canonical_chunks: &[Arc<CodeSearchChunkV1>],
     max_sessions: usize,
     memory_ceiling_bytes: u64,
     cache: &SemanticEvaluationProjectionBatchCacheV1,
@@ -694,6 +695,7 @@ mod tests {
         PolicyRevisionId, ProjectionBatchRequestV1, ProjectionReplayReasonV1, SanitizerRevision,
         SensitivityDecision, SensitivityLevelV1, SourceSpan,
     };
+    use tracedecay_semantic_contracts::SemanticResourceCeilings;
 
     use super::{
         CachedSemanticEvaluationChunkEncoderV1, CanonicalChunkVectorEncoderV1, CodeSearchChunkV1,
@@ -701,8 +703,8 @@ mod tests {
         SemanticEvaluationProjectionBatchCachePolicyV1, SemanticEvaluationProjectionBatchCacheV1,
         SemanticExecutionAuthority, SemanticExecutionInterruptionV1, prepare_vector_generation,
     };
+    use crate::AdmittedProjectionArtifactV1;
     use crate::model_catalog::{CatalogMemberPinV1, CatalogSourceV1, CatalogedFastEmbedModelV1};
-    use crate::{AdmittedProjectionArtifactV1, SemanticResourceCeilings};
 
     struct ActiveCancellation;
 
@@ -897,11 +899,11 @@ mod tests {
         generation: &CodeGenerationId,
         case: &str,
         count: usize,
-    ) -> Vec<CodeSearchChunkV1> {
+    ) -> Vec<Arc<CodeSearchChunkV1>> {
         (0..count)
             .map(|ordinal| {
                 let label = format!("{case}.{ordinal:05}");
-                CodeSearchChunkV1 {
+                Arc::new(CodeSearchChunkV1 {
                     id: CodeSearchChunkId::new(format!("evaluation-cache.chunk.{label}"))
                         .expect("chunk fixture"),
                     anchor: CodeSearchChunkAnchorV1 {
@@ -935,7 +937,7 @@ mod tests {
                         "identical canonical FastEmbed group input",
                     )
                     .expect("sanitized fixture"),
-                }
+                })
             })
             .collect()
     }
@@ -943,7 +945,7 @@ mod tests {
     fn projection_case_request(
         generation: &CodeGenerationId,
         from_generation: Option<CodeGenerationId>,
-        chunks: &[CodeSearchChunkV1],
+        chunks: &[Arc<CodeSearchChunkV1>],
         projection: &tracedecay_domain::AdmittedEmbeddingProjectionKeyV1,
         replay_reason: ProjectionReplayReasonV1,
     ) -> ProjectionBatchRequestV1 {

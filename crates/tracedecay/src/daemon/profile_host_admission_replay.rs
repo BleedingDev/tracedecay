@@ -44,7 +44,7 @@ const BOOTSTRAP_TERMINAL_CACHE_FOR: Duration = Duration::from_secs(2);
 const BOOTSTRAP_RETRY_BUDGET: Duration = Duration::from_mins(1);
 
 pub(super) type ProfileHostAdmissionBootstrapOperation = Arc<
-    dyn Fn() -> Pin<Box<dyn Future<Output = tracedecay_runtime_core::errors::Result<()>> + Send>>
+    dyn Fn() -> Pin<Box<dyn Future<Output = tracedecay_domain::errors::Result<()>> + Send>>
         + Send
         + Sync,
 >;
@@ -86,7 +86,7 @@ struct ProfileHostAdmissionBootstrapWorker {
     state: AtomicU8,
     attempt_count: AtomicUsize,
     backoff_count: AtomicUsize,
-    terminal_error: std::sync::Mutex<Option<Arc<tracedecay_runtime_core::errors::TraceDecayError>>>,
+    terminal_error: std::sync::Mutex<Option<Arc<tracedecay_domain::errors::TraceDecayError>>>,
     completed_at: std::sync::Mutex<Option<Instant>>,
     completed: Notify,
     cancellation: Arc<ProfileHostAdmissionCancellation>,
@@ -97,7 +97,7 @@ struct ProfileHostAdmissionBootstrapWorker {
 pub(super) enum ProfileHostAdmissionBootstrapStatus {
     Running,
     Ready,
-    Terminal(Arc<tracedecay_runtime_core::errors::TraceDecayError>),
+    Terminal(Arc<tracedecay_domain::errors::TraceDecayError>),
     Cancelled,
 }
 
@@ -145,6 +145,7 @@ impl Drop for ProfileHostAdmissionReplayRegistry {
 }
 
 impl ProfileHostAdmissionReplayRegistry {
+    #[hotpath::skip]
     pub(super) async fn ensure_bootstrap(
         &self,
         profile_root: &Path,
@@ -192,6 +193,7 @@ impl ProfileHostAdmissionReplayRegistry {
         );
     }
 
+    #[hotpath::skip]
     pub(super) async fn bootstrap_status(
         &self,
         profile_root: &Path,
@@ -202,6 +204,7 @@ impl ProfileHostAdmissionReplayRegistry {
             .and_then(|entry| entry.worker.status())
     }
 
+    #[hotpath::skip]
     pub(super) async fn ensure(
         &self,
         broker_path: &Path,
@@ -221,6 +224,7 @@ impl ProfileHostAdmissionReplayRegistry {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn ensure_with_pass_override(
         &self,
         broker_path: &Path,
@@ -238,6 +242,7 @@ impl ProfileHostAdmissionReplayRegistry {
         self.ensure_worker(broker_path, worker).await;
     }
 
+    #[hotpath::skip]
     async fn ensure_worker(
         &self,
         broker_path: &Path,
@@ -285,6 +290,7 @@ impl ProfileHostAdmissionReplayRegistry {
         );
     }
 
+    #[hotpath::skip]
     pub(super) async fn shutdown(&self) {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
             return;
@@ -306,6 +312,7 @@ impl ProfileHostAdmissionReplayRegistry {
         }
     }
 
+    #[hotpath::skip]
     pub(super) async fn wait_idle(&self, broker_path: &Path, timeout: Duration) -> bool {
         if self.shutting_down.load(Ordering::Acquire)
             || self.cancellation.cancelled.load(Ordering::Acquire)
@@ -349,6 +356,7 @@ impl ProfileHostAdmissionReplayRegistry {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn pass_count(&self, broker_path: &Path) -> usize {
         let workers = self.workers.lock().await;
         workers
@@ -357,6 +365,7 @@ impl ProfileHostAdmissionReplayRegistry {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn backoff_count(&self, broker_path: &Path) -> usize {
         let workers = self.workers.lock().await;
         workers.get(broker_path).map_or(0, |entry| {
@@ -365,16 +374,19 @@ impl ProfileHostAdmissionReplayRegistry {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     async fn worker_count(&self) -> usize {
         self.workers.lock().await.len()
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     async fn bootstrap_worker_count(&self) -> usize {
         self.bootstrap_workers.lock().await.len()
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn bootstrap_attempt_count(&self, profile_root: &Path) -> usize {
         self.bootstrap_workers
             .lock()
@@ -386,6 +398,7 @@ impl ProfileHostAdmissionReplayRegistry {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn bootstrap_backoff_count(&self, profile_root: &Path) -> usize {
         self.bootstrap_workers
             .lock()
@@ -397,6 +410,7 @@ impl ProfileHostAdmissionReplayRegistry {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn wait_bootstrap_completed(
         &self,
         profile_root: &Path,
@@ -476,7 +490,7 @@ impl ProfileHostAdmissionBootstrapWorker {
         self.completed.notify_waiters();
     }
 
-    fn finish_terminal(&self, error: tracedecay_runtime_core::errors::TraceDecayError) {
+    fn finish_terminal(&self, error: tracedecay_domain::errors::TraceDecayError) {
         *self
             .terminal_error
             .lock()
@@ -589,9 +603,7 @@ impl ProfileHostAdmissionBootstrapWorker {
     }
 }
 
-fn bootstrap_error_disposition(
-    error: &tracedecay_runtime_core::errors::TraceDecayError,
-) -> (&str, bool) {
+fn bootstrap_error_disposition(error: &tracedecay_domain::errors::TraceDecayError) -> (&str, bool) {
     if error.reset_required_context().is_some() {
         ("reset_required", false)
     } else if let Some((reason_code, retryable, _)) = error.hook_runtime_context() {
@@ -617,6 +629,7 @@ impl ProfileHostAdmissionCancellation {
         }
     }
 
+    #[hotpath::skip]
     async fn wait(&self) {
         loop {
             let notified = self.notification.notified();
@@ -658,6 +671,7 @@ impl ProfileHostAdmissionReplayWorker {
         self.wake.notify_one();
     }
 
+    #[hotpath::skip]
     async fn is_idle(&self) -> bool {
         if self.busy.load(Ordering::Acquire) || self.dirty.load(Ordering::Acquire) {
             return false;
@@ -667,10 +681,12 @@ impl ProfileHostAdmissionReplayWorker {
             && !self.dirty.load(Ordering::Acquire)
     }
 
+    #[hotpath::skip]
     async fn wait_for_cancellation(&self) {
         self.cancellation.wait().await;
     }
 
+    #[hotpath::skip]
     async fn pending_replay_count_or_cancelled(&self) -> Option<usize> {
         #[cfg(test)]
         if let Some(pending_count_override) = &self.pending_count_override {
@@ -685,6 +701,7 @@ impl ProfileHostAdmissionReplayWorker {
         }
     }
 
+    #[hotpath::skip]
     async fn has_pending_replay_or_cancelled(&self) -> Option<bool> {
         self.pending_replay_count_or_cancelled()
             .await
@@ -696,6 +713,7 @@ impl ProfileHostAdmissionReplayWorker {
         self.idle.notify_waiters();
     }
 
+    #[hotpath::skip]
     async fn run(&self, idle_eviction_after: Duration) {
         let mut consecutive_retryable = 0u32;
         loop {
@@ -791,6 +809,7 @@ impl ProfileHostAdmissionReplayWorker {
         }
     }
 
+    #[hotpath::skip]
     async fn run_pass(&self) -> HostAdmissionOutcome {
         #[cfg(test)]
         if let Some(pass_override) = &self.pass_override {
@@ -919,13 +938,11 @@ mod tests {
             let attempts = Arc::clone(&operation_attempts);
             Box::pin(async move {
                 attempts.fetch_add(1, Ordering::AcqRel);
-                Err(
-                    tracedecay_runtime_core::errors::TraceDecayError::project_route(
-                        "test_bootstrap_terminal",
-                        false,
-                        "repair required",
-                    ),
-                )
+                Err(tracedecay_domain::errors::TraceDecayError::project_route(
+                    "test_bootstrap_terminal",
+                    false,
+                    "repair required",
+                ))
             })
         });
 
@@ -965,12 +982,10 @@ mod tests {
             let attempts = Arc::clone(&operation_attempts);
             Box::pin(async move {
                 attempts.fetch_add(1, Ordering::AcqRel);
-                Err(
-                    tracedecay_runtime_core::errors::TraceDecayError::reset_required(
-                        "host-admission spool",
-                        "future spool version 3 is incompatible with required version 2",
-                    ),
-                )
+                Err(tracedecay_domain::errors::TraceDecayError::reset_required(
+                    "host-admission spool",
+                    "future spool version 3 is incompatible with required version 2",
+                ))
             })
         });
 
@@ -1015,13 +1030,11 @@ mod tests {
             let attempts = Arc::clone(&operation_attempts);
             Box::pin(async move {
                 if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
-                    Err(
-                        tracedecay_runtime_core::errors::TraceDecayError::hook_runtime(
-                            "spool_io_failed",
-                            true,
-                            "host-admission spool open failed",
-                        ),
-                    )
+                    Err(tracedecay_domain::errors::TraceDecayError::hook_runtime(
+                        "spool_io_failed",
+                        true,
+                        "host-admission spool open failed",
+                    ))
                 } else {
                     Ok(())
                 }
@@ -1047,13 +1060,11 @@ mod tests {
 
         let terminal_operation: ProfileHostAdmissionBootstrapOperation = Arc::new(move || {
             Box::pin(async move {
-                Err(
-                    tracedecay_runtime_core::errors::TraceDecayError::hook_runtime(
-                        "spool_corrupted",
-                        false,
-                        "host-admission spool is corrupted",
-                    ),
-                )
+                Err(tracedecay_domain::errors::TraceDecayError::hook_runtime(
+                    "spool_corrupted",
+                    false,
+                    "host-admission spool is corrupted",
+                ))
             })
         });
         registry
@@ -1095,13 +1106,11 @@ mod tests {
             Box::pin(async move {
                 let attempt = attempts.fetch_add(1, Ordering::AcqRel);
                 if attempt < 2 {
-                    Err(
-                        tracedecay_runtime_core::errors::TraceDecayError::project_route(
-                            "test_bootstrap_unavailable",
-                            true,
-                            "transient test failure",
-                        ),
-                    )
+                    Err(tracedecay_domain::errors::TraceDecayError::project_route(
+                        "test_bootstrap_unavailable",
+                        true,
+                        "transient test failure",
+                    ))
                 } else {
                     Ok(())
                 }
@@ -1136,13 +1145,11 @@ mod tests {
             let attempts = Arc::clone(&operation_attempts);
             Box::pin(async move {
                 attempts.fetch_add(1, Ordering::AcqRel);
-                Err(
-                    tracedecay_runtime_core::errors::TraceDecayError::project_route(
-                        "test_bootstrap_unavailable",
-                        true,
-                        "permanently retryable test failure",
-                    ),
-                )
+                Err(tracedecay_domain::errors::TraceDecayError::project_route(
+                    "test_bootstrap_unavailable",
+                    true,
+                    "permanently retryable test failure",
+                ))
             })
         });
 
@@ -1189,7 +1196,7 @@ mod tests {
             let started = Arc::clone(&operation_started);
             Box::pin(async move {
                 started.notify_one();
-                std::future::pending::<tracedecay_runtime_core::errors::Result<()>>().await
+                std::future::pending::<tracedecay_domain::errors::Result<()>>().await
             })
         });
 

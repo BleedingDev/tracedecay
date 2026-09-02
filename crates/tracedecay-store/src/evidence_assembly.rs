@@ -139,6 +139,7 @@ impl SourceOccurrenceCoordinateV1 {
         }
     }
 
+    #[hotpath::skip]
     pub const fn is_code(&self) -> bool {
         matches!(
             self,

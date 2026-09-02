@@ -21,18 +21,19 @@ use tracedecay_application::{
 };
 use tracedecay_domain::{ManifestDigest, UtcMicros};
 use tracedecay_tool_catalog::{
-    BindingId, BindingSurface, CatalogSnapshotV1, FeatureId, ProfileId, SchemaRef,
-    SurfaceOperationName,
+    ApplicationSurfaceOperation, BindingId, BindingSurface, CatalogSnapshotV1, FeatureId,
+    ProfileId, SchemaRef, SurfaceOperationName,
 };
 
-use tracedecay_usecases::feedback::observations::{FeedbackDeliveryRouteV1, FeedbackSourceEventV1};
-use tracedecay_usecases::request_identity::{
-    ConnectionLocalRequestSequence, GlobalRequestSurface, mint_global_request_id,
+use tracedecay_application::feedback::observations::{
+    FeedbackDeliveryRouteV1, FeedbackSourceEventV1,
 };
+use tracedecay_application::request_identity::{GlobalRequestSurface, mint_global_request_id};
 
 pub type ScopeSelector = InvocationTarget;
 
-pub use tracedecay_mcp::{RequestedOutputFormat, requested_output_format};
+use crate::lsp_wire::ConnectionLocalRequestSequence;
+use crate::output_format::RequestedOutputFormat;
 
 /// The shared cancellation reference carried into an application invocation.
 pub type CancellationRef = CancellationSignal;
@@ -298,9 +299,22 @@ pub enum InvocationCancellationPolicy {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DaemonInvocationError {
-    Cancelled { stage: CancellationStage },
-    TimedOut { stage: CancellationStage },
+    Cancelled {
+        stage: CancellationStage,
+    },
+    TimedOut {
+        stage: CancellationStage,
+    },
     Unavailable,
+    /// The connect phase failed after the restart grace: no daemon accepted
+    /// at the endpoint, so the request was never sent. Kept distinct from
+    /// [`Self::Unavailable`] because re-dispatching the same request in-process
+    /// cannot succeed until a daemon is back — callers fail fast with the
+    /// typed connect diagnostic instead of retrying to their deadline.
+    Unreachable {
+        reason_code: String,
+        detail: String,
+    },
 }
 
 impl DaemonInvocationError {
@@ -319,6 +333,13 @@ impl DaemonInvocationError {
             Self::Unavailable => ApplicationProblem::unavailable(SafeDiagnostic {
                 code: "daemon_unavailable".to_owned(),
                 message: "The owning TraceDecay daemon is unavailable".to_owned(),
+            }),
+            Self::Unreachable {
+                reason_code,
+                detail,
+            } => ApplicationProblem::unavailable(SafeDiagnostic {
+                code: reason_code,
+                message: detail,
             }),
         }
     }
@@ -352,7 +373,7 @@ pub trait DaemonInvocationExecutor: ApplicationInvocationExecutor + Send + Sync 
         subject_digest: ManifestDigest,
         observed_at: UtcMicros,
         event: FeedbackSourceEventV1,
-    ) -> DaemonInvocationExecutorFuture<'_, tracedecay_runtime_core::errors::Result<()>>;
+    ) -> DaemonInvocationExecutorFuture<'_, tracedecay_domain::errors::Result<()>>;
 }
 
 /// Authenticated socket client for the daemon's closed invocation protocol.
@@ -475,7 +496,7 @@ impl DaemonInvocationClient {
     pub async fn invoke(
         &self,
         request: crate::contract::DaemonInvocationRequest,
-    ) -> tracedecay_runtime_core::errors::Result<crate::contract::DaemonInvocationResponse> {
+    ) -> tracedecay_domain::errors::Result<crate::contract::DaemonInvocationResponse> {
         let request_id = request.request_id.clone();
         let request_label = request.operation().as_str();
         let queued = self.activity.queued();
@@ -507,7 +528,7 @@ impl DaemonInvocationClient {
             });
         }
         let result = async {
-            let connection = state.as_mut().ok_or_else(|| tracedecay_runtime_core::errors::TraceDecayError::Config {
+            let connection = state.as_mut().ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
                 message: "daemon invocation connection was not initialized".to_owned(),
             })?;
             let request_json = hotpath::measure_block!(
@@ -537,7 +558,7 @@ impl DaemonInvocationClient {
             )
             .await?
             else {
-                return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                return Err(tracedecay_domain::errors::TraceDecayError::Config {
                     message: format!(
                         "daemon closed the invocation connection after '{request_label}' was sent; the outcome is unknown"
                     ),
@@ -545,18 +566,29 @@ impl DaemonInvocationClient {
             };
             hotpath::gauge!("daemon.invocation.client.response.bytes").set(line.len() as f64);
             let response: crate::contract::DaemonInvocationResponse =
-                hotpath::measure_block!(
+                match hotpath::measure_block!(
                     "daemon.invocation.client.response.decode",
                     serde_json::from_str(&line)
-                )
-                .map_err(|_| tracedecay_runtime_core::errors::TraceDecayError::Config {
-                    message: "daemon returned an invalid invocation response".to_owned(),
-                })?;
+                ) {
+                    Ok(response) => response,
+                    Err(_) => {
+                        // A daemon that refused the handshake answers with one
+                        // refusal frame instead of an invocation response.
+                        if let Some(refusal) =
+                            crate::handshake::DaemonHandshakeRefusal::from_line(&line)
+                        {
+                            return Err(handshake_refusal_error(&refusal, &self.handshake));
+                        }
+                        return Err(tracedecay_domain::errors::TraceDecayError::Config {
+                            message: "daemon returned an invalid invocation response".to_owned(),
+                        });
+                    }
+                };
             if response.protocol != crate::contract::DAEMON_INVOCATION_PROTOCOL
                 || response.revision != crate::contract::DAEMON_INVOCATION_REVISION
                 || response.request_id != request_id
             {
-                return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                return Err(tracedecay_domain::errors::TraceDecayError::Config {
                     message: "daemon invocation response did not match the request".to_owned(),
                 });
             }
@@ -566,15 +598,18 @@ impl DaemonInvocationClient {
         if result.is_err() {
             *state = None;
         }
-        result
+        result.map_err(|error| {
+            with_daemon_version_skew_context(error, &self.connection, &self.handshake)
+        })
     }
 
+    #[hotpath::skip]
     pub async fn acknowledge_work_delivery(
         &self,
         target_request_id: &str,
         outcome: tracedecay_domain::DeliverySettlementOutcomeV1,
         reason: Option<tracedecay_domain::DeliveryDropReasonV1>,
-    ) -> tracedecay_runtime_core::errors::Result<()> {
+    ) -> tracedecay_domain::errors::Result<()> {
         let request = match (outcome, reason) {
             (tracedecay_domain::DeliverySettlementOutcomeV1::Delivered, None) => {
                 crate::contract::DaemonInvocationDeliveryAckRequest::delivered(target_request_id)
@@ -591,7 +626,7 @@ impl DaemonInvocationClient {
                 | tracedecay_domain::DeliverySettlementOutcomeV1::Dropped,
                 _,
             ) => {
-                return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                return Err(tracedecay_domain::errors::TraceDecayError::Config {
                     message: "invalid Work delivery acknowledgement outcome".to_owned(),
                 });
             }
@@ -606,7 +641,7 @@ impl DaemonInvocationClient {
         let _in_flight = queued.into_in_flight();
         let result = async {
             let connection = state.as_mut().ok_or_else(|| {
-                tracedecay_runtime_core::errors::TraceDecayError::Config {
+                tracedecay_domain::errors::TraceDecayError::Config {
                     message: "daemon invocation connection is unavailable for Work delivery acknowledgement"
                         .to_owned(),
                 }
@@ -626,24 +661,24 @@ impl DaemonInvocationClient {
             )
             .await?
             else {
-                return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                return Err(tracedecay_domain::errors::TraceDecayError::Config {
                     message: "daemon closed the invocation connection before acknowledging Work delivery"
                         .to_owned(),
                 });
             };
             let response: crate::contract::DaemonInvocationDeliveryAckResponse =
-                serde_json::from_str(&line).map_err(|_| tracedecay_runtime_core::errors::TraceDecayError::Config {
+                serde_json::from_str(&line).map_err(|_| tracedecay_domain::errors::TraceDecayError::Config {
                     message: "daemon returned an invalid Work delivery acknowledgement response"
                         .to_owned(),
                 })?;
             if !response.matches_request(&request_id) {
-                return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                return Err(tracedecay_domain::errors::TraceDecayError::Config {
                     message: "daemon Work delivery acknowledgement did not match the request"
                         .to_owned(),
                 });
             }
             if let Some(reason) = response.rejection_reason() {
-                return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                return Err(tracedecay_domain::errors::TraceDecayError::Config {
                     message: format!(
                         "daemon rejected the Work delivery acknowledgement: {reason:?}"
                     ),
@@ -658,18 +693,17 @@ impl DaemonInvocationClient {
         result
     }
 
+    #[hotpath::skip]
     pub async fn observe_feedback(
         &self,
         subject_digest: ManifestDigest,
         observed_at: UtcMicros,
         event: FeedbackSourceEventV1,
-    ) -> tracedecay_runtime_core::errors::Result<()> {
+    ) -> tracedecay_domain::errors::Result<()> {
         let request_id = mint_global_request_id(GlobalRequestSurface::FeedbackObservation)
-            .map_err(
-                |error| tracedecay_runtime_core::errors::TraceDecayError::Config {
-                    message: error.to_string(),
-                },
-            )?;
+            .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+                message: error.to_string(),
+            })?;
         let response = self
             .invoke(
                 crate::contract::DaemonInvocationRequest::feedback_observation(
@@ -686,16 +720,17 @@ impl DaemonInvocationClient {
         ) {
             Ok(())
         } else {
-            Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: "daemon did not accept the feedback observation".to_owned(),
             })
         }
     }
 
+    #[hotpath::skip]
     pub async fn evaluate_and_publish_semantic_profile(
         &self,
         evaluated_profile_id: &str,
-    ) -> tracedecay_runtime_core::errors::Result<SemanticEvaluationPublicationResultV1> {
+    ) -> tracedecay_domain::errors::Result<SemanticEvaluationPublicationResultV1> {
         self.evaluate_and_publish_semantic_profile_until(
             evaluated_profile_id,
             SEMANTIC_EVALUATION_DISPATCH_DEADLINE_MICROS,
@@ -703,43 +738,133 @@ impl DaemonInvocationClient {
         .await
     }
 
-    pub async fn evaluate_and_publish_semantic_profile_until(
+    /// Run the composed activation journey: evaluate the profile natively,
+    /// publish the accepted evaluation, and compare-and-swap it into
+    /// `active_profile`. The daemon owns every stage; the evaluation phase
+    /// dominates the deadline.
+    #[hotpath::skip]
+    pub async fn activate_semantic_profile(
         &self,
         evaluated_profile_id: &str,
+        set_rollback: bool,
+    ) -> tracedecay_domain::errors::Result<SemanticActivationResultV1> {
+        self.activate_semantic_profile_until(
+            evaluated_profile_id,
+            set_rollback,
+            SEMANTIC_EVALUATION_DISPATCH_DEADLINE_MICROS,
+        )
+        .await
+    }
+
+    #[hotpath::skip]
+    pub async fn activate_semantic_profile_until(
+        &self,
+        evaluated_profile_id: &str,
+        set_rollback: bool,
         deadline_micros: i64,
-    ) -> tracedecay_runtime_core::errors::Result<SemanticEvaluationPublicationResultV1> {
+    ) -> tracedecay_domain::errors::Result<SemanticActivationResultV1> {
         let request_id =
             mint_global_request_id(GlobalRequestSurface::SemanticEvaluation).map_err(|error| {
-                tracedecay_runtime_core::errors::TraceDecayError::Config {
+                tracedecay_domain::errors::TraceDecayError::Config {
                     message: error.to_string(),
                 }
             })?;
         let observed_at = current_system_micros().ok_or_else(|| {
-            tracedecay_runtime_core::errors::TraceDecayError::Config {
+            tracedecay_domain::errors::TraceDecayError::Config {
+                message: "semantic activation clock is unavailable".to_owned(),
+            }
+        })?;
+        let deadline = Deadline::new(UtcMicros(
+            observed_at.0.checked_add(deadline_micros).ok_or_else(|| {
+                tracedecay_domain::errors::TraceDecayError::Config {
+                    message: "semantic activation deadline is unavailable".to_owned(),
+                }
+            })?,
+        ))
+        .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+            message: error.to_string(),
+        })?;
+        let cancellation = CancellationContext::active(format!(
+            "cancellation.semantic-activation.{}",
+            request_id.as_str()
+        ))
+        .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+            message: error.to_string(),
+        })?;
+        let response = self
+            .invoke(crate::contract::DaemonInvocationRequest::semantic_activate(
+                request_id.as_str(),
+                evaluated_profile_id.to_owned(),
+                set_rollback,
+                observed_at,
+                deadline,
+                cancellation,
+            ))
+            .await?;
+        match response.outcome {
+            crate::contract::DaemonInvocationOutcome::SemanticProfileActivated {
+                scope,
+                profile_digest,
+                report_digest,
+                configuration_revision,
+                rollback_profile_id,
+                runtime_state,
+            } => Ok(SemanticActivationResultV1 {
+                project_id: scope.project_id.as_str().to_owned(),
+                profile_digest: profile_digest.as_str().to_owned(),
+                report_digest: report_digest.as_str().to_owned(),
+                configuration_revision: configuration_revision.to_string(),
+                rollback_profile_id,
+                runtime_state,
+            }),
+            crate::contract::DaemonInvocationOutcome::Problem { problem } => {
+                Err(tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!("semantic activation rejected: {problem:?}"),
+                })
+            }
+            crate::contract::DaemonInvocationOutcome::ApplicationProblem { problem } => {
+                Err(semantic_activation_application_problem(problem))
+            }
+            _ => Err(tracedecay_domain::errors::TraceDecayError::Config {
+                message: "daemon returned an invalid semantic activation response".to_owned(),
+            }),
+        }
+    }
+
+    #[hotpath::skip]
+    pub async fn evaluate_and_publish_semantic_profile_until(
+        &self,
+        evaluated_profile_id: &str,
+        deadline_micros: i64,
+    ) -> tracedecay_domain::errors::Result<SemanticEvaluationPublicationResultV1> {
+        let request_id =
+            mint_global_request_id(GlobalRequestSurface::SemanticEvaluation).map_err(|error| {
+                tracedecay_domain::errors::TraceDecayError::Config {
+                    message: error.to_string(),
+                }
+            })?;
+        let observed_at = current_system_micros().ok_or_else(|| {
+            tracedecay_domain::errors::TraceDecayError::Config {
                 message: "semantic evaluation clock is unavailable".to_owned(),
             }
         })?;
         let deadline = Deadline::new(UtcMicros(
             observed_at.0.checked_add(deadline_micros).ok_or_else(|| {
-                tracedecay_runtime_core::errors::TraceDecayError::Config {
+                tracedecay_domain::errors::TraceDecayError::Config {
                     message: "semantic evaluation deadline is unavailable".to_owned(),
                 }
             })?,
         ))
-        .map_err(
-            |error| tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: error.to_string(),
-            },
-        )?;
+        .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+            message: error.to_string(),
+        })?;
         let cancellation = CancellationContext::active(format!(
             "cancellation.semantic-evaluation.{}",
             request_id.as_str()
         ))
-        .map_err(
-            |error| tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: error.to_string(),
-            },
-        )?;
+        .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+            message: error.to_string(),
+        })?;
         let response = self
             .invoke(
                 crate::contract::DaemonInvocationRequest::semantic_evaluate_and_publish(
@@ -768,48 +893,45 @@ impl DaemonInvocationClient {
                 snapshot_digest: snapshot_digest.as_str().to_owned(),
             }),
             crate::contract::DaemonInvocationOutcome::Problem { problem } => {
-                Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                Err(tracedecay_domain::errors::TraceDecayError::Config {
                     message: format!("semantic evaluation publication rejected: {problem:?}"),
                 })
             }
             crate::contract::DaemonInvocationOutcome::ApplicationProblem { problem } => {
                 Err(semantic_evaluation_application_problem(problem))
             }
-            _ => Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            _ => Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: "daemon returned an invalid semantic evaluation response".to_owned(),
             }),
         }
     }
 
+    #[hotpath::skip]
     pub async fn qualify_semantic_profile_until(
         &self,
         evaluated_profile_id: &str,
         deadline_micros: i64,
         cancellation: CancellationSignal,
-    ) -> tracedecay_runtime_core::errors::Result<SemanticEvaluationQualificationResultV1> {
+    ) -> tracedecay_domain::errors::Result<SemanticEvaluationQualificationResultV1> {
         let request_id = mint_global_request_id(GlobalRequestSurface::SemanticQualification)
-            .map_err(
-                |error| tracedecay_runtime_core::errors::TraceDecayError::Config {
-                    message: error.to_string(),
-                },
-            )?;
+            .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+                message: error.to_string(),
+            })?;
         let observed_at = current_system_micros().ok_or_else(|| {
-            tracedecay_runtime_core::errors::TraceDecayError::Config {
+            tracedecay_domain::errors::TraceDecayError::Config {
                 message: "semantic qualification clock is unavailable".to_owned(),
             }
         })?;
         let deadline = Deadline::new(UtcMicros(
             observed_at.0.checked_add(deadline_micros).ok_or_else(|| {
-                tracedecay_runtime_core::errors::TraceDecayError::Config {
+                tracedecay_domain::errors::TraceDecayError::Config {
                     message: "semantic qualification deadline is unavailable".to_owned(),
                 }
             })?,
         ))
-        .map_err(
-            |error| tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: error.to_string(),
-            },
-        )?;
+        .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+            message: error.to_string(),
+        })?;
         let response = self
             .invoke_controlled(
                 crate::contract::DaemonInvocationRequest::semantic_qualify(
@@ -839,16 +961,17 @@ impl DaemonInvocationClient {
             crate::contract::DaemonInvocationOutcome::ApplicationProblem { problem } => {
                 Err(semantic_qualification_application_problem(problem))
             }
-            _ => Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            _ => Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: "daemon returned an invalid semantic qualification response".to_owned(),
             }),
         }
     }
 
+    #[hotpath::skip]
     async fn cancel_invocation(
         &self,
         target_request_id: &str,
-    ) -> tracedecay_runtime_core::errors::Result<()> {
+    ) -> tracedecay_domain::errors::Result<()> {
         let stream = crate::connection::connect_to_daemon_connection(&self.connection).await?;
         let (_reader, mut writer) = stream.into_split();
         crate::connection::write_daemon_preamble(&mut writer, &self.connection, &self.handshake)
@@ -888,7 +1011,7 @@ impl DaemonInvocationExecutor for DaemonInvocationClient {
         subject_digest: ManifestDigest,
         observed_at: UtcMicros,
         event: FeedbackSourceEventV1,
-    ) -> DaemonInvocationExecutorFuture<'_, tracedecay_runtime_core::errors::Result<()>> {
+    ) -> DaemonInvocationExecutorFuture<'_, tracedecay_domain::errors::Result<()>> {
         Box::pin(DaemonInvocationClient::observe_feedback(
             self,
             subject_digest,
@@ -904,7 +1027,7 @@ impl DaemonInvocationExecutor for DaemonInvocationClient {
 /// `ConfigurationWireRequestV1` envelope before admission, so the client
 /// deserializes the inner request and wraps the operation-selected variant.
 fn configuration_request_from_surface_payload(
-    operation: crate::surface::ApplicationSurfaceOperation,
+    operation: ApplicationSurfaceOperation,
     payload: serde_json::Value,
 ) -> Result<tracedecay_application::ConfigurationWireRequestV1, InvocationError> {
     tracedecay_application::configuration_wire_request_from_invocation_payload(
@@ -935,10 +1058,8 @@ impl ApplicationInvocationExecutor for DaemonInvocationClient {
                 ApplicationRequest::Surface { binding, payload } => {
                     let (_binding_id, surface, operation, result_contract, _page) =
                         binding.into_parts();
-                    let operation = crate::surface::ApplicationSurfaceOperation::from_tool_name(
-                        operation.as_str(),
-                    )
-                    .ok_or(InvocationError::InvalidRequest)?;
+                    let operation = ApplicationSurfaceOperation::from_tool_name(operation.as_str())
+                        .ok_or(InvocationError::InvalidRequest)?;
                     let observed_at = invocation_now_micros();
                     let cancellation_context = cancellation.context();
                     let scope = match target {
@@ -947,19 +1068,19 @@ impl ApplicationInvocationExecutor for DaemonInvocationClient {
                     };
                     let policy = if matches!(
                         operation,
-                        crate::surface::ApplicationSurfaceOperation::ConfigurationSet
-                            | crate::surface::ApplicationSurfaceOperation::ConfigurationUnset
-                            | crate::surface::ApplicationSurfaceOperation::ConfigurationBatch
+                        ApplicationSurfaceOperation::ConfigurationSet
+                            | ApplicationSurfaceOperation::ConfigurationUnset
+                            | ApplicationSurfaceOperation::ConfigurationBatch
                     ) {
                         InvocationCancellationPolicy::AuthoritativeEffect
                     } else {
                         InvocationCancellationPolicy::ReadOnly
                     };
                     let request = match operation {
-                        crate::surface::ApplicationSurfaceOperation::ConfigurationGet
-                        | crate::surface::ApplicationSurfaceOperation::ConfigurationSet
-                        | crate::surface::ApplicationSurfaceOperation::ConfigurationUnset
-                        | crate::surface::ApplicationSurfaceOperation::ConfigurationBatch => {
+                        ApplicationSurfaceOperation::ConfigurationGet
+                        | ApplicationSurfaceOperation::ConfigurationSet
+                        | ApplicationSurfaceOperation::ConfigurationUnset
+                        | ApplicationSurfaceOperation::ConfigurationBatch => {
                             let request =
                                 configuration_request_from_surface_payload(operation, payload)?;
                             crate::contract::DaemonInvocationRequest::configuration(
@@ -972,7 +1093,7 @@ impl ApplicationInvocationExecutor for DaemonInvocationClient {
                             )
                             .with_resolved_scope(scope)
                         }
-                        crate::surface::ApplicationSurfaceOperation::FeedbackGet => {
+                        ApplicationSurfaceOperation::FeedbackGet => {
                             let request = feedback_handle_from_surface_payload(payload)?;
                             crate::contract::DaemonInvocationRequest::feedback(
                                 request_id.as_str(),
@@ -1034,6 +1155,13 @@ pub fn map_invocation_error(error: DaemonInvocationError) -> InvocationError {
         DaemonInvocationError::Cancelled { .. } => InvocationError::Cancelled,
         DaemonInvocationError::TimedOut { .. } => InvocationError::DeadlineExceeded,
         DaemonInvocationError::Unavailable => InvocationError::Unavailable,
+        DaemonInvocationError::Unreachable {
+            reason_code,
+            detail,
+        } => InvocationError::Unreachable {
+            reason_code,
+            detail,
+        },
     }
 }
 
@@ -1119,39 +1247,39 @@ fn invocation_error_from_problem(problem: &ApplicationProblem) -> InvocationErro
 
 fn semantic_evaluation_application_problem(
     problem: ApplicationProblem,
-) -> tracedecay_runtime_core::errors::TraceDecayError {
+) -> tracedecay_domain::errors::TraceDecayError {
     let retryable = problem.retry() != RetryDirective::Never;
     match problem.kind() {
         ApplicationProblemKind::Cancelled => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_evaluation_cancelled",
                 retryable,
                 "Semantic evaluation was cancelled",
             )
         }
         ApplicationProblemKind::TimedOut => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_evaluation_deadline_exceeded",
                 retryable,
                 "Semantic evaluation exceeded its deadline",
             )
         }
         ApplicationProblemKind::Unavailable | ApplicationProblemKind::Saturated => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_evaluation_unavailable",
                 retryable,
                 "Semantic evaluation publication is unavailable",
             )
         }
         ApplicationProblemKind::Conflict | ApplicationProblemKind::Stale => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_evaluation_conflict",
                 retryable,
                 "Semantic evaluation publication conflicted with newer state",
             )
         }
         ApplicationProblemKind::PartialEffect => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_evaluation_partial_effect",
                 retryable,
                 problem.diagnostic().map_or(
@@ -1161,14 +1289,14 @@ fn semantic_evaluation_application_problem(
             )
         }
         ApplicationProblemKind::ExecutionFailed => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_evaluation_execution_failed",
                 false,
                 "Semantic evaluation execution failed",
             )
         }
         ApplicationProblemKind::ResetRequired => {
-            tracedecay_runtime_core::errors::TraceDecayError::reset_required(
+            tracedecay_domain::errors::TraceDecayError::reset_required(
                 "semantic evaluation publication",
                 problem.diagnostic().map_or(
                     "the semantic evaluation authority requires reset",
@@ -1177,14 +1305,14 @@ fn semantic_evaluation_application_problem(
             )
         }
         ApplicationProblemKind::NotFoundOrNotAuthorized => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_evaluation_denied",
                 retryable,
                 "Semantic evaluation publication was not found or not authorized",
             )
         }
         ApplicationProblemKind::InvalidRequest | ApplicationProblemKind::Unsupported => {
-            tracedecay_runtime_core::errors::TraceDecayError::Config {
+            tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!(
                     "semantic evaluation publication rejected: {}",
                     problem.diagnostic().map_or_else(
@@ -1197,32 +1325,201 @@ fn semantic_evaluation_application_problem(
     }
 }
 
+/// A daemon that could not serve this client's handshake refused before any
+/// request ran; name the refusal, both versions, and the action.
+pub fn handshake_refusal_error(
+    refusal: &crate::handshake::DaemonHandshakeRefusal,
+    handshake: &crate::handshake::DaemonHandshake,
+) -> tracedecay_domain::errors::TraceDecayError {
+    if refusal.refusal == crate::handshake::DaemonHandshakeRefusalReason::AuthenticationRejected {
+        // Not version skew: the daemon read the preface and rejected the
+        // token. The token came from the daemon authority record, so a stale
+        // record (daemon restarted after this client resolved it) is the
+        // ordinary cause and a fresh attempt re-resolves it.
+        return tracedecay_domain::errors::TraceDecayError::project_route(
+            DAEMON_AUTHENTICATION_REJECTED,
+            true,
+            format!(
+                "daemon (version {}) rejected this client's authentication token; \
+                 the daemon authority record this client resolved is likely stale — \
+                 retry, or check `tracedecay daemon status`",
+                refusal.daemon_version
+            ),
+        );
+    }
+    let action =
+        crate::handshake::version_skew_action(&refusal.daemon_version, &handshake.client_version);
+    tracedecay_domain::errors::TraceDecayError::project_route(
+        DAEMON_PROTOCOL_REVISION_SKEW,
+        false,
+        format!(
+            "daemon (version {}) refused this client's handshake as {:?} \
+             (client version {}); {action}",
+            refusal.daemon_version, refusal.refusal, handshake.client_version
+        ),
+    )
+}
+
+/// Typed reason code for a daemon/client wire-revision mismatch.
+pub const DAEMON_PROTOCOL_REVISION_SKEW: &str = "daemon_protocol_revision_skew";
+
+/// Typed reason code for a daemon that refused the client's auth preface.
+pub const DAEMON_AUTHENTICATION_REJECTED: &str = "daemon_authentication_rejected";
+
+/// Attach version-skew context to a transport-level invocation failure.
+///
+/// Every error the invocation path produces here is transport-shaped (the
+/// daemon's typed problems arrive as `Ok` responses), so a version mismatch
+/// between the authority record's daemon and this client is the most likely
+/// cause and must be visible instead of a bare `Connection reset by peer`.
+fn with_daemon_version_skew_context(
+    error: tracedecay_domain::errors::TraceDecayError,
+    connection: &crate::connection::DaemonConnection,
+    handshake: &crate::handshake::DaemonHandshake,
+) -> tracedecay_domain::errors::TraceDecayError {
+    // A refusal the daemon authored is already the definitive answer; naming
+    // version skew over it would misdirect the operator.
+    if let Some((code, _, _)) = error.project_route_context()
+        && (code == DAEMON_PROTOCOL_REVISION_SKEW || code == DAEMON_AUTHENTICATION_REJECTED)
+    {
+        return error;
+    }
+    let Some(daemon_version) = connection.daemon_version.as_deref() else {
+        return error;
+    };
+    if crate::handshake::client_version_skew(&handshake.client_version, daemon_version).is_none() {
+        return error;
+    }
+    let action = crate::handshake::version_skew_action(daemon_version, &handshake.client_version);
+    tracedecay_domain::errors::TraceDecayError::project_route(
+        DAEMON_PROTOCOL_REVISION_SKEW,
+        false,
+        format!(
+            "{error}. The daemon (version {daemon_version}) and this client \
+             (version {}) are different builds of the invocation protocol, \
+             which is the most likely cause of this transport failure; {action}",
+            handshake.client_version
+        ),
+    )
+}
+
+/// Map a typed activation-journey problem onto the client error surface.
+///
+/// The stage that refused is carried by the diagnostic the daemon attached
+/// (evaluation problems come from the semantic evaluation route,
+/// configuration problems from the mutation route); this mapping preserves
+/// that detail instead of flattening it into a generic message.
+fn semantic_activation_application_problem(
+    problem: ApplicationProblem,
+) -> tracedecay_domain::errors::TraceDecayError {
+    let retryable = problem.retry() != RetryDirective::Never;
+    let detail = problem
+        .diagnostic()
+        .map(|diagnostic| format!(" ({}: {})", diagnostic.code, diagnostic.message))
+        .unwrap_or_default();
+    match problem.kind() {
+        ApplicationProblemKind::Conflict | ApplicationProblemKind::Stale => {
+            tracedecay_domain::errors::TraceDecayError::project_route(
+                "semantic_activation_conflict",
+                retryable,
+                format!(
+                    "Semantic activation lost its configuration compare-and-swap; \
+                     the configuration changed while the profile evaluated — re-run \
+                     the activation{detail}"
+                ),
+            )
+        }
+        ApplicationProblemKind::Cancelled => {
+            tracedecay_domain::errors::TraceDecayError::project_route(
+                "semantic_activation_cancelled",
+                retryable,
+                format!("Semantic activation was cancelled{detail}"),
+            )
+        }
+        ApplicationProblemKind::TimedOut => {
+            tracedecay_domain::errors::TraceDecayError::project_route(
+                "semantic_activation_deadline_exceeded",
+                retryable,
+                format!("Semantic activation exceeded its deadline{detail}"),
+            )
+        }
+        ApplicationProblemKind::Unavailable | ApplicationProblemKind::Saturated => {
+            tracedecay_domain::errors::TraceDecayError::project_route(
+                "semantic_activation_unavailable",
+                retryable,
+                format!("Semantic activation is unavailable{detail}"),
+            )
+        }
+        ApplicationProblemKind::PartialEffect => {
+            tracedecay_domain::errors::TraceDecayError::project_route(
+                "semantic_activation_partial_effect",
+                retryable,
+                format!("Semantic activation committed only part of its effect{detail}"),
+            )
+        }
+        ApplicationProblemKind::ExecutionFailed => {
+            tracedecay_domain::errors::TraceDecayError::project_route(
+                "semantic_activation_execution_failed",
+                false,
+                format!("Semantic activation execution failed{detail}"),
+            )
+        }
+        ApplicationProblemKind::ResetRequired => {
+            tracedecay_domain::errors::TraceDecayError::reset_required(
+                "semantic activation",
+                problem.diagnostic().map_or(
+                    "the semantic activation authority requires reset",
+                    |diagnostic| diagnostic.message.as_str(),
+                ),
+            )
+        }
+        ApplicationProblemKind::NotFoundOrNotAuthorized => {
+            tracedecay_domain::errors::TraceDecayError::project_route(
+                "semantic_activation_denied",
+                retryable,
+                format!("Semantic activation was not found or not authorized{detail}"),
+            )
+        }
+        ApplicationProblemKind::InvalidRequest | ApplicationProblemKind::Unsupported => {
+            tracedecay_domain::errors::TraceDecayError::Config {
+                message: format!(
+                    "semantic activation rejected: {}",
+                    problem.diagnostic().map_or_else(
+                        || format!("{problem:?}"),
+                        |diagnostic| diagnostic.message.clone(),
+                    )
+                ),
+            }
+        }
+    }
+}
+
 fn semantic_qualification_daemon_problem(
     problem: crate::contract::DaemonInvocationProblem,
-) -> tracedecay_runtime_core::errors::TraceDecayError {
+) -> tracedecay_domain::errors::TraceDecayError {
     match problem {
         crate::contract::DaemonInvocationProblem::InvalidRequest
         | crate::contract::DaemonInvocationProblem::UnsupportedRevision => {
-            tracedecay_runtime_core::errors::TraceDecayError::Config {
+            tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!("semantic qualification rejected: {problem:?}"),
             }
         }
         crate::contract::DaemonInvocationProblem::NotFoundOrNotAuthorized => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_qualification_denied",
                 false,
                 "Semantic qualification was not found or not authorized",
             )
         }
         crate::contract::DaemonInvocationProblem::ResetRequired => {
-            tracedecay_runtime_core::errors::TraceDecayError::reset_required(
+            tracedecay_domain::errors::TraceDecayError::reset_required(
                 "semantic qualification",
                 "the semantic qualification authority requires reset",
             )
         }
         crate::contract::DaemonInvocationProblem::ApplicationContractViolation
         | crate::contract::DaemonInvocationProblem::Unavailable => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_qualification_unavailable",
                 false,
                 "Semantic qualification is unavailable",
@@ -1233,39 +1530,39 @@ fn semantic_qualification_daemon_problem(
 
 fn semantic_qualification_application_problem(
     problem: ApplicationProblem,
-) -> tracedecay_runtime_core::errors::TraceDecayError {
+) -> tracedecay_domain::errors::TraceDecayError {
     let retryable = problem.retry() != RetryDirective::Never;
     match problem.kind() {
         ApplicationProblemKind::Cancelled => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_qualification_cancelled",
                 retryable,
                 "Semantic qualification was cancelled",
             )
         }
         ApplicationProblemKind::TimedOut => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_qualification_deadline_exceeded",
                 retryable,
                 "Semantic qualification exceeded its deadline",
             )
         }
         ApplicationProblemKind::Unavailable | ApplicationProblemKind::Saturated => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_qualification_unavailable",
                 retryable,
                 "Semantic qualification is unavailable",
             )
         }
         ApplicationProblemKind::Conflict | ApplicationProblemKind::Stale => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_qualification_stale",
                 retryable,
                 "Semantic qualification became stale",
             )
         }
         ApplicationProblemKind::PartialEffect => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_qualification_partial_result",
                 retryable,
                 problem.diagnostic().map_or(
@@ -1275,14 +1572,14 @@ fn semantic_qualification_application_problem(
             )
         }
         ApplicationProblemKind::ExecutionFailed => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_qualification_execution_failed",
                 false,
                 "Semantic qualification execution failed",
             )
         }
         ApplicationProblemKind::ResetRequired => {
-            tracedecay_runtime_core::errors::TraceDecayError::reset_required(
+            tracedecay_domain::errors::TraceDecayError::reset_required(
                 "semantic qualification",
                 problem.diagnostic().map_or(
                     "the semantic qualification authority requires reset",
@@ -1291,14 +1588,14 @@ fn semantic_qualification_application_problem(
             )
         }
         ApplicationProblemKind::NotFoundOrNotAuthorized => {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "semantic_qualification_denied",
                 retryable,
                 "Semantic qualification was not found or not authorized",
             )
         }
         ApplicationProblemKind::InvalidRequest | ApplicationProblemKind::Unsupported => {
-            tracedecay_runtime_core::errors::TraceDecayError::Config {
+            tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!(
                     "semantic qualification rejected: {}",
                     problem.diagnostic().map_or_else(
@@ -1316,9 +1613,21 @@ pub struct SemanticEvaluationPublicationResultV1 {
     pub project_id: String,
     pub profile_digest: String,
     pub report_digest: String,
-    pub report: tracedecay_search_eval::DirectEvaluationReportV1,
+    pub report: serde_json::Value,
     pub source_generation: String,
     pub snapshot_digest: String,
+}
+
+/// Terminal receipt of the composed semantic activation journey.
+/// `runtime_state` is the daemon-serialized `SemanticRuntimeStateV1`.
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct SemanticActivationResultV1 {
+    pub project_id: String,
+    pub profile_digest: String,
+    pub report_digest: String,
+    pub configuration_revision: String,
+    pub rollback_profile_id: Option<String>,
+    pub runtime_state: serde_json::Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1362,11 +1671,11 @@ mod tests {
         feedback_handle_from_surface_payload, semantic_evaluation_application_problem,
         semantic_qualification_application_problem,
     };
-    use crate::surface::ApplicationSurfaceOperation;
     use tracedecay_application::{
         ApplicationProblem, ApplicationProblemKind, CancellationStage, ConfigurationWireRequestV1,
         InvocationError, RequestId, ResultContractRef,
     };
+    use tracedecay_tool_catalog::ApplicationSurfaceOperation;
     use tracedecay_tool_catalog::SchemaId;
 
     #[test]
@@ -1450,6 +1759,198 @@ mod tests {
         }
     }
 
+    fn unused_test_endpoint() -> crate::transport::DaemonEndpoint {
+        crate::transport::DaemonEndpoint::loopback(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("loopback endpoint")
+    }
+
+    #[test]
+    fn transport_failures_name_version_skew_when_the_authority_daemon_differs() {
+        let connection = crate::connection::DaemonConnection::new(unused_test_endpoint(), None)
+            .with_daemon_version("0.1.0-beta.36+aaaa");
+        let mut handshake = test_skew_handshake();
+        handshake.client_version = "0.1.0-beta.37+bbbb".to_owned();
+
+        let error = super::with_daemon_version_skew_context(
+            tracedecay_domain::errors::TraceDecayError::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            )),
+            &connection,
+            &handshake,
+        );
+        let (code, retryable, _) = error
+            .project_route_context()
+            .expect("skewed transport failures must be typed");
+        assert_eq!(code, super::DAEMON_PROTOCOL_REVISION_SKEW);
+        assert!(!retryable);
+        let message = error.to_string();
+        assert!(
+            message.contains("0.1.0-beta.36+aaaa") && message.contains("0.1.0-beta.37+bbbb"),
+            "the skew error must name both versions: {message}"
+        );
+        assert!(
+            message.contains("daemon restart"),
+            "an older daemon must be pointed at `tracedecay daemon restart`: {message}"
+        );
+    }
+
+    #[test]
+    fn transport_failures_stay_untouched_without_version_skew() {
+        let matching = crate::connection::DaemonConnection::new(unused_test_endpoint(), None)
+            .with_daemon_version("0.1.0-beta.37+cccc");
+        let unknown = crate::connection::DaemonConnection::new(unused_test_endpoint(), None);
+        let mut handshake = test_skew_handshake();
+        handshake.client_version = "0.1.0-beta.37+cccc".to_owned();
+
+        for connection in [matching, unknown] {
+            let error = super::with_daemon_version_skew_context(
+                tracedecay_domain::errors::TraceDecayError::Io(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionReset,
+                )),
+                &connection,
+                &handshake,
+            );
+            assert!(
+                error.project_route_context().is_none(),
+                "matching or unknown daemon versions must not invent a skew: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn handshake_refusal_frames_become_typed_revision_skew_errors() {
+        let refusal = crate::handshake::DaemonHandshakeRefusal {
+            protocol: crate::handshake::DAEMON_HANDSHAKE_REFUSAL_PROTOCOL.to_owned(),
+            refusal: crate::handshake::DaemonHandshakeRefusalReason::UnsupportedRevision,
+            daemon_version: "0.1.0-beta.36+dddd".to_owned(),
+        };
+        let mut handshake = test_skew_handshake();
+        handshake.client_version = "0.1.0-beta.37+eeee".to_owned();
+
+        let error = super::handshake_refusal_error(&refusal, &handshake);
+        let (code, retryable, _) = error
+            .project_route_context()
+            .expect("handshake refusals must be typed");
+        assert_eq!(code, super::DAEMON_PROTOCOL_REVISION_SKEW);
+        assert!(!retryable);
+        let message = error.to_string();
+        assert!(
+            message.contains("UnsupportedRevision")
+                && message.contains("0.1.0-beta.36+dddd")
+                && message.contains("0.1.0-beta.37+eeee"),
+            "the refusal error must name the reason and both versions: {message}"
+        );
+    }
+
+    #[test]
+    fn authentication_refusal_frames_become_typed_auth_errors() {
+        let refusal = crate::handshake::DaemonHandshakeRefusal::for_rejected_authentication(
+            "0.1.0-beta.36+dddd",
+        );
+        let mut handshake = test_skew_handshake();
+        handshake.client_version = "0.1.0-beta.37+eeee".to_owned();
+
+        let error = super::handshake_refusal_error(&refusal, &handshake);
+        let (code, retryable, _) = error
+            .project_route_context()
+            .expect("authentication refusals must be typed");
+        assert_eq!(code, super::DAEMON_AUTHENTICATION_REJECTED);
+        assert!(
+            retryable,
+            "a stale authority record is recoverable by re-resolving it"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("rejected this client's authentication token")
+                && message.contains("0.1.0-beta.36+dddd")
+                && message.contains("tracedecay daemon status"),
+            "the auth error must name the refusal and the next action: {message}"
+        );
+
+        // The skew decorator must not relabel the daemon's definitive answer,
+        // even when the authority record names a different daemon version.
+        let connection = crate::connection::DaemonConnection::new(unused_test_endpoint(), None)
+            .with_daemon_version("0.1.0-beta.36+dddd");
+        let decorated = super::with_daemon_version_skew_context(error, &connection, &handshake);
+        let (code, _, _) = decorated
+            .project_route_context()
+            .expect("decorated auth refusal stays typed");
+        assert_eq!(code, super::DAEMON_AUTHENTICATION_REJECTED);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refused_handshake_surfaces_typed_skew_instead_of_transport_noise() {
+        let isolation = tempfile::TempDir::new().expect("socket isolation");
+        let socket = isolation.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake daemon");
+        let refusal_line = crate::handshake::DaemonHandshakeRefusal {
+            protocol: crate::handshake::DAEMON_HANDSHAKE_REFUSAL_PROTOCOL.to_owned(),
+            refusal: crate::handshake::DaemonHandshakeRefusalReason::UnsupportedRevision,
+            daemon_version: "0.1.0-beta.36+ffff".to_owned(),
+        }
+        .to_line()
+        .expect("refusal line");
+        let daemon = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            // Handshake line, then the pipelined request line.
+            let _ = lines.next_line().await.expect("read handshake");
+            let _ = lines.next_line().await.expect("read request");
+            writer
+                .write_all(format!("{refusal_line}\n").as_bytes())
+                .await
+                .expect("write refusal");
+            writer.flush().await.expect("flush refusal");
+        });
+
+        let mut handshake = test_skew_handshake();
+        handshake.client_version = "0.1.0-beta.37+gggg".to_owned();
+        let client = super::DaemonInvocationClient::new(
+            crate::connection::DaemonConnection::new(
+                crate::transport::DaemonEndpoint::Unix(socket),
+                None,
+            )
+            .with_daemon_version("0.1.0-beta.36+ffff"),
+            handshake,
+        );
+
+        let error = client
+            .evaluate_and_publish_semantic_profile("hybrid-conservative")
+            .await
+            .expect_err("a refused handshake must not look like a published profile");
+        let (code, _, _) = error
+            .project_route_context()
+            .expect("the refusal must surface as a typed revision skew");
+        assert_eq!(code, super::DAEMON_PROTOCOL_REVISION_SKEW);
+        assert!(
+            error.to_string().contains("0.1.0-beta.36+ffff"),
+            "the error must name the refusing daemon version: {error}"
+        );
+        daemon.await.expect("fake daemon completes");
+    }
+
+    fn test_skew_handshake() -> crate::handshake::DaemonHandshake {
+        crate::handshake::DaemonHandshake {
+            project_path: None,
+            scope_prefix: None,
+            timings: false,
+            allow_init: false,
+            allow_initialize_root_routing: false,
+            client_identity: crate::client_identity::DaemonClientIdentity::new(
+                std::path::PathBuf::from("/tmp/profile"),
+                std::path::PathBuf::from("/tmp/profile/global.db"),
+            ),
+            client_version: String::new(),
+            client_instance_id: "00000000000000000000000000000000".to_owned(),
+            tool_list_changed_capable: false,
+            catalog_version: String::new(),
+            moved_store_adoption: crate::handshake::MovedStoreAdoption::Never,
+        }
+    }
+
     #[test]
     fn semantic_qualification_client_maps_typed_application_problems() {
         for (problem, expected_reason) in [
@@ -1498,36 +1999,35 @@ mod tests {
             project_id: "project-1".to_owned(),
             profile_digest: format!("sha256:{}", "1".repeat(64)),
             report_digest: format!("sha256:{}", "2".repeat(64)),
-            report: tracedecay_search_eval::DirectEvaluationReportV1 {
-                command: "compare".to_owned(),
-                status: tracedecay_search_eval::DirectEvaluationStatusV1::Pass,
-                workload_digest: format!("sha256:{}", "3".repeat(64)),
-                corpus_digest: format!("sha256:{}", "4".repeat(64)),
-                fixture_source_repository_commit: "fixture-commit".to_owned(),
-                fixture_source_repository_tree: "fixture-tree".to_owned(),
-                execution_contract: tracedecay_search_eval::EvaluationExecutionContractV1 {
-                    exact_file_count: 0,
-                    exact_corpus_bytes: 0,
-                    exact_eligible_chunks_current: 0,
-                    exact_eligible_chunks_10x: 0,
-                    exact_query_count: 0,
-                    model_revision: "model.serialization-test.v1".to_owned(),
-                    projection_revision: "projection.serialization-test.v1".to_owned(),
-                    fusion_revision: "fusion.serialization-test.v1".to_owned(),
-                    runtime_revision: "runtime.serialization-test.v1".to_owned(),
-                    cache_state: "empty".to_owned(),
-                    concurrency:
-                        tracedecay_search_eval::candidate_output::EvaluationConcurrencyContractV1 {
-                            query_workers: 1,
-                            projection_workers: 1,
-                            query_execution: "serial".to_owned(),
-                        },
+            report: serde_json::json!({
+                "command": "compare",
+                "status": "pass",
+                "workload_digest": format!("sha256:{}", "3".repeat(64)),
+                "corpus_digest": format!("sha256:{}", "4".repeat(64)),
+                "fixture_source_repository_commit": "fixture-commit",
+                "fixture_source_repository_tree": "fixture-tree",
+                "execution_contract": {
+                    "exact_file_count": 0,
+                    "exact_corpus_bytes": 0,
+                    "exact_eligible_chunks_current": 0,
+                    "exact_eligible_chunks_10x": 0,
+                    "exact_query_count": 0,
+                    "model_revision": "model.serialization-test.v1",
+                    "projection_revision": "projection.serialization-test.v1",
+                    "fusion_revision": "fusion.serialization-test.v1",
+                    "runtime_revision": "runtime.serialization-test.v1",
+                    "cache_state": "empty",
+                    "concurrency": {
+                        "query_workers": 1,
+                        "projection_workers": 1,
+                        "query_execution": "serial"
+                    }
                 },
-                profile_material_digests: std::collections::BTreeMap::new(),
-                raw_output_digest: format!("sha256:{}", "6".repeat(64)),
-                raw_outputs: Vec::new(),
-                profiles: Vec::new(),
-            },
+                "profile_material_digests": {},
+                "raw_output_digest": format!("sha256:{}", "6".repeat(64)),
+                "raw_outputs": [],
+                "profiles": []
+            }),
             source_generation: "generation-1".to_owned(),
             snapshot_digest: format!("sha256:{}", "5".repeat(64)),
         };

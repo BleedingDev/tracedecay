@@ -9,9 +9,30 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::tracedecay::TraceDecay;
+use tracedecay_application::{
+    ProfileIdentityReadPort, SessionTemporalRefreshWakePort,
+    remote::status::RemoteOperationalStatusReadPort,
+};
+use tracedecay_daemon_identity::profile_identity::LocalProfileIdentityAuthorityV1;
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_sessions::serving::SessionProjectionServingStatusPort;
 
 use super::hook_writes::{BackgroundRefreshWriter, direct_background_refresh_writer};
+
+fn wrap_profile_identity(
+    identity: LocalProfileIdentityAuthorityV1,
+) -> Arc<dyn ProfileIdentityReadPort> {
+    Arc::new(identity)
+}
+
+fn wrap_refresh_wake(
+    wake: tracedecay_session_runtime::session_temporal_refresh_scheduler::SessionTemporalRefreshWake,
+) -> (
+    Arc<dyn SessionTemporalRefreshWakePort>,
+    Arc<dyn SessionProjectionServingStatusPort>,
+) {
+    (Arc::new(wake.clone()), Arc::new(wake))
+}
 
 /// Updates daemon ownership routing after this server changes physical graph DB.
 /// Implementations must not call back into this `McpServer`: reconciliation is
@@ -22,9 +43,9 @@ pub(crate) type DatabaseOwnerReconciler = Arc<
 >;
 
 pub(crate) type CodeGraphProjectionReadPort =
-    Arc<dyn tracedecay_usecases::graph::CodeGraphProjectionReadPort + 'static>;
+    Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort + 'static>;
 pub(crate) type CodeGraphReadAdmissionPort =
-    Arc<dyn tracedecay_usecases::graph::CodeGraphReadAdmissionPort + 'static>;
+    Arc<dyn tracedecay_graph_query::CodeGraphReadAdmissionPort + 'static>;
 pub(crate) type CodeIndexIgnoredDependencyAdmissionPort =
     Arc<dyn tracedecay_usecases::code_index::CodeIndexIgnoredDependencyAdmissionPortV1 + 'static>;
 
@@ -34,13 +55,36 @@ pub(crate) type CodeIndexIgnoredDependencyAdmissionPort =
 pub(crate) use tracedecay_dashboard_api::project_graph::RetainedProjectGraphRequest;
 pub(crate) type RetainedProjectServerFuture = Pin<
     Box<
-        dyn Future<Output = tracedecay_runtime_core::errors::Result<Option<Arc<super::McpServer>>>>
+        dyn Future<Output = tracedecay_domain::errors::Result<Option<Arc<super::McpServer>>>>
             + Send
             + 'static,
     >,
 >;
-pub(crate) type RetainedProjectServerResolver =
-    Arc<dyn Fn(RetainedProjectGraphRequest) -> RetainedProjectServerFuture + Send + Sync + 'static>;
+/// Named project-server resolution port.
+///
+/// The composition root installs a daemon-built implementor that returns the
+/// retained `McpServer`. Construction and routed handlers resolve through
+/// this trait instead of naming a `Fn` alias.
+pub(crate) trait McpProjectServerResolvePort: Send + Sync {
+    fn resolve(&self, request: RetainedProjectGraphRequest) -> RetainedProjectServerFuture;
+}
+
+impl<F> McpProjectServerResolvePort for F
+where
+    F: Fn(RetainedProjectGraphRequest) -> RetainedProjectServerFuture + Send + Sync + 'static,
+{
+    fn resolve(&self, request: RetainedProjectGraphRequest) -> RetainedProjectServerFuture {
+        self(request)
+    }
+}
+
+pub(crate) type RetainedProjectServerResolver = Arc<dyn McpProjectServerResolvePort>;
+
+pub(crate) fn install_retained_project_server_resolver(
+    resolve: impl Fn(RetainedProjectGraphRequest) -> RetainedProjectServerFuture + Send + Sync + 'static,
+) -> RetainedProjectServerResolver {
+    Arc::new(resolve)
+}
 
 /// Product provider composition retained for exactly one project-server
 /// lifetime. The concrete type stays behind the opt-in host feature.
@@ -68,20 +112,18 @@ pub(crate) fn dashboard_retained_project_graph_resolver(
         let resolver = Arc::clone(&resolver);
         let expected_profile_id = expected_profile_id.clone();
         Box::pin(async move {
-            let server = resolver(request).await?;
+            let server = resolver.resolve(request).await?;
             let graph = match server {
                 Some(server) => {
                     let profile_matches = server
                         .profile_identity()
                         .is_some_and(|identity| identity.profile_id() == &expected_profile_id);
                     if !profile_matches {
-                        return Err(
-                            tracedecay_runtime_core::errors::TraceDecayError::project_route(
-                                "project_route_not_authorized",
-                                false,
-                                "retained dashboard project belongs to another profile",
-                            ),
-                        );
+                        return Err(tracedecay_domain::errors::TraceDecayError::project_route(
+                            "project_route_not_authorized",
+                            false,
+                            "retained dashboard project belongs to another profile",
+                        ));
                     }
                     Some(server.cg_snapshot().await)
                 }
@@ -98,8 +140,7 @@ pub(crate) struct McpServerConstructionContext {
     pub(crate) cg: Arc<TraceDecay>,
     pub(crate) scope_prefix: Option<String>,
     pub(crate) profile_root: Option<PathBuf>,
-    pub(crate) profile_identity:
-        Option<crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1>,
+    pub(crate) profile_identity: Option<Arc<dyn ProfileIdentityReadPort>>,
     pub(crate) global_db: Option<RegisteredGlobalDbLeaseV1>,
     pub(crate) accounting_db: Option<RegisteredGlobalDbLeaseV1>,
     pub(crate) registry_db: Option<RegisteredGlobalDbLeaseV1>,
@@ -110,29 +151,28 @@ pub(crate) struct McpServerConstructionContext {
     pub(crate) session_sync_service:
         Option<std::sync::Weak<dyn tracedecay_application::session_sync::SessionSyncServicePort>>,
     pub(crate) host_admission_broker: Option<tracedecay_host_admission::SharedHostAdmissionBroker>,
-    pub(crate) project_session_refresh_wake:
-        Option<crate::daemon::session_temporal_refresh_scheduler::SessionTemporalRefreshWake>,
-    pub(crate) user_session_refresh_wake:
-        Option<crate::daemon::session_temporal_refresh_scheduler::SessionTemporalRefreshWake>,
+    pub(crate) project_session_refresh_wake: Option<Arc<dyn SessionTemporalRefreshWakePort>>,
+    pub(crate) user_session_refresh_wake: Option<Arc<dyn SessionTemporalRefreshWakePort>>,
+    pub(crate) project_session_refresh_serving: Option<Arc<dyn SessionProjectionServingStatusPort>>,
     /// When true (daemon-owned project servers), spawn a cancellable worker that
     /// continues bounded host-admission replay passes until idle.
     pub(crate) own_project_host_admission_replay: bool,
     pub(crate) startup_catch_up_enabled: bool,
     pub(crate) automation_scheduler_reconciler:
-        Option<crate::dashboard::AutomationSchedulerReconciler>,
+        Option<tracedecay_dashboard_api::AutomationSchedulerReconciler>,
     pub(crate) database_owner_reconciler: Option<DatabaseOwnerReconciler>,
-    pub(crate) dashboard_automation_writer: crate::dashboard::DashboardAutomationWriter,
+    pub(crate) dashboard_automation_writer: tracedecay_dashboard_api::DashboardAutomationWriter,
     /// Live Remote Brain operational read composed from the mounted remote
     /// authorities. Daemon-owned servers install it; direct servers leave it
     /// absent and remote operator surfaces report typed unavailable.
-    pub(crate) remote_operational_status:
-        Option<crate::daemon::remote_protocol::RemoteOperationalStatusProviderV1>,
-    pub(crate) dashboard_doctor_report_reader: Option<crate::dashboard::DoctorReportReader>,
+    pub(crate) remote_operational_status: Option<Arc<dyn RemoteOperationalStatusReadPort>>,
+    pub(crate) dashboard_doctor_report_reader: Option<tracedecay_dashboard_api::DoctorReportReader>,
     pub(crate) dashboard_code_index_freshness_reader:
-        Option<crate::dashboard::code_index_freshness_api::CodeIndexFreshnessReader>,
-    pub(crate) dashboard_explorer_semantic_reader: Option<crate::dashboard::ExplorerSemanticReader>,
+        Option<tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader>,
+    pub(crate) dashboard_explorer_semantic_reader:
+        Option<tracedecay_dashboard_api::ExplorerSemanticReader>,
     pub(crate) dashboard_feedback_status_reader:
-        Option<crate::dashboard::feedback_api::FeedbackStatusReader>,
+        Option<tracedecay_dashboard_api::feedback_api::FeedbackStatusReader>,
     pub(crate) diagnostics_lsp:
         Option<Arc<tokio::sync::Mutex<tracedecay_lsp::analyzer::broker::DiagnosticBroker>>>,
     pub(crate) background_refresh_writer: BackgroundRefreshWriter,
@@ -144,6 +184,8 @@ pub(crate) struct McpServerConstructionContext {
     pub(crate) code_index_branch_diff_executor: Option<super::CodeIndexBranchDiffExecutor>,
     pub(crate) code_graph_projection_read_port: Option<CodeGraphProjectionReadPort>,
     pub(crate) code_graph_read_admission_port: Option<CodeGraphReadAdmissionPort>,
+    pub(crate) verified_graph_query_port:
+        Option<Arc<dyn tracedecay_graph_query::VerifiedGraphQueryPort + 'static>>,
     pub(crate) code_index_ignored_dependency_admission:
         Option<CodeIndexIgnoredDependencyAdmissionPort>,
     pub(crate) code_index_search_authority: Option<super::CodeIndexSearchAuthorityV1>,
@@ -151,7 +193,8 @@ pub(crate) struct McpServerConstructionContext {
     pub(crate) project_routes: crate::mcp::project_route::SharedHookProjectRouteCache,
     pub(crate) application_invocation_executor:
         Option<Arc<dyn tracedecay_daemon_protocol::DaemonInvocationExecutor>>,
-    pub(crate) daemon_invocation_service: Option<crate::daemon::DaemonInvocationService>,
+    pub(crate) daemon_invocation_service:
+        Option<tracedecay_daemon_service::DaemonInvocationService>,
     pub(crate) delivery_settlement_authority:
         Option<Arc<tracedecay_usecases::observability::DeliverySettlementAuthorityV1>>,
     pub(crate) delivery_settlement_recorder:
@@ -169,7 +212,7 @@ pub(crate) struct McpServerConstructionContext {
 }
 
 pub(crate) struct McpServerWriters {
-    dashboard_automation: crate::dashboard::DashboardAutomationWriter,
+    dashboard_automation: tracedecay_dashboard_api::DashboardAutomationWriter,
     background_refresh: BackgroundRefreshWriter,
 }
 
@@ -183,13 +226,13 @@ pub(crate) struct McpServerDaemonDatabases {
 }
 
 pub(crate) struct McpServerDaemonAuthority {
-    pub(crate) profile_identity: crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1,
+    pub(crate) profile_identity: LocalProfileIdentityAuthorityV1,
     pub(crate) databases: McpServerDaemonDatabases,
     pub(crate) host_admission_broker: Option<tracedecay_host_admission::SharedHostAdmissionBroker>,
     pub(crate) project_session_refresh_wake:
-        crate::daemon::session_temporal_refresh_scheduler::SessionTemporalRefreshWake,
+        tracedecay_session_runtime::session_temporal_refresh_scheduler::SessionTemporalRefreshWake,
     pub(crate) user_session_refresh_wake:
-        crate::daemon::session_temporal_refresh_scheduler::SessionTemporalRefreshWake,
+        tracedecay_session_runtime::session_temporal_refresh_scheduler::SessionTemporalRefreshWake,
     pub(crate) session_sync_service:
         std::sync::Weak<dyn tracedecay_application::session_sync::SessionSyncServicePort>,
     pub(crate) database_owner_reconciler: DatabaseOwnerReconciler,
@@ -202,7 +245,7 @@ pub(crate) struct McpServerDaemonAuthority {
 }
 
 pub(crate) struct McpServerDaemonCoreAuthority {
-    pub(crate) profile_identity: crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1,
+    pub(crate) profile_identity: LocalProfileIdentityAuthorityV1,
     pub(crate) accounting: Option<RegisteredGlobalDbLeaseV1>,
     pub(crate) registry: RegisteredGlobalDbLeaseV1,
     pub(crate) database_owner_reconciler: DatabaseOwnerReconciler,
@@ -212,7 +255,7 @@ pub(crate) struct McpServerDaemonCoreAuthority {
 
 impl McpServerWriters {
     pub(crate) fn daemon_owned(
-        dashboard_automation: crate::dashboard::DashboardAutomationWriter,
+        dashboard_automation: tracedecay_dashboard_api::DashboardAutomationWriter,
         background_refresh: BackgroundRefreshWriter,
     ) -> Self {
         Self {
@@ -223,6 +266,7 @@ impl McpServerWriters {
 }
 
 impl McpServerConstructionContext {
+    #[hotpath::measure(label = "mcp.server.construction.direct")]
     pub(crate) fn direct(cg: impl Into<Arc<TraceDecay>>, scope_prefix: Option<String>) -> Self {
         Self {
             cg: cg.into(),
@@ -240,11 +284,13 @@ impl McpServerConstructionContext {
             host_admission_broker: None,
             project_session_refresh_wake: None,
             user_session_refresh_wake: None,
+            project_session_refresh_serving: None,
             own_project_host_admission_replay: false,
             startup_catch_up_enabled: true,
             automation_scheduler_reconciler: None,
             database_owner_reconciler: None,
-            dashboard_automation_writer: crate::dashboard::standalone_dashboard_automation_writer(),
+            dashboard_automation_writer:
+                tracedecay_dashboard_api::standalone_dashboard_automation_writer(),
             remote_operational_status: None,
             dashboard_doctor_report_reader: None,
             dashboard_code_index_freshness_reader: None,
@@ -260,6 +306,7 @@ impl McpServerConstructionContext {
             code_index_branch_diff_executor: None,
             code_graph_projection_read_port: None,
             code_graph_read_admission_port: None,
+            verified_graph_query_port: None,
             code_index_ignored_dependency_admission: None,
             code_index_search_authority: None,
             retained_project_server_resolver: None,
@@ -301,13 +348,14 @@ impl McpServerConstructionContext {
     #[cfg(test)]
     pub(crate) fn with_direct_profile_identity(
         mut self,
-        profile_identity: crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1,
+        profile_identity: LocalProfileIdentityAuthorityV1,
     ) -> Self {
         self.profile_root = Some(profile_identity.profile_root().to_path_buf());
-        self.profile_identity = Some(profile_identity);
+        self.profile_identity = Some(wrap_profile_identity(profile_identity));
         self
     }
 
+    #[hotpath::measure(label = "mcp.server.construction.daemon_owned")]
     pub(crate) fn daemon_owned(
         cg: impl Into<Arc<TraceDecay>>,
         scope_prefix: Option<String>,
@@ -328,11 +376,15 @@ impl McpServerConstructionContext {
         } = authority;
         let profile_root = profile_identity.profile_root().to_path_buf();
         let registry = databases.registry;
+        let (project_session_refresh_wake, project_session_refresh_serving) =
+            wrap_refresh_wake(project_session_refresh_wake);
+        let user_session_refresh_wake: Arc<dyn SessionTemporalRefreshWakePort> =
+            Arc::new(user_session_refresh_wake);
         Self {
             cg: cg.into(),
             scope_prefix,
             profile_root: Some(profile_root),
-            profile_identity: Some(profile_identity),
+            profile_identity: Some(wrap_profile_identity(profile_identity)),
             global_db: Some(registry.clone()),
             accounting_db: databases.accounting,
             registry_db: Some(registry),
@@ -344,6 +396,7 @@ impl McpServerConstructionContext {
             host_admission_broker,
             project_session_refresh_wake: Some(project_session_refresh_wake),
             user_session_refresh_wake: Some(user_session_refresh_wake),
+            project_session_refresh_serving: Some(project_session_refresh_serving),
             own_project_host_admission_replay: true,
             startup_catch_up_enabled: true,
             automation_scheduler_reconciler: None,
@@ -364,6 +417,7 @@ impl McpServerConstructionContext {
             code_index_branch_diff_executor: None,
             code_graph_projection_read_port: None,
             code_graph_read_admission_port: None,
+            verified_graph_query_port: None,
             code_index_ignored_dependency_admission: None,
             code_index_search_authority: None,
             retained_project_server_resolver: None,
@@ -402,7 +456,7 @@ impl McpServerConstructionContext {
             cg: cg.into(),
             scope_prefix,
             profile_root: Some(profile_root),
-            profile_identity: Some(profile_identity),
+            profile_identity: Some(wrap_profile_identity(profile_identity)),
             global_db: Some(registry.clone()),
             accounting_db: accounting,
             registry_db: Some(registry),
@@ -414,6 +468,7 @@ impl McpServerConstructionContext {
             host_admission_broker: None,
             project_session_refresh_wake: None,
             user_session_refresh_wake: None,
+            project_session_refresh_serving: None,
             own_project_host_admission_replay: false,
             startup_catch_up_enabled: false,
             automation_scheduler_reconciler: None,
@@ -434,6 +489,7 @@ impl McpServerConstructionContext {
             code_index_branch_diff_executor: None,
             code_graph_projection_read_port: None,
             code_graph_read_admission_port: None,
+            verified_graph_query_port: None,
             code_index_ignored_dependency_admission: None,
             code_index_search_authority: None,
             retained_project_server_resolver: None,
@@ -517,6 +573,14 @@ impl McpServerConstructionContext {
         self
     }
 
+    pub(crate) fn with_verified_graph_query_port(
+        mut self,
+        port: Arc<dyn tracedecay_graph_query::VerifiedGraphQueryPort + 'static>,
+    ) -> Self {
+        self.verified_graph_query_port = Some(port);
+        self
+    }
+
     pub(crate) fn with_code_index_ignored_dependency_admission(
         mut self,
         admission: CodeIndexIgnoredDependencyAdmissionPort,
@@ -543,7 +607,7 @@ impl McpServerConstructionContext {
 
     pub(crate) fn with_daemon_invocation_service(
         mut self,
-        service: crate::daemon::DaemonInvocationService,
+        service: tracedecay_daemon_service::DaemonInvocationService,
     ) -> Self {
         self.daemon_invocation_service = Some(service);
         self
@@ -564,7 +628,7 @@ impl McpServerConstructionContext {
 
     pub(crate) fn with_automation_scheduler_reconciler(
         mut self,
-        reconciler: crate::dashboard::AutomationSchedulerReconciler,
+        reconciler: tracedecay_dashboard_api::AutomationSchedulerReconciler,
     ) -> Self {
         self.automation_scheduler_reconciler = Some(reconciler);
         self
@@ -577,7 +641,7 @@ impl McpServerConstructionContext {
 
     pub(crate) fn with_dashboard_doctor_report_reader(
         mut self,
-        reader: crate::dashboard::DoctorReportReader,
+        reader: tracedecay_dashboard_api::DoctorReportReader,
     ) -> Self {
         self.dashboard_doctor_report_reader = Some(reader);
         self
@@ -585,7 +649,7 @@ impl McpServerConstructionContext {
 
     pub(crate) fn with_remote_operational_status(
         mut self,
-        provider: crate::daemon::remote_protocol::RemoteOperationalStatusProviderV1,
+        provider: Arc<dyn RemoteOperationalStatusReadPort>,
     ) -> Self {
         self.remote_operational_status = Some(provider);
         self
@@ -593,7 +657,7 @@ impl McpServerConstructionContext {
 
     pub(crate) fn with_dashboard_code_index_freshness_reader(
         mut self,
-        reader: crate::dashboard::code_index_freshness_api::CodeIndexFreshnessReader,
+        reader: tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader,
     ) -> Self {
         self.dashboard_code_index_freshness_reader = Some(reader);
         self
@@ -601,7 +665,7 @@ impl McpServerConstructionContext {
 
     pub(crate) fn with_dashboard_explorer_semantic_reader(
         mut self,
-        reader: crate::dashboard::ExplorerSemanticReader,
+        reader: tracedecay_dashboard_api::ExplorerSemanticReader,
     ) -> Self {
         self.dashboard_explorer_semantic_reader = Some(reader);
         self
@@ -609,7 +673,7 @@ impl McpServerConstructionContext {
 
     pub(crate) fn with_dashboard_feedback_status_reader(
         mut self,
-        reader: crate::dashboard::feedback_api::FeedbackStatusReader,
+        reader: tracedecay_dashboard_api::feedback_api::FeedbackStatusReader,
     ) -> Self {
         self.dashboard_feedback_status_reader = Some(reader);
         self

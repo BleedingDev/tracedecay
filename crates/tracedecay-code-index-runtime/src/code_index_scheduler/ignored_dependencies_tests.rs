@@ -102,11 +102,14 @@ fn project_id() -> ProjectId {
 }
 
 fn git(root: &Path, arguments: &[&str]) {
-    let status = Command::new(tracedecay_runtime_core::git::git_program())
-        .current_dir(root)
-        .args(arguments)
-        .status()
-        .expect("run git fixture command");
+    let status = Command::new(
+        tracedecay_runtime_core::git::try_git_program()
+            .expect("absolute git executable should resolve"),
+    )
+    .current_dir(root)
+    .args(arguments)
+    .status()
+    .expect("run git fixture command");
     assert!(
         status.success(),
         "git fixture command failed: {arguments:?}"
@@ -315,10 +318,10 @@ export function GenerationAnchor() { return 1; }
     let store = TempDir::new().expect("store root");
     let profile = TempDir::new().expect("profile root");
     let profile_root = profile.path().join("profile");
-    crate::storage::pin_fixture_repository_identity(fixture.path(), PROJECT_ID)
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(fixture.path(), PROJECT_ID)
         .expect("project enrollment");
-    let identity =
-        crate::daemon::profile_identity::load_or_create(&profile_root).expect("profile identity");
+    let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+        .expect("profile identity");
     let _database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         &profile_root,
         91,
@@ -326,11 +329,9 @@ export function GenerationAnchor() { return 1; }
     )
     .expect("daemon database scope");
     let graph_runtime = Arc::new(
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity,
-        )
-        .await
-        .expect("graph runtime registry"),
+        tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity)
+            .await
+            .expect("graph runtime registry"),
     );
     let project_database = graph_runtime
         .project_memory(project_id(), [fixture.path().to_path_buf()])

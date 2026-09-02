@@ -422,6 +422,7 @@ pub struct NativeIntegrationService<P> {
 }
 
 impl<P: NativeIntegrationPort> NativeIntegrationService<P> {
+    #[hotpath::skip]
     pub const fn new(port: P) -> Self {
         Self { port }
     }

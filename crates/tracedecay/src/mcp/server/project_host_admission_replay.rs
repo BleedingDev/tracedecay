@@ -66,6 +66,7 @@ impl ProjectHostAdmissionReplayTask {
         &self.worker
     }
 
+    #[hotpath::skip]
     pub(super) async fn shutdown(mut self) {
         self.worker.cancel();
         if let Some(task) = self.task.take() {
@@ -107,6 +108,7 @@ impl ProjectHostAdmissionReplayWorker {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn wait_idle(&self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -141,6 +143,7 @@ impl ProjectHostAdmissionReplayWorker {
         self.backoff_count.load(Ordering::Acquire)
     }
 
+    #[hotpath::skip]
     async fn run(self: Arc<Self>) {
         let mut consecutive_retryable = 0u32;
         loop {

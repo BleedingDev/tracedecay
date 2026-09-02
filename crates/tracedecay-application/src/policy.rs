@@ -76,6 +76,7 @@ pub struct PolicyEvidenceHorizonV1 {
 impl PolicyEvidenceHorizonV1 {
     /// Conservative routing prerequisite without replacing either recorded
     /// frontier. The full independent states remain on the result.
+    #[hotpath::skip]
     pub const fn routing_state(&self) -> TruthSourceStateV1 {
         match (self.local_session.state, self.live_git.state) {
             (Unavailable, _) | (_, Unavailable) => Unavailable,
@@ -145,6 +146,7 @@ impl PolicyEvaluationContextV1 {
         &self.configuration
     }
 
+    #[hotpath::skip]
     pub const fn policy_revision(&self) -> u64 {
         self.policy_revision
     }
@@ -196,10 +198,12 @@ impl RegisteredPolicyCapabilityV1 {
         &self.capability_id
     }
 
+    #[hotpath::skip]
     pub const fn effect_class(&self) -> EffectClass {
         self.effect_class
     }
 
+    #[hotpath::skip]
     pub const fn catalog_availability(&self) -> CapabilityAvailabilityV1 {
         self.catalog_availability
     }

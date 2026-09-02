@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tracedecay::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_lcm::{LcmCompressionRequest, LcmSummarizerMode};
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::runtime::SessionMessageRecord;
-use tracedecay_sessions::runtime::lcm::{LcmCompressionRequest, LcmSummarizerMode};
 use tracedecay_sessions::runtime::source::{
     ParsedTranscript, SessionDraft, StoredCursor, TranscriptSource,
 };
@@ -178,14 +178,11 @@ async fn transcript_ingest_preserves_lossless_raw_content() {
         .await
         .unwrap()
         .expect("compatibility message should exist");
-    assert!(
-        compatibility.text.chars().count()
-            <= tracedecay_sessions::runtime::lcm::MAX_DERIVED_TEXT_CHARS
-    );
+    assert!(compatibility.text.chars().count() <= tracedecay_lcm::MAX_DERIVED_TEXT_CHARS);
     assert!(
         compatibility
             .text
-            .contains(tracedecay_sessions::runtime::lcm::DERIVED_TRUNCATION_MARKER)
+            .contains(tracedecay_lcm::DERIVED_TRUNCATION_MARKER)
     );
 
     let raw = db
@@ -211,7 +208,7 @@ async fn search_uses_bounded_projection_but_load_recovers_raw() {
 
     let oversized = format!(
         "unique-search-token\n{}::lossless-tail",
-        "x".repeat(tracedecay_sessions::runtime::lcm::MAX_DERIVED_TEXT_CHARS * 5)
+        "x".repeat(tracedecay_lcm::MAX_DERIVED_TEXT_CHARS * 5)
     );
     let message = sample_message("cursor", "message-1", "session-1", &oversized);
     assert!(
@@ -232,15 +229,12 @@ async fn search_uses_bounded_projection_but_load_recovers_raw() {
         .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].message.message_id, "message-1");
-    assert!(
-        results[0].message.text.chars().count()
-            <= tracedecay_sessions::runtime::lcm::MAX_DERIVED_TEXT_CHARS
-    );
+    assert!(results[0].message.text.chars().count() <= tracedecay_lcm::MAX_DERIVED_TEXT_CHARS);
     assert!(
         results[0]
             .message
             .text
-            .contains(tracedecay_sessions::runtime::lcm::DERIVED_TRUNCATION_MARKER)
+            .contains(tracedecay_lcm::DERIVED_TRUNCATION_MARKER)
     );
 
     let raw = db

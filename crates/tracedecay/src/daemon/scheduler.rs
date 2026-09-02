@@ -10,7 +10,7 @@ use crate::daemon::automation_effect::{
     AutomationEffectAdmission, AutomationEffectAuthority, RetainedAutomationSettlementOutcome,
 };
 use crate::tracedecay::TraceDecay;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 use super::branch_admin::MaintenanceReaperKind;
 use super::{
@@ -85,7 +85,7 @@ fn log_scheduler_task_error(
 fn log_scheduler_automation_replay(
     project_path: &Path,
     task: tracedecay_automation_runtime::automation::backend::AgentTaskKind,
-    terminal: &crate::daemon::automation_effect::AutomationSettledTerminal,
+    terminal: &tracedecay_automation_runtime::automation::effect_runtime::AutomationSettledTerminal,
 ) {
     log_daemon_event(
         "scheduler_task_application_replay",
@@ -113,7 +113,7 @@ fn log_scheduler_automation_replay(
 pub(super) fn scheduler_application_problem_log_fields(
     project_path: &Path,
     task: tracedecay_automation_runtime::automation::backend::AgentTaskKind,
-    problem: &crate::daemon::automation_effect::AutomationSettledProblem,
+    problem: &tracedecay_automation_runtime::automation::effect_runtime::AutomationSettledProblem,
 ) -> Vec<(&'static str, String)> {
     vec![
         ("project", project_path.display().to_string()),
@@ -297,6 +297,7 @@ pub(super) struct AutomationSchedulerRetirement {
 }
 
 impl AutomationSchedulerRetirement {
+    #[hotpath::skip]
     pub(super) async fn wait(self) {
         self.termination.wait().await;
     }
@@ -321,6 +322,7 @@ impl AutomationSchedulerExitBarrier {
         Self { state }
     }
 
+    #[hotpath::skip]
     async fn pause_after_disabled_read(&self) {
         self.state.send_modify(|state| *state |= Self::REACHED);
         self.wait_for(|state| state & Self::RELEASED != 0).await;
@@ -332,6 +334,7 @@ impl AutomationSchedulerExitBarrier {
             .send_modify(|state| *state = (*state & !Self::DECISION_MASK) | decision);
     }
 
+    #[hotpath::skip]
     pub(super) async fn wait_until_reached(&self) {
         self.wait_for(|state| state & Self::REACHED != 0).await;
     }
@@ -340,12 +343,14 @@ impl AutomationSchedulerExitBarrier {
         self.state.send_modify(|state| *state |= Self::RELEASED);
     }
 
+    #[hotpath::skip]
     pub(super) async fn wait_for_decision(&self) -> u8 {
         self.wait_for(|state| state & Self::DECISION_MASK != Self::UNDECIDED)
             .await
             & Self::DECISION_MASK
     }
 
+    #[hotpath::skip]
     async fn wait_for(&self, ready: impl Fn(u8) -> bool) -> u8 {
         let mut state = self.state.subscribe();
         loop {
@@ -394,6 +399,7 @@ mod automation_scheduler_exit_barrier_tests {
 }
 
 impl DaemonEngine {
+    #[hotpath::skip]
     pub(super) async fn activate_automation_scheduler_for_open_project(
         &self,
         key: ProjectServerKey,
@@ -402,6 +408,22 @@ impl DaemonEngine {
         cg: Arc<crate::tracedecay::TraceDecay>,
     ) {
         if !self.lifecycle.accepting() {
+            return;
+        }
+
+        let transition = self.maintenance_transition_gate(&key).await;
+        let _transition = transition.lock().await;
+        let owner_is_current = self
+            .store_administration
+            .project_servers()
+            .lock()
+            .await
+            .get(&key)
+            .is_some();
+        if !owner_is_current {
+            if let Some(retirement) = self.retire_exact_automation_scheduler_locked(&key).await {
+                let _ = timeout(DAEMON_TASK_ABORT_DEADLINE, retirement.wait()).await;
+            }
             return;
         }
 
@@ -439,8 +461,6 @@ impl DaemonEngine {
             return;
         }
 
-        let transition = self.maintenance_transition_gate(&key).await;
-        let _transition = transition.lock().await;
         let scope = super::branch_admin::owner_writer_scope(&key);
         self.store_administration
             .with_writer_in(scope, || async move {
@@ -463,12 +483,13 @@ impl DaemonEngine {
             .await;
     }
 
+    #[hotpath::skip]
     pub(super) async fn ensure_automation_scheduler(
         &self,
         key: ProjectServerKey,
         project_path: PathBuf,
         handshake: DaemonHandshake,
-    ) -> crate::dashboard::AutomationSchedulerReconcileOutcome {
+    ) -> tracedecay_dashboard_api::AutomationSchedulerReconcileOutcome {
         let transition = self.maintenance_transition_gate(&key).await;
         let _transition = transition.lock().await;
         let scope = super::branch_admin::owner_writer_scope(&key);
@@ -480,13 +501,14 @@ impl DaemonEngine {
             .await
     }
 
+    #[hotpath::skip]
     pub(super) async fn reconcile_automation_scheduler_locked(
         &self,
         key: ProjectServerKey,
         project_path: PathBuf,
         handshake: DaemonHandshake,
-    ) -> crate::dashboard::AutomationSchedulerReconcileOutcome {
-        use crate::dashboard::AutomationSchedulerReconcileOutcome;
+    ) -> tracedecay_dashboard_api::AutomationSchedulerReconcileOutcome {
+        use tracedecay_dashboard_api::AutomationSchedulerReconcileOutcome;
 
         if !self.lifecycle.accepting() {
             return AutomationSchedulerReconcileOutcome::LifecycleInactive;
@@ -638,7 +660,7 @@ impl DaemonEngine {
         current_key: Arc<tokio::sync::Mutex<ProjectServerKey>>,
         current_project_path: Arc<tokio::sync::Mutex<PathBuf>>,
         handshake: DaemonHandshake,
-    ) -> crate::dashboard::AutomationSchedulerReconciler {
+    ) -> tracedecay_dashboard_api::AutomationSchedulerReconciler {
         let engine = self.clone();
         std::sync::Arc::new(move || {
             let engine = engine.clone();
@@ -662,8 +684,8 @@ impl DaemonEngine {
         project_path: PathBuf,
         handshake: DaemonHandshake,
         cg: Arc<TraceDecay>,
-    ) -> crate::dashboard::AutomationSchedulerReconcileOutcome {
-        use crate::dashboard::AutomationSchedulerReconcileOutcome;
+    ) -> tracedecay_dashboard_api::AutomationSchedulerReconcileOutcome {
+        use tracedecay_dashboard_api::AutomationSchedulerReconcileOutcome;
 
         if !self.lifecycle.accepting() {
             return AutomationSchedulerReconcileOutcome::LifecycleInactive;
@@ -770,6 +792,7 @@ impl DaemonEngine {
         AutomationSchedulerReconcileOutcome::Started
     }
 
+    #[hotpath::skip]
     async fn commit_automation_scheduler_exit(
         &self,
         key: &ProjectServerKey,
@@ -840,9 +863,29 @@ impl DaemonEngine {
             .await
     }
 
+    #[hotpath::skip]
     pub(super) async fn retire_automation_scheduler_locked(
         &self,
         key: &ProjectServerKey,
+    ) -> Option<AutomationSchedulerRetirement> {
+        self.retire_matching_automation_scheduler_locked(key, true)
+            .await
+    }
+
+    #[hotpath::skip]
+    async fn retire_exact_automation_scheduler_locked(
+        &self,
+        key: &ProjectServerKey,
+    ) -> Option<AutomationSchedulerRetirement> {
+        self.retire_matching_automation_scheduler_locked(key, false)
+            .await
+    }
+
+    #[hotpath::skip]
+    async fn retire_matching_automation_scheduler_locked(
+        &self,
+        key: &ProjectServerKey,
+        allow_logical_owner: bool,
     ) -> Option<AutomationSchedulerRetirement> {
         let (task, completion, termination, reservation) = {
             let mut schedulers = self
@@ -852,11 +895,13 @@ impl DaemonEngine {
                 .await;
             let owner = if schedulers.contains_key(key) {
                 key.clone()
-            } else {
+            } else if allow_logical_owner {
                 schedulers
                     .keys()
                     .find(|candidate| same_scheduler_owner(candidate, key))
                     .cloned()?
+            } else {
+                return None;
             };
             let handle = schedulers.get_mut(&owner)?;
             let reservation = self
@@ -908,6 +953,7 @@ impl DaemonEngine {
         Some(AutomationSchedulerRetirement { termination })
     }
 
+    #[hotpath::skip]
     pub(super) async fn shutdown_automation_schedulers(&self) {
         // Draining is latched before this runs, and every registration path
         // rechecks that latch. Do not queue shutdown behind unrelated
@@ -1991,7 +2037,11 @@ async fn run_user_jobs_scheduler_pass(
             &dashboard_root,
             Some(&requested_run_id),
             configuration_digest.clone(),
-            |run_id| crate::daemon::automation_effect::user_job_run_request(run_id, &job.id),
+            |run_id| {
+                tracedecay_automation_runtime::automation::effect_runtime::user_job_run_request(
+                    run_id, &job.id,
+                )
+            },
         )
         .await
         {

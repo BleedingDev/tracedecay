@@ -24,8 +24,8 @@ use tracedecay_store::{
     build_observation_resolution_authorization_v1, build_observation_retrieval_anchor_v2,
 };
 
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDb;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 
 /// One canonical message observation to seed for a dashboard fixture session.
 pub struct DashboardSessionMessageSeedV1<'a> {
@@ -204,7 +204,7 @@ pub async fn materialize_session_temporal_refresh_for_test(
 ) -> Result<()> {
     let session_id =
         SessionId::new(session_id).map_err(|error| fixture_error("session id", error))?;
-    crate::store::GlobalDbSessionTemporalStore::new(project_database)
+    tracedecay_session_temporal_store::GlobalDbSessionTemporalStore::new(project_database)
         .materialize_pending_session_refresh_for_test(&session_id)
         .await
         .map_err(|error| fixture_error("materialize session refresh", error))?;

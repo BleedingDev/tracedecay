@@ -11,8 +11,8 @@ mod storage;
 pub(crate) use bench::handle_bench;
 pub(crate) use branch::handle_branch_action;
 pub(crate) use daemon::{
-    daemon_tool_json, daemon_tool_json_until, env_duration_ms, recover_truncated_mcp_result,
-    reject_truncation_envelope,
+    daemon_tool_json, daemon_tool_json_until, recover_truncated_mcp_result,
+    reject_truncation_envelope, retained_tool_payload,
 };
 pub use gain::handle_gain;
 pub(crate) use index::{handle_init, handle_no_command, handle_sync};
@@ -23,4 +23,7 @@ pub(crate) use settings::{
     handle_gitignore, handle_upload_counter, mutate_project_configuration,
     project_configuration_set, report_configuration_receipt,
 };
-pub(crate) use storage::{handle_list, handle_wipe};
+pub(crate) use storage::{
+    ProfileOfflineAuthority, handle_list, handle_wipe, join_outcome_and_restore,
+    take_profile_offline,
+};

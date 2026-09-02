@@ -1,13 +1,12 @@
 use tracedecay_store::{
     GraphPublicationOperationContextV1, GraphPublicationReplayLookupV1,
-    GraphPublicationReplayRecordV1, MAX_SEMANTIC_VECTOR_STAGE_CHUNKS, RuntimeInterruptionV1,
-    SemanticVectorBatchReceiptDigest, SemanticVectorPublicationAuthority,
-    SemanticVectorPublishedGenerationKey, SemanticVectorPublishedGenerationLookup,
-    SemanticVectorStageBatchKey, SemanticVectorStageBatchReceiptLookup,
-    SemanticVectorStageEffectState, SemanticVectorStageEffectTerminal,
-    SemanticVectorStageGraphBatchEffect, SemanticVectorStagePlan,
-    SemanticVectorStagePublicationPrepareRequest, SemanticVectorStageRecord,
-    SemanticVectorStageResumeOutcome, SemanticVectorStageSettlement,
+    GraphPublicationReplayRecordV1, RuntimeInterruptionV1, SemanticVectorBatchReceiptDigest,
+    SemanticVectorPublicationAuthority, SemanticVectorPublishedGenerationKey,
+    SemanticVectorPublishedGenerationLookup, SemanticVectorStageBatchKey,
+    SemanticVectorStageBatchReceiptLookup, SemanticVectorStageEffectState,
+    SemanticVectorStageEffectTerminal, SemanticVectorStageGraphBatchEffect,
+    SemanticVectorStagePlan, SemanticVectorStagePublicationPrepareRequest,
+    SemanticVectorStageRecord, SemanticVectorStageResumeOutcome, SemanticVectorStageSettlement,
     SemanticVectorStageSettlementOutcome, SemanticVectorStageState,
     SemanticVectorStageWriterAdoption, SemanticVectorStageWriterAdoptionOutcome,
     SemanticVectorStagingStoreError, SemanticVectorWriterFence,
@@ -15,7 +14,7 @@ use tracedecay_store::{
 
 use super::publication_support::{check_all, map_publication_error, require_publication_binding};
 use super::{GraphDbRegistration, GraphDbRegistry};
-use crate::{GraphBudgetKind, GraphCommit, GraphDbError, GraphWriteBatch, VerifiedGraphCommit};
+use crate::{GraphCommit, GraphDbError, GraphWriteBatch, VerifiedGraphCommit};
 
 #[derive(Clone, Debug)]
 pub struct VerifiedGenerationBatchCommit {
@@ -44,12 +43,6 @@ impl GraphDbRegistry {
         require_authority_binding(&registration, authority)?;
         require_publication_binding(&registration, &plan.publication_key)?;
         require_plan_binding(&registration, plan)?;
-        if plan.expected_chunk_count > MAX_SEMANTIC_VECTOR_STAGE_CHUNKS {
-            return Err(GraphDbError::budget_exhausted(
-                GraphBudgetKind::Capacity,
-                MAX_SEMANTIC_VECTOR_STAGE_CHUNKS,
-            ));
-        }
         plan.validate()
             .map_err(|error| GraphDbError::invalid(error.to_string()))?;
         self.resolve(registration.clone())?;
@@ -72,7 +65,7 @@ impl GraphDbRegistry {
             | tracedecay_store::SemanticVectorStageBeginOutcome::PublicationConflict
             | tracedecay_store::SemanticVectorStageBeginOutcome::PriorVerifiedHeadConflict {
                 ..
-            } => return Err(GraphDbError::Conflict),
+            } => return Err(GraphDbError::conflict("staging.begin_verified_generation")),
         };
         if recovered_publication {
             require_same_semantic_generation(&record.plan, plan)?;
@@ -93,7 +86,9 @@ impl GraphDbRegistry {
         check_all(&registration, context, "generation.staging")?;
         require_authority_binding(&registration, authority)?;
         if registration.binding().shard_id != key.projection.shard_id {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "staging.published_semantic_generation",
+            ));
         }
         self.resolve(registration)?;
         authority
@@ -141,7 +136,7 @@ impl GraphDbRegistry {
                     }
                     SemanticVectorPublishedGenerationLookup::Published { .. }
                     | SemanticVectorPublishedGenerationLookup::Missing => {
-                        Err(GraphDbError::Conflict)
+                        Err(GraphDbError::conflict("staging.resume_generation_stage"))
                     }
                 };
             }
@@ -183,7 +178,7 @@ impl GraphDbRegistry {
                 SemanticVectorStageWriterAdoptionOutcome::StaleFence { .. }
                 | SemanticVectorStageWriterAdoptionOutcome::VerifiedHeadConflict { .. }
                 | SemanticVectorStageWriterAdoptionOutcome::NotAdoptable(_) => {
-                    return Err(GraphDbError::Conflict);
+                    return Err(GraphDbError::conflict("staging.resume_generation_stage"));
                 }
                 SemanticVectorStageWriterAdoptionOutcome::MissingStage => {
                     return Err(GraphDbError::ResetRequired {
@@ -199,7 +194,7 @@ impl GraphDbRegistry {
             .pending_stage(&stage.projection, context)
             .map_err(map_staging_error)?;
         if pending.as_ref() != Some(&record) {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict("staging.resume_generation_stage"));
         }
         match record.state {
             SemanticVectorStageState::Pending => {
@@ -247,10 +242,14 @@ impl GraphDbRegistry {
             .pending_stage(&batch_key.stage.projection, context)
             .map_err(map_staging_error)?;
         if pending.as_ref() != Some(&record) {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "staging.apply_verified_generation_batch",
+            ));
         }
         if record.state != SemanticVectorStageState::Pending {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "staging.apply_verified_generation_batch",
+            ));
         }
         let actual_head = authority
             .verified_head(&batch_key.stage.projection, context)
@@ -261,7 +260,9 @@ impl GraphDbRegistry {
                 .map_err(map_publication_error)?
                 .is_some()
         {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "staging.apply_verified_generation_batch",
+            ));
         }
         let next_applied = match record.applied_ordinal {
             Some(ordinal) => ordinal.checked_add(1).ok_or_else(|| {
@@ -286,7 +287,9 @@ impl GraphDbRegistry {
             }
         };
         if receipt.key != *batch_key || receipt.receipt_digest != *expected_receipt_digest {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "staging.apply_verified_generation_batch",
+            ));
         }
         require_authority_binding(&registration, authority)?;
         require_plan_binding(&registration, &record.plan)?;
@@ -301,10 +304,14 @@ impl GraphDbRegistry {
             })?;
         if latest.state == SemanticVectorStageState::Cancelled {
             cleanup_cancelled_generation(&database, authority, context, &registration, &latest)?;
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "staging.apply_verified_generation_batch",
+            ));
         }
         if latest.plan.key != batch_key.stage || latest.state != SemanticVectorStageState::Pending {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "staging.apply_verified_generation_batch",
+            ));
         }
         Ok(VerifiedGenerationBatchApply { commit })
     }
@@ -397,7 +404,9 @@ impl GraphDbRegistry {
         require_plan_binding(&registration, &record.plan)?;
         if record.state == SemanticVectorStageState::Cancelled {
             cleanup_cancelled_generation(&database, authority, context, &registration, &record)?;
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "staging.settle_verified_generation_batch",
+            ));
         }
         let receipt = match authority
             .batch_receipt(batch_key, context)
@@ -411,7 +420,9 @@ impl GraphDbRegistry {
             }
         };
         if receipt.key != *batch_key || receipt.receipt_digest != *expected_receipt_digest {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "staging.settle_verified_generation_batch",
+            ));
         }
         let graph_batch_digest =
             database.staged_generation_batch_publication_digest(&record.plan, &receipt)?;
@@ -441,7 +452,9 @@ impl GraphDbRegistry {
             | SemanticVectorStageSettlementOutcome::StaleOrdinal { .. }
             | SemanticVectorStageSettlementOutcome::StaleFence { .. }
             | SemanticVectorStageSettlementOutcome::Cancelled(_) => {
-                return Err(GraphDbError::Conflict);
+                return Err(GraphDbError::conflict(
+                    "staging.settle_verified_generation_batch",
+                ));
             }
             SemanticVectorStageSettlementOutcome::MissingBatch => {
                 return Err(GraphDbError::ResetRequired {
@@ -478,7 +491,9 @@ impl GraphDbRegistry {
             record.state,
             SemanticVectorStageState::ReadyToPublish | SemanticVectorStageState::Published
         ) {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "staging.publish_ready_generation.stage_state",
+            ));
         }
         let intent = record
             .publication_intent
@@ -487,7 +502,7 @@ impl GraphDbRegistry {
                 message: "ready semantic vector stage has no publication intent".to_owned(),
             })?;
         if intent.publication_key != record.plan.publication_key {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict("staging.publish_ready_generation"));
         }
         match authority
             .replay(&intent.publication_key, context)
@@ -499,7 +514,7 @@ impl GraphDbRegistry {
                         == intent.expected_recovered_digest => {}
             GraphPublicationReplayLookupV1::Active(_)
             | GraphPublicationReplayLookupV1::Retired(_) => {
-                return Err(GraphDbError::Conflict);
+                return Err(GraphDbError::conflict("staging.publish_ready_generation"));
             }
             GraphPublicationReplayLookupV1::Missing => {
                 return Err(GraphDbError::ResetRequired {
@@ -552,7 +567,9 @@ impl GraphDbRegistry {
         ) || record.recorded_chunk_count != record.plan.expected_chunk_count
             || record.applied_ordinal.map(|ordinal| ordinal + 1) != Some(record.next_ordinal)
         {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "staging.prepare_publication_from_staged_native.stage_state",
+            ));
         }
         let checkpoint = record.checkpoint_digest.clone();
         let check = || check_all(&registration, context, "generation.staging");
@@ -586,7 +603,7 @@ impl GraphDbRegistry {
             }
             | tracedecay_store::SemanticVectorStagePublicationPrepareOutcome::Cancelled(_)
             | tracedecay_store::SemanticVectorStagePublicationPrepareOutcome::MissingStage => {
-                Err(GraphDbError::Conflict)
+                Err(GraphDbError::conflict("staging.prepare_publication_from_staged_native"))
             }
         }
     }
@@ -609,7 +626,9 @@ fn require_active_stage_replay(
         .map_err(map_publication_error)?
     {
         GraphPublicationReplayLookupV1::Active(replay) => Ok(replay),
-        GraphPublicationReplayLookupV1::Retired(_) => Err(GraphDbError::Conflict),
+        GraphPublicationReplayLookupV1::Retired(_) => Err(GraphDbError::conflict(
+            "staging.require_active_stage_replay",
+        )),
         GraphPublicationReplayLookupV1::Missing => Err(GraphDbError::ResetRequired {
             message: "semantic vector stage lost its publication replay".to_owned(),
         }),
@@ -631,7 +650,7 @@ fn require_unpublished_stage(
         .map_err(map_publication_error)?
         .is_some_and(|head| head.key == record.plan.publication_key)
     {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict("staging.require_unpublished_stage"));
     }
     Ok(())
 }
@@ -644,7 +663,9 @@ fn cleanup_cancelled_generation(
     record: &SemanticVectorStageRecord,
 ) -> Result<(), GraphDbError> {
     if record.state != SemanticVectorStageState::Cancelled {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict(
+            "staging.cleanup_cancelled_generation",
+        ));
     }
     require_unpublished_stage(authority, context, record)?;
     database.reserve_staged_generation_retirement(&record.plan)?;
@@ -677,7 +698,9 @@ fn require_stage_replay_intent(
         || replay.publication.key != record.plan.publication_key
         || replay.publication.expected_prior_head != record.plan.expected_prior_verified_head
     {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict(
+            "staging.require_stage_replay_intent",
+        ));
     }
     Ok(())
 }
@@ -687,7 +710,7 @@ fn require_stage_plan(
     plan: &SemanticVectorStagePlan,
 ) -> Result<(), GraphDbError> {
     if record.plan != *plan {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict("staging.require_stage_plan"));
     }
     Ok(())
 }
@@ -705,7 +728,9 @@ fn require_same_semantic_generation(
         || existing.recipe != requested.recipe
         || existing.expected_chunk_count != requested.expected_chunk_count
     {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict(
+            "staging.require_same_semantic_generation",
+        ));
     }
     Ok(())
 }
@@ -715,7 +740,7 @@ fn require_stage_key(
     stage: &tracedecay_store::SemanticVectorStageKey,
 ) -> Result<(), GraphDbError> {
     if record.plan.key != *stage || record.plan.publication_key.projection != stage.projection {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict("staging.require_stage_key"));
     }
     Ok(())
 }
@@ -725,7 +750,7 @@ fn require_stage_binding(
     stage: &tracedecay_store::SemanticVectorStageKey,
 ) -> Result<(), GraphDbError> {
     if registration.binding().shard_id != stage.projection.shard_id {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict("staging.require_stage_binding"));
     }
     Ok(())
 }
@@ -735,7 +760,7 @@ fn require_plan_binding(
     plan: &SemanticVectorStagePlan,
 ) -> Result<(), GraphDbError> {
     if plan.writer_fence.binding != *registration.binding() {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict("staging.require_plan_binding"));
     }
     Ok(())
 }
@@ -745,7 +770,7 @@ pub(super) fn require_authority_binding(
     authority: &dyn SemanticVectorPublicationAuthority,
 ) -> Result<(), GraphDbError> {
     if authority.binding() != registration.binding() {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict("staging.require_authority_binding"));
     }
     Ok(())
 }
@@ -764,7 +789,9 @@ pub(super) fn map_staging_error(error: SemanticVectorStagingStoreError) -> Graph
         SemanticVectorStagingStoreError::Infrastructure => {
             GraphDbError::unavailable("semantic vector staging persistence is unavailable")
         }
-        SemanticVectorStagingStoreError::AuthorityLost => GraphDbError::Conflict,
+        SemanticVectorStagingStoreError::AuthorityLost => {
+            GraphDbError::conflict("staging.map_staging_error")
+        }
         SemanticVectorStagingStoreError::Busy => {
             GraphDbError::unavailable("semantic vector staging authority is busy")
         }

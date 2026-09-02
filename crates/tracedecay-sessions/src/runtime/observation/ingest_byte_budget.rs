@@ -12,6 +12,7 @@ pub(in crate::runtime) struct IngestByteBudget {
 }
 
 impl IngestByteBudget {
+    #[hotpath::skip]
     pub(in crate::runtime) const fn bounded(limit: u64) -> Self {
         Self {
             remaining: Some(limit),
@@ -21,6 +22,7 @@ impl IngestByteBudget {
         }
     }
 
+    #[hotpath::skip]
     pub(in crate::runtime) const fn bounded_allowing_empty(limit: u64) -> Self {
         Self {
             remaining: Some(limit),
@@ -30,6 +32,7 @@ impl IngestByteBudget {
         }
     }
 
+    #[hotpath::skip]
     pub(in crate::runtime) const fn unbounded() -> Self {
         Self {
             remaining: None,
@@ -39,22 +42,27 @@ impl IngestByteBudget {
         }
     }
 
+    #[hotpath::skip]
     pub(in crate::runtime) const fn exhausted(&self) -> bool {
         matches!(self.remaining, Some(0))
     }
 
+    #[hotpath::skip]
     pub(in crate::runtime) const fn remaining(&self) -> Option<u64> {
         self.remaining
     }
 
+    #[hotpath::skip]
     pub(in crate::runtime) const fn consumed(&self) -> u64 {
         self.consumed
     }
 
+    #[hotpath::skip]
     pub(in crate::runtime) const fn deferred(&self) -> bool {
         self.deferred
     }
 
+    #[hotpath::skip]
     pub(in crate::runtime) const fn defer(&mut self) {
         self.deferred = true;
     }

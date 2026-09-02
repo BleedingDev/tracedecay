@@ -6,7 +6,7 @@
 //! diagnostics` CLI and dashboard analytics API use
 //! ([`tracedecay_global_db::RegisteredGlobalDb::query_analytics_tool_counts`],
 //! [`tracedecay_global_db::RegisteredGlobalDb::query_analytics_hint_counts`],
-//! [`crate::dashboard::analytics_api::hint_summary_from_counts`],
+//! [`tracedecay_dashboard_api::analytics_api::hint_summary_from_counts`],
 //! [`tracedecay_automation_runtime::automation::run_ledger::load_run_records`]) rather than
 //! re-implementing queries against those tables.
 
@@ -20,20 +20,21 @@ use tracedecay_application::{
     CancellationSignal, Deadline, now_micros, retained_surface_execution_problem,
 };
 use tracedecay_domain::{FactOwnerV1, ObservationScopeV1, ProjectId};
+use tracedecay_session_memory::memory::MemoryApplication;
 use tracedecay_store::{FactReadControl, StoreShardScopeV1};
-use tracedecay_usecases::memory::MemoryApplication;
 
 use crate::daemon::retained_owner::{MemoryTargetAccessV1, open_project_retained_memory_target};
-use crate::store::DatabaseFactStore;
 use crate::tracedecay::TraceDecay;
 use crate::tracedecay::current_timestamp;
 use tracedecay_automation_runtime::automation::run_ledger::load_run_records;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::{AnalyticsToolCounts, RegisteredGlobalDb};
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_runtime_core::store::memory::DatabaseFactStore;
 use tracedecay_runtime_core::timeutil::parse_rfc3339_timestamp;
 
-use super::super::{ToolResult, renderers};
 use super::support::tool_json_with_md;
+use tracedecay_mcp::ToolResult;
+use tracedecay_mcp::tools::renderers;
 
 /// Bound on how many automation run-ledger rows a single call will scan.
 const AUTOMATION_RECORD_LIMIT: usize = 200;
@@ -395,7 +396,7 @@ pub(super) async fn handle_analytics(
         )
         .await
         .map_err(config_error)?;
-        let hints = crate::dashboard::analytics_api::hint_summary_from_counts(&counts);
+        let hints = tracedecay_dashboard_api::analytics_api::hint_summary_from_counts(&counts);
         if let Some(object) = value.as_object_mut() {
             object.insert("hints".to_string(), hints);
         }
@@ -466,7 +467,7 @@ fn tools_section(rows: &[AnalyticsToolCounts]) -> Result<Value> {
         })
         .collect();
 
-    let defined: Vec<String> = crate::mcp::tools::get_tool_definitions()
+    let defined: Vec<String> = tracedecay_mcp::get_tool_definitions()
         .map_err(config_error)?
         .into_iter()
         .map(|definition| definition.name)
@@ -567,15 +568,16 @@ async fn facts_section(
 }
 
 async fn automation_section(project_root: &Path, since: i64) -> Value {
-    let dashboard_root = match crate::storage::resolve_layout_for_current_profile(project_root) {
-        Ok(layout) => layout.dashboard_root,
-        Err(err) => {
-            return json!({
-                "available": false,
-                "reason": format!("could not resolve automation dashboard root: {err}"),
-            });
-        }
-    };
+    let dashboard_root =
+        match tracedecay_runtime_core::storage::resolve_layout_for_current_profile(project_root) {
+            Ok(layout) => layout.dashboard_root,
+            Err(err) => {
+                return json!({
+                    "available": false,
+                    "reason": format!("could not resolve automation dashboard root: {err}"),
+                });
+            }
+        };
     let records = match load_run_records(&dashboard_root, AUTOMATION_RECORD_LIMIT).await {
         Ok(records) => records,
         Err(err) => {

@@ -3,12 +3,12 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tracedecay::host_admission::HostAdmissionTestRuntimeV1;
-use tracedecay_sessions::admission::HostAdmissionScope;
-use tracedecay_sessions::runtime::lcm::{
+use tracedecay_lcm::{
     LcmCompressionRequest, LcmGrepRequest, LcmGrepSort, LcmLifecycleUpdate, LcmLoadSessionRequest,
     LcmMaintenanceDebt, LcmPreflightRequest, LcmScope, LcmSessionBoundaryRequest, LcmSourceRef,
     LcmStorageKind, LcmSummarizerMode, LcmSummaryNodeDraft, MAX_DERIVED_SNIPPET_CHARS,
 };
+use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
 
 use crate::common::{self, LcmTestRuntime, open_lcm_db};
@@ -193,7 +193,7 @@ async fn ingest_active_messages(
     provider: &str,
     session_id: &str,
     messages: Vec<Value>,
-) -> tracedecay_sessions::runtime::lcm::LcmCompressionResponse {
+) -> tracedecay_lcm::LcmCompressionResponse {
     let messages = with_authoritative_timestamps(messages);
     let message_count = messages.len();
     let mut request = compress_request(provider, session_id, LcmSummarizerMode::Noop);

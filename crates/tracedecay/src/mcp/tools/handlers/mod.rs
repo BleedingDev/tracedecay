@@ -14,7 +14,6 @@ mod admin_project;
 pub mod analysis;
 mod analytics;
 mod application_surface;
-pub mod ast_grep_search;
 mod automation_runs;
 pub mod dashboard;
 mod dashboard_delivery;
@@ -30,40 +29,6 @@ mod dashboard_lcm;
 // default production build does not carry it as an unused re-export.
 #[cfg(feature = "test-transport")]
 pub(crate) use dashboard_lcm::DashboardLcmReadAdapter;
-mod dependency_hints;
-mod dispatch_controls;
-mod dispatch_groups;
-pub mod edit;
-pub mod git;
-pub mod graph;
-pub mod grep;
-pub mod health;
-pub mod hook_runtime;
-pub mod info;
-mod multi_root;
-mod project_registry;
-pub mod redundancy;
-pub(crate) mod retained_catalog;
-pub mod session;
-mod session_authorities;
-pub mod skills;
-mod support;
-mod tool_call_support;
-mod work;
-pub mod workflow;
-mod workflow_family;
-pub(crate) use project_registry::{
-    ProjectRegistryContextCommand, ProjectRegistryContextFuture, ProjectRegistryContextOutcome,
-    ProjectRegistryContextView, ProjectRegistryListingCommand, ProjectRegistryListingFuture,
-    ProjectRegistryListingOutcome, ProjectRegistryListingScope, ProjectRegistryListingView,
-    ProjectRegistryReadPort, ProjectRegistrySelector,
-};
-pub(crate) use session::{
-    SessionRefreshAction, SessionRefreshCommand, SessionRefreshCoverageView,
-    SessionRefreshFrontierView, SessionRefreshProgressView, SessionRefreshReceiptView,
-    SessionRefreshServiceOutcome, SessionRefreshServicePort, utc_micros_value,
-};
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -82,6 +47,9 @@ mod configuration_dispatch_tests;
     clippy::uninlined_format_args
 )]
 mod context_scout_control_dispatch_tests;
+mod dependency_hints;
+mod dispatch_controls;
+mod dispatch_groups;
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -100,6 +68,14 @@ mod dispatch_test_support;
     clippy::uninlined_format_args
 )]
 mod dispatch_tests;
+pub mod edit;
+pub mod git;
+pub mod graph;
+pub mod health;
+pub mod hook_runtime;
+pub mod info;
+pub mod redundancy;
+pub(crate) mod retained_catalog;
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -127,6 +103,10 @@ mod runtime_generation_census_dispatch_tests;
     clippy::uninlined_format_args
 )]
 mod search_graph_independence_tests;
+mod session_authorities;
+pub mod skills;
+mod support;
+mod tool_call_support;
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -136,6 +116,18 @@ mod search_graph_independence_tests;
     clippy::uninlined_format_args
 )]
 mod tool_definition_tests;
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::await_holding_lock,
+    clippy::redundant_closure_for_method_calls,
+    clippy::uninlined_format_args
+)]
+mod verified_graph_query_authority_tests;
+mod work;
+pub mod workflow;
+mod workflow_family;
 
 pub use session_authorities::SessionAuthorities;
 use std::path::Path;
@@ -143,22 +135,22 @@ use std::sync::Arc;
 pub(crate) use tool_call_support::resolve_registered_project_route_for_tool;
 pub(super) use tool_call_support::{json_result, text_tool_result};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracedecay_application::RetainedSurfaceOperation;
 #[cfg(test)]
 use tracedecay_application::{
     APPLICATION_DEFAULT_PROFILE_ID, retained_surface_application_operation,
 };
-use tracedecay_tool_catalog::BindingSurface;
+use tracedecay_tool_catalog::{ApplicationSurfaceOperation, BindingSurface};
 #[cfg(test)]
 use tracedecay_tool_catalog::{ProfileId, SurfaceOperationName};
 
+use super::LegacyToolCompatibilityOwner;
 use super::binding::{
     McpToolDispatchGroup, dispatch_group_for_tool, tool_accepts_registered_project_selector,
-    tool_is_selector_bound_effect,
+    tool_dispatches_registered_project_reader,
 };
-use super::{LegacyToolCompatibilityOwner, ToolResult};
-use crate::application_surface::{ApplicationSurfaceOperation, resolve_catalog_tool_binding};
+use crate::application_surface::resolve_catalog_tool_binding;
 use crate::tracedecay::TraceDecay;
 pub(crate) use dispatch_groups::tool_dispatch_ceiling;
 use dispatch_groups::{
@@ -167,14 +159,16 @@ use dispatch_groups::{
     dispatch_info_tools, dispatch_memory_tools, dispatch_retained_application_tools,
     dispatch_session_workflow_tools,
 };
-use multi_root::handle_multi_root;
 use retained_catalog::dispatch_profile_retained_application_tool;
 #[cfg(test)]
 use retained_catalog::retained_mcp_composition;
 pub(crate) use tool_call_support::INTERNAL_DAEMON_TOOL_NAMES;
 use tool_call_support::{boxed_send, rejected_tool_project_selector_present};
+use tracedecay_application::ProjectRegistryReadPort;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_mcp::ToolResult;
+use tracedecay_mcp::handle_multi_root;
 use work::handle_work;
 use workflow_family::handle_workflow;
 
@@ -227,6 +221,21 @@ pub async fn handle_tool_call(
     .await
 }
 
+/// Evidence for the `code_graph_freshness` response trailer when a
+/// graph-backed tool served the last complete seated generation instead of a
+/// proven-current one.
+#[derive(Clone, Debug)]
+pub(crate) struct ServedStaleCodeGraphReadV1 {
+    /// Identity of the generation that answered.
+    pub(crate) generation: String,
+    /// When that generation was durably sealed.
+    pub(crate) sealed_at: tracedecay_domain::UtcMicros,
+    /// Whether a reconcile pass or pending scheduler wake existed at open
+    /// time. False means nothing is progressing: the route is stalled, not
+    /// mid-rebuild, and the trailer must not claim a rebuild.
+    pub(crate) rebuild_in_flight: bool,
+}
+
 #[derive(Clone)]
 pub struct ToolCallRegistryOptions<'a> {
     pub(crate) global_db: Option<&'a RegisteredGlobalDbLeaseV1>,
@@ -239,10 +248,11 @@ pub struct ToolCallRegistryOptions<'a> {
     pub(crate) registered_profile_session_db:
         Option<tracedecay_global_db::RegisteredGlobalDbLeaseV1>,
     pub(crate) registered_savings_db: Option<tracedecay_global_db::RegisteredGlobalDbLeaseV1>,
-    pub(crate) dashboard_session_retrieval_service:
-        Option<Arc<dyn crate::daemon::session_retrieval::SessionApplicationRetrievalPortV1>>,
+    pub(crate) dashboard_session_retrieval_service: Option<
+        Arc<dyn tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1>,
+    >,
     pub(crate) dashboard_session_retrieval_identity:
-        Option<tracedecay_usecases::context::ResolvedSessionIdentity>,
+        Option<tracedecay_session_memory::context::ResolvedSessionIdentity>,
     /// The canonical profile identity bound by the daemon handshake. A
     /// dashboard profile write resolves its configuration layer through this
     /// identity, so it must not be derived from the project-session store —
@@ -251,23 +261,27 @@ pub struct ToolCallRegistryOptions<'a> {
     pub(crate) daemon_user_profile_id: Option<tracedecay_domain::configuration::UserProfileId>,
     pub profile_root: Option<&'a Path>,
     pub(crate) resolved_project_route: Option<&'a crate::mcp::project_route::ResolvedProjectRoute>,
-    pub automation_scheduler_reconciler: Option<crate::dashboard::AutomationSchedulerReconciler>,
-    pub automation_writer: crate::dashboard::DashboardAutomationWriter,
-    pub(crate) doctor_report_reader: Option<crate::dashboard::DoctorReportReader>,
-    pub(crate) remote_operational_status:
-        Option<crate::daemon::remote_protocol::RemoteOperationalStatusProviderV1>,
+    pub automation_scheduler_reconciler:
+        Option<tracedecay_dashboard_api::AutomationSchedulerReconciler>,
+    pub automation_writer: tracedecay_dashboard_api::DashboardAutomationWriter,
+    pub(crate) doctor_report_reader: Option<tracedecay_dashboard_api::DoctorReportReader>,
+    pub(crate) remote_operational_status: Option<
+        std::sync::Arc<dyn tracedecay_application::remote::status::RemoteOperationalStatusReadPort>,
+    >,
     pub(crate) code_index_freshness_reader:
-        Option<crate::dashboard::code_index_freshness_api::CodeIndexFreshnessReader>,
-    pub(crate) explorer_semantic_reader: Option<crate::dashboard::ExplorerSemanticReader>,
-    pub feedback_status_reader: Option<crate::dashboard::feedback_api::FeedbackStatusReader>,
-    pub diagnostics_cache: Option<&'a crate::diagnostics::DiagnosticsCache>,
+        Option<tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader>,
+    pub(crate) explorer_semantic_reader: Option<tracedecay_dashboard_api::ExplorerSemanticReader>,
+    pub feedback_status_reader:
+        Option<tracedecay_dashboard_api::feedback_api::FeedbackStatusReader>,
+    pub diagnostics_cache: Option<&'a tracedecay_lsp::compile_diagnostics::DiagnosticsCache>,
     pub diagnostics_lsp:
         Option<Arc<tokio::sync::Mutex<tracedecay_lsp::analyzer::broker::DiagnosticBroker>>>,
     pub application_invocation_executor:
         Option<&'a dyn tracedecay_daemon_protocol::DaemonInvocationExecutor>,
     pub dashboard_application_invocation_executor:
         Option<Arc<dyn tracedecay_daemon_protocol::DaemonInvocationExecutor>>,
-    pub(crate) daemon_invocation_service: Option<&'a crate::daemon::DaemonInvocationService>,
+    pub(crate) daemon_invocation_service:
+        Option<&'a tracedecay_daemon_service::DaemonInvocationService>,
     pub(crate) dashboard_delivery_settlement_authority:
         Option<Arc<tracedecay_usecases::observability::DeliverySettlementAuthorityV1>>,
     pub application_request_id: Option<tracedecay_application::RequestId>,
@@ -291,10 +305,13 @@ pub struct ToolCallRegistryOptions<'a> {
         Option<crate::mcp::server::CodeGraphProjectionReadPort>,
     pub(crate) code_graph_read_admission_port:
         Option<crate::mcp::server::CodeGraphReadAdmissionPort>,
+    pub(crate) verified_graph_query_port:
+        Option<std::sync::Arc<dyn tracedecay_graph_query::VerifiedGraphQueryPort + 'static>>,
     pub(crate) code_index_ignored_dependency_admission:
         Option<crate::mcp::server::CodeIndexIgnoredDependencyAdmissionPort>,
     /// Exact-scope sealed-generation census authority for runtime telemetry.
-    pub(crate) generation_census_reader: Option<crate::runtime_telemetry::GenerationCensusReader>,
+    pub(crate) generation_census_reader:
+        Option<tracedecay_session_memory::runtime_telemetry::GenerationCensusReader>,
     /// Retained server authority consumed by the dashboard boundary. Project
     /// selection itself is completed before handler dispatch.
     pub(crate) retained_project_server_resolver:
@@ -303,6 +320,14 @@ pub struct ToolCallRegistryOptions<'a> {
     /// Absence is a typed unavailable authority, never a local store fallback.
     pub(crate) session_sync_service:
         Option<&'a dyn tracedecay_application::session_sync::SessionSyncServicePort>,
+    /// One-shot report from the single verified-graph open funnel
+    /// (`dispatch_groups::admitted_graph_query`) back to the top-level
+    /// dispatch boundary: set when a graph-backed tool answered from the last
+    /// complete seated generation, so the response gains a typed
+    /// `code_graph_freshness` trailer carrying the seat's age and whether a
+    /// rebuild pass is actually in flight. Constructed fresh per tool call.
+    pub(crate) served_stale_graph_generation:
+        std::sync::Arc<std::sync::OnceLock<ServedStaleCodeGraphReadV1>>,
     pub session_authorities: SessionAuthorities<'a>,
 }
 
@@ -321,7 +346,7 @@ impl Default for ToolCallRegistryOptions<'_> {
             profile_root: None,
             resolved_project_route: None,
             automation_scheduler_reconciler: None,
-            automation_writer: crate::dashboard::standalone_dashboard_automation_writer(),
+            automation_writer: tracedecay_dashboard_api::standalone_dashboard_automation_writer(),
             doctor_report_reader: None,
             remote_operational_status: None,
             code_index_freshness_reader: None,
@@ -347,10 +372,12 @@ impl Default for ToolCallRegistryOptions<'_> {
             code_index_search_authority: None,
             code_graph_projection_read_port: None,
             code_graph_read_admission_port: None,
+            verified_graph_query_port: None,
             code_index_ignored_dependency_admission: None,
             generation_census_reader: None,
             retained_project_server_resolver: None,
             session_sync_service: None,
+            served_stale_graph_generation: std::sync::Arc::new(std::sync::OnceLock::new()),
             session_authorities: SessionAuthorities::default(),
         }
     }
@@ -463,18 +490,20 @@ pub fn handle_tool_call_with_registry_options<'a>(
                 }
             }
         }
-        if !tool_accepts_registered_project_selector(tool_name)
-            && rejected_tool_project_selector_present(tool_name, &args)
-        {
+        if tool_accepts_registered_project_selector(tool_name) {
+            support::validate_registered_project_selector_aliases(
+                &args,
+                crate::mcp::project_route::semantic_route_argument_fields(tool_name),
+            )?;
+        } else if rejected_tool_project_selector_present(tool_name, &args) {
             return Err(TraceDecayError::Config {
                 message: format!(
                     "{tool_name} is scoped to the active project and does not accept project selectors"
                 ),
             });
         }
-        if tool_accepts_registered_project_selector(tool_name)
-            && !tool_is_selector_bound_effect(tool_name)
-            && crate::mcp::project_route::arguments_have_project_selector(&args)
+        if tool_dispatches_registered_project_reader(tool_name)
+            && crate::mcp::project_route::arguments_have_project_selector(tool_name, &args)
             && options.resolved_project_route.is_none()
         {
             return Err(TraceDecayError::project_route(
@@ -582,6 +611,7 @@ pub fn handle_tool_call_with_registry_options<'a>(
         // The lease is cloned out of `options` (one field, not the whole
         // struct) so the dispatch arms below can take `options` by value.
         let project_session_db_lease = options.registered_project_session_db.clone();
+        let served_stale_graph_generation = Arc::clone(&options.served_stale_graph_generation);
         let project_session_db = project_session_db_lease
             .as_ref()
             .or(options.session_authorities.project);
@@ -672,7 +702,7 @@ pub fn handle_tool_call_with_registry_options<'a>(
                 | None => Err(unknown_tool_error(tool_name)),
             }
         };
-        if matches!(
+        let result = if matches!(
             dispatch_group,
             Some(McpToolDispatchGroup::RetainedApplication)
         ) || super::binding::tool_requires_canonical_effect_settlement(tool_name)
@@ -690,9 +720,61 @@ pub fn handle_tool_call_with_registry_options<'a>(
                     dispatch_budget,
                 )),
             }
+        };
+        match result {
+            Ok(mut result) => {
+                // The verified-graph open funnel reports serve-old-while-
+                // rebuilding through the one-shot options slot; the answer is
+                // sound for the served generation but may trail the live
+                // worktree, and the response must say so — including whether
+                // a rebuild is actually in motion, so a wedged route serving
+                // days-old answers is visibly wedged, not "rebuilding".
+                if let Some(served) = served_stale_graph_generation.get()
+                    && let Some(content) = result
+                        .value
+                        .get_mut("content")
+                        .and_then(|content| content.as_array_mut())
+                {
+                    let generation = &served.generation;
+                    let age = seated_generation_age_label(served.sealed_at);
+                    let remedy = if served.rebuild_in_flight {
+                        "while the code index rebuilds"
+                    } else {
+                        "with no rebuild pass in flight — the scheduler is not \
+                         replacing this generation"
+                    };
+                    content.push(json!({"type": "text", "text": format!(
+                        "\ncode_graph_freshness: stale — serving the last complete generation \
+                         {generation} (sealed {age} ago) {remedy}; results may trail the \
+                         live worktree"
+                    )}));
+                }
+                Ok(result)
+            }
+            Err(error) => Err(error),
         }
     };
     Box::pin(hotpath::future!(dispatch, label = "mcp.tool_call"))
+}
+
+/// Coarse human duration between a generation's seal time and now, for the
+/// freshness trailer. A routine rebuild window reads in seconds or minutes; a
+/// wedged route reads in hours or days.
+fn seated_generation_age_label(sealed_at: tracedecay_domain::UtcMicros) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_micros() as i64)
+        .unwrap_or(sealed_at.0);
+    let seconds = now.saturating_sub(sealed_at.0).max(0) / 1_000_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
 }
 
 /// The single rejection every dispatch group returns for a name it does not own.

@@ -49,30 +49,34 @@ use tokio::time::{Instant, timeout_at};
 
 use tracedecay::application_surface::{
     ApplicationSurfaceAdapterError, ApplicationSurfaceInvocationResult,
-    ApplicationSurfaceOperation, normalize_application_tool_args,
-    observe_surface_argument_rejection, parse_application_surface_request,
-    resolve_catalog_tool_binding,
+    normalize_application_tool_args, observe_surface_argument_rejection,
+    parse_application_surface_request,
 };
 use tracedecay::daemon::{DaemonHandshake, call_default_tool_awaiting_project_open};
-use tracedecay::mcp::tools::internal_daemon_tool_definition;
-use tracedecay::mcp::tools::{
-    LegacyToolCompatibilityOwner, RESERVED_FLAGS_FOOTER, ToolDefinition, get_tool_definitions,
-    render_tool_cli_help, short_tool_name,
-};
+use tracedecay_application::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_application::{CancellationSignal, Deadline};
 use tracedecay_daemon_protocol::RequestedOutputFormat;
 use tracedecay_domain::UtcMicros;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
-use tracedecay_tool_catalog::BindingSurface;
-use tracedecay_usecases::request_identity::{GlobalRequestSurface, mint_global_request_id};
+use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_mcp::{
+    RESERVED_FLAGS_FOOTER, ToolDefinition, get_tool_definitions, internal_daemon_tool_definition,
+    render_tool_cli_help, short_tool_name,
+};
+use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
 use crate::cli::dispatch::resolve_cli_application_surface;
 use crate::commands::{recover_truncated_mcp_result, reject_truncation_envelope};
 
 mod args;
-use args::{ParsedInvocation, canonical_tool_name, nearest_tool_name, parse_invocation};
+use args::{
+    ParsedInvocation, canonical_tool_name, nearest_tool_name, parse_invocation,
+    parse_whole_payload_invocation,
+};
 #[cfg(test)]
-use args::{edit_distance, finalize_arrays, parse_invocation_with_stdin};
+use args::{
+    edit_distance, finalize_arrays, parse_invocation_with_stdin,
+    parse_whole_payload_invocation_with_stdin,
+};
 #[cfg(test)]
 use serde_json::Map;
 
@@ -102,18 +106,17 @@ const FIRST_TOUCH_STORE_TOOLS: &[&str] = &[
     "tracedecay_lcm_expand_query",
 ];
 
-const DEFAULT_TOOL_DEADLINE: Duration = Duration::from_secs(120);
-const MAX_TOOL_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
-const TOOL_DEADLINE_ENV: &str = "TRACEDECAY_TOOL_DEADLINE_MS";
-
 fn tool_deadline_range_error() -> TraceDecayError {
     TraceDecayError::Config {
-        message: format!("{TOOL_DEADLINE_ENV} exceeds the supported monotonic deadline range"),
+        message: format!(
+            "{} exceeds the supported monotonic deadline range",
+            tracedecay::daemon::TOOL_REQUEST_DEADLINE_ENV
+        ),
     }
 }
 
 fn tool_command_deadline() -> Result<Duration> {
-    crate::commands::env_duration_ms(TOOL_DEADLINE_ENV, DEFAULT_TOOL_DEADLINE, MAX_TOOL_DEADLINE)
+    tracedecay::daemon::tool_request_deadline()
 }
 
 fn tool_timeout_error(tool_name: &str) -> TraceDecayError {
@@ -162,6 +165,36 @@ fn run_inner(
         {
             let requested_name = name.as_deref().map(canonical_tool_name);
             hotpath::val!("cli.tool.name").set(&requested_name.as_deref().unwrap_or("list"));
+        }
+        if let Some(canonical) = name.as_deref().map(canonical_tool_name)
+            && let Some(operation) = ApplicationSurfaceOperation::from_tool_name(&canonical)
+            && let Some(parsed) = parse_whole_payload_invocation(&args)?
+        {
+            let ParsedInvocation {
+                tool_args,
+                project: parsed_project,
+                raw_json,
+                dry_run: _,
+                show_help: _,
+            } = parsed;
+            let explicit_project = project.or(parsed_project);
+            let deadline = Instant::now()
+                .checked_add(tool_command_deadline()?)
+                .ok_or_else(tool_deadline_range_error)?;
+            let (request, requested_format) =
+                cli_surface_invocation(&canonical, tool_args, raw_json).map_err(|error| {
+                    TraceDecayError::Config {
+                        message: error.to_string(),
+                    }
+                })?;
+            return dispatch_cli_application_surface(
+                operation,
+                request,
+                DaemonToolDispatch::project_scoped(explicit_project, &canonical).project_path,
+                requested_format,
+                deadline,
+            )
+            .await;
         }
         let defs = get_tool_definitions().map_err(|error| {
             TraceDecayError::project_route(
@@ -234,32 +267,12 @@ fn run_inner(
             )
             .await;
         }
-        // Catalog-declared operations must pass the same binding resolver as the
-        // typed application surfaces before entering the retained compatibility
-        // owner. Operations with no catalog contract remain explicitly owned by
-        // the root MCP handler migration, rather than an unclassified fallback.
-        let _catalog_binding = resolve_catalog_tool_binding(BindingSurface::Cli, &def.name)
-            .map_err(|error| TraceDecayError::Config {
-                message: error.to_string(),
-            })?;
-        let compatibility_owned =
-            LegacyToolCompatibilityOwner::admits(&def.name).map_err(|error| {
-                TraceDecayError::project_route(
-                    "mcp.catalog_discovery_unavailable",
-                    false,
-                    format!("MCP tool discovery is unavailable: {error}"),
-                )
-            })?;
-        if internal_def.is_none() && !compatibility_owned {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "{} does not own {}: {}",
-                    LegacyToolCompatibilityOwner::OWNER,
-                    def.name,
-                    LegacyToolCompatibilityOwner::REASON
-                ),
-            });
-        }
+        // Finding `def` in the host-filtered MCP definitions is the retained
+        // compatibility owner's admission authority. This point is reachable
+        // only after both typed application-operation branches above rejected
+        // the name, so composing the application catalog again can only return
+        // `None`; rebuilding a second advertised-name set likewise repeats the
+        // exact membership check that selected `def`.
         dispatch_compatibility_tool(
             DaemonToolDispatch::for_tool(explicit_project, &def.name, &tool_args),
             &def.name,
@@ -362,7 +375,7 @@ fn dispatch_cli_application_surface_inner(
                     false,
                     false,
                 ) && let Ok(client) =
-                    tracedecay::daemon::invocation_client_for_current(handshake)
+                    tracedecay_daemon_identity::invocation_client_for_current(handshake)
                 {
                     observe_surface_argument_rejection(
                         Some(&client),
@@ -380,7 +393,7 @@ fn dispatch_cli_application_surface_inner(
         };
         let handshake =
             tracedecay::daemon::handshake_for_current_client(project, None, false, false)?;
-        let client = tracedecay::daemon::invocation_client_for_current(handshake)?;
+        let client = tracedecay_daemon_identity::invocation_client_for_current(handshake)?;
         // A cold daemon answers a retryable pre-admission problem while the
         // project open still warms in the background (bounded by the daemon's
         // foreground open wait). The compatibility tool path rides that state out
@@ -423,8 +436,17 @@ fn dispatch_cli_application_surface_inner(
                 Some(&client),
             )
             .await
-            .map_err(|error| TraceDecayError::Config {
-                message: error.to_string(),
+            .map_err(|error| match error {
+                // The same typed connect failure the compatibility tool path
+                // returns: one restart grace, then fail fast — never another
+                // dispatch attempt against a dead socket.
+                ApplicationSurfaceAdapterError::DaemonUnreachable {
+                    reason_code,
+                    detail,
+                } => TraceDecayError::project_route(reason_code, true, detail),
+                error => TraceDecayError::Config {
+                    message: error.to_string(),
+                },
             })?;
             let Some(delay) = crate::cli::dispatch::surface_retry_delay(&result) else {
                 break result;
@@ -517,6 +539,7 @@ impl DaemonToolDispatch {
 
     /// `deadline` is the caller's request deadline. It is sent to the daemon and
     /// enforced there; the transport reads for a bounded grace beyond it.
+    #[hotpath::skip]
     async fn call(&self, tool_name: &str, tool_args: Value, deadline: Instant) -> Result<Value> {
         let handshake = self.handshake()?;
         // The interactive CLI wants the tool's answer, not the daemon's typed
@@ -544,7 +567,7 @@ fn implicit_tool_project_path(cwd: &Path) -> Option<PathBuf> {
 }
 
 fn map_tool_deadline_error(tool_name: &str, error: TraceDecayError) -> TraceDecayError {
-    if tracedecay::daemon::error_message_is_read_deadline(&error.to_string()) {
+    if tracedecay::daemon::error_is_read_deadline(&error) {
         tool_timeout_error(tool_name)
     } else {
         error
@@ -684,7 +707,7 @@ fn print_tool_list(defs: &[ToolDefinition]) {
     println!(
         "Available tools ({}; TraceDecay {}) — run `tracedecay tool <name> --help` for parameters, then",
         defs.len(),
-        tracedecay::version::build_version()
+        crate::product_runtime::PRODUCT_BUILD_VERSION
     );
     println!("invoke with `tracedecay tool <name> --args '<json>'` (the same JSON arguments");
     println!("object as the MCP tool; `--args -` reads a heredoc from stdin) or, for quick");

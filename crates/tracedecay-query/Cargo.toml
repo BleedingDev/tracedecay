@@ -5,11 +5,20 @@ publish = false
 edition.workspace = true
 license = "MIT"
 repository = "https://github.com/ScriptedAlchemy/tracedecay"
-description = "TraceDecay code retrieval query kernel"
-include = ["/src/**"]
+description = "TraceDecay code retrieval query kernel and search-quality candidate/profile inputs"
+include = ["/src/**", "/assets/**"]
 
 [dependencies]
+flate2 = "1"
 fst = { version = "=0.4.7", default-features = false, features = ["levenshtein"] }
+gix = { version = "=0.86.0", default-features = false, features = [
+    "revision",
+    "blob-diff",
+    "parallel",
+    "sha1",
+    "sha256",
+    "status",
+] }
 hex = "0.4"
 hmac = "0.13.0"
 hotpath.workspace = true
@@ -74,21 +83,37 @@ test-helpers = ["tracedecay-temporal-query/test-helpers"]
 production = ["tracedecay-code-index/lite", "tracedecay-code-index/full"]
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 static_assertions = "1.1.0"
 tempfile = "3"
 # Test-only: the relocated search-quality suites build lexical/exact fixtures
 # through the code-index intake and the extracted language registry, which
 # needs the bundled lite grammar tier (Rust).
-tracedecay-code-extraction = { path = "../tracedecay-code-extraction", version = "0.1.0", features = ["lite"] }
+tracedecay-code-extraction = { path = "../tracedecay-code-extraction", version = "0.1.0", default-features = false, features = ["lang-markdown", "lite"] }
 tracedecay-code-index = { path = "../tracedecay-code-index", version = "0.1.0", default-features = false, features = ["lite", "test-helpers"] }
 tracedecay-graph-db = { path = "../tracedecay-graph-db", version = "0.1.0", features = ["test-helpers"] }
 
+# Profiling bench: built only under the opt-in `hotpath` feature so a
+# default `cargo bench` / `cargo test --all-targets` never compiles hotpath
+# instrumentation. Run with `cargo bench -p tracedecay-query
+# --features hotpath --bench code_lexical_catchup`.
 [[bench]]
 name = "code_lexical_catchup"
+harness = false
+required-features = ["hotpath"]
+
+[[bench]]
+name = "semantic_flat_scan"
 harness = false
 
 # Daemon-free indexing workload profiled by `.github/workflows/hotpath-profile.yml`.
 [[bin]]
 name = "tracedecay-index-bench"
 path = "src/bin/tracedecay_index_bench.rs"
+test = false
+
+# Daemon-free search-lane query latency workload over a published artifact.
+[[bin]]
+name = "tracedecay-search-bench"
+path = "src/bin/tracedecay_search_bench.rs"
 test = false

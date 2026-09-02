@@ -2,6 +2,7 @@ use super::*;
 
 use std::collections::BTreeSet;
 use std::fmt::Debug;
+use std::future::ready;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -102,7 +103,7 @@ fn verified_graph_context(cancellation: &CancellationSignal) -> RequestContext {
 
 fn verified_graph(
     fixture_symbols: &[FixtureSymbol<'_>],
-) -> crate::tracedecay::queries::graph::VerifiedGraphQuery {
+) -> tracedecay_graph_query::VerifiedGraphQuery {
     let generation = fixture_id::<CodeGenerationId>("generation.affected-tests.1");
     let mut files = Vec::new();
     let mut chunks = Vec::new();
@@ -185,13 +186,12 @@ fn verified_graph(
     let store = store
         .verified_store(&generation)
         .expect("open verified fixture generation");
-    let graph_cancellation =
-        tracedecay_usecases::graph::application_graph_cancellation(&cancellation);
+    let graph_cancellation = tracedecay_graph_query::application_graph_cancellation(&cancellation);
     let reader = store
         .interactive_reader_with_cancellation(&generation, Arc::clone(&graph_cancellation))
         .expect("open generation-pinned fixture reader");
     let context = verified_graph_context(&cancellation);
-    crate::tracedecay::queries::graph::VerifiedGraphQuery::from_reader(
+    tracedecay_graph_query::VerifiedGraphQuery::from_fixture_reader(
         reader,
         graph_cancellation,
         context,
@@ -207,10 +207,10 @@ fn push_fixture_symbol(
     qualified_name: &str,
     kind: &str,
     ordinal: u32,
-    symbols: &mut Vec<LineageSymbolRecordV1>,
-    chunks: &mut Vec<CodeSearchChunkV1>,
+    symbols: &mut Vec<Arc<LineageSymbolRecordV1>>,
+    chunks: &mut Vec<Arc<CodeSearchChunkV1>>,
 ) {
-    symbols.push(LineageSymbolRecordV1 {
+    symbols.push(Arc::new(LineageSymbolRecordV1 {
         occurrence: occurrence.clone(),
         identity: fixture_digest("symbol-identity", occurrence.as_str()),
         qualified_name: qualified_name.to_owned(),
@@ -230,8 +230,8 @@ fn push_fixture_symbol(
         skip_test_coverage: false,
         file_identity: fixture_digest("file-identity", path),
         content_digest: fixture_digest("symbol-content", occurrence.as_str()),
-    });
-    chunks.push(CodeSearchChunkV1 {
+    }));
+    chunks.push(Arc::new(CodeSearchChunkV1 {
         id: fixture_id(format!("chunk.{ordinal}")),
         anchor: CodeSearchChunkAnchorV1 {
             generation_id: generation.clone(),
@@ -258,7 +258,7 @@ fn push_fixture_symbol(
         exact_terms: Vec::new(),
         subtokens: Vec::new(),
         sanitized_text: BoundedSanitizedText::new("fixture symbol").expect("bounded fixture text"),
-    });
+    }));
 }
 
 #[tokio::test]
@@ -311,7 +311,7 @@ async fn directly_changed_test_file_dispatches_each_full_test_identity() {
     let expected_root = project.to_path_buf();
     let result = handle_run_affected_tests_with_runner(
         &cg,
-        &graph,
+        ready(Ok(graph)),
         json!({
             "changed_paths": ["tests/edited_only.rs"],
             "timeout_secs": 60,
@@ -430,7 +430,7 @@ async fn nested_source_module_dispatches_the_crate_relative_test_identity() {
     const EXPECTED: &str = "auth::login::tests::successful_login_creates_session";
     let result = handle_run_affected_tests_with_runner(
         &cg,
-        &graph,
+        ready(Ok(graph)),
         json!({
             "changed_paths": ["src/auth/login.rs"],
             "timeout_secs": 60,
@@ -494,7 +494,7 @@ async fn non_string_changed_paths_are_rejected_before_test_selection() {
     }]);
     let result = handle_run_affected_tests_with_runner(
         &cg,
-        &graph,
+        ready(Ok(graph)),
         json!({
             "changed_paths": ["tests/valid.rs", 7],
             "format": "json"
@@ -606,7 +606,7 @@ async fn timed_out_test_runner_returns_a_terminal_receipt() {
     }]);
     let result = handle_run_affected_tests_with_runner(
         &cg,
-        &graph,
+        ready(Ok(graph)),
         json!({"changed_paths": ["tests/edited.rs"], "format": "json"}),
         None,
         None,
@@ -682,7 +682,7 @@ async fn cancellation_retains_results_completed_before_the_later_test() {
     ]);
     let result = handle_run_affected_tests_with_runner(
         &cg,
-        &graph,
+        ready(Ok(graph)),
         json!({"changed_paths": ["tests/edited.rs"], "format": "json"}),
         None,
         None,
@@ -755,7 +755,7 @@ async fn vacuous_or_nonzero_test_output_is_a_failed_terminal() {
     }]);
     let vacuous = handle_run_affected_tests_with_runner(
         &cg,
-        &graph,
+        ready(Ok(graph)),
         json!({"changed_paths": ["tests/edited.rs"], "format": "json"}),
         None,
         None,
@@ -772,9 +772,14 @@ async fn vacuous_or_nonzero_test_output_is_a_failed_terminal() {
     .unwrap();
     assert_failed_terminal(tool_result_body(vacuous));
 
+    let graph = verified_graph(&[FixtureSymbol {
+        path: "tests/edited.rs",
+        qualified_name: "selected_target",
+        annotated_test: false,
+    }]);
     let nonzero = handle_run_affected_tests_with_runner(
         &cg,
-        &graph,
+        ready(Ok(graph)),
         json!({"changed_paths": ["tests/edited.rs"], "format": "json"}),
         None,
         None,
@@ -844,7 +849,7 @@ async fn reported_passing_and_failing_tests_complete_with_observed_results() {
     ]);
     let result = handle_run_affected_tests_with_runner(
         &cg,
-        &graph,
+        ready(Ok(graph)),
         json!({"changed_paths": ["tests/edited.rs"], "format": "json"}),
         None,
         None,
@@ -917,6 +922,127 @@ fn cargo_test_args_keep_release_before_libtest_separator() {
 fn tail_handles_short_input() {
     assert_eq!(tail("hello", 100), "hello");
     assert_eq!(tail("0123456789", 4), "6789");
+}
+
+/// Fifteen symbols across a dozen files, so a file-scale budget (8) is far
+/// below the corpus while comfortably above the two requested files. Before
+/// the per-file index cutover, both scoped reads hydrated the whole corpus
+/// stream and refused this exact shape with a budget error — a 13-file PR
+/// paid (and could not even complete) a full-corpus sweep.
+fn scoped_read_fixture() -> tracedecay_graph_query::VerifiedGraphQuery {
+    let mut fixture_symbols = vec![
+        FixtureSymbol {
+            path: "src/hot.rs",
+            qualified_name: "hot_case",
+            annotated_test: true,
+        },
+        FixtureSymbol {
+            path: "src/warm.rs",
+            qualified_name: "warm_helper",
+            annotated_test: false,
+        },
+    ];
+    let bulk_paths: Vec<String> = (0..12)
+        .map(|index| format!("src/bulk_{index}.rs"))
+        .collect();
+    for path in &bulk_paths {
+        fixture_symbols.push(FixtureSymbol {
+            path,
+            qualified_name: "bulk_fn",
+            annotated_test: false,
+        });
+    }
+    verified_graph(&fixture_symbols)
+}
+
+#[test]
+fn scoped_test_annotation_lookup_needs_only_a_file_scale_budget() {
+    let graph = scoped_read_fixture();
+    let requested: HashSet<String> = ["src/hot.rs".to_owned(), "src/warm.rs".to_owned()]
+        .into_iter()
+        .collect();
+
+    let annotated = graph
+        .test_annotated_logical_files(Some(&requested), 8, 64)
+        .expect("a two-file question must not require a corpus-scale symbol budget");
+    assert_eq!(
+        annotated,
+        ["src/hot.rs".to_owned()]
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        "only the file whose function carries a test marker is reported"
+    );
+
+    // The unscoped census keeps its corpus sweep and its budget contract.
+    let census = graph.test_annotated_logical_files(None, 8, 64);
+    assert!(
+        census.is_err(),
+        "the whole-corpus census still refuses a budget below the corpus size"
+    );
+
+    // The scoped budget still bounds the requested files themselves.
+    let hot_only: HashSet<String> = ["src/hot.rs".to_owned()].into_iter().collect();
+    assert!(
+        graph
+            .test_annotated_logical_files(Some(&hot_only), 1, 64)
+            .is_err(),
+        "requested files larger than the budget stay a typed refusal"
+    );
+}
+
+#[test]
+fn scoped_file_symbol_page_needs_only_a_file_scale_budget() {
+    let graph = scoped_read_fixture();
+    let requested: HashSet<String> = ["src/hot.rs".to_owned(), "src/warm.rs".to_owned()]
+        .into_iter()
+        .collect();
+
+    let full = graph
+        .symbols_in_logical_files_page(&requested, None, 10, 8)
+        .expect("a two-file page must not require a corpus-scale scan budget");
+    assert!(!full.has_more);
+    let full_paths: Vec<&str> = full
+        .symbols
+        .iter()
+        .filter_map(|symbol| symbol.binding.as_ref()?.logical_path.as_deref())
+        .collect();
+    assert_eq!(full_paths.len(), 3, "hot function + marker + warm helper");
+    assert!(full_paths.iter().all(|path| requested.contains(*path)));
+
+    // Page identity: walking with limit 1 reproduces the same symbols in the
+    // same canonical occurrence order as the single full page.
+    let mut walked = Vec::new();
+    let mut after = None;
+    loop {
+        let page = graph
+            .symbols_in_logical_files_page(&requested, after.as_ref(), 1, 8)
+            .expect("paged walk stays within the file-scale budget");
+        let Some(symbol) = page.symbols.first() else {
+            assert!(!page.has_more);
+            break;
+        };
+        walked.push(symbol.occurrence.clone());
+        after = Some(symbol.occurrence.clone());
+        if !page.has_more {
+            break;
+        }
+    }
+    let full_occurrences: Vec<_> = full
+        .symbols
+        .iter()
+        .map(|symbol| symbol.occurrence.clone())
+        .collect();
+    assert_eq!(
+        walked, full_occurrences,
+        "cursor pagination preserves the canonical occurrence order"
+    );
+
+    assert!(
+        graph
+            .symbols_in_logical_files_page(&requested, None, 10, 2)
+            .is_err(),
+        "requested files larger than the scan budget stay a typed refusal"
+    );
 }
 
 fn tool_result_body(result: ToolResult) -> Value {

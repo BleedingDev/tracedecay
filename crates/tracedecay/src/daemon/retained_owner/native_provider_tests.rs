@@ -24,12 +24,12 @@ use tracedecay_memory_provider_registry::{
     PayloadSanitizationReceipt, PayloadSanitizationReceiptParts, ProviderCall, ProviderCallParts,
     ProviderOperation, ProviderReply, TerminalCode,
 };
+use tracedecay_session_memory::memory::{
+    ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
+};
 use tracedecay_store::{
     FactReadControl, FactWriteControl, ProjectMemoryFactHistoryQueryV1, ProjectMemoryFactHistoryV1,
     ProjectMemoryFactIdV1, ProjectMemoryFactSearchKindV1, ProjectMemoryFactSearchQuery,
-};
-use tracedecay_usecases::memory::{
-    ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
 };
 
 use super::*;

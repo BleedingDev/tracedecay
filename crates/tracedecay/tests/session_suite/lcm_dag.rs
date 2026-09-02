@@ -1,13 +1,11 @@
 use tempfile::TempDir;
 use tracedecay::host_admission::HostAdmissionTestRuntimeV1;
-use tracedecay_sessions::admission::HostAdmissionScope;
-use tracedecay_sessions::runtime::lcm::types::{
-    LcmImmutableSummaryPublication, LcmSummaryPublicationDisposition,
-};
-use tracedecay_sessions::runtime::lcm::{
+use tracedecay_lcm::types::{LcmImmutableSummaryPublication, LcmSummaryPublicationDisposition};
+use tracedecay_lcm::{
     LcmDescribeRequest, LcmDescribeTarget, LcmError, LcmGrepRequest, LcmGrepSort, LcmScope,
     LcmSessionBoundaryRequest, LcmSourceRef, LcmStorageKind, LcmSummaryNodeDraft,
 };
+use tracedecay_sessions::admission::HostAdmissionScope;
 
 use crate::common::{lcm_dag_message as raw_message, lcm_dag_session as sample_session};
 
@@ -28,12 +26,12 @@ trait ProfileLcmFixture {
     async fn lcm_insert_summary_node(
         &self,
         draft: LcmSummaryNodeDraft,
-    ) -> Result<tracedecay_sessions::runtime::lcm::LcmSummaryNode, LcmError>;
+    ) -> Result<tracedecay_lcm::LcmSummaryNode, LcmError>;
 
     async fn lcm_publish_immutable_summary(
         &self,
         publication: LcmImmutableSummaryPublication,
-    ) -> Result<tracedecay_sessions::runtime::lcm::types::LcmSummaryPublicationReceipt, LcmError>;
+    ) -> Result<tracedecay_lcm::types::LcmSummaryPublicationReceipt, LcmError>;
 }
 
 impl ProfileLcmFixture for HostAdmissionTestRuntimeV1 {
@@ -55,7 +53,7 @@ impl ProfileLcmFixture for HostAdmissionTestRuntimeV1 {
     async fn lcm_insert_summary_node(
         &self,
         draft: LcmSummaryNodeDraft,
-    ) -> Result<tracedecay_sessions::runtime::lcm::LcmSummaryNode, LcmError> {
+    ) -> Result<tracedecay_lcm::LcmSummaryNode, LcmError> {
         self.lcm_insert_summary_node_for_test(HostAdmissionScope::Profile, draft)
             .await
     }
@@ -63,8 +61,7 @@ impl ProfileLcmFixture for HostAdmissionTestRuntimeV1 {
     async fn lcm_publish_immutable_summary(
         &self,
         publication: LcmImmutableSummaryPublication,
-    ) -> Result<tracedecay_sessions::runtime::lcm::types::LcmSummaryPublicationReceipt, LcmError>
-    {
+    ) -> Result<tracedecay_lcm::types::LcmSummaryPublicationReceipt, LcmError> {
         self.lcm_publish_immutable_summary_for_test(HostAdmissionScope::Profile, publication)
             .await
     }

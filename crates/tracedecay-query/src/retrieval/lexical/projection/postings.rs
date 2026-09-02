@@ -300,6 +300,7 @@ pub(super) struct ByteNgramBudget {
 }
 
 impl ByteNgramBudget {
+    #[hotpath::skip]
     pub(super) const fn new(maximum_bytes: usize) -> Self {
         Self {
             consumed_bytes: 0,
@@ -344,6 +345,7 @@ impl ByteNgramBudget {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     const fn consumed_bytes(&self) -> usize {
         self.consumed_bytes
     }

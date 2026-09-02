@@ -5,7 +5,6 @@
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use tracedecay::store::memory::DatabaseFactStore;
 use tracedecay_domain::{
     AccessPolicyDigest, AnchorDurabilityClass, AnchorSourceGenerationV2, CapabilityId,
     ComponentVersion, Confidence, CoverageReportV1, DomainError, EntityId, EntityKind, EntityRef,
@@ -20,11 +19,12 @@ use tracedecay_domain::{
     VectorWatermark,
 };
 use tracedecay_runtime_core::db::Database;
+use tracedecay_runtime_core::store::memory::DatabaseFactStore;
+use tracedecay_session_memory::memory::MemoryApplication;
 use tracedecay_store::{
     CurrentFactsQuery, FactAsOfQuery, FactCommitOutcome, FactCurrentQuery, FactLineageQuery,
     FactWriteBatch, FactWriteControl, RetrievalAnchorQuery,
 };
-use tracedecay_usecases::memory::MemoryApplication;
 
 use crate::common::open_graph_db_from_template;
 

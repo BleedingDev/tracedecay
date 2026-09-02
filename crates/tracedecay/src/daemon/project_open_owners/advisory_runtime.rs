@@ -6,6 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
+use tracedecay_application::context_scout::ContextScoutDeliveryOutcomeV1;
+use tracedecay_application::feedback::observations::{
+    FeedbackDeliveryRouteV1, FeedbackOperationV1, FeedbackOutcomeV1, FeedbackSourceEventV1,
+};
 use tracedecay_application::feedback::{
     FeedbackRuntimeStatePort, GITHUB_REVIEW_INGEST_CAPABILITY_ID_V1,
     GITHUB_REVIEW_INGEST_USE_CASE_ID_V1, GitHubReviewReadRequestV1, ProximityEvaluationRequestV1,
@@ -31,6 +35,7 @@ use tracedecay_lsp::{
     DiagnosticTrigger, FeedbackCycleRequest, FeedbackCycleRuntimePort, LspRuntimeFailure,
     LspRuntimeFuture,
 };
+use tracedecay_session_memory::context::MonotonicDeadline;
 use tracedecay_usecases::advisory::github_runtime::{
     ConfiguredGitHubSourceAccessAuthorityV1, GitHubDiscoveryControlV1,
     GitHubExactCommitDiscoveryOutcomeV1, GitHubProviderLifecycleV1, GitHubSourceAccessAuthorityV1,
@@ -49,17 +54,13 @@ use tracedecay_usecases::advisory::{
     discover_production_ci_failure_request_v1, github_anchor_authorities_arc_v1,
     register_advisory_hook_notice_queue, unregister_advisory_hook_notice_queue,
 };
-use tracedecay_usecases::context::MonotonicDeadline;
 use tracedecay_usecases::delivery::{
     ProjectDeliveryProviderMountGateV1, ProjectDeliveryReadAuthorityOpenOutcomeV1,
     ProjectDeliveryReadOpenV1, ProjectDeliveryReviewBodySourceV1,
     gated_project_delivery_read_handle_v1, open_project_delivery_read_authority_v1,
 };
 use tracedecay_usecases::feedback::concrete::FeedbackRuntime;
-use tracedecay_usecases::feedback::observations::{
-    FeedbackDeliveryRouteV1, FeedbackObservationEmitterV1, FeedbackOperationV1, FeedbackOutcomeV1,
-    FeedbackSourceEventV1,
-};
+use tracedecay_usecases::feedback::observations::FeedbackObservationEmitterV1;
 use tracedecay_usecases::feedback::{
     FeedbackCycleInvocation, FeedbackCycleLspInput, FeedbackCycleRuntime,
     ProductionFeedbackCycleAuthorizationFuture, ProductionFeedbackCycleAuthorizationPort,
@@ -79,14 +80,17 @@ use crate::agents::context_scout_ports::{
     ContextScoutConfigurationPinV1, ProjectContextScoutAddressRegistryV1,
 };
 use crate::agents::context_scout_v2::{
-    ContextScoutDeliverySelectionInputV1, ContextScoutOutcomeV1, ContextScoutRuntimeOutcomeV1,
-    ContextScoutServiceStateV1, ContextScoutTriggerV1,
+    ContextScoutDeliverySelectionInputV1, ContextScoutRuntimeOutcomeV1, ContextScoutServiceStateV1,
+    ContextScoutTriggerV1,
 };
 use crate::daemon::context_scout_lifecycle::{
     AuthorityRegistrationV1, register_context_scout_lifecycle_authority,
     unregister_context_scout_lifecycle_authority,
 };
-use crate::daemon::service::invocation::{
+use crate::mcp::McpServer;
+use crate::mcp::tools::handlers::hook_runtime::daemon_mint_hook_v2_file_id;
+use tracedecay_daemon_service::RegisteredDeliveryReadAuthorityV1;
+use tracedecay_daemon_service::{
     BoundedHookOrchestratorV1, DaemonAdvisoryCycleInvocationFuture,
     DaemonAdvisoryCycleInvocationOwner, DaemonAdvisoryCycleInvocationPort,
     DaemonAdvisoryCycleInvocationRequest, HookOrchestrationRequestV1, HookOrchestrationTriggerV1,
@@ -94,10 +98,7 @@ use crate::daemon::service::invocation::{
     daemon_operation_event_authority, register_hook_orchestration_runtime,
     unregister_hook_orchestration_runtime,
 };
-use crate::daemon::service::project_runtime::RegisteredDeliveryReadAuthorityV1;
-use crate::mcp::McpServer;
-use crate::mcp::tools::handlers::hook_runtime::daemon_mint_hook_v2_file_id;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 mod deferred;
 mod model;
@@ -186,6 +187,7 @@ impl ProjectOpenAdvisoryFeedbackCycleV1 {
     /// next cycle instead of rejecting every cycle as
     /// `feedback-cycle-configuration-drift` until the project is reopened, and
     /// files sealed by later generations stay eligible without a reopen.
+    #[hotpath::skip]
     async fn run_cycle(
         &self,
         request: FeedbackCycleRequest,
@@ -200,6 +202,7 @@ impl ProjectOpenAdvisoryFeedbackCycleV1 {
             .await
     }
 
+    #[hotpath::skip]
     async fn run_cycle_with_lsp_input(
         &self,
         lsp_input: FeedbackCycleLspInput,
@@ -462,7 +465,7 @@ impl DaemonAdvisoryCycleInvocationPort for ProjectOpenAdvisoryFeedbackCycleV1 {
 struct ProjectOpenFeedbackCycleAuthorizationV1 {
     project_root: std::path::PathBuf,
     scope: tracedecay_application::ResolvedScope,
-    configuration: Arc<tracedecay_usecases::configuration::ProjectConfigurationRuntime>,
+    configuration: Arc<tracedecay_configuration::ProjectConfigurationRuntime>,
 }
 
 impl ProductionFeedbackCycleAuthorizationPort for ProjectOpenFeedbackCycleAuthorizationV1 {
@@ -528,7 +531,7 @@ struct ProjectOpenScoutProducerV1 {
     code_index_schedulers:
         tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1,
     session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
-    code_graph: Arc<dyn tracedecay_usecases::graph::CodeGraphProjectionReadPort>,
+    code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
     requester: tracedecay_domain::ActorId,
     diagnostic_broker: Arc<tokio::sync::Mutex<tracedecay_lsp::analyzer::broker::DiagnosticBroker>>,
 }
@@ -564,7 +567,7 @@ async fn current_feedback_lsp_input(
         .current()
         .await
         .map_err(|_| LspRuntimeFailure::new("feedback-cycle-current-configuration"))?;
-    let current_configuration = tracedecay_usecases::configuration::ConfigurationCurrentStateV1 {
+    let current_configuration = tracedecay_configuration::ConfigurationCurrentStateV1 {
         revision_id: pinned_configuration.revision_id,
         snapshot: pinned_configuration.snapshot,
     };
@@ -698,7 +701,7 @@ async fn run_production_hook_cycle(
     else {
         return HookOrchestrationWorkOutcomeV1::RetryableFailure;
     };
-    let current_configuration = tracedecay_usecases::configuration::ConfigurationCurrentStateV1 {
+    let current_configuration = tracedecay_configuration::ConfigurationCurrentStateV1 {
         revision_id: pinned_configuration.revision_id.clone(),
         snapshot: pinned_configuration.snapshot.clone(),
     };
@@ -773,11 +776,11 @@ async fn run_production_hook_cycle(
                 delivery.feedback.is_none()
                     && matches!(
                         delivery.receipt.outcome,
-                        ContextScoutOutcomeV1::Attempted
-                            | ContextScoutOutcomeV1::Delayed
-                            | ContextScoutOutcomeV1::Displayed
-                            | ContextScoutOutcomeV1::Expanded
-                            | ContextScoutOutcomeV1::Unknown
+                        ContextScoutDeliveryOutcomeV1::Attempted
+                            | ContextScoutDeliveryOutcomeV1::Delayed
+                            | ContextScoutDeliveryOutcomeV1::Displayed
+                            | ContextScoutDeliveryOutcomeV1::Expanded
+                            | ContextScoutDeliveryOutcomeV1::Unknown
                     )
             })
     });
@@ -1173,7 +1176,7 @@ async fn register_production_advisory_owner(
         .map_err(|error| TraceDecayError::Config {
             message: format!("project-open automation configuration is unavailable: {error}"),
         })?;
-    let current_configuration = tracedecay_usecases::configuration::ConfigurationCurrentStateV1 {
+    let current_configuration = tracedecay_configuration::ConfigurationCurrentStateV1 {
         revision_id: configuration.revision_id.clone(),
         snapshot: configuration.snapshot.clone(),
     };
@@ -1462,6 +1465,7 @@ async fn register_project_delivery_read_authority(
                 state.scope.clone(),
                 Arc::clone(state.graph.configuration_runtime()),
                 handle,
+                Arc::new(super::DaemonOwnedProjectSourceAccess),
             ),
         )
         .await
@@ -1659,15 +1663,16 @@ async fn resolve_github_stack_observability(
             "GitHub stack observability lane is not mounted"
         );
     };
-    let topology_policy = match crate::config::topology::resolved_work_topology_policy(
-        &state.scout_configuration.snapshot,
-    ) {
-        Ok(policy) => policy.clone(),
-        Err(error) => {
-            unavailable("work_topology_policy", format!("{error:?}"));
-            return None;
-        }
-    };
+    let topology_policy =
+        match tracedecay_configuration::config::topology::resolved_work_topology_policy(
+            &state.scout_configuration.snapshot,
+        ) {
+            Ok(policy) => policy.clone(),
+            Err(error) => {
+                unavailable("work_topology_policy", format!("{error:?}"));
+                return None;
+            }
+        };
     // Mirrors the native-integration mount condition at project open: the
     // standard pull-request fallback exists exactly when this project is an
     // admitted Git worktree (project open fails earlier otherwise).
@@ -1793,8 +1798,8 @@ fn github_discovery_authorization_context(
         DisclosureClass::Evidence,
     )
     .ok()?;
-    let request_id = tracedecay_usecases::request_identity::mint_global_request_id(
-        tracedecay_usecases::request_identity::GlobalRequestSurface::ProjectOpenGithubDiscovery,
+    let request_id = tracedecay_application::request_identity::mint_global_request_id(
+        tracedecay_application::request_identity::GlobalRequestSurface::ProjectOpenGithubDiscovery,
     )
     .ok()?;
     RequestContext::new(
@@ -1819,7 +1824,8 @@ fn resolve_production_github_identity(
     if pull.target != *target || head != feedback_scope.head_commit_id {
         return None;
     }
-    let merge_base = Command::new(tracedecay_runtime_core::git::git_program())
+    let git = tracedecay_runtime_core::git::try_git_program().ok()?;
+    let merge_base = Command::new(git)
         .args([
             "-C",
             &project_root.to_string_lossy(),

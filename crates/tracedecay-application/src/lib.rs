@@ -11,7 +11,8 @@
 //! only on `tracedecay-domain`, `tracedecay-policy`, and
 //! `tracedecay-tool-catalog`, and defines the traits (`WorkStoragePort`,
 //! `WorkflowDefinitionAuthorityPort`, `StoreSizeTelemetryPort`,
-//! `AuthorizedScopeSet`, …) that storage and runtime crates implement.
+//! `SemanticActivationCoordinationPort`, `AuthorizedScopeSet`, …) that
+//! storage and runtime crates implement.
 //! `tracedecay-usecases` is the **product use-case orchestration layer at the
 //! top of the stack** — it depends on this crate (never the reverse) plus
 //! `tracedecay-runtime-core`, `tracedecay-sessions`, `tracedecay-global-db`
@@ -24,6 +25,8 @@
 pub mod advisory;
 pub mod authorization;
 mod bearer_token;
+#[cfg(feature = "native-git")]
+pub mod branch_snapshots;
 pub mod clock;
 pub mod configuration;
 mod configuration_wire;
@@ -44,16 +47,21 @@ mod identity;
 pub mod invocation;
 pub mod lsp_context_catalog;
 mod mcp_catalog;
+pub mod mcp_construction;
 pub mod memory;
 pub mod multi_root;
 pub mod observability;
 pub mod observatory_surface;
 pub mod policy;
+pub mod project_registry;
 pub mod remote;
+pub mod request_identity;
 pub mod result;
+pub mod retained_receipts;
 pub mod retained_surfaces;
 pub mod retrieval;
 pub mod sdk_catalog;
+pub mod semantic_activation;
 pub mod session_sync;
 pub mod settings_preview;
 pub mod source_edit;
@@ -222,6 +230,10 @@ pub use invocation::{
 };
 pub use lsp_context_catalog::{lsp_context_catalog_contribution, lsp_context_handler_descriptors};
 pub use mcp_catalog::mcp_executable_binding_registry;
+pub use mcp_construction::{
+    HookOrchestrationAdmissionV1, ProfileIdentityReadPort, SessionTemporalRefreshWakeFuture,
+    SessionTemporalRefreshWakePort, UnavailableSessionTemporalRefreshWake,
+};
 pub use multi_root::{
     AuthorizedMultiRootQueryService, AuthorizedRoot, AuthorizedRootAdmission, AuthorizedScopeSet,
     AuthorizedScopeSetAuthority, AuthorizedScopeSetError, MultiRootCollectionResolutionV1,
@@ -243,6 +255,15 @@ pub use policy::{
     PolicyEvidenceAgreementV1, PolicyEvidenceFrontierV1, PolicyEvidenceHorizonV1,
     RegisteredPolicyCapabilityV1,
 };
+pub use project_registry::{
+    ProjectRegistryContextCommand, ProjectRegistryContextFuture, ProjectRegistryContextOutcome,
+    ProjectRegistryContextView, ProjectRegistryEntry, ProjectRegistryListingCommand,
+    ProjectRegistryListingFuture, ProjectRegistryListingOutcome, ProjectRegistryListingScope,
+    ProjectRegistryListingView, ProjectRegistryReadPort, ProjectRegistrySelector,
+    ProjectRegistrySummary, ProjectRegistryView, ProjectRepoGroup, PublicCodeProject,
+    list_registered_projects, read_registered_project_context, render_project_registry_view,
+};
+pub use remote::status::RemoteOperationalStatusReadPort;
 pub use result::{
     APPLICATION_PROBLEM_REVISION, ApplicationEnvelope, ApplicationExecutionFailureClassV1,
     ApplicationOutcome, ApplicationProblem, ApplicationProblemEnvelope, ApplicationProblemKind,
@@ -257,6 +278,11 @@ pub use result::{
     RetrievalEvidence, RetrieverContribution, RetrieverContributionState, RetryDirective,
     RetryScope, SafeDiagnostic, ScoreId, StreamEvent, StreamEventKind, StreamFrontier, StreamGap,
     StreamTermination, StreamValidationError, TemporalState, validate_stream,
+};
+pub use retained_receipts::{
+    PreparedRetainedEffect, authority_receipt, effective_memory_deadline, evidence_outcome,
+    measured_budget, memory_expiry_partial, prepare_retained_effect, retained_effect_outcome,
+    session_refresh_effect_outcome,
 };
 pub use retained_surfaces::{
     RetainedLcmExecutionPortV1, RetainedLcmRequestV1, RetainedMemoryExecutionPortV1,
@@ -299,6 +325,9 @@ pub use retrieval::{
     callable_code_request_schema, callable_code_result_schema,
 };
 pub use sdk_catalog::sdk_executable_binding_registry;
+pub use semantic_activation::{
+    SemanticActivationCoordinationErrorV1, SemanticActivationCoordinationPort,
+};
 pub use settings_preview::{
     MIN_AUTO_TRACK_PR_POLL_SECS_V1, ProjectSettingsPatchInputV1, SettingsValidationIssueV1,
     validate_project_settings_patch,
@@ -332,7 +361,7 @@ pub use surface_contracts::{
     CodeImplementationsSurfaceRequest, CodeNavigationSurfaceRequest,
     CodePhraseSearchSurfaceRequest, CodeSignatureSearchSurfaceRequest,
     CodeSymbolSearchSurfaceRequest, CodeTimelineSurfaceRequest, CodeTypeHierarchySurfaceRequest,
-    NativeIntegrationSurfaceRequest, PrimitiveCodeSurfaceRequest,
+    NativeIntegrationSurfaceRequest, PrimitiveCodeSurfaceRequest, primitive_code_into_primitive,
 };
 pub use work::*;
 pub use work_artifact_hydration::*;
@@ -346,12 +375,12 @@ pub use work_evidence::{
     WorkAttemptReceiptReadErrorV1, WorkAttemptReceiptReadPortV1, WorkAttemptReceiptV1,
     WorkEvidenceContinuationV1, WorkEvidenceCoverageStateV1, WorkEvidenceCoverageV1,
     WorkEvidenceExpansionSelectorV1, WorkEvidenceFreshnessV1, WorkEvidenceHydrationErrorV1,
-    WorkEvidenceOmissionReasonV1, WorkEvidenceOmissionV1, WorkEvidenceRetrievalServiceV1,
-    WorkEvidenceRetrievalV1, WorkEvidenceRetrieveRequestV1, WorkEvidenceRootReadErrorV1,
-    WorkEvidenceRootReadPortV1, WorkEvidenceSourceV1, WorkTaskSessionContinuationV1,
-    WorkTaskSessionCoverageV1, WorkTaskSessionEvidenceV1, WorkTaskSessionFuture,
-    WorkTaskSessionHydrationStateV1, WorkTaskSessionHydrationV1, WorkTaskSessionPortV1,
-    WorkTaskSessionRankContributionV1, WorkTaskSessionRankedAnchorV1,
+    WorkEvidenceOmissionReasonV1, WorkEvidenceOmissionV1, WorkEvidenceRetrievalPortV1,
+    WorkEvidenceRetrievalServiceV1, WorkEvidenceRetrievalV1, WorkEvidenceRetrieveRequestV1,
+    WorkEvidenceRootReadErrorV1, WorkEvidenceRootReadPortV1, WorkEvidenceSourceV1,
+    WorkTaskSessionContinuationV1, WorkTaskSessionCoverageV1, WorkTaskSessionEvidenceV1,
+    WorkTaskSessionFuture, WorkTaskSessionHydrationStateV1, WorkTaskSessionHydrationV1,
+    WorkTaskSessionPortV1, WorkTaskSessionRankContributionV1, WorkTaskSessionRankedAnchorV1,
     WorkTaskSessionReauthorizationErrorV1, WorkTaskSessionReauthorizationPortV1,
     WorkTaskSessionRequestV1,
 };

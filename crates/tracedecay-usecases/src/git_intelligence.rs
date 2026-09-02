@@ -55,6 +55,8 @@ use tracedecay_domain::research::{ManifestDigest, RepositoryId, WorktreeId, cano
 use tracedecay_runtime_core::cancellation::CancellationToken;
 use tracedecay_runtime_core::git_repository::GitRepositoryError;
 
+/// Git churn reads for structural-health and test-risk analysis.
+pub mod churn;
 mod topology;
 
 /// Read subcommands the adapter is allowed to run. Anything outside this
@@ -1729,10 +1731,13 @@ mod tests {
     use tracedecay_domain::git::GitStatusEntryV1;
 
     fn git_available() -> bool {
-        Command::new(tracedecay_runtime_core::git::git_program())
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success())
+        Command::new(
+            tracedecay_runtime_core::git::try_git_program()
+                .expect("absolute git executable should resolve"),
+        )
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
     }
 
     struct Fixture {
@@ -1745,19 +1750,22 @@ mod tests {
         }
 
         fn git(&self, args: &[&str]) -> Output {
-            Command::new(tracedecay_runtime_core::git::git_program())
-                .args([
-                    "-c",
-                    "user.name=Fixture",
-                    "-c",
-                    "user.email=fixture@example.com",
-                    "-c",
-                    "commit.gpgsign=false",
-                ])
-                .args(args)
-                .current_dir(self.path())
-                .output()
-                .expect("git spawn failed")
+            Command::new(
+                tracedecay_runtime_core::git::try_git_program()
+                    .expect("absolute git executable should resolve"),
+            )
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(self.path())
+            .output()
+            .expect("git spawn failed")
         }
 
         fn git_ok(&self, args: &[&str]) -> String {
@@ -1829,36 +1837,42 @@ mod tests {
             linked.to_str().unwrap(),
         ]);
         std::fs::write(linked.join("src/main.txt"), "feature\n").unwrap();
-        let output = Command::new(tracedecay_runtime_core::git::git_program())
-            .args([
-                "-c",
-                "user.name=Fixture",
-                "-c",
-                "user.email=fixture@example.com",
-                "-c",
-                "commit.gpgsign=false",
-                "add",
-                "-A",
-            ])
-            .current_dir(&linked)
-            .output()
-            .unwrap();
+        let output = Command::new(
+            tracedecay_runtime_core::git::try_git_program()
+                .expect("absolute git executable should resolve"),
+        )
+        .args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "add",
+            "-A",
+        ])
+        .current_dir(&linked)
+        .output()
+        .unwrap();
         assert!(output.status.success());
-        let output = Command::new(tracedecay_runtime_core::git::git_program())
-            .args([
-                "-c",
-                "user.name=Fixture",
-                "-c",
-                "user.email=fixture@example.com",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-m",
-                "feature",
-            ])
-            .current_dir(&linked)
-            .output()
-            .unwrap();
+        let output = Command::new(
+            tracedecay_runtime_core::git::try_git_program()
+                .expect("absolute git executable should resolve"),
+        )
+        .args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "feature",
+        ])
+        .current_dir(&linked)
+        .output()
+        .unwrap();
         assert!(output.status.success());
         let feature_head =
             tracedecay_runtime_core::git::git_capture(&linked, &["rev-parse", "HEAD"]).unwrap();
@@ -2208,17 +2222,20 @@ mod tests {
         // flagged submodule record.
         let sub_path = fixture.path().join("deps/sub");
         std::fs::write(sub_path.join("lib.txt"), "v2\n").unwrap();
-        Command::new(tracedecay_runtime_core::git::git_program())
-            .args([
-                "-c",
-                "user.name=Fixture",
-                "-c",
-                "user.email=fixture@example.com",
-            ])
-            .args(["commit", "-am", "submodule v2"])
-            .current_dir(&sub_path)
-            .output()
-            .unwrap();
+        Command::new(
+            tracedecay_runtime_core::git::try_git_program()
+                .expect("absolute git executable should resolve"),
+        )
+        .args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+        ])
+        .args(["commit", "-am", "submodule v2"])
+        .current_dir(&sub_path)
+        .output()
+        .unwrap();
 
         let status = adapter.status().unwrap();
         let entry = status.entries.iter().find_map(|entry| match entry {

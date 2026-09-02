@@ -18,6 +18,7 @@ pub(crate) struct RuntimeWriterPersistence<E> {
 }
 
 impl<E> RuntimeWriterPersistence<E> {
+    #[hotpath::skip]
     pub(crate) const fn new(executor: E) -> Self {
         Self { executor }
     }

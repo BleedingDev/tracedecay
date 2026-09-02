@@ -37,7 +37,7 @@ async fn observation_authority_audit_observes_the_real_invariant_pass() {
     let directory = tempfile::TempDir::new().expect("authority audit fixture root");
     let uninitialized_path = directory.path().join("uninitialized.db");
     let database_path = directory.path().join("registry.db");
-    crate::daemon::store_runtime::register_registered_schema_installer();
+    tracedecay_store_runtime::register_registered_schema_installer();
     let uninitialized_authority = tracedecay_runtime_core::db::DatabaseAuthority::acquire_test(
         &uninitialized_path,
         "doctor uninitialized authority audit fixture",
@@ -239,7 +239,7 @@ fn retained_or_unreported_observation_history_is_not_absent() {
     let mut active =
         tracedecay_usecases::feedback::observations::FeedbackObservationReadModelV1::project(&[])
             .expect("active empty projection");
-    active.coverage = tracedecay_usecases::feedback::observations::FeedbackCoverageV1::Known;
+    active.coverage = tracedecay_application::feedback::observations::FeedbackCoverageV1::Known;
     active.watermark.producer_boot_id =
         Some(tracedecay_domain::canonical_sha256(&"active-observation-boot").unwrap());
     assert_eq!(

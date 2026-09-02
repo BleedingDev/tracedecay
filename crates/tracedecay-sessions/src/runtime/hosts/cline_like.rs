@@ -182,7 +182,6 @@ impl TranscriptSource for ClineLikeSource {
         self.provider
     }
 
-    #[hotpath::measure(label = "sessions.hosts.cline_like.transcript_paths")]
     fn transcript_paths(&self, project_root: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         for root in &self.storage_roots {
@@ -229,7 +228,6 @@ impl ClineLikeSource {
         self.snapshot_location_from_metadata(&metadata, project_root)
     }
 
-    #[hotpath::measure(label = "sessions.hosts.cline_like.snapshot_location")]
     fn snapshot_location_from_metadata(
         &self,
         metadata: &Value,
@@ -268,7 +266,6 @@ impl ClineLikeSource {
         }
     }
 
-    #[hotpath::measure(label = "sessions.hosts.cline_like.parse_snapshot")]
     fn parse_snapshot(
         &self,
         path: &Path,

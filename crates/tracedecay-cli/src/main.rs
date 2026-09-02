@@ -12,23 +12,51 @@ use std::ffi::OsStr;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+#[cfg(feature = "hotpath")]
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "hotpath-alloc")]
 #[global_allocator]
 static HOTPATH_ALLOCATOR: hotpath::CountingAllocator = hotpath::CountingAllocator::new();
 
+// Opt-in allocator features (see Cargo.toml). Exactly one global allocator
+// may exist per binary, so overlapping selections resolve by fixed precedence
+// rather than a compile error: hotpath-alloc's counting allocator wins in
+// measurement builds, then jemalloc, then mimalloc. The default build keeps
+// the system allocator (glibc malloc on Linux), whose retained-arena behavior
+// the daemon compensates for with `malloc_trim` at maintenance boundaries and
+// `MALLOC_ARENA_MAX=2` in the installed service unit; neither compensation is
+// load-bearing under jemalloc or mimalloc.
+#[cfg(all(feature = "alloc-jemalloc", not(feature = "hotpath-alloc")))]
+#[global_allocator]
+static JEMALLOC_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(
+    feature = "alloc-mimalloc",
+    not(feature = "alloc-jemalloc"),
+    not(feature = "hotpath-alloc")
+))]
+#[global_allocator]
+static MIMALLOC_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod agent_cmd;
+mod analytics_cmd;
 mod automation_cli;
 mod cli;
 mod commands;
 mod cost_cmd;
+mod display;
 mod git_cmd;
 mod global;
 mod hook_capture_cmd;
 mod hook_cmd;
 mod lsp_cmd;
+mod monitor_cmd;
+mod product_runtime;
 mod project_cmd;
 mod remote_command;
+mod semantic_cmd;
+mod serve_cmd;
 mod sessions_cmd;
 mod status_cmd;
 mod tool_command;
@@ -38,8 +66,6 @@ mod work_cli;
 mod work_command;
 mod workflow_cli;
 mod workflow_command;
-
-pub use tracedecay::serve;
 
 use cli::*;
 use tracedecay::daemon::StderrTracingDefault;
@@ -161,12 +187,19 @@ impl Drop for Spinner {
 /// an explicit stack size gives every platform the same headroom.
 const ASYNC_STACK_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ASYNC_WORKER_THREADS: usize = 16;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsyncRuntimeFlavor {
+    CurrentThread,
+    MultiThread,
+}
 #[cfg(feature = "hotpath")]
 const HOTPATH_OUTPUT_FORMAT_ENV: &str = "HOTPATH_OUTPUT_FORMAT";
 #[cfg(feature = "hotpath")]
 const HOTPATH_OUTPUT_PATH_ENV: &str = "HOTPATH_OUTPUT_PATH";
 #[cfg(feature = "hotpath")]
 const HOTPATH_FOCUS_ENV: &str = "HOTPATH_FOCUS";
+#[cfg(feature = "hotpath")]
+const HOTPATH_METRICS_SERVER_OFF_ENV: &str = "HOTPATH_METRICS_SERVER_OFF";
 const MIN_SERVING_BLOCKING_RESERVE: usize = 4;
 const DEFAULT_MAX_DAEMON_CPU_THREADS: usize = 16;
 const DAEMON_CPU_THREADS_ENV: &str = "TRACEDECAY_DAEMON_CPU_THREADS";
@@ -176,6 +209,17 @@ fn async_worker_threads() -> usize {
     std::thread::available_parallelism()
         .map_or(1, usize::from)
         .clamp(1, MAX_ASYNC_WORKER_THREADS)
+}
+
+fn async_runtime_flavor(command: Option<&Commands>) -> AsyncRuntimeFlavor {
+    match command {
+        // `tool` is a one-shot daemon client. A multi-thread runtime eagerly
+        // starts up to 16 workers even though the command drives one socket
+        // request and exits; the current thread already has a fixed 16 MiB
+        // stack and Tokio's blocking pool remains available when needed.
+        Some(Commands::Tool { .. }) => AsyncRuntimeFlavor::CurrentThread,
+        _ => AsyncRuntimeFlavor::MultiThread,
+    }
 }
 
 /// Keep enough bounded blocking workers to run every admitted background CPU
@@ -248,9 +292,7 @@ fn is_daemon_run(command: Option<&Commands>) -> bool {
     )
 }
 
-fn install_daemon_cpu_pool(
-    command: Option<&Commands>,
-) -> tracedecay_runtime_core::errors::Result<()> {
+fn install_daemon_cpu_pool(command: Option<&Commands>) -> tracedecay_domain::errors::Result<()> {
     if !is_daemon_run(command) {
         return Ok(());
     }
@@ -269,16 +311,14 @@ fn install_daemon_cpu_pool(
             .as_ref()
             .map(|(source, value)| (*source, value.as_str())),
     )
-    .map_err(|message| tracedecay_runtime_core::errors::TraceDecayError::Config { message })?;
+    .map_err(|message| tracedecay_domain::errors::TraceDecayError::Config { message })?;
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|index| format!("tracedecay-cpu-{index}"))
         .build_global()
-        .map_err(
-            |error| tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: format!("failed to start daemon CPU pool: {error}"),
-            },
-        )
+        .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!("failed to start daemon CPU pool: {error}"),
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,6 +380,15 @@ fn hotpath_requires_protocol_safe_output(
 #[cfg(feature = "hotpath")]
 fn configure_hotpath_output(args: &[std::ffi::OsString]) -> Result<(), String> {
     let hook_protocol = hook_capture_cmd::is_hook_protocol_invocation(args);
+    if hook_protocol {
+        // Hook stderr belongs to the host and the process serves exactly one
+        // request, so the live metrics endpoint has no consumer here. Losing
+        // the fixed-port race would print a hotpath error onto the host's
+        // stderr stream, which hosts read as a hook failure.
+        unsafe {
+            std::env::set_var(HOTPATH_METRICS_SERVER_OFF_ENV, "1");
+        }
+    }
     let output_path = std::env::var_os(HOTPATH_OUTPUT_PATH_ENV);
     let output_format = std::env::var_os(HOTPATH_OUTPUT_FORMAT_ENV);
     let focus = std::env::var_os(HOTPATH_FOCUS_ENV);
@@ -397,7 +446,53 @@ fn configure_hotpath_output(args: &[std::ffi::OsString]) -> Result<(), String> {
 
 #[cfg(feature = "hotpath")]
 fn hotpath_guard() -> hotpath::HotpathGuard {
-    hotpath::HotpathGuardBuilder::new("tracedecay").build()
+    // The CPU report section autospawns an external `hotpath-samply`/`samply`
+    // profiler that SIGSTOPs this process while it attaches perf sampling and
+    // SIGCONTs it only once the attach succeeds. A profiler failure inside
+    // that window leaves the process stopped forever, so headless invocations
+    // (hooks, `--yes` flows, protocol streams) must never enter it implicitly.
+    // CPU sampling remains available only by explicit operator request:
+    // `HOTPATH_REPORT` (e.g. `functions-cpu`) takes precedence over this
+    // default exclusion.
+    hotpath::HotpathGuardBuilder::new("tracedecay")
+        .sections_exclude(vec![hotpath::Section::FunctionsCpu])
+        .build()
+}
+
+#[cfg(feature = "hotpath")]
+struct ProcessHotpathGuard {
+    guard: Arc<Mutex<Option<hotpath::HotpathGuard>>>,
+}
+
+#[cfg(feature = "hotpath")]
+impl ProcessHotpathGuard {
+    #[hotpath::measure(label = "cli.hotpath.install_shutdown_finalizer")]
+    fn install(guard: hotpath::HotpathGuard) -> Result<Self, String> {
+        let guard = Arc::new(Mutex::new(Some(guard)));
+        let watchdog_guard = Arc::clone(&guard);
+        if !tracedecay::daemon::install_hotpath_shutdown_finalizer(move || {
+            let guard = watchdog_guard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            drop(guard);
+        }) {
+            return Err("Hotpath shutdown finalizer is already installed".to_owned());
+        }
+        Ok(Self { guard })
+    }
+}
+
+#[cfg(feature = "hotpath")]
+impl Drop for ProcessHotpathGuard {
+    fn drop(&mut self) {
+        let guard = self
+            .guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(guard);
+    }
 }
 
 fn main() -> ExitCode {
@@ -408,7 +503,13 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     #[cfg(feature = "hotpath")]
-    let _hotpath = hotpath_guard();
+    let _hotpath = match ProcessHotpathGuard::install(hotpath_guard()) {
+        Ok(guard) => guard,
+        Err(message) => {
+            eprintln!("Error: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
     // The guard belongs to the real process boundary rather than the async
     // command body. Native capture hooks intentionally bypass the ordinary
     // composition root, and Clap can terminate before a Tokio runtime exists;
@@ -447,13 +548,20 @@ fn main() -> ExitCode {
     }
 }
 
-fn async_main() -> tracedecay_runtime_core::errors::Result<CommandOutcome> {
+fn async_main() -> tracedecay_domain::errors::Result<CommandOutcome> {
+    // This binary is the sole generator of source provenance and the embedded
+    // dashboard bundle; the composition library reads both through this
+    // set-once registration.
+    tracedecay::register_product_runtime(crate::product_runtime::provider())?;
     // Every process-global runtime port the extracted crates invert back into
     // the composition root. Must precede argument parsing: hook, install, and
     // ingest paths all read these slots, and an unregistered slot fails quietly
     // (no LCM redaction, no memory injection, zero turn costs) rather than
-    // loudly.
-    tracedecay::register_runtime_ports()?;
+    // loudly. The agent-host MCP catalog is the one exception: assembling all
+    // schemas costs hundreds of milliseconds and `tool` resolves its selected
+    // operation directly, so that port is installed only after parsing proves
+    // another command needs the eager catalog check.
+    tracedecay::register_runtime_ports_without_mcp_tool_catalog();
     let args: Vec<String> = std::env::args().collect();
     #[cfg(feature = "hotpath")]
     if let Some(command) = args.get(1) {
@@ -474,7 +582,7 @@ fn async_main() -> tracedecay_runtime_core::errors::Result<CommandOutcome> {
     };
     #[cfg(feature = "hotpath")]
     let command_name = command_profile_label(&matches);
-    let cli = match Cli::from_arg_matches(&matches) {
+    let mut cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
         Err(error) => {
             let code = error.exit_code();
@@ -482,6 +590,10 @@ fn async_main() -> tracedecay_runtime_core::errors::Result<CommandOutcome> {
             return Ok(CommandOutcome::Exit(code));
         }
     };
+    normalize_tool_reserved_global_flags(&mut cli);
+    if requires_eager_mcp_tool_catalog(cli.command.as_ref()) {
+        tracedecay::agents::register_mcp_tool_catalog_ports()?;
+    }
     if let Some(Commands::Daemon {
         action:
             DaemonAction::Run {
@@ -514,20 +626,29 @@ fn async_main() -> tracedecay_runtime_core::errors::Result<CommandOutcome> {
         "daemon_cpu_pool_install",
         install_daemon_cpu_pool(cli.command.as_ref())
     )?;
-    let worker_threads = async_worker_threads();
+    let runtime_flavor = async_runtime_flavor(cli.command.as_ref());
+    let worker_threads = match runtime_flavor {
+        AsyncRuntimeFlavor::CurrentThread => 1,
+        AsyncRuntimeFlavor::MultiThread => async_worker_threads(),
+    };
     let blocking_threads = tokio_blocking_thread_limit();
     let runtime = hotpath::measure_block!("tokio_runtime_build", {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(worker_threads)
-            .max_blocking_threads(blocking_threads)
-            .thread_stack_size(ASYNC_STACK_BYTES)
-            .build()
-            .map_err(
-                |e| tracedecay_runtime_core::errors::TraceDecayError::Config {
-                    message: format!("failed to start async runtime: {e}"),
-                },
-            )
+        let build = match runtime_flavor {
+            AsyncRuntimeFlavor::CurrentThread => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(blocking_threads)
+                .thread_stack_size(ASYNC_STACK_BYTES)
+                .build(),
+            AsyncRuntimeFlavor::MultiThread => tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(worker_threads)
+                .max_blocking_threads(blocking_threads)
+                .thread_stack_size(ASYNC_STACK_BYTES)
+                .build(),
+        };
+        build.map_err(|e| tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!("failed to start async runtime: {e}"),
+        })
     })?;
     #[cfg(feature = "hotpath")]
     {
@@ -610,7 +731,7 @@ fn command_profile_label(matches: &ArgMatches) -> String {
     }
 }
 
-async fn run(cli: Cli) -> tracedecay_runtime_core::errors::Result<CommandOutcome> {
+async fn run(cli: Cli) -> tracedecay_domain::errors::Result<CommandOutcome> {
     let host_bundle = HostBundleCliOptions {
         component: cli.component,
         dry_run: cli.dry_run,
@@ -634,13 +755,13 @@ async fn run_startup_preamble(command: &Commands) {
     let startup_policy = CommandStartupPolicy::for_command(command);
 
     // Check first-run before any config save creates the file.
-    let is_first_run = tracedecay_usecases::user_config::UserConfig::is_fresh();
+    let is_first_run = tracedecay_session_memory::user_config::UserConfig::is_fresh();
 
     let is_force_flush = matches!(
         command,
         Commands::Init { .. } | Commands::Sync { .. } | Commands::Status { .. }
     );
-    let mut user_config = tracedecay_usecases::user_config::UserConfig::load();
+    let mut user_config = tracedecay_session_memory::user_config::UserConfig::load();
     // Skip the worldwide-counter flush on hot startup paths. `try_flush`
     // makes a synchronous HTTP call which can add seconds to
     // `tracedecay serve` startup on slow networks — long enough to blow the
@@ -696,7 +817,7 @@ async fn run_startup_preamble(command: &Commands) {
 async fn resolve_registered_project_root(
     project_id: Option<String>,
     project_path: Option<String>,
-) -> tracedecay_runtime_core::errors::Result<Option<PathBuf>> {
+) -> tracedecay_domain::errors::Result<Option<PathBuf>> {
     let Some(selector) = project_id.or(project_path) else {
         return Ok(None);
     };
@@ -713,11 +834,9 @@ async fn resolve_registered_project_root(
         .get("project")
         .and_then(|project| project.get("display_root"))
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(
-            || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: "registered project not found for selector".to_string(),
-            },
-        )?;
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: "registered project not found for selector".to_string(),
+        })?;
     Ok(Some(PathBuf::from(display_root)))
 }
 
@@ -725,7 +844,7 @@ pub(crate) async fn resolve_cli_project_root(
     path: Option<String>,
     project_id: Option<String>,
     project_path: Option<String>,
-) -> tracedecay_runtime_core::errors::Result<PathBuf> {
+) -> tracedecay_domain::errors::Result<PathBuf> {
     if let Some(root) = resolve_registered_project_root(project_id, project_path).await? {
         return Ok(root);
     }
@@ -773,6 +892,7 @@ impl CommandFamily {
             Commands::Tool { .. }
             | Commands::Work { .. }
             | Commands::Workflow { .. }
+            | Commands::Semantic { .. }
             | Commands::Lsp { .. }
             | Commands::Remote { .. }
             | Commands::Dashboard { .. }
@@ -841,16 +961,35 @@ fn validate_host_bundle_options(
     command: &Commands,
     family: CommandFamily,
     host_bundle: &HostBundleCliOptions,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     // `wipe` is the one non-lifecycle command that destroys deployed state, so
     // it takes the same `--yes` confirmation as the lifecycle mutations instead
     // of an interactive-only `go!` prompt. It owns no host component and has no
     // preview, so `--component` and `--dry-run` stay rejected.
     if matches!(command, Commands::Wipe { .. }) {
         if host_bundle.component.is_some() || host_bundle.dry_run || host_bundle.adopt {
-            return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: "wipe accepts --yes to confirm; --component, --dry-run, and --adopt are only valid \
                           with install, update-plugin, reinstall, or uninstall"
+                    .to_string(),
+            });
+        }
+        return Ok(());
+    }
+    // `projects forget` destroys one registered project's rows and stores, so
+    // it REQUIRES `--yes` (its handler refuses to run without it) and takes
+    // the global `--dry-run` as its preview. It owns no host component.
+    if matches!(
+        command,
+        Commands::Projects {
+            action: ProjectsAction::Forget { .. },
+        }
+    ) {
+        if host_bundle.component.is_some() || host_bundle.adopt {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
+                message: "projects forget accepts --yes to confirm and --dry-run to preview; \
+                          --component and --adopt are only valid with install, update-plugin, \
+                          reinstall, or uninstall"
                     .to_string(),
             });
         }
@@ -867,7 +1006,7 @@ fn validate_host_bundle_options(
         }
     ) {
         if host_bundle.component.is_some() || host_bundle.dry_run || host_bundle.adopt {
-            return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: "storage resets accept --yes to confirm; --component, --dry-run, and --adopt are \
                           only valid with install, update-plugin, reinstall, or uninstall"
                     .to_string(),
@@ -887,14 +1026,14 @@ fn validate_host_bundle_options(
             || host_bundle.yes
             || host_bundle.adopt)
     {
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message:
                 "--component, --dry-run, --yes, and --adopt are only valid with install, update-plugin, reinstall, or uninstall"
                     .to_string(),
         });
     }
     if host_bundle.adopt && !host_bundle.yes {
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message:
                 "--adopt requires --yes because it authorizes taking ownership of existing bytes"
                     .to_string(),
@@ -906,7 +1045,7 @@ fn validate_host_bundle_options(
             Commands::Install { .. } | Commands::UpdatePlugin { .. } | Commands::Reinstall { .. }
         )
     {
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: "--adopt is valid only with install, update-plugin, or reinstall".to_string(),
         });
     }
@@ -928,12 +1067,12 @@ fn is_full_component_set_adoption(command: &Commands, host_bundle: &HostBundleCl
 async fn dispatch_command(
     command: Commands,
     host_bundle: HostBundleCliOptions,
-) -> tracedecay_runtime_core::errors::Result<CommandOutcome> {
+) -> tracedecay_domain::errors::Result<CommandOutcome> {
     let family = CommandFamily::for_command(&command);
     validate_host_bundle_options(&command, family, &host_bundle)?;
     match family {
         CommandFamily::Project => {
-            dispatch_project_command(command, host_bundle.yes).await?;
+            dispatch_project_command(command, host_bundle.yes, host_bundle.dry_run).await?;
             Ok(CommandOutcome::Success)
         }
         CommandFamily::Runtime => {
@@ -967,7 +1106,8 @@ async fn dispatch_command(
 async fn dispatch_project_command(
     command: Commands,
     assume_yes: bool,
-) -> tracedecay_runtime_core::errors::Result<()> {
+    dry_run: bool,
+) -> tracedecay_domain::errors::Result<()> {
     match command {
         Commands::Init {
             path,
@@ -1011,7 +1151,7 @@ async fn dispatch_project_command(
                 .await?;
         }
         Commands::Projects { action } => {
-            project_cmd::handle_projects_action(action).await?;
+            project_cmd::handle_projects_action(action, assume_yes, dry_run).await?;
         }
         Commands::Branch { action } => {
             commands::handle_branch_action(action).await?;
@@ -1034,9 +1174,7 @@ async fn dispatch_project_command(
 }
 
 #[hotpath::measure(label = "cli.memory.status", future = true)]
-async fn dispatch_memory_command(
-    action: MemoryAction,
-) -> tracedecay_runtime_core::errors::Result<()> {
+async fn dispatch_memory_command(action: MemoryAction) -> tracedecay_domain::errors::Result<()> {
     match action {
         MemoryAction::Status {
             json,
@@ -1052,7 +1190,7 @@ async fn dispatch_memory_command(
             )
             .await?;
             let status: tracedecay_application::retained_surfaces::MemoryStatusResultV1 =
-                serde_json::from_value(result)?;
+                commands::retained_tool_payload("tracedecay_memory_status", result)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
@@ -1066,9 +1204,7 @@ async fn dispatch_memory_command(
     Ok(())
 }
 
-async fn dispatch_runtime_command(
-    command: Commands,
-) -> tracedecay_runtime_core::errors::Result<()> {
+async fn dispatch_runtime_command(command: Commands) -> tracedecay_domain::errors::Result<()> {
     match command {
         Commands::Tool {
             project,
@@ -1079,6 +1215,7 @@ async fn dispatch_runtime_command(
         }
         Commands::Work { invocation } => work_command::run(invocation).await?,
         Commands::Workflow { invocation } => workflow_command::run(invocation).await?,
+        Commands::Semantic { action } => semantic_cmd::run(action).await?,
         Commands::Remote { action } => {
             hotpath::measure_block!("cli.remote.run", crate::remote_command::run(action.into()))?;
         }
@@ -1109,11 +1246,9 @@ async fn dispatch_runtime_command(
             let url = result
                 .get("url")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(
-                    || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                        message: "daemon dashboard response omitted URL".to_string(),
-                    },
-                )?;
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: "daemon dashboard response omitted URL".to_string(),
+                })?;
             // The daemon keys hosted dashboards by canonicalized project
             // root, so any response reached here always serves this
             // project; only the requested host/port may differ from what is
@@ -1175,7 +1310,7 @@ async fn dispatch_runtime_command(
             // structured-row backfill sweep; one-shot CLI/hook processes never
             // do (they would drop the sweep mid-parse on exit).
             tracedecay::daemon::mark_process_long_lived_for_session_maintenance();
-            hotpath::future!(serve::run_serve(path, timings), label = "cli.serve.run").await?;
+            hotpath::future!(serve_cmd::run_serve(path, timings), label = "cli.serve.run").await?;
         }
         Commands::Daemon { action } => {
             dispatch_daemon_command(action).await?;
@@ -1185,9 +1320,7 @@ async fn dispatch_runtime_command(
     Ok(())
 }
 
-async fn dispatch_daemon_command(
-    action: DaemonAction,
-) -> tracedecay_runtime_core::errors::Result<()> {
+async fn dispatch_daemon_command(action: DaemonAction) -> tracedecay_domain::errors::Result<()> {
     match action {
         DaemonAction::Run {
             socket,
@@ -1198,8 +1331,8 @@ async fn dispatch_daemon_command(
         } => {
             // Long-lived host: allowed to run the structured-row sweep.
             tracedecay::daemon::mark_process_long_lived_for_session_maintenance();
-            let socket_path = tracedecay::daemon::socket_path_or_default(socket)?;
-            let remote_tls = tracedecay::daemon::RemoteBrainTlsConfig::from_optional_parts(
+            let socket_path = tracedecay_daemon_control::socket_path_or_default(socket)?;
+            let remote_tls = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
                 remote_listen,
                 remote_tls_cert.map(PathBuf::from),
                 remote_tls_key.map(PathBuf::from),
@@ -1223,37 +1356,39 @@ async fn dispatch_daemon_command(
             remote_tls_key,
         } => {
             let tracedecay_bin = tracedecay::agents::which_tracedecay_path().ok_or_else(|| {
-                tracedecay_runtime_core::errors::TraceDecayError::Config {
+                tracedecay_domain::errors::TraceDecayError::Config {
                     message: "tracedecay not found on PATH".to_string(),
                 }
             })?;
-            let remote_tls = tracedecay::daemon::RemoteBrainTlsConfig::from_optional_parts(
+            let remote_tls = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
                 remote_listen,
                 remote_tls_cert.map(PathBuf::from),
                 remote_tls_key.map(PathBuf::from),
             )?;
-            let spec = tracedecay::daemon::service_spec_with_remote_tls(
+            let spec = tracedecay_daemon_control::service_spec_with_remote_tls(
                 tracedecay_bin,
                 socket,
                 remote_tls,
             )?;
             let service_path = hotpath::measure_block!(
                 "cli.daemon.install_service",
-                tracedecay::daemon::install_service(&spec, !no_start)
+                tracedecay_daemon_control::install_service(
+                    &spec,
+                    !no_start,
+                    crate::product_runtime::PRODUCT_BUILD_VERSION,
+                )
             )?;
             eprintln!(
                 "Installed TraceDecay daemon service at {}",
                 service_path.display()
             );
             if cfg!(windows) {
-                let profile_root = tracedecay::daemon::installed_service_socket_path()?
+                let profile_root = tracedecay_daemon_control::installed_service_socket_path()?
                     .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
-                    .ok_or_else(
-                        || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                            message: "installed Windows daemon task has no absolute profile root"
-                                .to_string(),
-                        },
-                    )?;
+                    .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                        message: "installed Windows daemon task has no absolute profile root"
+                            .to_string(),
+                    })?;
                 eprintln!("Daemon profile root: {}", profile_root.display());
                 eprintln!("Daemon endpoint: authenticated loopback (authority-discovered)");
             } else {
@@ -1263,7 +1398,10 @@ async fn dispatch_daemon_command(
         DaemonAction::UninstallService { no_stop } => {
             let service_path = hotpath::measure_block!(
                 "cli.daemon.uninstall_service",
-                tracedecay::daemon::uninstall_service(!no_stop)
+                tracedecay_daemon_control::uninstall_service(
+                    !no_stop,
+                    crate::product_runtime::PRODUCT_BUILD_VERSION,
+                )
             )?;
             eprintln!(
                 "Removed TraceDecay daemon service at {}",
@@ -1271,21 +1409,34 @@ async fn dispatch_daemon_command(
             );
         }
         DaemonAction::Start => {
-            hotpath::measure_block!("cli.daemon.start", tracedecay::daemon::start_service())?;
+            hotpath::measure_block!(
+                "cli.daemon.start",
+                tracedecay_daemon_control::start_service(
+                    crate::product_runtime::PRODUCT_BUILD_VERSION
+                )
+            )?;
             eprintln!("Started TraceDecay daemon service");
         }
         DaemonAction::Stop => {
-            hotpath::measure_block!("cli.daemon.stop", tracedecay::daemon::stop_service())?;
+            hotpath::measure_block!(
+                "cli.daemon.stop",
+                tracedecay_daemon_control::stop_service(
+                    crate::product_runtime::PRODUCT_BUILD_VERSION
+                )
+            )?;
             eprintln!("Stopped TraceDecay daemon service");
         }
         DaemonAction::Restart => {
             hotpath::measure_block!("cli.daemon.restart", update_cmd::restart_daemon_service())?;
         }
         DaemonAction::Status => {
-            let socket_path = tracedecay::daemon::socket_path_or_default(None)?;
+            let socket_path = tracedecay_daemon_control::socket_path_or_default(None)?;
             hotpath::measure_block!(
                 "cli.daemon.status",
-                print!("{}", tracedecay::daemon::service_status(&socket_path))
+                print!(
+                    "{}",
+                    tracedecay_daemon_control::service_status(&socket_path)
+                )
             );
         }
     }
@@ -1295,7 +1446,7 @@ async fn dispatch_daemon_command(
 async fn dispatch_agent_command(
     command: Commands,
     host_bundle: HostBundleCliOptions,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     let full_reinstall_preflight = matches!(
         &command,
         Commands::Reinstall {
@@ -1318,7 +1469,7 @@ async fn dispatch_agent_command(
         && !full_reinstall_preflight
         && !full_component_set_adoption
     {
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: "--dry-run and --yes require --component to select the target host component"
                 .to_string(),
         });
@@ -1332,7 +1483,7 @@ async fn dispatch_agent_command(
         } => {
             if host_bundle.component.is_some() {
                 if local || automation || no_dashboard {
-                    return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                    return Err(tracedecay_domain::errors::TraceDecayError::Config {
                         message: "--component cannot be combined with --local, --automation, or --no-dashboard"
                             .to_string(),
                     });
@@ -1357,7 +1508,7 @@ async fn dispatch_agent_command(
         Commands::Reinstall { local, agent } => {
             if host_bundle.component.is_some() {
                 if local {
-                    return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                    return Err(tracedecay_domain::errors::TraceDecayError::Config {
                         message: "--component cannot be combined with --local".to_string(),
                     });
                 }
@@ -1382,7 +1533,7 @@ async fn dispatch_agent_command(
         Commands::UpdatePlugin { local, agent } => {
             if host_bundle.component.is_some() {
                 if local {
-                    return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                    return Err(tracedecay_domain::errors::TraceDecayError::Config {
                         message: "--component cannot be combined with --local".to_string(),
                     });
                 }
@@ -1405,7 +1556,7 @@ async fn dispatch_agent_command(
         Commands::Uninstall { agent, local } => {
             if host_bundle.component.is_some() {
                 if local {
-                    return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                    return Err(tracedecay_domain::errors::TraceDecayError::Config {
                         message: "--component cannot be combined with --local".to_string(),
                     });
                 }
@@ -1427,7 +1578,7 @@ async fn dispatch_agent_command(
         }
         Commands::FeedbackRollback { mut action } => {
             if host_bundle.component.is_some() || host_bundle.dry_run {
-                return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                return Err(tracedecay_domain::errors::TraceDecayError::Config {
                     message: "feedback-rollback does not accept host-component selectors"
                         .to_string(),
                 });
@@ -1450,7 +1601,7 @@ async fn dispatch_agent_command(
                 agent_cmd::handle_host_bundle_artifact_command(action, host_bundle).await?;
             } else {
                 if host_bundle.component.is_some() {
-                    return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                    return Err(tracedecay_domain::errors::TraceDecayError::Config {
                         message: "host-bundle recovery operates on the whole component set"
                             .to_string(),
                     });
@@ -1470,7 +1621,7 @@ async fn dispatch_agent_command(
 
 async fn dispatch_hook_command(
     command: Commands,
-) -> tracedecay_runtime_core::errors::Result<CommandOutcome> {
+) -> tracedecay_domain::errors::Result<CommandOutcome> {
     let code = match command {
         hook_command @ (Commands::HookPreToolUse
         | Commands::HookPromptSubmit
@@ -1507,7 +1658,7 @@ async fn dispatch_hook_command(
     Ok(CommandOutcome::Exit(code))
 }
 
-async fn dispatch_update_command(command: Commands) -> tracedecay_runtime_core::errors::Result<()> {
+async fn dispatch_update_command(command: Commands) -> tracedecay_domain::errors::Result<()> {
     match command {
         Commands::Upgrade { no_reinstall } => {
             update_cmd::run_upgrade_command(no_reinstall)?;
@@ -1531,7 +1682,11 @@ async fn dispatch_update_command(command: Commands) -> tracedecay_runtime_core::
             } => {
                 hotpath::measure_block!(
                     "cli.package_hook.prepare",
-                    tracedecay::daemon::prepare_scoop_package_service(&package_id, &state_file)
+                    tracedecay_daemon_control::prepare_scoop_package_service(
+                        &package_id,
+                        &state_file,
+                        crate::product_runtime::PRODUCT_BUILD_VERSION,
+                    )
                 )?;
             }
             ScoopPackageHookAction::Restore {
@@ -1540,7 +1695,11 @@ async fn dispatch_update_command(command: Commands) -> tracedecay_runtime_core::
             } => {
                 hotpath::measure_block!(
                     "cli.package_hook.restore",
-                    tracedecay::daemon::restore_scoop_package_service(&package_id, &state_file)
+                    tracedecay_daemon_control::restore_scoop_package_service(
+                        &package_id,
+                        &state_file,
+                        crate::product_runtime::PRODUCT_BUILD_VERSION,
+                    )
                 )?;
             }
         },
@@ -1562,7 +1721,7 @@ async fn dispatch_update_command(command: Commands) -> tracedecay_runtime_core::
 
 async fn dispatch_configuration_command(
     command: Commands,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     match command {
         Commands::CurrentCounter { path } => {
             let project_path = tracedecay::config::resolve_path(path);
@@ -1578,11 +1737,9 @@ async fn dispatch_configuration_command(
             let value = result
                 .get("counter")
                 .and_then(serde_json::Value::as_u64)
-                .ok_or_else(
-                    || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                        message: "daemon counter response omitted counter".to_string(),
-                    },
-                )?;
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: "daemon counter response omitted counter".to_string(),
+                })?;
             println!("{value}");
         }
         Commands::ResetCounter { path } => {
@@ -1596,11 +1753,9 @@ async fn dispatch_configuration_command(
             let prev = result
                 .get("counter")
                 .and_then(serde_json::Value::as_u64)
-                .ok_or_else(
-                    || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                        message: "daemon counter response omitted counter".to_string(),
-                    },
-                )?;
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: "daemon counter response omitted counter".to_string(),
+                })?;
             hotpath::future!(
                 commands::daemon_tool_json(
                     Some(&project_path),
@@ -1626,9 +1781,7 @@ async fn dispatch_configuration_command(
     Ok(())
 }
 
-async fn dispatch_diagnostics_command(
-    command: Commands,
-) -> tracedecay_runtime_core::errors::Result<()> {
+async fn dispatch_diagnostics_command(command: Commands) -> tracedecay_domain::errors::Result<()> {
     match command {
         Commands::Doctor => {
             hotpath::future!(tracedecay::doctor::run_doctor(), label = "cli.doctor.run").await?;
@@ -1658,16 +1811,14 @@ async fn dispatch_diagnostics_command(
             commands::handle_gain(all, history, &range, json).await?;
         }
         Commands::Monitor => {
-            hotpath::measure_block!("cli.monitor.run", tracedecay::monitor::run())?;
+            hotpath::measure_block!("cli.monitor.run", monitor_cmd::run())?;
         }
         _ => unreachable!("non-diagnostics command passed to diagnostics dispatcher"),
     }
     Ok(())
 }
 
-async fn dispatch_knowledge_command(
-    command: Commands,
-) -> tracedecay_runtime_core::errors::Result<()> {
+async fn dispatch_knowledge_command(command: Commands) -> tracedecay_domain::errors::Result<()> {
     match command {
         Commands::Git { action } => {
             git_cmd::handle_git_action(action).await?;
@@ -1678,14 +1829,14 @@ async fn dispatch_knowledge_command(
         Commands::Analytics { action } => match action {
             AnalyticsAction::Diagnostics { all, no_sync, .. } => {
                 hotpath::future!(
-                    tracedecay::analytics_bridge::run_analytics_diagnostics(all, no_sync),
+                    analytics_cmd::run_analytics_diagnostics(all, no_sync),
                     label = "cli.analytics.diagnostics"
                 )
                 .await?;
             }
             AnalyticsAction::Sync => {
                 hotpath::future!(
-                    tracedecay::analytics_bridge::run_analytics_sync(),
+                    analytics_cmd::run_analytics_sync(),
                     label = "cli.analytics.sync"
                 )
                 .await?;
@@ -1719,6 +1870,7 @@ impl CommandStartupPolicy {
             Commands::Tool { .. }
             | Commands::Work { .. }
             | Commands::Workflow { .. }
+            | Commands::Semantic { .. }
             | Commands::Remote { .. }
             | Commands::Git { .. } => Self::SkipAll,
             // Explicit lifecycle/maintenance commands manage their own work.
@@ -1824,6 +1976,24 @@ fn should_skip_agent_install_check(command: &Commands) -> bool {
 
 fn is_local_install_command(command: &Commands) -> bool {
     matches!(command, Commands::Install { local: true, .. })
+}
+
+fn requires_eager_mcp_tool_catalog(command: Option<&Commands>) -> bool {
+    !matches!(command, Some(Commands::Tool { .. }))
+}
+
+fn normalize_tool_reserved_global_flags(cli: &mut Cli) {
+    if !cli.dry_run {
+        return;
+    }
+    let Some(Commands::Tool { args, .. }) = cli.command.as_mut() else {
+        return;
+    };
+    // Clap recognizes the lifecycle-global `--dry-run` before a tool's first
+    // trailing argument. Return it to the tool parser so the documented
+    // reserved flag has the same meaning on either side of `--args`.
+    args.push("--dry-run".to_owned());
+    cli.dry_run = false;
 }
 
 #[cfg(test)]

@@ -26,13 +26,15 @@ use tracedecay_application::doctor::{
     RemoteOperationalReadV1, advisory_feedback_read_from_publication, compose_doctor_report,
     merge_storage_reads, runtime_health_read, storage_family_read,
 };
+use tracedecay_application::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_application::{
     ApplicationContractError, CancellationContext, CapabilityGrantId, CapabilityGrantSnapshot,
     Deadline, DisclosureClass, RequestContext, now_micros,
 };
-use tracedecay_usecases::request_identity::{GlobalRequestSurface, mint_global_request_id};
+use tracedecay_usecases::semantic_runtime::ProjectSemanticActivationExt;
 
 use super::maintenance::GuardedStoreTelemetryPort;
+use tracedecay_daemon_service::DaemonFeedbackRuntimeRegistrar;
 
 const DOCTOR_REPORT_CAPABILITY: &str = "capability.application.doctor.report";
 const DOCTOR_REPORT_USE_CASE: &str = "use-case.application.doctor.report";
@@ -145,7 +147,9 @@ fn host_integration_read_from_report(
 ///
 /// An unmounted worktree reports `Unmounted`; a mounted worktree whose freshness
 /// ladder has already proven a complete generation current reports `Mounted`;
-/// stale, restored-unverified, or busy schedulers report `Indexing` and schedule
+/// a worktree whose background convergence is parked on a deterministic
+/// contract violation reports `Parked` with the exact reason; stale,
+/// restored-unverified, or busy schedulers report `Indexing` and schedule
 /// background reconciliation. Doctor never performs code-index catch-up on its
 /// request path.
 #[hotpath::measure(label = "daemon.doctor.code_index", future = true)]
@@ -159,13 +163,20 @@ pub(in crate::daemon) async fn code_index_read_from_registry(
             coverage: DoctorCoverageCompletenessV1::Complete,
         };
     }
-    let state = if registry.latest_complete_ready(project_root).await.is_some() {
-        CodeIndexMountStateV1::Mounted
-    } else {
-        CodeIndexMountStateV1::Indexing
-    };
+    if registry.latest_complete_ready(project_root).await.is_some() {
+        return CodeIndexMountReadV1::Observed {
+            state: CodeIndexMountStateV1::Mounted,
+            coverage: DoctorCoverageCompletenessV1::Complete,
+        };
+    }
+    if let Some(parked) = registry.convergence_park(project_root).await {
+        return CodeIndexMountReadV1::Parked {
+            reason: format!("{}; {}", parked.reason, parked.remediation),
+            coverage: DoctorCoverageCompletenessV1::Complete,
+        };
+    }
     CodeIndexMountReadV1::Observed {
-        state,
+        state: CodeIndexMountStateV1::Indexing,
         coverage: DoctorCoverageCompletenessV1::Complete,
     }
 }
@@ -230,7 +241,7 @@ pub fn observability_read_from_model(
             ObservabilityReadV1::Absent
         }
         Ok(model) => {
-            use tracedecay_usecases::feedback::observations::FeedbackCoverageV1;
+            use tracedecay_application::feedback::observations::FeedbackCoverageV1;
             let (state, coverage) = match model.coverage {
                 FeedbackCoverageV1::Known => (
                     ObservabilityStateV1::Current,
@@ -607,7 +618,7 @@ pub async fn collect_retention_backlog_findings(
     let Ok(snapshot) = profile_sessions.read_snapshot().await else {
         return DoctorStorageFamilyReadV1::Unknown;
     };
-    let Ok(records) = tracedecay_sessions::runtime::lcm::retention::read_session_retention_backlog(
+    let Ok(records) = tracedecay_lcm::retention::read_session_retention_backlog(
         &snapshot,
         store,
         &retention.session_lcm,
@@ -847,7 +858,7 @@ pub(in crate::daemon) type RemoteOperationalReadProviderV1 =
 pub(in crate::daemon) fn production_doctor_report_reader(
     project_root: PathBuf,
     project_id: tracedecay_domain::ProjectId,
-    layout: crate::storage::StoreLayout,
+    layout: tracedecay_runtime_core::storage::StoreLayout,
     graph: tracedecay_runtime_core::db::Database,
     registry: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
     profile_sessions: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
@@ -858,10 +869,10 @@ pub(in crate::daemon) fn production_doctor_report_reader(
     retention: crate::config::RetentionConfig,
     schedulers: tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1,
     diagnostic_broker: Arc<tokio::sync::Mutex<tracedecay_lsp::analyzer::broker::DiagnosticBroker>>,
-    feedback_runtimes: crate::daemon::service::invocation::DaemonFeedbackRuntimeRegistrar,
+    feedback_runtimes: DaemonFeedbackRuntimeRegistrar,
     store_telemetry_sampling: super::maintenance::StoreTelemetrySamplingRegistry,
-    configuration_runtime: Arc<tracedecay_usecases::configuration::ProjectConfigurationRuntime>,
-) -> crate::dashboard::DoctorReportReader {
+    configuration_runtime: Arc<tracedecay_configuration::ProjectConfigurationRuntime>,
+) -> tracedecay_dashboard_api::DoctorReportReader {
     Arc::new(move || {
         let project_root = project_root.clone();
         let project_id = project_id.clone();
@@ -880,11 +891,13 @@ pub(in crate::daemon) fn production_doctor_report_reader(
         let store_telemetry_sampling = store_telemetry_sampling.clone();
         let configuration_runtime = Arc::clone(&configuration_runtime);
         Box::pin(async move {
-            let scope =
-                super::project_open_owners::resolved_scope_for_project(&project_root, &project_id)
-                    .map_err(|_| ApplicationContractError::Inconsistent {
-                        field: "daemon Doctor project scope",
-                    })?;
+            let scope = tracedecay_code_index_runtime::resolved_scope_for_project(
+                &project_root,
+                &project_id,
+            )
+            .map_err(|_| ApplicationContractError::Inconsistent {
+                field: "daemon Doctor project scope",
+            })?;
             let context = doctor_report_request_context(scope)?;
             let mut telemetry_ports = Vec::new();
             let mut telemetry_paths = BTreeSet::new();
@@ -973,6 +986,14 @@ pub(in crate::daemon) fn production_doctor_report_reader(
             };
             let host_project_root = project_root.clone();
             let host_components_root = profile_root.join("host-components");
+            // Staleness comparison against the installed plugins' provenance
+            // headers requires this binary's exact generator commit.
+            let generator_commit = crate::product_runtime::product_runtime()
+                .map_err(|_| ApplicationContractError::Inconsistent {
+                    field: "registered product runtime source provenance",
+                })?
+                .source()
+                .full_sha;
             let host_scan = tokio::task::spawn_blocking(move || {
                 hotpath::measure_block!("daemon.doctor.host_scan", {
                     host_home
@@ -985,6 +1006,7 @@ pub(in crate::daemon) fn production_doctor_report_reader(
                             crate::agents::inspect_receipt_backed_host_components(
                                 &context,
                                 &host_components_root,
+                                generator_commit,
                             )
                             .as_ref()
                             .map_or(
@@ -1091,7 +1113,7 @@ pub(in crate::daemon) fn production_doctor_report_reader(
             };
             let inputs = DoctorKernelInputsV1 {
                 configuration: configuration_read_from_pin::<
-                    tracedecay_runtime_core::errors::TraceDecayError,
+                    tracedecay_domain::errors::TraceDecayError,
                 >(&pinned),
                 runtime: runtime_health_read(&DaemonRuntimeHealthSignalV1 {
                     serving: true,
@@ -1124,8 +1146,10 @@ pub(in crate::daemon) fn production_doctor_report_reader(
                 storage,
             };
             let report = compose_doctor_report(&context, &inputs).await?;
-            Ok(crate::dashboard::AdmittedDoctorReportV1::new(report)
-                .with_table_growth_evidence(store_telemetry.table_growth_evidence))
+            Ok(
+                tracedecay_dashboard_api::AdmittedDoctorReportV1::new(report)
+                    .with_table_growth_evidence(store_telemetry.table_growth_evidence),
+            )
         })
     })
 }

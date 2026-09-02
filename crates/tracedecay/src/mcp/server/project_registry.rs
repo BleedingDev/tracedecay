@@ -10,15 +10,17 @@
 use serde_json::Value;
 use std::path::Path;
 
-use crate::mcp::tools::{
+use tracedecay_application::{
     ProjectRegistryContextCommand, ProjectRegistryContextFuture, ProjectRegistryContextOutcome,
     ProjectRegistryContextView, ProjectRegistryListingCommand, ProjectRegistryListingFuture,
     ProjectRegistryListingOutcome, ProjectRegistryListingScope, ProjectRegistryListingView,
     ProjectRegistryReadPort, ProjectRegistrySelector,
 };
-use crate::project_registry::{PublicCodeProject, build_project_registry_view};
+use tracedecay_dashboard_api::project_registry::{
+    build_project_registry_view, public_code_project_from_record,
+};
+use tracedecay_domain::errors::Result;
 use tracedecay_global_db::{CodeProjectRecord, ProjectRegistryContext, RegisteredGlobalDbLeaseV1};
-use tracedecay_runtime_core::errors::Result;
 
 #[derive(Clone)]
 pub(crate) struct DaemonProjectRegistryReadService {
@@ -26,6 +28,7 @@ pub(crate) struct DaemonProjectRegistryReadService {
 }
 
 impl DaemonProjectRegistryReadService {
+    #[hotpath::skip]
     pub(crate) const fn new(registry: RegisteredGlobalDbLeaseV1) -> Self {
         Self { registry }
     }
@@ -42,6 +45,7 @@ impl DaemonProjectRegistryReadService {
             .map(|context| context.project.project_id))
     }
 
+    #[hotpath::skip]
     async fn listing(
         &self,
         active_project_root: &Path,
@@ -58,7 +62,7 @@ impl DaemonProjectRegistryReadService {
         let view = build_project_registry_view(&contexts, active_id.as_deref(), truncated);
         let projects = projects
             .iter()
-            .map(|project| PublicCodeProject::from_record(project, active_id.as_deref()))
+            .map(|project| public_code_project_from_record(project, active_id.as_deref()))
             .collect::<Vec<_>>();
         Ok(ProjectRegistryListingView {
             registry_path: self.registry.db_path().to_path_buf(),
@@ -68,6 +72,7 @@ impl DaemonProjectRegistryReadService {
         })
     }
 
+    #[hotpath::skip]
     async fn execute_list(
         &self,
         command: ProjectRegistryListingCommand,
@@ -90,6 +95,7 @@ impl DaemonProjectRegistryReadService {
         ))
     }
 
+    #[hotpath::skip]
     async fn resolve_context(
         &self,
         selector: &ProjectRegistrySelector,
@@ -122,6 +128,7 @@ impl DaemonProjectRegistryReadService {
         }
     }
 
+    #[hotpath::skip]
     async fn execute_context(
         &self,
         command: ProjectRegistryContextCommand,
@@ -140,7 +147,7 @@ impl DaemonProjectRegistryReadService {
             ProjectRegistryContextView {
                 registry_path,
                 is_active,
-                project: PublicCodeProject::from_record(&context.project, active_id.as_deref()),
+                project: public_code_project_from_record(&context.project, active_id.as_deref()),
                 aliases: serialize_records(&context.aliases)?,
                 stores: serialize_records(&context.stores)?,
             },

@@ -1,8 +1,25 @@
 use std::sync::Arc;
 
 use super::Database;
-use crate::errors::{Result, TraceDecayError};
 use crate::store_runtime::{VerifiedGraphRuntimePortV1, VerifiedGraphRuntimeWeakProxyV1};
+use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_graph_db::GraphWatermark;
+
+/// Watermark of the projected memory-graph source at an exact lineage stamp.
+///
+/// `memory_v2_lineage_events.event_sequence` is append-only (schema triggers
+/// reject updates and deletes) and its `AUTOINCREMENT` key is never reused,
+/// and every committed mutation that can change the projected source records
+/// at least one lineage event in the same transaction (the invariant
+/// `store::memory::graph::source_unchanged_since` already relies on). Two
+/// snapshots observing the same maximum sequence therefore saw an identical
+/// projected source, so a watermark computed under one snapshot remains valid
+/// for any later snapshot that still observes the same stamp.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct MemoryGraphSourceStampedWatermarkV1 {
+    lineage_stamp: i64,
+    watermark: GraphWatermark,
+}
 
 /// One short-lived use of the graph authority bound to a database owner.
 ///
@@ -77,7 +94,10 @@ impl Database {
     ///
     /// The proxy retains no database client, Store lease, Graph lease, or
     /// graph map owner. It carries the identity validated at binding time and
-    /// upgrades the weak graph port privately for each operation.
+    /// upgrades the weak graph port privately for each operation. `None`
+    /// proves graph activation has not completed yet; callers that must not
+    /// wait for activation bind [`Self::deferred_memory_graph_runtime`]
+    /// instead.
     #[must_use]
     pub fn memory_graph_runtime(&self) -> Option<VerifiedGraphRuntimeWeakProxyV1> {
         Some(VerifiedGraphRuntimeWeakProxyV1::new(
@@ -85,6 +105,60 @@ impl Database {
             self.registered_verified_locator().clone(),
             self.inner.memory_graph_runtime.get()?.clone(),
         ))
+    }
+
+    /// Returns the deferred-activation route to this exact database's graph
+    /// runtime, available before [`Self::bind_memory_graph_runtime`] runs.
+    ///
+    /// The proxy shares the activation cell instead of a resolved weak
+    /// pointer: every operation resolves the cell at use time, so a proxy
+    /// bound while deferred graph activation is still warming starts
+    /// answering the moment activation publishes the runtime and stays a
+    /// typed unavailable state until then. Like the resolved route, it
+    /// retains no database client, Store lease, Graph lease, or graph map
+    /// owner. This is the production composition route: binding it cannot
+    /// silently miss an activation that has not happened yet.
+    #[must_use]
+    pub fn deferred_memory_graph_runtime(&self) -> VerifiedGraphRuntimeWeakProxyV1 {
+        VerifiedGraphRuntimeWeakProxyV1::new_deferred(
+            self.registered_binding().clone(),
+            self.registered_verified_locator().clone(),
+            Arc::clone(&self.inner.memory_graph_runtime),
+        )
+    }
+
+    /// Returns the memoized projected-source watermark when it was computed
+    /// under the exact `lineage_stamp` the caller currently observes.
+    #[must_use]
+    pub(crate) fn memory_graph_source_watermark_at(
+        &self,
+        lineage_stamp: i64,
+    ) -> Option<GraphWatermark> {
+        self.inner
+            .memory_graph_source_watermark
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|memo| memo.lineage_stamp == lineage_stamp)
+            .map(|memo| memo.watermark.clone())
+    }
+
+    /// Records the projected-source watermark computed under `lineage_stamp`.
+    /// The stamp and the hashed source must come from the same read snapshot.
+    pub(crate) fn record_memory_graph_source_watermark(
+        &self,
+        lineage_stamp: i64,
+        watermark: GraphWatermark,
+    ) {
+        *self
+            .inner
+            .memory_graph_source_watermark
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(MemoryGraphSourceStampedWatermarkV1 {
+                lineage_stamp,
+                watermark,
+            });
     }
 
     /// Issues graph work through the exact weak map binding.
@@ -130,7 +204,7 @@ mod tests {
     use tracedecay_domain::LocatorDigest;
     use tracedecay_graph_db::{
         GraphDbError, GraphGenerationManifest, GraphIdempotencyKey, GraphProjectionIdentity,
-        VerifiedGraphSnapshot,
+        GraphWatermark, VerifiedGraphSnapshot,
     };
     use tracedecay_store::{FactReadControl, StoreRuntimeBindingV1, VerifiedStoreLocatorV1};
 
@@ -237,6 +311,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stamped_source_watermark_memo_serves_only_the_exact_lineage_stamp() {
+        let directory = tempfile::tempdir().expect("watermark memo directory");
+        let database_path = directory.path().join("memory.db");
+        let authority = DatabaseAuthority::acquire_test(&database_path, "watermark memo test")
+            .expect("database authority");
+        let (database, _) = Database::publish_test_runtime(
+            &database_path,
+            &authority,
+            TestDatabaseRuntimeMode::Initialize,
+        )
+        .await
+        .expect("database runtime");
+
+        // Before any record, every stamp is a miss — never a fabricated hit.
+        assert!(database.memory_graph_source_watermark_at(7).is_none());
+
+        let first = GraphWatermark::new("sha256:memo-stamp-seven").expect("first watermark");
+        database.record_memory_graph_source_watermark(7, first.clone());
+        assert_eq!(
+            database.memory_graph_source_watermark_at(7),
+            Some(first.clone())
+        );
+        // A snapshot observing a different stamp must not see the memo.
+        assert!(database.memory_graph_source_watermark_at(8).is_none());
+        // A stale-stamp probe does not evict the memo for its exact stamp.
+        assert_eq!(database.memory_graph_source_watermark_at(7), Some(first));
+
+        // A newer record supersedes the memo; the old stamp becomes a miss.
+        let second = GraphWatermark::new("sha256:memo-stamp-eight").expect("second watermark");
+        database.record_memory_graph_source_watermark(8, second.clone());
+        assert_eq!(database.memory_graph_source_watermark_at(8), Some(second));
+        assert!(database.memory_graph_source_watermark_at(7).is_none());
+    }
+
+    #[tokio::test]
     async fn graph_runtime_binding_rejects_the_right_shard_with_the_wrong_locator() {
         let directory = tempfile::tempdir().expect("graph locator binding directory");
         let database_path = directory.path().join("memory.db");
@@ -294,6 +403,126 @@ mod tests {
         drop(database);
 
         assert!(weak_runtime.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn deferred_graph_proxy_resolves_once_activation_completes() {
+        let directory = tempfile::tempdir().expect("deferred graph proxy directory");
+        let database_path = directory.path().join("memory.db");
+        let authority = DatabaseAuthority::acquire_test(&database_path, "deferred graph proxy")
+            .expect("database authority");
+        let (database, _) = Database::publish_test_runtime(
+            &database_path,
+            &authority,
+            TestDatabaseRuntimeMode::Initialize,
+        )
+        .await
+        .expect("database runtime");
+        let deferred = database.deferred_memory_graph_runtime();
+        assert_eq!(deferred.relational_binding(), database.registered_binding());
+        assert_eq!(
+            deferred.relational_verified_locator(),
+            database.registered_verified_locator()
+        );
+        let projection = GraphProjectionIdentity::new(
+            tracedecay_graph_db::GraphNamespace::new("deferred-proxy")
+                .expect("valid deferred proxy namespace"),
+            tracedecay_graph_db::GraphProjectionId::new("activation")
+                .expect("valid deferred proxy projection"),
+        );
+        // Before activation the deferred route is a typed unavailable state,
+        // and two deferred routes over one database share the eventual
+        // runtime.
+        assert!(matches!(
+            deferred.verified_snapshot(&projection, FactReadControl::new(Arc::new(|| false))),
+            Err(GraphDbError::Unavailable { .. })
+        ));
+        assert!(deferred.shares_runtime_with(&database.deferred_memory_graph_runtime()));
+
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let runtime: Arc<dyn VerifiedGraphRuntimePortV1> = Arc::new(TestGraphRuntime {
+            binding: database.registered_binding().clone(),
+            locator: database.registered_verified_locator().clone(),
+            snapshot_calls: Arc::clone(&snapshot_calls),
+            _retained_database: None,
+        });
+        database
+            .bind_memory_graph_runtime(Arc::clone(&runtime))
+            .expect("bind exact graph runtime");
+
+        // The proxy minted before activation resolves without a rebind.
+        assert!(matches!(
+            deferred.verified_snapshot(&projection, FactReadControl::new(Arc::new(|| false))),
+            Ok(None)
+        ));
+        assert_eq!(snapshot_calls.load(Ordering::Acquire), 1);
+        let resolved = database
+            .memory_graph_runtime()
+            .expect("activation publishes the resolved proxy");
+        assert!(deferred.shares_runtime_with(&resolved));
+        assert!(resolved.shares_runtime_with(&deferred));
+    }
+
+    #[tokio::test]
+    async fn deferred_graph_proxy_stays_typed_without_activation_and_across_owner_drop() {
+        let directory = tempfile::tempdir().expect("never-activated graph proxy directory");
+        let database_path = directory.path().join("memory.db");
+        let sibling_path = directory.path().join("sibling.db");
+        let authority =
+            DatabaseAuthority::acquire_test(&database_path, "never-activated graph proxy")
+                .expect("database authority");
+        let (database, _) = Database::publish_test_runtime(
+            &database_path,
+            &authority,
+            TestDatabaseRuntimeMode::Initialize,
+        )
+        .await
+        .expect("database runtime");
+        let sibling_authority =
+            DatabaseAuthority::acquire_test(&sibling_path, "never-activated graph sibling")
+                .expect("sibling authority");
+        let (sibling, _) = Database::publish_test_runtime(
+            &sibling_path,
+            &sibling_authority,
+            TestDatabaseRuntimeMode::Initialize,
+        )
+        .await
+        .expect("sibling runtime");
+        let deferred = database.deferred_memory_graph_runtime();
+        let projection = GraphProjectionIdentity::new(
+            tracedecay_graph_db::GraphNamespace::new("never-activated")
+                .expect("valid never-activated namespace"),
+            tracedecay_graph_db::GraphProjectionId::new("refusal")
+                .expect("valid never-activated projection"),
+        );
+        // A runtime that never becomes available stays a typed refusal at
+        // every read — never a panic, silent success, or empty result.
+        assert!(matches!(
+            deferred.verified_snapshot(&projection, FactReadControl::new(Arc::new(|| false))),
+            Err(GraphDbError::Unavailable { .. })
+        ));
+        deferred.cancel_reconciliation();
+        // Unresolved routes never claim another database's eventual runtime.
+        assert!(!deferred.shares_runtime_with(&sibling.deferred_memory_graph_runtime()));
+
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let runtime: Arc<dyn VerifiedGraphRuntimePortV1> = Arc::new(TestGraphRuntime {
+            binding: database.registered_binding().clone(),
+            locator: database.registered_verified_locator().clone(),
+            snapshot_calls: Arc::clone(&snapshot_calls),
+            _retained_database: None,
+        });
+        database
+            .bind_memory_graph_runtime(Arc::clone(&runtime))
+            .expect("bind exact graph runtime");
+        drop(runtime);
+        // Activation resolved but the owner dropped: the deferred route
+        // reports the same typed unavailability as the resolved proxy.
+        assert!(matches!(
+            deferred.verified_snapshot(&projection, FactReadControl::new(Arc::new(|| false))),
+            Err(GraphDbError::Unavailable { .. })
+        ));
+        assert_eq!(snapshot_calls.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

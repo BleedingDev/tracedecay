@@ -659,10 +659,10 @@ mod tests {
         NativeProviderActivation, OwnedProviderId, ProviderMode, RecallDenialReason,
         RecallScopeBindingsV1, ScopeField, UnknownValidityPolicy,
     };
-    use tracedecay_store::FactWriteControl;
-    use tracedecay_usecases::memory::{
+    use tracedecay_session_memory::memory::{
         ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
     };
+    use tracedecay_store::FactWriteControl;
 
     use super::*;
     use crate::tracedecay::{TraceDecay, TraceDecayOpenOptions};
@@ -686,8 +686,11 @@ mod tests {
         std::fs::create_dir_all(&project_root).expect("project root");
         std::fs::create_dir_all(&profile_root).expect("profile root");
         std::fs::create_dir_all(&ledger_root).expect("ledger root");
-        crate::storage::pin_fixture_repository_identity(&project_root, PROJECT_ID)
-            .expect("project enrollment");
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project_root,
+            PROJECT_ID,
+        )
+        .expect("project enrollment");
         let graph = Arc::new(
             TraceDecay::init_with_options(
                 &project_root,

@@ -42,6 +42,7 @@ impl CandidatePlan {
             .any(|clause| clause.channel == channel && clause.value == value)
     }
 
+    #[hotpath::skip]
     pub const fn has_semantic_channel(&self) -> bool {
         false
     }

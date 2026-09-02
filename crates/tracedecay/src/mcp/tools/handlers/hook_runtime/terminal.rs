@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracedecay_automation_runtime::automation::config_error;
-use tracedecay_runtime_core::errors::Result;
+use tracedecay_domain::errors::Result;
 
 use super::hermes::user_review;
 use super::ingest::ingest_transcript_with_cancellation;
@@ -18,9 +18,7 @@ use super::required_str;
 pub(super) fn retain_codex_stop(
     args: &Value,
     profile_root: &Path,
-    session_runtime_registry: &Arc<
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1,
-    >,
+    session_runtime_registry: &Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>,
     session_authorities: SessionAuthorities<'_>,
 ) -> Result<Value> {
     let session_id = required_str(args, "session_id")?.to_owned();
@@ -30,7 +28,7 @@ pub(super) fn retain_codex_stop(
         .ok_or_else(|| config_error("daemon user session database is unavailable"))?;
     let profile_identity = session_authorities
         .profile_identity
-        .cloned()
+        .clone()
         .ok_or_else(|| config_error("daemon profile identity is unavailable"))?;
     let profile_registered = session_authorities
         .profile_registered
@@ -59,7 +57,7 @@ pub(super) fn retain_codex_stop(
                         "session_id": task_session_id,
                     });
                     let authorities = SessionAuthorities::new(None, Some(&user_sessions))
-                        .with_profile_identity(Some(&profile_identity))
+                        .with_profile_identity(Some(std::sync::Arc::clone(&profile_identity)))
                         .with_registered_databases(None, Some(&profile_registered));
                     let ingested = ingest_transcript_with_cancellation(
                         None,

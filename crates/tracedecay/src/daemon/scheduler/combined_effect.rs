@@ -14,13 +14,14 @@ use tracedecay_automation_runtime::automation::runner::{
 
 use super::scheduler_automation_effect;
 use crate::daemon::DaemonEngine;
+use tracedecay_automation_runtime::automation::effect_runtime::AutomationSettledTerminal;
+
 use crate::daemon::automation_effect::{
-    AutomationEffectAdmission, AutomationEffectAuthority, AutomationSettledTerminal,
-    DeferredProblemSettlementRequest, DeferredRunSettlementRequest, DeferredSettlementOutcome,
-    DeferredSettlementRequest,
+    AutomationEffectAdmission, AutomationEffectAuthority, DeferredProblemSettlementRequest,
+    DeferredRunSettlementRequest, DeferredSettlementOutcome, DeferredSettlementRequest,
 };
 use crate::tracedecay::TraceDecay;
-use tracedecay_runtime_core::errors::Result;
+use tracedecay_domain::errors::Result;
 
 pub(super) enum CombinedEffectAdmission {
     Execute {
@@ -116,7 +117,7 @@ fn failed_leg_terminal(
     record: Option<
         tracedecay_automation_runtime::automation::run_ledger::AutomationRunLedgerRecord,
     >,
-    error: Option<tracedecay_runtime_core::errors::TraceDecayError>,
+    error: Option<tracedecay_domain::errors::TraceDecayError>,
     fallback_message: String,
 ) -> DeferredLegTerminal {
     match record {
@@ -126,11 +127,9 @@ fn failed_leg_terminal(
         })),
         None => DeferredLegTerminal::Problem(Box::new(DeferredProblemTerminal {
             error: error
-                .unwrap_or_else(
-                    || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                        message: fallback_message,
-                    },
-                )
+                .unwrap_or(tracedecay_domain::errors::TraceDecayError::Config {
+                    message: fallback_message,
+                })
                 .into(),
         })),
     }
@@ -171,7 +170,7 @@ fn deferred_settlement_request(
 fn collect_settlement_result(
     project_path: &Path,
     task: tracedecay_automation_runtime::automation::backend::AgentTaskKind,
-    first_error: &mut Option<tracedecay_runtime_core::errors::TraceDecayError>,
+    first_error: &mut Option<tracedecay_domain::errors::TraceDecayError>,
     result: Result<DeferredSettlementOutcome>,
 ) -> Option<DeferredSettlementOutcome> {
     match result {
@@ -260,7 +259,7 @@ async fn settle_single_replay_leg<Run>(
     engine: &DaemonEngine,
     project_id: &tracedecay_domain::ProjectId,
     project_path: &Path,
-    first_error: &mut Option<tracedecay_runtime_core::errors::TraceDecayError>,
+    first_error: &mut Option<tracedecay_domain::errors::TraceDecayError>,
     replay_completed: bool,
     executing_kind: tracedecay_automation_runtime::automation::backend::AgentTaskKind,
     control: &AutomationRunControl,
@@ -367,7 +366,7 @@ pub(super) async fn run_combined_scheduler_effect(
     backend: &dyn tracedecay_automation_runtime::automation::backend::AgentTaskBackend,
     retrieval: &dyn tracedecay_automation_runtime::automation::runner::AutomationSessionRetrieval,
     options: CombinedReviewAutomationOptions,
-    first_error: &mut Option<tracedecay_runtime_core::errors::TraceDecayError>,
+    first_error: &mut Option<tracedecay_domain::errors::TraceDecayError>,
 ) -> CombinedEffectOutcome {
     let outcome = match admission {
         CombinedEffectAdmission::Conflict => {
@@ -534,7 +533,7 @@ async fn run_execute_pair(
     backend: &dyn tracedecay_automation_runtime::automation::backend::AgentTaskBackend,
     retrieval: &dyn tracedecay_automation_runtime::automation::runner::AutomationSessionRetrieval,
     options: CombinedReviewAutomationOptions,
-    first_error: &mut Option<tracedecay_runtime_core::errors::TraceDecayError>,
+    first_error: &mut Option<tracedecay_domain::errors::TraceDecayError>,
 ) -> CombinedEffectOutcome {
     let retained = run_combined_review_with_backend_and_retrieval_for_retained_settlement(
         memory,
@@ -781,8 +780,7 @@ async fn run_execute_pair(
                     error: error.into(),
                 })),
                 DeferredLegTerminal::Problem(Box::new(DeferredProblemTerminal {
-                    error: tracedecay_runtime_core::errors::TraceDecayError::Config { message }
-                        .into(),
+                    error: tracedecay_domain::errors::TraceDecayError::Config { message }.into(),
                 })),
                 PairResultOrder::ReflectorFirst,
                 PairResultMode::Handled,
@@ -887,7 +885,7 @@ pub(super) async fn prepare_combined_effects(
         requested_run_id,
         configuration_digest.clone(),
         |run_id| {
-            crate::daemon::automation_effect::session_reflector_run_request(
+            tracedecay_automation_runtime::automation::effect_runtime::session_reflector_run_request(
                 run_id,
                 &options.session_reflector,
             )
@@ -904,7 +902,7 @@ pub(super) async fn prepare_combined_effects(
         Some(&skill_run_id),
         configuration_digest,
         |run_id| {
-            crate::daemon::automation_effect::skill_writer_run_request(
+            tracedecay_automation_runtime::automation::effect_runtime::skill_writer_run_request(
                 run_id,
                 &options.skill_writer,
             )
@@ -1019,7 +1017,7 @@ pub(super) async fn prepare_combined_effects(
         | (PairMode::ConflictNoAbandon, _, AutomationEffectAdmission::Conflict) => {
             Ok(CombinedEffectAdmission::Conflict)
         }
-        _ => Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        _ => Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: "combined automation admission matrix was internally inconsistent".to_owned(),
         }),
     }
@@ -1106,7 +1104,7 @@ mod tests {
                 .configuration_target()
                 .project_id
                 .clone();
-            let scope = crate::daemon::project_open_owners::resolved_scope_for_project(
+            let scope = tracedecay_code_index_runtime::resolved_scope_for_project(
                 &project_root,
                 &project_id,
             )
@@ -1322,7 +1320,7 @@ mod tests {
 
         fn retrieve(
             &self,
-            _query: tracedecay_usecases::session::SessionTemporalQuery,
+            _query: tracedecay_session_memory::session::SessionTemporalQuery,
         ) -> AutomationSessionRetrievalFuture<'_> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { AutomationTemporalRetrieval::CompleteZero })
@@ -1352,7 +1350,7 @@ mod tests {
                     Some(run_id),
                     fixture.configuration_digest.clone(),
                     |run_id| {
-                        crate::daemon::automation_effect::session_reflector_run_request(
+                        tracedecay_automation_runtime::automation::effect_runtime::session_reflector_run_request(
                             run_id,
                             &conflicting,
                         )
@@ -1374,7 +1372,7 @@ mod tests {
                     Some(&skill_run_id),
                     fixture.configuration_digest.clone(),
                     |run_id| {
-                        crate::daemon::automation_effect::skill_writer_run_request(
+                        tracedecay_automation_runtime::automation::effect_runtime::skill_writer_run_request(
                             run_id,
                             &conflicting,
                         )
@@ -1434,7 +1432,7 @@ mod tests {
         let cancellation = CancellationSignal::active(format!("cancel.{run_id}"))
             .expect("combined recovery cancellation");
         let report =
-            crate::daemon::automation_effect::reconcile_reserved_automation_effects_for_project(
+            crate::daemon::automation_effect::recovery_index::reconcile_reserved_automation_effects_for_project(
                 fixture.memory.as_ref(),
                 &fixture.dashboard_root,
                 &cancellation,
@@ -1455,7 +1453,7 @@ mod tests {
         assert!(!conflicting_journal.exists());
         assert!(pending_journal_files(&fixture.dashboard_root).is_empty());
         let report =
-            crate::daemon::automation_effect::reconcile_reserved_automation_effects_for_project(
+            crate::daemon::automation_effect::recovery_index::reconcile_reserved_automation_effects_for_project(
                 fixture.memory.as_ref(),
                 &fixture.dashboard_root,
                 &cancellation,
@@ -1514,7 +1512,7 @@ mod tests {
             Some(combined_run_id),
             fixture.configuration_digest.clone(),
             |run_id| {
-                crate::daemon::automation_effect::session_reflector_run_request(
+                tracedecay_automation_runtime::automation::effect_runtime::session_reflector_run_request(
                     run_id,
                     &options.session_reflector,
                 )
@@ -1588,7 +1586,9 @@ mod tests {
         let journal_lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(crate::storage::append_lock_path(&current_skill_journal))
+            .open(tracedecay_runtime_core::storage::append_lock_path(
+                &current_skill_journal,
+            ))
             .expect("open current skill journal lock");
         journal_lock
             .lock_exclusive()

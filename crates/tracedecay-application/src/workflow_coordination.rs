@@ -51,6 +51,7 @@ pub enum WorkflowDefinitionLifecycleState {
 }
 
 impl WorkflowDefinitionLifecycleState {
+    #[hotpath::skip]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Candidate => "candidate",
@@ -73,6 +74,7 @@ impl WorkflowDefinitionLifecycleState {
     }
 
     /// Retire and reject are terminal dispositions: nothing transitions out.
+    #[hotpath::skip]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Retired | Self::Rejected)
     }
@@ -101,6 +103,7 @@ const REJECT_FROM_OPEN: &[WorkflowDefinitionLifecycleState] =
     &[WorkflowDefinitionLifecycleState::Rejected];
 
 impl WorkflowLifecycleOperation {
+    #[hotpath::skip]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Activate => "activate",
@@ -128,6 +131,7 @@ impl WorkflowLifecycleOperation {
     /// candidate records the intermediate `validated` disposition it had to
     /// clear, and every state it passes through gets its own immutable history
     /// entry. `None` names an illegal transition.
+    #[hotpath::skip]
     pub const fn path_from(
         self,
         current: WorkflowDefinitionLifecycleState,
@@ -393,6 +397,7 @@ impl<P> WorkflowDefinitionService<P>
 where
     P: WorkflowDefinitionAuthorityPort,
 {
+    #[hotpath::skip]
     pub const fn new(authority: P) -> Self {
         Self { authority }
     }
@@ -1116,6 +1121,7 @@ impl<P> TaskHandoffService<P>
 where
     P: TaskHandoffAuthorityPort,
 {
+    #[hotpath::skip]
     pub const fn new(authority: P) -> Self {
         Self { authority }
     }

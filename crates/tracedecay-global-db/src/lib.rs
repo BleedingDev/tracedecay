@@ -1,9 +1,12 @@
 //! User-level database that tracks all `TraceDecay` projects and their saved tokens.
 //!
 //! Stored at `~/.tracedecay/global.db`, this database holds one row per project
-//! with the project's database path and its cumulative tokens-saved count. Read
-//! paths are generally best-effort; authoritative open and maintenance
-//! interfaces preserve failures for callers that must fail closed.
+//! with the project's database path and its cumulative tokens-saved count.
+//! Every read and write in this crate reports its outcome as a typed state:
+//! absence is a truthful `Ok(None)` / empty page, and a failed snapshot,
+//! query, decode, or commit is an error naming the failing operation — never
+//! a silent zero, empty result, or fabricated timestamp. Callers decide at
+//! the call site whether to fail closed or degrade with a named warning.
 //!
 //! ## Dependency edges
 //!
@@ -16,15 +19,14 @@
 //! a guarded database client issued by the registered owner, so the composition
 //! root retains its own typed client without receiving raw runtime authority.
 
-use tracedecay_sessions::runtime::SessionMessageSearchResult;
 pub use tracedecay_store::ParseOffset;
-use tracedecay_store::{SessionMessageRecord, SessionRecord};
 
 mod api_types;
 pub mod configuration;
 #[cfg(test)]
 mod delivery_settlement_tests;
 mod discovery_queue;
+mod git_correlation_adapter;
 mod git_index_transactions;
 mod git_topology_anchor;
 mod hotpath_observe;
@@ -34,6 +36,7 @@ pub mod observation;
 mod observation_adapter;
 mod observation_projection;
 mod registered_maintenance;
+mod workflow_adapter;
 pub use registered_maintenance::{
     REGISTERED_WAL_RECLAIM_TRIGGER_BYTES, RegisteredWalCheckpointReceiptV1, RegisteredWalReclaimV1,
 };
@@ -42,6 +45,7 @@ mod registered_provider_usage;
 mod stack_delivery_tests;
 mod support;
 pub use discovery_queue::HostDiscoveryQueueEntry;
+pub use git_correlation_adapter::GlobalDbGitCorrelationStore;
 pub use git_topology_anchor::RegisteredGitTopologyAnchorAuthorityV2;
 pub use observability_rollup::{
     ObservabilityRollupCompactionCandidateV1, ObservabilityRollupCompactionReceiptV1,
@@ -54,11 +58,13 @@ pub use observability_rollup::{
 };
 pub use observation_adapter::GlobalDbObservationStore;
 pub use observation_projection::{
-    converge_projection_predecessor, project_observation, rebuild_projection,
+    converge_projection_predecessor, project_observation, project_queued_observations,
+    rebuild_projection,
 };
 #[cfg(test)]
 pub use observation_projection::{project_observation_with_engine, rebuild_projection_with_engine};
 pub use tracedecay_domain::CoverageStateV1;
+pub use workflow_adapter::GlobalDbWorkflowStore;
 mod observation_store;
 mod project_registry;
 mod registered;
@@ -102,8 +108,10 @@ pub fn register_test_schema_installer() {
     });
 }
 
+mod session_handle;
 mod session_temporal_handle;
 mod session_temporal_schema;
+mod sqlite_persist;
 mod transcript;
 
 pub use git_index_transactions::{
@@ -116,8 +124,8 @@ use project_registry::project_path_alias_key;
 /// Registry reap contract. Lives beside `plan_registry_reap`, its only producer.
 pub use project_registry::{
     EPHEMERAL_PROJECT_ROOT_REASON_CODE, GIT_COMMON_DIR_ALIAS_PREFIX, PROJECT_REGISTRY_AUTHORITY,
-    ReapEntryKind, RegistryReapEntry, RegistryReapPlan, RetainedRegistryEntry, alias_key_path,
-    ephemeral_root_rejection, is_ephemeral_path,
+    ProjectStoreResolutionError, ReapEntryKind, RegistryReapEntry, RegistryReapPlan,
+    RetainedRegistryEntry, alias_key_path, ephemeral_root_rejection, is_ephemeral_path,
 };
 pub use registered::{
     DeliveryAttemptClaimV1, DeliverySourceReceiptReadV1, DurableDeliverySettlementReceiptV1,
@@ -125,8 +133,7 @@ pub use registered::{
     PendingDeliverySourceReceiptV1, RegisteredGlobalDb, RegisteredGlobalDbLeaseV1,
     RegisteredGlobalDbOwnerV1, RegisteredGlobalDbWeakLeaseIssuerV1,
     RegisteredGlobalDbWriteTransaction, RegisteredGlobalDbWriterConnection,
-    RegisteredWorkApplicationServicesV1, RegisteredWorkProductServicesV1,
-    RegisteredWorkflowApplicationServicesV1, WorkAttemptDeliveryCensusReadV1,
+    WorkAttemptDeliveryCensusReadV1,
 };
 pub use registered_analytics::ObservabilityRetentionReceiptV1;
 pub use registered_lcm_privacy::{LcmPrivacyRescanOutcomeV1, LcmPrivacyRescanReceiptV1};
@@ -138,9 +145,7 @@ pub use remote_deletion::{
 pub use tracedecay_runtime_core::store_runtime::{
     VerifiedGraphRuntimePortV1, VerifiedGraphRuntimeWeakProxyV1,
 };
-pub use transcript::TranscriptPersistenceError;
-
-pub(crate) const UNIX_TIMESTAMP_MILLIS_THRESHOLD: i64 = 1_000_000_000_000;
+pub use tracedecay_sessions::runtime::TranscriptPersistenceError;
 
 pub use api_types::{
     AnalyticsEventInsert, AnalyticsEventQuery, AnalyticsEventRecord, AnalyticsHintCounts,
@@ -157,12 +162,10 @@ pub use support::{
     global_db_path, global_db_path_is_overridden,
 };
 use support::{
-    SESSION_MESSAGE_SEARCH_MAX_FETCH, analytics_scope_query, downrank_inventory_messages,
-    ensure_code_project_primary_root_columns, ensure_parse_offset_columns,
+    analytics_scope_query, ensure_code_project_primary_root_columns, ensure_parse_offset_columns,
     ensure_session_parent_columns, ensure_table_columns, git_remote_search_alias,
-    global_db_operation_error, global_db_operation_message, interleave_workflow_search_results,
-    like_pattern, normalize_git_remote_url, push_optional_analytics_filter, repo_identity_aliases,
-    row_to_analytics_event, session_fts_query,
+    global_db_operation_error, global_db_operation_message, like_pattern, normalize_git_remote_url,
+    push_optional_analytics_filter, repo_identity_aliases, row_to_analytics_event,
 };
 /// Compatibility re-export: workflow search filters now live beside the
 /// workflow-index contracts in [`tracedecay_sessions::runtime::workflow_index`].

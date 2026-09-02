@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::task::JoinHandle;
 use tracedecay_query::code_search;
+use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
 #[cfg(unix)]
 use super::explicit_git_state;
@@ -23,6 +24,7 @@ use super::{AutomationSchedulerHandle, DaemonEngine};
 use super::{
     DaemonClientIdentity, DaemonHandshake, DaemonLifecycle, DatabaseOwnerRegistry, ProjectRouteKey,
     ProjectServerKey, StoreAdministration, StoreOwnerKey, multi_root_family_allows,
+    store_owner_key_from_paths,
 };
 
 mod bootstrap;
@@ -135,7 +137,6 @@ fn multi_root_git_generation_reads_each_explicit_root() {
 
 #[test]
 fn multi_root_families_refuse_cross_family_fallback() {
-    use crate::application_surface::ApplicationSurfaceOperation;
     use tracedecay_application::MultiRootOperationV1;
 
     let git = MultiRootOperationV1::Git { request: json!({}) };
@@ -188,16 +189,24 @@ fn daemon_test_transcript_source_home_is_profile_parent() {
 
 fn test_store_administration_for_profile(profile_root: &std::path::Path) -> StoreAdministration {
     prepare_test_profile_root(profile_root);
-    let profile_identity = crate::daemon::profile_identity::load_or_create(profile_root)
-        .expect("load test profile identity");
+    let profile_identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(profile_root)
+            .expect("load test profile identity");
     StoreAdministration::default().with_profile_identity(profile_identity)
 }
 
 #[cfg(unix)]
 fn test_daemon_engine_for_profile(profile_root: &std::path::Path) -> DaemonEngine {
+    // Every handshake refusal the served engine writes advertises
+    // `binary_version()`, which reads the registered product runtime; a test
+    // that drives the engine without ever building a handshake (for example
+    // the unparseable-handshake refusals) would otherwise depend on some other
+    // fixture in the same process registering it first.
+    crate::product_runtime::register_fixture_product_runtime();
     prepare_test_profile_root(profile_root);
-    let profile_identity = crate::daemon::profile_identity::load_or_create(profile_root)
-        .expect("load test profile identity");
+    let profile_identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(profile_root)
+            .expect("load test profile identity");
     let engine = DaemonEngine::default().with_profile_identity(profile_identity);
     // Daemon bootstrap installs the profile worker plan before it publishes any
     // transport endpoint (`bootstrap::install_profile_worker_plan`), and project
@@ -277,7 +286,7 @@ fn enter_test_daemon_database_scope(
 async fn initialize_test_project(
     project_root: &std::path::Path,
     client_identity: &DaemonClientIdentity,
-) -> crate::storage::StoreLayout {
+) -> tracedecay_runtime_core::storage::StoreLayout {
     prepare_test_profile_root(&client_identity.profile_root);
     let lifecycle = tracedecay_runtime_core::lifecycle_lease::acquire_exclusive_for_profile(
         &client_identity.profile_root,
@@ -288,13 +297,18 @@ async fn initialize_test_project(
         &client_identity.profile_root,
         "daemon test fixture initialization",
     );
-    let project = crate::tracedecay::TraceDecay::init_with_exclusive_maintenance(
-        project_root,
-        crate::tracedecay::TraceDecayOpenOptions {
-            profile_root: Some(client_identity.profile_root.clone()),
-            global_db_path: Some(client_identity.global_db_path.clone()),
-        },
-        &lifecycle,
+    // Heap-allocate the graph-init composition so every test awaiting this
+    // fixture keeps a bounded resident frame (perf-profile layouts overflow
+    // the test stack when the mega-future is inlined).
+    let project = Box::pin(
+        crate::tracedecay::TraceDecay::init_with_exclusive_maintenance(
+            project_root,
+            crate::tracedecay::TraceDecayOpenOptions {
+                profile_root: Some(client_identity.profile_root.clone()),
+                global_db_path: Some(client_identity.global_db_path.clone()),
+            },
+            &lifecycle,
+        ),
     )
     .await
     .expect("initialize project");
@@ -304,6 +318,9 @@ async fn initialize_test_project(
 }
 
 fn test_handshake_defaults() -> DaemonHandshake {
+    // Test processes only ever register the fixture product runtime, so every
+    // handshake in the suite advertises one identical fixture version.
+    let build_version = crate::product_runtime::register_fixture_product_runtime().build_version();
     DaemonHandshake {
         project_path: None,
         scope_prefix: None,
@@ -311,7 +328,7 @@ fn test_handshake_defaults() -> DaemonHandshake {
         allow_init: false,
         allow_initialize_root_routing: false,
         client_identity: test_client_identity(),
-        client_version: super::binary_version().to_string(),
+        client_version: build_version.to_string(),
         client_instance_id: tracedecay_runtime_core::runtime_identity::process_run_id().to_string(),
         tool_list_changed_capable: false,
         catalog_version: String::new(),
@@ -529,7 +546,7 @@ async fn apply_project_automation_patch_via_surface(
     )
     .expect("apply automation configuration patch");
     let target = graph.configuration_runtime().configuration_target().clone();
-    let scope = super::project_open_owners::resolved_scope_for_project(
+    let scope = tracedecay_code_index_runtime::resolved_scope_for_project(
         graph.project_root(),
         &target.project_id,
     )
@@ -543,7 +560,7 @@ async fn apply_project_automation_patch_via_surface(
         project_root,
         scope,
     );
-    let operation = crate::application_surface::ApplicationSurfaceOperation::ConfigurationBatch;
+    let operation = ApplicationSurfaceOperation::ConfigurationBatch;
     let application_operation =
         tracedecay_application::configuration_surface_operation(operation.as_str())
             .expect("configuration operation contract")
@@ -560,8 +577,8 @@ async fn apply_project_automation_patch_via_surface(
         observed_at.0 + i64::try_from(maximum_millis).expect("deadline fits") * 1_000,
     ))
     .expect("configuration deadline");
-    let request_id = tracedecay_usecases::request_identity::mint_global_request_id(
-        tracedecay_usecases::request_identity::GlobalRequestSurface::Cli,
+    let request_id = tracedecay_application::request_identity::mint_global_request_id(
+        tracedecay_application::request_identity::GlobalRequestSurface::Cli,
     )
     .expect("surface request id");
     let idempotency_key = tracedecay_domain::configuration::ConfigurationIdempotencyKey::new(
@@ -610,11 +627,15 @@ async fn apply_project_automation_patch_via_surface(
             tracedecay_daemon_protocol::RequestedOutputFormat::Json,
         )
         .expect("configuration batch dispatch");
-    crate::application_surface::execute_application_surface(operation, dispatched, Some(&executor))
-        .await
-        .expect("configuration batch application invocation")
-        .result
-        .expect("automation configuration effect");
+    Box::pin(crate::application_surface::execute_application_surface(
+        operation,
+        dispatched,
+        Some(&executor),
+    ))
+    .await
+    .expect("configuration batch application invocation")
+    .result
+    .expect("automation configuration effect");
     server
 }
 

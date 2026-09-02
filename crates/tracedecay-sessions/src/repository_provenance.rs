@@ -310,6 +310,7 @@ pub struct PreparedRepositoryProvenanceV1 {
 }
 
 impl PreparedRepositoryProvenanceV1 {
+    #[hotpath::skip]
     pub const fn unavailable() -> Self {
         Self {
             availability: EvidenceAvailabilityV1::Unavailable,

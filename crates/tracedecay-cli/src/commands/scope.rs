@@ -11,7 +11,7 @@
 //! the registry status taxonomy, and payload field extraction. The resolution
 //! guards (canonicalization, sibling-root authorization, digest revalidation)
 //! and the daemon-owned identity delegation live in the single canonical
-//! path (`tracedecay_usecases::context::RegisteredScopeResolver`).
+//! path (`tracedecay_session_memory::context::RegisteredScopeResolver`).
 
 use std::path::{Path, PathBuf};
 
@@ -33,7 +33,7 @@ pub(crate) struct ResolvedCliScope {
 /// discovers or substitutes a path from the process CWD.
 pub(crate) async fn resolve_project_scope(
     project_path: PathBuf,
-) -> tracedecay_runtime_core::errors::Result<ResolvedCliScope> {
+) -> tracedecay_domain::errors::Result<ResolvedCliScope> {
     let payload = daemon_tool_json(
         None,
         "tracedecay_admin_cli",
@@ -49,7 +49,7 @@ pub(crate) async fn resolve_project_scope(
 fn scope_from_registry_payload(
     requested: &Path,
     payload: &Value,
-) -> tracedecay_runtime_core::errors::Result<ResolvedCliScope> {
+) -> tracedecay_domain::errors::Result<ResolvedCliScope> {
     match payload.get("status").and_then(Value::as_str) {
         Some("ok") => {}
         Some("not_found") => {
@@ -126,7 +126,7 @@ fn scope_from_registry_payload(
     // The requested-root canonicalization, sibling-root authorization, and
     // scope-digest revalidation all live in the single canonical resolver; the
     // CLI keeps only the registry brokering and selector taxonomy above.
-    tracedecay_usecases::context::RegisteredScopeResolver::resolve(
+    tracedecay_session_memory::context::RegisteredScopeResolver::resolve(
         &canonical,
         requested,
         &project_id,
@@ -148,7 +148,7 @@ fn required_project_str<'a>(
     project: &'a Value,
     field: &str,
     requested: &Path,
-) -> tracedecay_runtime_core::errors::Result<&'a str> {
+) -> tracedecay_domain::errors::Result<&'a str> {
     project
         .get(field)
         .and_then(Value::as_str)
@@ -165,7 +165,7 @@ fn canonicalize_absolute_root(
     root: &Path,
     role: &str,
     requested: &Path,
-) -> tracedecay_runtime_core::errors::Result<PathBuf> {
+) -> tracedecay_domain::errors::Result<PathBuf> {
     if !root.is_absolute() {
         return Err(config_error(format!(
             "{role} '{}' for project selector '{}' is not absolute; refusing CWD-relative scope resolution",
@@ -182,8 +182,8 @@ fn canonicalize_absolute_root(
     })
 }
 
-fn config_error(message: String) -> tracedecay_runtime_core::errors::TraceDecayError {
-    tracedecay_runtime_core::errors::TraceDecayError::Config { message }
+fn config_error(message: String) -> tracedecay_domain::errors::TraceDecayError {
+    tracedecay_domain::errors::TraceDecayError::Config { message }
 }
 
 #[cfg(test)]

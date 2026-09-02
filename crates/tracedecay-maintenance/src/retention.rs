@@ -7,7 +7,7 @@
 //!   signal, so it carries a **safe default retention of 180 days**.
 //! * `session_messages` and `lcm_raw_messages` — legacy session copies retained
 //!   for a six-month recovery horizon. Current session stores additionally use
-//!   projection-durability-aware retention in [`tracedecay_sessions::runtime::lcm`].
+//!   projection-durability-aware retention in `tracedecay_lcm::retention`.
 //!
 //! Every window is expressed in whole days. Rows are pruned only when their
 //! timestamp is both present and strictly older than the cutoff, so rows with
@@ -19,8 +19,8 @@ pub use tracedecay_automation::config::{
     DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS, DEFAULT_LEGACY_SESSION_RETENTION_DAYS, RetentionConfig,
 };
 
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_runtime_core::db::engine::Executor;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 
 /// Free-page compaction for tracked branch databases, off the hot path
 /// (plan 38, §6).

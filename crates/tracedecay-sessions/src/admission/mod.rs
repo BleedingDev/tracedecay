@@ -10,7 +10,6 @@
 //!
 //! * the disposition values it returns ([`HostAdmissionOutcome`],
 //!   [`HostAdmissionStatus`], [`HostProjectionDrainOutcome`]),
-//! * the bounded-wire helpers shared by every host input reader,
 //! * the record/spool bounds every provider discovery walk charges against,
 //! * and [`HostAdmission`], the dyn-safe port the root facade implements.
 
@@ -31,19 +30,14 @@ use crate::observation::{
 
 pub mod bounds;
 pub mod disposition;
-pub mod wire;
+pub mod ingest;
 
 pub use bounds::{DEFAULT_MAX_RECORD_BYTES, DEFAULT_MAX_RECORDS, DEFAULT_MAX_SPOOL_BYTES};
 pub use disposition::{
     HostAdmissionDispositionClass, HostAdmissionStatus, HostAdmissionTelemetryDisposition,
     is_bounded_reason_code,
 };
-pub use wire::{
-    BoundedLineReader, MAX_MCP_JSONRPC_FRAME_BYTES, MAX_WIRE_MESSAGE_BYTES,
-    MCP_OVERSIZE_ID_INSPECT_BYTES, WIRE_RECORD_TOO_LARGE, WireReadOutcome,
-    is_wire_oversized_io_error, read_bounded_mcp_line, read_bounded_to_string,
-    wire_oversized_inspect_prefix, wire_oversized_io_error, wire_oversized_io_error_with_prefix,
-};
+pub use ingest::{SESSION_INGEST_DISABLED_REASON_V1, session_ingest_disabled};
 
 /// Boxed future returned by every [`HostAdmission`] method.
 ///
@@ -99,6 +93,7 @@ pub enum HostAdmissionScope {
 }
 
 impl HostAdmissionOutcome {
+    #[hotpath::skip]
     const fn new(
         status: HostAdmissionStatus,
         retryable: bool,
@@ -112,6 +107,7 @@ impl HostAdmissionOutcome {
         }
     }
 
+    #[hotpath::skip]
     pub const fn batch_requires_scalar_fallback(cause: ObservationBatchFallbackCause) -> Self {
         Self {
             status: HostAdmissionStatus::Backpressured,
@@ -121,6 +117,7 @@ impl HostAdmissionOutcome {
         }
     }
 
+    #[hotpath::skip]
     pub const fn deterministic_content_refusal(reason_code: &'static str) -> Self {
         Self {
             status: HostAdmissionStatus::Degraded,
@@ -130,26 +127,32 @@ impl HostAdmissionOutcome {
         }
     }
 
+    #[hotpath::skip]
     pub const fn supported() -> Self {
         Self::new(HostAdmissionStatus::Supported, false, None)
     }
 
+    #[hotpath::skip]
     pub const fn accepted_for_replay() -> Self {
         Self::new(HostAdmissionStatus::AcceptedForReplay, false, None)
     }
 
+    #[hotpath::skip]
     pub const fn retained_backpressured(reason_code: &'static str) -> Self {
         Self::new(HostAdmissionStatus::Backpressured, true, Some(reason_code))
     }
 
+    #[hotpath::skip]
     pub const fn retained_unavailable(reason_code: &'static str) -> Self {
         Self::new(HostAdmissionStatus::Unavailable, true, Some(reason_code))
     }
 
+    #[hotpath::skip]
     pub const fn degraded(reason_code: &'static str) -> Self {
         Self::new(HostAdmissionStatus::Degraded, false, Some(reason_code))
     }
 
+    #[hotpath::skip]
     pub const fn replay_completed(changed: bool, exact_duplicate: bool) -> Self {
         if changed {
             Self::new(HostAdmissionStatus::Committed, false, None)
@@ -160,6 +163,7 @@ impl HostAdmissionOutcome {
         }
     }
 
+    #[hotpath::skip]
     pub const fn spool_overflow() -> Self {
         Self::new(
             HostAdmissionStatus::Backpressured,
@@ -168,6 +172,7 @@ impl HostAdmissionOutcome {
         )
     }
 
+    #[hotpath::skip]
     pub const fn spool_record_too_large() -> Self {
         Self::new(
             HostAdmissionStatus::Degraded,
@@ -177,17 +182,20 @@ impl HostAdmissionOutcome {
     }
 
     /// Host-event wire or MCP/daemon JSON-RPC frame exceeded its respective
-    /// bound ([`wire::MAX_WIRE_MESSAGE_BYTES`] or
-    /// [`wire::MAX_MCP_JSONRPC_FRAME_BYTES`]) before durable retention.
+    /// bound ([`tracedecay_framing::MAX_WIRE_MESSAGE_BYTES`] or
+    /// [`tracedecay_framing::MAX_MCP_JSONRPC_FRAME_BYTES`])
+    /// before durable retention.
     /// Non-retryable; full payload is not retained.
+    #[hotpath::skip]
     pub const fn wire_record_too_large() -> Self {
         Self::new(
             HostAdmissionStatus::Degraded,
             false,
-            Some(wire::WIRE_RECORD_TOO_LARGE),
+            Some(tracedecay_framing::WIRE_RECORD_TOO_LARGE),
         )
     }
 
+    #[hotpath::skip]
     pub const fn spool_source_too_large() -> Self {
         Self::new(
             HostAdmissionStatus::Degraded,
@@ -196,6 +204,7 @@ impl HostAdmissionOutcome {
         )
     }
 
+    #[hotpath::skip]
     pub const fn spool_corrupted() -> Self {
         Self::new(
             HostAdmissionStatus::Unavailable,
@@ -204,10 +213,12 @@ impl HostAdmissionOutcome {
         )
     }
 
+    #[hotpath::skip]
     pub const fn durable_payload_unsupported_version() -> Self {
         Self::retained_unavailable("host_event_payload_unsupported_version")
     }
 
+    #[hotpath::skip]
     pub const fn durable_payload_malformed() -> Self {
         Self::new(
             HostAdmissionStatus::Unavailable,
@@ -216,6 +227,7 @@ impl HostAdmissionOutcome {
         )
     }
 
+    #[hotpath::skip]
     pub const fn spool_ack_conflict() -> Self {
         Self::new(
             HostAdmissionStatus::Backpressured,
@@ -224,6 +236,7 @@ impl HostAdmissionOutcome {
         )
     }
 
+    #[hotpath::skip]
     pub const fn spool_recovery_required() -> Self {
         Self::new(
             HostAdmissionStatus::Unavailable,
@@ -232,6 +245,7 @@ impl HostAdmissionOutcome {
         )
     }
 
+    #[hotpath::skip]
     pub const fn quarantine_full() -> Self {
         Self::new(
             HostAdmissionStatus::Backpressured,
@@ -240,6 +254,7 @@ impl HostAdmissionOutcome {
         )
     }
 
+    #[hotpath::skip]
     pub const fn quarantine_corrupted() -> Self {
         Self::new(
             HostAdmissionStatus::Unavailable,
@@ -248,6 +263,7 @@ impl HostAdmissionOutcome {
         )
     }
 
+    #[hotpath::skip]
     pub const fn quarantine_recovery_required() -> Self {
         Self::new(
             HostAdmissionStatus::Unavailable,
@@ -256,6 +272,7 @@ impl HostAdmissionOutcome {
         )
     }
 
+    #[hotpath::skip]
     pub const fn project_authority_unbound() -> Self {
         Self::new(
             HostAdmissionStatus::Unavailable,
@@ -264,6 +281,7 @@ impl HostAdmissionOutcome {
         )
     }
 
+    #[hotpath::skip]
     pub const fn project_authority_mismatch() -> Self {
         Self::new(
             HostAdmissionStatus::Unavailable,
@@ -272,6 +290,7 @@ impl HostAdmissionOutcome {
         )
     }
 
+    #[hotpath::skip]
     pub const fn registered_authority_unavailable() -> Self {
         Self::new(
             HostAdmissionStatus::Unavailable,
@@ -280,6 +299,7 @@ impl HostAdmissionOutcome {
         )
     }
 
+    #[hotpath::skip]
     pub const fn parse_offset_conflict() -> Self {
         Self::new(
             HostAdmissionStatus::Backpressured,
@@ -534,6 +554,8 @@ pub(crate) mod test_support {
         discovery_paths: Vec<(ObservationScopeV1, String, HostDiscoveryQueueEntry)>,
         next_discovery_sequence: u64,
         capture_failures_remaining: usize,
+        scalar_capture_calls: usize,
+        batch_capture_calls: usize,
         session_message_failures_remaining: usize,
         session_message_reads: usize,
     }
@@ -622,6 +644,7 @@ pub(crate) mod test_support {
     }
 
     impl ObservationStore for MemoryObservationStore {
+        #[hotpath::skip]
         async fn persist_observation(
             &self,
             write: AnchoredObservationWrite,
@@ -629,6 +652,7 @@ pub(crate) mod test_support {
             Self::persist_one(&mut self.state(), write)
         }
 
+        #[hotpath::skip]
         async fn persist_observations(
             &self,
             writes: Vec<AnchoredObservationWrite>,
@@ -660,6 +684,7 @@ pub(crate) mod test_support {
             Ok(outcomes)
         }
 
+        #[hotpath::skip]
         async fn get_source_cursor(
             &self,
             source: &ObservationSourceIdentityV1,
@@ -668,6 +693,7 @@ pub(crate) mod test_support {
             Ok(Self::current_cursor(&self.state(), source, scope))
         }
 
+        #[hotpath::skip]
         async fn advance_source_cursor(
             &self,
             advance: ObservationCursorAdvance,
@@ -688,6 +714,7 @@ pub(crate) mod test_support {
             Ok(CursorAdvanceOutcome::Committed)
         }
 
+        #[hotpath::skip]
         async fn get_observation(
             &self,
             observation_id: &CanonicalObservationIdV1,
@@ -700,6 +727,7 @@ pub(crate) mod test_support {
                 .cloned())
         }
 
+        #[hotpath::skip]
         async fn replay_observations(
             &self,
             request: ObservationReplayRequest,
@@ -728,6 +756,11 @@ pub(crate) mod test_support {
     impl MemoryHostAdmission {
         pub(crate) fn observations(&self) -> Vec<StoredObservation> {
             self.store.state().observations.clone()
+        }
+
+        pub(crate) fn capture_call_counts(&self) -> (usize, usize) {
+            let state = self.store.state();
+            (state.scalar_capture_calls, state.batch_capture_calls)
         }
 
         pub(crate) fn fail_next_capture(&self) {
@@ -810,6 +843,7 @@ pub(crate) mod test_support {
             Box::pin(async move {
                 {
                     let mut state = self.store.state();
+                    state.scalar_capture_calls = state.scalar_capture_calls.saturating_add(1);
                     if state.capture_failures_remaining > 0 {
                         state.capture_failures_remaining -= 1;
                         return Err(HostAdmissionOutcome::registered_authority_unavailable());
@@ -829,6 +863,7 @@ pub(crate) mod test_support {
             Box::pin(async move {
                 {
                     let mut state = self.store.state();
+                    state.batch_capture_calls = state.batch_capture_calls.saturating_add(1);
                     if state.capture_failures_remaining > 0 {
                         state.capture_failures_remaining -= 1;
                         return Err(HostAdmissionOutcome::registered_authority_unavailable());
@@ -1168,5 +1203,23 @@ pub(crate) mod test_support {
                     .map(|(_, _, entry)| entry.clone()))
             })
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod wire_disposition_tests {
+    use super::{HostAdmissionOutcome, HostAdmissionStatus};
+    use tracedecay_framing::WIRE_RECORD_TOO_LARGE;
+
+    #[test]
+    fn wire_oversized_maps_to_typed_non_durable_outcome_without_payload() {
+        let outcome = HostAdmissionOutcome::wire_record_too_large();
+        assert_eq!(outcome.status, HostAdmissionStatus::Degraded);
+        assert!(!outcome.retryable);
+        assert_eq!(outcome.reason_code, Some(WIRE_RECORD_TOO_LARGE));
+        let encoded = serde_json::to_string(&outcome).unwrap();
+        assert!(!encoded.contains('x'));
+        assert!(encoded.contains(WIRE_RECORD_TOO_LARGE));
     }
 }

@@ -84,6 +84,8 @@ pub use lexical_page_source::{
     VerifiedSealedLexicalSourceReceiptV1, VerifiedSealedLexicalSymbolDisplayV1,
     VerifiedSealedTextGenerationMetadataV1,
 };
+mod partitioned_codec;
+pub use partitioned_codec::SealedGenerationSegmentIdentityV1;
 mod sealed_codec;
 pub use sealed_codec::{
     MAX_SEALED_CODE_GENERATION_BYTES_V1, SEALED_GENERATION_FORMAT_REVISION_V1,
@@ -119,6 +121,69 @@ impl CodeIndexProductionConfigV1 {
             return Err(CodeIndexProductionOpenErrorV1::InvalidSnapshotAge);
         }
         Ok(())
+    }
+}
+
+/// One owner input that prevents a sealed generation from being reused.
+///
+/// These reason codes are stable status vocabulary. They deliberately identify
+/// the incompatible authority rather than embedding current or prior values,
+/// which may include private project configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CodeIndexGenerationIncompatibilityV1 {
+    Project,
+    SanitizerRevision,
+    PolicyRevision,
+    MixedPolicyRevisions,
+    ChunkerRevision,
+    PrivacyDomain,
+    PrivacyKeyEpoch,
+}
+
+impl CodeIndexGenerationIncompatibilityV1 {
+    #[hotpath::skip]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::SanitizerRevision => "sanitizer_revision",
+            Self::PolicyRevision => "policy_revision",
+            Self::MixedPolicyRevisions => "mixed_policy_revisions",
+            Self::ChunkerRevision => "chunker_revision",
+            Self::PrivacyDomain => "privacy_domain",
+            Self::PrivacyKeyEpoch => "privacy_key_epoch",
+        }
+    }
+}
+
+/// Compatibility witness between one immutable generation and one production
+/// owner configuration.
+///
+/// Every incompatibility retires the generation from incremental reuse. A
+/// chunker-only mismatch may keep serving while its replacement builds because
+/// its already-sealed bytes still satisfy the same project, sanitizer, policy,
+/// and privacy authorities. Every other mismatch is a fail-closed serving
+/// refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeIndexGenerationCompatibilityV1 {
+    incompatibilities: BTreeSet<CodeIndexGenerationIncompatibilityV1>,
+}
+
+impl CodeIndexGenerationCompatibilityV1 {
+    pub fn incompatibilities(&self) -> &BTreeSet<CodeIndexGenerationIncompatibilityV1> {
+        &self.incompatibilities
+    }
+
+    pub fn is_reusable(&self) -> bool {
+        self.incompatibilities.is_empty()
+    }
+
+    pub fn may_serve_while_rebuilding(&self) -> bool {
+        self.incompatibilities.iter().all(|reason| {
+            matches!(
+                reason,
+                CodeIndexGenerationIncompatibilityV1::ChunkerRevision
+            )
+        })
     }
 }
 
@@ -280,6 +345,12 @@ struct FileGenerationArtifactsV1 {
     extraction: ExtractionBatchV1,
     artifacts: CodeFileIndexArtifactsV1,
     exact_authority: ExactExtractionAuthorityV1,
+}
+
+impl AsRef<FileGenerationArtifactsV1> for FileGenerationArtifactsV1 {
+    fn as_ref(&self) -> &FileGenerationArtifactsV1 {
+        self
+    }
 }
 
 enum IncrementFileMaterializationV1 {
@@ -668,6 +739,45 @@ impl CodeIndexPublishedGenerationV1 {
                 ChunkPolicyRevisionSummaryV1::Uniform(first.sensitivity.policy_revision.clone())
             }
         })
+    }
+
+    /// Compare every owner-controlled generation input against this immutable
+    /// seal and return one canonical compatibility witness.
+    #[hotpath::measure(label = "code_index.generation.compatibility")]
+    pub fn compatibility_with(
+        &self,
+        config: &CodeIndexProductionConfigV1,
+    ) -> CodeIndexGenerationCompatibilityV1 {
+        let mut incompatibilities = BTreeSet::new();
+        if self.manifest.project_id != config.project_id {
+            incompatibilities.insert(CodeIndexGenerationIncompatibilityV1::Project);
+        }
+        if self.manifest.sanitizer_revision != config.sanitizer_revision {
+            incompatibilities.insert(CodeIndexGenerationIncompatibilityV1::SanitizerRevision);
+        }
+        match self.chunk_policy_summary() {
+            ChunkPolicyRevisionSummaryV1::Empty => {}
+            ChunkPolicyRevisionSummaryV1::Uniform(revision)
+                if *revision != config.policy_revision =>
+            {
+                incompatibilities.insert(CodeIndexGenerationIncompatibilityV1::PolicyRevision);
+            }
+            ChunkPolicyRevisionSummaryV1::Mixed => {
+                incompatibilities
+                    .insert(CodeIndexGenerationIncompatibilityV1::MixedPolicyRevisions);
+            }
+            ChunkPolicyRevisionSummaryV1::Uniform(_) => {}
+        }
+        if self.manifest.chunker_revision != config.chunker_revision {
+            incompatibilities.insert(CodeIndexGenerationIncompatibilityV1::ChunkerRevision);
+        }
+        if self.manifest.privacy_domain != config.privacy_domain {
+            incompatibilities.insert(CodeIndexGenerationIncompatibilityV1::PrivacyDomain);
+        }
+        if self.manifest.privacy_key_epoch != config.privacy_key_epoch {
+            incompatibilities.insert(CodeIndexGenerationIncompatibilityV1::PrivacyKeyEpoch);
+        }
+        CodeIndexGenerationCompatibilityV1 { incompatibilities }
     }
 
     /// Build the production generation-bound affected-test authority.
@@ -1088,16 +1198,16 @@ impl CodeIndexPublishedGenerationV1 {
                     "published generation does not match file artifacts".to_owned(),
                 ));
             }
-            let mut edges = files
-                .iter()
-                .flat_map(|file| file.artifacts.edges.iter())
-                .collect::<Vec<_>>();
-            edges.sort_by(|left, right| edge_order(left, right));
+            // Re-derive the generation's edge evidence (per-file edges plus
+            // the seal-time cross-file resolution) with the same authority
+            // that sealed it, so a published generation whose derivation and
+            // stored evidence disagree is refused.
+            let (edges, _) = collect_edge_evidence(&files);
             let edges_match = edges.len() == self.edges.len()
                 && edges
                     .iter()
                     .zip(&self.edges)
-                    .all(|(left, right)| *left == right);
+                    .all(|(left, right)| left == right);
             let mut edge_abstentions = files
                 .iter()
                 .flat_map(|file| file.artifacts.edge_abstentions.iter())
@@ -1296,23 +1406,12 @@ where
             ));
         }
         active.validate()?;
-        if active.manifest.project_id != self.config.project_id
-            || active.manifest.sanitizer_revision != self.config.sanitizer_revision
-            || active.manifest.chunker_revision != self.config.chunker_revision
-            || active.manifest.privacy_domain != self.config.privacy_domain
-            || active.manifest.privacy_key_epoch != self.config.privacy_key_epoch
-            || match active.chunk_policy_summary() {
-                ChunkPolicyRevisionSummaryV1::Empty => false,
-                ChunkPolicyRevisionSummaryV1::Uniform(revision) => {
-                    *revision != self.config.policy_revision
-                }
-                ChunkPolicyRevisionSummaryV1::Mixed => true,
-            }
-        {
-            return Err(CodeIndexProductionErrorV1::Contract(
-                "active generation is incompatible with the production owner configuration"
-                    .to_owned(),
-            ));
+        let compatibility = active.compatibility_with(&self.config);
+        if !compatibility.is_reusable() {
+            return Ok(ActiveGenerationLookupV1 {
+                reusable: None,
+                cas_incumbent: Some(active.manifest.generation_id.clone()),
+            });
         }
         let cas_incumbent = Some(active.manifest.generation_id.clone());
         Ok(ActiveGenerationLookupV1 {

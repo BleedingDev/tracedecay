@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use tracedecay_semantic_contracts::DEFAULT_FASTEMBED_MODEL_ID;
 
 use super::journey_test_support::{git, tool_payload};
 use super::semantic_activation_journey_test::{
@@ -296,12 +297,12 @@ async fn retrieval_answers_before_activation_and_is_unchanged_by_live_semantic_a
     };
     let _profile = crate::config::PinnedUserDataDir::new();
     let lifecycle_root =
-        crate::semantic_code::default_lifecycle_root().expect("isolated lifecycle root");
+        tracedecay_semantic::default_lifecycle_root().expect("isolated lifecycle root");
     let lifecycle =
-        crate::semantic_code::shared_lifecycle_owner().expect("production lifecycle owner");
+        tracedecay_semantic::default_shared_lifecycle_owner().expect("production lifecycle owner");
     seed_distribution_fixture(&lifecycle_root, &fixture_root, &lifecycle);
     lifecycle
-        .select_model(Some(crate::semantic_code::DEFAULT_FASTEMBED_MODEL_ID), true)
+        .select_model(Some(DEFAULT_FASTEMBED_MODEL_ID), true)
         .expect("select production semantic model");
     lifecycle
         .acquire_blocking_for_tests()

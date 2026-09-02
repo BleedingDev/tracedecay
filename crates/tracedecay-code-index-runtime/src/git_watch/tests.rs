@@ -245,6 +245,7 @@ fn backstop_covers_elapsed_intervals_regardless_of_watcher_liveness() {
 fn fast_watch_config() -> SyncConfig {
     let mut config = SyncConfig {
         auto_watch: true,
+        watch_linked_worktrees: true,
         ..SyncConfig::default()
     };
     config.watch_debounce_ms = 25;
@@ -273,12 +274,15 @@ fn fast_watch_config() -> SyncConfig {
 const TEST_READY_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn git(dir: &Path, args: &[&str]) {
-    let output = Command::new(tracedecay_runtime_core::git::git_program())
-        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("git should run");
+    let output = Command::new(
+        tracedecay_runtime_core::git::try_git_program()
+            .expect("absolute git executable should resolve"),
+    )
+    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+    .args(args)
+    .current_dir(dir)
+    .output()
+    .expect("git should run");
     assert!(
         output.status.success(),
         "git {args:?} failed in {}\nstdout:\n{}\nstderr:\n{}",
@@ -381,7 +385,7 @@ async fn currently_watch_limited(repo: &Path) -> bool {
     else {
         return false;
     };
-    let daemon_cancellation = tracedecay_usecases::context::CancellationToken::new();
+    let daemon_cancellation = tracedecay_session_memory::context::CancellationToken::new();
     let cancellation = state.cancellation(&daemon_cancellation);
     matches!(
         install_watches(&mut probe, state, cancellation).await,

@@ -20,12 +20,14 @@ use tracedecay_domain::{ActorId, ManifestDigest, ProjectId, RunId};
 use tracedecay_private_fs::framed_log::{DirectorySyncPolicy, with_owned_temp_publish};
 use tracedecay_store::FactReadControl;
 
-use super::{
-    AutomationSettledTerminal, contract_error, digest,
-    journal::{self, DurableAutomationAdmission},
-    projection::project_recovered_committed_receipts,
+use tracedecay_automation_runtime::automation::effect_runtime::journal::{
+    self, DurableAutomationAdmission,
 };
-use tracedecay_runtime_core::errors::Result;
+use tracedecay_automation_runtime::automation::effect_runtime::projection::project_recovered_committed_receipts;
+use tracedecay_automation_runtime::automation::effect_runtime::{
+    AutomationSettledTerminal, contract_error, digest, retirement,
+};
+use tracedecay_domain::errors::Result;
 
 const INDEX_SCHEMA_VERSION: u32 = 1;
 const MAX_PENDING_AUTOMATION_EFFECTS: usize = 256;
@@ -66,7 +68,7 @@ pub(crate) async fn reconcile_reserved_automation_effects_for_project(
             "automation recovery requires a project owner",
         ));
     };
-    let scope = crate::daemon::project_open_owners::resolved_scope_for_project(
+    let scope = tracedecay_code_index_runtime::resolved_scope_for_project(
         memory.project_root(),
         project_id,
     )
@@ -184,7 +186,7 @@ pub(super) fn reject_unbound_retirement_witness_if_index_empty(
     with_index_lock(&path, || {
         let index = read_index(&path)?;
         if index.entries.is_empty() && index.retirement_transitions.is_empty() {
-            super::retirement::reject_unbound_retirement_witness(dashboard_root)?;
+            retirement::reject_unbound_retirement_witness(dashboard_root)?;
         }
         Ok(())
     })
@@ -269,9 +271,9 @@ async fn reconcile_indexed_retirement_transition(
     let capture_expected = indexed.capture_expected;
     tokio::task::spawn_blocking(move || {
         let closure =
-            super::retirement::closure_for_durable_transition(&root, &binding, capture_expected)?;
+            retirement::closure_for_durable_transition(&root, &binding, capture_expected)?;
         remove_pending_for_retirement_blocking(&root, &path, &admission, &closure)?;
-        super::retirement::complete_after_pending_removal(&closure)?;
+        retirement::complete_after_pending_removal(&closure)?;
         finish_retirement_transition_blocking(&root, &path, &admission, &closure)
     })
     .await
@@ -379,7 +381,7 @@ async fn reconcile_indexed_automation_effect(
                 .ok_or_else(|| contract_error("prepared journal changed during recovery"))?;
             let terminal = journal::read_indexed_terminal_blocking(&prepared_path)?
                 .ok_or_else(|| contract_error("prepared journal lost its terminal sidecar"))?;
-            Ok::<_, tracedecay_runtime_core::errors::TraceDecayError>((terminal, publication))
+            Ok::<_, tracedecay_domain::errors::TraceDecayError>((terminal, publication))
         })
         .await
         .map_err(|error| contract_error(format!("prepared terminal reader failed: {error}")))??;
@@ -536,7 +538,7 @@ async fn persist_reserved_recovery(
             Some(&write_cancellation),
         )?
         else {
-            return Ok::<bool, tracedecay_runtime_core::errors::TraceDecayError>(false);
+            return Ok::<bool, tracedecay_domain::errors::TraceDecayError>(false);
         };
         remove_pending_blocking(&root, &path)?;
         Ok(true)
@@ -789,7 +791,7 @@ pub(super) fn remove_pending_for_retirement_blocking(
     dashboard_root: &Path,
     journal_path: &Path,
     admission: &DurableAutomationAdmission,
-    closure: &super::retirement::RetirementClosure,
+    closure: &retirement::RetirementClosure,
 ) -> Result<()> {
     remove_pending_for_retirement_with_writer(
         dashboard_root,
@@ -804,7 +806,7 @@ fn remove_pending_for_retirement_with_writer(
     dashboard_root: &Path,
     journal_path: &Path,
     admission: &DurableAutomationAdmission,
-    closure: &super::retirement::RetirementClosure,
+    closure: &retirement::RetirementClosure,
     mut write_index: impl FnMut(&Path, &[u8]) -> Result<()>,
 ) -> Result<()> {
     let expected = entry_for(journal_path, &admission.scope)?;
@@ -924,7 +926,7 @@ pub(super) fn finish_retirement_transition_blocking(
     dashboard_root: &Path,
     journal_path: &Path,
     admission: &DurableAutomationAdmission,
-    closure: &super::retirement::RetirementClosure,
+    closure: &retirement::RetirementClosure,
 ) -> Result<()> {
     let entry = entry_for(journal_path, &admission.scope)?;
     let transition = retirement_transition_for(&entry, admission, closure)?;
@@ -971,7 +973,7 @@ fn finish_retirement_transition_with_writer(
 fn retirement_transition_for(
     entry: &PendingIndexEntry,
     admission: &DurableAutomationAdmission,
-    closure: &super::retirement::RetirementClosure,
+    closure: &retirement::RetirementClosure,
 ) -> Result<PendingRetirementTransition> {
     let binding = admission.retirement().ok_or_else(|| {
         contract_error("automation retirement transition has no durable admission binding")
@@ -1087,7 +1089,7 @@ fn mutate_index_with_writer(
 
 fn write_pending_index(path: &Path, bytes: &[u8]) -> Result<()> {
     write_pending_index_with_publisher(path, bytes, |temporary, destination| {
-        super::journal::replace_automation_file_atomically(
+        journal::replace_automation_file_atomically(
             temporary,
             destination,
             "automation pending recovery index",
@@ -1118,9 +1120,8 @@ pub(super) fn write_pending_index_with_publisher(
 }
 
 fn read_index(path: &Path) -> Result<PendingIndex> {
-    crate::storage::reject_symlink_components(path, "automation pending index").map_err(
-        |error| contract_error(format!("automation pending index path failed: {error}")),
-    )?;
+    tracedecay_runtime_core::storage::reject_symlink_components(path, "automation pending index")
+        .map_err(|error| contract_error(format!("automation pending index path failed: {error}")))?;
     let parent = path
         .parent()
         .ok_or_else(|| contract_error("automation pending index path has no parent"))?;
@@ -1260,18 +1261,23 @@ fn with_index_lock<T>(path: &Path, operation: impl FnOnce() -> Result<T>) -> Res
     let parent = path
         .parent()
         .ok_or_else(|| contract_error("automation pending index path has no parent"))?;
-    crate::storage::PrivateStoreIo::create_dir_all_durable(parent).map_err(|error| {
+    tracedecay_runtime_core::storage::PrivateStoreIo::create_dir_all_durable(parent).map_err(
+        |error| {
+            contract_error(format!(
+                "automation pending index directory creation failed: {error}"
+            ))
+        },
+    )?;
+    let lock_path = tracedecay_runtime_core::storage::append_lock_path(path);
+    tracedecay_runtime_core::storage::reject_symlink_components(
+        &lock_path,
+        "automation pending index lock",
+    )
+    .map_err(|error| {
         contract_error(format!(
-            "automation pending index directory creation failed: {error}"
+            "automation pending index lock path failed: {error}"
         ))
     })?;
-    let lock_path = crate::storage::append_lock_path(path);
-    crate::storage::reject_symlink_components(&lock_path, "automation pending index lock")
-        .map_err(|error| {
-            contract_error(format!(
-                "automation pending index lock path failed: {error}"
-            ))
-        })?;
     let lock_parent = lock_path
         .parent()
         .ok_or_else(|| contract_error("automation pending index lock has no parent"))?;
@@ -1365,8 +1371,11 @@ mod tests {
         let path = root.join(INDEX_FILENAME);
         let outside = temp.path().join("outside.lock");
         std::fs::write(&outside, b"outside").expect("outside lock");
-        std::os::unix::fs::symlink(&outside, crate::storage::append_lock_path(&path))
-            .expect("symlink lock");
+        std::os::unix::fs::symlink(
+            &outside,
+            tracedecay_runtime_core::storage::append_lock_path(&path),
+        )
+        .expect("symlink lock");
 
         assert!(with_index_lock(&path, || Ok(())).is_err());
         assert_eq!(
@@ -1393,7 +1402,7 @@ mod tests {
             },
             |path, bytes| {
                 write_pending_index_with_publisher(path, bytes, |temporary, destination| {
-                    super::journal::replace_automation_file_atomically(
+                    journal::replace_automation_file_atomically(
                         temporary,
                         destination,
                         "automation pending recovery index",
@@ -1437,7 +1446,7 @@ mod tests {
             },
             |path, bytes| {
                 write_pending_index_with_publisher(path, bytes, |temporary, destination| {
-                    super::journal::replace_automation_file_atomically(
+                    journal::replace_automation_file_atomically(
                         temporary,
                         destination,
                         "automation pending recovery index",

@@ -18,11 +18,11 @@ use tracedecay_domain::{
     WorktreeId,
 };
 use tracedecay_graph_db::NeverCancelled;
-use tracedecay_tool_catalog::{CapabilityId, SchemaId, UseCaseId};
-use tracedecay_usecases::graph::{
+use tracedecay_graph_query::{
     CodeGraphProjectionReadPort, CodeGraphReadError, CodeGraphReadFuture, CodeGraphReadRequest,
     VerifiedCodeGraphRead,
 };
+use tracedecay_tool_catalog::{CapabilityId, SchemaId, UseCaseId};
 
 use super::{TraceDecay, TraceDecayOpenOptions};
 use tracedecay_usecases::primitives::SourceReadAdapter;
@@ -49,7 +49,11 @@ impl CodeGraphProjectionReadPort for FixtureCodeGraphProjection {
                 RequestAdmission::Cancelled => return Err(CodeGraphReadError::Cancelled),
                 RequestAdmission::TimedOut => return Err(CodeGraphReadError::TimedOut),
             }
-            VerifiedCodeGraphRead::new(self.scope.clone(), Arc::clone(&self.store))
+            VerifiedCodeGraphRead::new(
+                self.scope.clone(),
+                Arc::clone(&self.store),
+                tracedecay_graph_query::CodeGraphReadFreshnessV1::Current,
+            )
         })
     }
 }

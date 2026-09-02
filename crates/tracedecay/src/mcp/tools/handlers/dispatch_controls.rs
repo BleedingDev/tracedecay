@@ -4,11 +4,11 @@ use serde_json::Value;
 use tracedecay_application::{CancellationSignal, Deadline};
 
 use crate::tracedecay::TraceDecay;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 
-use super::super::ToolResult;
 use super::{ToolCallRegistryOptions, analytics};
+use tracedecay_mcp::ToolResult;
 
 fn admitted_control(
     options: &ToolCallRegistryOptions<'_>,
@@ -40,7 +40,7 @@ pub(super) async fn dispatch_analytics(
     analytics::handle_analytics(
         cg,
         args,
-        options.accounting_db,
+        options.global_db.map(RegisteredGlobalDbLeaseV1::as_ref),
         options
             .session_authorities
             .project_registered

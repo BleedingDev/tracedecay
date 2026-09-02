@@ -1439,9 +1439,16 @@ impl crate::agents::host_bundle_v2::HostComponentSetRegistrationV1
                 )),
             );
         }
-        let claude_global_install = component_set.host
-            == crate::agents::host_bundle_v2::HostKindV1::ClaudeCode
-            && self.operation == crate::agents::host_bundle_v2::HostBundleLifecycleOpV1::Install;
+        // Claude's global install and Hermes' named-profile projection both
+        // derive host-owned registration from deployed component bytes. An
+        // install may replace those bytes while the preflight registration
+        // still reads Current, so both must re-activate after every install.
+        let always_refresh_registration_on_install = matches!(
+            component_set.host,
+            crate::agents::host_bundle_v2::HostKindV1::ClaudeCode
+                | crate::agents::host_bundle_v2::HostKindV1::Hermes
+        ) && self.operation
+            == crate::agents::host_bundle_v2::HostBundleLifecycleOpV1::Install;
         self.should_apply = match self.operation {
             // A registration that is partially present or `Repairable` on
             // install is TraceDecay's own residue — staged sources, a
@@ -1452,7 +1459,7 @@ impl crate::agents::host_bundle_v2::HostComponentSetRegistrationV1
             // Refusing the mixed states here made every reinstall of a
             // partially activated host fail as a phantom ownership conflict.
             crate::agents::host_bundle_v2::HostBundleLifecycleOpV1::Install => {
-                !all_current || claude_global_install
+                !all_current || always_refresh_registration_on_install
             }
             crate::agents::host_bundle_v2::HostBundleLifecycleOpV1::Uninstall => !all_missing,
             crate::agents::host_bundle_v2::HostBundleLifecycleOpV1::Update
@@ -1869,6 +1876,7 @@ mod tests {
             crate::agents::host_bundle_registry::verified_embedded_default_host_component_set(
                 crate::agents::host_bundle_v2::HostKindV1::Gemini,
                 0,
+                crate::agents::TEST_GENERATOR_COMMIT,
             )
             .expect("Gemini has a compiled default set");
 
@@ -1891,6 +1899,7 @@ mod tests {
             crate::agents::host_bundle_registry::verified_embedded_default_host_component_set(
                 crate::agents::host_bundle_v2::HostKindV1::CursorDesktop,
                 0,
+                crate::agents::TEST_GENERATOR_COMMIT,
             )
             .expect("Cursor has a compiled default set");
         assert!(cursor.supports_artifact_only_backup_restore(&cursor_set.component_set));
@@ -1916,6 +1925,7 @@ mod tests {
             crate::agents::host_bundle_registry::verified_embedded_default_host_component_set(
                 crate::agents::host_bundle_v2::HostKindV1::Copilot,
                 0,
+                crate::agents::TEST_GENERATOR_COMMIT,
             )
             .expect("Copilot has a compiled default set");
 
@@ -1957,6 +1967,7 @@ mod tests {
             crate::agents::host_bundle_registry::verified_embedded_default_host_component_set(
                 HostKindV1::Codex,
                 0,
+                crate::agents::TEST_GENERATOR_COMMIT,
             )
             .expect("Codex has a compiled default set");
         let mut authority = CatalogHostComponentRegistrationAuthority::new(
@@ -2026,6 +2037,7 @@ mod tests {
             crate::agents::host_bundle_registry::verified_embedded_default_host_component_set(
                 HostKindV1::Codex,
                 0,
+                crate::agents::TEST_GENERATOR_COMMIT,
             )
             .expect("Codex has a compiled default set");
         let authority = CatalogHostComponentRegistrationAuthority::new(

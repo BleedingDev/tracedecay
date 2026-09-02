@@ -25,8 +25,9 @@ use tracedecay_domain::configuration::{
     MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
     ProtectedChange, ProtectedChangePlan, ProtectedChangeSnapshotError,
     RedactedConfigurationChangeV1, RollbackModeV1, RuleEffect, SOURCE_BINDINGS_SETTING_KEY,
-    ScopeControlOperationV1, ScopeSourceBinding, SettingKey, SourceKindV1,
-    USER_CODE_INDEX_WORKERS_SETTING_KEY, UserProfileId, WORK_TOPOLOGY_POLICY_SETTING_KEY,
+    SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY, ScopeControlOperationV1, ScopeSourceBinding, SettingKey,
+    SourceKindV1, USER_CODE_INDEX_WORKERS_SETTING_KEY, UserProfileId,
+    WORK_TOPOLOGY_POLICY_SETTING_KEY,
 };
 use tracedecay_domain::{AccessPolicyDigest, ActorId, ManifestDigest, UtcMicros, canonical_sha256};
 #[cfg(test)]
@@ -104,6 +105,7 @@ impl<'a> ConfigurationSqlStore<'a> {
 
 #[cfg(test)]
 impl ConfigurationSqlStore<'_> {
+    #[hotpath::skip]
     pub async fn current_revision(
         &self,
     ) -> ConfigurationStoreResult<ConfigurationRevisionRecordV1> {
@@ -113,6 +115,7 @@ impl ConfigurationSqlStore<'_> {
             .ok_or_else(|| invalid_store_data("current configuration revision disappeared"))
     }
 
+    #[hotpath::skip]
     pub async fn read_revision(
         &self,
         revision_id: &ConfigurationRevisionId,
@@ -123,6 +126,7 @@ impl ConfigurationSqlStore<'_> {
         read_revision_from_executor(self.connection, revision_id).await
     }
 
+    #[hotpath::skip]
     pub async fn save_change_plan(
         &self,
         plan: &ConfigurationProtectedPlanRecordV1,
@@ -141,15 +145,15 @@ impl ConfigurationSqlStore<'_> {
             Ok(None) => insert_change_plan(&transaction, plan).await,
             Err(error) => Err(error),
         };
-        match outcome {
-            Ok(()) => transaction.commit().await.map_err(unavailable_store),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+        crate::sqlite_persist::commit_outcome(
+            transaction,
+            outcome,
+            ConfigurationStoreError::Unavailable,
+        )
+        .await
     }
 
+    #[hotpath::skip]
     pub async fn read_change_plan(
         &self,
         plan_id: &ChangePlanId,
@@ -158,6 +162,7 @@ impl ConfigurationSqlStore<'_> {
         read_change_plan_from_executor(self.connection, plan_id).await
     }
 
+    #[hotpath::skip]
     pub async fn commit(
         &self,
         commit: ConfigurationCommitV1,
@@ -169,19 +174,15 @@ impl ConfigurationSqlStore<'_> {
             .await
             .map_err(unavailable_store)?;
         let outcome = commit_configuration_transaction(&transaction, &commit, false, None).await;
-        match outcome {
-            Ok(receipt) => transaction
-                .commit()
-                .await
-                .map(|()| receipt)
-                .map_err(unavailable_store),
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+        crate::sqlite_persist::commit_outcome(
+            transaction,
+            outcome,
+            ConfigurationStoreError::Unavailable,
+        )
+        .await
     }
 
+    #[hotpath::skip]
     pub async fn audit(
         &self,
         after: Option<&ConfigurationAuditEventId>,
@@ -262,10 +263,12 @@ impl ConfigurationSqlStore<'_> {
 
 #[cfg(test)]
 impl ConfigurationRevisionStore for ConfigurationSqlStore<'_> {
+    #[hotpath::skip]
     async fn current_revision(&self) -> ConfigurationStoreResult<ConfigurationRevisionRecordV1> {
         ConfigurationSqlStore::current_revision(self).await
     }
 
+    #[hotpath::skip]
     async fn read_revision(
         &self,
         revision_id: &ConfigurationRevisionId,
@@ -273,6 +276,7 @@ impl ConfigurationRevisionStore for ConfigurationSqlStore<'_> {
         ConfigurationSqlStore::read_revision(self, revision_id).await
     }
 
+    #[hotpath::skip]
     async fn save_change_plan(
         &self,
         plan: &ConfigurationProtectedPlanRecordV1,
@@ -280,6 +284,7 @@ impl ConfigurationRevisionStore for ConfigurationSqlStore<'_> {
         ConfigurationSqlStore::save_change_plan(self, plan).await
     }
 
+    #[hotpath::skip]
     async fn read_change_plan(
         &self,
         plan_id: &ChangePlanId,
@@ -287,6 +292,7 @@ impl ConfigurationRevisionStore for ConfigurationSqlStore<'_> {
         ConfigurationSqlStore::read_change_plan(self, plan_id).await
     }
 
+    #[hotpath::skip]
     async fn commit(
         &self,
         commit: ConfigurationCommitV1,
@@ -294,6 +300,7 @@ impl ConfigurationRevisionStore for ConfigurationSqlStore<'_> {
         ConfigurationSqlStore::commit(self, commit).await
     }
 
+    #[hotpath::skip]
     async fn audit(
         &self,
         after: Option<&ConfigurationAuditEventId>,
@@ -312,6 +319,7 @@ pub struct GlobalDbConfigurationControlStore<'db> {
 }
 
 impl<'db> GlobalDbConfigurationControlStore<'db> {
+    #[hotpath::skip]
     pub const fn new_registered(db: &'db RegisteredGlobalDb) -> Self {
         Self { db }
     }
@@ -388,6 +396,7 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
 
     /// Publishes the sole canonical first revision into an empty final-shape
     /// store. No legacy input, path, environment, or fallback value is read.
+    #[hotpath::skip]
     pub async fn initialize_canonical(
         &self,
         revision_id: &ConfigurationRevisionId,
@@ -588,6 +597,7 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
                 INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
                 MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
                 MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+                SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
             ]
             .into_iter()
             .map(SettingKey::new)
@@ -817,6 +827,7 @@ impl<'db> ProfileCodeIndexWorkerConfigurationStore<'db> {
         })
     }
 
+    #[hotpath::skip]
     pub async fn read_or_initialize(
         &self,
         occurred_at: UtcMicros,
@@ -996,6 +1007,7 @@ impl OwnedGlobalDbConfigurationControlStore {
     /// Revalidate mutation access by acquiring the exact guarded writer
     /// transaction. The capability carries the client-bound authority, so no
     /// path-derived authority can be substituted here.
+    #[hotpath::skip]
     async fn require_active_mutation_scope(
         db: &RegisteredGlobalDb,
     ) -> Result<(), ConfigurationError> {

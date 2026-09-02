@@ -21,6 +21,7 @@ pub enum HintOutcomePortOperation {
 }
 
 impl HintOutcomePortOperation {
+    #[hotpath::skip]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::QueryResolvedHints => "query_resolved_hints",
@@ -46,6 +47,7 @@ impl HintOutcomePortError {
         }
     }
 
+    #[hotpath::skip]
     pub const fn operation(&self) -> &'static str {
         self.operation
     }

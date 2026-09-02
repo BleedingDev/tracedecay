@@ -14,7 +14,7 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[1]
 CHECKER = REPO / "scripts/product/check-upstream-ownership-registry.py"
 SCHEMA = REPO / "product/upstream/convergence-map.schema.json"
-FLOOR = "08fbe33a7c7f403191fd5d6e356c7b6681b96403"
+FLOOR = "5749e4fcfe268e17bd19a0e6ef90c646f7b37289"
 OLD_FLOOR = "0000000000000000000000000000000000000001"
 KNOWN_BEADS = {
     "tdmem-0301",

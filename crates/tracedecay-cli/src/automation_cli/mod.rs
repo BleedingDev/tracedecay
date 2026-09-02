@@ -7,7 +7,7 @@ use crate::cli::AutomationAction;
 
 async fn daemon_project_dashboard_root(
     project_path: &std::path::Path,
-) -> tracedecay_runtime_core::errors::Result<std::path::PathBuf> {
+) -> tracedecay_domain::errors::Result<std::path::PathBuf> {
     let context = crate::commands::daemon_tool_json(
         Some(project_path),
         "tracedecay_active_project",
@@ -18,24 +18,22 @@ async fn daemon_project_dashboard_root(
         .get("storage")
         .and_then(|storage| storage.get("data_root"))
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(
-            || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: "managed daemon returned no active project data_root".to_string(),
-            },
-        )?;
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: "managed daemon returned no active project data_root".to_string(),
+        })?;
     Ok(std::path::PathBuf::from(data_root).join("dashboard"))
 }
 
 async fn daemon_automation_action(
     project_path: &std::path::Path,
     args: serde_json::Value,
-) -> tracedecay_runtime_core::errors::Result<serde_json::Value> {
+) -> tracedecay_domain::errors::Result<serde_json::Value> {
     crate::commands::daemon_tool_json(Some(project_path), "tracedecay_admin_project", args).await
 }
 
 pub(crate) async fn handle_automation_command(
     action: AutomationAction,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     match action {
         AutomationAction::Config { action } => {
             hotpath::future!(

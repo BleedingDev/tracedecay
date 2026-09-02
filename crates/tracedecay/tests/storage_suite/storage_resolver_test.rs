@@ -11,10 +11,13 @@ use tempfile::TempDir;
 use tracedecay::config::{TraceDecayConfig, USER_DATA_DIR_ENV};
 use tracedecay::config::{discover_project_root, get_config_path, load_config};
 use tracedecay::host_admission::HostAdmissionTestRuntimeV1;
-use tracedecay::mcp::response_handles::{
+use tracedecay::tracedecay::{TraceDecay, TraceDecayOpenOptions};
+use tracedecay_global_db::{ProjectObservationStoreError, StoreInstanceUpsert};
+use tracedecay_mcp::response_handles::{
     ResponseHandleLookup, retrieve_response_handle, store_response_handle,
 };
-use tracedecay::storage::{
+use tracedecay_runtime_core::branch_meta::{self, BranchMeta};
+use tracedecay_runtime_core::storage::{
     ActiveProjectContext, EnrollmentMarker, GraphScopeId, PrivateStoreIo, ProjectPath,
     STORE_MANIFEST_FILENAME, STORE_MANIFEST_SCHEMA_VERSION, StorageMode, StoreArtifactPath,
     StoreKind, StoreManifest, default_profile_project_id, default_profile_sharded_layout,
@@ -23,9 +26,6 @@ use tracedecay::storage::{
     resolve_project_session_db_path, resolve_response_handle_root,
     write_repository_identity_marker, write_store_manifest, write_store_manifest_to_path,
 };
-use tracedecay::tracedecay::{TraceDecay, TraceDecayOpenOptions};
-use tracedecay_global_db::{ProjectObservationStoreError, StoreInstanceUpsert};
-use tracedecay_runtime_core::branch_meta::{self, BranchMeta};
 
 mod artifact_routing;
 mod identity_resolution;
@@ -127,7 +127,7 @@ fn prepare_maintenance_profile(profile_root: &Path) {
 
 async fn init_with_maintenance(
     project_root: &Path,
-) -> tracedecay_runtime_core::errors::Result<TraceDecay> {
+) -> tracedecay_domain::errors::Result<TraceDecay> {
     let profile_root = maintenance_profile_root();
     prepare_maintenance_profile(&profile_root);
     let lifecycle = tracedecay_runtime_core::lifecycle_lease::acquire_exclusive_for_profile(
@@ -154,7 +154,7 @@ async fn init_with_maintenance(
 
 async fn open_with_maintenance(
     project_root: &Path,
-) -> tracedecay_runtime_core::errors::Result<TraceDecay> {
+) -> tracedecay_domain::errors::Result<TraceDecay> {
     let profile_root = maintenance_profile_root();
     prepare_maintenance_profile(&profile_root);
     let lifecycle = tracedecay_runtime_core::lifecycle_lease::acquire_exclusive_for_profile(

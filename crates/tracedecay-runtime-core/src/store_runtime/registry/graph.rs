@@ -222,6 +222,7 @@ impl StoreRuntimeRegistry {
     /// Retains one physical project graph store together with the exact code
     /// namespace selected by a linked worktree, ref, or immutable snapshot and
     /// code generation.
+    #[hotpath::skip]
     pub async fn retain_code_graph_store(
         &self,
         project_key: StoreRuntimeKey,
@@ -364,6 +365,7 @@ impl StoreRuntimeRegistry {
     /// with the daemon so Store retirement can reclassify only this exact map
     /// owner. Ordinary graph work must still obtain its own
     /// [`CanonicalGraphStoreLeaseV1`] through [`Self::retain_graph_store`].
+    #[hotpath::skip]
     pub async fn attach_graph_store_owner(
         &self,
         key: StoreRuntimeKey,

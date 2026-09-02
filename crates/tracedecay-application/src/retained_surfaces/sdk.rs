@@ -27,8 +27,9 @@ pub use results::{
     ClosedUtcIntervalV1, CompactLineageEdgeV1, CorrelationIndexV1, FactCommitDispositionV1,
     FactCommitOwnerV1, FactCommitReceiptV1, FactContradictionV1, FactFeedbackDetailsAvailabilityV1,
     FactFeedbackResultV1, FactFeedbackV1, FactIdentitySourceResultV1, FactPayloadAccessV1,
-    FactProjectionV1, FactSearchCursorV1, FactSearchGraphCoverageV1, FactSearchGraphDegradationV1,
-    FactSearchHitV1, FactSearchScoresV1, FactStatusV1, FactStoreAddCommitV1, FactStoreAddResultV1,
+    FactProjectionV1, FactRetrievalTelemetryDegradationV1, FactRetrievalTelemetryV1,
+    FactSearchCursorV1, FactSearchGraphCoverageV1, FactSearchGraphDegradationV1, FactSearchHitV1,
+    FactSearchScoresV1, FactStatusV1, FactStoreAddCommitV1, FactStoreAddResultV1,
     FactStoreContradictResultV1, FactStoreGetResultV1, FactStoreListResultV1,
     FactStoreProbeResultV1, FactStoreReasonResultV1, FactStoreRelatedResultV1,
     FactStoreRemoveResultV1, FactStoreSearchResultV1, FactStoreUpdateResultV1, FactTelemetryV1,
@@ -90,8 +91,15 @@ pub enum RetainedOutputFormatV1 {
 }
 
 /// Exact registered-project selector shared by retained reads.
+///
+/// Inlined so every request schema advertises the closed selector contract
+/// (`required: ["project_id"]`, no additional properties) directly on its
+/// `project_selector` property instead of behind a `$defs` reference, matching
+/// the selector shape the MCP dispatch policy promises for selector-accepting
+/// tools.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[schemars(inline)]
 pub struct RetainedProjectSelectorV1 {
     pub project_id: ProjectId,
 }
@@ -523,6 +531,7 @@ pub struct SessionRefreshRequestV1 {
 }
 
 impl SessionRefreshRequestV1 {
+    #[hotpath::skip]
     pub const fn with_action(
         action: SessionRefreshActionV1,
         request: SessionRefreshActionRequestV1,
@@ -530,6 +539,7 @@ impl SessionRefreshRequestV1 {
         Self { action, request }
     }
 
+    #[hotpath::skip]
     pub const fn operation(&self) -> RetainedSurfaceOperation {
         match self.action {
             SessionRefreshActionV1::Status => RetainedSurfaceOperation::SessionRefreshStatus,
@@ -658,6 +668,7 @@ pub enum RetainedSurfaceRequestV1 {
 }
 
 impl RetainedSurfaceRequestV1 {
+    #[hotpath::skip]
     pub const fn operation(&self) -> RetainedSurfaceOperation {
         match self {
             Self::FactStoreCurate(_) => RetainedSurfaceOperation::FactStoreCurate,

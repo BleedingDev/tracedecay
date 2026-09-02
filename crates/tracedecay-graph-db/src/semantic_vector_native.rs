@@ -66,6 +66,16 @@ pub fn vector_property(generation: &str) -> Result<GraphPropertyName, GraphDbErr
     GraphPropertyName::new(format!("{VECTOR}:{generation}"))
 }
 
+/// Entity id of one generation-owned vector row. This is the identity the
+/// generation's persisted vector index answers with, so writers and search
+/// callers must derive it from the same scheme.
+pub fn generation_vector_entity_id(
+    generation: &str,
+    chunk: &str,
+) -> Result<GraphEntityId, GraphDbError> {
+    scoped_entity_id("generation-vector", generation, chunk)
+}
+
 pub fn scoped_entity_id(
     kind: &str,
     owner: &str,
@@ -157,7 +167,7 @@ pub fn encode_generation_receipt(
 
 pub fn decode_generation_receipt(bytes: &[u8]) -> Result<ProjectionBatchReceiptV1, GraphDbError> {
     match serde_json::from_slice::<StoredBatchReceiptV1>(bytes)
-        .map_err(|_| GraphDbError::Conflict)?
+        .map_err(|_| GraphDbError::conflict("semantic_vector_native.decode_generation_receipt"))?
     {
         StoredBatchReceiptV1::Fat(receipt) => Ok(receipt),
         StoredBatchReceiptV1::Slim(receipt) => Ok(ProjectionBatchReceiptV1 {

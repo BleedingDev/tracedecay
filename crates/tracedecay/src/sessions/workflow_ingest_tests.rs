@@ -4,12 +4,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracedecay_domain::ProjectId;
 use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
 
-use crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1;
-use crate::store::GlobalDbWorkflowStore;
+use tracedecay_global_db::GlobalDbWorkflowStore;
 use tracedecay_sessions::runtime::workflow_index::{
     INGEST_WATERMARK_KEY, RegisteredWorkflowIndexSnapshot, WorkflowStatus, read_ingest_watermark,
 };
 use tracedecay_sessions::runtime::workflow_ingest::WorkflowIngestStats;
+use tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1;
 
 static WORKFLOW_TEST_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -36,8 +36,10 @@ impl WorkflowTestStore {
 
 async fn workflow_test_store(project_root: &Path) -> WorkflowTestStore {
     let profile = tempfile::tempdir().unwrap();
-    let identity =
-        crate::daemon::profile_identity::load_or_create(&profile.path().join("profile")).unwrap();
+    let identity = tracedecay_daemon_identity::profile_identity::load_or_create(
+        &profile.path().join("profile"),
+    )
+    .unwrap();
     let nonce = WORKFLOW_TEST_NONCE.fetch_add(1, Ordering::Relaxed);
     let scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         identity.profile_root(),

@@ -46,6 +46,7 @@ impl SourceAuthorizationSnapshot {
         &self.input
     }
 
+    #[hotpath::skip]
     pub const fn source_visible(&self) -> bool {
         self.source_visible
     }

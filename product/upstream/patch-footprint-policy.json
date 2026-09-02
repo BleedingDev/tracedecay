@@ -104,11 +104,11 @@
         "crates/tracedecay/src/mcp/server.rs",
         "crates/tracedecay/src/mcp/server/construction.rs",
         "crates/tracedecay/src/mcp/server/connection.rs",
-        "crates/tracedecay/src/daemon/session_sync.rs",
-        "crates/tracedecay/src/daemon/session_sync/git_topology.rs",
-        "crates/tracedecay/src/daemon/session_sync/project_lifecycle.rs",
-        "crates/tracedecay/src/daemon/session_sync/project_lifecycle_tests.rs",
-        "crates/tracedecay/src/daemon/session_sync_tests.rs"
+        "crates/tracedecay-session-runtime/src/session_sync.rs",
+        "crates/tracedecay-session-runtime/src/session_sync/git_topology.rs",
+        "crates/tracedecay-session-runtime/src/session_sync/project_lifecycle.rs",
+        "crates/tracedecay/src/daemon/session_runtime_tests/project_lifecycle_tests.rs",
+        "crates/tracedecay/src/daemon/session_runtime_tests/session_sync_tests.rs"
       ],
       "required_verification": [
         "daemon composition/restart tests",
@@ -136,8 +136,8 @@
         "crates/tracedecay/src/daemon/bootstrap.rs",
         "crates/tracedecay/src/daemon/engine/shutdown.rs",
         "crates/tracedecay/src/daemon/invocation_state.rs",
-        "crates/tracedecay/src/daemon/service/invocation/lsp.rs",
-        "crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs"
+        "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
+        "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs"
       ],
       "required_verification": [
         "blocking drain deadline regression test",
@@ -171,21 +171,24 @@
       "allowed_changes": [
         "select an explicit or Cargo-provided same-checkout CLI and otherwise fail closed",
         "clear inherited daemon routing and use one bounded production-equivalent socket path",
-        "share the common isolated command environment across the memory integration suite"
+        "share the common isolated command environment across the memory integration suite",
+        "remove a platform gate from a test-only import so an upstream lib-test module compiles on every supported host"
       ],
       "category": "integration_test",
       "forbidden_changes": [
         "guessing a sibling profile binary",
         "reusing an installed daemon or global profile",
         "silently mixing checkout revisions",
-        "changing production behavior"
+        "changing production behavior",
+        "changing any upstream test body, assertion, or fixture while fixing its compilation"
       ],
       "id": "integration_test_runtime_isolation",
-      "max_changed_lines": 218,
-      "max_files": 2,
+      "max_changed_lines": 240,
+      "max_files": 3,
       "paths": [
         "crates/tracedecay/tests/common/mod.rs",
-        "crates/tracedecay/tests/memory_suite/memory_eval_test.rs"
+        "crates/tracedecay/tests/memory_suite/memory_eval_test.rs",
+        "crates/tracedecay-daemon-control/src/service/tests.rs"
       ],
       "required_verification": [
         "memory-suite harness isolation tests",
@@ -295,7 +298,8 @@
         "crates/tracedecay-usecases/src/configuration/operations.rs",
         "crates/tracedecay-domain/src/configuration.rs",
         "crates/tracedecay-usecases/src/config/mod.rs",
-        "crates/tracedecay/src/config/tests.rs"
+        "crates/tracedecay/src/config/tests.rs",
+        "crates/tracedecay-configuration/src/config/mod.rs"
       ],
       "required_verification": [
         "configuration authorization and rollback tests",
@@ -682,10 +686,10 @@
     "metadata": "product/upstream/tracedecay-v2-pr707.json",
     "pull_request": 707,
     "repository": "ScriptedAlchemy/tracedecay",
-    "sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403"
+    "sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289"
   },
   "verification": {
-    "branch_diff_command": "git diff --numstat 08fbe33a7c7f403191fd5d6e356c7b6681b96403...HEAD --",
+    "branch_diff_command": "git diff --numstat 5749e4fcfe268e17bd19a0e6ef90c646f7b37289...HEAD --",
     "checker": "scripts/product/check-patch-footprint-policy.py",
     "convergence_map": "product/upstream/convergence-map.json",
     "tests": [

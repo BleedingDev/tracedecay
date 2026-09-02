@@ -10,14 +10,14 @@
 
 use std::sync::Arc;
 
-use tracedecay_store::{FactReadControl, FactWriteControl};
-use tracedecay_usecases::memory::{
+use tracedecay_session_memory::memory::{
     PrivacyRemediationTriggerV1, ProjectMemoryPrivacyRemediationReceiptV1,
 };
+use tracedecay_store::{FactReadControl, FactWriteControl};
 
 use crate::tracedecay::TraceDecay;
+use tracedecay_domain::errors::Result;
 use tracedecay_global_db::{LcmPrivacyRescanOutcomeV1, RegisteredGlobalDbLeaseV1};
-use tracedecay_runtime_core::errors::Result;
 
 /// Spawns the bounded background rescan for one adopted project store.
 pub(crate) fn spawn_at_rest_privacy_remediation(
@@ -92,7 +92,7 @@ async fn run_project_memory_privacy_remediation(
             &remediation_write_control(),
         )
         .await
-        .map_err(tracedecay_usecases::memory::memory_application_error)
+        .map_err(tracedecay_session_memory::memory::memory_application_error)
 }
 
 fn remediation_read_control() -> FactReadControl {
@@ -117,17 +117,17 @@ mod tests {
         ProvenanceId, SanitizationReceiptId, SanitizationReceiptRefV1, SanitizationReceiptV1,
         SanitizerDispositionV1, SensitivityV1,
     };
+    use tracedecay_session_memory::memory::{MemoryApplication, PrivacyRemediationTriggerV1};
     use tracedecay_store::{
         FactWriteControl, ProjectMemoryFactAddMaterialV1, ProjectMemoryFactIdV1,
         ProjectMemoryFactListQueryV1, ProjectMemoryFactProjectionV1, ProjectMemoryFactStore,
         ProjectMemoryFactUpdateCommandV1, ProjectMemoryFactUpdatePatchV1,
     };
-    use tracedecay_usecases::memory::{MemoryApplication, PrivacyRemediationTriggerV1};
 
     use super::{remediation_read_control, remediation_write_control};
-    use crate::daemon::profile_identity;
-    use crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1;
-    use crate::store::DatabaseFactStore;
+    use tracedecay_daemon_identity::profile_identity;
+    use tracedecay_runtime_core::store::memory::DatabaseFactStore;
+    use tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1;
 
     fn secret() -> String {
         ["sk", "-test-", "1234567890abcdef"].concat()
@@ -136,8 +136,11 @@ mod tests {
     fn enrolled_root(base: &Path, project_id: &ProjectId) -> PathBuf {
         let root = base.join(project_id.as_str());
         std::fs::create_dir_all(&root).expect("project root");
-        crate::storage::pin_fixture_repository_identity(&root, project_id.as_str())
-            .expect("project enrollment");
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &root,
+            project_id.as_str(),
+        )
+        .expect("project enrollment");
         root
     }
 

@@ -33,6 +33,7 @@ impl<D: CheckpointDriver> WriterCheckpointController<D> {
         })
     }
 
+    #[hotpath::skip]
     pub(crate) const fn hard_drain_required(&self) -> bool {
         self.hard_drain_required
     }

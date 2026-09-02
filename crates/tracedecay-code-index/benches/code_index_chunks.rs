@@ -411,11 +411,44 @@ impl CodeChunkProjectionSink for CountingSink {
     }
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
+    configure_hotpath();
+    // Declared before the workload and dropped on return (never skipped by
+    // `process::exit`), so a requested profile observes every measured span.
+    let _hotpath = hotpath::HotpathGuardBuilder::new("code-index-chunks-bench").build();
     if let Err(error) = run_cli() {
         eprintln!("query code-index benchmark: {error}");
-        std::process::exit(1);
+        return std::process::ExitCode::FAILURE;
     }
+    std::process::ExitCode::SUCCESS
+}
+
+/// Mirrors `tracedecay-index-bench`'s guard defaults: stdout here carries the
+/// machine-read benchmark output, so the hotpath report goes to
+/// `HOTPATH_OUTPUT_PATH` when one is named and nowhere otherwise, and the
+/// localhost metrics server stays off. A named report cannot be shared with
+/// `--sample` children: each child `main` would write its own process-local
+/// file to that path, and the parent never runs `execute_case` itself.
+/// Profiled `--run` therefore measures in-process. This runs as the first
+/// statement of `main`, before any other thread exists, which makes
+/// `set_var` sound.
+fn configure_hotpath() {
+    if std::env::var_os("HOTPATH_METRICS_SERVER_OFF").is_none() {
+        unsafe {
+            std::env::set_var("HOTPATH_METRICS_SERVER_OFF", "1");
+        }
+    }
+    if !named_hotpath_report() {
+        unsafe {
+            std::env::set_var("HOTPATH_OUTPUT_FORMAT", "none");
+            std::env::remove_var("HOTPATH_OUTPUT_PATH");
+        }
+    }
+}
+
+fn named_hotpath_report() -> bool {
+    std::env::var_os("HOTPATH_OUTPUT_PATH")
+        .is_some_and(|path| path.to_str().is_some_and(|path| !path.is_empty()))
 }
 
 fn run_cli() -> Result<(), String> {
@@ -496,15 +529,17 @@ fn run_measurement(output_path: &Path) -> Result<(), String> {
 
     let executable =
         env::current_exe().map_err(|error| format!("resolve benchmark executable: {error}"))?;
+    let profile_in_process = named_hotpath_report();
     let mut results = Vec::new();
     for scale in &workload.scales {
         for case in &workload.cases {
             for _ in 0..workload.repetitions.warmups {
-                run_child_sample(&executable, scale, case.name)?;
+                measure_sample(&workload, &executable, scale, case.name, profile_in_process)?;
             }
             let mut samples = Vec::with_capacity(workload.repetitions.measured as usize);
             for repetition in 0..workload.repetitions.measured {
-                let mut sample = run_child_sample(&executable, scale, case.name)?;
+                let mut sample =
+                    measure_sample(&workload, &executable, scale, case.name, profile_in_process)?;
                 sample.repetition = repetition;
                 validate_sample(&expected, &sample)?;
                 samples.push(sample);
@@ -539,6 +574,24 @@ fn run_measurement(output_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Isolated child samples keep process counters honest. A named
+/// `HOTPATH_OUTPUT_PATH` cannot ride along: every child `main` would also
+/// emit a process-local report to that path. Profile those runs in-process
+/// so the named file is one report of the measured `execute_case` spans.
+fn measure_sample(
+    workload: &WorkloadManifest,
+    executable: &Path,
+    scale: &ScaleManifest,
+    case: CaseName,
+    profile_in_process: bool,
+) -> Result<RawSample, String> {
+    if profile_in_process {
+        execute_case(workload, scale, case, 0)
+    } else {
+        run_child_sample(executable, scale, case)
+    }
+}
+
 fn run_child_sample(
     executable: &Path,
     scale: &ScaleManifest,
@@ -546,6 +599,8 @@ fn run_child_sample(
 ) -> Result<RawSample, String> {
     let output = Command::new(executable)
         .args(["--sample", &scale.name, case.as_str()])
+        .env_remove("HOTPATH_OUTPUT_PATH")
+        .env("HOTPATH_OUTPUT_FORMAT", "none")
         .output()
         .map_err(|error| format!("run {} {} sample: {error}", scale.name, case.as_str()))?;
     if !output.status.success() {
@@ -832,6 +887,7 @@ fn rebind_artifact(
     artifact.chunks.document.generation_id = generation_id.clone();
     artifact.chunks.document.file_occurrence_id = occurrence.clone();
     for chunk in &mut artifact.chunks.chunks {
+        let chunk = std::sync::Arc::make_mut(chunk);
         chunk.anchor.generation_id = generation_id.clone();
         chunk.anchor.file_occurrence_id = occurrence.clone();
     }

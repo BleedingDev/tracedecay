@@ -33,6 +33,7 @@ impl ClosedStoreRuntime {
         &self.path
     }
 
+    #[hotpath::skip]
     pub const fn opened_file_identity(&self) -> u64 {
         self.opened_file_identity
     }
@@ -86,6 +87,7 @@ impl StoreRuntimeRegistry {
     /// The caller retains only the binding and originating authority. Any
     /// issued database facade, direct runtime reference, or client lease
     /// refuses the close before physical admission is fenced.
+    #[hotpath::skip]
     pub async fn close_exact(
         &self,
         expected: &StoreRuntimeBindingV1,
@@ -97,6 +99,7 @@ impl StoreRuntimeRegistry {
 
     /// Closes an exact retained runtime after the canonical path has already
     /// advanced to another inode under an exclusive recovery authority.
+    #[hotpath::skip]
     pub async fn close_exact_stale_attachment(
         &self,
         expected: &StoreRuntimeBindingV1,

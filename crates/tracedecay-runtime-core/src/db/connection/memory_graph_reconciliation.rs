@@ -610,6 +610,7 @@ impl MemoryGraphReconciliationTaskOwnerV1 {
         })
     }
 
+    #[hotpath::skip]
     pub async fn shutdown(
         &self,
     ) -> std::result::Result<
@@ -670,6 +671,7 @@ impl MemoryGraphReconciliationTaskOwnerV1 {
         Ok(MemoryGraphReconciliationRetirementReceiptV1 { shared })
     }
 
+    #[hotpath::skip]
     async fn cancel_and_join(&self) -> MemoryGraphReconciliationRetirementTerminalV1 {
         let cancellation_error = (self.cancel_reconciliation)().err();
         let joined = self.join_workers().await;
@@ -689,6 +691,7 @@ impl MemoryGraphReconciliationTaskOwnerV1 {
         }
     }
 
+    #[hotpath::skip]
     async fn join_workers(&self) -> MemoryGraphReconciliationRetirementTerminalV1 {
         loop {
             let joined = self.shared.joined.notified();
@@ -718,6 +721,7 @@ impl MemoryGraphReconciliationTaskOwnerV1 {
         }
     }
 
+    #[hotpath::skip]
     async fn join(
         &self,
         tasks: Vec<JoinHandle<()>>,
@@ -759,6 +763,7 @@ impl MemoryGraphReconciliationTaskOwnerV1 {
 }
 
 impl MemoryGraphReconciliationRetirementReceiptV1 {
+    #[hotpath::skip]
     pub(in crate::db) async fn wait(self) -> MemoryGraphReconciliationRetirementTerminalV1 {
         loop {
             let settled = self.shared.joined.notified();
@@ -840,6 +845,7 @@ impl MemoryGraphReconciliationRetirementReservationV1 {
     /// state. This is the only public completion boundary; callers cannot
     /// accidentally retain a detached receipt while proceeding to graph or
     /// Store close.
+    #[hotpath::skip]
     pub async fn commit_and_wait(
         self,
     ) -> std::result::Result<

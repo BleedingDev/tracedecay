@@ -8,16 +8,17 @@ use tracedecay_application::source_edit::{
     RenameSymbolBindingV1,
 };
 use tracedecay_automation_runtime::ports::project_runtime::{ProjectRuntime, RuntimeFuture};
+use tracedecay_configuration::UserSettingsDaemonClient;
 use tracedecay_dashboard_api::DashboardProjectRuntime;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{FactOwnerV1, ProjectId, UserProfileId};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_graph_query::SourceReadRuntimePort;
 use tracedecay_runtime_core::db::{Database, DatabaseStorageTelemetryHandle};
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 use tracedecay_runtime_core::storage::StoreLayout;
-use tracedecay_usecases::configuration::UserSettingsDaemonClient;
 use tracedecay_usecases::tracedecay::{
     EditDiagnosticRecord, GraphFuture, PlannedSourceEditFile, SourceEditGraphReadV1,
-    SourceEditRuntimePort, SourceReadRuntimePort,
+    SourceEditRuntimePort,
 };
 
 use super::TraceDecay;
@@ -40,7 +41,7 @@ impl ProjectRuntime for TraceDecay {
     }
 
     fn profile_id(&self) -> &UserProfileId {
-        self.store_runtime_registry().profile_id()
+        self.project_store_runtime().profile_id()
     }
 
     fn profile_database(&self) -> &RegisteredGlobalDbLeaseV1 {
@@ -53,7 +54,7 @@ impl ProjectRuntime for TraceDecay {
         roots: Vec<PathBuf>,
     ) -> RuntimeFuture<'_, RegisteredGlobalDbLeaseV1> {
         Box::pin(async move {
-            TraceDecay::store_runtime_registry(self)
+            TraceDecay::project_store_runtime(self)
                 .project_sessions(project_id, roots)
                 .await
         })
@@ -262,5 +263,13 @@ impl SourceReadRuntimePort for TraceDecay {
 
     fn is_read_only(&self) -> bool {
         TraceDecay::is_read_only(self)
+    }
+
+    fn project_id(&self) -> &str {
+        self.store_layout()
+            .identity
+            .project_id
+            .as_deref()
+            .unwrap_or("")
     }
 }

@@ -63,6 +63,7 @@ impl ApplicationInvocationBinding {
         &self.binding_id
     }
 
+    #[hotpath::skip]
     pub const fn surface(&self) -> BindingSurface {
         self.surface
     }
@@ -244,10 +245,12 @@ impl ApplicationRequest {
         }
     }
 
+    #[hotpath::skip]
     pub const fn is_stream(&self) -> bool {
         matches!(self, Self::OperationEvents { .. })
     }
 
+    #[hotpath::skip]
     pub const fn is_cancellation(&self) -> bool {
         matches!(self, Self::OperationCancel { .. })
     }
@@ -302,6 +305,15 @@ impl ApplicationInvocation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InvocationError {
     Unavailable,
+    /// No daemon accepted the connection after the transport's restart grace,
+    /// so the request was never sent. Distinct from [`Self::Unavailable`]
+    /// because re-dispatching in-process cannot succeed until a daemon is
+    /// back: dispatchers fail fast with the typed connect diagnostic instead
+    /// of retrying to their deadline.
+    Unreachable {
+        reason_code: String,
+        detail: String,
+    },
     Denied,
     Cancelled,
     DeadlineExceeded,

@@ -89,6 +89,7 @@ impl McpServer {
     /// Reads the upload policy from the daemon-retained desired configuration
     /// snapshot. There is deliberately no `config.toml` fallback: without the
     /// canonical authority, the upload decision is unavailable.
+    #[hotpath::skip]
     pub(super) async fn canonical_upload_enabled(&self) -> Result<bool> {
         let cg = self.cg_snapshot().await;
         let desired = cg
@@ -163,14 +164,20 @@ impl McpServer {
                 let cg = cg_lock.read().await.clone();
                 let _ = cg.set_tokens_saved(new_total).await;
                 let _ = cg.add_local_counter(net_saved_tokens).await;
-                if let LedgerSink::Mounted(gdb) = sink {
-                    gdb.upsert(cg.project_root(), new_total).await;
+                if let LedgerSink::Mounted(gdb) = sink
+                    && let Err(error) = gdb
+                        .try_upsert_project_tokens(cg.project_root(), new_total)
+                        .await
+                {
+                    // Background persist: the response already went out, so
+                    // the failed ledger write degrades to a named warning.
+                    tracing::warn!(error = %error, "background token-accounting persist failed");
                 }
             }
             // The monitor entry opens, locks, and mmaps a file; keep that
             // off the async workers.
             let monitor_write = tokio::task::spawn_blocking(move || {
-                crate::monitor::write_entry(
+                tracedecay_runtime_core::monitor_ring::write_entry(
                     &monitor_project_root,
                     "tracedecay",
                     &tool_name,
@@ -197,6 +204,7 @@ impl McpServer {
     /// (a stuck DB handle, a task that never resolves) can never hang the
     /// caller forever — the earlier unbounded loop made a wedged write
     /// manifest as an un-observable, indefinitely-hung integration test.
+    #[hotpath::skip]
     pub async fn ledger_writes_settled(&self) {
         self.ledger_writes_settled_within(LEDGER_SETTLE_TIMEOUT)
             .await;
@@ -207,6 +215,7 @@ impl McpServer {
     /// within the bound, `false` when the bound elapsed with writes still
     /// pending. A timeout is never silent: it logs a warning naming how many
     /// writes were still outstanding so a wedged recorder is diagnosable.
+    #[hotpath::skip]
     pub async fn ledger_writes_settled_within(&self, timeout: std::time::Duration) -> bool {
         let wait = async {
             loop {
@@ -253,6 +262,7 @@ impl McpServer {
 
     /// Flushes pending tokens to the worldwide counter if at least 30 seconds
     /// have elapsed since the last flush. Best-effort, never blocks for long.
+    #[hotpath::skip]
     pub(crate) async fn maybe_flush_worldwide(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -293,7 +303,7 @@ impl McpServer {
         };
 
         let success = tokio::task::spawn_blocking(move || {
-            let mut config = tracedecay_usecases::user_config::UserConfig::load();
+            let mut config = tracedecay_session_memory::user_config::UserConfig::load();
             config.pending_upload += delta;
             if upload_enabled && crate::cloud::flush_pending(config.pending_upload).is_some() {
                 config.pending_upload = 0;
@@ -497,8 +507,9 @@ impl McpServer {
                     hook_events::authorize_add_branch_at_root(&worktree_raw, &active_project_root)
                         .ok()?;
                 let worktree = git_correlation::normalize_worktree(&worktree_raw.to_string_lossy());
-                let branch =
-                    bounded_identifier(crate::branch::current_branch(&worktree_raw).as_deref());
+                let branch = bounded_identifier(
+                    tracedecay_runtime_core::branch::current_branch(&worktree_raw).as_deref(),
+                );
                 Some((worktree, branch))
             })
             .await;
@@ -529,7 +540,7 @@ impl McpServer {
                 ts,
                 source: SpanSource::HookRoute,
             };
-            if let Err(e) = crate::store::GlobalDbGitCorrelationStore::new(db)
+            if let Err(e) = tracedecay_global_db::GlobalDbGitCorrelationStore::new(db)
                 .record_span_observation(&observation, DEFAULT_SPAN_MERGE_GAP_SECS)
                 .await
             {

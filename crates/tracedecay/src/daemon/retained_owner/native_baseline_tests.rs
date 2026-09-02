@@ -47,8 +47,11 @@ async fn project_fixture() -> StoreFixture {
     let fixture_root = temporary.path().join("baseline-workspaces");
     std::fs::create_dir_all(&project_root).expect("project root");
     std::fs::create_dir_all(&profile_root).expect("profile root");
-    crate::storage::pin_fixture_repository_identity(&project_root, CORPUS_PROJECT_ID)
-        .expect("project enrollment");
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+        &project_root,
+        CORPUS_PROJECT_ID,
+    )
+    .expect("project enrollment");
     let graph = Arc::new(
         TraceDecay::init_with_options(
             &project_root,

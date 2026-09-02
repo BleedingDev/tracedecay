@@ -22,25 +22,25 @@ use tracedecay_domain::ObservationScopeV1;
 
 use crate::tracedecay::TraceDecay;
 use tracedecay_automation_runtime::automation::config_error;
+use tracedecay_domain::errors::Result;
 use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_host_admission::HostAdmissionFacade;
-use tracedecay_runtime_core::errors::Result;
+use tracedecay_session_memory::session::lcm::{
+    LcmAuthorityOutcome, LcmAuthorityPayload, LcmAuthorityRequest, LcmAuthorityResponse,
+    LcmTranscriptIngestCommand,
+};
 use tracedecay_sessions::admission::HostAdmissionOutcome;
 use tracedecay_sessions::runtime::claude_observation::ClaudeObservationIngestStats;
 use tracedecay_sessions::runtime::snapshot_observation::SnapshotCaptureOutcome;
 use tracedecay_usecases::observation::ObservationCancellation;
-use tracedecay_usecases::session::lcm::{
-    LcmAuthorityOutcome, LcmAuthorityPayload, LcmAuthorityRequest, LcmAuthorityResponse,
-    LcmTranscriptIngestCommand,
-};
 
 use super::super::super::SessionAuthorities;
-use super::super::errors::{map_claude_observation_ingest_error, map_transcript_ingest_error};
 use super::super::{required_str, required_user_db};
 use super::{
     admit_codex_project_rollouts, compaction_unavailable_reason,
     drain_host_observation_projections, project_observation_id,
 };
+use tracedecay_mcp::{map_claude_observation_ingest_error, map_transcript_ingest_error};
 
 /// Which payload shape a hook ingest request carries.
 ///
@@ -65,7 +65,7 @@ impl TranscriptPayloadRouteV1 {
 }
 
 /// Everything a capture kernel may borrow for one ingest pass.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct TranscriptCaptureContext<'a> {
     pub(super) cg: Option<&'a TraceDecay>,
     pub(super) args: &'a Value,
@@ -97,7 +97,10 @@ impl<'a> TranscriptCaptureContext<'a> {
 
 /// Registered project roots as seen by the daemon session registry.
 async fn registered_project_roots(global_db: &RegisteredGlobalDb) -> Result<Vec<PathBuf>> {
-    let registry_authority = crate::store::GlobalDbSessionIngestAuthority::new(global_db);
+    let registry_authority =
+        tracedecay_host_admission::session_ingest_authority::GlobalDbSessionIngestAuthority::new(
+            global_db,
+        );
     tracedecay_sessions::runtime::registered_project_roots_from(&registry_authority)
         .await
         .ok_or_else(|| config_error("daemon project registry is unavailable"))
@@ -339,7 +342,8 @@ async fn capture_hermes_profile(
         ctx.max_new_bytes,
         ctx.cancellation,
     )
-    .await;
+    .await
+    .ok_or_else(|| config_error("Hermes transcript source is unavailable"))?;
     Ok(TranscriptCaptureOutcome {
         messages_upserted: outcome.stats.messages_upserted,
         source_deferred: outcome.deferred_by_byte_cap,
@@ -390,7 +394,8 @@ async fn capture_hermes_project(
         ctx.max_new_bytes,
         ctx.cancellation,
     )
-    .await;
+    .await
+    .ok_or_else(|| config_error("Hermes transcript source is unavailable"))?;
     Ok(TranscriptCaptureOutcome {
         messages_upserted: outcome.stats.messages_upserted,
         source_deferred: outcome.deferred_by_byte_cap,
@@ -475,7 +480,7 @@ async fn capture_hermes_callback(
     let event_digest = tracedecay_domain::canonical_sha256(&(&"hermes", &session_id, &messages))
         .map_err(|error| config_error(format!("digest Hermes turn failed: {error}")))?;
     let request = LcmAuthorityRequest::Ingest(LcmTranscriptIngestCommand {
-        preflight: tracedecay_sessions::runtime::lcm::LcmPreflightRequest {
+        preflight: tracedecay_lcm::LcmPreflightRequest {
             provider: "hermes".to_owned(),
             session_id: session_id.to_owned(),
             messages,

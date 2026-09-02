@@ -9,7 +9,10 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use url::Url;
 
-use super::detect::{SanitizationFindingV1, redact_sensitive_values};
+use super::detect::{
+    SanitizationFindingV1, is_semantically_sensitive_key, redact_sensitive_values,
+};
+use super::detector_kernel::NormalizedSensitiveKey;
 use tracedecay_capture::ParseLimits;
 
 mod code_shape;
@@ -55,6 +58,7 @@ impl StructuredSanitizedPayload {
         &self.payload
     }
 
+    #[hotpath::skip]
     pub(crate) const fn was_structurally_parsed(&self) -> bool {
         self.structurally_parsed
     }
@@ -358,6 +362,23 @@ fn has_yaml_mapping_intent(text: &str) -> bool {
         .any(looks_like_yaml_mapping)
 }
 
+fn has_sensitive_yaml_mapping_intent(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && !is_yaml_preamble_line(line))
+        .filter(|line| looks_like_yaml_mapping(line))
+        .any(|line| {
+            let line = line.strip_prefix("- ").unwrap_or(line);
+            let line = line.strip_prefix('{').map_or(line, str::trim_start);
+            split_yaml_mapping_entry(line).is_some_and(|(key, _)| {
+                let key = key
+                    .trim_end()
+                    .trim_matches(|quote| quote == '"' || quote == '\'');
+                is_semantically_sensitive_key(&NormalizedSensitiveKey::new(key))
+            })
+        })
+}
+
 fn is_assignment_key(key: &str) -> bool {
     !key.is_empty()
         && !key.starts_with(|character: char| character.is_ascii_digit())
@@ -638,29 +659,61 @@ fn parse_yaml_document(
     let established_mapping =
         looks_like_yaml_mapping(first) && (!has_code_shape_context(text) || explicit_yaml_preamble);
     if !established_mapping {
-        if yaml_intent {
+        if yaml_intent && (explicit_yaml_preamble || has_sensitive_yaml_mapping_intent(text)) {
             return Err(StructuredTextParseFailureV1::Malformed);
         }
         return Ok(None);
     }
+    let fail_closed = explicit_yaml_preamble
+        || has_sensitive_yaml_mapping_intent(text)
+        || is_yaml_shaped_document(text);
     if text.bytes().any(|byte| matches!(byte, b'&' | b'*' | b'\t')) {
-        return Err(StructuredTextParseFailureV1::Malformed);
+        if fail_closed {
+            return Err(StructuredTextParseFailureV1::Malformed);
+        }
+        return Ok(None);
     }
-    preflight_tree_document(text)?;
+    match preflight_tree_document(text) {
+        Ok(()) => {}
+        Err(StructuredTextParseFailureV1::Malformed) if !fail_closed => return Ok(None),
+        Err(error) => return Err(error),
+    }
     // Parse through YAML's own value authority before converting to the common
     // JSON-shaped tree. In particular, YAML tags arrive through serde's enum
     // data model, which the JSON duplicate-key preflight cannot accept. The
     // YAML mapping implementation rejects duplicate keys while materializing,
     // so this preserves the fail-closed ambiguity fence without rejecting
     // valid YAML-specific syntax ahead of the canonical parser.
-    let yaml_value: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(text).map_err(|_| StructuredTextParseFailureV1::Malformed)?;
+    let Ok(yaml_value) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text) else {
+        if fail_closed {
+            return Err(StructuredTextParseFailureV1::Malformed);
+        }
+        return Ok(None);
+    };
     let value =
         serde_json::to_value(yaml_value).map_err(|_| StructuredTextParseFailureV1::Malformed)?;
-    (value.is_object() || value.is_array())
-        .then(|| parsed(StructuredTextFormatV1::Yaml, value))
-        .ok_or(StructuredTextParseFailureV1::Malformed)
-        .map(Some)
+    if value.is_object() || value.is_array() {
+        return Ok(Some(parsed(StructuredTextFormatV1::Yaml, value)));
+    }
+    if fail_closed {
+        return Err(StructuredTextParseFailureV1::Malformed);
+    }
+    Ok(None)
+}
+
+fn is_yaml_shaped_document(text: &str) -> bool {
+    text.lines().all(|line| {
+        if line.starts_with(char::is_whitespace) {
+            return true;
+        }
+        let trimmed = line.trim();
+        trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || is_yaml_preamble_line(trimmed)
+            || trimmed == "-"
+            || trimmed.starts_with("- ")
+            || looks_like_yaml_mapping(trimmed)
+    })
 }
 
 fn parse_toml_document(
@@ -672,9 +725,19 @@ fn parse_toml_document(
     let table_candidate = first
         .split_once('#')
         .map_or(first, |(header, _)| header.trim_end());
-    let table_header = table_candidate.starts_with('[') && table_candidate.ends_with(']');
+    // Only a header TOML itself accepts commits the document to the TOML
+    // lane. Prose that opens with a bracketed annotation line (LCM's own
+    // compacted-history scaffold emits `[Current user objective …]`) is not a
+    // table header — bare TOML keys cannot contain unquoted spaces — and must
+    // fall through to the raw scan instead of quarantining as malformed TOML.
+    let table_header = table_candidate.starts_with('[')
+        && table_candidate.ends_with(']')
+        && toml::from_str::<toml::Table>(table_candidate).is_ok();
     if first.starts_with('[') && !table_header {
-        return Err(StructuredTextParseFailureV1::Malformed);
+        if has_assignment_intent(text) {
+            return Err(StructuredTextParseFailureV1::Malformed);
+        }
+        return Ok(None);
     }
     if !table_header && !first.contains('=') {
         if looks_like_yaml_mapping(first) {

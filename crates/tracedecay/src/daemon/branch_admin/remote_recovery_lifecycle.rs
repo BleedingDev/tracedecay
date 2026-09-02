@@ -1,15 +1,23 @@
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tracedecay_domain::{BrainId, ProjectId, UserProfileId};
+use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_store::StoreShardScopeV1;
+use tracedecay_store_runtime::{
+    RemoteRecoveryAdmission, RemoteRecoveryProjectLifecycle, RemoteRecoveryQuiescence,
+};
 
 use super::{
     DatabaseOwnerRegistry, StoreAdministration, StoreWriterClass, StoreWriterGates, WriterScope,
 };
 use crate::daemon::store_writer_gate::WriterAdmissionGuard;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_daemon_identity::authority;
+use tracedecay_daemon_service::DaemonNativeIntegrationRuntimeRegistrar;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 pub(in crate::daemon) struct RemoteRecoveryProjectLifecycleV1 {
     brain_id: BrainId,
@@ -22,14 +30,13 @@ pub(in crate::daemon) struct RemoteRecoveryProjectLifecycleV1 {
     lsp_session_registry: Arc<tokio::sync::Mutex<tracedecay_lsp::LspSessionRegistry>>,
     project_open_gates: Arc<tokio::sync::Mutex<super::super::ProjectOpenGates>>,
     session_temporal_refresh_schedulers: Arc<
-        super::super::session_temporal_refresh_scheduler::SessionTemporalRefreshSchedulerRegistry,
+        tracedecay_session_runtime::session_temporal_refresh_scheduler::SessionTemporalRefreshSchedulerRegistry,
     >,
     git_index_transaction_services: Arc<
         tracedecay_code_index_runtime::git_transactions::DaemonGitIndexTransactionServiceRegistry,
     >,
-    native_integration_services:
-        Arc<crate::daemon::service::invocation::DaemonNativeIntegrationRuntimeRegistrar>,
-    session_sync_service: Arc<super::super::session_sync::DaemonSessionSyncService>,
+    native_integration_services: Arc<DaemonNativeIntegrationRuntimeRegistrar>,
+    session_sync_service: Arc<tracedecay_session_runtime::session_sync::DaemonSessionSyncService>,
     project_server_retirements:
         Arc<tokio::sync::Mutex<Vec<super::project_retirement::ProjectServerRetirement>>>,
     #[cfg(unix)]
@@ -98,9 +105,8 @@ fn ensure_profile_lifecycle(
     administration: &StoreAdministration,
     lifecycles: &mut RemoteRecoveryProjectLifecyclesV1,
 ) -> Result<Arc<RemoteRecoveryProjectLifecycleV1>> {
-    let profile_root = super::authority::canonical_identity_path(
-        administration.profile_identity()?.profile_root(),
-    )?;
+    let profile_root =
+        authority::canonical_identity_path(administration.profile_identity()?.profile_root())?;
     if let Some(lifecycle) = lifecycles.profiles.get(&profile_root) {
         return Ok(Arc::clone(lifecycle));
     }
@@ -136,7 +142,7 @@ impl RemoteRecoveryProjectLifecycleV1 {
         Ok(Self {
             brain_id: identity.brain_id().clone(),
             profile_id: identity.profile_id().clone(),
-            profile_root: super::authority::canonical_identity_path(identity.profile_root())?,
+            profile_root: authority::canonical_identity_path(identity.profile_root())?,
             gate: Arc::clone(&administration.gate),
             project_servers: Arc::clone(&administration.project_servers),
             session_runtime_registries: Arc::clone(&administration.session_runtime_registries),
@@ -265,12 +271,15 @@ impl RemoteRecoveryProjectLifecycleV1 {
         Ok(fence)
     }
 
+    #[hotpath::skip]
     pub(in crate::daemon) async fn authorize_project_recovery(
         &self,
         project_id: &ProjectId,
     ) -> Result<WriterAdmissionGuard> {
-        let data_root =
-            crate::storage::profile_sharded_data_root(&self.profile_root, project_id.as_str());
+        let data_root = tracedecay_runtime_core::storage::profile_sharded_data_root(
+            &self.profile_root,
+            project_id.as_str(),
+        );
         self.settle_retained_runtime_retirement(project_id).await?;
         let writer = self
             .gate
@@ -280,6 +289,7 @@ impl RemoteRecoveryProjectLifecycleV1 {
         Ok(writer)
     }
 
+    #[hotpath::skip]
     async fn settle_retained_runtime_retirement(&self, project_id: &ProjectId) -> Result<()> {
         let deadline = tokio::time::Instant::now() + super::super::DAEMON_TASK_ABORT_DEADLINE;
         let receipt = super::project_retirement::settle_project_retirements(
@@ -303,6 +313,7 @@ impl RemoteRecoveryProjectLifecycleV1 {
         }
     }
 
+    #[hotpath::skip]
     async fn ensure_project_recovery_active(&self, project_id: &ProjectId) -> Result<()> {
         let registry = {
             let registries = self.session_runtime_registries.lock().await;
@@ -378,7 +389,7 @@ pub(super) async fn project_roots(
 
 pub(super) async fn retire_runtime_work(
     project_servers: &tokio::sync::Mutex<DatabaseOwnerRegistry>,
-    temporal: &super::super::session_temporal_refresh_scheduler::SessionTemporalRefreshSchedulerRegistry,
+    temporal: &tracedecay_session_runtime::session_temporal_refresh_scheduler::SessionTemporalRefreshSchedulerRegistry,
     #[cfg(unix)] automation: &tokio::sync::Mutex<
         std::collections::HashMap<
             super::super::ProjectServerKey,
@@ -488,6 +499,32 @@ async fn retire_maintenance_tasks(
     }
 }
 
+impl RemoteRecoveryProjectLifecycle for RemoteRecoveryProjectLifecycleV1 {
+    fn authorize_project_recovery<'a>(
+        &'a self,
+        project_id: &'a ProjectId,
+    ) -> Pin<Box<dyn Future<Output = Result<RemoteRecoveryAdmission>> + Send + 'a>> {
+        Box::pin(async move {
+            let guard =
+                RemoteRecoveryProjectLifecycleV1::authorize_project_recovery(self, project_id)
+                    .await?;
+            Ok(RemoteRecoveryAdmission::hold(guard))
+        })
+    }
+
+    fn quiesce<'a>(
+        &'a self,
+        project_id: &'a ProjectId,
+        database: &'a RegisteredGlobalDbLeaseV1,
+    ) -> Pin<Box<dyn Future<Output = Result<RemoteRecoveryQuiescence>> + Send + 'a>> {
+        Box::pin(async move {
+            let fence =
+                RemoteRecoveryProjectLifecycleV1::quiesce(self, project_id, database).await?;
+            Ok(RemoteRecoveryQuiescence::hold(fence))
+        })
+    }
+}
+
 #[cfg(unix)]
 fn matching_scheduler_keys<T>(
     schedulers: &std::collections::HashMap<super::super::ProjectServerKey, T>,
@@ -514,7 +551,7 @@ mod tests {
 
     fn profile_identity(
         root: &Path,
-    ) -> crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1 {
+    ) -> tracedecay_daemon_identity::profile_identity::LocalProfileIdentityAuthorityV1 {
         std::fs::create_dir_all(root).expect("create profile root");
         #[cfg(unix)]
         {
@@ -522,7 +559,8 @@ mod tests {
             std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
                 .expect("secure profile root");
         }
-        crate::daemon::profile_identity::load_or_create(root).expect("profile identity")
+        tracedecay_daemon_identity::profile_identity::load_or_create(root)
+            .expect("profile identity")
     }
 
     #[test]

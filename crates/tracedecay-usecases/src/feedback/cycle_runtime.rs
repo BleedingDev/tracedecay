@@ -9,6 +9,10 @@ use thiserror::Error;
 use tracedecay_application::diagnostics::{
     AnalyzerAdmittedDiagnosticProviderV1, DiagnosticProviderIdentity,
 };
+use tracedecay_application::feedback::observations::{
+    FeedbackDeliveryRouteV1, FeedbackLspMethodClassV1, FeedbackLspStateV1, FeedbackOperationV1,
+    FeedbackOutcomeV1, FeedbackSourceEventV1,
+};
 use tracedecay_application::feedback::{
     FeedbackCycleAdvisoryV1, FeedbackCycleExecutionRequest, FeedbackCycleExecutionResult,
     FeedbackCycleService, FeedbackExpandRequestV1, FeedbackImpactPort, FeedbackImpactPortOutcome,
@@ -39,7 +43,7 @@ use tracedecay_lsp::{
 use tracedecay_policy::CapabilityRoutingDecisionV1;
 
 use crate::diagnostics_publication::{CodeIndexPublicationIdentityPortV1, code_index_logical_path};
-use crate::graph::{
+use tracedecay_graph_query::{
     CodeGraphProjectionReadPort, CodeGraphReadError, CodeGraphReadRequest, map_projection_error,
     request_graph_cancellation,
 };
@@ -47,10 +51,7 @@ use tracedecay_runtime_core::db::Database;
 
 use super::concrete::{FeedbackRuntime, ProjectFeedbackRouteAuthorization, ProjectFeedbackStore};
 use super::diagnostics::{DatabaseDiagnosticStore, DiagnosticStoreFeedbackProvider};
-use super::observations::{
-    FeedbackDeliveryRouteV1, FeedbackLspMethodClassV1, FeedbackLspStateV1,
-    FeedbackObservationEmitterV1, FeedbackOperationV1, FeedbackOutcomeV1, FeedbackSourceEventV1,
-};
+use super::observations::FeedbackObservationEmitterV1;
 
 const FEEDBACK_IMPACT_DEPTH_V1: u32 = 3;
 const FEEDBACK_IMPACT_MAX_SYMBOLS_V1: usize = 1_000;

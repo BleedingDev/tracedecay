@@ -7,7 +7,6 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tracedecay_automation_runtime::ports::session_store::AutomationSessionStore;
 
-use crate::mcp::tools::ToolResult;
 use crate::tracedecay::TraceDecay;
 use tracedecay_automation_runtime::automation::hermes_skill_bridge::{
     HermesSkillBridgeOptions, load_standard_hermes_skill_bridge,
@@ -23,11 +22,12 @@ use tracedecay_automation_runtime::automation::skill_usage::{
     record_skill_usage, skill_improvement_recommendations, stale_skill_recommendations,
     summarize_skill_usage, summarize_skill_usage_for,
 };
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDb;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_mcp::ToolResult;
 
-use super::super::renderers;
 use super::support::{tool_json, tool_json_with_md};
+use tracedecay_mcp::tools::renderers;
 
 const SKILL_ANALYTICS_IMPORT_LIMIT: usize = 10_000;
 const STALE_SKILL_AFTER_SECS: i64 = 60 * 60 * 24 * 90;
@@ -95,7 +95,7 @@ pub(super) async fn handle_skill_list(
     args: Value,
     analytics_db: Option<&RegisteredGlobalDb>,
 ) -> Result<ToolResult> {
-    let profile_root = crate::storage::default_profile_root()?;
+    let profile_root = tracedecay_runtime_core::storage::default_profile_root()?;
     sync_project_skill_analytics(cg, &profile_root, analytics_db).await?;
     let state = parse_state(&args)?;
     let include_body = optional_bool(&args, "include_body", false);
@@ -161,7 +161,7 @@ pub(super) async fn handle_skill_view(
     args: Value,
     analytics_db: Option<&RegisteredGlobalDb>,
 ) -> Result<ToolResult> {
-    let profile_root = crate::storage::default_profile_root()?;
+    let profile_root = tracedecay_runtime_core::storage::default_profile_root()?;
     sync_project_skill_analytics(cg, &profile_root, analytics_db).await?;
     let include_support_files = optional_bool(&args, "include_support_files", true);
     let mut skill = hotpath::future!(

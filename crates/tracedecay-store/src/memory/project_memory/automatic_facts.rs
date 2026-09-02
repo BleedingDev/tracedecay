@@ -139,6 +139,7 @@ impl ProjectMemoryAutomaticFactEffectV1 {
         Ok(())
     }
 
+    #[hotpath::skip]
     pub const fn state(&self) -> ProjectMemoryAutomaticFactStateV1 {
         match self {
             Self::Applied { .. } => ProjectMemoryAutomaticFactStateV1::Applied,
@@ -236,6 +237,7 @@ impl ProjectMemoryAutomaticFactReceiptV1 {
         &self.owner
     }
 
+    #[hotpath::skip]
     pub const fn state(&self) -> ProjectMemoryAutomaticFactStateV1 {
         self.state
     }
@@ -276,6 +278,7 @@ impl ProjectMemoryAutomaticFactReceiptV1 {
         self.effect.quarantine_reason()
     }
 
+    #[hotpath::skip]
     pub const fn recorded_at(&self) -> UtcMicros {
         self.recorded_at
     }
@@ -328,6 +331,7 @@ impl ProjectMemoryAutomaticFactApplyResultV1 {
         &self.receipt
     }
 
+    #[hotpath::skip]
     pub const fn disposition(&self) -> ProjectMemoryAutomaticFactApplyDispositionV1 {
         self.disposition
     }

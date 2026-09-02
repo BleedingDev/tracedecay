@@ -11,7 +11,7 @@ use crate::common::host_sources;
 use tempfile::TempDir;
 use tracedecay::agents::host_bundle_registry::verified_embedded_host_component_set_with_tracedecay_bin;
 use tracedecay::agents::host_bundle_v2::{HostBundleComponentV1, HostKindV1};
-use tracedecay::external_tools::ast_grep_command;
+use tracedecay_mcp::host_cli::ast_grep_command;
 
 // Compiles the generated plugin sources with py_compile (argv[1] is the
 // plugin dir). Only `generated_python_sources_compile` runs this: loading the
@@ -65,6 +65,11 @@ spec.loader.exec_module(plugin)
 /// Binary path baked into the generated `tools.py` for the shared install.
 /// Part of the bundle fingerprint: changing it changes the rendered plugin.
 const FIXTURE_TRACEDECAY_BIN: &str = "/usr/local/bin/tracedecay";
+
+/// Generator commit baked into the rendered bundle's provenance header. A
+/// fixed 40-hex fixture value keeps the shared cross-process install
+/// byte-stable regardless of the checkout that runs the suite.
+const GENERATOR_COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 /// One unpinned Hermes install shared by every check.
 ///
@@ -139,6 +144,7 @@ fn render_install(home: &Path) -> std::io::Result<()> {
         &[HostBundleComponentV1::Core],
         0,
         FIXTURE_TRACEDECAY_BIN,
+        GENERATOR_COMMIT,
     )
     .map_err(std::io::Error::other)?;
     for component in component_set.component_set.components {

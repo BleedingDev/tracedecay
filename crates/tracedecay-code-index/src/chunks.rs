@@ -25,7 +25,7 @@ use tracedecay_domain::{
     LanguageDescriptorV1, MAX_CHUNK_TEXT_BYTES, Node, NodeKind, PolicyRevisionId,
     RelationEdgeKindV1, RepositoryId, SanitizerRevision, SensitivityDecision, SensitivityLevelV1,
     SourceSpan, SymbolIdentityDigest, SymbolOccurrenceId, UnresolvedRef, ValidatedCodeFileV1,
-    canonical_sha256,
+    canonical_sha256, classify_technical_token, split_subtokens, technical_tokens,
 };
 
 use super::{
@@ -39,7 +39,7 @@ mod artifacts;
 
 pub use artifacts::{
     CodeFileIndexArtifactsV1, CodeIndexEdgeAbstentionReasonV1, CodeIndexEdgeAbstentionV1,
-    CodeIndexImportEvidenceV1,
+    CodeIndexImportEvidenceV1, CodeIndexUnresolvedReferenceV1,
 };
 
 /// Eligibility of one generation-bound file document for chunk production.
@@ -103,11 +103,16 @@ pub trait CodeChunker {
 
 /// The chunks produced for one file: the generation-bound document manifest
 /// plus its chunks in deterministic order (Plan 25).
+///
+/// Rows are `Arc`-shared so a published generation's per-file artifacts and
+/// its flattened aggregate manifest hold the same allocations instead of two
+/// owned copies of the corpus. Serialization is transparent: an `Arc` row
+/// writes and reads exactly the bytes of the row itself.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CodeFileChunksV1 {
     pub document: CodeSearchDocumentV1,
-    pub chunks: Vec<CodeSearchChunkV1>,
+    pub chunks: Vec<Arc<CodeSearchChunkV1>>,
 }
 
 /// Opaque capability proving the exact chunk bytes produced by one
@@ -133,7 +138,7 @@ pub struct ExactExtractionAuthorityV1 {
 /// ```
 #[derive(Clone, Debug)]
 pub struct ExtractionAdmittedCodeSearchChunkV1 {
-    chunk: CodeSearchChunkV1,
+    chunk: Arc<CodeSearchChunkV1>,
 }
 
 impl ExtractionAdmittedCodeSearchChunkV1 {
@@ -142,8 +147,10 @@ impl ExtractionAdmittedCodeSearchChunkV1 {
     }
 
     /// Consume the authority-bearing wrapper and return its admitted chunk.
+    /// A row still shared with its generation is copied out; page-scale
+    /// consumers hold a bounded number of rows at once.
     pub fn into_chunk(self) -> CodeSearchChunkV1 {
-        self.chunk
+        Arc::try_unwrap(self.chunk).unwrap_or_else(|shared| (*shared).clone())
     }
 }
 
@@ -151,7 +158,7 @@ impl ExtractionAdmittedCodeSearchChunkV1 {
 // after the parser-backed chunk digest has been validated.
 unsafe impl ExtractionAdmittedChunkV1 for ExtractionAdmittedCodeSearchChunkV1 {
     fn into_admitted_chunk(self) -> CodeSearchChunkV1 {
-        self.chunk
+        self.into_chunk()
     }
 }
 
@@ -167,7 +174,7 @@ const PARALLEL_CHUNK_THRESHOLD: usize = 16;
 /// sequential sweep this replaces.
 #[hotpath::measure(label = "code_index.chunk.map_ordered")]
 fn map_chunks_ordered<T, F>(
-    chunks: &[CodeSearchChunkV1],
+    chunks: &[Arc<CodeSearchChunkV1>],
     operation: F,
 ) -> Result<Vec<T>, ChunkingFailureV1>
 where
@@ -175,7 +182,7 @@ where
     F: Fn(&CodeSearchChunkV1) -> Result<T, ChunkingFailureV1> + Send + Sync,
 {
     if chunks.len() < PARALLEL_CHUNK_THRESHOLD {
-        return chunks.iter().map(operation).collect();
+        return chunks.iter().map(|chunk| operation(chunk)).collect();
     }
     let results: Vec<Result<T, ChunkingFailureV1>> = chunks
         .par_iter()
@@ -188,14 +195,14 @@ where
 /// the pool once the batch is large enough. The lowest-index failure is
 /// returned, matching the sequential sweep's short-circuit outcome.
 fn try_for_each_chunk_ordered<F>(
-    chunks: &[CodeSearchChunkV1],
+    chunks: &[Arc<CodeSearchChunkV1>],
     operation: F,
 ) -> Result<(), ChunkingFailureV1>
 where
     F: Fn(&CodeSearchChunkV1) -> Result<(), ChunkingFailureV1> + Send + Sync,
 {
     if chunks.len() < PARALLEL_CHUNK_THRESHOLD {
-        return chunks.iter().try_for_each(operation);
+        return chunks.iter().try_for_each(|chunk| operation(chunk));
     }
     let failure = chunks
         .par_iter()
@@ -213,7 +220,7 @@ where
 }
 
 impl ExactExtractionAuthorityV1 {
-    fn mint(chunks: &[CodeSearchChunkV1]) -> Result<Self, ChunkingFailureV1> {
+    fn mint(chunks: &[Arc<CodeSearchChunkV1>]) -> Result<Self, ChunkingFailureV1> {
         let digests = map_chunks_ordered(chunks, |chunk| {
             canonical_digest(EXACT_EXTRACTION_AUTHORITY_SEPARATOR, chunk)
         })?;
@@ -257,7 +264,7 @@ impl ExactExtractionAuthorityV1 {
 
     pub(crate) fn validate_all(
         &self,
-        chunks: &[CodeSearchChunkV1],
+        chunks: &[Arc<CodeSearchChunkV1>],
     ) -> Result<(), ChunkingFailureV1> {
         if chunks.len() != self.chunk_digests.len() {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
@@ -282,7 +289,7 @@ impl ExactExtractionAuthorityV1 {
 
     pub fn admit(
         &self,
-        chunk: CodeSearchChunkV1,
+        chunk: Arc<CodeSearchChunkV1>,
     ) -> Result<ExtractionAdmittedCodeSearchChunkV1, ChunkingFailureV1> {
         self.validate_chunk(&chunk)?;
         Ok(ExtractionAdmittedCodeSearchChunkV1 { chunk })
@@ -290,7 +297,7 @@ impl ExactExtractionAuthorityV1 {
 
     pub fn admit_all(
         &self,
-        chunks: Vec<CodeSearchChunkV1>,
+        chunks: Vec<Arc<CodeSearchChunkV1>>,
     ) -> Result<Vec<ExtractionAdmittedCodeSearchChunkV1>, ChunkingFailureV1> {
         if chunks.len() < PARALLEL_CHUNK_THRESHOLD {
             return chunks.into_iter().map(|chunk| self.admit(chunk)).collect();
@@ -394,6 +401,9 @@ impl CodeFileChunksV1 {
 
         let mut occurrences: BTreeMap<SymbolOccurrenceId, SymbolOccurrenceId> = BTreeMap::new();
         for chunk in &mut rematerialized.chunks {
+            // Carried rows are shared with the prior generation; rebinding
+            // writes into this generation's own copy.
+            let chunk = Arc::make_mut(chunk);
             chunk.anchor.generation_id = generation_id.clone();
             chunk.anchor.file_occurrence_id = file_occurrence_id.clone();
             if let Some(prior_occurrence) = chunk.anchor.symbol_occurrence_id.clone() {
@@ -813,33 +823,15 @@ fn structural_segments(body: SourceSpan, mut member_starts: Vec<u64>) -> Vec<(u6
 /// sanitized text (Plan 25: whole exact terms and subtokens are distinct
 /// fields; this is extraction evidence only).
 fn classify_chunk_text(text: &str, base_offset: u64) -> (Vec<ExactTechnicalTermV1>, Vec<String>) {
-    let is_token_char =
-        |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.' | '/');
     let mut terms = Vec::new();
     let mut seen_terms = BTreeSet::new();
     let mut subtokens = Vec::new();
     let mut seen_subtokens = BTreeSet::new();
 
-    let bytes = text.as_bytes();
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        let ch = text[cursor..].chars().next().expect("cursor is a boundary");
-        if !is_token_char(ch) {
-            cursor += ch.len_utf8();
-            continue;
-        }
-        let start = cursor;
-        while cursor < bytes.len() {
-            let c = text[cursor..].chars().next().expect("cursor is a boundary");
-            if !is_token_char(c) {
-                break;
-            }
-            cursor += c.len_utf8();
-        }
-        let token = &text[start..cursor];
+    for (start, token) in technical_tokens(text) {
         let span = SourceSpan {
             start_byte: base_offset + start as u64,
-            end_byte: base_offset + cursor as u64,
+            end_byte: base_offset + (start + token.len()) as u64,
         };
         for subtoken in split_subtokens(token) {
             if !seen_subtokens.contains(subtoken.as_str()) {
@@ -847,7 +839,7 @@ fn classify_chunk_text(text: &str, base_offset: u64) -> (Vec<ExactTechnicalTermV
                 subtokens.push(subtoken);
             }
         }
-        if let Some(kind) = classify_token(token) {
+        if let Some(kind) = classify_technical_token(token) {
             mint_exact_term(&mut terms, &mut seen_terms, kind, token.as_bytes(), span);
         }
     }
@@ -960,93 +952,6 @@ fn mint_exact_term(
     }
 }
 
-/// Classify one maximal token as a whole exact technical term kind, or
-/// `None` when the token is only subtoken evidence.
-fn classify_token(token: &str) -> Option<ExactTechnicalTermKindV1> {
-    let is_ident = |segment: &str| {
-        !segment.is_empty()
-            && segment
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && segment
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-    };
-    if token.strip_prefix("--").is_some_and(|flag| {
-        !flag.is_empty()
-            && !flag.ends_with('-')
-            && flag
-                .chars()
-                .next()
-                .is_some_and(|character| character.is_ascii_alphabetic())
-            && flag.chars().all(|character| {
-                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
-            })
-    }) {
-        return Some(ExactTechnicalTermKindV1::CliFlag);
-    }
-    if ["E", "TS", "CS"].into_iter().any(|prefix| {
-        token.strip_prefix(prefix).is_some_and(|digits| {
-            digits.len() == 4 && digits.chars().all(|character| character.is_ascii_digit())
-        })
-    }) {
-        return Some(ExactTechnicalTermKindV1::CompilerErrorCode);
-    }
-    if token.strip_prefix("ERR_").is_some_and(|suffix| {
-        !suffix.is_empty()
-            && suffix.chars().all(|character| {
-                character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
-            })
-    }) {
-        return Some(ExactTechnicalTermKindV1::RuntimeErrorCode);
-    }
-    if token.strip_prefix("commit:").is_some_and(|identifier| {
-        (7..=40).contains(&identifier.len())
-            && identifier
-                .chars()
-                .all(|character| character.is_ascii_hexdigit())
-    }) {
-        return Some(ExactTechnicalTermKindV1::CommitIdentifier);
-    }
-    if matches!(
-        token.to_ascii_lowercase().as_str(),
-        "cargo" | "rustc" | "tracedecay" | "pytest" | "kubectl" | "fastembed" | "ast-grep"
-    ) {
-        return Some(ExactTechnicalTermKindV1::ToolName);
-    }
-    if token.contains("::") && token.split("::").all(is_ident) {
-        return Some(ExactTechnicalTermKindV1::QualifiedName);
-    }
-    if token.contains('/')
-        && token.split('/').all(|segment| {
-            !segment.is_empty()
-                && segment
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        })
-        && token
-            .rsplit('/')
-            .next()
-            .is_some_and(|filename| filename.contains('.'))
-    {
-        return Some(ExactTechnicalTermKindV1::Path);
-    }
-    if token.contains('.')
-        && !token.contains('/')
-        && token.split('.').count() >= 3
-        && token.split('.').all(|segment| {
-            !segment.is_empty()
-                && segment
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-        })
-    {
-        return Some(ExactTechnicalTermKindV1::ConfigurationKey);
-    }
-    None
-}
-
 fn symbol_name_span(source: &str, symbol: &SymbolRow) -> Option<SourceSpan> {
     if symbol.name.is_empty() {
         return None;
@@ -1070,37 +975,6 @@ fn symbol_name_span(source: &str, symbol: &SymbolRow) -> Option<SourceSpan> {
                 end_byte: symbol.span.start_byte + (relative + name.len()) as u64,
             })
         })
-}
-
-/// Split one token into lowercase language-profiled subtokens: path,
-/// qualifier, and key separators first, then snake/camel boundaries.
-fn split_subtokens(token: &str) -> Vec<String> {
-    let mut subtokens = Vec::new();
-    for segment in token.split([':', '.', '/', '-']) {
-        let mut current = String::new();
-        let mut prev: Option<char> = None;
-        for c in segment.chars() {
-            let boundary = match (prev, c) {
-                (Some('_'), _) => false,
-                (_, '_') => true,
-                (Some(p), c) if p.is_lowercase() && c.is_uppercase() => true,
-                (Some(p), c) if p.is_ascii_digit() != c.is_ascii_digit() => true,
-                _ => false,
-            };
-            if boundary && !current.is_empty() {
-                subtokens.push(current.to_lowercase());
-                current.clear();
-            }
-            if c != '_' {
-                current.push(c);
-            }
-            prev = Some(c);
-        }
-        if !current.is_empty() {
-            subtokens.push(current.to_lowercase());
-        }
-    }
-    subtokens
 }
 
 /// One not-yet-identified chunk: everything except the id, digest, ordinal,
@@ -1328,10 +1202,9 @@ impl DeterministicCodeChunker {
             self.lineage_symbols(source, &file_identity, &symbol_rows)
         })?;
         let mut relation_edges = result.edges.clone();
-        relation_edges.extend(resolve_same_file_references(
-            &result.unresolved_refs,
-            &symbol_rows,
-        ));
+        let (same_file_edges, unresolved_references) =
+            resolve_file_references(&result.unresolved_refs, &symbol_rows);
+        relation_edges.extend(same_file_edges);
         let (edges, edge_abstentions) = canonical_relation_edges(&relation_edges, &symbol_rows);
 
         let eligibility = if partial_reason.is_empty() {
@@ -1349,10 +1222,14 @@ impl DeterministicCodeChunker {
             chunk_ids: chunks.iter().map(|chunk| chunk.id.clone()).collect(),
         };
         CodeFileIndexArtifactsV1::from_parser_artifact(
-            CodeFileChunksV1 { document, chunks },
+            CodeFileChunksV1 {
+                document,
+                chunks: chunks.into_iter().map(Arc::new).collect(),
+            },
             symbols,
             edges,
             edge_abstentions,
+            unresolved_references,
             artifact,
             batch,
         )
@@ -1827,12 +1704,129 @@ impl DeterministicCodeChunker {
     }
 }
 
-/// Resolve same-file symbol references (calls and other extractor
-/// reference kinds) into relation edges. Only an UNAMBIGUOUS name match
-/// against this file's own symbol table resolves; ambiguous or unmatched
-/// references stay unresolved rather than guessing. Cross-file resolution
-/// requires the dependency closure and is deliberately not attempted here.
-fn resolve_same_file_references(unresolved: &[UnresolvedRef], symbols: &[SymbolRow]) -> Vec<Edge> {
+/// Names too ubiquitous to resolve across files by name alone: standard
+/// library types, universal trait methods, and container operations that
+/// fabricate false edges when matched outside their defining file. Same-file
+/// resolution still binds them (a unique kind-compatible local definition is
+/// real evidence); generation sealing never binds them cross-file.
+pub(crate) const CROSS_FILE_REFERENCE_BLOCKLIST: &[&str] = &[
+    // Rust std types / prelude
+    "Result",
+    "Option",
+    "String",
+    "Vec",
+    "Box",
+    "Arc",
+    "Rc",
+    "Ok",
+    "Err",
+    "Some",
+    "None",
+    // Ubiquitous trait methods
+    "fmt",
+    "format",
+    "display",
+    "to_string",
+    "clone",
+    "clone_from",
+    "default",
+    "from",
+    "into",
+    "try_from",
+    "try_into",
+    "new",
+    "build",
+    "builder",
+    "parse",
+    "from_str",
+    "eq",
+    "ne",
+    "cmp",
+    "partial_cmp",
+    "hash",
+    "next",
+    "iter",
+    "into_iter",
+    "drop",
+    "deref",
+    "deref_mut",
+    "as_ref",
+    "as_mut",
+    "borrow",
+    "borrow_mut",
+    "read",
+    "write",
+    "flush",
+    "close",
+    "len",
+    "is_empty",
+    "contains",
+    "push",
+    "pop",
+    "insert",
+    "remove",
+    "get",
+    "unwrap",
+    "expect",
+    "map",
+    "and_then",
+    "or_else",
+    "unwrap_or",
+    // Common test/assertion names
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    // Common patterns matched across files
+    "run",
+    "start",
+    "stop",
+    "init",
+    "setup",
+    // Stdlib method names that collide with user-defined functions
+    "status",
+    "modified",
+    "output",
+    "exists",
+    "join",
+    "to_owned",
+    "collect",
+    "filter",
+    "find",
+    "take",
+    "skip",
+    "count",
+    "sum",
+    "max",
+    "min",
+    "sort",
+    "extend",
+    "chain",
+    "zip",
+    "enumerate",
+    "flatten",
+    "open",
+    "create",
+    "metadata",
+    "canonicalize",
+    "spawn",
+    "wait",
+    "send",
+    "recv",
+    "lock",
+    "try_lock",
+];
+
+/// Resolve same-file symbol references (calls and other extractor reference
+/// kinds) into relation edges, and retain the references this file cannot
+/// bind as typed cross-file candidates. Only an UNAMBIGUOUS kind-compatible
+/// name match against this file's own symbol table resolves; ambiguous or
+/// unmatched references stay unresolved rather than guessing. Cross-file
+/// resolution requires the whole generation's symbol set and runs at sealing.
+fn resolve_file_references(
+    unresolved: &[UnresolvedRef],
+    symbols: &[SymbolRow],
+) -> (Vec<Edge>, Vec<CodeIndexUnresolvedReferenceV1>) {
     let mut by_name: BTreeMap<&str, Vec<&SymbolRow>> = BTreeMap::new();
     for symbol in symbols {
         by_name
@@ -1840,39 +1834,164 @@ fn resolve_same_file_references(unresolved: &[UnresolvedRef], symbols: &[SymbolR
             .or_default()
             .push(symbol);
     }
-    let mut resolved = Vec::new();
-    for reference in unresolved {
-        let Some(candidates) = by_name.get(reference.reference_name.as_str()) else {
-            continue;
-        };
-        let compatible = candidates
-            .iter()
-            .copied()
-            .filter(|target| {
-                reference_target_kind_is_compatible(reference.reference_kind, &target.kind)
-            })
-            .collect::<Vec<_>>();
-        let [target] = compatible.as_slice() else {
-            continue;
-        };
-        resolved.push(Edge {
-            source: reference.from_node_id.clone(),
-            target: target.node_id.clone(),
-            kind: reference.reference_kind,
-            line: Some(reference.line),
-        });
+    // A node id normally identifies one symbol row; duplicates abstain rather
+    // than anchoring retained evidence to an arbitrary row.
+    let mut by_node_id: BTreeMap<&str, Option<&SymbolRow>> = BTreeMap::new();
+    for symbol in symbols {
+        by_node_id
+            .entry(symbol.node_id.as_str())
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(symbol));
     }
-    resolved
+    // Extractors emit a bare method-name duplicate alongside every dotted
+    // receiver call (`self.rows.push(row)` → `self.rows.push` + `push`) so an
+    // in-file method definition can still match. Index those duplicates by
+    // their call site: a duplicate that binds back to its own enclosing symbol
+    // is a receiver whose type is unknown (usually a container or another
+    // struct's method sharing the name), not evidence of recursion.
+    let dotted_duplicate_sites = unresolved
+        .iter()
+        .filter(|reference| reference.reference_name.contains('.'))
+        .filter_map(|reference| {
+            let simple = reference.reference_name.rsplit('.').next()?;
+            (simple != reference.reference_name).then_some((
+                reference.from_node_id.as_str(),
+                reference.line,
+                reference.column,
+                simple,
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+    let mut resolved = Vec::new();
+    let mut retained = Vec::new();
+    for reference in unresolved {
+        let compatible = by_name
+            .get(reference.reference_name.as_str())
+            .map(|candidates| {
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|target| {
+                        reference_target_kind_is_compatible(reference.reference_kind, &target.kind)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        match compatible.as_slice() {
+            [target] => {
+                if target.node_id == reference.from_node_id
+                    && dotted_duplicate_sites.contains(&(
+                        reference.from_node_id.as_str(),
+                        reference.line,
+                        reference.column,
+                        reference.reference_name.as_str(),
+                    ))
+                {
+                    continue;
+                }
+                resolved.push(Edge {
+                    source: reference.from_node_id.clone(),
+                    target: target.node_id.clone(),
+                    kind: reference.reference_kind,
+                    line: Some(reference.line),
+                });
+            }
+            [] => {
+                if let Some(candidate) = cross_file_reference_candidate(reference, &by_node_id) {
+                    retained.push(candidate);
+                }
+            }
+            // Same-file ambiguity: adding cross-file candidates can only make
+            // it more ambiguous, so the reference stays unresolved.
+            _ => {}
+        }
+    }
+    (resolved, retained)
 }
 
+/// The retained cross-file form of one reference the file could not bind, or
+/// `None` when the reference can never bind cross-file: receiver-dotted
+/// paths (unknown receiver type), blocklisted ubiquitous names, relation
+/// kinds outside the canonical graph contract, and references whose
+/// enclosing symbol is not uniquely identified.
+fn cross_file_reference_candidate(
+    reference: &UnresolvedRef,
+    by_node_id: &BTreeMap<&str, Option<&SymbolRow>>,
+) -> Option<CodeIndexUnresolvedReferenceV1> {
+    if reference.reference_name.contains('.') {
+        return None;
+    }
+    let simple_name = reference
+        .reference_name
+        .rsplit("::")
+        .next()
+        .unwrap_or(reference.reference_name.as_str());
+    if simple_name.is_empty() || CROSS_FILE_REFERENCE_BLOCKLIST.contains(&simple_name) {
+        return None;
+    }
+    let kind = canonical_relation_kind(&reference.reference_kind)?;
+    let from = (*by_node_id.get(reference.from_node_id.as_str())?)?;
+    Some(CodeIndexUnresolvedReferenceV1 {
+        from_occurrence: from.occurrence.clone(),
+        reference_name: reference.reference_name.clone(),
+        kind,
+        evidence_span: from.span,
+    })
+}
+
+/// The structural compatibility matrix between a reference's edge kind and a
+/// candidate target's node kind. Deliberately conservative where the edge
+/// kind constrains the target shape: `Implements`/`Extends`/`DerivesMacro`
+/// must bind a trait-shaped target and `Calls` a callable one — otherwise a
+/// `Calls` ref named `new` happily binds a same-file `struct new`, and an
+/// `impl Default for X` ref poisons rank/impls by binding an unrelated
+/// `Default` enum variant. Everything else stays permissive.
 fn reference_target_kind_is_compatible(reference_kind: EdgeKind, target_kind: &str) -> bool {
+    match canonical_relation_kind(&reference_kind) {
+        Some(kind) => relation_target_kind_is_compatible(kind, target_kind),
+        // `DerivesMacro` has no canonical relation kind (it abstains at
+        // canonicalization) but still binds trait-shaped targets only, so the
+        // abstention names a plausible endpoint rather than a name collision.
+        None => relation_target_kind_is_compatible(RelationEdgeKindV1::Implements, target_kind),
+    }
+}
+
+/// [`reference_target_kind_is_compatible`] over the canonical relation kinds,
+/// shared with generation sealing's cross-file resolution.
+pub(crate) fn relation_target_kind_is_compatible(
+    kind: RelationEdgeKindV1,
+    target_kind: &str,
+) -> bool {
     let Some(target_kind) = NodeKind::from_str(target_kind) else {
         return false;
     };
-    match reference_kind {
-        EdgeKind::Implements => matches!(
+    match kind {
+        RelationEdgeKindV1::Implements | RelationEdgeKindV1::Extends => matches!(
             target_kind,
-            NodeKind::Trait | NodeKind::Interface | NodeKind::InterfaceType
+            NodeKind::Trait
+                | NodeKind::Interface
+                | NodeKind::InterfaceType
+                | NodeKind::Class
+                | NodeKind::InnerClass
+                | NodeKind::AbstractMethod
+                | NodeKind::SealedClass
+                | NodeKind::Annotation
+                | NodeKind::TypeAlias
+        ),
+        RelationEdgeKindV1::Calls => matches!(
+            target_kind,
+            NodeKind::Function
+                | NodeKind::Method
+                | NodeKind::StructMethod
+                | NodeKind::Constructor
+                | NodeKind::AbstractMethod
+                | NodeKind::ArrowFunction
+                | NodeKind::Procedure
+                | NodeKind::Macro
+        ),
+        RelationEdgeKindV1::Annotates => matches!(
+            target_kind,
+            NodeKind::Annotation | NodeKind::Decorator | NodeKind::AnnotationUsage
         ),
         _ => true,
     }
@@ -1958,7 +2077,7 @@ fn edge_abstention(
     }
 }
 
-fn canonical_edge_key(
+pub(crate) fn canonical_edge_key(
     edge: &CanonicalRelationEdgeV1,
 ) -> (
     &SymbolOccurrenceId,
@@ -2170,7 +2289,7 @@ mod tests {
                 eligibility: CodeSearchEligibilityV1::Eligible,
                 chunk_ids: vec![chunk_id.clone()],
             },
-            chunks: vec![CodeSearchChunkV1 {
+            chunks: vec![Arc::new(CodeSearchChunkV1 {
                 id: chunk_id,
                 anchor: CodeSearchChunkAnchorV1 {
                     generation_id,
@@ -2195,7 +2314,7 @@ mod tests {
                 exact_terms: vec![],
                 subtokens: vec!["text".to_owned()],
                 sanitized_text: BoundedSanitizedText::new("text").unwrap(),
-            }],
+            })],
         }
     }
 
@@ -2204,7 +2323,9 @@ mod tests {
         file_chunks().validate().expect("consistent file chunks");
 
         let mut mixed_generation = file_chunks();
-        mixed_generation.chunks[0].anchor.generation_id = id("generation.other");
+        Arc::make_mut(&mut mixed_generation.chunks[0])
+            .anchor
+            .generation_id = id("generation.other");
         assert_eq!(
             mixed_generation.validate(),
             Err(ChunkingFailureV1::GenerationMismatch)
@@ -2222,7 +2343,7 @@ mod tests {
         let authority = ExactExtractionAuthorityV1::restore(&chunks).expect("sealed authority");
         let admitted = authority.admit(expected.clone()).expect("exact admission");
 
-        assert_eq!(admitted.into_chunk(), expected);
+        assert_eq!(admitted.into_chunk(), *expected);
     }
 
     const RUST_SOURCE: &str = "//! Module documentation.\n\nuse std::collections::HashMap;\n\n/// Doc comment.\npub fn alpha(x: u32) -> u32 {\n    x + 1\n}\n\npub struct Holder {\n    map: HashMap<u32, u32>,\n}\n\nimpl Holder {\n    pub fn get(&self, key: u32) -> Option<u32> {\n        self.map.get(&key).copied()\n    }\n}\n\n// A trailing free-floating comment.\n";
@@ -2344,13 +2465,13 @@ mod tests {
     }
 
     fn sequential_digest_reference(
-        chunks: &[CodeSearchChunkV1],
+        chunks: &[Arc<CodeSearchChunkV1>],
     ) -> BTreeMap<CodeSearchChunkId, String> {
         let mut digests = BTreeMap::new();
         for chunk in chunks {
             digests.insert(
                 chunk.id.clone(),
-                canonical_digest(EXACT_EXTRACTION_AUTHORITY_SEPARATOR, chunk)
+                canonical_digest(EXACT_EXTRACTION_AUTHORITY_SEPARATOR, chunk.as_ref())
                     .expect("reference digest"),
             );
         }
@@ -2392,7 +2513,12 @@ mod tests {
             .into_iter()
             .map(ExtractionAdmittedCodeSearchChunkV1::into_chunk)
             .collect::<Vec<_>>();
-        assert_eq!(readmitted, chunks.chunks, "admission must preserve order");
+        let expected = chunks
+            .chunks
+            .iter()
+            .map(|chunk| (**chunk).clone())
+            .collect::<Vec<_>>();
+        assert_eq!(readmitted, expected, "admission must preserve order");
     }
 
     /// The fanned-out sweeps still report the lowest-index failure, so callers
@@ -2405,18 +2531,26 @@ mod tests {
         assert!(early < late);
 
         let mut identity_first = baseline.clone();
-        identity_first.chunks[early].anchor.parent_chunk_id =
-            Some(identity_first.chunks[early].id.clone());
-        identity_first.chunks[late].anchor.generation_id = id("generation.other");
+        let early_id = identity_first.chunks[early].id.clone();
+        Arc::make_mut(&mut identity_first.chunks[early])
+            .anchor
+            .parent_chunk_id = Some(early_id);
+        Arc::make_mut(&mut identity_first.chunks[late])
+            .anchor
+            .generation_id = id("generation.other");
         assert!(matches!(
             identity_first.validate(),
             Err(ChunkingFailureV1::NonCanonicalIdentity(_))
         ));
 
         let mut generation_first = baseline.clone();
-        generation_first.chunks[early].anchor.generation_id = id("generation.other");
-        generation_first.chunks[late].anchor.parent_chunk_id =
-            Some(generation_first.chunks[late].id.clone());
+        Arc::make_mut(&mut generation_first.chunks[early])
+            .anchor
+            .generation_id = id("generation.other");
+        let late_id = generation_first.chunks[late].id.clone();
+        Arc::make_mut(&mut generation_first.chunks[late])
+            .anchor
+            .parent_chunk_id = Some(late_id);
         assert_eq!(
             generation_first.validate(),
             Err(ChunkingFailureV1::GenerationMismatch)
@@ -2678,6 +2812,7 @@ mod tests {
         let body_pieces: Vec<&CodeSearchChunkV1> = result
             .chunks
             .iter()
+            .map(Arc::as_ref)
             .filter(|chunk| chunk.anchor.grain == CodeSearchChunkGrainV1::SymbolBody)
             .collect();
         assert!(body_pieces.len() > 1, "oversized body split into windows");
@@ -3228,10 +3363,15 @@ pub fn real_symbol() {}
             file_path: "src/lib.rs".to_owned(),
         };
 
-        let resolved = resolve_same_file_references(&[reference], &[enum_variant, trait_target]);
+        let (resolved, retained) =
+            resolve_file_references(&[reference], &[enum_variant, trait_target]);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].kind, EdgeKind::Implements);
         assert_eq!(resolved[0].target, "node.trait.default");
+        assert!(
+            retained.is_empty(),
+            "a same-file-resolved reference must not also be retained: {retained:?}"
+        );
     }
 
     #[test]
@@ -3316,11 +3456,12 @@ pub fn real_symbol() {}
             end_byte: chunk.anchor.source_span.start_byte
                 + (relative + "comment_fake".len()) as u64,
         };
-        chunk.exact_terms.push(
+        let forged = Arc::make_mut(&mut chunk);
+        forged.exact_terms.push(
             ExactTechnicalTermV1::untrusted_whole_symbol_candidate(
                 b"comment_fake".to_vec(),
                 span,
-                chunk
+                forged
                     .anchor
                     .symbol_occurrence_id
                     .clone()
@@ -3328,7 +3469,7 @@ pub fn real_symbol() {}
             )
             .expect("raw matching-occurrence candidate"),
         );
-        chunk.exact_terms.sort_by_key(|term| {
+        forged.exact_terms.sort_by_key(|term| {
             (
                 term.span().start_byte,
                 term.span().end_byte,

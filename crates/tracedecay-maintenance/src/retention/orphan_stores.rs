@@ -755,7 +755,7 @@ pub async fn execute_registered_collection(
     db: &RegisteredGlobalDb,
     plan: &CollectionPlan,
     profile_root: &Path,
-) -> tracedecay_runtime_core::errors::Result<(CollectionOutcome, usize)> {
+) -> tracedecay_domain::errors::Result<(CollectionOutcome, usize)> {
     execute_registered_collection_controlled(db, plan, profile_root, unbounded_collection_control())
         .await
 }
@@ -766,7 +766,7 @@ pub(crate) async fn execute_registered_collection_controlled(
     plan: &CollectionPlan,
     profile_root: &Path,
     control: CollectionControl<'_>,
-) -> tracedecay_runtime_core::errors::Result<(CollectionOutcome, usize)> {
+) -> tracedecay_domain::errors::Result<(CollectionOutcome, usize)> {
     let mut outcome = CollectionOutcome::default();
     let mut retired = 0usize;
     for finding in &plan.collect {
@@ -1193,8 +1193,8 @@ pub(crate) async fn execute_registered_collection_controlled(
 fn orphan_db_error(
     operation: &'static str,
     error: impl std::fmt::Display,
-) -> tracedecay_runtime_core::errors::TraceDecayError {
-    tracedecay_runtime_core::errors::TraceDecayError::Database {
+) -> tracedecay_domain::errors::TraceDecayError {
+    tracedecay_domain::errors::TraceDecayError::Database {
         operation: operation.to_string(),
         message: error.to_string(),
     }
@@ -1746,15 +1746,13 @@ pub(crate) fn dir_size_bytes_controlled(
 pub async fn build_store_census(
     db: &RegisteredGlobalDb,
     profile_root: &Path,
-) -> tracedecay_runtime_core::errors::Result<Vec<StoreCensusEntry>> {
+) -> tracedecay_domain::errors::Result<Vec<StoreCensusEntry>> {
     let projects = db.list_code_projects(usize::MAX).await?;
     build_store_census_for_projects(db, profile_root, &projects, None)
         .await?
-        .ok_or_else(
-            || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: "unbounded store census was unexpectedly interrupted".to_owned(),
-            },
-        )
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: "unbounded store census was unexpectedly interrupted".to_owned(),
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -1769,7 +1767,7 @@ pub async fn build_store_census_page(
     profile_root: &Path,
     after_project_id: Option<&str>,
     limit: usize,
-) -> tracedecay_runtime_core::errors::Result<StoreCensusPageV1> {
+) -> tracedecay_domain::errors::Result<StoreCensusPageV1> {
     let limit = limit.clamp(1, 64);
     let mut projects = db
         .list_code_projects_after(after_project_id, limit.saturating_add(1))
@@ -1781,11 +1779,9 @@ pub async fn build_store_census_page(
         .flatten();
     let entries = build_store_census_for_projects(db, profile_root, &projects, None)
         .await?
-        .ok_or_else(
-            || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: "unbounded store census page was unexpectedly interrupted".to_owned(),
-            },
-        )?;
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: "unbounded store census page was unexpectedly interrupted".to_owned(),
+        })?;
     Ok(StoreCensusPageV1 {
         entries,
         next_cursor,
@@ -1797,7 +1793,7 @@ async fn build_store_census_for_projects(
     profile_root: &Path,
     projects: &[tracedecay_global_db::CodeProjectRecord],
     control: Option<CollectionControl<'_>>,
-) -> tracedecay_runtime_core::errors::Result<Option<Vec<StoreCensusEntry>>> {
+) -> tracedecay_domain::errors::Result<Option<Vec<StoreCensusEntry>>> {
     let mut census = Vec::new();
     // Aliases and the git common directory are part of the identity: a linked
     // worktree or a second enrolled checkout keeps the store live even when
@@ -1934,7 +1930,7 @@ async fn inspect_store_leaf_cheap(
     profile_root: &Path,
     data_root: &Path,
     control: Option<CollectionControl<'_>>,
-) -> tracedecay_runtime_core::errors::Result<Option<CheapStoreInspect>> {
+) -> tracedecay_domain::errors::Result<Option<CheapStoreInspect>> {
     if let Some(control) = control {
         if control.completion().is_some() {
             return Ok(None);
@@ -1972,18 +1968,16 @@ async fn inspect_store_leaf_cheap(
     tokio::task::spawn_blocking(move || inspect_store_leaf_cheap_sync(&profile_root, &data_root))
         .await
         .map(Some)
-        .map_err(
-            |error| tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: format!("store census inspect join failed: {error}"),
-            },
-        )
+        .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!("store census inspect join failed: {error}"),
+        })
 }
 
 async fn attach_lazy_content_fences(
     census: &mut [StoreCensusEntry],
     profile_root: &Path,
     control: Option<CollectionControl<'_>>,
-) -> tracedecay_runtime_core::errors::Result<Option<()>> {
+) -> tracedecay_domain::errors::Result<Option<()>> {
     for entry in census.iter_mut() {
         if matches!(classify_one(entry), StoreDisposition::Live) {
             continue;
@@ -2038,7 +2032,7 @@ pub(crate) async fn sweep_orphan_stores(
     retention_secs: i64,
     now: i64,
     apply: bool,
-) -> tracedecay_runtime_core::errors::Result<OrphanSweepReport> {
+) -> tracedecay_domain::errors::Result<OrphanSweepReport> {
     let census = build_store_census(db, profile_root).await?;
     let findings = classify_stores(&census, now);
     let plan = plan_collection(findings, retention_secs);
@@ -2139,7 +2133,7 @@ pub async fn census_unregistered_project_dirs(
     db: &RegisteredGlobalDb,
     profile_root: &Path,
     now: i64,
-) -> tracedecay_runtime_core::errors::Result<Vec<UnregisteredStoreFinding>> {
+) -> tracedecay_domain::errors::Result<Vec<UnregisteredStoreFinding>> {
     let cancellation = CancellationToken::new();
     let report = sweep_unregistered_store_page(
         db,
@@ -2208,7 +2202,7 @@ pub(crate) async fn execute_unregistered_collection(
     db: &RegisteredGlobalDb,
     plan: &UnregisteredCollectionPlan,
     profile_root: &Path,
-) -> tracedecay_runtime_core::errors::Result<CollectionOutcome> {
+) -> tracedecay_domain::errors::Result<CollectionOutcome> {
     execute_unregistered_collection_controlled(
         db,
         plan,
@@ -2227,7 +2221,7 @@ pub(crate) async fn execute_unregistered_collection_controlled(
     plan: &UnregisteredCollectionPlan,
     profile_root: &Path,
     control: CollectionControl<'_>,
-) -> tracedecay_runtime_core::errors::Result<CollectionOutcome> {
+) -> tracedecay_domain::errors::Result<CollectionOutcome> {
     let mut outcome = CollectionOutcome::default();
     for finding in &plan.collect {
         if let Some(completion) = control.completion() {
@@ -2636,7 +2630,7 @@ pub async fn sweep_unregistered_stores(
     retention_secs: i64,
     now: i64,
     apply: bool,
-) -> tracedecay_runtime_core::errors::Result<UnregisteredStoreSweepReport> {
+) -> tracedecay_domain::errors::Result<UnregisteredStoreSweepReport> {
     let cancellation = CancellationToken::new();
     let report = sweep_unregistered_store_page(
         db,
@@ -2659,7 +2653,7 @@ pub async fn sweep_unregistered_stores(
         && (completion_is_terminal || report.next_cursor.is_none())
         && (apply || report.outcome.collected.is_empty());
     if !receipt_is_consistent {
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: "unregistered-store page returned an inconsistent receipt".to_owned(),
         });
     }

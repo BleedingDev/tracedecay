@@ -18,8 +18,6 @@
 use std::sync::Arc;
 
 use super::DaemonEngine;
-#[cfg(test)]
-use crate::daemon::DAEMON_SHUTDOWN_DEADLINE;
 use crate::daemon::shutdown_coordination::{ShutdownOwner, ShutdownStatus};
 #[cfg(test)]
 use crate::daemon::shutdown_orchestration::{
@@ -27,6 +25,8 @@ use crate::daemon::shutdown_orchestration::{
 };
 use crate::daemon::store_shutdown::ShutdownTaskReceipt;
 use crate::daemon::{log_daemon_event, project_open_tasks, shutdown_project_servers};
+#[cfg(test)]
+use tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE;
 
 impl DaemonEngine {
     #[hotpath::measure(label = "daemon.engine.shutdown_owner_phases", future = true)]
@@ -252,6 +252,7 @@ impl DaemonEngine {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(in crate::daemon) async fn shutdown_all(&self) -> Arc<DaemonShutdownReceipt> {
         let deadline = tokio::time::Instant::now() + DAEMON_SHUTDOWN_DEADLINE;
         let lifecycle = self.lifecycle.clone();
@@ -261,7 +262,7 @@ impl DaemonEngine {
             let terminal_owner = shutdown_engine.memory_graph_reconciliation_shutdown_owner();
             let server_engine = shutdown_engine.clone();
             DaemonShutdownPlan::new(
-                tokio::task::JoinSet::<tracedecay_runtime_core::errors::Result<()>>::new(),
+                tokio::task::JoinSet::<tracedecay_domain::errors::Result<()>>::new(),
                 owner_phases,
                 move |project_server_deadline| async move {
                     server_engine

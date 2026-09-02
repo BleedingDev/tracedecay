@@ -29,6 +29,7 @@ use tracedecay_domain::UtcMicros;
 use tracedecay_domain::WorkDuplicateAdjudicationCommandV1;
 use tracedecay_tool_catalog::OperationId;
 
+use tracedecay_application::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_daemon_protocol::{
     DaemonInvocationClient, InvocationCancellationPolicy, invocation_now_micros,
 };
@@ -36,8 +37,7 @@ use tracedecay_daemon_protocol::{
     DaemonInvocationOutcome, DaemonInvocationProblem, DaemonInvocationRequest,
     WorkApplicationInvocationV1, WorkApplicationOutcomeV1,
 };
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
-use tracedecay_usecases::request_identity::{GlobalRequestSurface, mint_global_request_id};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 const WORK_CLI_DEADLINE_MICROS: i64 = 120_000_000;
 
@@ -70,6 +70,7 @@ pub struct WorkCliDelivery {
 
 impl WorkCliDelivery {
     /// Acknowledge only after the caller's output write and flush succeeded.
+    #[hotpath::skip]
     pub async fn acknowledge_delivered(&self) -> Result<()> {
         self.client
             .acknowledge_work_delivery(
@@ -82,6 +83,7 @@ impl WorkCliDelivery {
 
     /// Record a terminal disconnected/drop outcome when the caller's output
     /// boundary fails. This must never be converted into Delivered.
+    #[hotpath::skip]
     pub async fn acknowledge_dropped(
         &self,
         reason: tracedecay_domain::DeliveryDropReasonV1,
@@ -379,7 +381,7 @@ pub async fn invoke_work_cli_with_delivery(
     );
     let handshake =
         tracedecay::daemon::handshake_for_current_client(Some(project_root), None, false, false)?;
-    let client = tracedecay::daemon::invocation_client_for_current(handshake)?;
+    let client = tracedecay_daemon_identity::invocation_client_for_current(handshake)?;
     let response = match client
         .invoke_controlled(
             request,

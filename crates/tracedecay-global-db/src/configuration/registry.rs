@@ -22,6 +22,7 @@ use tracedecay_domain::configuration::{
     SYNC_ORPHAN_DB_GC_DAYS_SETTING_KEY, SYNC_READ_COOLDOWN_SECS_SETTING_KEY,
     SYNC_READ_REFRESH_SETTING_KEY, SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY,
     SYNC_SESSION_START_SYNC_SETTING_KEY, SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY,
+    SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
     SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY, SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, SettingDefinitionV1,
     SettingKey, SettingScopeV1, SettingSensitivityV1, TELEMETRY_TIMINGS_SETTING_KEY,
     USER_CODE_INDEX_WORKERS_SETTING_KEY, USER_EXTRACTION_TIMEOUT_SECS_SETTING_KEY,
@@ -30,8 +31,11 @@ use tracedecay_domain::configuration::{
     WORK_TOPOLOGY_POLICY_SETTING_KEY, WorkExpertiseConsentV1, safe_work_topology_policy_v1,
 };
 use tracedecay_domain::feedback::PROXIMITY_RISK_THRESHOLD_SETTING_KEY_V1;
-
-use super::semantic::SemanticConfig;
+use tracedecay_semantic_contracts::SemanticConfig;
+#[cfg(test)]
+use tracedecay_semantic_contracts::{
+    DEFAULT_FASTEMBED_MODEL_ID, SemanticProfileSelection, SemanticResourceCeilings,
+};
 
 /// Canonical default for configured-tier proximity warnings.
 pub const DEFAULT_PROXIMITY_RISK_THRESHOLD_BASIS_POINTS_V1: u64 = 7_000;
@@ -39,7 +43,7 @@ pub const MAX_PROXIMITY_RISK_THRESHOLD_BASIS_POINTS_V1: u64 = 10_000;
 
 /// Registry schema revision. Increment only when setting-definition semantics
 /// change, not when a setting value changes.
-pub const CONFIGURATION_REGISTRY_SCHEMA_REVISION: u16 = 5;
+pub const CONFIGURATION_REGISTRY_SCHEMA_REVISION: u16 = 6;
 
 #[derive(Debug, Error)]
 pub enum ConfigurationRegistryError {
@@ -452,6 +456,7 @@ struct ProjectDefaults {
 #[derive(Clone, Copy)]
 struct SyncDefaults {
     auto_watch: bool,
+    watch_linked_worktrees: bool,
     watch_debounce_ms: u64,
     watch_max_delay_ms: u64,
     watch_max_projects: usize,
@@ -473,6 +478,7 @@ impl Default for SyncDefaults {
     fn default() -> Self {
         Self {
             auto_watch: false,
+            watch_linked_worktrees: false,
             watch_debounce_ms: 2000,
             watch_max_delay_ms: 30000,
             watch_max_projects: 32,
@@ -599,6 +605,12 @@ fn register_project_settings(
         (
             SYNC_AUTO_WATCH_SETTING_KEY,
             ConfigurationValueV1::Boolean(sync.auto_watch),
+            SettingSensitivityV1::Public,
+            RestartRequirementV1::DaemonRestart,
+        ),
+        (
+            SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
+            ConfigurationValueV1::Boolean(sync.watch_linked_worktrees),
             SettingSensitivityV1::Public,
             RestartRequirementV1::DaemonRestart,
         ),
@@ -862,7 +874,7 @@ mod user_profile_settings_tests {
 
     #[test]
     fn code_index_workers_default_is_automatic_and_zero_exact_is_denied() {
-        assert_eq!(CONFIGURATION_REGISTRY_SCHEMA_REVISION, 5);
+        assert_eq!(CONFIGURATION_REGISTRY_SCHEMA_REVISION, 6);
         let key = SettingKey::new(USER_CODE_INDEX_WORKERS_SETTING_KEY).expect("key");
         let project_registry = ConfigurationRegistry::core().expect("project registry");
         assert!(matches!(
@@ -929,6 +941,25 @@ mod automation_defaults_tests {
 #[cfg(test)]
 mod sync_defaults_tests {
     use super::*;
+
+    #[test]
+    fn linked_worktree_watching_requires_explicit_project_opt_in() {
+        let registry = ConfigurationRegistry::core().expect("registry");
+        let key = SettingKey::new(SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY).expect("setting key");
+        let definition = registry.definition(&key).expect("setting definition");
+
+        assert_eq!(
+            definition.default_value,
+            ConfigurationValueV1::Boolean(false)
+        );
+        assert_eq!(definition.value_kind, ConfigurationValueKindV1::Boolean);
+        assert_eq!(definition.scope, SettingScopeV1::Project);
+        assert_eq!(definition.sensitivity, SettingSensitivityV1::Public);
+        assert_eq!(
+            definition.restart_requirement,
+            RestartRequirementV1::DaemonRestart
+        );
+    }
 
     #[test]
     fn orphan_database_retention_has_one_exact_project_default() {
@@ -1017,9 +1048,6 @@ mod semantic_runtime_payload_tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::configuration::semantic::{
-        DEFAULT_FASTEMBED_MODEL_ID, SemanticProfileSelection, SemanticResourceCeilings,
-    };
     use tracedecay_domain::ManifestDigest;
     use tracedecay_domain::canonical_text::CANONICAL_TEXT_MAX_BYTES;
 

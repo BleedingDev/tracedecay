@@ -72,6 +72,7 @@ impl<P> WorkProjectionReadService<P>
 where
     P: WorkProjectionReadPort,
 {
+    #[hotpath::skip]
     pub const fn new(port: P) -> Self {
         Self { port }
     }

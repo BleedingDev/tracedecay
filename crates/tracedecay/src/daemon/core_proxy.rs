@@ -18,19 +18,18 @@ use super::{
     next_daemon_response_line, write_daemon_preamble,
 };
 #[cfg(unix)]
-use super::{
-    binary_version, connect_with_restart_grace, connection_for_socket_path, log_daemon_event,
-    version_skew_action,
-};
-use crate::mcp::StdioTransport;
+use super::{binary_version, connect_with_restart_grace, log_daemon_event, version_skew_action};
 #[cfg(unix)]
-use crate::mcp::transport::{McpDuplexTransport, McpTransportReader, McpTransportWriter};
+use tracedecay_daemon_identity::connection_for_socket_path;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_mcp::JsonRpcRequest;
 #[cfg(not(unix))]
 use tracedecay_mcp::McpTransport;
+use tracedecay_mcp::transport::StdioTransport;
+#[cfg(unix)]
+use tracedecay_mcp::transport::{McpDuplexTransport, McpTransportReader, McpTransportWriter};
 #[cfg(unix)]
 use tracedecay_mcp::{ErrorCode, JsonRpcResponse};
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 
 /// Decides at `tracedecay serve` startup whether to proxy to the daemon.
 ///
@@ -42,7 +41,9 @@ use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 /// the same grace used for per-request connects before falling back.
 #[cfg(unix)]
 pub async fn should_proxy_serve_to_daemon(socket_path: &Path) -> bool {
-    let installed_socket = super::installed_service_socket_path().ok().flatten();
+    let installed_socket = tracedecay_daemon_control::installed_service_socket_path()
+        .ok()
+        .flatten();
     should_proxy_serve_to_daemon_with(
         socket_path,
         installed_socket.as_deref(),
@@ -199,7 +200,9 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
 /// client that would have received the answer is gone.
 ///
 /// A line that is not a `tools/call` (initialize, tools/list, resources/*) has
-/// no tool of its own and takes the ordinary interactive ceiling.
+/// no tool of its own and takes the unnamed-tool default ceiling
+/// ([`tool_dispatch_ceiling`](crate::mcp::tools::handlers::tool_dispatch_ceiling)
+/// with an empty name), not a named catalog tool's possibly shorter deadline.
 #[cfg(unix)]
 fn disconnect_drain_bound(line: &str) -> Duration {
     let ceiling = request_tool_name(line)
@@ -306,7 +309,6 @@ async fn proxy_host_input_to_daemon(
             continue;
         }
 
-        let request_drain_bound = drain_bound.unwrap_or_else(|| disconnect_drain_bound(&line));
         let result = {
             let daemon_request = send_daemon_request_line_with_project_open_retry(
                 socket_path,
@@ -314,11 +316,16 @@ async fn proxy_host_input_to_daemon(
                 &line,
             );
             tokio::pin!(daemon_request);
+            // The catalog-backed drain ceiling is only meaningful after the
+            // owning client is gone. Computing it eagerly would stall every
+            // live `tools/call` on catalog load before the daemon is even
+            // contacted.
+            let disconnect_bound = || drain_bound.unwrap_or_else(|| disconnect_drain_bound(&line));
             loop {
                 if *eof.borrow() {
                     break drain_daemon_request_after_disconnect(
                         &mut daemon_request,
-                        request_drain_bound,
+                        disconnect_bound(),
                     )
                     .await;
                 }
@@ -340,7 +347,7 @@ async fn proxy_host_input_to_daemon(
                             // for the same reason stdin EOF says it is.
                             break drain_daemon_request_after_disconnect(
                                 &mut daemon_request,
-                                request_drain_bound,
+                                disconnect_bound(),
                             )
                             .await;
                         };
@@ -393,7 +400,7 @@ pub(crate) fn reset_proxy_handshake_for_initialize(
 pub(crate) async fn resolve_daemon_initialize_route(
     params: Option<&serde_json::Value>,
     registry: Option<&tracedecay_global_db::RegisteredGlobalDb>,
-) -> tracedecay_runtime_core::errors::Result<Option<InitializeRouteMetadata>> {
+) -> tracedecay_domain::errors::Result<Option<InitializeRouteMetadata>> {
     let roots = crate::mcp::server::initialize_root_paths(params);
     if let Some(registry) = registry {
         for root in &roots {
@@ -526,7 +533,8 @@ async fn write_proxy_request_result(
     match result {
         Ok(responses) => {
             let metadata = proxy_initialize_metadata(line, &responses);
-            if let Some(warning) = daemon_version_skew_warning(line, &responses, binary_version()) {
+            if let Some(warning) = daemon_version_skew_warning(line, &responses, binary_version()?)
+            {
                 eprintln!("[tracedecay] warning: {warning}");
             }
             for response in responses {
@@ -627,7 +635,7 @@ pub(crate) async fn send_daemon_request_line_with_liveness_poll(
         }
         None => connect_to_current_daemon_within(socket_path, None).await?,
     };
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_owned_split();
 
     let write = async {
         write_daemon_preamble(&mut writer, &connection, handshake).await?;
@@ -899,13 +907,19 @@ mod tests {
             );
         }
 
-        // A tool the daemon lets run longer drains for longer; a method with no
-        // tool of its own takes the ordinary interactive ceiling.
-        assert!(disconnect_drain_bound(&long) > disconnect_drain_bound(&interactive));
-        assert_eq!(
-            disconnect_drain_bound(&non_tool),
-            disconnect_drain_bound(&interactive)
-        );
+        // Unnamed methods resolve the unnamed-tool default
+        // (`tool_dispatch_ceiling("")`), not a named catalog tool such as
+        // `tracedecay_context`. The drain must outlive that resolved ceiling —
+        // the longest bound that actually applies to this request — rather
+        // than a hardcoded catalog value.
         assert_eq!(request_tool_name(&non_tool), None);
+        let unnamed_ceiling = crate::mcp::tools::handlers::tool_dispatch_ceiling("");
+        assert!(
+            disconnect_drain_bound(&non_tool) > unnamed_ceiling,
+            "tools/list must drain past the unnamed-tool default ceiling {unnamed_ceiling:?}"
+        );
+
+        // A tool the daemon lets run longer drains for longer.
+        assert!(disconnect_drain_bound(&long) > disconnect_drain_bound(&interactive));
     }
 }

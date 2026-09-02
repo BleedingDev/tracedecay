@@ -148,6 +148,7 @@ pub enum AutomationTaskRequestV1 {
 }
 
 impl AutomationTaskRequestV1 {
+    #[hotpath::skip]
     pub const fn task(&self) -> AutomationTaskV1 {
         match self {
             Self::MemoryCurator(_) => AutomationTaskV1::MemoryCurator,
@@ -196,6 +197,7 @@ pub struct AutomationRunRequestV1 {
 }
 
 impl AutomationRunRequestV1 {
+    #[hotpath::skip]
     pub const fn task_kind(&self) -> AutomationTaskV1 {
         self.task.task()
     }

@@ -21,13 +21,13 @@ use std::pin::Pin;
 use std::sync::{Arc, atomic::AtomicBool};
 
 use tracedecay_code_index::production::CodeIndexPublishedGenerationV1;
+use tracedecay_domain::errors::Result;
 use tracedecay_domain::{CodeGenerationId, ProjectId, RefId, RepositoryId, WorktreeId};
 use tracedecay_graph_db::{
     GraphDbError, GraphGenerationDependency, SealedGraphStateDigest,
     SealedReadBundleArtifactStateV1, VerifiedGraphSnapshot,
 };
 use tracedecay_runtime_core::db::Database;
-use tracedecay_runtime_core::errors::Result;
 use tracedecay_runtime_core::store_runtime::registry::CanonicalCodeGraphStoreLeaseV1;
 use tracedecay_store::{StoreRuntimeBindingV1, StoreShardIdV1};
 use tracedecay_usecases::semantic_runtime::{
@@ -43,9 +43,9 @@ pub struct CodeGraphReplayBindingV1 {
 
 /// Short-lived activation lease returned by [`CodeGraphSeatRuntimePortV1`].
 ///
-/// The serving slot keeps only [`Self::authority`]; the lease itself is dropped
-/// at the end of persistent graph activation, matching the pre-port inherent
-/// `RetainedCodeGraphRuntimeV1` lifetime.
+/// The serving slot keeps [`Self::authority`]. The activation lease may remain
+/// alive in the detached catalog-restore task so optional read artifacts never
+/// delay occurrence graph publication.
 pub trait CodeGraphSeatLeaseV1: Send {
     fn sweep_aborted_read_bundle_temporaries(&self) -> std::result::Result<(), GraphDbError>;
 
@@ -54,6 +54,11 @@ pub trait CodeGraphSeatLeaseV1: Send {
     fn publish_verified_snapshot(
         &self,
         generation: &CodeIndexPublishedGenerationV1,
+        request_cancelled: Arc<AtomicBool>,
+    ) -> std::result::Result<VerifiedGraphSnapshot, GraphDbError>;
+
+    fn recover_verified_snapshot_from_head(
+        &self,
         request_cancelled: Arc<AtomicBool>,
     ) -> std::result::Result<VerifiedGraphSnapshot, GraphDbError>;
 
@@ -92,6 +97,10 @@ pub trait CodeGraphSeatLeaseV1: Send {
 ///
 /// Object-safe so `CodeGraphActivationAuthorityV1::Persistent` can hold one
 /// `Arc<dyn …>` instead of the whole session-registry aggregate.
+/// Boxed lease future returned by [`CodeGraphSeatRuntimePortV1`].
+pub type CodeGraphSeatLeaseFutureV1<'a> =
+    Pin<Box<dyn Future<Output = Result<Box<dyn CodeGraphSeatLeaseV1 + Send>>> + Send + 'a>>;
+
 pub trait CodeGraphSeatRuntimePortV1: Send + Sync {
     fn retain_code_graph_runtime(
         &self,
@@ -103,5 +112,5 @@ pub trait CodeGraphSeatRuntimePortV1: Send + Sync {
         project_database: Arc<Database>,
         replay_binding: CodeGraphReplayBindingV1,
         decoded_generation: Option<Arc<CodeIndexPublishedGenerationV1>>,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn CodeGraphSeatLeaseV1 + Send>>> + Send + '_>>;
+    ) -> CodeGraphSeatLeaseFutureV1<'_>;
 }

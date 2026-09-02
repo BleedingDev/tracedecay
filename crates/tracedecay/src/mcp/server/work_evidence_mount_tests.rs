@@ -2,24 +2,27 @@ use std::sync::Arc;
 
 use tracedecay_application::{RequestContext, ResolvedScope};
 use tracedecay_domain::{ProjectId, RepositoryId, WorktreeId};
-use tracedecay_usecases::context::{
+use tracedecay_session_memory::context::{
     BranchId, ProfileId, ResolvedGitRoute, ResolvedSessionIdentity, SessionRootId, SessionStoreId,
 };
-use tracedecay_usecases::session::SessionTemporalQuery;
+use tracedecay_session_memory::session::SessionTemporalQuery;
 
 use super::MountedProjectApplicationRetrievalV1;
 
 struct DeniedSessionRetrieval;
 
-impl crate::daemon::session_retrieval::SessionApplicationRetrievalPortV1
+impl tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1
     for DeniedSessionRetrieval
 {
     fn retrieve_admitted<'a>(
         &'a self,
         _context: &'a RequestContext,
         _query: SessionTemporalQuery,
-    ) -> crate::daemon::session_retrieval::SessionApplicationRetrievalFutureV1<'a> {
-        Box::pin(async { crate::daemon::session_retrieval::SessionRetrievalServiceOutcome::Denied })
+    ) -> tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalFutureV1<'a>
+    {
+        Box::pin(async {
+            tracedecay_session_runtime::session_retrieval::SessionRetrievalServiceOutcome::Denied
+        })
     }
 }
 

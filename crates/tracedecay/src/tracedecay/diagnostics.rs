@@ -2,13 +2,12 @@
 //! store.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use crate::branch;
-use crate::storage::StoreLayout;
+use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_runtime_core::branch;
 use tracedecay_runtime_core::branch_meta;
 use tracedecay_runtime_core::db::Database;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_runtime_core::storage::StoreLayout;
 
 use super::TraceDecay;
 
@@ -73,6 +72,7 @@ impl TraceDecay {
     /// Reopens this project for the live git branch, returning a fresh instance
     /// bound to the correct branch DB. Use after [`branch_drifted`](Self::branch_drifted)
     /// reports drift so subsequent reads and writes target the right DB.
+    #[hotpath::skip]
     pub async fn reopen_for_current_branch(&self) -> Result<Self> {
         Self::open_with_registered_configuration(
             &self.project_root,
@@ -80,7 +80,7 @@ impl TraceDecay {
             self.store_layout.clone(),
             self.configuration_runtime.registered_database(),
             self.profile_database.clone(),
-            Arc::clone(&self.store_runtime_registry),
+            self.store_runtime_registry.clone(),
         )
         .await
     }
@@ -112,14 +112,6 @@ impl TraceDecay {
         &self.store_layout
     }
 
-    pub(crate) fn retained_store_runtime_registry(
-        &self,
-    ) -> std::sync::Arc<
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1,
-    > {
-        std::sync::Arc::clone(&self.store_runtime_registry)
-    }
-
     pub(crate) fn retained_project_store_db(&self) -> Result<Database> {
         if self.db.canonical_database_path() != self.store_layout.graph_db_path {
             return Err(TraceDecayError::Config {
@@ -133,6 +125,7 @@ impl TraceDecay {
         Ok(self.db.clone())
     }
 
+    #[hotpath::skip]
     pub async fn open_project_store_db(&self) -> Result<Database> {
         if self.read_only {
             return Err(TraceDecayError::Config {
@@ -143,6 +136,7 @@ impl TraceDecay {
         self.retained_project_store_db()
     }
 
+    #[hotpath::skip]
     pub async fn open_project_store_db_read_only(&self) -> Result<Database> {
         let database = self.retained_project_store_db()?;
         if database.is_writable() {

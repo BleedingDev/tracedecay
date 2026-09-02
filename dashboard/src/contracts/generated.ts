@@ -636,6 +636,23 @@ export type CapabilityId = z.infer<typeof CapabilityIdSchema>;
 export const CatalogGenerationIdSchema = z.string();
 export type CatalogGenerationId = z.infer<typeof CatalogGenerationIdSchema>;
 
+/** Interactive graph-serving state for the latest sealed generation.
+
+A sealed generation can expose truthful census statistics before its graph
+projection is ready to serve queries, so readiness is reported separately. */
+export const CodeGraphServingReadinessV1Schema = z.discriminatedUnion("state", [z.object({
+  state: z.literal("pending"),
+}), z.object({
+  state: z.literal("ready"),
+}), z.object({
+  reason: z.string(),
+  state: z.literal("refused"),
+}), z.object({
+  reason: z.string(),
+  state: z.literal("unavailable"),
+})]);
+export type CodeGraphServingReadinessV1 = z.infer<typeof CodeGraphServingReadinessV1Schema>;
+
 /** A typed reason an otherwise active generation cannot make durable progress. */
 export const CodeIndexBuildBlockedReasonV1Schema = z.enum(["artifact_store_unavailable", "resident_memory", "retry_backoff", "source_unavailable"]);
 export type CodeIndexBuildBlockedReasonV1 = z.infer<typeof CodeIndexBuildBlockedReasonV1Schema>;
@@ -678,11 +695,40 @@ export const CodeIndexBuildProgressV1Schema = z.object({
 });
 export type CodeIndexBuildProgressV1 = z.infer<typeof CodeIndexBuildProgressV1Schema>;
 
+/** A deterministic contract violation that parked background convergence.
+
+Parked is not dead: the worker keeps re-observing the violation on its
+ordinary wake cadence, so an operator fix (for example restoring an
+owner-private mode) is picked up on the next wake without a restart. The
+state exists so `status`, doctor, and the dashboard report the violation
+typed instead of an indefinite "warming". */
+export const CodeIndexConvergenceParkedV1Schema = z.object({
+  observed_passes: z.number().int().safe().min(0),
+  parked_at_micros: z.number().int().safe(),
+  reason: z.string(),
+  remediation: z.string(),
+  retries_on_wake: z.boolean(),
+});
+export type CodeIndexConvergenceParkedV1 = z.infer<typeof CodeIndexConvergenceParkedV1Schema>;
+
 export const CodeIndexFreshnessPayloadV1Schema = z.object({
   note: z.string(),
   worktrees: z.array(z.lazy(() => CodeIndexWorktreeFreshnessV1Schema)),
 });
 export type CodeIndexFreshnessPayloadV1 = z.infer<typeof CodeIndexFreshnessPayloadV1Schema>;
+
+/** Serving disposition of an incompatible generation during recovery. */
+export const CodeIndexGenerationRecoveryServingV1Schema = z.enum(["preserved", "refused"]);
+export type CodeIndexGenerationRecoveryServingV1 = z.infer<typeof CodeIndexGenerationRecoveryServingV1Schema>;
+
+/** Recovery state for a durable generation sealed under a different production
+owner configuration. */
+export const CodeIndexGenerationRecoveryV1Schema = z.object({
+  incompatibilities: z.array(z.string()),
+  incompatible_generation_id: z.string(),
+  serving: z.lazy(() => CodeIndexGenerationRecoveryServingV1Schema),
+});
+export type CodeIndexGenerationRecoveryV1 = z.infer<typeof CodeIndexGenerationRecoveryV1Schema>;
 
 export const CodeIndexWorkerLimitingReasonV1Schema = z.enum(["automatic_all_cores", "automatic_half_cores", "configured_exact", "environment_override", "resident_memory"]);
 export type CodeIndexWorkerLimitingReasonV1 = z.infer<typeof CodeIndexWorkerLimitingReasonV1Schema>;
@@ -723,11 +769,15 @@ export type CodeIndexWorkerStatusV1 = z.infer<typeof CodeIndexWorkerStatusV1Sche
 exactly this type back out of the daemon's `tracedecay_status` response,
 keeping one authority for the freshness shape. */
 export const CodeIndexWorktreeFreshnessV1Schema = z.object({
+  code_graph_serving: z.union([z.lazy(() => CodeGraphServingReadinessV1Schema), z.null()]).optional(),
   coverage: z.string(),
+  generation_recovery: z.union([z.lazy(() => CodeIndexGenerationRecoveryV1Schema), z.null()]).optional(),
   hook_hint_count: z.number().int().safe().min(0).nullable(),
   last_reconcile_micros: z.number().int().safe().nullable(),
   latest_generation_id: z.string().nullable(),
+  parked: z.union([z.lazy(() => CodeIndexConvergenceParkedV1Schema), z.null()]),
   progress: z.union([z.lazy(() => CodeIndexBuildProgressV1Schema), z.null()]),
+  rebuild_in_flight: z.boolean(),
   repository_id: z.string().nullable(),
   sealed_at_micros: z.number().int().safe().nullable(),
   snapshot_content_identity: z.string().nullable(),

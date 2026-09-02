@@ -127,6 +127,7 @@ impl<S> WorkArtifactHydrationService<S>
 where
     S: WorkAttemptEvidenceReadPort,
 {
+    #[hotpath::skip]
     pub const fn new(attempts: S) -> Self {
         Self { attempts }
     }

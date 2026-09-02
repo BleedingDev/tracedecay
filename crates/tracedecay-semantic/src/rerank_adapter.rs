@@ -18,15 +18,17 @@ use tracedecay_domain::{
     RetrievalRequest, SanitizedStageFailure, SymbolOccurrenceId, canonical_sha256,
 };
 use tracedecay_query::retrieval::rerank::{
-    BoundedRerankOutcomeV1, BoundedRerankRuntimeV1, DeterministicLocalRerankExecutorV1,
-    EphemeralRerankViewSourceV1, LocalRerankFailureV1, LocalRerankInputV1, LocalRerankPermitV1,
-    RerankExecutionControlV1, RerankViewOutcomeV1, RerankViewPermitV1,
+    AdmittedNativeRerankExecutorV1, BoundedRerankOutcomeV1, BoundedRerankRuntimeV1,
+    DeterministicLocalRerankExecutorV1, EphemeralRerankViewSourceV1, LocalRerankFailureV1,
+    LocalRerankInputV1, LocalRerankPermitV1, RerankExecutionControlV1, RerankViewOutcomeV1,
+    RerankViewPermitV1,
+};
+use tracedecay_semantic_contracts::{
+    ArtifactMemberRoleV1, ArtifactProfileKindV1, ModelArtifactManifestV1,
+    RerankCompatibilityPinsV1, ResourceCeilingV1,
 };
 
 use super::artifact_store::AdmittedArtifactV1;
-use super::manifest::{ArtifactMemberRoleV1, ArtifactProfileKindV1};
-use crate::RerankCompatibilityPinsV1;
-use tracedecay_query::retrieval::rerank::AdmittedNativeRerankExecutorV1;
 
 pub const RERANK_IMPLEMENTATION_REVISION_V1: &str = "rerank.fastembed.production.v1";
 pub const RERANK_RUNTIME_DIGEST_DOMAIN_V1: &str = "tracedecay.rerank-runtime-compatibility.v1";
@@ -82,9 +84,9 @@ impl AdmittedRerankArtifactV1 {
 }
 
 pub fn validate_reranker_manifest_pins(
-    manifest: &super::manifest::ModelArtifactManifestV1,
+    manifest: &ModelArtifactManifestV1,
     pins: &RerankCompatibilityPinsV1,
-) -> Result<super::manifest::ResourceCeilingV1, RerankArtifactAdmissionErrorV1> {
+) -> Result<ResourceCeilingV1, RerankArtifactAdmissionErrorV1> {
     let payload = &manifest.payload;
     manifest
         .validate()
@@ -201,9 +203,9 @@ impl DeterministicLocalRerankExecutorV1 for FastEmbedRerankExecutorV1 {
             }));
         }
         run_session(
-            session
-                .as_mut()
-                .unwrap_or_else(|| panic!("rerank session initialized above")),
+            session.as_mut().ok_or(LocalRerankFailureV1::Unavailable(
+                SanitizedStageFailure::Internal,
+            ))?,
             query,
             &documents,
             inputs,
@@ -431,10 +433,15 @@ pub fn resolve_generation_chunk<'a>(
     // The generation chunk manifest is canonically ordered by typed chunk
     // identity. Selecting its first exact symbol binding matches the graph
     // projection's canonical representative without reparsing mutable files.
-    generation.chunks().chunks().iter().find(|chunk| {
-        chunk.anchor.generation_id == generation.manifest().generation_id
-            && chunk.anchor.symbol_occurrence_id.as_ref() == Some(&symbol)
-    })
+    generation
+        .chunks()
+        .chunks()
+        .iter()
+        .find(|chunk| {
+            chunk.anchor.generation_id == generation.manifest().generation_id
+                && chunk.anchor.symbol_occurrence_id.as_ref() == Some(&symbol)
+        })
+        .map(Arc::as_ref)
 }
 
 fn encode_view(query: &[u8], document: &str) -> Vec<u8> {

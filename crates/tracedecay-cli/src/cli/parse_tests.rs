@@ -2,7 +2,7 @@ use super::{
     AutomationAction, AutomationConfigAction, AutomationConfigScope, AutomationRunsAction,
     AutomationSkillsAction, BranchAction, Cli, Commands, DaemonAction, FeedbackRollbackAction,
     HostBundleAction, LspAction, MemoryAction, PackageHookAction, ProfileStorageAction,
-    RemoteAction, ScoopPackageHookAction, SessionsAction, SessionsRefreshAction,
+    RemoteAction, ScoopPackageHookAction, SemanticAction, SessionsAction, SessionsRefreshAction,
 };
 use clap::{Parser, error::ErrorKind};
 
@@ -106,6 +106,57 @@ fn tool_command_preserves_trailing_help_and_reserved_args() {
                         "@payload.json".to_string(),
                     ]
     ));
+}
+
+#[test]
+fn semantic_activate_parses_with_defaults_and_explicit_selection() {
+    let cli = Cli::try_parse_from(["tracedecay", "semantic", "activate"])
+        .expect("bare semantic activate should parse");
+    let Some(Commands::Semantic {
+        action:
+            SemanticAction::Activate {
+                profile,
+                no_rollback,
+                project,
+                json,
+            },
+    }) = cli.command
+    else {
+        panic!("unexpected Semantic command");
+    };
+    assert_eq!(profile, "hybrid-conservative");
+    assert!(!no_rollback);
+    assert_eq!(project, None);
+    assert!(!json);
+
+    let cli = Cli::try_parse_from([
+        "tracedecay",
+        "semantic",
+        "activate",
+        "--profile",
+        "hybrid-conservative",
+        "--no-rollback",
+        "--project",
+        "/tmp/project",
+        "--json",
+    ])
+    .expect("explicit semantic activate should parse");
+    let Some(Commands::Semantic {
+        action:
+            SemanticAction::Activate {
+                profile,
+                no_rollback,
+                project,
+                json,
+            },
+    }) = cli.command
+    else {
+        panic!("unexpected Semantic command");
+    };
+    assert_eq!(profile, "hybrid-conservative");
+    assert!(no_rollback);
+    assert_eq!(project.as_deref(), Some("/tmp/project"));
+    assert!(json);
 }
 
 #[test]
@@ -1677,6 +1728,26 @@ fn parses_sessions_import_and_search_commands() {
             && args.message_type == "direct_user"
             && args.parent_session_id.as_deref() == Some("parent-1")
     ));
+}
+
+/// `--json` is not a sessions-search flag. Clap must reject it at parse
+/// time; a hang after the usage error is a process-lifetime defect, not
+/// this check.
+#[test]
+fn sessions_search_rejects_json_at_parse() {
+    let error = match Cli::try_parse_from([
+        "tracedecay",
+        "sessions",
+        "search",
+        "tracedecay",
+        "--limit",
+        "3",
+        "--json",
+    ]) {
+        Ok(_) => panic!("sessions search does not accept --json"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::UnknownArgument);
 }
 
 #[test]

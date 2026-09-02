@@ -111,6 +111,7 @@ impl OpenedDatabaseFile {
         Ok(Self { file, identity })
     }
 
+    #[hotpath::skip]
     pub(crate) const fn identity(&self) -> u64 {
         self.identity
     }

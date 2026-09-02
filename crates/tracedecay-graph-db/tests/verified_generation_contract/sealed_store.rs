@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use tracedecay_graph_db::{GraphTraversalDirection, TraversalRequest};
+use tracedecay_graph_db::{GraphTraversalDirection, GraphVector, TraversalRequest, VectorMetric};
 
 use super::*;
 
@@ -227,10 +227,11 @@ fn seal_builds_compact_store_while_second_generation_stages_and_seals() {
     assert_snapshot_reads(&g1_commit.snapshot, &identity, "one");
 }
 
-/// Rows carrying Bytes properties seal in replay form (the pinned engine's
-/// columnar Dict codec does not round-trip Bytes) and still read exactly.
+/// Small generations carrying Bytes properties stay in replay form and still
+/// read exactly. Eager compact construction is reserved for generations above
+/// the measured size threshold where its publication cost can be amortized.
 #[test]
-fn bytes_rows_seal_in_replay_form_and_read_exactly() {
+fn small_bytes_rows_seal_in_replay_form_and_read_exactly() {
     let temp = TempDir::new().unwrap();
     let registered = RegisteredGraph::new_mounted(temp.path()).unwrap();
     let mut authority = RelationalAuthority::default();
@@ -263,7 +264,7 @@ fn bytes_rows_seal_in_replay_form_and_read_exactly() {
         .expect("seal must write the artifact receipt");
     assert!(
         receipt.contains("\"form\": \"replay\""),
-        "Bytes rows must seal in replay form on the pinned engine: {receipt}"
+        "small Bytes generations must not pay eager compact construction: {receipt}"
     );
     assert_snapshot_reads(&commit.snapshot, &identity, "payload");
     let entity = commit
@@ -279,6 +280,62 @@ fn bytes_rows_seal_in_replay_form_and_read_exactly() {
             .properties
             .get(&GraphPropertyName::new("record").unwrap()),
         Some(&GraphProperty::Bytes(payload)),
+    );
+}
+
+/// Rows carrying Vector properties seal in replay form: the sealed lane never
+/// serves vector search, so compacting these rows buys nothing, and
+/// mixed-dimension vectors still fall back to a lossy display dictionary.
+#[test]
+fn vector_rows_seal_in_replay_form_and_read_exactly() {
+    let temp = TempDir::new().unwrap();
+    let registered = RegisteredGraph::new_mounted(temp.path()).unwrap();
+    let mut authority = RelationalAuthority::default();
+    let identity = projection("sealed-store:vectors", "code");
+
+    let mut g1 = rich_manifest(identity.clone(), "vectors-g1", "payload");
+    let vector = GraphVector::new(vec![0.25_f32, -0.5, 0.75], 3, VectorMetric::Cosine).unwrap();
+    for entity in &mut g1.entities {
+        entity.properties.insert(
+            GraphPropertyName::new("embedding").unwrap(),
+            GraphProperty::Vector(vector.clone()),
+        );
+    }
+    let record = stage_manifest(
+        &mut authority,
+        &registered.binding,
+        &g1,
+        "publish:vectors-g1",
+        None,
+        '4',
+    );
+    let commit = publish(
+        &registered,
+        temp.path(),
+        &mut authority,
+        &record.publication.key,
+    );
+    assert!(commit.snapshot.serves_from_sealed_store());
+    let receipt = receipt_for_generation(temp.path(), "vectors-g1")
+        .expect("seal must write the artifact receipt");
+    assert!(
+        receipt.contains("\"form\": \"replay\""),
+        "vector rows must seal in replay form on the pinned engine: {receipt}"
+    );
+    assert_snapshot_reads(&commit.snapshot, &identity, "payload");
+    let entity = commit
+        .snapshot
+        .entity(
+            &GraphEntityRef::new(identity.clone(), GraphEntityId::new("entity:b").unwrap()),
+            Arc::new(TestCancellation),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        entity
+            .properties
+            .get(&GraphPropertyName::new("embedding").unwrap()),
+        Some(&GraphProperty::Vector(vector)),
     );
 }
 
@@ -439,6 +496,58 @@ fn restart_recovery_adopts_or_discards_the_on_disk_artifact() {
     assert_snapshot_reads(&snapshot, &identity, "durable");
 }
 
+/// Replaying an already-linearized publication is activation, not a new seal:
+/// if an older installation has no derived sealed artifact, seating its
+/// verified staging rows must not copy and compact the whole generation before
+/// those rows can serve.
+#[test]
+fn historical_replay_does_not_rebuild_a_missing_sealed_artifact() {
+    let temp = TempDir::new().unwrap();
+    let registered = RegisteredGraph::new_mounted(temp.path()).unwrap();
+    let mut authority = RelationalAuthority::default();
+    let identity = projection("sealed-store:historical-replay", "code");
+
+    let g1 = rich_manifest(identity.clone(), "historical-g1", "durable");
+    let record = stage_manifest(
+        &mut authority,
+        &registered.binding,
+        &g1,
+        "publish:historical-g1",
+        None,
+        '7',
+    );
+    let commit = publish(
+        &registered,
+        temp.path(),
+        &mut authority,
+        &record.publication.key,
+    );
+    assert!(commit.snapshot.serves_from_sealed_store());
+    drop(commit);
+    assert!(registered.close().unwrap());
+    drop(registered);
+
+    std::fs::remove_dir_all(sealed_store_root(temp.path())).unwrap();
+    std::fs::remove_file(support::graph_path(temp.path()).with_extension("verified")).unwrap();
+    let registered = RegisteredGraph::new_mounted(temp.path()).unwrap();
+    let replayed = publish(
+        &registered,
+        temp.path(),
+        &mut authority,
+        &record.publication.key,
+    );
+
+    assert!(
+        !replayed.snapshot.serves_from_sealed_store(),
+        "historical activation must serve verified staging rows without an eager sealed copy"
+    );
+    assert!(
+        receipt_for_generation(temp.path(), "historical-g1").is_none(),
+        "historical activation rebuilt the missing sealed artifact"
+    );
+    assert_snapshot_reads(&replayed.snapshot, &identity, "durable");
+}
+
 /// Retiring a sealed code generation deletes its artifact directory while the
 /// successor's artifact stays.
 #[test]
@@ -534,6 +643,153 @@ fn retirement_deletes_the_superseded_sealed_artifact() {
     assert!(
         receipt_for_generation(temp.path(), "retire-g2").is_some(),
         "the successor's sealed artifact must stay"
+    );
+}
+
+/// A live direct-sealed reader (recovered through
+/// `recover_verified_sealed_snapshot`, which bypasses the staging database's
+/// verified-generation state) must gate retirement of its generation exactly
+/// like an ordinary live snapshot; retirement proceeds once it drops.
+#[test]
+fn retirement_waits_for_a_live_direct_sealed_reader() {
+    let temp = TempDir::new().unwrap();
+    let registered = RegisteredGraph::new_mounted(temp.path()).unwrap();
+    let mut authority = RelationalAuthority::default();
+    let identity = projection("sealed-store:reader-gate", "code");
+    let sealed_generation = CodeGenerationId::new("code-generation.sealed-reader-gate").unwrap();
+    let sealed_digest =
+        SealedGraphStateDigest::try_from(format!("sha256:{}", "9".repeat(64))).unwrap();
+
+    let g1 = rich_manifest(identity.clone(), "gate-g1", "old");
+    let g1_record = stage_manifest(
+        &mut authority,
+        &registered.binding,
+        &g1,
+        "publish:gate-g1",
+        None,
+        '7',
+    );
+    let g1_commit = publish(
+        &registered,
+        temp.path(),
+        &mut authority,
+        &g1_record.publication.key,
+    );
+    let g1_head = g1_commit.head.clone();
+    drop(g1_commit);
+    // Rewrite the journal row as a sealed code generation replay so both the
+    // direct-sealed recovery and the production retirement path own it.
+    let sealed_publication = g1
+        .relational_sealed_replay(
+            registered.binding.shard_id.clone(),
+            GraphIdempotencyKey::new("publish:gate-g1").unwrap(),
+            digest('7'),
+            None,
+            SealedCodeGenerationReplay {
+                repository: RepositoryId::new("repository.sealed-reader-gate").unwrap(),
+                generation: sealed_generation.clone(),
+                sealed_state_digest: sealed_digest.clone(),
+                projector_revision: GraphProjectorRevision::try_from(
+                    "projector.sealed-reader-gate".to_owned(),
+                )
+                .unwrap(),
+            },
+            &|| Ok(()),
+        )
+        .unwrap();
+    let rewritten =
+        GraphPublicationReplayRecordV1::new(g1_record.sequence, sealed_publication).unwrap();
+    let rewritten_head =
+        GraphVerifiedHeadV1::from_replay(&rewritten, g1_head.recovered_digest.clone()).unwrap();
+    authority
+        .records
+        .insert(g1_record.publication.key.clone(), rewritten);
+    authority.heads.insert(
+        g1_record.publication.key.projection.clone(),
+        rewritten_head.clone(),
+    );
+
+    // Direct-sealed recovery serves cold starts: the staging shard is closed,
+    // so the sealed artifact is the only open handle on this generation.
+    assert!(
+        registered
+            .registry
+            .close(&registration(registered.binding.clone(), temp.path()))
+            .unwrap(),
+        "the publishing runtime must close before cold direct recovery"
+    );
+    let (control, probe) = control_and_probe();
+    let context = GraphPublicationOperationContextV1::new(&control, &probe).unwrap();
+    let reader = registered
+        .registry
+        .recover_verified_sealed_snapshot(
+            registration(registered.binding.clone(), temp.path()),
+            &mut authority,
+            &context,
+            &g1_record.publication.key.projection,
+        )
+        .expect("direct-sealed recovery of the g1 head");
+    assert_eq!(reader.generation(), &g1.generation);
+
+    // The staging runtime comes back while the direct-sealed reader is live —
+    // the successor generation publishes through it.
+    registered.mount().unwrap();
+    let g2 = rich_manifest(identity.clone(), "gate-g2", "new");
+    let g2_record = stage_manifest(
+        &mut authority,
+        &registered.binding,
+        &g2,
+        "publish:gate-g2",
+        Some(rewritten_head),
+        '8',
+    );
+    let g2_commit = publish(
+        &registered,
+        temp.path(),
+        &mut authority,
+        &g2_record.publication.key,
+    );
+    drop(g2_commit);
+    assert!(receipt_for_generation(temp.path(), "gate-g1").is_some());
+
+    assert!(
+        matches!(
+            registered
+                .registry
+                .retire_one_code_generation_replay(
+                    registration(registered.binding.clone(), temp.path()),
+                    &mut authority,
+                    &context,
+                    &sealed_generation,
+                    &sealed_digest,
+                )
+                .unwrap(),
+            GraphReplayCollectionOutcome::Retained
+        ),
+        "a live direct-sealed reader must retain its generation"
+    );
+    assert!(
+        receipt_for_generation(temp.path(), "gate-g1").is_some(),
+        "the sealed artifact must survive while the direct-sealed reader lives"
+    );
+
+    drop(reader);
+    assert!(matches!(
+        registered
+            .registry
+            .retire_one_code_generation_replay(
+                registration(registered.binding.clone(), temp.path()),
+                &mut authority,
+                &context,
+                &sealed_generation,
+                &sealed_digest,
+            )
+            .unwrap(),
+        GraphReplayCollectionOutcome::Retired(_)
+    ));
+    assert!(
+        receipt_for_generation(temp.path(), "gate-g1").is_none(),
+        "retirement must delete the artifact once the reader drops"
     );
 }
 

@@ -9,6 +9,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
+use tracedecay_semantic_contracts::{
+    DEFAULT_FASTEMBED_MODEL_ID, SemanticConfig, SemanticProfileSelection,
+};
 
 struct EnvRestore {
     key: &'static str,
@@ -268,6 +271,10 @@ fn sync_config_defaults_round_trip() {
         !parsed.sync.auto_watch,
         "filesystem metadata watching is an explicit opt-in fallback"
     );
+    assert!(
+        !parsed.sync.watch_linked_worktrees,
+        "linked worktree watching requires explicit project opt-in"
+    );
     assert_eq!(parsed.sync.watch_debounce_ms, 2000);
     assert_eq!(parsed.sync.full_sync_escalation_files, 500);
     assert_eq!(parsed.sync.max_concurrent_syncs, 2);
@@ -277,18 +284,18 @@ fn sync_config_defaults_round_trip() {
 #[test]
 fn semantic_config_defaults_to_offline_healthy_baseline() {
     let config = TraceDecayConfig::default();
-    assert_eq!(config.semantic, super::SemanticConfig::default());
+    assert_eq!(config.semantic, SemanticConfig::default());
     assert_eq!(
         config.semantic.selected_model.as_deref(),
-        Some(super::DEFAULT_FASTEMBED_MODEL_ID)
+        Some(DEFAULT_FASTEMBED_MODEL_ID)
     );
     assert!(config.semantic.auto_download);
     assert!(config.semantic.active_profile.is_none());
     assert!(config.semantic.rollback_profile.is_none());
     assert!(config.semantic.validate().is_ok());
-    let catalog = crate::semantic_code::production_fastembed_catalog();
+    let catalog = tracedecay_semantic::production_fastembed_catalog();
     let model = catalog
-        .get(super::DEFAULT_FASTEMBED_MODEL_ID)
+        .get(DEFAULT_FASTEMBED_MODEL_ID)
         .expect("default semantic model is cataloged");
     let model_bytes = model.members.get("model").expect("model member").length;
     assert!(config.semantic.resources.max_model_bytes >= model_bytes);
@@ -309,7 +316,7 @@ fn semantic_config_defaults_to_offline_healthy_baseline() {
 
 #[test]
 fn semantic_config_rejects_uncataloged_model_ids() {
-    let mut semantic = super::SemanticConfig {
+    let mut semantic = SemanticConfig {
         selected_model: Some("NotInCatalog".to_owned()),
         ..Default::default()
     };
@@ -320,7 +327,7 @@ fn semantic_config_rejects_uncataloged_model_ids() {
 
 #[test]
 fn semantic_config_accepts_only_explicit_local_installed_profiles() {
-    let local = super::SemanticProfileSelection {
+    let local = SemanticProfileSelection {
         profile_id: "code-embedding.v1".to_owned(),
         accepted_profile_digest: tracedecay_domain::ManifestDigest::new(format!(
             "sha256:{}",
@@ -330,9 +337,9 @@ fn semantic_config_accepts_only_explicit_local_installed_profiles() {
         artifact_digest: "a".repeat(64),
         artifact_path: std::path::PathBuf::from("/var/lib/tracedecay/models/code-embedding"),
     };
-    let mut semantic = super::SemanticConfig {
+    let mut semantic = SemanticConfig {
         active_profile: Some(local.clone()),
-        rollback_profile: Some(super::SemanticProfileSelection {
+        rollback_profile: Some(SemanticProfileSelection {
             profile_id: "code-embedding.previous".to_owned(),
             accepted_profile_digest: tracedecay_domain::ManifestDigest::new(format!(
                 "sha256:{}",
@@ -344,7 +351,7 @@ fn semantic_config_accepts_only_explicit_local_installed_profiles() {
                 "/var/lib/tracedecay/models/code-embedding-previous",
             ),
         }),
-        ..super::SemanticConfig::default()
+        ..SemanticConfig::default()
     };
     assert!(semantic.validate().is_ok());
 
@@ -364,11 +371,11 @@ fn semantic_config_accepts_only_explicit_local_installed_profiles() {
 
 #[test]
 fn semantic_resource_ceilings_reject_zero_or_incoherent_limits() {
-    let mut semantic = super::SemanticConfig::default();
+    let mut semantic = SemanticConfig::default();
     semantic.resources.max_threads = 0;
     assert!(semantic.validate().is_err());
 
-    semantic = super::SemanticConfig::default();
+    semantic = SemanticConfig::default();
     semantic.resources.max_model_bytes = semantic.resources.max_resident_bytes + 1;
     assert!(semantic.validate().is_err());
 }
@@ -568,6 +575,7 @@ fn partial_sync_table_fills_missing_fields_with_defaults() {
     }"#;
     let parsed: TraceDecayConfig = serde_json::from_str(json).unwrap();
     assert!(!parsed.sync.auto_watch);
+    assert!(!parsed.sync.watch_linked_worktrees);
     assert_eq!(parsed.sync.backstop_interval_mins, 99);
     // Untouched fields keep their defaults.
     assert_eq!(parsed.sync.watch_debounce_ms, 2000);
@@ -646,12 +654,14 @@ fn pr_autotrack_env_overrides() {
 fn sync_config_env_overrides_bool_and_int() {
     let _lock = lock_user_data_dir_test_env();
     let _watch = EnvRestore::set("TRACEDECAY_SYNC_AUTO_WATCH", "false");
+    let _linked = EnvRestore::set("TRACEDECAY_SYNC_WATCH_LINKED_WORKTREES", "true");
     let _debounce = EnvRestore::set("TRACEDECAY_SYNC_WATCH_DEBOUNCE_MS", "5000");
     // Unparsable ints/bools are ignored (field keeps its base value).
     let _bad = EnvRestore::set("TRACEDECAY_SYNC_MAX_CONCURRENT_SYNCS", "not-a-number");
 
     let overridden = super::SyncConfig::default().with_env_overrides();
     assert!(!overridden.auto_watch);
+    assert!(overridden.watch_linked_worktrees);
     assert_eq!(overridden.watch_debounce_ms, 5000);
     assert_eq!(
         overridden.max_concurrent_syncs,
@@ -674,7 +684,7 @@ fn implicit_discovery_never_selects_the_user_profile_root() {
 #[tokio::test]
 async fn discover_project_root_with_identity_does_not_open_registry_only_store() {
     let _profile = super::PinnedUserDataDir::new();
-    let profile_root = crate::storage::default_profile_root().unwrap();
+    let profile_root = tracedecay_runtime_core::storage::default_profile_root().unwrap();
 
     let gdb = crate::host_admission::HostAdmissionTestRuntimeV1::profile(&profile_root)
         .await
@@ -700,12 +710,12 @@ async fn discover_project_root_with_identity_does_not_open_registry_only_store()
     .await
     .unwrap();
 
-    let layout = crate::storage::profile_sharded_layout(
+    let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
         &project_root,
         &profile_root,
-        &crate::storage::EnrollmentMarker {
+        &tracedecay_runtime_core::storage::EnrollmentMarker {
             project_id: project_id.to_string(),
-            storage_mode: crate::storage::StorageMode::ProfileSharded,
+            storage_mode: tracedecay_runtime_core::storage::StorageMode::ProfileSharded,
         },
     )
     .unwrap();
@@ -752,7 +762,7 @@ async fn discover_project_root_with_identity_does_not_open_registry_only_store()
 #[tokio::test]
 async fn config_path_with_identity_does_not_open_registry_without_enrollment() {
     let _profile = super::PinnedUserDataDir::new();
-    let profile_root = crate::storage::default_profile_root().unwrap();
+    let profile_root = tracedecay_runtime_core::storage::default_profile_root().unwrap();
     let gdb = crate::host_admission::HostAdmissionTestRuntimeV1::profile(&profile_root)
         .await
         .unwrap();
@@ -789,12 +799,12 @@ async fn config_path_with_identity_does_not_open_registry_without_enrollment() {
     })
     .await
     .unwrap();
-    let identity_layout = crate::storage::profile_sharded_layout(
+    let identity_layout = tracedecay_runtime_core::storage::profile_sharded_layout(
         &project_root,
         &profile_root,
-        &crate::storage::EnrollmentMarker {
+        &tracedecay_runtime_core::storage::EnrollmentMarker {
             project_id: project_id.to_string(),
-            storage_mode: crate::storage::StorageMode::ProfileSharded,
+            storage_mode: tracedecay_runtime_core::storage::StorageMode::ProfileSharded,
         },
     )
     .unwrap();
@@ -823,7 +833,7 @@ async fn config_path_with_identity_does_not_open_registry_without_enrollment() {
 #[tokio::test]
 async fn discover_project_root_with_identity_does_not_bind_non_git_child_to_parent_store() {
     let _profile = super::PinnedUserDataDir::new();
-    let profile_root = crate::storage::default_profile_root().unwrap();
+    let profile_root = tracedecay_runtime_core::storage::default_profile_root().unwrap();
     let gdb = crate::host_admission::HostAdmissionTestRuntimeV1::profile(&profile_root)
         .await
         .unwrap();
@@ -846,12 +856,12 @@ async fn discover_project_root_with_identity_does_not_bind_non_git_child_to_pare
     })
     .await
     .unwrap();
-    let layout = crate::storage::profile_sharded_layout(
+    let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
         &parent_root,
         &profile_root,
-        &crate::storage::EnrollmentMarker {
+        &tracedecay_runtime_core::storage::EnrollmentMarker {
             project_id: project_id.to_string(),
-            storage_mode: crate::storage::StorageMode::ProfileSharded,
+            storage_mode: tracedecay_runtime_core::storage::StorageMode::ProfileSharded,
         },
     )
     .unwrap();
@@ -972,230 +982,6 @@ fn default_excludes_still_catch_target_and_worktrees() {
     assert!(is_excluded("bin/cli.js", &config));
 }
 
-// ---------------------------------------------------------------------------
-// Topology policy resolution
-//
-// The sole resolver produces the pinned snapshot and src/config/topology.rs
-// extracts its one complete work-topology policy, failing closed on every
-// invalid or unsupported combination without adapter-local defaults.
-// ---------------------------------------------------------------------------
-
-mod topology_resolution {
-    use std::collections::BTreeMap;
-
-    use tracedecay_domain::configuration::{
-        BranchTopologyKindV1, ConfigurationLayerIdV1, ConfigurationSnapshotV1,
-        ConfigurationValueKindV1, ConfigurationValueV1, RestartRequirementV1, SettingKey,
-        SettingScopeV1, SettingSensitivityV1, WORK_TOPOLOGY_POLICY_SETTING_KEY,
-        WorkTopologyPolicyV1, safe_work_topology_policy_v1,
-    };
-    use tracedecay_domain::{ManifestDigest, ProjectId, UserProfileId};
-
-    use crate::config::registry::ConfigurationRegistry;
-    use crate::config::resolver::{ConfigurationLayerV1, resolve_configuration};
-    use crate::config::topology::{
-        TopologyConfigurationError, resolved_work_topology_policy,
-        safe_default_work_topology_policy,
-    };
-
-    fn id<T>(value: &str) -> T
-    where
-        T: TryFrom<String>,
-        <T as TryFrom<String>>::Error: std::fmt::Debug,
-    {
-        T::try_from(value.to_owned()).expect("fixture id is canonical")
-    }
-
-    fn topology_key() -> SettingKey {
-        SettingKey::new(WORK_TOPOLOGY_POLICY_SETTING_KEY).unwrap()
-    }
-
-    fn project_layer(policy: WorkTopologyPolicyV1) -> ConfigurationLayerV1 {
-        ConfigurationLayerV1 {
-            layer: ConfigurationLayerIdV1::Project {
-                project_id: id::<ProjectId>("project.fixture"),
-            },
-            revision_id: id("revision.project.1"),
-            entries: BTreeMap::from([(
-                topology_key(),
-                ConfigurationValueV1::WorkTopologyPolicy(Box::new(policy)),
-            )]),
-        }
-    }
-
-    #[test]
-    fn registry_default_is_the_domain_safe_default() {
-        let registry = ConfigurationRegistry::core().unwrap();
-        let definition = registry.definition(&topology_key()).unwrap();
-        assert_eq!(
-            definition.value_kind,
-            ConfigurationValueKindV1::WorkTopologyPolicy
-        );
-        assert_eq!(definition.sensitivity, SettingSensitivityV1::Sensitive);
-        assert_eq!(definition.scope, SettingScopeV1::Project);
-        assert_eq!(
-            definition.restart_requirement,
-            RestartRequirementV1::DaemonRestart
-        );
-        let ConfigurationValueV1::WorkTopologyPolicy(default) = &definition.default_value else {
-            panic!("registry default must be a typed topology policy");
-        };
-        let safe = safe_work_topology_policy_v1();
-        assert_eq!(**default, safe);
-        assert_eq!(
-            default.compute_digest().unwrap(),
-            safe.compute_digest().unwrap()
-        );
-    }
-
-    #[test]
-    fn resolves_safe_default_when_no_layer_overrides() {
-        let registry = ConfigurationRegistry::core().unwrap();
-        let snapshot = resolve_configuration(&registry, &[]).unwrap().snapshot;
-        let resolved = resolved_work_topology_policy(&snapshot).unwrap();
-        let safe = safe_default_work_topology_policy();
-        assert_eq!(*resolved, safe);
-        assert_eq!(
-            resolved.compute_digest().unwrap(),
-            safe.compute_digest().unwrap()
-        );
-    }
-
-    #[test]
-    fn project_layer_override_wins_with_its_own_digest() {
-        let registry = ConfigurationRegistry::core().unwrap();
-        let mut replacement = safe_work_topology_policy_v1();
-        replacement
-            .branch_topology
-            .allowed
-            .insert(BranchTopologyKindV1::LocalStack);
-        replacement.validate().unwrap();
-
-        let resolution =
-            resolve_configuration(&registry, &[project_layer(replacement.clone())]).unwrap();
-        let resolved = resolved_work_topology_policy(&resolution.snapshot).unwrap();
-        assert_eq!(*resolved, replacement);
-        assert_ne!(*resolved, safe_work_topology_policy_v1());
-        assert_eq!(
-            resolved.compute_digest().unwrap(),
-            replacement.compute_digest().unwrap()
-        );
-
-        // The behavior digest changes with the override even though the
-        // resolution path is identical.
-        let baseline = resolve_configuration(&registry, &[]).unwrap();
-        let moved = resolve_configuration(&registry, &[project_layer(replacement)]).unwrap();
-        assert_ne!(
-            baseline.snapshot.effective_behavior_digest,
-            moved.snapshot.effective_behavior_digest
-        );
-    }
-
-    #[test]
-    fn user_profile_layer_cannot_override_project_scoped_topology() {
-        let registry = ConfigurationRegistry::core().unwrap();
-        let layer = ConfigurationLayerV1 {
-            layer: ConfigurationLayerIdV1::UserProfile {
-                profile_id: id::<UserProfileId>("profile.fixture"),
-            },
-            revision_id: id("revision.profile.1"),
-            entries: BTreeMap::from([(
-                topology_key(),
-                ConfigurationValueV1::WorkTopologyPolicy(Box::new(safe_work_topology_policy_v1())),
-            )]),
-        };
-        assert!(resolve_configuration(&registry, &[layer]).is_err());
-    }
-
-    #[test]
-    fn reserved_default_layer_injection_is_rejected() {
-        let registry = ConfigurationRegistry::core().unwrap();
-        let layer = ConfigurationLayerV1 {
-            layer: ConfigurationLayerIdV1::Default,
-            revision_id: id("revision.adapter.default"),
-            entries: BTreeMap::from([(
-                topology_key(),
-                ConfigurationValueV1::WorkTopologyPolicy(Box::new(safe_work_topology_policy_v1())),
-            )]),
-        };
-        assert!(resolve_configuration(&registry, &[layer]).is_err());
-    }
-
-    #[test]
-    fn wrong_value_kind_fails_closed() {
-        let registry = ConfigurationRegistry::core().unwrap();
-        let layer = ConfigurationLayerV1 {
-            layer: ConfigurationLayerIdV1::Project {
-                project_id: id::<ProjectId>("project.fixture"),
-            },
-            revision_id: id("revision.project.1"),
-            entries: BTreeMap::from([(
-                topology_key(),
-                ConfigurationValueV1::Text("permissive".to_owned()),
-            )]),
-        };
-        assert!(resolve_configuration(&registry, &[layer]).is_err());
-    }
-
-    #[test]
-    fn invalid_or_unsupported_policy_in_layer_fails_closed() {
-        let registry = ConfigurationRegistry::core().unwrap();
-
-        // No protected-ref rules at all.
-        let mut unprotected = safe_work_topology_policy_v1();
-        unprotected.protected_refs.clear();
-        assert!(resolve_configuration(&registry, &[project_layer(unprotected)]).is_err());
-
-        // Unsupported schema version.
-        let mut future = safe_work_topology_policy_v1();
-        future.schema_version = 2;
-        assert!(resolve_configuration(&registry, &[project_layer(future)]).is_err());
-    }
-
-    #[test]
-    fn snapshot_resolution_requires_the_typed_policy_value() {
-        // Missing key fails closed rather than inventing a default.
-        let empty = ConfigurationSnapshotV1::new(BTreeMap::new(), BTreeMap::new()).unwrap();
-        assert!(matches!(
-            resolved_work_topology_policy(&empty),
-            Err(TopologyConfigurationError::MissingTopologyPolicy)
-        ));
-
-        // A mistyped value at the topology key fails closed.
-        let registry = ConfigurationRegistry::core().unwrap();
-        let default_candidate = resolve_configuration(&registry, &[])
-            .unwrap()
-            .settings
-            .get(&topology_key())
-            .unwrap()
-            .candidates
-            .first()
-            .unwrap()
-            .clone();
-        let mistyped = ConfigurationSnapshotV1::new(
-            BTreeMap::from([(
-                topology_key(),
-                ConfigurationValueV1::Text("permissive".to_owned()),
-            )]),
-            BTreeMap::from([(topology_key(), vec![default_candidate])]),
-        )
-        .unwrap();
-        assert!(matches!(
-            resolved_work_topology_policy(&mistyped),
-            Err(TopologyConfigurationError::WrongTopologyValue)
-        ));
-
-        // A tampered snapshot identity fails closed before the value is read.
-        let mut snapshot = resolve_configuration(&registry, &[]).unwrap().snapshot;
-        snapshot.effective_behavior_digest =
-            ManifestDigest::new(format!("sha256:{}", "0".repeat(64))).unwrap();
-        assert!(matches!(
-            resolved_work_topology_policy(&snapshot),
-            Err(TopologyConfigurationError::Domain(_))
-        ));
-    }
-}
-
 mod runtime_configuration_cutover {
     #[cfg(unix)]
     use std::process::Command;
@@ -1223,7 +1009,7 @@ mod runtime_configuration_cutover {
         runtime_configuration_for_layout,
     };
     use crate::host_admission::HostAdmissionTestRuntimeV1;
-    use tracedecay_usecases::configuration::{
+    use tracedecay_configuration::{
         ConfigurationControlStore, ConfigurationMutationAuthority, DirectConfigurationMutation,
         ProjectConfigurationRuntime,
     };
@@ -1356,13 +1142,17 @@ mod runtime_configuration_cutover {
         let _profile = crate::config::PinnedUserDataDir::new();
         let root = TempDir::new().expect("temporary project root");
         let project_id = project_id("project.configuration-runtime-drift");
-        crate::storage::pin_fixture_repository_identity(root.path(), project_id.as_str())
-            .expect("write enrollment marker");
-        let layout = crate::storage::resolve_layout_for_current_profile(root.path())
-            .expect("resolve store layout");
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            root.path(),
+            project_id.as_str(),
+        )
+        .expect("write enrollment marker");
+        let layout =
+            tracedecay_runtime_core::storage::resolve_layout_for_current_profile(root.path())
+                .expect("resolve store layout");
         std::fs::create_dir_all(&layout.data_root).expect("create data root");
         let host_runtime = HostAdmissionTestRuntimeV1::project(
-            crate::storage::default_profile_root().unwrap(),
+            tracedecay_runtime_core::storage::default_profile_root().unwrap(),
             root.path(),
             project_id.clone(),
         )
@@ -1374,7 +1164,7 @@ mod runtime_configuration_cutover {
         crate::config::install_usecase_runtime_configuration_authority()
             .expect("install the root runtime configuration authority");
         let opened =
-            tracedecay_usecases::config::open_runtime_configuration_for_registered_database(
+            tracedecay_configuration::config::open_runtime_configuration_for_registered_database(
                 root.path(),
                 &layout,
                 database,
@@ -1433,13 +1223,14 @@ mod runtime_configuration_cutover {
     async fn ensure_runtime_configuration_persists_initial_resolution_when_cache_is_empty() {
         let _profile = crate::config::PinnedUserDataDir::new();
         let root = TempDir::new().expect("temporary project root");
-        crate::storage::pin_fixture_repository_identity(
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
             root.path(),
             "proj_ensure_runtime_bootstrap",
         )
         .expect("write enrollment marker");
-        let layout = crate::storage::resolve_layout_for_current_profile(root.path())
-            .expect("resolve store layout");
+        let layout =
+            tracedecay_runtime_core::storage::resolve_layout_for_current_profile(root.path())
+                .expect("resolve store layout");
         std::fs::create_dir_all(&layout.data_root).expect("create data root");
         // Write the opposite of the typed registry default so the stale input
         // stays distinguishable from the canonical resolution regardless of
@@ -1457,7 +1248,7 @@ mod runtime_configuration_cutover {
         );
 
         let runtime = HostAdmissionTestRuntimeV1::project(
-            crate::storage::default_profile_root().unwrap(),
+            tracedecay_runtime_core::storage::default_profile_root().unwrap(),
             root.path(),
             project_id("proj_ensure_runtime_bootstrap"),
         )
@@ -1510,13 +1301,17 @@ mod runtime_configuration_cutover {
         let _profile = crate::config::PinnedUserDataDir::new();
         let root = TempDir::new().expect("temporary project root");
         let project_id = project_id("proj_configuration_native_graph_default_upgrade");
-        crate::storage::pin_fixture_repository_identity(root.path(), project_id.as_str())
-            .expect("write enrollment marker");
-        let layout = crate::storage::resolve_layout_for_current_profile(root.path())
-            .expect("resolve store layout");
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            root.path(),
+            project_id.as_str(),
+        )
+        .expect("write enrollment marker");
+        let layout =
+            tracedecay_runtime_core::storage::resolve_layout_for_current_profile(root.path())
+                .expect("resolve store layout");
         std::fs::create_dir_all(&layout.data_root).expect("create data root");
         let runtime = HostAdmissionTestRuntimeV1::project(
-            crate::storage::default_profile_root().unwrap(),
+            tracedecay_runtime_core::storage::default_profile_root().unwrap(),
             root.path(),
             project_id,
         )
@@ -1629,13 +1424,17 @@ mod runtime_configuration_cutover {
         let _profile = crate::config::PinnedUserDataDir::new();
         let root = TempDir::new().expect("temporary project root");
         let project_id = project_id("proj_runtime_binding_required");
-        crate::storage::pin_fixture_repository_identity(root.path(), project_id.as_str())
-            .expect("write enrollment marker");
-        let layout = crate::storage::resolve_layout_for_current_profile(root.path())
-            .expect("resolve store layout");
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            root.path(),
+            project_id.as_str(),
+        )
+        .expect("write enrollment marker");
+        let layout =
+            tracedecay_runtime_core::storage::resolve_layout_for_current_profile(root.path())
+                .expect("resolve store layout");
         std::fs::create_dir_all(&layout.data_root).expect("create data root");
         let runtime = HostAdmissionTestRuntimeV1::project(
-            crate::storage::default_profile_root().unwrap(),
+            tracedecay_runtime_core::storage::default_profile_root().unwrap(),
             root.path(),
             project_id,
         )
@@ -1665,7 +1464,7 @@ mod runtime_configuration_cutover {
             .expect_err("missing registered source binding must not be repaired");
         assert!(matches!(
             error,
-            tracedecay_runtime_core::errors::TraceDecayError::ResetRequired { ref authority, .. }
+            tracedecay_domain::errors::TraceDecayError::ResetRequired { ref authority, .. }
                 if authority == "configuration"
         ));
     }
@@ -1711,13 +1510,16 @@ mod runtime_configuration_cutover {
         );
 
         let project_id = project_id("proj_runtime_linked_binding");
-        crate::storage::pin_fixture_repository_identity(&primary, project_id.as_str())
-            .expect("write enrollment marker");
-        let layout = crate::storage::resolve_layout_for_current_profile(&primary)
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &primary,
+            project_id.as_str(),
+        )
+        .expect("write enrollment marker");
+        let layout = tracedecay_runtime_core::storage::resolve_layout_for_current_profile(&primary)
             .expect("resolve store layout");
         std::fs::create_dir_all(&layout.data_root).expect("create data root");
         let runtime = HostAdmissionTestRuntimeV1::project(
-            crate::storage::default_profile_root().unwrap(),
+            tracedecay_runtime_core::storage::default_profile_root().unwrap(),
             &primary,
             project_id.clone(),
         )
@@ -1746,12 +1548,12 @@ mod runtime_configuration_cutover {
             "returning to the primary must not repair linked-worktree churn"
         );
         assert_eq!(
-            tracedecay_usecases::config::scope_control::daemon_owned_project_source_binding(
+            tracedecay_configuration::config::scope_control::daemon_owned_project_source_binding(
                 &project_id,
                 &primary,
             )
             .expect("primary binding"),
-            tracedecay_usecases::config::scope_control::daemon_owned_project_source_binding(
+            tracedecay_configuration::config::scope_control::daemon_owned_project_source_binding(
                 &project_id,
                 &linked,
             )
@@ -1771,13 +1573,17 @@ mod runtime_configuration_cutover {
         let renamed = root.path().join("checkout-renamed");
         std::fs::create_dir_all(&original).expect("create original checkout");
         let project_id = project_id("proj_runtime_rebind_rename");
-        crate::storage::pin_fixture_repository_identity(&original, project_id.as_str())
-            .expect("write enrollment marker");
-        let layout = crate::storage::resolve_layout_for_current_profile(&original)
-            .expect("resolve store layout");
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &original,
+            project_id.as_str(),
+        )
+        .expect("write enrollment marker");
+        let layout =
+            tracedecay_runtime_core::storage::resolve_layout_for_current_profile(&original)
+                .expect("resolve store layout");
         std::fs::create_dir_all(&layout.data_root).expect("create data root");
         let runtime = HostAdmissionTestRuntimeV1::project(
-            crate::storage::default_profile_root().unwrap(),
+            tracedecay_runtime_core::storage::default_profile_root().unwrap(),
             &original,
             project_id.clone(),
         )
@@ -1824,13 +1630,17 @@ mod runtime_configuration_cutover {
         std::fs::create_dir_all(&elsewhere).expect("create foreign locator root");
         let other_project = project_id("proj_runtime_rebind_other");
         let project_id = project_id("proj_runtime_rebind_denied");
-        crate::storage::pin_fixture_repository_identity(&checkout, project_id.as_str())
-            .expect("write enrollment marker");
-        let layout = crate::storage::resolve_layout_for_current_profile(&checkout)
-            .expect("resolve store layout");
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &checkout,
+            project_id.as_str(),
+        )
+        .expect("write enrollment marker");
+        let layout =
+            tracedecay_runtime_core::storage::resolve_layout_for_current_profile(&checkout)
+                .expect("resolve store layout");
         std::fs::create_dir_all(&layout.data_root).expect("create data root");
         let runtime = HostAdmissionTestRuntimeV1::project(
-            crate::storage::default_profile_root().unwrap(),
+            tracedecay_runtime_core::storage::default_profile_root().unwrap(),
             &checkout,
             project_id.clone(),
         )
@@ -1848,13 +1658,13 @@ mod runtime_configuration_cutover {
         // matches this project's authority but carries a foreign binding id
         // and a drifted locator digest.
         let other_binding =
-            tracedecay_usecases::config::scope_control::daemon_owned_project_source_binding(
+            tracedecay_configuration::config::scope_control::daemon_owned_project_source_binding(
                 &other_project,
                 &checkout,
             )
             .expect("build other-project binding");
         let drifted =
-            tracedecay_usecases::config::scope_control::daemon_owned_project_source_binding(
+            tracedecay_configuration::config::scope_control::daemon_owned_project_source_binding(
                 &project_id,
                 &elsewhere,
             )
@@ -1895,7 +1705,7 @@ mod runtime_configuration_cutover {
             .expect_err("locator drift without the daemon binding id must stay a reset");
         assert!(matches!(
             error,
-            tracedecay_runtime_core::errors::TraceDecayError::ResetRequired { ref authority, .. }
+            tracedecay_domain::errors::TraceDecayError::ResetRequired { ref authority, .. }
                 if authority == "configuration"
         ));
     }
@@ -1904,10 +1714,14 @@ mod runtime_configuration_cutover {
     async fn resolve_runtime_configuration_pins_registered_project_when_cache_is_cold() {
         let _profile = crate::config::PinnedUserDataDir::new();
         let root = TempDir::new().expect("temporary project root");
-        crate::storage::pin_fixture_repository_identity(root.path(), "proj_resolve_cold_cache")
-            .expect("write enrollment marker");
-        let layout = crate::storage::resolve_layout_for_current_profile(root.path())
-            .expect("resolve store layout");
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            root.path(),
+            "proj_resolve_cold_cache",
+        )
+        .expect("write enrollment marker");
+        let layout =
+            tracedecay_runtime_core::storage::resolve_layout_for_current_profile(root.path())
+                .expect("resolve store layout");
         std::fs::create_dir_all(&layout.data_root).expect("create data root");
 
         // A freshly registered project has no pinned snapshot in this process's
@@ -1922,7 +1736,7 @@ mod runtime_configuration_cutover {
         // The daemon authority path resolves and pins on demand instead of
         // erroring, so branch administration and other daemon operations run.
         let runtime = HostAdmissionTestRuntimeV1::project(
-            crate::storage::default_profile_root().unwrap(),
+            tracedecay_runtime_core::storage::default_profile_root().unwrap(),
             root.path(),
             project_id("proj_resolve_cold_cache"),
         )
@@ -1954,14 +1768,18 @@ mod runtime_configuration_cutover {
     async fn resolve_runtime_configuration_errors_typed_when_authority_is_unresolvable() {
         let _profile = crate::config::PinnedUserDataDir::new();
         let root = TempDir::new().expect("temporary project root");
-        crate::storage::pin_fixture_repository_identity(root.path(), "proj_resolve_unresolvable")
-            .expect("write enrollment marker");
-        let mut layout = crate::storage::resolve_layout_for_current_profile(root.path())
-            .expect("resolve store layout");
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            root.path(),
+            "proj_resolve_unresolvable",
+        )
+        .expect("write enrollment marker");
+        let mut layout =
+            tracedecay_runtime_core::storage::resolve_layout_for_current_profile(root.path())
+                .expect("resolve store layout");
         std::fs::create_dir_all(&layout.data_root).expect("create data root");
 
         let runtime = HostAdmissionTestRuntimeV1::project(
-            crate::storage::default_profile_root().unwrap(),
+            tracedecay_runtime_core::storage::default_profile_root().unwrap(),
             root.path(),
             project_id("proj_resolve_unresolvable"),
         )
@@ -1979,7 +1797,7 @@ mod runtime_configuration_cutover {
         assert!(
             matches!(
                 error,
-                tracedecay_runtime_core::errors::TraceDecayError::Config { .. }
+                tracedecay_domain::errors::TraceDecayError::Config { .. }
             ),
             "genuine unavailability must stay a typed configuration error, got {error:?}"
         );
@@ -1989,13 +1807,14 @@ mod runtime_configuration_cutover {
     async fn read_only_open_rejects_an_uninitialized_store_without_fabricated_defaults() {
         let _profile = crate::config::PinnedUserDataDir::new();
         let root = TempDir::new().expect("temporary project root");
-        crate::storage::pin_fixture_repository_identity(
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
             root.path(),
             "proj_read_only_uninitialized",
         )
         .expect("write enrollment marker");
-        let layout = crate::storage::resolve_layout_for_current_profile(root.path())
-            .expect("resolve store layout");
+        let layout =
+            tracedecay_runtime_core::storage::resolve_layout_for_current_profile(root.path())
+                .expect("resolve store layout");
         std::fs::create_dir_all(&layout.data_root).expect("create data root");
         if let Some(parent) = layout.sessions_db_path.parent() {
             std::fs::create_dir_all(parent).expect("create sessions db parent");
@@ -2006,7 +1825,7 @@ mod runtime_configuration_cutover {
         // left in after a repository move, when its configuration authority was
         // never migrated in.
         let runtime = HostAdmissionTestRuntimeV1::project(
-            crate::storage::default_profile_root().unwrap(),
+            tracedecay_runtime_core::storage::default_profile_root().unwrap(),
             root.path(),
             project_id("proj_read_only_uninitialized"),
         )
@@ -2019,7 +1838,7 @@ mod runtime_configuration_cutover {
         assert!(
             matches!(
                 error,
-                tracedecay_runtime_core::errors::TraceDecayError::ResetRequired { ref authority, .. }
+                tracedecay_domain::errors::TraceDecayError::ResetRequired { ref authority, .. }
                     if authority == "configuration"
             ),
             "uninitialized durable configuration must remain a typed reset state: {error:?}"

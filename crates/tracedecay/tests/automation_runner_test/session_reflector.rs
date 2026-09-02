@@ -158,9 +158,9 @@ async fn session_reflector_interrupts_validation_before_near_match_or_apply() {
         "the canonical graph cancellation must stay typed through validation: {error}"
     );
     interrupted.store(false, Ordering::Release);
-    let memory = tracedecay_usecases::memory::MemoryApplication::new(
+    let memory = tracedecay_session_memory::memory::MemoryApplication::new(
         project_memory_owner(&cg),
-        tracedecay::store::memory::DatabaseFactStore::new(cg.db()),
+        tracedecay_runtime_core::store::memory::DatabaseFactStore::new(cg.db()),
     )
     .unwrap();
     assert!(
@@ -376,9 +376,9 @@ async fn session_reflector_runner_applies_valid_automatic_facts_by_default() {
     let temp = tempdir().unwrap();
     let cg = init_project(temp.path()).await;
     seed_session_evidence(&cg).await;
-    let seed_memory = tracedecay_usecases::memory::MemoryApplication::new(
+    let seed_memory = tracedecay_session_memory::memory::MemoryApplication::new(
         project_memory_owner(&cg),
-        tracedecay::store::memory::DatabaseFactStore::new(cg.db()),
+        tracedecay_runtime_core::store::memory::DatabaseFactStore::new(cg.db()),
     )
     .unwrap();
     let seeded = record_session_automatic_facts(
@@ -589,9 +589,9 @@ async fn session_reflector_runner_applies_valid_automatic_facts_by_default() {
         run.report["accepted_facts"][2]["add_fact_request"]["trust"],
         json!(0.85)
     );
-    let memory = tracedecay_usecases::memory::MemoryApplication::new(
+    let memory = tracedecay_session_memory::memory::MemoryApplication::new(
         project_memory_owner(&cg),
-        tracedecay::store::memory::DatabaseFactStore::new(cg.db()),
+        tracedecay_runtime_core::store::memory::DatabaseFactStore::new(cg.db()),
     )
     .unwrap();
     let receipts: Vec<_> = list_automatic_fact_receipts(
@@ -803,9 +803,9 @@ async fn session_reflector_runner_auto_applies_validated_facts() {
         json!("applied")
     );
 
-    let memory = tracedecay_usecases::memory::MemoryApplication::new(
+    let memory = tracedecay_session_memory::memory::MemoryApplication::new(
         project_memory_owner(&cg),
-        tracedecay::store::memory::DatabaseFactStore::new(cg.db()),
+        tracedecay_runtime_core::store::memory::DatabaseFactStore::new(cg.db()),
     )
     .unwrap();
     let receipts = list_automatic_fact_receipts(
@@ -988,9 +988,9 @@ async fn session_reflector_records_terminal_quarantine_without_an_admitted_fact(
     );
     assert_eq!(run.report["quarantined_facts"].as_array().unwrap().len(), 1);
 
-    let memory = tracedecay_usecases::memory::MemoryApplication::new(
+    let memory = tracedecay_session_memory::memory::MemoryApplication::new(
         project_memory_owner(&cg),
-        tracedecay::store::memory::DatabaseFactStore::new(cg.db()),
+        tracedecay_runtime_core::store::memory::DatabaseFactStore::new(cg.db()),
     )
     .unwrap();
     assert!(
@@ -1011,9 +1011,9 @@ async fn session_automatic_facts_replay_same_run_idempotently() {
     let temp = tempdir().unwrap();
     let cg = init_project(temp.path()).await;
     let owner = project_memory_owner(&cg);
-    let memory = tracedecay_usecases::memory::MemoryApplication::new(
+    let memory = tracedecay_session_memory::memory::MemoryApplication::new(
         owner,
-        tracedecay::store::memory::DatabaseFactStore::new(cg.db()),
+        tracedecay_runtime_core::store::memory::DatabaseFactStore::new(cg.db()),
     )
     .unwrap();
     let run_control = test_automation_run_control(Arc::new(AtomicBool::new(false)));
@@ -1405,21 +1405,19 @@ async fn session_reflector_replay_respects_include_summaries_false() {
         .expect("seeded raw message provides summary ownership");
     db.lcm_publish_immutable_summary_for_test(
         HostAdmissionScope::Project,
-        tracedecay_sessions::runtime::lcm::types::LcmImmutableSummaryPublication {
+        tracedecay_lcm::types::LcmImmutableSummaryPublication {
             summary_id: "summary.session-reflect-1.no-replay".to_string(),
             predecessor_summary_id: None,
-            draft: tracedecay_sessions::runtime::lcm::LcmSummaryNodeDraft {
+            draft: tracedecay_lcm::LcmSummaryNodeDraft {
                 provider: "cursor".to_string(),
                 conversation_id: "session-reflect-1".to_string(),
                 session_id: "session-reflect-1".to_string(),
                 depth: 0,
                 summary_text: "summary that should not be replayed when summaries are disabled"
                     .to_string(),
-                source_refs: vec![
-                    tracedecay_sessions::runtime::lcm::LcmSourceRef::RawMessage {
-                        store_id: source.store_id,
-                    },
-                ],
+                source_refs: vec![tracedecay_lcm::LcmSourceRef::RawMessage {
+                    store_id: source.store_id,
+                }],
                 source_token_count: 10,
                 summary_token_count: 5,
                 source_time_start: Some(1_715_000_001),

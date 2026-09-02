@@ -5,29 +5,27 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracedecay_application::retrieval::grep_analysis::{
-    AstGrepAuthorityV1, AstGrepRequestV1, ComplexityAuthorityV1, ComplexityRequestV1,
-    DependencyDepthAuthorityV1, DependencyDepthRequestV1, GrepAnalysisProblemV1, GrepRequestV1,
+    AstGrepAuthorityV1, ComplexityAuthorityV1, DependencyDepthAuthorityV1, GrepAnalysisProblemV1,
     LexicalGrepAuthorityV1, PrimitiveCoverageV1, PrimitiveOutcomeV1, PrimitivePortContextV1,
-    RedundancyAuthorityV1, RedundancyRequestV1,
+    RedundancyAuthorityV1,
 };
 use tracedecay_application::retrieval::{
-    AffectedFileTestsPrimitiveRequest, AffectedFileTestsPrimitiveResultV1, ExactSymbolRequest,
-    GraphImpactPrimitiveRequest, GraphRelationRequest, HealthDeltaRequest, HealthDeltaResult,
-    HealthReadRequest, ImplementationsRequest, OperationalRetrievalPort, PrimitiveFailureKind,
-    RetrievalPortContext, RetrievalPortOutcome, SessionLookupRequest,
-    SessionRetrievalBudgetStageV1, SessionRetrievalStructuralRefusalV1, SignatureSearchRequest,
-    SourceLinesRequest, SourceReadPortContext, SourceReadPortOutcome, SourceReadPrimitivePort,
-    SourceReadPrimitiveRequest, SourceRetrievalPort, SymbolGraphPage, SymbolGraphPortContext,
-    SymbolGraphPortOutcome, SymbolGraphPrimitivePort, SymbolSearchPrimitiveRequest,
-    TemporalRetrievalPort, TestMapPrimitiveRequest, TestMapPrimitiveResultV1, TestPrimitivePort,
-    TestPrimitivePortContext, TestPrimitivePortOutcome, TypeHierarchyRequest,
+    AffectedFileTestsPrimitiveResultV1, HealthDeltaRequest, HealthDeltaResult,
+    OperationalRetrievalPort, PrimitiveFailureKind, PrimitiveInvocation, PrimitiveRequest,
+    RetrievalPortContext, RetrievalPortOutcome, SessionRetrievalBudgetStageV1,
+    SessionRetrievalStructuralRefusalV1, SourceReadPortContext, SourceReadPortOutcome,
+    SourceReadPrimitivePort, SourceRetrievalPort, SymbolGraphPage, SymbolGraphPortContext,
+    SymbolGraphPortOutcome, SymbolGraphPrimitivePort, TemporalRetrievalPort,
+    TestMapPrimitiveResultV1, TestPrimitivePort, TestPrimitivePortContext,
+    TestPrimitivePortOutcome,
 };
 use tracedecay_application::{
     ApplicationContractError, ApplicationEnvelope, ApplicationOperation, ApplicationOutcome,
@@ -212,50 +210,6 @@ pub trait ExtendedPrimitivePort: Send + Sync {
         context: RetrievalPortContext<'a>,
         request: &'a DiagnosticsPrimitiveRequest,
     ) -> ExtendedPrimitiveFuture<'a, DiagnosticsPrimitiveResult>;
-}
-
-/// Closed typed request enum accepted by direct daemon invocation.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "primitive", content = "request", rename_all = "snake_case")]
-pub enum PrimitiveRequest {
-    #[serde(skip)]
-    SymbolSearch(SymbolSearchPrimitiveRequest),
-    ExactSymbol(ExactSymbolRequest),
-    SignatureSearch(SignatureSearchRequest),
-    Implementations(ImplementationsRequest),
-    TypeHierarchy(TypeHierarchyRequest),
-    Callers(GraphRelationRequest),
-    Callees(GraphRelationRequest),
-    Impact(GraphImpactPrimitiveRequest),
-    SourceRead(SourceReadPrimitiveRequest),
-    TestMap(TestMapPrimitiveRequest),
-    AffectedFileTests(AffectedFileTestsPrimitiveRequest),
-    LexicalGrep(GrepRequestV1),
-    AstGrep(AstGrepRequestV1),
-    Complexity(ComplexityRequestV1),
-    Redundancy(RedundancyRequestV1),
-    DependencyDepth(DependencyDepthRequestV1),
-    SessionLookup(SessionLookupRequest),
-    QualifiedName(QualifiedNamePrimitiveRequest),
-    CallChain(CallChainPrimitiveRequest),
-    FileDependents(FileDependentsPrimitiveRequest),
-    SourceLines(SourceLinesRequest),
-    SourceBody(SourceBodyPrimitiveRequest),
-    SourceOutline(SourceOutlinePrimitiveRequest),
-    ModuleApi(ModuleApiPrimitiveRequest),
-    FileMetadata(FileMetadataPrimitiveRequest),
-    HealthRead(HealthReadRequest),
-    HealthDelta(HealthDeltaRequest),
-    StorageStatus(StorageStatusPrimitiveRequest),
-    DiagnosticsRead(DiagnosticsPrimitiveRequest),
-    RecentTestResults(PageRequest),
-}
-
-/// One catalog operation plus its closed typed primitive request.
-#[derive(Debug)]
-pub struct PrimitiveInvocation {
-    pub operation: ApplicationOperation,
-    pub request: PrimitiveRequest,
 }
 
 /// Object-safe asynchronous facade retained and called directly by the daemon.
@@ -559,8 +513,8 @@ fn transport_context(
 #[hotpath::measure(label = "usecases.primitives.open_runtime")]
 pub fn open_primitive_project_runtime(
     database: Database,
-    source_runtime: Arc<crate::tracedecay::SourceReadRuntime>,
-    code_graph: Arc<dyn crate::graph::CodeGraphProjectionReadPort>,
+    source_runtime: Arc<tracedecay_graph_query::SourceReadRuntime>,
+    code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
     symbol_graph_cursors: Arc<dyn SymbolGraphCursorPort>,
     ignored_dependency_admission: Option<Arc<dyn CodeIndexIgnoredDependencyAdmissionPortV1>>,
     tests: Arc<dyn TestPrimitivePort + Send + Sync>,
@@ -577,7 +531,7 @@ pub fn open_primitive_project_runtime(
     test_run_scope: Arc<dyn ManagedTestRunCurrentScopePort>,
 ) -> Result<PrimitiveProjectRuntime, ApplicationContractError> {
     scope.validate()?;
-    validate_admitted_root_uri(&admitted_root_uri)?;
+    let admitted_project_root = validate_admitted_root_uri(&admitted_root_uri)?;
     if access.scope != scope {
         return Err(ApplicationContractError::Inconsistent {
             field: "application primitive admitted project authority",
@@ -589,11 +543,13 @@ pub fn open_primitive_project_runtime(
             symbol_graph_cursors,
             ignored_dependency_admission,
         ));
-    let source: Arc<dyn SourceReadPrimitivePort + Send + Sync> = Arc::new(SourceReadAdapter::new(
-        Arc::clone(&source_runtime),
-        Arc::clone(&code_graph),
-        scope.clone(),
-    )?);
+    let source: Arc<dyn SourceReadPrimitivePort + Send + Sync> =
+        Arc::new(SourceReadAdapter::new_bound(
+            Arc::clone(&source_runtime),
+            Arc::clone(&code_graph),
+            scope.clone(),
+            &admitted_project_root,
+        )?);
     let services = PrimitiveProjectServices::new(
         symbol_graph,
         source,
@@ -627,7 +583,9 @@ pub fn open_primitive_project_runtime(
     Ok(PrimitiveProjectRuntime { database, dispatch })
 }
 
-fn validate_admitted_root_uri(admitted_root_uri: &str) -> Result<(), ApplicationContractError> {
+fn validate_admitted_root_uri(
+    admitted_root_uri: &str,
+) -> Result<PathBuf, ApplicationContractError> {
     if admitted_root_uri.len() > MAX_ADMITTED_ROOT_URI_BYTES {
         return Err(ApplicationContractError::InvalidRange {
             field: "application primitive admitted root URI",
@@ -650,7 +608,10 @@ fn validate_admitted_root_uri(admitted_root_uri: &str) -> Result<(), Application
             field: "application primitive admitted root URI",
         });
     }
-    Ok(())
+    uri.to_file_path()
+        .map_err(|()| ApplicationContractError::Inconsistent {
+            field: "application primitive admitted root URI",
+        })
 }
 
 #[hotpath::measure(label = "usecases.primitives.admit")]

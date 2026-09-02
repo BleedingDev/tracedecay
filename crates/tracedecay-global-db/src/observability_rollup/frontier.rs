@@ -67,6 +67,7 @@ impl RegisteredGlobalDb {
     /// first observable day. First mount starts at tomorrow's boundary, so
     /// startup never fabricates coverage for the partial current day or any
     /// pre-installation history.
+    #[hotpath::skip]
     pub async fn claim_observability_rollup_empty_day(
         &self,
         authorized_scope_ref: &str,
@@ -222,6 +223,7 @@ impl RegisteredGlobalDb {
         ))
     }
 
+    #[hotpath::skip]
     pub async fn release_observability_rollup_empty_day(
         &self,
         claim: &ObservabilityRollupEmptyDayClaimV1,
