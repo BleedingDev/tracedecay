@@ -52,7 +52,18 @@ pub enum ProviderMode {
 pub struct FabricConfig {
     /// Maximum registered providers.
     pub max_registered_providers: usize,
-    /// Maximum concurrent provider calls admitted by this fabric instance.
+    /// Maximum concurrent provider calls admitted *per admission lane* by
+    /// this fabric instance.
+    ///
+    /// The fabric runs two structurally independent lanes, selected by the
+    /// contacted registration's [`ProviderMode`]: an **active lane** for
+    /// `Active` registrations and an **observer lane** for `Observer`
+    /// registrations. Each lane holds its own finite counter of this size, so
+    /// a blocking, slow, or slow-failing observer can exhaust only the
+    /// observer lane and can never make an otherwise valid active call return
+    /// [`FabricError::CapacityExhausted`]. Total concurrency across the
+    /// fabric is therefore bounded by `2 * max_in_flight`, and each lane is
+    /// bounded by `max_in_flight`; neither lane can borrow from the other.
     pub max_in_flight: usize,
 }
 
@@ -491,7 +502,11 @@ pub struct ObserverReceipt {
 pub struct MemoryFabric {
     config: FabricConfig,
     registrations: RwLock<BTreeMap<OwnedProviderId, Registration>>,
-    permits: PermitCounter,
+    /// Admission lane for `Active` registrations.
+    active_permits: PermitCounter,
+    /// Admission lane for `Observer` registrations, disjoint from the active
+    /// lane so observer execution can never consume active capacity.
+    observer_permits: PermitCounter,
 }
 
 impl MemoryFabric {
@@ -501,7 +516,8 @@ impl MemoryFabric {
         Ok(Self {
             config,
             registrations: RwLock::new(BTreeMap::new()),
-            permits: PermitCounter::new(config.max_in_flight),
+            active_permits: PermitCounter::new(config.max_in_flight),
+            observer_permits: PermitCounter::new(config.max_in_flight),
         })
     }
 
@@ -699,7 +715,7 @@ impl MemoryFabric {
                 .map(|capability| capability.as_str()),
         )?;
         Self::preflight(&request.control)?;
-        let _permit = self.permits.try_acquire()?;
+        let _permit = self.admission_lane(registration.mode).try_acquire()?;
         let readiness_epoch =
             self.invalidate_readiness(&request.provider_id, request.registration_revision)?;
         let response = registration.provider.handshake(request);
@@ -819,7 +835,7 @@ impl MemoryFabric {
         let readiness = Self::require_readiness(&registration, call)?;
         call.validate_request_bytes(readiness.effective_limits.request_bytes)?;
         Self::preflight(&call.control)?;
-        let _permit = self.permits.try_acquire()?;
+        let _permit = self.active_permits.try_acquire()?;
         let reply = registration.provider.invoke(call);
         if let Err(error) = reply.validate(readiness.effective_limits.response_bytes) {
             self.invalidate_matching_readiness(call)?;
@@ -873,7 +889,7 @@ impl MemoryFabric {
         let readiness = Self::require_readiness(&registration, call)?;
         call.validate_request_bytes(readiness.effective_limits.request_bytes)?;
         Self::preflight(&call.control)?;
-        let _permit = self.permits.try_acquire()?;
+        let _permit = self.admission_lane(registration.mode).try_acquire()?;
         let reply = registration.provider.invoke(call);
         if let Err(error) = reply.validate(readiness.effective_limits.response_bytes) {
             self.invalidate_matching_readiness(call)?;
@@ -908,6 +924,23 @@ impl MemoryFabric {
             registration_revision: call.registration_revision,
             terminal: reply.terminal,
         })
+    }
+
+    /// Selects the finite admission lane a contact with `mode` may consume.
+    ///
+    /// Lane choice is the registration's own participation mode, never the
+    /// call route: an `Observer` registration draws from the observer lane
+    /// for every contact it ever receives (handshake and observation
+    /// delivery alike), so no observer — blocking, slow, or slow-failing —
+    /// can hold a permit an active call needs. A `Disabled` registration is
+    /// refused before this point; it is mapped to the observer lane so a
+    /// future caller that forgets the enabled check can still never reach
+    /// active capacity.
+    const fn admission_lane(&self, mode: ProviderMode) -> &PermitCounter {
+        match mode {
+            ProviderMode::Active => &self.active_permits,
+            ProviderMode::Observer | ProviderMode::Disabled => &self.observer_permits,
+        }
     }
 
     fn registration(&self, provider_id: &OwnedProviderId) -> Result<Registration, FabricError> {

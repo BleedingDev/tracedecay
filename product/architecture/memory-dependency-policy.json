@@ -19,6 +19,9 @@
       "required_direct_dependencies": [
         "sha2"
       ],
+      "allowed_dependency_features": {
+        "sha2": []
+      },
       "reason": "The canonical provider boundary is the inward dependency root; sha2 is its only external crate, for canonical payload and receipt digest validation."
     },
     {
@@ -29,6 +32,9 @@
       "required_direct_dependencies": [
         "tracedecay-memory-provider-api"
       ],
+      "allowed_dependency_features": {
+        "tracedecay-memory-provider-api": []
+      },
       "reason": "The fabric coordinates provider-neutral contracts only."
     },
     {
@@ -41,6 +47,10 @@
         "serde_json",
         "tracedecay-memory-provider-api"
       ],
+      "allowed_dependency_features": {
+        "serde_json": [],
+        "tracedecay-memory-provider-api": []
+      },
       "reason": "The Native adapter parses the provider-neutral observation envelope at its boundary, exposes a narrow application port, and owns no TraceDecay internals."
     },
     {
@@ -55,7 +65,15 @@
         "sha2",
         "tracedecay-memory-provider-api"
       ],
-      "reason": "The NCM boundary may hash an opaque exact-scope namespace and validate canonical JSON payloads but cannot import TraceDecay internals."
+      "allowed_dependency_features": {
+        "serde_json": [],
+        "sha2": [],
+        "tracedecay-memory-provider-api": []
+      },
+      "allowed_dev_dependencies": [
+        "tracedecay-memory-conformance"
+      ],
+      "reason": "The NCM boundary may hash an opaque exact-scope namespace and validate canonical JSON payloads but cannot import TraceDecay internals. tracedecay-memory-conformance is admitted as a test-only edge so the adapter is judged by the canonical provider-neutral harness instead of by adapter-local assertions; it is provider-neutral, depends only on the provider API, and is not compiled into the shipped crate."
     },
     {
       "package": "tracedecay-memory-conformance",
@@ -73,6 +91,15 @@
         "tiktoken-rs",
         "tracedecay-memory-provider-api"
       ],
+      "allowed_dependency_features": {
+        "serde": [
+          "derive"
+        ],
+        "serde_json": [],
+        "sha2": [],
+        "tiktoken-rs": [],
+        "tracedecay-memory-provider-api": []
+      },
       "reason": "Conformance remains provider-neutral and dashboard-independent; serde and serde_json load the deterministic scenario corpus and emit canonical baseline reports, sha2 binds fixture, corpus, and report identity digests, and tiktoken-rs counts admitted context tokens under the pinned o200k_base estimator identity."
     },
     {
@@ -91,21 +118,120 @@
         "tracedecay-memory-conformance",
         "tracedecay-memory-provider-api"
       ],
+      "allowed_dependency_features": {
+        "serde": [
+          "derive"
+        ],
+        "serde_json": [],
+        "thiserror": [],
+        "tracedecay-memory-conformance": [],
+        "tracedecay-memory-provider-api": []
+      },
       "reason": "The metric catalog is embedded JSON parsed with serde/serde_json, failures are typed with thiserror, the conformance baseline report is the production input, and the provider API supplies the canonical terminal-code vocabulary."
     },
     {
       "package": "tracedecay-memory-provider-registry",
       "allowed_direct_dependencies": [
+        "chrono",
+        "getrandom",
+        "hex",
+        "serde",
+        "serde_json",
+        "sha2",
+        "thiserror",
+        "tiktoken-rs",
+        "tokio",
+        "tracedecay-application",
         "tracedecay-memory-fabric",
         "tracedecay-memory-provider-api",
         "tracedecay-memory-provider-native"
       ],
       "required_direct_dependencies": [
+        "chrono",
+        "getrandom",
+        "hex",
+        "serde",
+        "serde_json",
+        "sha2",
+        "thiserror",
+        "tiktoken-rs",
+        "tokio",
+        "tracedecay-application",
         "tracedecay-memory-fabric",
         "tracedecay-memory-provider-api",
         "tracedecay-memory-provider-native"
       ],
-      "reason": "The default-off composition registry is the one product-owned crate allowed to construct the Native adapter behind the provider-neutral fabric."
+      "allowed_dev_dependencies": [
+        "tokio",
+        "tracedecay-domain"
+      ],
+      "allowed_dependency_features": {
+        "chrono": [
+          "std"
+        ],
+        "getrandom": [],
+        "hex": [],
+        "serde": [
+          "derive"
+        ],
+        "serde_json": [],
+        "sha2": [],
+        "thiserror": [],
+        "tiktoken-rs": [],
+        "tokio": [
+          "rt"
+        ],
+        "tracedecay-application": [],
+        "tracedecay-memory-fabric": [],
+        "tracedecay-memory-provider-api": [],
+        "tracedecay-memory-provider-native": []
+      },
+      "dependencies_requiring_default_features_off": [
+        "chrono",
+        "tokio",
+        "tracedecay-application"
+      ],
+      "reason": "The default-off composition registry is the one product-owned crate allowed to construct the Native adapter behind the provider-neutral fabric, and since the cognitive-recall route was mounted it also owns rank-final recall admission. Every production edge carries an exact reviewed feature set, so no feature arrives unreviewed: chrono is std-only with no clock feature, so the crate has no ambient clock and the host clock stays injected through tracedecay-application; serde and serde_json encode the canonical recall request and decode the provider reply at the boundary; sha2 and hex bind request and candidate digests; thiserror types the failures; getrandom draws only the per-handshake challenge nonce; and tokio is admitted at `rt` only, with its use pinned by the source contract to spawn_blocking on an explicitly invoked recall and to the per-recall cancellation bridge. tracedecay-application supplies port traits and value types only. That crate is NOT capability-free -- it mounts a gix historical-blob reader behind its optional native-git feature, and the production root enables that feature, so Cargo feature unification puts the reader in scope for every consumer in the root graph no matter what this edge requests. The manifest feature pins therefore only stop this crate from asking for a capability feature itself; the real bound is the source contract, which admits exactly the reviewed CognitiveRecall* port and value paths, the two error types, the cancellation signal, the resolved scope, and the clock helper, and refuses NativeHistoricalBlobReaderV1 and every other item. tracedecay-domain is a test-only identity-fixture edge and is never compiled into the shipped registry. The registry still constructs no store, session store, code index, host, transport, or root-crate type: the rusqlite admission ledger and the exact-scope authority are owned by the daemon composition root and injected through the RecallAdmissionObserver and ExactScopeBinding traits. tiktoken-rs is the canonical context tokenizer: the context-pack compiler measures every token budget as an exact o200k_base BPE count under the same estimator identity the coding-memory conformance baseline records admitted-context costs with, its vendored ranks are compile-time data, and it opens no file, socket, process, or store."
+    },
+    {
+      "package": "tracedecay-application",
+      "allowed_direct_dependencies": [
+        "gix",
+        "hotpath",
+        "schemars",
+        "serde",
+        "serde_json",
+        "thiserror",
+        "tracedecay-domain",
+        "tracedecay-policy",
+        "tracedecay-tool-catalog"
+      ],
+      "allowed_dev_dependencies": [
+        "tokio"
+      ],
+      "allowed_dependency_features": {
+        "gix": [
+          "revision",
+          "blob-diff",
+          "parallel",
+          "sha1",
+          "sha256",
+          "status"
+        ],
+        "hotpath": [
+          "threads"
+        ],
+        "schemars": [],
+        "serde": [
+          "derive"
+        ],
+        "serde_json": [],
+        "thiserror": [],
+        "tracedecay-domain": [],
+        "tracedecay-policy": [],
+        "tracedecay-tool-catalog": []
+      },
+      "reason": "This crate is under contract only because the composition registry is allowed one edge to it. Its dependency closure is therefore default-deny by exact name, external crates included, so a concrete store, code index, host, transport, or HTTP stack cannot be added here and become reachable from the registry. The closure is stated honestly: gix is a real capability, mounted behind the optional native-git feature for the CLI, MCP, usecases, and root consumers that need the historical-blob reader. That is exactly why the registry's protection is the source-import contract rather than a feature pin on its own edge -- Cargo unifies native-git across the production root graph. Adding any further capability here requires an ADR-bound exception, and the registry's source contract must still refuse to name whatever it exports."
     },
     {
       "package": "tracedecay-memory-observation",
@@ -125,6 +251,22 @@
         "sha2",
         "thiserror",
         "tracedecay-memory-provider-api"
+      ],
+      "allowed_dependency_features": {
+        "rusqlite": [
+          "bundled",
+          "cache"
+        ],
+        "serde": [
+          "derive"
+        ],
+        "serde_json": [],
+        "sha2": [],
+        "thiserror": [],
+        "tracedecay-memory-provider-api": []
+      },
+      "dependencies_requiring_default_features_off": [
+        "rusqlite"
       ],
       "reason": "The bounded observation journal persists delivery receipts through its own bundled rusqlite storage and exposes only the provider-neutral boundary; tempfile is a dev-dependency for isolated journal fixtures."
     },
@@ -150,7 +292,56 @@
         "tracedecay-memory-provider-api",
         "tracedecay-runtime-core"
       ],
+      "allowed_dependency_features": {
+        "regex": [],
+        "serde": [
+          "derive"
+        ],
+        "serde_json": [],
+        "sha2": [],
+        "thiserror": [],
+        "tracedecay-domain": [],
+        "tracedecay-memory-provider-api": [],
+        "tracedecay-runtime-core": []
+      },
       "reason": "The hygiene pipeline mints into the provider API's receipt vocabulary, takes over the canonical JSON encoding owned by tracedecay-domain, and reuses the single vendored credential-detector corpus exposed through tracedecay-runtime-core's public surface instead of re-deriving it; both TraceDecay-internal edges are explicit, narrow, and reviewed rather than a general internals import."
+    }
+  ],
+  "source_contracts": [
+    {
+      "package": "tracedecay-memory-provider-registry",
+      "reason": "A manifest allowlist cannot bound this crate. Cargo unifies features per compiled crate instance, tracedecay-application mounts a gix historical-blob reader behind its optional native-git feature, and crates/tracedecay/Cargo.toml enables that feature in the production root graph. The registry links against that one compiled instance, so NativeHistoricalBlobReaderV1 is in scope for it whatever its own manifest requests, and `default-features = false` on its edge cannot change that. The exact import allowlist below is the enforcement that actually holds: the registry may name the CognitiveRecall port and value types, the application contract and clock error types, the cancellation signal, the resolved scope, and the clock helper, and nothing else. Every unlisted item -- the gix reader first among them -- is refused. tokio is admitted for exactly four items and its two executor entry points are pinned to the reviewed call sites, so no new task-spawning or blocking-offload site can appear anywhere in this crate without review; combined with the checker's forbidden-symbol floor (no runtime constructor, OS thread, process, filesystem, socket, embedded store, HTTP stack, or git object store may be named at all) this is what keeps a feature-on/provider-disabled host from acquiring background work.",
+      "allowed_imports": {
+        "tracedecay_application": [
+          "tracedecay_application::ApplicationContractError",
+          "tracedecay_application::CancellationSignal",
+          "tracedecay_application::ClockError",
+          "tracedecay_application::ResolvedScope",
+          "tracedecay_application::try_now_micros",
+          "tracedecay_application::memory::CognitiveRecallCandidate",
+          "tracedecay_application::memory::CognitiveRecallDegradation",
+          "tracedecay_application::memory::CognitiveRecallPort",
+          "tracedecay_application::memory::CognitiveRecallPortResult",
+          "tracedecay_application::memory::CognitiveRecallProvenance",
+          "tracedecay_application::memory::CognitiveRecallProviderIdentity",
+          "tracedecay_application::memory::CognitiveRecallRequest",
+          "tracedecay_application::memory::CognitiveRecallResult"
+        ],
+        "tokio": [
+          "tokio::spawn",
+          "tokio::task::JoinError",
+          "tokio::task::JoinHandle",
+          "tokio::task::spawn_blocking"
+        ]
+      },
+      "executor_call_sites": {
+        "tokio::spawn": [
+          "recall_port.rs::bridge_cancellation"
+        ],
+        "tokio::task::spawn_blocking": [
+          "recall_port.rs::recall_uncounted"
+        ]
+      }
     }
   ],
   "rules": [
@@ -160,6 +351,7 @@
         "tracedecay-memory-provider-api"
       ],
       "forbidden_dependencies": [
+        "tracedecay",
         "tracedecay-*"
       ],
       "allowed_dependencies": [],
@@ -171,6 +363,7 @@
         "tracedecay-memory-fabric"
       ],
       "forbidden_dependencies": [
+        "tracedecay",
         "tracedecay-*"
       ],
       "allowed_dependencies": [
@@ -184,6 +377,7 @@
         "tracedecay-memory-provider-native"
       ],
       "forbidden_dependencies": [
+        "tracedecay",
         "tracedecay-*",
         "ncm*",
         "ocean*"
@@ -199,13 +393,17 @@
         "tracedecay-memory-provider-ncm"
       ],
       "forbidden_dependencies": [
+        "tracedecay",
         "tracedecay-*",
         "ocean*"
       ],
       "allowed_dependencies": [
         "tracedecay-memory-provider-api"
       ],
-      "reason": "The licensed NCM boundary receives only provider-neutral values and an opaque namespace."
+      "allowed_dev_dependencies": [
+        "tracedecay-memory-conformance"
+      ],
+      "reason": "The licensed NCM boundary receives only provider-neutral values and an opaque namespace. The one test-only edge is tracedecay-memory-conformance: ADR-0009 requires handshake and failure conformance to be run against this adapter, and the canonical harness is provider-neutral, so the edge admits an evaluator rather than a TraceDecay internal. It is a dev-dependency only and never reaches the shipped crate."
     },
     {
       "id": "conformance-is-provider-neutral",
@@ -213,6 +411,7 @@
         "tracedecay-memory-conformance"
       ],
       "forbidden_dependencies": [
+        "tracedecay",
         "tracedecay-*",
         "ncm*",
         "ocean*"
@@ -228,6 +427,7 @@
         "tracedecay-memory-evaluation"
       ],
       "forbidden_dependencies": [
+        "tracedecay",
         "tracedecay-*",
         "ncm*",
         "ocean*"
@@ -244,16 +444,45 @@
         "tracedecay-memory-provider-registry"
       ],
       "forbidden_dependencies": [
+        "tracedecay",
         "tracedecay-*",
         "ncm*",
         "ocean*"
       ],
       "allowed_dependencies": [
+        "tracedecay-application",
         "tracedecay-memory-fabric",
         "tracedecay-memory-provider-api",
         "tracedecay-memory-provider-native"
       ],
-      "reason": "The composition registry may construct only the provider-neutral fabric and Native adapter, never stores, code indexes, hosts, transports, or the root crate."
+      "allowed_dev_dependencies": [
+        "tracedecay-domain"
+      ],
+      "reason": "The composition registry may construct only the provider-neutral fabric and the Native adapter, and may adapt provider-neutral and application-owned contract types; it may never depend on, construct, or reach a store, session store, code index, host, transport, another concrete provider, or the root crate. Every shipped TraceDecay edge is an exact reviewed name with a stated job: tracedecay-memory-fabric and tracedecay-memory-provider-api are the provider-neutral contracts it composes, tracedecay-memory-provider-native is the one concrete adapter it is allowed to construct, and tracedecay-application contributes port traits and value types only -- bounded by the registry's source contract, because that crate carries an optional gix reader that Cargo unification makes visible in the production root regardless of this edge's feature request. tracedecay-domain is admitted as a test-only value fixture edge and is not compiled into the shipped crate. The bare root crate name and everything else under tracedecay-*, ncm*, and ocean* stays fail-closed."
+    },
+    {
+      "id": "application-contract-crate-capability-closure",
+      "from_packages": [
+        "tracedecay-application"
+      ],
+      "forbidden_dependencies": [
+        "*"
+      ],
+      "allowed_dependencies": [
+        "gix",
+        "hotpath",
+        "schemars",
+        "serde",
+        "serde_json",
+        "thiserror",
+        "tracedecay-domain",
+        "tracedecay-policy",
+        "tracedecay-tool-catalog"
+      ],
+      "allowed_dev_dependencies": [
+        "tokio"
+      ],
+      "reason": "The composition registry is allowed exactly one contract-crate edge, so this crate's whole dependency closure is default-deny -- every package, external crates included, not merely the tracedecay-*, ncm*, and ocean* prefixes. A store such as rusqlite, an HTTP stack, a code index, a host, a transport, or the root crate added here would widen what the registry can reach and is refused by name. The closure is not a claim that this crate is capability-free: gix is present behind the optional native-git feature, which the production root enables, and that is precisely why the registry is additionally bound by an exact source-import allowlist rather than by feature pins on its own edge."
     },
     {
       "id": "observation-journal-is-isolated",
@@ -261,6 +490,7 @@
         "tracedecay-memory-observation"
       ],
       "forbidden_dependencies": [
+        "tracedecay",
         "tracedecay-*",
         "ncm*",
         "ocean*"
@@ -276,6 +506,7 @@
         "tracedecay-memory-hygiene"
       ],
       "forbidden_dependencies": [
+        "tracedecay",
         "tracedecay-*",
         "ncm*",
         "ocean*"
@@ -322,7 +553,10 @@
       "Exceptions authorize one exact direct edge and one exact rule only.",
       "The ADR must exist under product/architecture/adr and reject provider-neutral alternatives.",
       "Rationale, accountable owner, focused verification, and a dated review are mandatory.",
-      "Unused, duplicate, wildcard, or malformed exceptions fail validation."
+      "Unused, duplicate, wildcard, or malformed exceptions fail validation.",
+      "A dev-dependency allowance is stated separately from the production allowance and is still an exact name list, never a wildcard or a blanket test exemption.",
+      "A dependency feature allowance is an exact allowlist per edge; a feature that is not named is refused, and no denylist may stand in for it.",
+      "A source-import allowance is an exact item-path list per crate root; a glob import can never satisfy it, and an executor item must additionally be pinned to exact call sites."
     ]
   },
   "exceptions": []

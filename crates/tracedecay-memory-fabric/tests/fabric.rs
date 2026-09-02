@@ -1,7 +1,7 @@
 //! Behavioral tests for capability-driven memory-fabric orchestration.
 
 use std::error::Error;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -2400,5 +2400,583 @@ fn fallback_dispatches_only_under_the_matching_pinned_rule_with_a_fresh_target_h
     );
     assert_eq!(target.handshake_count(), 1);
     assert_eq!(target.invocation_count(), 1);
+    Ok(())
+}
+
+/// Deterministic **FNV-1a** digest (not SHA-256) over an active reply's
+/// complete `Debug` representation.
+///
+/// Scope, stated honestly: [`ProviderReply`] is the *upstream provider
+/// envelope* this router returns, not TraceDecay's final product-visible
+/// output. This digest is therefore a focused **router invariant** - the
+/// bytes the fabric hands its caller do not change when an observer is
+/// registered alongside - and nothing more. The product-output differential
+/// (the final admitted recall result a request actually consumes, hashed
+/// with SHA-256 with the observer enabled, disabled, and failing) lives one
+/// layer up, in
+/// `tracedecay-memory-provider-registry/tests/recall_port.rs`, where the
+/// real recall port and its outcome type exist.
+///
+/// FNV-1a rather than SHA-256 because this crate's dependency-direction gate
+/// fixes the exact allowlist of dev-dependencies it may declare, and a
+/// router-invariant check does not need collision resistance: full
+/// `assert_eq!` equality on the reply value is asserted alongside it.
+fn product_output_digest(reply: &ProviderReply) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+    format!("{reply:?}")
+        .as_bytes()
+        .iter()
+        .fold(FNV_OFFSET_BASIS, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        })
+}
+
+/// tdmem-0903: product output is bit-identical whether or not an observer
+/// registration exists alongside the active provider.
+///
+/// Two independent fabrics run the identical active call plan against
+/// behaviorally identical active providers; one fabric additionally carries a
+/// registered, actively-delivering observer. Active registrations are keyed
+/// by provider ID in disjoint map entries with their own dispatch gate and
+/// readiness state (`MemoryFabric::register`), so an observer's registration
+/// and delivery cannot reach the active provider's entry through any typed
+/// path this crate exposes. This test proves that structural claim against
+/// real dispatch rather than asserting it from the type shape alone: the
+/// [`product_output_digest`] of the active reply, and the full reply value,
+/// match exactly between the two fabrics. This is a router invariant over
+/// the provider envelope, not the product-output differential; see
+/// [`product_output_digest`] for where that proof lives.
+#[test]
+fn active_provider_output_hash_is_identical_with_or_without_observer() -> Result<(), Box<dyn Error>>
+{
+    let solo_fabric = MemoryFabric::new(FabricConfig::new(4, 2)?)?;
+    let solo_active = Arc::new(TestProvider::new("provider.active", &[])?);
+    solo_fabric.register(
+        provider_id("provider.active")?,
+        1,
+        ProviderMode::Active,
+        solo_active.clone(),
+    )?;
+    solo_fabric.handshake(&handshake_request("provider.active")?)?;
+    let solo_reply = solo_fabric.invoke_active(&call(
+        "provider.active",
+        ProviderOperation::Recall,
+        None,
+        &["recall.query.v1"],
+        OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+    )?)?;
+
+    let accompanied_fabric = MemoryFabric::new(FabricConfig::new(4, 2)?)?;
+    let accompanied_active = Arc::new(TestProvider::new("provider.active", &[])?);
+    accompanied_fabric.register(
+        provider_id("provider.active")?,
+        1,
+        ProviderMode::Active,
+        accompanied_active.clone(),
+    )?;
+    let observer = Arc::new(TestProvider::new("provider.observer", &[])?);
+    accompanied_fabric.register(
+        provider_id("provider.observer")?,
+        1,
+        ProviderMode::Observer,
+        observer.clone(),
+    )?;
+    accompanied_fabric.handshake(&handshake_request("provider.active")?)?;
+    accompanied_fabric.handshake(&handshake_request("provider.observer")?)?;
+    // The observer actively delivers observations before the active call, so
+    // this is not merely "an idle observer changed nothing" but "an observer
+    // that did real work changed nothing".
+    accompanied_fabric.deliver_observation(&call(
+        "provider.observer",
+        ProviderOperation::Observe,
+        Some(DIGEST),
+        &["observation.accept.v1"],
+        OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+    )?)?;
+    let accompanied_reply = accompanied_fabric.invoke_active(&call(
+        "provider.active",
+        ProviderOperation::Recall,
+        None,
+        &["recall.query.v1"],
+        OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+    )?)?;
+
+    assert_eq!(solo_reply, accompanied_reply);
+    assert_eq!(
+        product_output_digest(&solo_reply),
+        product_output_digest(&accompanied_reply)
+    );
+    assert_eq!(solo_active.invocation_count(), 1);
+    assert_eq!(accompanied_active.invocation_count(), 1);
+    assert_eq!(observer.invocation_count(), 1);
+    Ok(())
+}
+
+/// tdmem-0903: an observer's delivery failure never alters active provider
+/// output, and an observer can never write canonical (active) state.
+///
+/// The observer's scripted reply misattributes its terminal to a different
+/// operation, so `deliver_observation` fails closed with a typed
+/// `FabricError` before any terminal is retained for the observer. The active
+/// provider, registered under a disjoint provider ID in the same fabric, is
+/// then invoked and its output hash is compared against a baseline fabric
+/// that never registered an observer at all. An unchanged hash proves the
+/// failed observer call left no trace reachable from the active path.
+#[test]
+fn observer_delivery_failure_does_not_alter_active_provider_output() -> Result<(), Box<dyn Error>> {
+    let baseline_fabric = MemoryFabric::new(FabricConfig::new(4, 2)?)?;
+    let baseline_active = Arc::new(TestProvider::new("provider.active", &[])?);
+    baseline_fabric.register(
+        provider_id("provider.active")?,
+        1,
+        ProviderMode::Active,
+        baseline_active.clone(),
+    )?;
+    baseline_fabric.handshake(&handshake_request("provider.active")?)?;
+    let baseline_reply = baseline_fabric.invoke_active(&call(
+        "provider.active",
+        ProviderOperation::Recall,
+        None,
+        &["recall.query.v1"],
+        OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+    )?)?;
+
+    let fabric = MemoryFabric::new(FabricConfig::new(4, 2)?)?;
+    let active = Arc::new(TestProvider::new("provider.active", &[])?);
+    fabric.register(
+        provider_id("provider.active")?,
+        1,
+        ProviderMode::Active,
+        active.clone(),
+    )?;
+    let failing_observe_call = call(
+        "provider.failing-observer",
+        ProviderOperation::Observe,
+        Some(DIGEST),
+        &["observation.accept.v1"],
+        OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+    )?;
+    // Misattributed operation on the reply's own terminal: a provider defect
+    // that must fail closed rather than be silently accepted as an observation.
+    let failing_reply = ProviderReply {
+        terminal: terminal(
+            ProviderOperation::Recall,
+            "provider.failing-observer",
+            TerminalCode::SuccessZeroResults,
+            CommittedEffectEvidence::none(Some(0)),
+            FallbackDirective::forbidden(),
+            &failing_observe_call.operation_id,
+            &failing_observe_call.exact_scope.exact_scope_sha256(),
+            None,
+        )?,
+        payload: None,
+        warnings: Vec::new(),
+        extensions: Vec::new(),
+        state_generation: 0,
+    };
+    let failing_observer = Arc::new(TestProvider::scripted(
+        "provider.failing-observer",
+        failing_reply,
+    )?);
+    fabric.register(
+        provider_id("provider.failing-observer")?,
+        1,
+        ProviderMode::Observer,
+        failing_observer.clone(),
+    )?;
+    fabric.handshake(&handshake_request("provider.active")?)?;
+    fabric.handshake(&handshake_request("provider.failing-observer")?)?;
+
+    assert_eq!(
+        fabric.deliver_observation(&failing_observe_call),
+        Err(FabricError::ResponseOperationKindMismatch {
+            expected: ProviderOperation::Observe,
+            returned: ProviderOperation::Recall,
+        })
+    );
+    // The failed observer delivery cannot write canonical active output: the
+    // fabric never even offers an active-call path for an observer-mode
+    // registration in the first place.
+    assert!(matches!(
+        fabric.invoke_active(&call(
+            "provider.failing-observer",
+            ProviderOperation::Recall,
+            None,
+            &["recall.query.v1"],
+            OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+        )?),
+        Err(FabricError::ProviderObserverOnly(provider)) if provider == "provider.failing-observer"
+    ));
+
+    let reply_after_observer_failure = fabric.invoke_active(&call(
+        "provider.active",
+        ProviderOperation::Recall,
+        None,
+        &["recall.query.v1"],
+        OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+    )?)?;
+
+    assert_eq!(baseline_reply, reply_after_observer_failure);
+    assert_eq!(
+        product_output_digest(&baseline_reply),
+        product_output_digest(&reply_after_observer_failure)
+    );
+    assert_eq!(baseline_active.invocation_count(), 1);
+    assert_eq!(active.invocation_count(), 1);
+    assert_eq!(failing_observer.invocation_count(), 1);
+    Ok(())
+}
+
+/// tdmem-0903: a blocking observer that has exhausted the observer admission
+/// lane cannot make a valid active call fail.
+///
+/// Before the fix this test guards, `MemoryFabric` held one global
+/// `PermitCounter` that `invoke_active` and `deliver_observation` both drew
+/// from. With `max_in_flight = 1`, one observer sitting inside
+/// `MemoryProvider::invoke` held the only permit, and an otherwise valid
+/// active invocation returned `FabricError::CapacityExhausted` *before the
+/// active provider was ever contacted* — the exact refutation of "observer
+/// failures do not alter active provider behavior".
+///
+/// The proof is concurrent, not sequential: a real observer is parked inside
+/// its provider call while the active invocation runs. The second observer's
+/// rejection is what proves the observer lane really is exhausted at that
+/// instant, so the active call's success cannot be explained by the lane
+/// having quietly drained.
+#[test]
+fn blocked_observer_lane_cannot_starve_the_active_provider() -> Result<(), Box<dyn Error>> {
+    // Baseline: the same active call with no observer registered anywhere.
+    let baseline_fabric = MemoryFabric::new(FabricConfig::new(1, 1)?)?;
+    let baseline_active = Arc::new(TestProvider::new("provider.active", &[])?);
+    baseline_fabric.register(
+        provider_id("provider.active")?,
+        1,
+        ProviderMode::Active,
+        baseline_active.clone(),
+    )?;
+    baseline_fabric.handshake(&handshake_request("provider.active")?)?;
+    let baseline_reply = baseline_fabric.invoke_active(&call(
+        "provider.active",
+        ProviderOperation::Recall,
+        None,
+        &["recall.query.v1"],
+        OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+    )?)?;
+
+    // One permit per lane: the tightest configuration production uses.
+    let fabric = Arc::new(MemoryFabric::new(FabricConfig::new(4, 1)?)?);
+    let active = Arc::new(TestProvider::new("provider.active", &[])?);
+    let dispatch_barrier = Arc::new(Barrier::new(2));
+    let blocking_observer = Arc::new(BlockingProvider {
+        inner: TestProvider::new("provider.blocking-observer", &[])?,
+        dispatch_barrier: Arc::clone(&dispatch_barrier),
+    });
+    let second_observer = Arc::new(TestProvider::new("provider.second-observer", &[])?);
+    fabric.register(
+        provider_id("provider.active")?,
+        1,
+        ProviderMode::Active,
+        active.clone(),
+    )?;
+    fabric.register(
+        provider_id("provider.blocking-observer")?,
+        1,
+        ProviderMode::Observer,
+        blocking_observer,
+    )?;
+    fabric.register(
+        provider_id("provider.second-observer")?,
+        1,
+        ProviderMode::Observer,
+        second_observer.clone(),
+    )?;
+    fabric.handshake(&handshake_request("provider.active")?)?;
+    fabric.handshake(&handshake_request("provider.blocking-observer")?)?;
+    fabric.handshake(&handshake_request("provider.second-observer")?)?;
+
+    let blocking_call = call(
+        "provider.blocking-observer",
+        ProviderOperation::Observe,
+        Some(DIGEST),
+        &["observation.accept.v1"],
+        OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+    )?;
+    let observer_fabric = Arc::clone(&fabric);
+    let parked_observer =
+        thread::spawn(move || observer_fabric.deliver_observation(&blocking_call));
+    // The observer is now inside its provider call, holding an observer permit.
+    dispatch_barrier.wait();
+
+    // The observer lane is genuinely exhausted at this instant: a second,
+    // independently gated observer is refused.
+    let starved_observer = fabric.deliver_observation(&call(
+        "provider.second-observer",
+        ProviderOperation::Observe,
+        Some(DIGEST),
+        &["observation.accept.v1"],
+        OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+    )?);
+
+    // ...and the active provider is nevertheless contacted exactly once and
+    // returns byte-identical baseline output.
+    let reply_under_observer_pressure = fabric.invoke_active(&call(
+        "provider.active",
+        ProviderOperation::Recall,
+        None,
+        &["recall.query.v1"],
+        OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+    )?)?;
+
+    dispatch_barrier.wait();
+    let parked_result = parked_observer.join();
+    assert!(parked_result.is_ok());
+    if let Ok(result) = parked_result {
+        result?;
+    }
+
+    assert_eq!(starved_observer, Err(FabricError::CapacityExhausted));
+    assert_eq!(second_observer.invocation_count(), 0);
+    assert_eq!(baseline_reply, reply_under_observer_pressure);
+    assert_eq!(
+        product_output_digest(&baseline_reply),
+        product_output_digest(&reply_under_observer_pressure)
+    );
+    assert_eq!(active.invocation_count(), 1);
+    assert_eq!(baseline_active.invocation_count(), 1);
+    Ok(())
+}
+
+/// A counted canonical-state write port.
+///
+/// `writes` is incremented, and the rolling state digest advanced, only by
+/// [`Self::apply_write`] — the single path through which anything in this
+/// test can change canonical state. An assertion that the count is zero and
+/// the digest unchanged is therefore a mechanical statement that no write was
+/// attempted, not an inference from a return value.
+struct CanonicalStateAuthority {
+    writes: AtomicUsize,
+    state_digest: AtomicU64,
+}
+
+impl CanonicalStateAuthority {
+    const EMPTY_DIGEST: u64 = 0xcbf2_9ce4_8422_2325;
+    const DIGEST_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+    fn new() -> Self {
+        Self {
+            writes: AtomicUsize::new(0),
+            state_digest: AtomicU64::new(Self::EMPTY_DIGEST),
+        }
+    }
+
+    /// The only mutation path. Advances the canonical generation and folds the
+    /// mutation's identity into the canonical state digest.
+    fn apply_write(&self, operation: ProviderOperation, operation_id: &str) {
+        self.writes.fetch_add(1, Ordering::AcqRel);
+        let mut digest = self.state_digest.load(Ordering::Acquire);
+        for byte in operation.as_wire().bytes().chain(operation_id.bytes()) {
+            digest = (digest ^ u64::from(byte)).wrapping_mul(Self::DIGEST_PRIME);
+        }
+        self.state_digest.store(digest, Ordering::Release);
+    }
+
+    fn write_count(&self) -> usize {
+        self.writes.load(Ordering::Acquire)
+    }
+
+    fn state_digest(&self) -> u64 {
+        self.state_digest.load(Ordering::Acquire)
+    }
+}
+
+/// Whether an operation would write canonical state if it reached a provider.
+const fn writes_canonical_state(operation: ProviderOperation) -> bool {
+    matches!(
+        operation,
+        ProviderOperation::Correction
+            | ProviderOperation::DeleteBySource
+            | ProviderOperation::SnapshotRestore
+            | ProviderOperation::Replay
+    )
+}
+
+/// A provider whose canonical-authority write port is contacted by every
+/// mutating operation that actually reaches it, and by nothing else.
+struct CanonicalWritingProvider {
+    inner: TestProvider,
+    authority: Arc<CanonicalStateAuthority>,
+}
+
+impl CanonicalWritingProvider {
+    fn new(provider: &str, authority: Arc<CanonicalStateAuthority>) -> Result<Self, ApiError> {
+        Ok(Self {
+            inner: TestProvider::new(
+                provider,
+                &[
+                    "correction.apply.v1",
+                    "deletion.by_source.v1",
+                    "snapshot.restore.v1",
+                    "replay.apply.v1",
+                ],
+            )?,
+            authority,
+        })
+    }
+}
+
+impl MemoryProvider for CanonicalWritingProvider {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        self.inner.handshake(request)
+    }
+
+    fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+        if !writes_canonical_state(call.operation) {
+            return self.inner.invoke(call);
+        }
+        self.authority
+            .apply_write(call.operation, &call.operation_id);
+        let committed = CommittedEffectEvidence::committed(
+            0,
+            1,
+            vec![call.operation_id.clone()],
+            DIGEST,
+            DIGEST,
+        );
+        match committed.and_then(|effect| {
+            terminal(
+                call.operation,
+                self.inner.descriptor().provider_id.as_str(),
+                TerminalCode::Success,
+                effect,
+                FallbackDirective::forbidden(),
+                &call.operation_id,
+                &call.exact_scope.exact_scope_sha256(),
+                None,
+            )
+        }) {
+            Ok(reply_terminal) => ProviderReply {
+                terminal: reply_terminal,
+                payload: None,
+                warnings: Vec::new(),
+                extensions: Vec::new(),
+                state_generation: 1,
+            },
+            Err(_) => self.inner.invoke(call),
+        }
+    }
+}
+
+/// tdmem-0903: an observer registration cannot reach a canonical-state write
+/// port, and canonical state is provably unchanged after every attempt.
+///
+/// The previous proof for this acceptance criterion only attempted
+/// [`ProviderOperation::Recall`], which the API classifies as advisory and
+/// read-only, so it demonstrated nothing about writes. This test attempts
+/// every operation the provider API defines as mutating canonical state
+/// (`correction`, `deletion_by_source`, `snapshot_restore`, `replay`) from an
+/// Observer registration, over both routes the fabric exposes:
+///
+/// * `invoke_active` — refused with `ProviderObserverOnly`, the observer-mode
+///   gate, before provider contact;
+/// * `deliver_observation` — refused with `OperationNotObservation`, because
+///   the observation route accepts only `observation.accept.v1`, so a
+///   mutating operation cannot be smuggled through the one route an observer
+///   *is* allowed to use.
+///
+/// Both the write counter and the canonical state digest are asserted
+/// unchanged after every attempt. The final section is the positive control
+/// that keeps those assertions from passing vacuously: the identical provider
+/// registered as Active writes exactly once and moves the digest, proving the
+/// write port is genuinely reachable when the mode gate permits it.
+#[test]
+fn observer_cannot_reach_the_canonical_state_write_port() -> Result<(), Box<dyn Error>> {
+    const MUTATIONS: [ProviderOperation; 4] = [
+        ProviderOperation::Correction,
+        ProviderOperation::DeleteBySource,
+        ProviderOperation::SnapshotRestore,
+        ProviderOperation::Replay,
+    ];
+
+    let observer_authority = Arc::new(CanonicalStateAuthority::new());
+    let quiescent_digest = observer_authority.state_digest();
+    let fabric = MemoryFabric::new(FabricConfig::new(2, 2)?)?;
+    let observer = Arc::new(CanonicalWritingProvider::new(
+        "provider.observer",
+        Arc::clone(&observer_authority),
+    )?);
+    fabric.register(
+        provider_id("provider.observer")?,
+        1,
+        ProviderMode::Observer,
+        observer,
+    )?;
+    fabric.handshake(&handshake_request("provider.observer")?)?;
+
+    for operation in MUTATIONS {
+        let mutation = call(
+            "provider.observer",
+            operation,
+            Some(DIGEST),
+            &[operation.capability_id()],
+            OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+        )?;
+        assert_eq!(
+            fabric.invoke_active(&mutation),
+            Err(FabricError::ProviderObserverOnly(
+                "provider.observer".to_owned()
+            )),
+            "active route admitted {} from an observer",
+            operation.as_wire()
+        );
+        assert_eq!(
+            fabric.deliver_observation(&mutation),
+            Err(FabricError::OperationNotObservation),
+            "observation route admitted {} from an observer",
+            operation.as_wire()
+        );
+        assert_eq!(
+            observer_authority.write_count(),
+            0,
+            "canonical write port was contacted for {}",
+            operation.as_wire()
+        );
+        assert_eq!(
+            observer_authority.state_digest(),
+            quiescent_digest,
+            "canonical state digest moved for {}",
+            operation.as_wire()
+        );
+    }
+
+    // Positive control: the same provider, the same call, an Active
+    // registration. The write port is reached exactly once and canonical
+    // state moves, so the zero-write assertions above are load-bearing.
+    let active_authority = Arc::new(CanonicalStateAuthority::new());
+    let active_fabric = MemoryFabric::new(FabricConfig::new(2, 2)?)?;
+    let active = Arc::new(CanonicalWritingProvider::new(
+        "provider.observer",
+        Arc::clone(&active_authority),
+    )?);
+    active_fabric.register(
+        provider_id("provider.observer")?,
+        1,
+        ProviderMode::Active,
+        active,
+    )?;
+    active_fabric.handshake(&handshake_request("provider.observer")?)?;
+    active_fabric.invoke_active(&call(
+        "provider.observer",
+        ProviderOperation::Correction,
+        Some(DIGEST),
+        &["correction.apply.v1"],
+        OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+    )?)?;
+    assert_eq!(active_authority.write_count(), 1);
+    assert_ne!(active_authority.state_digest(), quiescent_digest);
     Ok(())
 }

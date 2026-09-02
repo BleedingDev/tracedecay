@@ -215,6 +215,11 @@ fn normalized_direct(page: &FactStoreSearchResultV1) -> Vec<NormalizedCandidate>
 
 fn normalized_direct_hit(hit: &FactSearchHitV1) -> NormalizedCandidate {
     let refs = source_refs(&hit.fact.source);
+    // The adapter leads `origin_refs` with the canonical record identity in
+    // the host's own reference form; the direct-store projection must say the
+    // same thing for parity to mean anything.
+    let mut origin_refs = vec![format!("record:{}", hit.fact.fact_id)];
+    origin_refs.extend(refs.clone());
     NormalizedCandidate {
         fact_id: hit.fact.fact_id.to_string(),
         content: hit.fact.content.clone(),
@@ -229,7 +234,7 @@ fn normalized_direct_hit(hit: &FactSearchHitV1) -> NormalizedCandidate {
         why: hit.why.clone(),
         provenance: NormalizedProvenance {
             state: "available".to_owned(),
-            origin_refs: refs.clone(),
+            origin_refs,
             source_refs: refs,
             observation_refs: Vec::new(),
             transform_chain_empty: true,

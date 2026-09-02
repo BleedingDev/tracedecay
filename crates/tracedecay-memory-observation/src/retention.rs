@@ -115,14 +115,15 @@ impl RetentionPolicyV1 {
     }
 
     /// Capped exponential backoff for the given one-based attempt number.
+    ///
+    /// One formula, shared with the dispatcher through [`RetryBackoffV1`]: a
+    /// recorded retryable outcome and an attempt that produced no terminal at
+    /// all are rescheduled by the same curve.
+    ///
+    /// [`RetryBackoffV1`]: crate::RetryBackoffV1
     #[must_use]
     pub fn next_attempt_delay(&self, attempt_number: u32) -> i64 {
-        let shift = attempt_number.saturating_sub(1).min(31);
-        let multiplier = 1i64.checked_shl(shift).unwrap_or(i64::MAX);
-        self.backoff_base_micros
-            .checked_mul(multiplier)
-            .unwrap_or(i64::MAX)
-            .min(self.backoff_max_micros)
+        crate::runtime::RetryBackoffV1::of(self).delay_for(attempt_number)
     }
 }
 

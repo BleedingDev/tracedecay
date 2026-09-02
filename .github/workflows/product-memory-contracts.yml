@@ -7,7 +7,8 @@ on:
       - ".github/workflows/product-memory-contracts.yml"
       - "product/contracts/memory-provider-v1/**"
       - "product/observations/**"
-      - "crates/tracedecay-memory-hygiene/policy/**"
+      - "crates/tracedecay-memory-hygiene/**"
+      - "crates/tracedecay-memory-provider-registry/**"
       - "product/evaluation/**"
       - "scripts/product/**"
       - "tests/product_memory_provider_*"
@@ -22,7 +23,8 @@ on:
       - ".github/workflows/product-memory-contracts.yml"
       - "product/contracts/memory-provider-v1/**"
       - "product/observations/**"
-      - "crates/tracedecay-memory-hygiene/policy/**"
+      - "crates/tracedecay-memory-hygiene/**"
+      - "crates/tracedecay-memory-provider-registry/**"
       - "product/evaluation/**"
       - "scripts/product/**"
       - "tests/product_memory_provider_*"
@@ -79,6 +81,22 @@ jobs:
           do
             python3 "$test_file"
           done
+
+      - name: Run the untrusted-memory and secret hygiene suites
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: "${{ runner.temp }}/tracedecay-cargo-target"
+          TRACEDECAY_DATA_DIR: "${{ runner.temp }}/tracedecay-test-profile/.tracedecay"
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-hygiene \
+            --test untrusted_recall_text \
+            --test secret_classes \
+            --test false_positives \
+            --test transient_evidence
+          cargo test -p tracedecay-memory-provider-registry \
+            --test advisory_metadata_containment \
+            --test recall_context_pack
 
       - name: Validate every canonical provider contract
         shell: bash

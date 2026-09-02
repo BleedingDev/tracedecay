@@ -1,23 +1,26 @@
 //! The SQLite-backed observation journal.
 //!
 //! One file, one writer transaction at a time, `synchronous = FULL`. Delivery
-//! state, attempt history, and both replay positions are rows, so process death
-//! loses nothing and recovery needs no coordinator.
+//! state, attempt history, both replay positions, and the restart-recovery
+//! record are rows, so process death loses nothing and recovery needs no
+//! coordinator.
 
 mod append;
 mod dispatch;
+mod recovery;
 mod retention;
 pub(crate) mod row;
 mod schema;
 
 use std::path::Path;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
+use rusqlite::{Connection, ErrorCode, OpenFlags, Transaction, TransactionBehavior};
 
 use crate::error::ObservationJournalError;
 use crate::identity::{SourceSequenceV1, SourceStreamIdV1};
+use crate::recovery::RecoveryTimeBudgetV1;
 use crate::retention::RetentionPolicyV1;
 use crate::settlement::SourceAuthorityV1;
 
@@ -26,6 +29,11 @@ pub use schema::SCHEMA_VERSION;
 /// How long a write-ahead-log truncation waits for concurrent readers before
 /// reporting the log busy.
 const CHECKPOINT_BUSY_TIMEOUT_MILLIS: u64 = 250;
+
+/// How long a bounded caller sleeps between attempts on the journal mutex.
+/// Short enough that a small budget is honoured, long enough that waiting is
+/// not a spin.
+const LOCK_POLL_MICROS: u64 = 200;
 
 /// Durable bounded observation journal, delivery authority, and replay position.
 ///
@@ -101,11 +109,11 @@ impl SqliteObservationJournal {
             )?;
             sequence
                 .map(|value| {
-                    u64::try_from(value)
-                        .map(SourceSequenceV1)
-                        .map_err(|_| ObservationJournalError::ValueOutOfRange {
+                    u64::try_from(value).map(SourceSequenceV1).map_err(|_| {
+                        ObservationJournalError::ValueOutOfRange {
                             field: "last_admitted_sequence",
-                        })
+                        }
+                    })
                 })
                 .transpose()
         })
@@ -136,6 +144,82 @@ impl SqliteObservationJournal {
         action(&guard)
     }
 
+    /// Acquires the journal connection inside `budget`, or reports the budget
+    /// spent.
+    ///
+    /// `Mutex::lock` would park for however long the current holder needs,
+    /// which is precisely the wait a caller with a deadline cannot afford: it
+    /// would turn a bounded delivery attempt into an unbounded one.
+    fn lock_within(
+        &self,
+        operation: &'static str,
+        budget: RecoveryTimeBudgetV1,
+    ) -> Result<MutexGuard<'_, Connection>, ObservationJournalError> {
+        if budget.is_spent() {
+            return Err(ObservationJournalError::BudgetExhausted { operation });
+        }
+        let remaining = u64::try_from(budget.remaining_micros).unwrap_or(0);
+        let deadline = Instant::now() + Duration::from_micros(remaining);
+        loop {
+            match self.connection.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(ObservationJournalError::LockPoisoned);
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(ObservationJournalError::BudgetExhausted { operation });
+                    }
+                    std::thread::sleep(
+                        Duration::from_micros(LOCK_POLL_MICROS).min(deadline.duration_since(now)),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Runs one read inside the caller's remaining budget.
+    pub(crate) fn with_bounded_connection<T, F>(
+        &self,
+        operation: &'static str,
+        budget: RecoveryTimeBudgetV1,
+        action: F,
+    ) -> Result<T, ObservationJournalError>
+    where
+        F: FnOnce(&Connection) -> Result<T, ObservationJournalError>,
+    {
+        let started = Instant::now();
+        let mut guard = self.lock_within(operation, budget)?;
+        with_busy_budget(&mut guard, operation, budget, started, |connection| {
+            action(connection)
+        })
+    }
+
+    /// Runs one immediate write transaction inside the caller's remaining
+    /// budget. A transaction that cannot start because another writer holds the
+    /// database reports the budget spent instead of waiting out the fixed
+    /// five-second busy timeout.
+    pub(crate) fn with_bounded_transaction<T, F>(
+        &self,
+        operation: &'static str,
+        budget: RecoveryTimeBudgetV1,
+        action: F,
+    ) -> Result<T, ObservationJournalError>
+    where
+        F: FnOnce(&Transaction<'_>) -> Result<T, ObservationJournalError>,
+    {
+        let started = Instant::now();
+        let mut guard = self.lock_within(operation, budget)?;
+        with_busy_budget(&mut guard, operation, budget, started, |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let value = action(&transaction)?;
+            transaction.commit()?;
+            Ok(value)
+        })
+    }
+
     /// Checkpoints and truncates the write-ahead log, reporting whether it
     /// actually happened.
     ///
@@ -158,4 +242,53 @@ impl SqliteObservationJournal {
             Ok(busy? == 0)
         })
     }
+}
+
+/// Runs `action` with SQLite's own waiting capped by what is left of `budget`,
+/// and reports a busy database inside a spent budget as a spent budget.
+///
+/// Without this the connection's fixed five-second busy timeout would outlive
+/// any shorter caller bound: the statement would still be waiting on another
+/// writer long after the delivery attempt that asked for it gave up.
+fn with_busy_budget<T, F>(
+    connection: &mut Connection,
+    operation: &'static str,
+    budget: RecoveryTimeBudgetV1,
+    started: Instant,
+    action: F,
+) -> Result<T, ObservationJournalError>
+where
+    F: FnOnce(&mut Connection) -> Result<T, ObservationJournalError>,
+{
+    let spent = i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
+    let left = budget.remaining_micros.saturating_sub(spent);
+    if left <= 0 {
+        return Err(ObservationJournalError::BudgetExhausted { operation });
+    }
+    // Round up so a sub-millisecond budget still gets one attempt rather than
+    // an immediate `SQLITE_BUSY` that looks like contention.
+    let millis = left
+        .saturating_add(999)
+        .saturating_div(1_000)
+        .clamp(1, i64::from(u32::MAX));
+    connection.busy_timeout(Duration::from_millis(u64::try_from(millis).unwrap_or(1)))?;
+    let outcome = action(connection);
+    connection.busy_timeout(Duration::from_millis(schema::BUSY_TIMEOUT_MILLIS))?;
+    match outcome {
+        Err(error) if is_busy(&error) => {
+            Err(ObservationJournalError::BudgetExhausted { operation })
+        }
+        other => other,
+    }
+}
+
+/// Whether the failure is SQLite reporting the database busy or locked.
+fn is_busy(error: &ObservationJournalError) -> bool {
+    let ObservationJournalError::Storage(rusqlite::Error::SqliteFailure(failure, _)) = error else {
+        return false;
+    };
+    matches!(
+        failure.code,
+        ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+    )
 }

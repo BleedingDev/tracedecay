@@ -221,6 +221,7 @@
     {
       "allowed_changes": [
         "invoke provider-neutral bounded advisory recall",
+        "carry an advisory, provenance-labelled provider-memory lane into MCP context assembly",
         "validate provenance, freshness, exact scope, policy, deadline, and cancellation before context assembly",
         "report typed per-lane coverage and degradation"
       ],
@@ -237,6 +238,7 @@
       "paths": [
         "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
         "crates/tracedecay/src/daemon/session_retrieval/contract.rs",
+        "crates/tracedecay/src/mcp/server/requests/tool_dispatch.rs",
         "crates/tracedecay-usecases/src/context/mod.rs",
         "crates/tracedecay-usecases/src/context/read_modes.rs",
         "crates/tracedecay-usecases/src/diagnostics_query.rs",

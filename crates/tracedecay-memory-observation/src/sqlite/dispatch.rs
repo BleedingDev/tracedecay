@@ -16,11 +16,13 @@ use crate::inspection::{
     JournalInspectionFilterV1, JournalInspectionPageV1, JournalInspectionRowV1,
 };
 use crate::lease::{AttemptOutcomeV1, LeaseRequestV1, LeasedObservationV1};
+use crate::orphan::{AttemptOrphanCauseV1, AttemptOrphanRecordV1, AttemptOrphanRecoveryV1};
 use crate::port::ObservationJournalReaderV1;
 use crate::receipt::{
     ObservationCommittedEffectV1, ObservationDeliveryReceiptV1, ObservationOutcomeV1,
     ProviderEffectSummaryV1,
 };
+use crate::refusal::{AttemptRefusalCategoryV1, AttemptRefusalOutcomeV1, AttemptRefusalRecordV1};
 use crate::settlement::SourceAuthorityV1;
 use crate::state::DeliveryStateV1;
 
@@ -41,8 +43,76 @@ INSERT INTO tdmem_observation_receipt_v1 (
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
 "#;
 
+/// Append-only, exactly like the receipt insert: a second refusal for the same
+/// `(observation, attempt)` collides on the primary key and the standing record
+/// is what survives.
+const INSERT_ATTEMPT_REFUSAL: &str = r#"
+INSERT INTO tdmem_observation_attempt_refusal_v1 (
+    observation_id, attempt_number, idempotency_key, provider_id, provider_instance_id,
+    registration_revision, exact_scope_sha256, category, refused_field, expected_value,
+    provided_value, detail, terminal_operation, terminal_code, terminal_operation_id,
+    provider_receipt_digest, started_at_micros, finished_at_micros, recorded_at_micros
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+"#;
+
+const REFUSAL_SELECT_COLUMNS: &str = "observation_id, attempt_number, idempotency_key, \
+     provider_id, provider_instance_id, registration_revision, exact_scope_sha256, category, \
+     refused_field, expected_value, provided_value, detail, terminal_operation, terminal_code, \
+     terminal_operation_id, provider_receipt_digest, started_at_micros, finished_at_micros, \
+     recorded_at_micros";
+
+/// Append-only, exactly like the receipt and refusal inserts. A second reap of
+/// the same `(observation, attempt)` cannot happen — attempt numbers are never
+/// handed back — but the insert is written to collide rather than to overwrite,
+/// so the standing evidence is what survives if one ever did.
+const INSERT_ATTEMPT_ORPHAN: &str = r#"
+INSERT INTO tdmem_observation_attempt_orphan_v1 (
+    observation_id, attempt_number, idempotency_key, provider_id, provider_instance_id,
+    registration_revision, exact_scope_sha256, lease_id, lease_owner, payload_sha256,
+    cause, recovery, lease_expired_at_micros, recorded_at_micros
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+"#;
+
+const ORPHAN_SELECT_COLUMNS: &str = "observation_id, attempt_number, idempotency_key, \
+     provider_id, provider_instance_id, registration_revision, exact_scope_sha256, lease_id, \
+     lease_owner, payload_sha256, cause, recovery, lease_expired_at_micros, recorded_at_micros";
+
+/// The lapsed leases one reap round reclaims, with everything the orphan record
+/// has to name. Selected before the update so the lease identity and the
+/// attempt number the claim consumed are still readable.
+const SELECT_EXPIRED_LEASES: &str = r#"
+SELECT d.idempotency_key, d.observation_id, d.provider_id, d.last_provider_instance_id,
+       d.registration_revision, d.exact_scope_sha256, d.attempt_number, d.lease_id,
+       d.lease_owner, d.lease_expires_at_micros, j.payload_sha256
+FROM tdmem_observation_delivery_v1 d
+JOIN tdmem_observation_journal_v1 j ON j.idempotency_key = d.idempotency_key
+WHERE d.state = 'leased' AND d.lease_expires_at_micros <= ?1
+ORDER BY d.lease_expires_at_micros, d.idempotency_key
+LIMIT ?2
+"#;
+
+/// Whether the attempt this lease consumed already has a durable answer. A
+/// reclaimed lease whose attempt was answered needs no orphan record; one whose
+/// attempt was not is exactly the gap the record exists to close.
+const ATTEMPT_ALREADY_ANSWERED: &str = r#"
+SELECT 1 WHERE EXISTS (
+    SELECT 1 FROM tdmem_observation_receipt_v1
+    WHERE observation_id = ?1 AND attempt_number = ?2)
+OR EXISTS (
+    SELECT 1 FROM tdmem_observation_attempt_refusal_v1
+    WHERE observation_id = ?1 AND attempt_number = ?2)
+"#;
+
+const RECLAIM_ONE_LEASE: &str = r#"
+UPDATE tdmem_observation_delivery_v1
+SET state = 'pending', lease_id = NULL, lease_owner = NULL, lease_expires_at_micros = NULL,
+    updated_at_micros = ?1
+WHERE idempotency_key = ?2 AND state = 'leased'
+"#;
+
 const SELECT_JOURNAL_ROW: &str = r#"
-SELECT payload_sha256, extensions_digest, provider_id, registration_revision
+SELECT payload_sha256, extensions_digest, provider_id, registration_revision,
+       source_authority, exact_scope_sha256, source_stream, source_sequence
 FROM tdmem_observation_journal_v1
 WHERE observation_id = ?1
 "#;
@@ -82,17 +152,6 @@ SET state = 'leased', lease_id = ?1, lease_owner = ?2, lease_expires_at_micros =
     attempt_number = attempt_number + 1, last_provider_instance_id = ?4,
     updated_at_micros = ?5
 WHERE idempotency_key = ?6 AND state = ?7 AND attempt_number = ?8
-"#;
-
-const REAP_LEASES: &str = r#"
-UPDATE tdmem_observation_delivery_v1
-SET state = 'pending', lease_id = NULL, lease_owner = NULL, lease_expires_at_micros = NULL,
-    updated_at_micros = ?1
-WHERE idempotency_key IN (
-    SELECT idempotency_key FROM tdmem_observation_delivery_v1
-    WHERE state = 'leased' AND lease_expires_at_micros <= ?1
-    ORDER BY lease_expires_at_micros, idempotency_key
-    LIMIT ?2)
 "#;
 
 const RELEASE_LEASE: &str = r#"
@@ -245,12 +304,17 @@ impl SqliteObservationJournal {
     }
 }
 
-/// The immutable journal facts a receipt must agree with.
+/// The immutable journal facts a receipt must agree with, plus the stream
+/// coordinates the acknowledged watermark is keyed by.
 struct JournalFactsV1 {
     payload_sha256: String,
     extensions_digest: String,
     provider_id: String,
     registration_revision: i64,
+    source_authority: String,
+    exact_scope_sha256: String,
+    source_stream: String,
+    source_sequence: i64,
 }
 
 /// Terminalizes every row one bounded selection returns.
@@ -386,6 +450,37 @@ fn read_receipt(
     decode_receipt(row)
 }
 
+/// Advances the acknowledged watermark when — and only when — the receipt is
+/// the provider's own acknowledgement of an effect.
+///
+/// A rejection, an expiry, a cancellation, or an exhausted retry is not an
+/// acknowledgement and must never move the position a restart replays from.
+fn advance_watermark_for(
+    transaction: &Transaction<'_>,
+    journal: &JournalFactsV1,
+    receipt: &ObservationDeliveryReceiptV1,
+) -> Result<(), ObservationJournalError> {
+    if !matches!(
+        receipt.implied_state(),
+        DeliveryStateV1::Acknowledged | DeliveryStateV1::DuplicateAcknowledged
+    ) {
+        return Ok(());
+    }
+    super::recovery::advance_acknowledged_watermark(
+        transaction,
+        &super::recovery::AcknowledgedWriteV1 {
+            provider_id: &journal.provider_id,
+            registration_revision: journal.registration_revision,
+            source_authority: &journal.source_authority,
+            exact_scope_sha256: &journal.exact_scope_sha256,
+            source_stream: &journal.source_stream,
+            source_sequence: journal.source_sequence,
+            observation_id: receipt.observation_id.as_str(),
+            acknowledged_at_unix_micros: receipt.finished_at_unix_micros,
+        },
+    )
+}
+
 fn read_journal_row(
     transaction: &Transaction<'_>,
     observation_id: &str,
@@ -397,6 +492,10 @@ fn read_journal_row(
                 extensions_digest: row.get(1)?,
                 provider_id: row.get(2)?,
                 registration_revision: row.get(3)?,
+                source_authority: row.get(4)?,
+                exact_scope_sha256: row.get(5)?,
+                source_stream: row.get(6)?,
+                source_sequence: row.get(7)?,
             })
         })
         .optional()?
@@ -661,9 +760,17 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
                     true => settled.state,
                     false => read_delivery_state(transaction, receipt.observation_id.as_str())?,
                 };
+                // The standing receipt, not the one just refused, is the
+                // authority for what that attempt did — so it is the one that
+                // may move the acknowledged watermark.
+                advance_watermark_for(transaction, &journal, &standing)?;
                 return Ok(AttemptOutcomeV1::DuplicateReceipt { state });
             }
 
+            // Written in the receipt's own transaction: a crash can never
+            // leave an acknowledgement without its watermark, or a watermark
+            // without the receipt that justifies it.
+            advance_watermark_for(transaction, &journal, receipt)?;
             let settled = settle_delivery(transaction, receipt, &policy)?;
             if !settled.advanced {
                 // The lease lapsed and was reaped, or another attempt already
@@ -706,10 +813,52 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
         now_unix_micros: i64,
         budget: u32,
     ) -> Result<u32, ObservationJournalError> {
+        let max_attempts = self.policy().max_attempts;
         self.with_transaction(|transaction| {
-            let changed =
-                transaction.execute(REAP_LEASES, params![now_unix_micros, i64::from(budget)])?;
-            read_u32(i64::try_from(changed).unwrap_or(i64::MAX), "reaped_leases")
+            let reclaimed = select_expired_leases(transaction, now_unix_micros, budget)?;
+            let mut reaped: u32 = 0;
+            for lease in reclaimed {
+                // The row goes back to `pending` first, so the reap is the same
+                // reclaim it always was even for a lease whose attempt was
+                // already answered.
+                let changed = transaction.execute(
+                    RECLAIM_ONE_LEASE,
+                    params![now_unix_micros, lease.idempotency_key.as_str()],
+                )?;
+                if changed == 0 {
+                    continue;
+                }
+                reaped = reaped.saturating_add(1);
+                // An attempt with a receipt or a refusal behind it is already
+                // accounted for; only the unanswered one leaves a gap in the
+                // row's attempt counter, and that gap is what gets a record.
+                if attempt_already_answered(transaction, &lease)? {
+                    continue;
+                }
+                let record = AttemptOrphanRecordV1 {
+                    observation_id: lease.observation_id.clone(),
+                    attempt_number: lease.attempt_number,
+                    idempotency_key: lease.idempotency_key.clone(),
+                    provider_id: lease.provider_id.clone(),
+                    provider_instance_id: lease.provider_instance_id.clone(),
+                    registration_revision: lease.registration_revision,
+                    exact_scope_sha256: lease.exact_scope_sha256.clone(),
+                    lease_id: lease.lease_id.clone(),
+                    lease_owner: lease.lease_owner.clone(),
+                    payload_sha256: lease.payload_sha256.clone(),
+                    cause: AttemptOrphanCauseV1::LeaseExpiredWithoutAnswer,
+                    recovery: if lease.attempt_number >= max_attempts {
+                        AttemptOrphanRecoveryV1::AttemptsExhausted
+                    } else {
+                        AttemptOrphanRecoveryV1::RedeliveryScheduled
+                    },
+                    lease_expired_at_unix_micros: lease.lease_expires_at_micros,
+                    recorded_at_unix_micros: now_unix_micros,
+                };
+                record.validate()?;
+                insert_attempt_orphan(transaction, &record)?;
+            }
+            Ok(reaped)
         })
     }
 
@@ -833,6 +982,152 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
         })
     }
 
+    fn record_attempt_refusal(
+        &self,
+        refusal: &AttemptRefusalRecordV1,
+    ) -> Result<AttemptRefusalOutcomeV1, ObservationJournalError> {
+        refusal.validate()?;
+        let registration = sql_i64(refusal.registration_revision, "registration_revision")?;
+        self.with_transaction(|transaction| {
+            // The observation must exist: a refusal about a delivery this store
+            // never admitted is evidence about nothing.
+            let known: Option<i64> = transaction
+                .query_row(
+                    "SELECT 1 FROM tdmem_observation_journal_v1 WHERE observation_id = ?1",
+                    params![refusal.observation_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if known.is_none() {
+                return Err(ObservationJournalError::UnknownObservation {
+                    observation_id: refusal.observation_id.as_str().to_owned(),
+                });
+            }
+            match transaction.execute(
+                INSERT_ATTEMPT_REFUSAL,
+                params![
+                    refusal.observation_id.as_str(),
+                    i64::from(refusal.attempt_number),
+                    refusal.idempotency_key.as_str(),
+                    &refusal.provider_id,
+                    &refusal.provider_instance_id,
+                    registration,
+                    &refusal.exact_scope_sha256,
+                    refusal.category.as_wire(),
+                    &refusal.refused_field,
+                    refusal.expected.as_deref(),
+                    refusal.provided.as_deref(),
+                    &refusal.detail,
+                    &refusal.terminal_operation,
+                    &refusal.terminal_code,
+                    &refusal.terminal_operation_id,
+                    refusal.provider_receipt_digest.as_deref(),
+                    refusal.started_at_unix_micros,
+                    refusal.finished_at_unix_micros,
+                    refusal.recorded_at_unix_micros,
+                ],
+            ) {
+                Ok(_) => Ok(AttemptRefusalOutcomeV1::Recorded),
+                // The standing refusal stands; refusals are never rewritten.
+                Err(rusqlite::Error::SqliteFailure(error, message))
+                    if error.code == ErrorCode::ConstraintViolation
+                        && matches!(error.extended_code, 1555 | 2067) =>
+                {
+                    let _ = message;
+                    Ok(AttemptRefusalOutcomeV1::AlreadyRecorded)
+                }
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
+
+    fn attempt_refusals_for(
+        &self,
+        observation_id: &ObservationIdV1,
+    ) -> Result<Vec<AttemptRefusalRecordV1>, ObservationJournalError> {
+        self.with_connection(|connection| {
+            let select = format!(
+                "SELECT {REFUSAL_SELECT_COLUMNS} FROM tdmem_observation_attempt_refusal_v1 \
+                 WHERE observation_id = ?1 ORDER BY attempt_number"
+            );
+            let mut statement = connection.prepare(&select)?;
+            let mut rows = statement.query(params![observation_id.as_str()])?;
+            let mut refusals = Vec::new();
+            while let Some(row) = rows.next()? {
+                let refusal = AttemptRefusalRecordV1 {
+                    observation_id: ObservationIdV1::parse(&row.get::<_, String>(0)?)?,
+                    attempt_number: read_u32(row.get::<_, i64>(1)?, "attempt_number")?,
+                    idempotency_key: ObservationIdempotencyKeyV1::parse(&row.get::<_, String>(2)?)?,
+                    provider_id: row.get(3)?,
+                    provider_instance_id: row.get(4)?,
+                    registration_revision: read_u64(
+                        row.get::<_, i64>(5)?,
+                        "registration_revision",
+                    )?,
+                    exact_scope_sha256: row.get(6)?,
+                    category: AttemptRefusalCategoryV1::from_wire(&row.get::<_, String>(7)?)?,
+                    refused_field: row.get(8)?,
+                    expected: row.get(9)?,
+                    provided: row.get(10)?,
+                    detail: row.get(11)?,
+                    terminal_operation: row.get(12)?,
+                    terminal_code: row.get(13)?,
+                    terminal_operation_id: row.get(14)?,
+                    provider_receipt_digest: row.get(15)?,
+                    started_at_unix_micros: row.get(16)?,
+                    finished_at_unix_micros: row.get(17)?,
+                    recorded_at_unix_micros: row.get(18)?,
+                };
+                // A persisted row that no longer validates is corruption, not
+                // something a reader should quietly hand on.
+                refusal.validate()?;
+                refusals.push(refusal);
+            }
+            Ok(refusals)
+        })
+    }
+
+    fn attempt_orphans_for(
+        &self,
+        observation_id: &ObservationIdV1,
+    ) -> Result<Vec<AttemptOrphanRecordV1>, ObservationJournalError> {
+        self.with_connection(|connection| {
+            let select = format!(
+                "SELECT {ORPHAN_SELECT_COLUMNS} FROM tdmem_observation_attempt_orphan_v1 \
+                 WHERE observation_id = ?1 ORDER BY attempt_number"
+            );
+            let mut statement = connection.prepare(&select)?;
+            let mut rows = statement.query(params![observation_id.as_str()])?;
+            let mut orphans = Vec::new();
+            while let Some(row) = rows.next()? {
+                let record = AttemptOrphanRecordV1 {
+                    observation_id: ObservationIdV1::parse(&row.get::<_, String>(0)?)?,
+                    attempt_number: read_u32(row.get::<_, i64>(1)?, "attempt_number")?,
+                    idempotency_key: ObservationIdempotencyKeyV1::parse(&row.get::<_, String>(2)?)?,
+                    provider_id: row.get(3)?,
+                    provider_instance_id: row.get(4)?,
+                    registration_revision: read_u64(
+                        row.get::<_, i64>(5)?,
+                        "registration_revision",
+                    )?,
+                    exact_scope_sha256: row.get(6)?,
+                    lease_id: DispatchLeaseIdV1::parse(&row.get::<_, String>(7)?)?,
+                    lease_owner: row.get(8)?,
+                    payload_sha256: row.get(9)?,
+                    cause: AttemptOrphanCauseV1::from_wire(&row.get::<_, String>(10)?)?,
+                    recovery: AttemptOrphanRecoveryV1::from_wire(&row.get::<_, String>(11)?)?,
+                    lease_expired_at_unix_micros: row.get(12)?,
+                    recorded_at_unix_micros: row.get(13)?,
+                };
+                // A persisted row that no longer validates is corruption, not
+                // something a reader should quietly hand on.
+                record.validate()?;
+                orphans.push(record);
+            }
+            Ok(orphans)
+        })
+    }
+
     fn receipts_for(
         &self,
         observation_id: &ObservationIdV1,
@@ -851,4 +1146,95 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
             Ok(receipts)
         })
     }
+}
+
+/// One lapsed lease, read before it is reclaimed.
+///
+/// The reclaim clears `lease_id`, `lease_owner`, and the expiry, so the record
+/// that explains the orphaned attempt has to be built from a read taken while
+/// the claim is still on the row.
+struct ExpiredLeaseV1 {
+    idempotency_key: ObservationIdempotencyKeyV1,
+    observation_id: ObservationIdV1,
+    provider_id: String,
+    provider_instance_id: Option<String>,
+    registration_revision: u64,
+    exact_scope_sha256: String,
+    attempt_number: u32,
+    lease_id: DispatchLeaseIdV1,
+    lease_owner: String,
+    payload_sha256: String,
+    lease_expires_at_micros: i64,
+}
+
+/// Reads the lapsed leases one bounded reap round will reclaim.
+fn select_expired_leases(
+    transaction: &Transaction<'_>,
+    now_unix_micros: i64,
+    budget: u32,
+) -> Result<Vec<ExpiredLeaseV1>, ObservationJournalError> {
+    let mut statement = transaction.prepare(SELECT_EXPIRED_LEASES)?;
+    let mut rows = statement.query(params![now_unix_micros, i64::from(budget)])?;
+    let mut expired = Vec::new();
+    while let Some(row) = rows.next()? {
+        expired.push(ExpiredLeaseV1 {
+            idempotency_key: ObservationIdempotencyKeyV1::parse(&row.get::<_, String>(0)?)?,
+            observation_id: ObservationIdV1::parse(&row.get::<_, String>(1)?)?,
+            provider_id: row.get(2)?,
+            provider_instance_id: row.get(3)?,
+            registration_revision: read_u64(row.get::<_, i64>(4)?, "registration_revision")?,
+            exact_scope_sha256: row.get(5)?,
+            attempt_number: read_u32(row.get::<_, i64>(6)?, "attempt_number")?,
+            lease_id: DispatchLeaseIdV1::parse(&row.get::<_, String>(7)?)?,
+            lease_owner: row.get(8)?,
+            payload_sha256: row.get(10)?,
+            lease_expires_at_micros: row.get(9)?,
+        });
+    }
+    Ok(expired)
+}
+
+/// Whether the attempt a lapsed lease consumed already carries durable evidence.
+fn attempt_already_answered(
+    transaction: &Transaction<'_>,
+    lease: &ExpiredLeaseV1,
+) -> Result<bool, ObservationJournalError> {
+    Ok(transaction
+        .query_row(
+            ATTEMPT_ALREADY_ANSWERED,
+            params![
+                lease.observation_id.as_str(),
+                sql_i64(u64::from(lease.attempt_number), "attempt_number")?
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Writes one orphaned-attempt record, append-only.
+fn insert_attempt_orphan(
+    transaction: &Transaction<'_>,
+    record: &AttemptOrphanRecordV1,
+) -> Result<(), ObservationJournalError> {
+    transaction.execute(
+        INSERT_ATTEMPT_ORPHAN,
+        params![
+            record.observation_id.as_str(),
+            sql_i64(u64::from(record.attempt_number), "attempt_number")?,
+            record.idempotency_key.as_str(),
+            &record.provider_id,
+            record.provider_instance_id.as_deref(),
+            sql_i64(record.registration_revision, "registration_revision")?,
+            &record.exact_scope_sha256,
+            record.lease_id.as_str(),
+            &record.lease_owner,
+            &record.payload_sha256,
+            record.cause.as_wire(),
+            record.recovery.as_wire(),
+            record.lease_expired_at_unix_micros,
+            record.recorded_at_unix_micros,
+        ],
+    )?;
+    Ok(())
 }

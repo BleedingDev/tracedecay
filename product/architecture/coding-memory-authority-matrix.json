@@ -325,12 +325,14 @@
         "ObservationDispatchPortV1::append_admitted after canonical host or operation settlement",
         "ObservationDispatchPortV1::record_withheld for a source event admission refused before journalling",
         "ObservationJournalReaderV1::record_attempt for provider acknowledgement receipts",
-        "ObservationRetentionPortV1::sweep_expired and forget_source for retention expiry and privacy deletion"
+        "ObservationRetentionPortV1::sweep_expired and forget_source for retention expiry and privacy deletion",
+        "ObservationRecoveryPortV1::accept_checkpoint and record_recovery_refusal for the accepted provider state identity and the bounded automatic repair counter; the acknowledged watermark is written only by the acknowledging receipt and can never be lowered"
       ],
       "read_interfaces": [
         "ObservationJournalReaderV1::lease_pending for the provider delivery worker",
         "ObservationJournalReaderV1::inspect and receipts_for for inspection and reconciliation",
-        "ObservationDispatchPortV1::replay_cursor and queue_pressure for restart recovery and backpressure"
+        "ObservationDispatchPortV1::replay_cursor and queue_pressure for restart recovery and backpressure",
+        "ObservationRecoveryPortV1::recovery_state and unacknowledged_frontier for restart recovery replay position and exact-effect verification against the provider checkpoint"
       ],
       "consistency_model": "At-least-once delivery from a durable journal, deduplicated by operation ID plus provider and exact scope. Provider acknowledgements are receipts; queue capacity and retry policy are bounded.",
       "failure_behavior": "Observer-mode dispatch failure is recorded and retryable but cannot alter prompts, Native facts, source edits, session ingest, or the already-settled host action. Capacity exhaustion returns a typed terminal outcome and never drops silently.",

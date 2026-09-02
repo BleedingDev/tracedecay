@@ -1026,7 +1026,17 @@ async fn native_recall_current_preserves_order_and_projects_native_score_explain
             json!(fact.last_event_id.to_string())
         );
         assert_eq!(candidate["provenance"]["state"], json!("available"));
-        assert_eq!(candidate["provenance"]["origin_refs"], json!(source_refs));
+        // The adapter names the canonical record this candidate *is*, in the
+        // host's own `record:` reference form, ahead of the evidence anchors
+        // that produced it. Without it host provenance hydration has nothing
+        // it can read back through the retained memory authority, and every
+        // Native candidate is dropped as ungrounded.
+        let mut expected_origin_refs = vec![format!("record:{fact_id}")];
+        expected_origin_refs.extend(source_refs.clone());
+        assert_eq!(
+            candidate["provenance"]["origin_refs"],
+            json!(expected_origin_refs)
+        );
         assert_eq!(candidate["provenance"]["source_refs"], json!(source_refs));
         assert_eq!(
             candidate["provenance"]["native_linkage"],

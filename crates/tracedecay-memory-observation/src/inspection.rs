@@ -5,7 +5,9 @@
 //! rather than bytes. Inspection is an operations surface, never a recall path:
 //! the outbox must not become a second authority for Native facts.
 
-use crate::envelope::{PrivacyClassificationV1, RetentionClassV1};
+use tracedecay_memory_provider_api::OwnedProviderId;
+
+use crate::envelope::{PrivacyClassificationV1, ProviderTargetV1, RetentionClassV1};
 use crate::error::ObservationJournalError;
 use crate::identity::{
     ForgetSourceKeyV1, ObservationIdV1, ObservationIdempotencyKeyV1, SourceSequenceV1,
@@ -63,6 +65,47 @@ impl ReplayDispositionV1 {
                 value: other.to_owned(),
             }),
         }
+    }
+}
+
+/// The bounded queue one provider *registration* owns.
+///
+/// Pressure is held per registration, never per instance: a restart mints a
+/// new instance identity but inherits exactly the same undelivered backlog. So
+/// the lane a record would land in can be named from the registration alone —
+/// before any readiness handshake has proven which incarnation will serve it.
+///
+/// That is not a convenience. It is what lets a caller read the lane's real
+/// pressure and refuse a saturated lane *before* it pays for hygiene,
+/// canonicalization, digest derivation, and a readiness proof — the whole
+/// foreground cost the gate exists to avoid spending on work that cannot be
+/// admitted.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ObservationLaneKeyV1 {
+    /// Logical provider identity that owns the queue.
+    pub provider_id: OwnedProviderId,
+    /// Pinned registration revision the queue is accounted under.
+    pub registration_revision: u64,
+}
+
+impl ObservationLaneKeyV1 {
+    /// The lane a proven readiness target addresses.
+    #[must_use]
+    pub fn of(target: &ProviderTargetV1) -> Self {
+        Self {
+            provider_id: target.provider_id.clone(),
+            registration_revision: target.registration_revision,
+        }
+    }
+
+    /// Refuses a lane key that cannot address a registration.
+    pub fn validate(&self) -> Result<(), ObservationJournalError> {
+        if self.registration_revision == 0 {
+            return Err(ObservationJournalError::ValueOutOfRange {
+                field: "registration_revision",
+            });
+        }
+        Ok(())
     }
 }
 

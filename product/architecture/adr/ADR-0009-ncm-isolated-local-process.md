@@ -103,20 +103,42 @@ Every request receives one monotonic remaining budget and live cancellation
 signal across readiness checks, transport, queueing, and provider execution.
 Client timeout alone never proves server cancellation or a bounded mutation.
 
-The selected topology requires, but does not yet provide, all of the following
-before production admission:
+The TraceDecay side of the topology is implemented and behaviorally tested
+against a conforming child process in
+`crates/tracedecay-memory-provider-ncm/tests/ncm_local_process.rs`, which
+exercises the real supervisor, the real private-loopback transport, and the
+real durable effect store:
+
+- the supervisor enforces child access denial through a probe-verified backend
+  and fails closed when this host cannot prove it;
+- exact-scope namespace isolation, one child, one state directory, one private
+  loopback endpoint and one readiness incarnation per exact scope, with a
+  bounded scope set that refuses rather than evicts;
+- readiness identity is pinned to build, configuration, state schema,
+  generation, loaded state, recovery, and a challenge-response proof, and any
+  crash or restart invalidates it and requires a fresh handshake;
+- bounded restart with typed unavailability on budget exhaustion, and bounded
+  shutdown that closes admission and reaps the child;
+- host-side durable dedupe, same-key/different-payload conflict detection,
+  unknown-effect records for interrupted mutations, atomic publication, and
+  refusal of corrupt or truncated records without a silent reset.
+
+That evidence covers the host supervisor and adapter only. The selected
+topology still requires, and does not yet have, all of the following from
+Biomem before production admission:
 
 - fail-closed loaded-state, build/configuration, schema, generation, and
   recovery identity in Biomem;
-- exact-scope namespace isolation in the adapter/topology;
 - server-side deadline/cancellation and mutation effect reconciliation in
   Biomem;
 - durable idempotency/deduplication with same-key/different-payload conflict
   detection across restarts in Biomem;
 - atomic crash-safe persistence and corrupt/incompatible load rejection in
-  Biomem;
-- a TraceDecay supervisor that enforces process access, bounded restart,
-  readiness invalidation, and bounded shutdown.
+  Biomem.
+
+`tdmem-0504` remains a blocking dependency: the supervisor behavior above is
+implemented and tested here, but its acceptance is recorded by that bead, and
+`supervisor_capability` stays a production blocker until it closes.
 
 ## Consequences
 
@@ -239,6 +261,38 @@ Restart checks reject old readiness/incarnation receipts while proving that
 durable operation outcomes remain queryable across the new incarnation.
 Production admission stays blocked until these tests exercise the real child
 process and inspect outcomes, not merely file or endpoint presence.
+
+Those runtime checks now exist for the host side of the topology, each as a
+named behavioral test in
+`crates/tracedecay-memory-provider-ncm/tests/ncm_local_process.rs`:
+
+- two exact scopes and cross-scope denial —
+  `two_exact_scopes_own_separate_namespaces_state_and_readiness`,
+  `the_mountable_scope_set_isolates_two_exact_scopes_and_refuses_a_third`;
+- child access denial —
+  `the_child_cannot_open_host_database_repository_credential_or_sibling_scope_paths`;
+- crash during read and restart receipt rejection —
+  `a_crash_during_a_read_invalidates_readiness_and_requires_a_fresh_handshake`;
+- restart-budget exhaustion — `restart_budget_exhaustion_leaves_a_typed_unavailable_provider`;
+- cancellation before and after commit —
+  `cancellation_of_a_read_returns_cancelled_and_tells_the_child_to_stop`,
+  `a_cancelled_mutation_becomes_a_durable_unknown_effect`,
+  `an_elapsed_deadline_returns_deadline_exceeded_without_waiting_for_the_child`;
+- unknown-effect reconciliation — `a_crash_after_commit_records_a_reconcilable_unknown_effect`;
+- durable dedupe and conflict —
+  `a_committed_mutation_is_deduplicated_from_durable_state_across_a_restart`,
+  `the_same_key_with_a_different_payload_is_a_conflict`;
+- corrupt or truncated state — `a_corrupt_durable_record_is_refused_and_never_silently_reset`;
+- fail-closed readiness identity —
+  `settings_fail_closed_without_a_pinned_distribution`,
+  `a_missing_child_program_never_reports_readiness`,
+  `readiness_is_refused_when_the_child_reports_an_unpinned_build`,
+  `readiness_is_refused_when_loaded_state_is_not_proven`,
+  `readiness_is_refused_when_the_child_cannot_prove_the_challenge`;
+- bounded shutdown — `shutdown_is_bounded_closes_admission_and_reaps_the_child`.
+
+Each of those runs a real child process over the real private loopback
+endpoint. None of them substitutes for the Biomem-side blockers above.
 
 ## Review triggers
 

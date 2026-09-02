@@ -208,6 +208,15 @@ pub struct RecallFixturePort {
     /// returns a complete outcome with an empty candidate list; every other
     /// code returns a payload-less failure terminal.
     pub terminal_code: TerminalCode,
+    /// Replaces the `native_score` of the named candidates in the mixed
+    /// outcome, so a test can exercise host normalization over the real
+    /// fabric, adapter, and port path.
+    pub native_score_overrides: std::collections::BTreeMap<String, Value>,
+    /// Replaces the whole candidate list with `(candidate_id, content)` pairs,
+    /// every one of them in-scope and current, so a test can drive the real
+    /// fabric, adapter, and port path with a candidate stream of its own
+    /// shape — duplicate content included.
+    pub candidate_contents: Option<Vec<(String, String)>>,
 }
 
 impl RecallFixturePort {
@@ -218,11 +227,27 @@ impl RecallFixturePort {
             recall_calls: AtomicUsize::new(0),
             outcome_request_identity: None,
             terminal_code: TerminalCode::Success,
+            native_score_overrides: std::collections::BTreeMap::new(),
+            candidate_contents: None,
         }
     }
 
     pub fn outcome_value(&self, call: &ProviderCall) -> Value {
-        let mut outcome = self.mixed_outcome_value(call);
+        let mut outcome = match &self.candidate_contents {
+            Some(contents) => self.explicit_outcome_value(call, contents),
+            None => self.mixed_outcome_value(call),
+        };
+        if let Value::Array(candidates) = &mut outcome["candidates"] {
+            for candidate in candidates.iter_mut() {
+                let id = candidate["candidate_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                if let Some(score) = self.native_score_overrides.get(&id) {
+                    candidate["native_score"] = score.clone();
+                }
+            }
+        }
         if self.terminal_code == TerminalCode::SuccessZeroResults {
             outcome["candidates"] = json!([]);
             outcome["coverage"]["state"] = json!("zero_results");
@@ -230,6 +255,31 @@ impl RecallFixturePort {
                 outcome["coverage"][counter] = json!(0);
             }
             outcome["terminal"]["terminal_code"] = json!("success_zero_results");
+        }
+        outcome
+    }
+
+    /// A complete, successful outcome whose candidates are exactly the
+    /// supplied `(candidate_id, content)` pairs, all attested as in-scope
+    /// current project facts.
+    fn explicit_outcome_value(&self, call: &ProviderCall, contents: &[(String, String)]) -> Value {
+        let candidate_scope = project_facts_candidate_value(&call.exact_scope);
+        let candidates: Vec<Value> = contents
+            .iter()
+            .map(|(candidate_id, content)| {
+                candidate_value(
+                    candidate_id,
+                    content,
+                    candidate_scope.clone(),
+                    current_validity(),
+                )
+            })
+            .collect();
+        let count = candidates.len();
+        let mut outcome = self.mixed_outcome_value(call);
+        outcome["candidates"] = Value::Array(candidates);
+        for counter in ["scanned_items", "matched_items", "returned_items"] {
+            outcome["coverage"][counter] = json!(count);
         }
         outcome
     }
@@ -558,4 +608,224 @@ pub fn handshake() -> HandshakeRequest {
         challenge_nonce: [7; 32],
     })
     .expect("handshake request")
+}
+
+// ---------------------------------------------------------------------------
+// tdmem-0903: an injected evaluation observer for the composed provider set.
+// ---------------------------------------------------------------------------
+
+/// Stable identity of the injected evaluation observer used by provider-set
+/// tests. It is deliberately not the Native identity: the composition refuses
+/// an observer that declares the separately selected active provider.
+pub const EVALUATION_OBSERVER_PROVIDER_ID: &str = "provider.evaluation-observer";
+
+/// Contract id of the observation payload these tests dispatch.
+pub const OBSERVER_PAYLOAD_CONTRACT_ID: &str = "tracedecay.memory.observation-test.v1";
+
+/// Sanitizer revision the fixture stands in for. The real revision comes from
+/// `tracedecay-memory-hygiene`; dispatch only requires a self-consistent
+/// receipt that binds the dispatched payload.
+pub const OBSERVER_SANITIZER_REVISION: &str =
+    "tracedecay.memory.observation.hygiene.v1+recall-fixture";
+
+/// What an injected observer does when the host delivers an observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObserverBehaviour {
+    /// Accept the observation and return a well-formed committed terminal.
+    Accepts,
+    /// Return a terminal misattributed to another operation kind, which the
+    /// fabric must refuse. Stands in for any provider-side observer defect.
+    FailsDelivery,
+}
+
+/// A concrete evaluation observer adapter, injected by the composition root.
+///
+/// It counts every handshake and invocation so a test can prove the observer
+/// really ran (or really was refused) rather than inferring it from a return
+/// value.
+pub struct EvaluationObserverProvider {
+    behaviour: ObserverBehaviour,
+    pub handshakes: AtomicUsize,
+    pub invocations: AtomicUsize,
+}
+
+impl EvaluationObserverProvider {
+    #[must_use]
+    pub fn new(behaviour: ObserverBehaviour) -> Self {
+        Self {
+            behaviour,
+            handshakes: AtomicUsize::new(0),
+            invocations: AtomicUsize::new(0),
+        }
+    }
+
+    #[must_use]
+    pub fn observer_descriptor() -> ProviderDescriptor {
+        ProviderDescriptor::new(
+            OwnedProviderId::new(EVALUATION_OBSERVER_PROVIDER_ID).expect("observer id"),
+            ONE_SHA,
+            "observer-state-v1",
+            0,
+            [
+                OwnedVersionedId::new("provider.health.v1").expect("health capability"),
+                OwnedVersionedId::new("observation.accept.v1").expect("observe capability"),
+                // Declared deliberately: the observer is *capable* of recall
+                // and is refused anyway, so the refusal is proven to come
+                // from the mode gate and the absent recall authorization, not
+                // from a missing capability.
+                OwnedVersionedId::new(RECALL_QUERY_CAPABILITY_ID).expect("recall capability"),
+            ],
+            limits(),
+        )
+        .expect("observer descriptor")
+    }
+
+    #[must_use]
+    pub fn handshake_count(&self) -> usize {
+        self.handshakes.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn invocation_count(&self) -> usize {
+        self.invocations.load(Ordering::Acquire)
+    }
+}
+
+impl tracedecay_memory_provider_api::MemoryProvider for EvaluationObserverProvider {
+    fn descriptor(&self) -> ProviderDescriptor {
+        Self::observer_descriptor()
+    }
+
+    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        self.handshakes.fetch_add(1, Ordering::AcqRel);
+        let descriptor = Self::observer_descriptor();
+        HandshakeResponse {
+            terminal: TerminalRecord::new(
+                ProviderOperation::Handshake,
+                descriptor.provider_id.clone(),
+                TerminalCode::Success,
+                CommittedEffectEvidence::none(Some(descriptor.state_generation)),
+                FallbackDirective::forbidden(),
+                &request.request_id,
+                &request.exact_scope.exact_scope_sha256(),
+                None,
+            )
+            .expect("observer handshake terminal"),
+            descriptor: Some(descriptor.clone()),
+            provider_instance_id: Some("observer.instance-1".to_owned()),
+            state_namespace: Some("observer-namespace-1".to_owned()),
+            accepted_scope: Some(request.exact_scope.clone()),
+            effective_limits: Some(request.host_limits.minimum(descriptor.limits)),
+            ready_receipt_sha256: Some(ONE_SHA.to_owned()),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+        self.invocations.fetch_add(1, Ordering::AcqRel);
+        // The failing variant misattributes its terminal to another operation
+        // kind: a provider defect the fabric must refuse before it ever
+        // retains an observer terminal.
+        let (operation, effect, state_generation) = match self.behaviour {
+            ObserverBehaviour::Accepts => (
+                call.operation,
+                CommittedEffectEvidence::committed(
+                    0,
+                    1,
+                    vec![call.operation_id.clone()],
+                    ONE_SHA,
+                    ONE_SHA,
+                )
+                .expect("observer committed effect"),
+                1,
+            ),
+            ObserverBehaviour::FailsDelivery => (
+                ProviderOperation::Recall,
+                CommittedEffectEvidence::none(Some(0)),
+                0,
+            ),
+        };
+        ProviderReply {
+            terminal: TerminalRecord::new(
+                operation,
+                OwnedProviderId::new(EVALUATION_OBSERVER_PROVIDER_ID).expect("observer id"),
+                TerminalCode::Success,
+                effect,
+                FallbackDirective::forbidden(),
+                &call.operation_id,
+                &call.exact_scope.exact_scope_sha256(),
+                None,
+            )
+            .expect("observer terminal"),
+            payload: None,
+            warnings: Vec::new(),
+            extensions: Vec::new(),
+            state_generation,
+        }
+    }
+}
+
+/// The readiness handshake request the host issues for an injected observer.
+#[must_use]
+pub fn observer_handshake_request(
+    exact_scope: OwnedExactScope,
+    registration_revision: u64,
+) -> HandshakeRequest {
+    HandshakeRequest::new(HandshakeRequestParts {
+        provider_id: OwnedProviderId::new(EVALUATION_OBSERVER_PROVIDER_ID).expect("observer id"),
+        registration_revision,
+        exact_scope,
+        request_id: "observer-handshake-1".to_owned(),
+        required_capabilities: vec![
+            OwnedVersionedId::new("provider.health.v1").expect("health capability"),
+            OwnedVersionedId::new("observation.accept.v1").expect("observe capability"),
+        ],
+        host_limits: limits(),
+        control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
+        challenge_nonce: [7; 32],
+    })
+    .expect("observer handshake request")
+}
+
+/// One admitted observation delivery for an injected observer, complete with
+/// the sanitization receipt observation dispatch fails closed without.
+#[must_use]
+pub fn observer_observation_call(
+    exact_scope: OwnedExactScope,
+    registration_revision: u64,
+    ready_receipt_sha256: String,
+) -> ProviderCall {
+    let bytes = br#"{"observation":"fixture"}"#.to_vec();
+    let payload = CanonicalPayload::new(
+        OwnedVersionedId::new(OBSERVER_PAYLOAD_CONTRACT_ID).expect("payload contract"),
+        bytes.clone(),
+        sha256_hex(&bytes),
+    )
+    .expect("observation payload");
+    let receipt = tracedecay_memory_provider_api::PayloadSanitizationReceipt::new(
+        tracedecay_memory_provider_api::PayloadSanitizationReceiptParts::accepted_unmodified(
+            OBSERVER_SANITIZER_REVISION,
+            payload.sha256.clone(),
+        ),
+    )
+    .expect("sanitization receipt");
+    ProviderCall::new(ProviderCallParts {
+        operation: ProviderOperation::Observe,
+        provider_id: OwnedProviderId::new(EVALUATION_OBSERVER_PROVIDER_ID).expect("observer id"),
+        registration_revision,
+        ready_receipt_sha256,
+        exact_scope,
+        request_id: "observer-observation-1".to_owned(),
+        operation_id: "observer-observation-operation-1".to_owned(),
+        expected_state_generation: 0,
+        idempotency_key: Some("observer-idempotency-1".to_owned()),
+        control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
+        payload,
+        required_capabilities: vec![
+            OwnedVersionedId::new("observation.accept.v1").expect("observe capability"),
+        ],
+        extensions: Vec::new(),
+    })
+    .expect("observation call")
+    .with_sanitization(receipt)
 }

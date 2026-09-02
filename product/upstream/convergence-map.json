@@ -107,21 +107,30 @@
         "tdmem-0303",
         "tdmem-0307",
         "tdmem-0308",
+        "tdmem-0602",
         "tdmem-0603",
+        "tdmem-0604",
+        "tdmem-0605",
         "tdmem-0607"
       ],
-      "rationale": "Own provider construction and activation outside the host while exposing one typed project-scoped composition object, the rank-final recall admission authority, and the application cognitive-recall port implementation the composition root mounts.",
+      "rationale": "Own provider construction and activation outside the host while exposing one typed project-scoped composition object, the rank-final recall admission authority, the host normalization of admitted candidates, and the application cognitive-recall port implementation the composition root mounts.",
       "semantic_invariants": [
         "Disabled activation constructs no fabric, provider, storage, queue, or background worker.",
         "Enabled Native activation requires the canonical application port explicitly.",
         "Recall admission compares every candidate's seven exact-scope identity fields byte-for-byte against the scope the host dispatched; stale resolved-scope digests and unresolvable identities are distinct typed denials, never generic mismatches.",
         "Validity windows, revocation, supersession, and unknown-validity policy are evaluated by the host after provider ordering and before any normalization or packing; denied candidates survive only as content-free ledger rows.",
-        "The recall bridge maps every non-success terminal and fabric error to a typed degradation or error and never reports an empty success."
+        "The recall bridge maps every non-success terminal and fabric error to a typed degradation or error and never reports an empty success.",
+        "Host normalization is additive and deterministic for a pinned policy: the provider-native score and explanation are retained verbatim beside a separately labelled normalized relevance that names its policy, revision, and input score digest, raw scores are never compared across providers or domains, and a non-finite, malformed, or out-of-declared-range score denies the candidate at admission instead of being projected onto a neutral value.",
+        "Host selection runs on every mounted recall between normalization and application conversion: duplicates never consume repeated advisory budget, candidates whose negation-marker signatures differ are never collapsed on wording overlap, every input candidate is accounted for exactly once across the selected, deduplicated, diversity-excluded, and budget-excluded ledgers, and a normalization that does not describe the admitted slice it indexes is a typed refusal rather than a degraded comparison.",
+        "Context-pack compilation is the last stage before an agent sees anything: required host evidence is admitted before one advisory token is spent and is never truncated or evicted by provider volume, every token cost is an exact o200k_base count under the pinned canonical tokenizer identity and a non-canonical counter is refused outright, every provider item is either admitted with its section and provenance or recorded in the exclusion ledger with a typed reason, and the pack hash is deterministic over the policy, the tokenizer, the budgets, and every admitted item."
       ],
       "tests": [
         "cargo test -p tracedecay-memory-provider-registry --locked",
         "cargo test -p tracedecay-memory-provider-registry --test recall_admission --locked",
-        "cargo test -p tracedecay-memory-provider-registry --test recall_port --locked"
+        "cargo test -p tracedecay-memory-provider-registry --test recall_context_pack --locked",
+        "cargo test -p tracedecay-memory-provider-registry --test recall_normalization --locked",
+        "cargo test -p tracedecay-memory-provider-registry --test recall_port --locked",
+        "cargo test -p tracedecay-memory-provider-registry --test recall_selection --locked"
       ],
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
       "upstreamability": {
@@ -193,16 +202,20 @@
       ],
       "bead_ids": [
         "tdmem-0304",
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0702"
       ],
       "rationale": "Isolate NCM protocol mapping, audit evidence, and fail-closed readiness from provider-neutral and host code.",
       "semantic_invariants": [
         "NCM receives only opaque exact-scope namespaces and bounded provider requests.",
-        "NCM cannot become production-ready without verified identity, limits, and readiness proof."
+        "NCM cannot become production-ready without verified identity, limits, and readiness proof.",
+        "The supervised isolated local-process topology lives behind the crate's own opt-in local-process feature: one child process, one state directory, one private loopback endpoint and one readiness incarnation per exact scope; the child is granted only its own per-scope state directory and every setup, readiness, transport, or persistence refusal is typed and fails closed."
       ],
       "tests": [
         "cargo test -p tracedecay-memory-provider-ncm --locked",
-        "python3 tests/product_ncm_surface_audit_test.py"
+        "python3 tests/product_ncm_surface_audit_test.py",
+        "cargo test -p tracedecay-memory-provider-ncm --features local-process --test ncm_local_process --locked",
+        "cargo test -p tracedecay-memory-provider-ncm --features local-process --test ncm_conformance --locked"
       ],
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
       "upstreamability": {
@@ -296,7 +309,8 @@
       ],
       "bead_ids": [
         "tdmem-0308",
-        "tdmem-0502"
+        "tdmem-0502",
+        "tdmem-0503"
       ],
       "rationale": "Hold the durable observation journal, its delivery state machine, and its retention and privacy deletion authority in one removable product-owned boundary.",
       "semantic_invariants": [
@@ -360,16 +374,25 @@
       ],
       "bead_ids": [
         "tdmem-0502",
-        "tdmem-0507"
+        "tdmem-0507",
+        "tdmem-0503",
+        "tdmem-0504",
+        "tdmem-0505",
+        "tdmem-0506"
       ],
-      "rationale": "Hold the one product-owned seam where the canonical observation store, the durable observation journal, the hygiene pipeline, and the provider registry meet, as a single file inside the retained-owner tree that the composition root mounts only under the optional host feature.",
+      "rationale": "Hold the one product-owned seam where the canonical observation store, the durable observation journal, the hygiene pipeline, the provider lifecycle supervisor, and the provider registry meet, as a single file inside the retained-owner tree that the composition root mounts only under the optional host feature.",
       "semantic_invariants": [
         "Every canonical record is sanitized through ObservationSanitizer::admit_observation before any digest, idempotency key, journal append, or provider call is derived from it.",
         "A withheld admission persists a typed reason and digests only, advances the replay cursor, and never creates delivery work; the canonical record is never rewritten or deleted.",
         "Journalled payload bytes are the sanitized bytes and carry a sanitization binding whose receipt names exactly those bytes; delivery sends journal bytes verbatim.",
         "Exact project and per-session scope is copied from the authoritative resolved scope and never re-derived from paths, CWD, or journal placement.",
         "The delivery worker drives the journal's bounded retention sweep on an explicit cadence: expired rows are terminalized with a receipt before their content is purged, a backlog converges over worker turns, and a failed sweep is logged and waits out its backoff.",
-        "mount_and_replay is the single product-owned mount sequence the composition root calls: mount, authoritative startup replay, then the bounded live replay edge over the same registered store."
+        "mount_and_replay is the single product-owned mount sequence the composition root calls: mount, authoritative startup replay, then the bounded live replay edge over the same registered store.",
+        "Every readiness target admission and delivery use is obtained from the mounted SupervisedProviderReadinessV1, never from the registry directly: one supervisor owns one exact scope, refuses any other scope before contacting the provider, enforces a finite restart budget and capped backoff, confirms a predecessor incarnation is dead before starting a replacement, contains an adapter panic, and validates every handshake success invariant before a target exists.",
+        "Re-proving the readiness of an already-ready incarnation spends no restart attempt, so a healthy provider answering many records can never be wedged into RestartBudgetExhausted; only a spawn consumes the crash-loop budget.",
+        "The supervised owner set is bounded by a finite exact-scope ceiling and retires the coldest scope only after its instance death is confirmed, so no two owners ever exist for one provider namespace and the set never grows without bound.",
+        "Every delivery attempt passes the mounted ObservationRecoveryGateV1 before the provider is contacted: the checkpoint carries the provider identity, state schema, state generation, and the typed replay position derived from validated readiness evidence, the assessment is run under the delivery attempt's own cancellation token and deadline, and a state-incompatible or budget-exhausted assessment refuses the attempt with a typed terminal so no observation reaches a provider whose durable state the host has not verified.",
+        "Every canonical admission passes the mounted BackpressureGateV1 before any journal append: the gate reads real queue pressure for the record's own provider lane, classifies the record by its retention lifetime, and refuses optional traffic at the declared shed threshold, every class at the refusal threshold or the journal ceiling, and optional traffic on backlog age or a run of over-budget foreground admissions. A refusal never advances a watermark, never deletes a canonical record, and never reports success: the replay pass stops, reports the typed refusal with its backlog measurements, and re-presents the same record once the lane drains."
       ],
       "tests": [
         "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::observation_journey::tests",
@@ -397,6 +420,7 @@
       ],
       "bead_ids": [
         "tdmem-0603",
+        "tdmem-0606",
         "tdmem-0607"
       ],
       "rationale": "Hold the one product-owned seam where the daemon's authoritative resolved scope, the provider-qualified session identity, the durable recall admission ledger, and the registry's rank-final recall port meet, as a single file inside the retained-owner tree that the composition root mounts only under the optional host feature.",
@@ -406,7 +430,8 @@
         "Every admission report is retained in the project-owned SQLite ledger before the result is delivered; an unwritable ledger fails the recall with a typed audit error rather than delivering content whose denials are not audit-visible.",
         "Ledger rows carry denial identities, typed reasons, and provider-claimed digests only; no table has a content column, and a replay of an identical report is idempotent while a divergent replay is a typed conflict.",
         "On the production Native route a same-project fact committed from any checkout is denied per candidate by the host scope check (unknown_identity, because Native attests no worktree, branch, or session) and lands in the ledger; the application result carries no candidate content for it.",
-        "The mount holds the host-pinned ActiveRoutingPolicy and hands it to every session port unchanged; no port or provider can select a different provider than the one the routing gate named, and observer registrations are refused by routing before any handshake."
+        "The mount holds the host-pinned ActiveRoutingPolicy and hands it to every session port unchanged; no port or provider can select a different provider than the one the routing gate named, and observer registrations are refused by routing before any handshake.",
+        "Every candidate's provider-claimed provenance is run through host-authority hydration (tracedecay_memory_provider_registry::hydrate_provider_item_provenance) before it reaches an agent: only a claim that resolves to one of the host's own recognised evidence shapes is ever rendered as cited grounding, an unresolved claim is labelled Unresolvable rather than silently treated as available, and resolution is bounded by a typed, non-panicking budget rather than an unbounded loop over provider-supplied claims."
       ],
       "tests": [
         "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::cognitive_recall::tests",
@@ -862,6 +887,39 @@
         "kind": "upstream_candidate",
         "rationale": "The ledger-uninitialized-versus-fault distinction is a general diagnostics-evidence correctness fix, independent of any concrete memory provider, and upstream can adopt it directly."
       }
+    },
+    {
+      "id": "advisory_recall_context_lane",
+      "status": "active",
+      "owner": "ScriptedAlchemy",
+      "ownership_class": "upstream_owned",
+      "feature": "memory-provider-host",
+      "path_patterns": [
+        "crates/tracedecay/src/mcp/server/requests/tool_dispatch.rs"
+      ],
+      "touch_points": [
+        "recall_context_mount"
+      ],
+      "bead_ids": [
+        "tdmem-0607"
+      ],
+      "rationale": "Hold the one upstream file that carries the mounted cognitive-recall route's advisory output from real MCP tool dispatch into the context answer, so the route has a production invocation path instead of existing only for tests.",
+      "semantic_invariants": [
+        "The lane runs on the real MCP dispatch path under that call's own admitted deadline and live cancellation identity; no adapter mints a replacement cancellation identity.",
+        "Only candidates that survived host admission reach the tool answer, each rendered with its explicit provenance label and under an advisory heading; denied candidates remain visible only in the project's admission ledger.",
+        "A dormant provider host or observer-only routing gate produces no lane at all, and the context answer is unchanged; every other refusal renders a typed unavailable reason rather than an empty-looking lane.",
+        "No file in this area names a provider, registry, or fabric type or branches on a provider name; the provider boundary stays behind the cognitive-recall mount."
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::cognitive_recall::tests",
+        "python3 tests/product_memory_composition_feature_test.py",
+        "python3 tests/product_upstream_ownership_registry_test.py"
+      ],
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "product_only",
+        "rationale": "The lane exists only to deliver the optional product-owned provider host's advisory output and is removed with the memory-provider-host feature."
+      }
     }
   ],
   "entries": [
@@ -1094,7 +1152,8 @@
         "tdmem-0307",
         "tdmem-0308",
         "tdmem-0507",
-        "tdmem-0902"
+        "tdmem-0902",
+        "tdmem-0702"
       ],
       "line_budget": 40,
       "rebase_or_removal_plan": "Remove the three optional dependencies, the memory-provider-host feature, its feature-list membership, and the conformance dev-dependency together.",
@@ -1122,7 +1181,8 @@
         "NativeActive is selected only when memory.provider_recall_routing.v1 names the Native provider and the host boolean is on; resolve_memory_provider_activation is the sole reading of both gates and any contradiction is a typed TraceDecayError::Config at project open.",
         "project_recall_routing_policy builds the one ActiveRoutingPolicy (Native under PROJECT_NATIVE_REGISTRATION_REVISION, fallback forbidden unless the gate pins a complete rule) and the recall route is mounted only when it exists.",
         "The daemon profile identity is threaded into the Native application port at mount (mount_project_memory_provider_host takes profile_identity.profile_id()); it is the only profile the Native adapter attests on a recall candidate, fixed at mount and never copied from a call's exact scope.",
-        "The journey mount receives every worker bound (journal retention, dispatch lease/batch/attempt budget/reap budget, park, sweep cadence) as one validated ObservationJourneyPolicyV1 from the composition root; a policy that cannot bound the worker refuses the mount with a typed error, and the composition root passes the product default rather than the journey minting limits."
+        "The journey mount receives every worker bound (journal retention, dispatch lease/batch/attempt budget/reap budget, park, sweep cadence) as one validated ObservationJourneyPolicyV1 from the composition root; a policy that cannot bound the worker refuses the mount with a typed error, and the composition root passes the product default rather than the journey minting limits.",
+        "The mountable-adapter decision is the registry's: the composition asks tracedecay_memory_provider_registry::mountable_active_provider for a typed kind and branches only on that kind plus the build feature, never on a provider name."
       ],
       "verification": [
         "git diff --check"
@@ -1131,7 +1191,9 @@
         "cargo test -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss --locked",
         "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::observation_journey::tests",
         "cargo test --locked -p tracedecay --features memory-provider-host remount_sweeps_rows_that_expired_while_the_journey_was_down",
-        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers daemon::project_composition::memory_provider_routing_tests"
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers daemon::project_composition::memory_provider_routing_tests",
+        "cargo test -p tracedecay-memory-provider-ncm --features local-process --test ncm_local_process --locked",
+        "cargo test -p tracedecay-memory-provider-registry --test registry --locked"
       ],
       "bead_ids": [
         "tdmem-0307",
@@ -1140,7 +1202,8 @@
         "tdmem-0603",
         "tdmem-0502",
         "tdmem-0607",
-        "tdmem-0503"
+        "tdmem-0503",
+        "tdmem-0702"
       ],
       "line_budget": 560,
       "rebase_or_removal_plan": "Remove the typed mount helper, disabled activation, and two construction-context injections as one bounded patch.",
@@ -2070,6 +2133,40 @@
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "A doc/test-only clarification of retry semantics supporting the same general diagnostics-evidence fix."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/mcp/server/requests/tool_dispatch.rs",
+      "area_id": "advisory_recall_context_lane",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "recall_context_mount",
+      "rationale": "Admit a context-assembly call into the cognitive-recall lane before the handler arguments move, run the authoritative handler first with its full deadline, then mint this session's recall port and compile the mounted route's typed advisory result into the context answer, so the recall route has a production invocation path that can never displace canonical host output.",
+      "semantic_invariants": [
+        "The authoritative tool handler runs first and keeps its whole deadline; advisory recall is invoked only after the handler answered, so a slow or blocking provider can never starve, delay, or displace canonical host output.",
+        "The advisory lane runs under the dispatch control's own admitted deadline and live cancellation identity, clamped to the mount's bounded advisory sub-deadline; no replacement cancellation identity is minted.",
+        "A dormant provider host, an observer-only routing gate, a non-context tool, a call with no canonical session identity, or any advisory failure leaves the dispatched result exactly as the handler produced it.",
+        "The lane is applied after the handler answered, so a coalesced read shared with other callers never carries this caller's advisory candidates.",
+        "The dispatch path names no provider, registry, or fabric type; the provider boundary stays behind the cognitive-recall mount."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::cognitive_recall::tests",
+        "python3 tests/product_memory_composition_feature_test.py"
+      ],
+      "bead_ids": [
+        "tdmem-0607",
+        "tdmem-0605"
+      ],
+      "line_budget": 90,
+      "rebase_or_removal_plan": "Remove the advisory admission before dispatch and the advisory compile after dispatch.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "product_only",
+        "rationale": "The lane exists only to carry the optional product-owned provider host's advisory output and disappears with the memory-provider-host feature."
       }
     }
   ],

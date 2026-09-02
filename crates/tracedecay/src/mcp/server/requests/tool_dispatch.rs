@@ -210,6 +210,7 @@ impl McpServer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "memory-provider-host"), allow(clippy::let_and_return))]
     pub(super) async fn execute_tool_dispatch(
         &self,
         cg: &TraceDecay,
@@ -238,6 +239,15 @@ impl McpServer {
             .session_sync_service
             .as_ref()
             .and_then(std::sync::Weak::upgrade);
+        // Advisory admission reads the arguments before they move; the
+        // recall itself runs only after the handler answered.
+        #[cfg(feature = "memory-provider-host")]
+        let advisory_call = crate::daemon::retained_owner::cognitive_recall::advisory_context_call(
+            tool_name,
+            &handler_arguments,
+            application_deadline.as_ref(),
+            application_cancellation.as_ref(),
+        );
         let dispatch: std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + '_>,
         > = handle_tool_call_with_registry_options(
@@ -321,7 +331,7 @@ impl McpServer {
                 ),
             },
         );
-        if let Some(read_flight) = read_flight {
+        let dispatched = if let Some(read_flight) = read_flight {
             match read_flight {
                 ReadFlightClaim::Leader(leader) => match dispatch.await {
                     Ok(result) => Ok(leader.complete(result)),
@@ -337,7 +347,28 @@ impl McpServer {
             }
         } else {
             dispatch.await
-        }
+        };
+        // The authoritative handler keeps its whole deadline, so a blocking
+        // provider can never starve, delay or displace code truth, and a lane
+        // that fails leaves the canonical result exactly as produced. Running
+        // here also keeps a coalesced read free of this caller's candidates.
+        #[cfg(feature = "memory-provider-host")]
+        let dispatched = match (dispatched, advisory_call) {
+            (Ok(result), Some(call)) => Ok(
+                match crate::daemon::retained_owner::cognitive_recall::advisory_memory_context_for_call(
+                    self.cognitive_recall_port_for_session(call.canonical_session_id()),
+                    self.cognitive_recall_mount.as_deref(),
+                    call,
+                )
+                .await
+                {
+                    Some(advisory) => advisory.appended_to(result),
+                    None => result,
+                },
+            ),
+            (dispatched, _) => dispatched,
+        };
+        dispatched
     }
 }
 

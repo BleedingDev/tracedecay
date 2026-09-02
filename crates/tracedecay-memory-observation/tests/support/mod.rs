@@ -3,16 +3,18 @@
 //! so a test that wants an invalid one has to break it on purpose.
 
 use std::error::Error;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use sha2::{Digest, Sha256};
 use tracedecay_memory_observation::{
-    AdmittedObservationV1, CanonicalSettlementReceiptV1, DeliveryReceiptIdV1, ForgetSourceKeyV1,
-    LeaseRequestV1, LeasedObservationV1, ObservationCommittedEffectV1,
-    ObservationDeliveryReceiptV1, ObservationIdV1, ObservationIdempotencyKeyV1,
-    ObservationOutcomeV1, ObservationPrivacyV1, PrivacyClassificationV1, ProvenanceOriginV1,
-    ProviderEffectSummaryV1, ProviderTargetV1, RetentionClassV1, RetentionPolicyV1,
-    SanitizationBindingV1, SourceAuthorityV1, SourceSequenceV1, SourceStreamIdV1,
-    SourceStreamKeyV1, SqliteObservationJournal, WithheldAdmissionV1, extensions_digest,
+    AdmittedObservationV1, BackpressureGateV1, BackpressurePolicyV1, CanonicalSettlementReceiptV1,
+    DeliveryReceiptIdV1, ForgetSourceKeyV1, IngressControlV1, LeaseRequestV1, LeasedObservationV1,
+    ObservationCommittedEffectV1, ObservationDeliveryReceiptV1, ObservationIdV1,
+    ObservationIdempotencyKeyV1, ObservationLaneKeyV1, ObservationOutcomeV1, ObservationPrivacyV1,
+    PrivacyClassificationV1, ProvenanceOriginV1, ProviderEffectSummaryV1, ProviderTargetV1,
+    RetentionClassV1, RetentionPolicyV1, SanitizationBindingV1, SourceAuthorityV1,
+    SourceSequenceV1, SourceStreamIdV1, SourceStreamKeyV1, SqliteObservationJournal,
+    WithheldAdmissionV1, extensions_digest,
 };
 use tracedecay_memory_provider_api::{
     CanonicalPayload, OwnedExactScope, OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId,
@@ -465,4 +467,91 @@ pub fn unavailable_receipt(leased: &LeasedObservationV1, at: i64) -> Observation
         ObservationCommittedEffectV1::None,
         at,
     )
+}
+
+/// Backpressure thresholds that never shed on their own, so a test that wants
+/// a shed has to create real pressure rather than inherit it from the fixture.
+///
+/// The queue ceiling itself is still enforced by the gate — that bound belongs
+/// to the journal's retention policy, not to these thresholds.
+pub fn backpressure_policy() -> BackpressurePolicyV1 {
+    BackpressurePolicyV1 {
+        shed_optional_at_ppm: 900_000,
+        refuse_at_ppm: 1_000_000,
+        max_backlog_age_micros: 365 * DAY,
+        foreground_budget_micros: HOUR,
+        foreground_breach_streak: 3,
+    }
+}
+
+pub fn gate() -> Result<BackpressureGateV1, Box<dyn Error>> {
+    Ok(BackpressureGateV1::new(backpressure_policy())?)
+}
+
+/// A gate under caller-chosen thresholds.
+pub fn gate_with(policy: BackpressurePolicyV1) -> Result<BackpressureGateV1, Box<dyn Error>> {
+    Ok(BackpressureGateV1::new(policy)?)
+}
+
+/// The provider lane the fixture target addresses.
+pub fn lane() -> Result<ObservationLaneKeyV1, Box<dyn Error>> {
+    Ok(ObservationLaneKeyV1::of(&target()?))
+}
+
+/// A caller-owned ingest bound with an explicit clock, deadline, and
+/// cancellation flag.
+///
+/// Nothing here defaults: a test says what instant the lane is measured on,
+/// how much budget the call has, and whether the caller has given up. All
+/// three are interior-mutable so a test can move the clock or cancel *while*
+/// an ingest is in flight, which is the only way to prove the bound reaches
+/// inside a record rather than only between them.
+#[derive(Debug)]
+pub struct TestIngestControl {
+    now: AtomicI64,
+    deadline: AtomicI64,
+    cancelled: AtomicBool,
+}
+
+impl TestIngestControl {
+    /// A control whose clock reads `now` and whose deadline is `budget` later.
+    #[must_use]
+    pub fn at(now: i64, budget: i64) -> Self {
+        Self {
+            now: AtomicI64::new(now),
+            deadline: AtomicI64::new(now.saturating_add(budget)),
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    /// Moves the caller's clock.
+    pub fn set_now(&self, now: i64) {
+        self.now.store(now, Ordering::Relaxed);
+    }
+
+    /// Fires the caller's cancellation.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+impl IngressControlV1 for TestIngestControl {
+    fn now_unix_micros(&self) -> i64 {
+        self.now.load(Ordering::Relaxed)
+    }
+
+    fn deadline_unix_micros(&self) -> i64 {
+        self.deadline.load(Ordering::Relaxed)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+}
+
+/// The bound most tests run under: the fixture instant with a day of budget,
+/// so nothing stops on a deadline the test did not ask for.
+#[must_use]
+pub fn ingest_control() -> TestIngestControl {
+    TestIngestControl::at(T0, DAY)
 }

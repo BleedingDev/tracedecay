@@ -1555,7 +1555,14 @@ fn native_recall_candidate(
     fact: &FactV1,
     hit: &tracedecay_application::retained_surfaces::FactSearchHitV1,
 ) -> Result<Value, NativeReadFailure> {
-    let source_refs = fact_source_refs(fact);
+    // The canonical record this candidate *is*, named in the host's own
+    // canonical-record reference form so host provenance hydration can read
+    // it back through the retained project-memory authority instead of
+    // taking the adapter's word for it. It leads `origin_refs` because it is
+    // the strongest origin the adapter can offer; the evidence anchors that
+    // produced the fact follow it.
+    let mut origin_refs = vec![format!("record:{}", fact.fact_id)];
+    origin_refs.extend(fact_source_refs(fact));
     let summary = hit
         .why
         .clone()
@@ -1623,7 +1630,7 @@ fn native_recall_candidate(
         },
         "provenance": {
             "state": "available",
-            "origin_refs": source_refs,
+            "origin_refs": origin_refs,
             "observation_refs": [],
             "source_refs": fact_source_refs(fact),
             "native_linkage": native_linkage,

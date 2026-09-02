@@ -73,8 +73,11 @@ mod error;
 mod identity;
 mod inspection;
 mod lease;
+mod orphan;
 mod port;
 mod receipt;
+mod recovery;
+mod refusal;
 mod retention;
 mod runtime;
 mod settlement;
@@ -93,10 +96,11 @@ pub use identity::{
     SOURCE_EVENT_ID_MAX_BYTES, SourceSequenceV1, SourceStreamIdV1, extensions_digest,
 };
 pub use inspection::{
-    JournalInspectionFilterV1, JournalInspectionPageV1, JournalInspectionRowV1, QueuePressureV1,
-    ReplayCursorV1, ReplayDispositionV1,
+    JournalInspectionFilterV1, JournalInspectionPageV1, JournalInspectionRowV1,
+    ObservationLaneKeyV1, QueuePressureV1, ReplayCursorV1, ReplayDispositionV1,
 };
 pub use lease::{AttemptOutcomeV1, LeaseRequestV1, LeasedObservationV1};
+pub use orphan::{AttemptOrphanCauseV1, AttemptOrphanRecordV1, AttemptOrphanRecoveryV1};
 pub use port::{
     AppendOutcomeV1, ObservationDispatchPortV1, ObservationJournalReaderV1,
     ObservationRetentionPortV1,
@@ -105,17 +109,32 @@ pub use receipt::{
     ObservationCommittedEffectV1, ObservationDeliveryReceiptV1, ObservationOutcomeV1,
     ProviderEffectSummaryV1,
 };
+pub use recovery::{
+    AcknowledgedPositionV1, HostRecoveryStateV1, ObservationRecoveryPortV1, ProviderCheckpointV1,
+    ProviderReplayPositionV1, RecoveryAssessmentIdV1, RecoveryBudgetV1, RecoveryControlV1,
+    RecoveryPlanV1, RecoveryRefusalWriteV1, RecoveryTargetKeyV1, RecoveryTimeBudgetV1,
+    RepairActionV1, STATE_SCHEMA_VERSION_MAX_BYTES, StateIncompatibilityV1,
+    UnacknowledgedFrontierV1,
+};
+pub use refusal::{
+    AttemptRefusalCategoryV1, AttemptRefusalOutcomeV1, AttemptRefusalRecordV1,
+    REFUSAL_TEXT_MAX_BYTES,
+};
 pub use retention::{
     ForgetReceiptV1, ForgetSourceRequestV1, ForgetVerificationV1, RetentionPolicyV1,
     RetentionSweepReceiptV1,
 };
 pub use runtime::{
-    AdapterFailureV1, AdmissionDecisionV1, DeliveryAttemptV1, DeliveryBatchReportV1,
-    DeliveryControlV1, DeliveryFailureV1, DeliveryRuntimeV1, DeliveryWakeV1, DispatchPolicyV1,
-    DispatchRequestV1, IngressBatchReportV1, IngressHaltV1, IngressResumeV1, IngressRuntimeV1,
-    ObservationAdmissionAdapterV1, ObservationRuntimeError, ProviderDeliveryAdapterV1,
-    RetentionSweepScheduleV1, RetentionSweeperV1, RetentionTickV1, ShutdownReportV1,
-    ShutdownRequestV1, SourceRecordV1, TerminalIdentityMismatchV1, WakeOutcomeV1,
+    AdapterFailureV1, AdmissionDecisionV1, BackpressureDecisionV1, BackpressureGateV1,
+    BackpressureHaltV1, BackpressurePolicyV1, BackpressureReasonV1, BackpressureRefusalV1,
+    BackpressureStateV1, DeliveryAttemptV1, DeliveryBatchReportV1, DeliveryControlV1,
+    DeliveryFailureV1, DeliveryRuntimeV1, DeliveryWakeV1, DispatchPolicyV1, DispatchRequestV1,
+    DrainBoundsV1, DrainReportV1, DrainStopV1, ForegroundOutcomeV1, IngressBatchReportV1,
+    IngressControlV1, IngressHaltV1, IngressResumeV1, IngressRuntimeV1, IngressStopReasonV1,
+    IngressStopV1, ObservationAdmissionAdapterV1, ObservationLoadClassV1, ObservationRuntimeError,
+    ProviderDeliveryAdapterV1, QueueBacklogV1, RecoveryRuntimeV1, RetentionSweepScheduleV1,
+    RetentionSweeperV1, RetentionTickV1, RetryBackoffV1, ShutdownReportV1, ShutdownRequestV1,
+    SourceRecordV1, TerminalIdentityMismatchV1, UTILIZATION_SCALE_PPM, WakeOutcomeV1,
 };
 pub use settlement::{CanonicalSettlementReceiptV1, SourceAuthorityV1, SourceStreamKeyV1};
 pub use sqlite::{SCHEMA_VERSION, SqliteObservationJournal};

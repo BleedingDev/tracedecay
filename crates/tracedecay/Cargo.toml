@@ -229,12 +229,17 @@ production = [
     "full",
     "semantic-fastembed",
     "graph-sealed-store",
-    "memory-provider-host",
 ]
 
 # Product-owned provider composition is mounted at the daemon project-server
-# lifetime boundary. Keeping the dependency optional leaves feature-minimal
-# builds free of provider-registry code.
+# lifetime boundary. Opt-in only: never in `default` and never in
+# `production`, so a shipped default build compiles no provider-registry,
+# observation-journal, or hygiene code at all and behaves exactly as upstream.
+# `product/upstream/convergence-map.json` and
+# `product/upstream/patch-footprint-policy.md` both record this mount as the
+# "default-off host feature"; enabling it is a deliberate build choice
+# (`--features memory-provider-host`), and even then the runtime configuration
+# gates `memory.provider_native_enabled.v1` decide whether anything runs.
 #
 # The durable observation journal and the hygiene pipeline join the same
 # feature rather than getting one of their own: a mounted provider host that
@@ -245,6 +250,7 @@ memory-provider-host = [
     "dep:tracedecay-memory-observation",
     "dep:tracedecay-memory-hygiene",
 ]
+
 
 # Exact token counting for the Savings & Cost dashboard (tiktoken BPE).
 # Embeds the o200k_base/cl100k_base vocabularies (~4 MB of binary weight);

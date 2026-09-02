@@ -141,6 +141,47 @@ pub enum ObservationRuntimeError {
         received: u64,
     },
 
+    /// The class the adapter answered before admission is not the class the
+    /// admitted envelope carries.
+    ///
+    /// Ingress refuses a lane's work early on the pre-admission answer, so
+    /// that answer has to be the same one the envelope will produce. A
+    /// disagreement means either the adapter is inconsistent or a stream is
+    /// trying to buy itself out of shedding, and neither may be resolved by
+    /// picking one of the two answers.
+    #[error(
+        "admission adapter classified source event {source_event_id} at sequence \
+         {source_sequence} as {declared} before admission but the admitted envelope \
+         is {derived}"
+    )]
+    LoadClassMismatch {
+        /// Settled source event the adapter was handed.
+        source_event_id: String,
+        /// Position of that event in its stream.
+        source_sequence: u64,
+        /// Canonical wire value the adapter answered up front.
+        declared: &'static str,
+        /// Canonical wire value derived from the admitted envelope.
+        derived: &'static str,
+    },
+
+    /// The delivery that owns this recovery assessment was cancelled. Nothing
+    /// was decided and nothing was written at or after the named stage, so the
+    /// next attempt assesses the same incarnation from scratch.
+    #[error("recovery assessment was cancelled before {stage}")]
+    RecoveryCancelled {
+        /// Stage the assessment stopped in front of.
+        stage: &'static str,
+    },
+
+    /// The assessment's own deadline expired. Same terminal shape as
+    /// cancellation: no decision, no write, no consumed repair attempt.
+    #[error("recovery assessment budget expired before {stage}")]
+    RecoveryDeadlineExceeded {
+        /// Stage the assessment stopped in front of.
+        stage: &'static str,
+    },
+
     /// A record in the batch belongs to a different source stream than the one
     /// being resumed. One ingest call drives exactly one stream's watermark.
     #[error("ingress batch is scoped to stream {expected} but carries a record from {received}")]

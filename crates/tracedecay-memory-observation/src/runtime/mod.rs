@@ -20,7 +20,10 @@
 //!   bytes to a typed provider delivery adapter, records an immutable attempt
 //!   receipt for every provider answer, releases the lease when there was no
 //!   answer, reaps lapsed leases, and stops within an explicit bound.
-//! * [`DeliveryWakeV1`] carries the signal from the first to the second.
+//! * [`DeliveryWakeV1`] carries the signal from the first to the second. It is
+//!   one collapsed edge, not a count, so [`DeliveryRuntimeV1::drain`] — not the
+//!   signal — is what converges a journalled backlog, under an explicit round
+//!   and wall bound.
 //! * [`RetentionSweeperV1`] decides, on the caller's clock, when the journal's
 //!   bounded retention sweep is due, so an expired row is terminalized and
 //!   purged by the same loop that delivers — never by a sweep nobody mounts.
@@ -33,23 +36,32 @@
 //! TraceDecay store, provider registry, or host type crosses this boundary.
 //! Nothing here reads content: the runtime moves bytes it never inspects.
 
+mod backpressure;
 mod delivery;
 mod dispatch_policy;
 mod error;
 mod ingress;
+mod recovery;
 mod retention;
 mod wake;
 
+pub use backpressure::{
+    BackpressureDecisionV1, BackpressureGateV1, BackpressureHaltV1, BackpressurePolicyV1,
+    BackpressureReasonV1, BackpressureRefusalV1, BackpressureStateV1, ForegroundOutcomeV1,
+    ObservationLoadClassV1, QueueBacklogV1, UTILIZATION_SCALE_PPM,
+};
 pub use delivery::{
     DeliveryAttemptV1, DeliveryBatchReportV1, DeliveryControlV1, DeliveryFailureV1,
-    DeliveryRuntimeV1, DispatchRequestV1, ProviderDeliveryAdapterV1, ShutdownReportV1,
-    ShutdownRequestV1,
+    DeliveryRuntimeV1, DispatchRequestV1, DrainBoundsV1, DrainReportV1, DrainStopV1,
+    ProviderDeliveryAdapterV1, ShutdownReportV1, ShutdownRequestV1,
 };
-pub use dispatch_policy::DispatchPolicyV1;
+pub use dispatch_policy::{DispatchPolicyV1, RetryBackoffV1};
 pub use error::{AdapterFailureV1, ObservationRuntimeError, TerminalIdentityMismatchV1};
 pub use ingress::{
-    AdmissionDecisionV1, IngressBatchReportV1, IngressHaltV1, IngressResumeV1, IngressRuntimeV1,
-    ObservationAdmissionAdapterV1, SourceRecordV1,
+    AdmissionDecisionV1, IngressBatchReportV1, IngressControlV1, IngressHaltV1, IngressResumeV1,
+    IngressRuntimeV1, IngressStopReasonV1, IngressStopV1, ObservationAdmissionAdapterV1,
+    SourceRecordV1,
 };
+pub use recovery::RecoveryRuntimeV1;
 pub use retention::{RetentionSweepScheduleV1, RetentionSweeperV1, RetentionTickV1};
 pub use wake::{DeliveryWakeV1, WakeOutcomeV1};

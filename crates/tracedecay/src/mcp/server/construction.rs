@@ -635,10 +635,7 @@ impl McpServerConstructionContext {
     }
 
     #[cfg(feature = "memory-provider-host")]
-    pub(crate) fn with_observation_journey_mount(
-        mut self,
-        mount: ObservationJourneyMount,
-    ) -> Self {
+    pub(crate) fn with_observation_journey_mount(mut self, mount: ObservationJourneyMount) -> Self {
         self.observation_journey_mount = Some(mount);
         self
     }

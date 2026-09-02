@@ -20,16 +20,18 @@ use std::time::{Duration, Instant};
 
 use support::{
     Builder, LEASE, MINUTE, PROVENANCE_DIGEST, PROVIDER, PROVIDER_RECEIPT_DIGEST, SECOND, T0,
-    TestResult, journal, lease_request, policy, stream_key, withheld_at,
+    TestResult, ingest_control, journal, lane, lease_request, policy, stream_key, withheld_at,
 };
 
 use tracedecay_memory_observation::{
-    AdmissionDecisionV1, AppendOutcomeV1, DeliveryAttemptV1, DeliveryControlV1, DeliveryRuntimeV1,
-    DeliveryStateV1, DeliveryWakeV1, DispatchPolicyV1, DispatchRequestV1, IngressResumeV1,
+    AdmissionDecisionV1, AppendOutcomeV1, AttemptRefusalCategoryV1, BackpressureReasonV1,
+    BackpressureStateV1, DeliveryAttemptV1, DeliveryControlV1, DeliveryRuntimeV1, DeliveryStateV1,
+    DeliveryWakeV1, DispatchPolicyV1, DispatchRequestV1, IngressControlV1, IngressResumeV1,
     IngressRuntimeV1, JournalInspectionFilterV1, LeasedObservationV1,
     ObservationAdmissionAdapterV1, ObservationDispatchPortV1, ObservationJournalError,
-    ObservationJournalReaderV1, ObservationRuntimeError, ProviderDeliveryAdapterV1,
-    ReplayDispositionV1, RetentionPolicyV1, ShutdownRequestV1, SourceRecordV1, SourceSequenceV1,
+    ObservationJournalReaderV1, ObservationLaneKeyV1, ObservationLoadClassV1,
+    ObservationRuntimeError, ProviderDeliveryAdapterV1, ReplayDispositionV1, RetentionClassV1,
+    RetentionPolicyV1, RetryBackoffV1, ShutdownRequestV1, SourceRecordV1, SourceSequenceV1,
     SqliteObservationJournal, WakeOutcomeV1,
 };
 use tracedecay_memory_provider_api::contract::TerminalCode;
@@ -58,6 +60,7 @@ fn adapter_error(error: &dyn Display) -> AdapterError {
 /// Admission that mints the envelope a real pipeline would mint for the record,
 /// withholding exactly the sequences it was told to withhold.
 struct FixtureAdmission {
+    lane: ObservationLaneKeyV1,
     withhold_at: BTreeSet<u64>,
     /// Offsets the sequence the *decision* claims, to prove the runtime refuses
     /// a decision that answers about another event.
@@ -66,24 +69,27 @@ struct FixtureAdmission {
 }
 
 impl FixtureAdmission {
-    fn admitting() -> Self {
+    fn admitting(lane: ObservationLaneKeyV1) -> Self {
         Self {
+            lane,
             withhold_at: BTreeSet::new(),
             sequence_drift: 0,
             calls: Cell::new(0),
         }
     }
 
-    fn withholding(sequences: &[u64]) -> Self {
+    fn withholding(lane: ObservationLaneKeyV1, sequences: &[u64]) -> Self {
         Self {
+            lane,
             withhold_at: sequences.iter().copied().collect(),
             sequence_drift: 0,
             calls: Cell::new(0),
         }
     }
 
-    fn drifting() -> Self {
+    fn drifting(lane: ObservationLaneKeyV1) -> Self {
         Self {
+            lane,
             withhold_at: BTreeSet::new(),
             sequence_drift: 1,
             calls: Cell::new(0),
@@ -94,10 +100,22 @@ impl FixtureAdmission {
 impl ObservationAdmissionAdapterV1 for FixtureAdmission {
     type Record = ();
     type Error = AdapterError;
+    type Control = dyn IngressControlV1;
+
+    fn lane(&self, _record: &SourceRecordV1<Self::Record>) -> ObservationLaneKeyV1 {
+        self.lane.clone()
+    }
+
+    fn classify(&self, _record: &SourceRecordV1<Self::Record>) -> ObservationLoadClassV1 {
+        // Every fixture envelope is project-lifetime, so the class the gate
+        // sees up front is the class the envelope will carry.
+        ObservationLoadClassV1::of(RetentionClassV1::Project)
+    }
 
     fn decide(
         &self,
         record: &SourceRecordV1<Self::Record>,
+        _control: &Self::Control,
     ) -> Result<AdmissionDecisionV1, Self::Error> {
         self.calls.set(self.calls.get().saturating_add(1));
         let sequence = record.source_sequence.0.saturating_add(self.sequence_drift);
@@ -143,7 +161,6 @@ struct ScriptedProvider {
     /// Bodies the provider considers already applied, keyed by idempotency key.
     applied: RefCell<BTreeSet<String>>,
     now: Cell<i64>,
-    retry_after: Cell<i64>,
 }
 
 impl ScriptedProvider {
@@ -154,7 +171,6 @@ impl ScriptedProvider {
             seen: RefCell::new(Vec::new()),
             applied: RefCell::new(BTreeSet::new()),
             now: Cell::new(now),
-            retry_after: Cell::new(now),
         }
     }
 
@@ -166,7 +182,6 @@ impl ScriptedProvider {
 
     fn advance_to(&self, now: i64) {
         self.now.set(now);
-        self.retry_after.set(now);
     }
 }
 
@@ -201,9 +216,7 @@ impl ProviderDeliveryAdapterV1 for ScriptedProvider {
                 self.applied
                     .borrow_mut()
                     .insert(leased.idempotency_key.as_str().to_owned());
-                Ok(DeliveryAttemptV1::Unanswered {
-                    retry_after_unix_micros: self.retry_after.get(),
-                })
+                Ok(DeliveryAttemptV1::Unanswered)
             }
             AnswerV1::Applied => {
                 self.applied
@@ -275,7 +288,7 @@ const ATTEMPT_BUDGET: i64 = 5 * SECOND;
 fn dispatch_at(now: i64) -> DispatchRequestV1 {
     DispatchRequestV1 {
         lease: lease_request(now, 8),
-        retry_after_unix_micros: now.saturating_add(MINUTE),
+        retry_backoff: RetryBackoffV1::of(&policy()),
         attempt_budget_micros: ATTEMPT_BUDGET,
     }
 }
@@ -350,9 +363,10 @@ impl ProviderDeliveryAdapterV1 for BlockingProvider {
         if token.is_cancelled() {
             // The provider stopped before committing anything: no answer, no
             // receipt, and the remaining budget is reported truthfully.
-            return Ok(DeliveryAttemptV1::Unanswered {
-                retry_after_unix_micros: self.now,
-            });
+            // The control really is cancelled, so the row goes back
+            // eligible at once rather than serving a backoff for a shutdown
+            // it did not cause.
+            return Ok(DeliveryAttemptV1::CancelledByShutdown);
         }
         Err(AdapterError(format!(
             "provider ran past its hard stop with {} micros of budget left",
@@ -366,7 +380,6 @@ impl ProviderDeliveryAdapterV1 for BlockingProvider {
 struct ShutdownDuringBatchProvider<'a> {
     wake: &'a DeliveryWakeV1,
     deadlines: RefCell<Vec<(u32, i64)>>,
-    now: i64,
 }
 
 impl ProviderDeliveryAdapterV1 for ShutdownDuringBatchProvider<'_> {
@@ -389,16 +402,13 @@ impl ProviderDeliveryAdapterV1 for ShutdownDuringBatchProvider<'_> {
             control.is_cancelled(),
             "the control handed to an attempt must be the wake edge's own token"
         );
-        Ok(DeliveryAttemptV1::Unanswered {
-            retry_after_unix_micros: self.now,
-        })
+        Ok(DeliveryAttemptV1::CancelledByShutdown)
     }
 }
 
 /// A provider that only records the bound it was handed.
 struct DeadlineRecordingProvider {
     deadlines: RefCell<Vec<(u64, i64)>>,
-    now: i64,
 }
 
 impl ProviderDeliveryAdapterV1 for DeadlineRecordingProvider {
@@ -412,9 +422,7 @@ impl ProviderDeliveryAdapterV1 for DeadlineRecordingProvider {
         self.deadlines
             .borrow_mut()
             .push((leased.source_sequence.0, control.deadline_unix_micros()));
-        Ok(DeliveryAttemptV1::Unanswered {
-            retry_after_unix_micros: self.now,
-        })
+        Ok(DeliveryAttemptV1::Unanswered)
     }
 }
 
@@ -425,6 +433,8 @@ fn dispatch_policy() -> DispatchPolicyV1 {
         batch_max_bytes: 1_048_576,
         attempt_budget_micros: ATTEMPT_BUDGET,
         reap_budget: 16,
+        max_rounds_per_drain: 4,
+        drain_budget_micros: 30 * SECOND,
     }
 }
 
@@ -450,8 +460,10 @@ fn ingest_appends_in_order_wakes_delivery_and_replays_idempotently() -> TestResu
     let directory = tempfile::tempdir()?;
     let store = journal(&directory.path().join("journal.sqlite3"))?;
     let wake = DeliveryWakeV1::new();
-    let admission = FixtureAdmission::admitting();
-    let ingress = IngressRuntimeV1::new(&store, &admission, &wake);
+    let admission = FixtureAdmission::admitting(lane()?);
+    let gate = support::gate()?;
+    let control = ingest_control();
+    let ingress = IngressRuntimeV1::new(&store, &admission, &wake, &gate, &control);
     let stream = stream_key("session-1")?;
 
     let resume = ingress.recover(&stream)?;
@@ -500,8 +512,10 @@ fn restart_resumes_from_the_journal_and_admits_only_what_is_new() -> TestResult 
     {
         let store = journal(&path)?;
         let wake = DeliveryWakeV1::new();
-        let admission = FixtureAdmission::admitting();
-        let ingress = IngressRuntimeV1::new(&store, &admission, &wake);
+        let admission = FixtureAdmission::admitting(lane()?);
+        let gate = support::gate()?;
+        let control = ingest_control();
+        let ingress = IngressRuntimeV1::new(&store, &admission, &wake, &gate, &control);
         let resume = ingress.recover(&stream_key("session-1")?)?;
         let report = ingress.ingest(&resume, &records(&[1, 2])?)?;
         assert_eq!(report.appended, 2);
@@ -510,8 +524,10 @@ fn restart_resumes_from_the_journal_and_admits_only_what_is_new() -> TestResult 
     // ---- phase 2: a brand-new process on the same file ----
     let store = journal(&path)?;
     let wake = DeliveryWakeV1::new();
-    let admission = FixtureAdmission::admitting();
-    let ingress = IngressRuntimeV1::new(&store, &admission, &wake);
+    let admission = FixtureAdmission::admitting(lane()?);
+    let gate = support::gate()?;
+    let control = ingest_control();
+    let ingress = IngressRuntimeV1::new(&store, &admission, &wake, &gate, &control);
 
     let resume = ingress.recover(&stream_key("session-1")?)?;
     assert_eq!(resume.resume_after, Some(SourceSequenceV1(2)));
@@ -535,8 +551,10 @@ fn a_withheld_decision_advances_the_watermark_and_closes_that_position() -> Test
     let directory = tempfile::tempdir()?;
     let store = journal(&directory.path().join("journal.sqlite3"))?;
     let wake = DeliveryWakeV1::new();
-    let hygiene = FixtureAdmission::withholding(&[2]);
-    let ingress = IngressRuntimeV1::new(&store, &hygiene, &wake);
+    let hygiene = FixtureAdmission::withholding(lane()?, &[2]);
+    let gate = support::gate()?;
+    let control = ingest_control();
+    let ingress = IngressRuntimeV1::new(&store, &hygiene, &wake, &gate, &control);
     let stream = stream_key("session-1")?;
 
     let resume = ingress.recover(&stream)?;
@@ -561,8 +579,10 @@ fn a_withheld_decision_advances_the_watermark_and_closes_that_position() -> Test
     // A later run that tries to admit the refused position is refused by the
     // journal, and the runtime halts on that typed outcome instead of stepping
     // over it.
-    let admitting = FixtureAdmission::admitting();
-    let retry = IngressRuntimeV1::new(&store, &admitting, &wake);
+    let admitting = FixtureAdmission::admitting(lane()?);
+    let gate = support::gate()?;
+    let control = ingest_control();
+    let retry = IngressRuntimeV1::new(&store, &admitting, &wake, &gate, &control);
     let rewound = IngressResumeV1 {
         stream: stream.clone(),
         resume_after: Some(SourceSequenceV1(1)),
@@ -586,8 +606,10 @@ fn a_decision_about_another_event_never_moves_the_watermark() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = journal(&directory.path().join("journal.sqlite3"))?;
     let wake = DeliveryWakeV1::new();
-    let drifting = FixtureAdmission::drifting();
-    let ingress = IngressRuntimeV1::new(&store, &drifting, &wake);
+    let drifting = FixtureAdmission::drifting(lane()?);
+    let gate = support::gate()?;
+    let control = ingest_control();
+    let ingress = IngressRuntimeV1::new(&store, &drifting, &wake, &gate, &control);
     let stream = stream_key("session-1")?;
 
     let resume = ingress.recover(&stream)?;
@@ -611,8 +633,10 @@ fn an_out_of_order_batch_is_refused_before_anything_is_appended() -> TestResult 
     let directory = tempfile::tempdir()?;
     let store = journal(&directory.path().join("journal.sqlite3"))?;
     let wake = DeliveryWakeV1::new();
-    let admission = FixtureAdmission::admitting();
-    let ingress = IngressRuntimeV1::new(&store, &admission, &wake);
+    let admission = FixtureAdmission::admitting(lane()?);
+    let gate = support::gate()?;
+    let control = ingest_control();
+    let ingress = IngressRuntimeV1::new(&store, &admission, &wake, &gate, &control);
     let stream = stream_key("session-1")?;
     let resume = ingress.recover(&stream)?;
 
@@ -646,20 +670,24 @@ fn a_capacity_refusal_halts_the_batch_instead_of_leaving_a_hole() -> TestResult 
         },
     )?;
     let wake = DeliveryWakeV1::new();
-    let admission = FixtureAdmission::admitting();
-    let ingress = IngressRuntimeV1::new(&store, &admission, &wake);
+    let admission = FixtureAdmission::admitting(lane()?);
+    let gate = support::gate()?;
+    let control = ingest_control();
+    let ingress = IngressRuntimeV1::new(&store, &admission, &wake, &gate, &control);
     let stream = stream_key("session-1")?;
 
     let resume = ingress.recover(&stream)?;
     let report = ingress.ingest(&resume, &records(&[1, 2, 3])?)?;
     assert_eq!(report.appended, 1);
     assert_eq!(report.high_watermark, Some(SourceSequenceV1(1)));
-    let halt = report.halted_on.ok_or("expected a capacity halt")?;
-    assert_eq!(halt.source_sequence, SourceSequenceV1(2));
-    assert!(matches!(
-        halt.outcome,
-        AppendOutcomeV1::RejectedCapacity { .. }
-    ));
+    // The ceiling is now enforced by the backpressure gate, one pressure read
+    // ahead of the append, so the batch stops without paying for a transaction
+    // that could only have answered `RejectedCapacity`.
+    assert!(report.halted_on.is_none());
+    let shed = report.shed_on.ok_or("expected a capacity shed")?;
+    assert_eq!(shed.source_sequence, SourceSequenceV1(2));
+    assert_eq!(shed.refusal.reason, BackpressureReasonV1::QueueCeiling);
+    assert_eq!(shed.refusal.state, BackpressureStateV1::Saturated);
 
     // Sequence 3 was never offered, so the watermark still points at 1 and the
     // refused position stays admittable once capacity frees up.
@@ -667,6 +695,15 @@ fn a_capacity_refusal_halts_the_batch_instead_of_leaving_a_hole() -> TestResult 
         .replay_cursor(&stream)?
         .ok_or("cursor missing after a partial batch")?;
     assert_eq!(cursor.last_admitted_sequence, SourceSequenceV1(1));
+
+    // The journal keeps its own typed capacity refusal for a co-located caller
+    // that appends without going through ingress: the gate is a cheaper first
+    // line, never the only one.
+    let direct = Builder::at_sequence(2).build()?;
+    assert!(matches!(
+        store.append_admitted(&direct)?,
+        AppendOutcomeV1::RejectedCapacity { queue_items: 1, .. }
+    ));
     Ok(())
 }
 
@@ -675,8 +712,10 @@ fn delivery_sends_the_stored_bytes_and_records_one_receipt_per_attempt() -> Test
     let directory = tempfile::tempdir()?;
     let store = journal(&directory.path().join("journal.sqlite3"))?;
     let wake = DeliveryWakeV1::new();
-    let admission = FixtureAdmission::admitting();
-    let ingress = IngressRuntimeV1::new(&store, &admission, &wake);
+    let admission = FixtureAdmission::admitting(lane()?);
+    let gate = support::gate()?;
+    let control = ingest_control();
+    let ingress = IngressRuntimeV1::new(&store, &admission, &wake, &gate, &control);
     let resume = ingress.recover(&stream_key("session-1")?)?;
     assert_eq!(ingress.ingest(&resume, &records(&[1, 2])?)?.appended, 2);
 
@@ -716,8 +755,10 @@ fn an_acknowledgement_lost_after_the_provider_committed_is_redelivered() -> Test
     let directory = tempfile::tempdir()?;
     let store = journal(&directory.path().join("journal.sqlite3"))?;
     let wake = DeliveryWakeV1::new();
-    let admission = FixtureAdmission::admitting();
-    let ingress = IngressRuntimeV1::new(&store, &admission, &wake);
+    let admission = FixtureAdmission::admitting(lane()?);
+    let gate = support::gate()?;
+    let control = ingest_control();
+    let ingress = IngressRuntimeV1::new(&store, &admission, &wake, &gate, &control);
     let resume = ingress.recover(&stream_key("session-1")?)?;
     assert_eq!(ingress.ingest(&resume, &records(&[1])?)?.appended, 1);
 
@@ -769,8 +810,10 @@ fn an_adapter_failure_releases_the_lease_and_reports_the_cause() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = journal(&directory.path().join("journal.sqlite3"))?;
     let wake = DeliveryWakeV1::new();
-    let admission = FixtureAdmission::admitting();
-    let ingress = IngressRuntimeV1::new(&store, &admission, &wake);
+    let admission = FixtureAdmission::admitting(lane()?);
+    let gate = support::gate()?;
+    let control = ingest_control();
+    let ingress = IngressRuntimeV1::new(&store, &admission, &wake, &gate, &control);
     let resume = ingress.recover(&stream_key("session-1")?)?;
     assert_eq!(ingress.ingest(&resume, &records(&[1])?)?.appended, 1);
 
@@ -797,8 +840,10 @@ fn a_terminal_about_another_scope_never_becomes_a_receipt() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = journal(&directory.path().join("journal.sqlite3"))?;
     let wake = DeliveryWakeV1::new();
-    let admission = FixtureAdmission::admitting();
-    let ingress = IngressRuntimeV1::new(&store, &admission, &wake);
+    let admission = FixtureAdmission::admitting(lane()?);
+    let gate = support::gate()?;
+    let control = ingest_control();
+    let ingress = IngressRuntimeV1::new(&store, &admission, &wake, &gate, &control);
     let resume = ingress.recover(&stream_key("session-1")?)?;
     assert_eq!(ingress.ingest(&resume, &records(&[1])?)?.appended, 1);
 
@@ -818,6 +863,25 @@ fn a_terminal_about_another_scope_never_becomes_a_receipt() -> TestResult {
     let observation = Builder::at_sequence(1).build()?;
     assert!(store.receipts_for(&observation.observation_id)?.is_empty());
     assert_eq!(state_of(&store, 1)?, DeliveryStateV1::Pending);
+
+    // No receipt — and no amnesia either. The attempt number the claim consumed
+    // is gone, so the refusal it was spent on is durable evidence in its own
+    // right, keyed by the same (observation, attempt) pair a receipt would use.
+    assert_eq!(report.refusals_recorded, 1);
+    let refusals = store.attempt_refusals_for(&observation.observation_id)?;
+    assert_eq!(refusals.len(), 1);
+    let refusal = refusals.first().ok_or("expected one refusal")?;
+    assert_eq!(refusal.attempt_number, 1);
+    assert_eq!(
+        refusal.category,
+        AttemptRefusalCategoryV1::TerminalIdentityMismatch
+    );
+    assert_eq!(refusal.refused_field, "exact_scope_sha256");
+    assert_eq!(
+        refusal.expected,
+        Some(observation.exact_scope.exact_scope_sha256())
+    );
+    assert_eq!(refusal.provided.as_deref(), Some(PROVENANCE_DIGEST));
     Ok(())
 }
 
@@ -826,8 +890,10 @@ fn shutdown_is_bounded_and_reports_outstanding_leases_truthfully() -> TestResult
     let directory = tempfile::tempdir()?;
     let store = journal(&directory.path().join("journal.sqlite3"))?;
     let wake = DeliveryWakeV1::new();
-    let admission = FixtureAdmission::admitting();
-    let ingress = IngressRuntimeV1::new(&store, &admission, &wake);
+    let admission = FixtureAdmission::admitting(lane()?);
+    let gate = support::gate()?;
+    let control = ingest_control();
+    let ingress = IngressRuntimeV1::new(&store, &admission, &wake, &gate, &control);
     let resume = ingress.recover(&stream_key("session-1")?)?;
     assert_eq!(ingress.ingest(&resume, &records(&[1])?)?.appended, 1);
 
@@ -977,7 +1043,6 @@ fn shutdown_between_items_releases_the_rest_of_the_batch_without_an_attempt() ->
     let provider = ShutdownDuringBatchProvider {
         wake: &wake,
         deadlines: RefCell::new(Vec::new()),
-        now: T0,
     };
     let delivery = DeliveryRuntimeV1::new(&store, &provider, &wake);
 
@@ -1005,48 +1070,48 @@ fn shutdown_between_items_releases_the_rest_of_the_batch_without_an_attempt() ->
 
 #[test]
 fn an_attempt_deadline_is_the_tightest_of_budget_lease_and_row_deadline() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    let store = journal(&directory.path().join("journal.sqlite3"))?;
-    // Row 1 keeps the fixture's one-hour delivery deadline; row 2 must be
-    // delivered within one second of the lease instant.
-    store.append_admitted(&Builder::at_sequence(1).build()?)?;
-    store.append_admitted(
-        &Builder {
-            deadline: T0 + SECOND,
-            ..Builder::at_sequence(2)
-        }
-        .build()?,
-    )?;
-    let wake = DeliveryWakeV1::new();
-    let provider = DeadlineRecordingProvider {
-        deadlines: RefCell::new(Vec::new()),
-        now: T0,
-    };
-    let delivery = DeliveryRuntimeV1::new(&store, &provider, &wake);
+    // Each budget gets its own journal: an attempt that produced no terminal is
+    // rescheduled on the runtime's own retry curve, so the same rows are not
+    // leasable twice at the same instant — which is precisely the property that
+    // keeps a failed batch from looping inside one drain.
+    fn deadlines_for(attempt_budget_micros: i64) -> Result<Vec<(u64, i64)>, Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = journal(&directory.path().join("journal.sqlite3"))?;
+        // Row 1 keeps the fixture's one-hour delivery deadline; row 2 must be
+        // delivered within one second of the lease instant.
+        store.append_admitted(&Builder::at_sequence(1).build()?)?;
+        store.append_admitted(
+            &Builder {
+                deadline: T0 + SECOND,
+                ..Builder::at_sequence(2)
+            }
+            .build()?,
+        )?;
+        let wake = DeliveryWakeV1::new();
+        let provider = DeadlineRecordingProvider {
+            deadlines: RefCell::new(Vec::new()),
+        };
+        let delivery = DeliveryRuntimeV1::new(&store, &provider, &wake);
+        let report = delivery.dispatch_batch(&DispatchRequestV1 {
+            lease: lease_request(T0, 8),
+            retry_backoff: RetryBackoffV1::of(&policy()),
+            attempt_budget_micros,
+        })?;
+        assert_eq!(report.leased, 2);
+        let deadlines = provider.deadlines.borrow().clone();
+        Ok(deadlines)
+    }
 
     // A budget longer than the lease: the lease expiry binds row 1, the row's
     // own deadline binds row 2.
-    let report = delivery.dispatch_batch(&DispatchRequestV1 {
-        lease: lease_request(T0, 8),
-        retry_after_unix_micros: T0,
-        attempt_budget_micros: 2 * LEASE,
-    })?;
-    assert_eq!(report.leased, 2);
     assert_eq!(
-        provider.deadlines.borrow().as_slice(),
+        deadlines_for(2 * LEASE)?.as_slice(),
         &[(1, T0 + LEASE), (2, T0 + SECOND)]
     );
 
     // A budget shorter than either: the budget binds.
-    provider.deadlines.borrow_mut().clear();
-    let report = delivery.dispatch_batch(&DispatchRequestV1 {
-        lease: lease_request(T0, 8),
-        retry_after_unix_micros: T0,
-        attempt_budget_micros: ATTEMPT_BUDGET,
-    })?;
-    assert_eq!(report.leased, 2);
     assert_eq!(
-        provider.deadlines.borrow().as_slice(),
+        deadlines_for(ATTEMPT_BUDGET)?.as_slice(),
         &[(1, T0 + ATTEMPT_BUDGET), (2, T0 + SECOND)]
     );
     Ok(())
@@ -1065,7 +1130,7 @@ fn a_dispatch_request_without_a_positive_attempt_budget_is_refused_before_leasin
         let error = delivery
             .dispatch_batch(&DispatchRequestV1 {
                 lease: lease_request(T0, 8),
-                retry_after_unix_micros: T0,
+                retry_backoff: RetryBackoffV1::of(&policy()),
                 attempt_budget_micros: budget,
             })
             .err()

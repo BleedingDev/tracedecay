@@ -8,10 +8,16 @@
 //!   anything a provider returns — and the composition root is the only place
 //!   that implements the binding, so one derivation of `agent_session_id`
 //!   exists;
-//! * the application deadline and cancellation snapshot are carried into the
-//!   provider call unchanged, and a request that is already cancelled or past
-//!   its deadline is answered with a typed degradation without contacting the
-//!   provider;
+//! * the application deadline is carried into the provider call unchanged,
+//!   and the caller's *live* cancellation identity — the host-owned
+//!   [`CancellationSignal`] whose token id the request names — is bridged
+//!   into one [`CancellationToken`] that every handshake, call, and pinned
+//!   fallback call of that recall shares. The adapter never mints a
+//!   replacement identity: a signal whose token id differs from the request's
+//!   is refused, and cancellation requested *after* dispatch reaches the
+//!   provider through the token it is already holding. A request that is
+//!   already cancelled or past its deadline is answered with a typed
+//!   degradation without contacting the provider;
 //! * every provider reply is passed through rank-final
 //!   [`admit_recall_reply`], so a candidate that fails exact-scope, identity,
 //!   validity, or revocation checks can only reach the caller as a row in the
@@ -21,6 +27,14 @@
 //!   `capability_unsupported`, `capacity_exceeded`) become
 //!   [`CognitiveRecallDegradation`], and a provider that rejects the host's
 //!   own scope is an error, never an empty success;
+//! * admitted candidates are normalized and then *selected* before anything
+//!   becomes advisory content: host-owned deduplication and diversity
+//!   selection ([`select_recall_candidates`]) run on every mounted recall, so
+//!   the same memory returned twice can never consume the result budget
+//!   twice, and the complete selection receipt — including why each dropped
+//!   candidate was dropped — travels with the outcome. A normalization that
+//!   does not describe the admitted slice is a typed refusal, never a
+//!   silently unpruned stream;
 //! * provider selection is the host's [`ActiveRoutingPolicy`], never a
 //!   provider name baked into the port: the pinned provider must be
 //!   registered active under the pinned revision with the recall capability
@@ -43,7 +57,9 @@ use tracedecay_application::memory::{
     CognitiveRecallPortResult, CognitiveRecallProvenance, CognitiveRecallProviderIdentity,
     CognitiveRecallRequest, CognitiveRecallResult,
 };
-use tracedecay_application::{ApplicationContractError, ClockError, ResolvedScope, try_now_micros};
+use tracedecay_application::{
+    ApplicationContractError, CancellationSignal, ClockError, ResolvedScope, try_now_micros,
+};
 use tracedecay_memory_fabric::{
     ActiveCallPlan, ActiveRoutingPolicy, FabricError, FallbackDecision, ProviderMode,
     ReadyRouteTarget, RouteTarget, RoutedProviderIdentity, RoutingError,
@@ -60,6 +76,14 @@ use crate::recall_admission::{
     AdmittedTemporalQuery, RECALL_QUERY_CAPABILITY_ID, RecallAdmissionError, RecallAdmissionReport,
     RecallBudgetsV1, RecallCandidateContent, RecallCandidateV1, RecallRequestParts,
     admit_recall_reply, build_recall_request_payload, rfc3339_utc_micros,
+};
+use crate::recall_normalization::{
+    RecallNormalizationError, RecallNormalizationPolicyV1, RecallNormalizationV1,
+    normalize_admitted_candidates,
+};
+use crate::recall_selection::{
+    RecallSelectionError, RecallSelectionPolicyError, RecallSelectionPolicyV1, RecallSelectionV1,
+    select_recall_candidates,
 };
 
 /// Objective sent with every recall. The contract carries the objective as
@@ -194,6 +218,19 @@ pub enum CognitiveRecallPortError {
         /// Provider diagnostic identity, when supplied.
         diagnostic_id: Option<String>,
     },
+    /// The admitted candidates could not be normalized into the host
+    /// candidate space.
+    #[error("recall candidates could not be normalized: {0}")]
+    Normalization(#[source] RecallNormalizationError),
+    /// The normalized candidate set does not describe the admitted slice it
+    /// was built from, so no honest deduplication is possible over it. The
+    /// recall is refused rather than delivered with an unpruned or
+    /// mis-attributed candidate stream.
+    #[error("recall candidates could not be selected: {0}")]
+    Selection(#[source] RecallSelectionError),
+    /// The host selection budget for this recall is not a usable policy.
+    #[error("recall selection policy is invalid: {0}")]
+    SelectionPolicy(#[source] RecallSelectionPolicyError),
     /// The provider returned a failure terminal that is not a lane degradation.
     #[error(
         "provider recall failed with {} (diagnostic {diagnostic_id:?})",
@@ -226,6 +263,55 @@ pub enum CognitiveRecallPortError {
     /// The blocking provider invocation did not complete.
     #[error("recall invocation task did not complete: {0}")]
     Invocation(#[source] tokio::task::JoinError),
+    /// The live cancellation signal handed to the port is a different
+    /// cancellation identity than the one the request names. An adapter may
+    /// not replace the caller's cancellation identity, so the recall is
+    /// refused rather than run under a token the runtime cannot cancel.
+    #[error(
+        "recall cancellation identity mismatch: request names {expected}, live signal is \
+         {received}"
+    )]
+    CancellationIdentityMismatch {
+        /// Cancellation token identity the application request carries.
+        expected: String,
+        /// Cancellation token identity of the live signal supplied.
+        received: String,
+    },
+}
+
+impl CognitiveRecallPortError {
+    /// Stable machine-readable code of this terminal outcome.
+    ///
+    /// A recall failure crosses several boundaries before it reaches a
+    /// receipt or an agent-visible notice. The typed variant is the authority
+    /// on what went wrong, and this code is how that stays true after the
+    /// error has been rendered: callers branch on the code, never on the
+    /// message text.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::CompositionDisabled => "recall_composition_disabled",
+            Self::Scope(_) => "recall_scope_not_derivable",
+            Self::Clock(_) => "recall_host_clock_unavailable",
+            Self::EntropyUnavailable => "recall_host_entropy_unavailable",
+            Self::Contract(_) => "recall_call_contract_violation",
+            Self::Fabric(_) => "recall_fabric_refused",
+            Self::ProviderNotActive { .. } => "recall_provider_not_active",
+            Self::Routing(_) => "recall_routing_refused",
+            Self::HandshakeNotReady { .. } => "recall_handshake_not_ready",
+            Self::ScopeRejected { .. } => "recall_scope_rejected",
+            Self::Normalization(_) => "recall_normalization_failed",
+            Self::Selection(_) => "recall_selection_failed",
+            Self::SelectionPolicy(_) => "recall_selection_policy_invalid",
+            Self::TerminalFailed { .. } => "recall_provider_terminal_failed",
+            Self::ScopeBindingsUnrecorded { .. } => "recall_scope_bindings_unrecorded",
+            Self::Admission(_) => "recall_admission_failed",
+            Self::AdmissionAudit(_) => "recall_admission_audit_failed",
+            Self::Application(_) => "recall_application_contract_violation",
+            Self::Invocation(_) => "recall_invocation_incomplete",
+            Self::CancellationIdentityMismatch { .. } => "recall_cancellation_identity_mismatch",
+        }
+    }
 }
 
 /// Failure building the handshake or call for one routed target.
@@ -274,6 +360,8 @@ pub struct ProjectCognitiveRecallPortV1 {
     host_limits: ProviderLimits,
     policy_revision: u64,
     budgets: RecallBudgetsV1,
+    normalization: RecallNormalizationPolicyV1,
+    selection: RecallSelectionPolicyV1,
 }
 
 impl fmt::Debug for ProjectCognitiveRecallPortV1 {
@@ -283,6 +371,8 @@ impl fmt::Debug for ProjectCognitiveRecallPortV1 {
             .field("routing", &self.routing)
             .field("policy_revision", &self.policy_revision)
             .field("budgets", &self.budgets)
+            .field("normalization", &self.normalization)
+            .field("selection", &self.selection)
             .finish_non_exhaustive()
     }
 }
@@ -290,8 +380,23 @@ impl fmt::Debug for ProjectCognitiveRecallPortV1 {
 /// A bridged recall result together with its audit-visible admission report.
 #[derive(Clone, Debug)]
 pub struct CognitiveRecallAdmittedOutcomeV1 {
-    /// Application-facing result carrying only admitted inline candidates.
+    /// Application-facing result carrying only admitted inline candidates, in
+    /// the host order [`Self::normalization`] recorded.
     pub result: CognitiveRecallResult,
+    /// The admitted candidates in the host's common candidate space: the
+    /// provider's native score and explanation retained verbatim alongside a
+    /// separately labelled, deterministic host relevance. `None` when the lane
+    /// degraded before any provider outcome existed.
+    pub normalization: Option<RecallNormalizationV1>,
+    /// The host selection receipt over [`Self::normalization`]: which
+    /// normalized candidates were retained, and for every candidate that was
+    /// not, whether it was a duplicate, redundant with a selected candidate,
+    /// or did not fit the selection budget. `None` when the lane degraded
+    /// before any provider outcome existed. The four ledgers account for
+    /// every normalized candidate exactly once, so
+    /// [`CognitiveRecallResult::candidates`] can always be reconciled back to
+    /// the admitted set.
+    pub selection: Option<RecallSelectionV1>,
     /// Rank-final admission ledger. `None` when the lane degraded before any
     /// provider outcome existed (cancelled, deadline elapsed, provider
     /// unavailable).
@@ -320,6 +425,14 @@ impl ProjectCognitiveRecallPortV1 {
             .budgets
             .validate()
             .map_err(CognitiveRecallPortError::Admission)?;
+        // The mounted advisory-context budget is the host's own candidate
+        // budget: no recall may ever select more candidates than the host
+        // allowed the provider to return. Per call it is narrowed again to
+        // the budget that recall actually dispatched.
+        let selection = RecallSelectionPolicyV1::new(
+            usize::try_from(inputs.budgets.maximum_candidates).unwrap_or(usize::MAX),
+        )
+        .map_err(CognitiveRecallPortError::SelectionPolicy)?;
         Ok(Self {
             composition: inputs.composition,
             scope_binding: inputs.scope_binding,
@@ -328,16 +441,80 @@ impl ProjectCognitiveRecallPortV1 {
             host_limits: inputs.host_limits,
             policy_revision: inputs.policy_revision,
             budgets: inputs.budgets,
+            normalization: RecallNormalizationPolicyV1::default(),
+            selection,
         })
+    }
+
+    /// Pins a different host normalization policy revision.
+    ///
+    /// The policy is host-owned configuration, never a provider claim: the
+    /// mounted default is the accepted revision and this setter exists so a
+    /// revision change is an explicit, reviewable act.
+    #[must_use]
+    pub const fn with_normalization_policy(
+        mut self,
+        normalization: RecallNormalizationPolicyV1,
+    ) -> Self {
+        self.normalization = normalization;
+        self
+    }
+
+    /// Pins a different host selection policy: the advisory-context budget
+    /// and the similarity bars deduplication and diversity run at.
+    ///
+    /// The mounted default carries the host's own candidate budget and the
+    /// pinned default thresholds. Every recall narrows the budget again to
+    /// the candidate budget that recall dispatched, so this setter can only
+    /// tighten what a recall selects, never widen it.
+    #[must_use]
+    pub const fn with_selection_policy(mut self, selection: RecallSelectionPolicyV1) -> Self {
+        self.selection = selection;
+        self
+    }
+
+    /// The host selection policy every recall of this port is pruned under.
+    #[must_use]
+    pub const fn selection_policy(&self) -> RecallSelectionPolicyV1 {
+        self.selection
+    }
+
+    /// The host normalization policy every recall of this port is scored
+    /// under.
+    #[must_use]
+    pub const fn normalization_policy(&self) -> RecallNormalizationPolicyV1 {
+        self.normalization
+    }
+
+    /// Binds this port to one live host cancellation identity so it satisfies
+    /// the application [`CognitiveRecallPort`] contract.
+    ///
+    /// The application trait carries only the request, and a recall must run
+    /// under a cancellation signal the host runtime can still cancel while
+    /// the provider is working. Binding is therefore the only way to obtain
+    /// the trait object, and the bound signal is checked against the
+    /// request's own token identity on every call.
+    #[must_use]
+    pub const fn bound(&self, cancellation: CancellationSignal) -> BoundCognitiveRecallPortV1<'_> {
+        BoundCognitiveRecallPortV1 {
+            port: self,
+            cancellation,
+        }
     }
 
     /// Performs one bridged recall and returns the result with its admission
     /// report. The report is also delivered to the admission observer.
+    ///
+    /// `cancellation` is the caller's live signal, not a copy: its token
+    /// identity must equal the one the request carries, and cancelling it
+    /// while the provider is working cancels the in-flight handshake, call,
+    /// and any pinned fallback call.
     pub async fn recall_admitted(
         &self,
         request: CognitiveRecallRequest,
+        cancellation: &CancellationSignal,
     ) -> Result<CognitiveRecallAdmittedOutcomeV1, CognitiveRecallPortError> {
-        let outcome = self.recall_uncounted(request).await?;
+        let outcome = self.recall_uncounted(request, cancellation).await?;
         if let Some(report) = &outcome.report {
             self.admission_observer
                 .observe_admission(report)
@@ -361,12 +538,24 @@ impl ProjectCognitiveRecallPortV1 {
     async fn recall_uncounted(
         &self,
         request: CognitiveRecallRequest,
+        cancellation: &CancellationSignal,
     ) -> Result<CognitiveRecallAdmittedOutcomeV1, CognitiveRecallPortError> {
         request
             .validate()
             .map_err(CognitiveRecallPortError::Application)?;
+        // The live signal must be the request's own cancellation identity.
+        // Accepting a foreign token here would be exactly the substitution
+        // the application contract forbids: the provider would then hold a
+        // token nothing in the runtime cancels.
+        let live_identity = cancellation.context().token_id;
+        if live_identity.as_str() != request.cancellation().token_id.as_str() {
+            return Err(CognitiveRecallPortError::CancellationIdentityMismatch {
+                expected: request.cancellation().token_id.as_str().to_owned(),
+                received: live_identity.as_str().to_owned(),
+            });
+        }
         let now = try_now_micros().map_err(CognitiveRecallPortError::Clock)?;
-        if request.cancellation().is_cancelled() {
+        if request.cancellation().is_cancelled() || cancellation.is_cancelled() {
             return degraded_outcome(
                 &request,
                 self.configured_identity()?,
@@ -414,7 +603,12 @@ impl ProjectCognitiveRecallPortV1 {
         let admitted_budget = usize::try_from(budgets.maximum_candidates).unwrap_or(usize::MAX);
         let recall_capability = OwnedVersionedId::new(RECALL_QUERY_CAPABILITY_ID)
             .map_err(CognitiveRecallPortError::Contract)?;
+        // One live token for this recall, cancelled by the caller's own
+        // signal. The bridge task is aborted on every exit path by the guard,
+        // so a completed recall leaves nothing waiting on the signal.
+        let (cancellation_token, _cancellation_bridge) = bridge_cancellation(cancellation);
         let plan = RecallCallPlan {
+            cancellation: cancellation_token,
             exact_scope,
             request_id: request.request_id().as_str().to_owned(),
             query: request.query().to_owned(),
@@ -486,9 +680,41 @@ impl ProjectCognitiveRecallPortV1 {
             })?;
         let admission = admit_recall_reply(&call, &temporal, admitted_budget, &authorized, &reply)
             .map_err(CognitiveRecallPortError::Admission)?;
-        let mut candidates = Vec::with_capacity(admission.admitted.len());
+        // Host order is the normalization's order, not the provider's: the
+        // provider's own rank is retained inside the normalized set so the
+        // reordering stays explainable, and no raw provider score is ever
+        // compared against another provider's.
+        let normalization = normalize_admitted_candidates(self.normalization, &admission.admitted)
+            .map_err(CognitiveRecallPortError::Normalization)?;
+        // Redundant evidence is pruned before anything consumes the
+        // application's result budget: a duplicate the provider returned twice
+        // must never displace a distinct candidate. The selection budget is
+        // the host policy narrowed to the candidate budget this recall
+        // actually dispatched, and the whole decision receipt travels with the
+        // outcome so every dropped candidate stays explainable.
+        let selection = select_recall_candidates(
+            self.selection
+                .narrowed_to(admitted_budget)
+                .map_err(CognitiveRecallPortError::SelectionPolicy)?,
+            &normalization,
+            &admission.admitted,
+        )
+        .map_err(CognitiveRecallPortError::Selection)?;
+        let mut candidates = Vec::with_capacity(selection.selected.len());
         let mut unhydrated_reference_candidate_ids = Vec::new();
-        for admitted in &admission.admitted {
+        for selected in &selection.selected {
+            let Some(admitted) = admission.admitted.get(selected.provider_rank) else {
+                // Selection verified every rank against this exact slice, so
+                // reaching this is a host-internal inconsistency. It is
+                // reported, never skipped.
+                return Err(CognitiveRecallPortError::Selection(
+                    RecallSelectionError::ProviderRankOutOfRange {
+                        candidate_id: selected.candidate_id.clone(),
+                        provider_rank: selected.provider_rank,
+                        admitted_len: admission.admitted.len(),
+                    },
+                ));
+            };
             let candidate = admitted.candidate();
             let content = match admitted.content() {
                 RecallCandidateContent::Inline(content) => content,
@@ -542,6 +768,8 @@ impl ProjectCognitiveRecallPortV1 {
             .map_err(CognitiveRecallPortError::Application)?;
         Ok(CognitiveRecallAdmittedOutcomeV1 {
             result,
+            normalization: Some(normalization),
+            selection: Some(selection),
             report: Some(admission.report),
             unhydrated_reference_candidate_ids,
             fallback,
@@ -549,7 +777,40 @@ impl ProjectCognitiveRecallPortV1 {
     }
 }
 
-impl CognitiveRecallPort for ProjectCognitiveRecallPortV1 {
+/// A mounted recall port bound to one live host cancellation identity.
+///
+/// This, and not the bare port, is what implements the application
+/// [`CognitiveRecallPort`] trait: the trait's method signature carries no
+/// cancellation handle, and manufacturing one inside the adapter would leave
+/// the provider holding a token no runtime can cancel. Binding forces the
+/// caller to hand over the signal it will actually cancel.
+pub struct BoundCognitiveRecallPortV1<'port> {
+    port: &'port ProjectCognitiveRecallPortV1,
+    cancellation: CancellationSignal,
+}
+
+impl fmt::Debug for BoundCognitiveRecallPortV1<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BoundCognitiveRecallPortV1")
+            .field("port", &self.port)
+            .field("cancellation", &self.cancellation.context().token_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BoundCognitiveRecallPortV1<'_> {
+    /// Performs one bridged recall under the bound live cancellation
+    /// identity and returns the result with its admission report.
+    pub async fn recall_admitted(
+        &self,
+        request: CognitiveRecallRequest,
+    ) -> Result<CognitiveRecallAdmittedOutcomeV1, CognitiveRecallPortError> {
+        self.port.recall_admitted(request, &self.cancellation).await
+    }
+}
+
+impl CognitiveRecallPort for BoundCognitiveRecallPortV1<'_> {
     type Error = CognitiveRecallPortError;
 
     async fn recall(
@@ -560,11 +821,47 @@ impl CognitiveRecallPort for ProjectCognitiveRecallPortV1 {
     }
 }
 
+/// A guard that stops the cancellation bridge on every exit path.
+struct CancellationBridgeGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for CancellationBridgeGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Bridges the caller's live application cancellation signal onto the one
+/// provider-facing token this recall dispatches with.
+///
+/// The token is not a snapshot: cancelling `signal` at any point — before
+/// dispatch, between the handshake and the call, or while the provider is
+/// blocked in its store — cancels this exact token, which is the token every
+/// control of the recall already holds.
+fn bridge_cancellation(
+    signal: &CancellationSignal,
+) -> (CancellationToken, CancellationBridgeGuard) {
+    let token = CancellationToken::new();
+    if signal.is_cancelled() {
+        token.cancel();
+    }
+    let bridged = token.clone();
+    let signal = signal.clone();
+    let task = tokio::spawn(async move {
+        signal.cancelled().await;
+        bridged.cancel();
+    });
+    (token, CancellationBridgeGuard(task))
+}
+
 /// Host-owned request construction for whichever provider the router
 /// selects. The same plan is asked again for a pinned fallback target, so a
 /// second provider only ever sees a handshake and a call bound to its own
 /// identity, registration revision, ready receipt, and state generation.
 struct RecallCallPlan {
+    /// The one live cancellation token of this recall, cloned into every
+    /// handshake and call control so a cancellation requested after dispatch
+    /// is observed by whichever provider is currently working.
+    cancellation: CancellationToken,
     exact_scope: OwnedExactScope,
     request_id: String,
     query: String,
@@ -582,7 +879,9 @@ impl RecallCallPlan {
         OperationControl::new(
             self.deadline_utc_micros,
             self.remaining_millis,
-            CancellationToken::new(),
+            // Clone, never `new()`: the handshake, the primary call, and any
+            // pinned fallback call all observe the caller's one live token.
+            self.cancellation.clone(),
         )
     }
 }
@@ -743,6 +1042,8 @@ fn degraded_outcome(
     .map_err(CognitiveRecallPortError::Application)?;
     Ok(CognitiveRecallAdmittedOutcomeV1 {
         result,
+        normalization: None,
+        selection: None,
         report: None,
         unhydrated_reference_candidate_ids: Vec::new(),
         fallback: FallbackDecision::NotApplicable,
@@ -761,21 +1062,41 @@ fn application_provenance(
         .unwrap_or("unavailable");
     match state {
         "available" => {
-            let first_ref = |key: &str| {
+            let refs_at = |key: &str| {
                 candidate
                     .provenance
                     .get(key)
                     .and_then(serde_json::Value::as_array)
-                    .and_then(|refs| refs.first())
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
+                    .map(|refs| {
+                        refs.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
             };
-            let source = candidate
-                .stable_memory_ref
-                .clone()
-                .or_else(|| first_ref("origin_refs"))
-                .or_else(|| first_ref("source_refs"))
-                .or_else(|| candidate.source_refs.first().cloned());
+            // Ordered by evidential value, not by convenience.
+            // `stable_memory_ref` is a *dedup identity*; the provenance
+            // record's own refs are what the provider offered as evidence.
+            // The host prefers whichever of them names one of its own
+            // reference shapes, so a candidate that carries a citable
+            // reference is never demoted because a dedup key happened to
+            // sort first. Shape recognition here is only a preference: the
+            // reference still has to be confirmed against real host storage
+            // in `recall_provenance_hydration`.
+            let mut ordered = Vec::new();
+            ordered.extend(refs_at("origin_refs"));
+            ordered.extend(refs_at("source_refs"));
+            ordered.extend(candidate.source_refs.iter().cloned());
+            let citable = ordered
+                .iter()
+                .find(|reference| {
+                    crate::recall_provenance_hydration::HostEvidenceRefV1::parse(reference).is_ok()
+                })
+                .cloned();
+            let source = citable
+                .or_else(|| candidate.stable_memory_ref.clone())
+                .or_else(|| ordered.into_iter().next());
             match source {
                 Some(source) => CognitiveRecallProvenance::available(source),
                 // A provider that claims availability without naming any

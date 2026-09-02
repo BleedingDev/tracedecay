@@ -23,10 +23,12 @@
 
 use rusqlite::{OptionalExtension, Transaction, params};
 
-use crate::envelope::{AdmittedObservationV1, ProviderTargetV1, WithheldAdmissionV1};
+use crate::envelope::{AdmittedObservationV1, WithheldAdmissionV1};
 use crate::error::ObservationJournalError;
 use crate::identity::{ObservationIdV1, ObservationIdempotencyKeyV1, SourceSequenceV1};
-use crate::inspection::{QueuePressureV1, ReplayCursorV1, ReplayDispositionV1};
+use crate::inspection::{
+    ObservationLaneKeyV1, QueuePressureV1, ReplayCursorV1, ReplayDispositionV1,
+};
 use crate::port::{AppendOutcomeV1, ObservationDispatchPortV1};
 use crate::settlement::SourceStreamKeyV1;
 use crate::state::DeliveryStateV1;
@@ -349,7 +351,11 @@ impl SqliteObservationJournal {
 
         // (5) Bounded queue. Exhaustion is a typed outcome, never a silent drop.
         let queue_bytes = admitted.queue_bytes();
-        let pressure = read_pressure(transaction, &admitted.target, self.policy())?;
+        let pressure = read_pressure(
+            transaction,
+            &ObservationLaneKeyV1::of(&admitted.target),
+            self.policy(),
+        )?;
         if pressure.would_exceed(queue_bytes) {
             return Ok(AppendOutcomeV1::RejectedCapacity {
                 queue_items: pressure.queue_items,
@@ -553,14 +559,14 @@ impl SqliteObservationJournal {
 
 fn read_pressure(
     transaction: &Transaction<'_>,
-    target: &ProviderTargetV1,
+    lane: &ObservationLaneKeyV1,
     policy: &crate::retention::RetentionPolicyV1,
 ) -> Result<QueuePressureV1, ObservationJournalError> {
     let (items, bytes, oldest): (i64, i64, Option<i64>) = transaction.query_row(
         SELECT_PRESSURE,
         params![
-            target.provider_id.as_str(),
-            sql_i64(target.registration_revision, "registration_revision")?,
+            lane.provider_id.as_str(),
+            sql_i64(lane.registration_revision, "registration_revision")?,
         ],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
@@ -633,13 +639,13 @@ impl ObservationDispatchPortV1 for SqliteObservationJournal {
         })
     }
 
-    fn queue_pressure(
+    fn lane_pressure(
         &self,
-        target: &ProviderTargetV1,
+        lane: &ObservationLaneKeyV1,
     ) -> Result<QueuePressureV1, ObservationJournalError> {
-        target.validate()?;
+        lane.validate()?;
         let policy = *self.policy();
-        self.with_transaction(|transaction| read_pressure(transaction, target, &policy))
+        self.with_transaction(|transaction| read_pressure(transaction, lane, &policy))
     }
 }
 

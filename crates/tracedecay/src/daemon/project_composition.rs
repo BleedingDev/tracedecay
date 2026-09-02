@@ -133,12 +133,17 @@ fn resolve_memory_provider_activation(
     }
 }
 
-/// Whether the routing gate names the one provider this composition can
-/// mount in active mode. Only the host feature knows the Native identity; a
-/// build without the host cannot honour any active provider.
+/// Whether the routing gate names an adapter this build can mount actively.
+///
+/// The registry, not this composition, owns provider-identity recognition: it
+/// returns a typed kind for a configured name and this gate accepts only the
+/// Native one. A build without the host cannot honour any active provider.
 #[cfg(feature = "memory-provider-host")]
 fn is_mountable_active_provider(provider: &str) -> bool {
-    provider == tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID
+    matches!(
+        tracedecay_memory_provider_registry::mountable_active_provider(provider),
+        Some(tracedecay_memory_provider_registry::MountableProviderKindV1::Native)
+    )
 }
 
 #[cfg(not(feature = "memory-provider-host"))]
@@ -157,31 +162,33 @@ fn project_recall_routing_policy(
 ) -> Result<Option<tracedecay_memory_provider_registry::ActiveRoutingPolicy>> {
     use tracedecay_memory_provider_registry::{
         ActiveRoutingPolicy, FallbackRule, NATIVE_PROVIDER_ID, OwnedProviderId,
-        PinnedFallbackPolicy,
     };
-    if activation != ProjectMemoryProviderActivation::NativeActive {
-        return Ok(None);
-    }
+    // The registry declares the routed identity, never this composition.
+    let selected_provider_id = match activation {
+        ProjectMemoryProviderActivation::NativeActive => NATIVE_PROVIDER_ID,
+        _ => return Ok(None),
+    };
     let contract = |message: String| TraceDecayError::Config { message };
-    let active_provider = OwnedProviderId::new(NATIVE_PROVIDER_ID)
-        .map_err(|error| contract(format!("Native provider identity is invalid: {error}")))?;
+    let active_provider = OwnedProviderId::new(selected_provider_id)
+        .map_err(|error| contract(format!("selected provider identity is invalid: {error}")))?;
     let fallback = match &config.memory_provider_recall_routing.fallback {
         None => FallbackRule::Forbidden,
+        // This composition registers exactly one provider — the selected
+        // adapter — and the routing gate already refuses a fallback
+        // target equal to the active provider. Every configured target is
+        // therefore necessarily absent from this registry, so a pinned rule
+        // could only ever produce `TargetNotRegistered` at dispatch time. A
+        // route that advertises a fallback it can never take is exactly the
+        // fake readiness the product forbids, so the configuration is refused
+        // at project open instead of being carried into the policy.
         Some(rule) => {
-            let target = OwnedProviderId::new(rule.target_provider.as_str()).map_err(|error| {
-                contract(format!(
-                    "memory provider recall fallback target '{}' is invalid: {error}",
-                    rule.target_provider
-                ))
-            })?;
-            FallbackRule::ExplicitPinned(
-                PinnedFallbackPolicy::new(rule.policy_id.as_str(), rule.policy_revision, target)
-                    .map_err(|error| {
-                        contract(format!(
-                            "memory provider recall fallback rule is invalid: {error}"
-                        ))
-                    })?,
-            )
+            return Err(contract(format!(
+                "memory provider recall routing pins fallback policy '{}'@{} to target provider \
+                 '{}', but this project composition registers only the selected provider \
+                 '{selected_provider_id}' and can never dispatch a fallback; remove `fallback` \
+                 from memory.provider_recall_routing.v1",
+                rule.policy_id, rule.policy_revision, rule.target_provider
+            )));
         }
     };
     ActiveRoutingPolicy::new(
@@ -212,7 +219,7 @@ fn mount_project_memory_provider_host(
     profile_id: &tracedecay_domain::UserProfileId,
 ) -> Result<crate::mcp::server::MemoryProviderHostMount> {
     // Disabled composition constructs no port, no fabric, no adapter, and no
-    // registration: the Native application port below is built only inside the
+    // registration: the concrete provider below is built only inside the
     // enabled arms, so a default-false configuration allocates nothing.
     let enabled_mode = match activation {
         ProjectMemoryProviderActivation::Disabled => None,
@@ -730,6 +737,12 @@ async fn production_project_server_inner(
                     scope: code_search_scope.clone(),
                     authoritative_project_id: code_search_project_id.clone(),
                     store_data_root: cg.store_layout().data_root.clone(),
+                    // Provenance hydration confirms a claimed `source:`
+                    // range against exactly this checkout and a claimed
+                    // `record:` identity against this project's own
+                    // retained memory authority.
+                    canonical_project_path: canonical_project_path.to_path_buf(),
+                    graph: Arc::clone(&cg),
                     routing,
                     host_limits: super::retained_owner::native_provider::native_provider_limits(),
                 },
@@ -1975,23 +1988,24 @@ mod memory_provider_routing_tests {
                 .is_none()
         );
 
-        // A pinned fallback rule is carried into the policy verbatim.
+        // A pinned fallback rule names a second provider this composition
+        // cannot register, so it is refused at project open rather than
+        // carried into a policy that could only ever decline at dispatch.
+        let unregistrable_target = "provider.ncm-local";
         config.memory_provider_recall_routing.fallback = Some(MemoryProviderRecallFallbackV1 {
             policy_id: "policy.memory-failover".to_owned(),
             policy_revision: 7,
-            target_provider: "provider.ncm-local".to_owned(),
+            target_provider: unregistrable_target.to_owned(),
         });
-        let policy = project_recall_routing_policy(activation, &config)
-            .unwrap()
-            .expect("routing policy");
-        match policy.fallback() {
-            FallbackRule::ExplicitPinned(pinned) => {
-                assert_eq!(pinned.policy_id(), "policy.memory-failover");
-                assert_eq!(pinned.policy_revision(), 7);
-                assert_eq!(pinned.target_provider_id().as_str(), "provider.ncm-local");
-            }
-            FallbackRule::Forbidden => panic!("pinned rule must be carried"),
-        }
+        let error = project_recall_routing_policy(activation, &config)
+            .expect_err("a fallback target this composition cannot register is refused");
+        let message = error.to_string();
+        assert!(message.contains(unregistrable_target), "{message}");
+        assert!(
+            message.contains("can never dispatch a fallback"),
+            "{message}"
+        );
+        config.memory_provider_recall_routing.fallback = None;
 
         // Any other provider name is refused rather than mapped onto Native.
         let error =

@@ -16,18 +16,26 @@ use recall_fixture::*;
 use tracedecay_application::memory::{
     CognitiveRecallDegradation, CognitiveRecallPort, CognitiveRecallRequest,
 };
-use tracedecay_application::{CancellationContext, Deadline, RequestId, ResolvedScope, now_micros};
+use tracedecay_application::{
+    CancellationContext, CancellationSignal, Deadline, RequestId, ResolvedScope, now_micros,
+};
 use tracedecay_domain::{ProjectId, RefId, RepositoryId, UtcMicros, WorktreeId};
 use tracedecay_memory_provider_api::contract::TerminalCode;
-use tracedecay_memory_provider_api::{OwnedExactScope, OwnedProviderId, PinnedFallbackPolicy};
+use tracedecay_memory_provider_api::{
+    CommittedEffectEvidence, FallbackDirective, HandshakeRequest, HandshakeResponse,
+    OwnedExactScope, OwnedProviderId, PinnedFallbackPolicy, ProviderCall, ProviderDescriptor,
+    ProviderOperation, ProviderReply, TerminalRecord,
+};
+use tracedecay_memory_provider_native::{NativeMemoryApplicationPort, NativeObservation};
 use tracedecay_memory_provider_registry::{
-    ActiveRoutingPolicy, CognitiveRecallPortError, CognitiveRecallPortInputsV1,
-    EnabledProviderMode, ExactScopeBinding, ExactScopeBindingError, FabricConfig, FallbackDecision,
-    FallbackDeclinedReason, FallbackRule, NATIVE_PROVIDER_ID, NativeProviderActivation,
+    ActiveRoutingPolicy, BudgetExclusionReason, CognitiveRecallPortError,
+    CognitiveRecallPortInputsV1, DuplicateReason, EnabledProviderMode, ExactScopeBinding,
+    ExactScopeBindingError, FabricConfig, FallbackDecision, FallbackDeclinedReason, FallbackRule,
+    NATIVE_PROVIDER_ID, NativeProviderActivation, ObserverProviderRegistration,
     ProjectCognitiveRecallPortV1, ProjectMemoryProviderComposition, ProviderMode,
     ProviderReadiness, RecallAdmissionAuditError, RecallAdmissionError, RecallAdmissionObserver,
     RecallAdmissionReport, RecallBudgetsV1, RecallDenialReason, RecallScopeBindingsV1,
-    RoutingError, ScopeBinding, ScopeField,
+    RecallSelectionPolicyV1, RegistryError, RoutingError, ScopeBinding, ScopeField,
 };
 
 /// Host-side scope binding standing in for the composition root: profile and
@@ -95,6 +103,12 @@ fn resolved_scope(reference: Option<&str>) -> ResolvedScope {
     .expect("resolved scope")
 }
 
+/// The caller's live cancellation identity for a recall: the same token id
+/// the request carries, so the port accepts it as the request's own signal.
+fn live_signal() -> CancellationSignal {
+    CancellationSignal::active("token.recall-port").expect("live cancellation signal")
+}
+
 fn request(
     scope: ResolvedScope,
     deadline_offset_micros: i64,
@@ -118,7 +132,7 @@ fn request(
 }
 
 fn compose_mode(
-    port: Arc<RecallFixturePort>,
+    port: Arc<dyn NativeMemoryApplicationPort>,
     mode: EnabledProviderMode,
 ) -> Arc<ProjectMemoryProviderComposition> {
     Arc::new(
@@ -216,7 +230,7 @@ async fn host_candidate_budget_is_enforced_when_smaller_than_the_request() {
     assert_eq!(request.maximum_candidates(), 8);
 
     let error = port
-        .recall_admitted(request)
+        .recall_admitted(request, &live_signal())
         .await
         .expect_err("provider exceeded the host candidate budget");
     assert!(
@@ -247,7 +261,7 @@ async fn unwritable_audit_sink_withholds_the_admitted_result() {
     let scope = resolved_scope(Some("refs/heads/recall-port"));
 
     let error = port
-        .recall_admitted(request(scope, 60_000_000, false))
+        .recall_admitted(request(scope, 60_000_000, false), &live_signal())
         .await
         .expect_err("audit sink refused the report");
     match error {
@@ -257,6 +271,133 @@ async fn unwritable_audit_sink_withholds_the_admitted_result() {
         other => panic!("expected an admission audit error, got {other:?}"),
     }
     assert_eq!(provider.recall_calls.load(Ordering::Relaxed), 1);
+}
+
+/// A provider that returns the same memory twice must not have it delivered
+/// twice: the mounted port prunes redundant evidence before anything reaches
+/// the application result, and the selection receipt names what was pruned
+/// and why.
+#[tokio::test]
+async fn mounted_recall_prunes_duplicate_candidates_from_the_application_result() {
+    let mut fixture = RecallFixturePort::new();
+    fixture.candidate_contents = Some(duplicate_candidate_stream());
+    let provider = Arc::new(fixture);
+    let observer = Arc::new(LedgerObserver::default());
+    let port = mount(
+        compose_mode(provider.clone(), EnabledProviderMode::Active),
+        observer.clone(),
+    )
+    .expect("mounted port");
+    let scope = resolved_scope(Some("refs/heads/recall-port"));
+
+    let outcome = port
+        .recall_admitted(request(scope, 60_000_000, false), &live_signal())
+        .await
+        .expect("bridged recall");
+
+    let delivered: Vec<&str> = outcome
+        .result
+        .candidates()
+        .iter()
+        .map(|candidate| candidate.candidate_id())
+        .collect();
+    assert_eq!(delivered, vec!["aa-duplicate-1", "mm-distinct", "zz-other"]);
+
+    let selection = outcome.selection.expect("selection receipt");
+    assert_eq!(selection.deduplicated.len(), 1);
+    assert_eq!(selection.deduplicated[0].candidate_id, "ab-duplicate-2");
+    assert_eq!(
+        selection.deduplicated[0].duplicate_of_candidate_id,
+        "aa-duplicate-1"
+    );
+    assert_eq!(
+        selection.deduplicated[0].reason,
+        DuplicateReason::ContentDigest
+    );
+    assert!(selection.budget_excluded.is_empty());
+    // The report still accounts for all four admitted candidates: selection
+    // prunes what is delivered, never what was admitted.
+    let report = outcome.report.expect("admission report");
+    assert_eq!(report.admitted_count, 4);
+    assert!(report.denied.is_empty(), "{:?}", report.denied);
+}
+
+/// Under a constrained advisory-context budget a duplicate must not displace
+/// a distinct candidate: with a budget of two and the duplicate pair first in
+/// host order, an unpruned stream would deliver the same memory twice and
+/// drop the distinct evidence entirely. Every candidate that did not fit is
+/// still named in the receipt.
+#[tokio::test]
+async fn duplicates_do_not_displace_a_distinct_candidate_under_a_constrained_budget() {
+    let mut fixture = RecallFixturePort::new();
+    fixture.candidate_contents = Some(duplicate_candidate_stream());
+    let provider = Arc::new(fixture);
+    let observer = Arc::new(LedgerObserver::default());
+    let port = mount(
+        compose_mode(provider.clone(), EnabledProviderMode::Active),
+        observer.clone(),
+    )
+    .expect("mounted port")
+    .with_selection_policy(RecallSelectionPolicyV1::new(2).expect("selection policy"));
+    let scope = resolved_scope(Some("refs/heads/recall-port"));
+
+    let outcome = port
+        .recall_admitted(request(scope, 60_000_000, false), &live_signal())
+        .await
+        .expect("bridged recall");
+
+    let delivered: Vec<&str> = outcome
+        .result
+        .candidates()
+        .iter()
+        .map(|candidate| candidate.candidate_id())
+        .collect();
+    assert_eq!(delivered, vec!["aa-duplicate-1", "mm-distinct"]);
+
+    let selection = outcome.selection.expect("selection receipt");
+    assert_eq!(selection.deduplicated.len(), 1);
+    assert_eq!(selection.deduplicated[0].candidate_id, "ab-duplicate-2");
+    assert_eq!(selection.budget_excluded.len(), 1);
+    assert_eq!(selection.budget_excluded[0].candidate_id, "zz-other");
+    assert_eq!(
+        selection.budget_excluded[0].reason,
+        BudgetExclusionReason::SelectionBudgetExhausted {
+            maximum_selected: 2
+        }
+    );
+    // Every admitted candidate is accounted for exactly once.
+    let mut accounted: Vec<&str> = selection.accounted_candidate_ids().collect();
+    accounted.sort_unstable();
+    assert_eq!(
+        accounted,
+        vec![
+            "aa-duplicate-1",
+            "ab-duplicate-2",
+            "mm-distinct",
+            "zz-other"
+        ]
+    );
+}
+
+/// A provider candidate stream whose first two entries are the same memory
+/// under different candidate ids, followed by two distinct memories. Host
+/// order is candidate-id order because every fixture candidate scores the
+/// same, so the duplicate pair is what an unpruned stream would spend the
+/// first two budget slots on.
+fn duplicate_candidate_stream() -> Vec<(String, String)> {
+    let repeated = "the release checklist requires a database migration before shipping";
+    [
+        ("aa-duplicate-1", repeated),
+        ("ab-duplicate-2", repeated),
+        (
+            "mm-distinct",
+            "telemetry sampling runs at one percent in staging",
+        ),
+        ("zz-other", "release notes are generated from the changelog"),
+    ]
+    .into_iter()
+    .map(|(id, content)| (id.to_owned(), content.to_owned()))
+    .collect()
 }
 
 #[tokio::test]
@@ -271,7 +412,7 @@ async fn port_admits_only_exact_scope_current_candidates_and_reports_denials() {
     let scope = resolved_scope(Some("refs/heads/recall-port"));
 
     let outcome = port
-        .recall_admitted(request(scope.clone(), 60_000_000, false))
+        .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
         .await
         .expect("bridged recall");
 
@@ -347,6 +488,7 @@ async fn port_admits_only_exact_scope_current_candidates_and_reports_denials() {
     // The application port path returns exactly the admitted result and
     // reports through the same observer.
     let via_port = port
+        .bound(live_signal())
         .recall(request(scope, 60_000_000, false))
         .await
         .expect("port recall");
@@ -367,7 +509,7 @@ async fn cancelled_and_elapsed_requests_degrade_without_provider_contact() {
     let scope = resolved_scope(Some("refs/heads/recall-port"));
 
     let cancelled = port
-        .recall_admitted(request(scope.clone(), 60_000_000, true))
+        .recall_admitted(request(scope.clone(), 60_000_000, true), &live_signal())
         .await
         .expect("cancelled recall");
     assert_eq!(
@@ -378,7 +520,7 @@ async fn cancelled_and_elapsed_requests_degrade_without_provider_contact() {
     assert!(cancelled.report.is_none());
 
     let elapsed = port
-        .recall_admitted(request(scope, -1, false))
+        .recall_admitted(request(scope, -1, false), &live_signal())
         .await
         .expect("elapsed recall");
     assert_eq!(
@@ -388,6 +530,228 @@ async fn cancelled_and_elapsed_requests_degrade_without_provider_contact() {
     assert!(elapsed.result.candidates().is_empty());
     assert!(elapsed.report.is_none());
 
+    assert_eq!(provider.recall_calls.load(Ordering::Relaxed), 0);
+    assert!(observer.0.lock().unwrap().is_empty());
+}
+
+/// A provider that parks inside `recall` until the control it was dispatched
+/// with is cancelled. It never returns a normal outcome on its own, so a
+/// recall over it can only terminate if the host's live cancellation identity
+/// actually reached the provider's own token.
+struct BlockingRecallPort {
+    descriptor: ProviderDescriptor,
+    entered_recall: Arc<std::sync::atomic::AtomicBool>,
+    observed_cancellation: Arc<std::sync::atomic::AtomicBool>,
+    handshake_calls: std::sync::atomic::AtomicUsize,
+    recall_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl BlockingRecallPort {
+    fn new() -> Self {
+        Self {
+            descriptor: descriptor(),
+            entered_recall: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            observed_cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            handshake_calls: std::sync::atomic::AtomicUsize::new(0),
+            recall_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl NativeMemoryApplicationPort for BlockingRecallPort {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        self.handshake_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        HandshakeResponse {
+            terminal: TerminalRecord::new(
+                ProviderOperation::Handshake,
+                OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+                TerminalCode::Success,
+                CommittedEffectEvidence::none(Some(self.descriptor.state_generation)),
+                FallbackDirective::forbidden(),
+                request.request_id.clone(),
+                request.exact_scope.exact_scope_sha256(),
+                None,
+            )
+            .expect("handshake terminal"),
+            descriptor: Some(self.descriptor.clone()),
+            provider_instance_id: Some("native.blocking-recall".to_owned()),
+            state_namespace: Some("native.recall-scope".to_owned()),
+            accepted_scope: Some(request.exact_scope.clone()),
+            effective_limits: Some(request.host_limits.minimum(self.descriptor.limits)),
+            ready_receipt_sha256: Some(ONE_SHA.to_owned()),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn recall(&self, call: &ProviderCall) -> ProviderReply {
+        self.recall_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.entered_recall
+            .store(true, std::sync::atomic::Ordering::Release);
+        let cancellation = call.control.cancellation();
+        // Bounded so a regression fails the assertions instead of hanging the
+        // suite: a token that is never cancelled falls through to a success
+        // terminal with no payload, which the port refuses loudly.
+        let give_up_at = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cancellation.is_cancelled() && std::time::Instant::now() < give_up_at {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let cancelled = cancellation.is_cancelled();
+        self.observed_cancellation
+            .store(cancelled, std::sync::atomic::Ordering::Release);
+        ProviderReply {
+            terminal: TerminalRecord::new(
+                call.operation,
+                call.provider_id.clone(),
+                if cancelled {
+                    TerminalCode::Cancelled
+                } else {
+                    TerminalCode::Success
+                },
+                CommittedEffectEvidence::none(Some(call.expected_state_generation)),
+                FallbackDirective::forbidden(),
+                call.operation_id.clone(),
+                call.exact_scope.exact_scope_sha256(),
+                cancelled.then(|| "native.blocking-recall.cancelled".to_owned()),
+            )
+            .expect("recall terminal"),
+            payload: None,
+            warnings: Vec::new(),
+            extensions: Vec::new(),
+            state_generation: call.expected_state_generation,
+        }
+    }
+
+    fn health(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn observe(&self, _observation: NativeObservation<'_>) -> ProviderReply {
+        unexpected()
+    }
+
+    fn feedback(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn maintenance(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn inspection(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn correction(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn delete_by_source(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn snapshot_export(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn snapshot_restore(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn replay(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+}
+
+/// Cancellation requested *after* the handshake and after dispatch reaches the
+/// provider that is already working: the recall terminates as a typed
+/// `cancelled` degradation with no admitted content and no admission report.
+///
+/// This fails if the port mints its own `CancellationToken` per control
+/// instead of cloning the caller's live identity, because the provider would
+/// then hold a token nothing cancels and would run to its bounded give-up.
+#[tokio::test]
+async fn cancellation_after_dispatch_reaches_the_working_provider() {
+    let provider = Arc::new(BlockingRecallPort::new());
+    let entered = Arc::clone(&provider.entered_recall);
+    let observed = Arc::clone(&provider.observed_cancellation);
+    let observer = Arc::new(LedgerObserver::default());
+    let port = mount(
+        compose_mode(provider.clone(), EnabledProviderMode::Active),
+        observer.clone(),
+    )
+    .expect("mounted port");
+    let scope = resolved_scope(Some("refs/heads/recall-port"));
+    let signal = live_signal();
+
+    let canceller = {
+        let signal = signal.clone();
+        tokio::spawn(async move {
+            // Cancel only once the provider is demonstrably inside the call,
+            // i.e. after the readiness handshake and after dispatch.
+            let mut spins = 0u32;
+            while !entered.load(Ordering::Acquire) && spins < 10_000_000 {
+                spins = spins.saturating_add(1);
+                tokio::task::yield_now().await;
+            }
+            signal.cancel(now_micros());
+        })
+    };
+
+    let outcome = port
+        .recall_admitted(request(scope, 60_000_000, false), &signal)
+        .await
+        .expect("cancelled recall terminates");
+    canceller.await.expect("canceller task");
+
+    assert!(
+        observed.load(Ordering::Acquire),
+        "the working provider must observe the caller's own cancellation token"
+    );
+    assert_eq!(
+        outcome.result.degradation(),
+        Some(CognitiveRecallDegradation::Cancelled)
+    );
+    assert!(outcome.result.candidates().is_empty());
+    assert!(outcome.report.is_none());
+    assert!(outcome.normalization.is_none());
+    assert_eq!(provider.handshake_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(provider.recall_calls.load(Ordering::Relaxed), 1);
+    assert!(observer.0.lock().unwrap().is_empty());
+}
+
+/// A live signal that is not the request's cancellation identity is refused:
+/// an adapter may not swap in a token the caller's runtime cannot cancel.
+#[tokio::test]
+async fn a_foreign_cancellation_identity_is_refused_before_provider_contact() {
+    let provider = Arc::new(RecallFixturePort::new());
+    let observer = Arc::new(LedgerObserver::default());
+    let port = mount(
+        compose_mode(provider.clone(), EnabledProviderMode::Active),
+        observer.clone(),
+    )
+    .expect("mounted port");
+    let scope = resolved_scope(Some("refs/heads/recall-port"));
+    let foreign = CancellationSignal::active("token.some-other-request").expect("foreign signal");
+
+    let error = port
+        .recall_admitted(request(scope, 60_000_000, false), &foreign)
+        .await
+        .expect_err("foreign cancellation identity");
+    assert!(
+        matches!(
+            &error,
+            CognitiveRecallPortError::CancellationIdentityMismatch { expected, received }
+                if expected == "token.recall-port" && received == "token.some-other-request"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(provider.handshake_calls.load(Ordering::Relaxed), 0);
     assert_eq!(provider.recall_calls.load(Ordering::Relaxed), 0);
     assert!(observer.0.lock().unwrap().is_empty());
 }
@@ -402,11 +766,14 @@ async fn observer_only_and_disabled_compositions_are_typed() {
     )
     .expect("mounted port");
     let error = port
-        .recall_admitted(request(
-            resolved_scope(Some("refs/heads/recall-port")),
-            60_000_000,
-            false,
-        ))
+        .recall_admitted(
+            request(
+                resolved_scope(Some("refs/heads/recall-port")),
+                60_000_000,
+                false,
+            ),
+            &live_signal(),
+        )
         .await
         .expect_err("observer composition cannot serve recall");
     match error {
@@ -439,7 +806,10 @@ async fn unresolved_reference_is_a_typed_scope_error_before_any_provider_contact
     )
     .expect("mounted port");
     let error = port
-        .recall_admitted(request(resolved_scope(None), 60_000_000, false))
+        .recall_admitted(
+            request(resolved_scope(None), 60_000_000, false),
+            &live_signal(),
+        )
         .await
         .expect_err("a scope without a reference has no exact branch identity");
     assert!(
@@ -462,11 +832,14 @@ async fn provider_terminals_map_to_typed_degradations_or_errors_never_empty_succ
     )
     .expect("mounted port");
     let outcome = port
-        .recall_admitted(request(
-            resolved_scope(Some("refs/heads/recall-port")),
-            60_000_000,
-            false,
-        ))
+        .recall_admitted(
+            request(
+                resolved_scope(Some("refs/heads/recall-port")),
+                60_000_000,
+                false,
+            ),
+            &live_signal(),
+        )
         .await
         .expect("unavailable provider degrades the lane");
     assert_eq!(
@@ -484,11 +857,14 @@ async fn provider_terminals_map_to_typed_degradations_or_errors_never_empty_succ
     )
     .expect("mounted port");
     let error = port
-        .recall_admitted(request(
-            resolved_scope(Some("refs/heads/recall-port")),
-            60_000_000,
-            false,
-        ))
+        .recall_admitted(
+            request(
+                resolved_scope(Some("refs/heads/recall-port")),
+                60_000_000,
+                false,
+            ),
+            &live_signal(),
+        )
         .await
         .expect_err("scope rejection is not a degradation");
     assert!(
@@ -510,11 +886,14 @@ async fn provider_terminals_map_to_typed_degradations_or_errors_never_empty_succ
     )
     .expect("mounted port");
     let error = port
-        .recall_admitted(request(
-            resolved_scope(Some("refs/heads/recall-port")),
-            60_000_000,
-            false,
-        ))
+        .recall_admitted(
+            request(
+                resolved_scope(Some("refs/heads/recall-port")),
+                60_000_000,
+                false,
+            ),
+            &live_signal(),
+        )
         .await
         .expect_err("unattributable outcome is refused");
     assert!(
@@ -542,7 +921,7 @@ async fn every_result_carries_the_configured_provider_identity() {
     let scope = resolved_scope(Some("refs/heads/recall-port"));
 
     let complete = port
-        .recall_admitted(request(scope.clone(), 60_000_000, false))
+        .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
         .await
         .expect("complete recall");
     let identity = complete.result.provider();
@@ -555,7 +934,7 @@ async fn every_result_carries_the_configured_provider_identity() {
     assert_eq!(complete.fallback, FallbackDecision::NotApplicable);
 
     let cancelled = port
-        .recall_admitted(request(scope.clone(), 60_000_000, true))
+        .recall_admitted(request(scope.clone(), 60_000_000, true), &live_signal())
         .await
         .expect("cancelled recall");
     let identity = cancelled.result.provider();
@@ -572,7 +951,7 @@ async fn every_result_carries_the_configured_provider_identity() {
     )
     .expect("mounted port");
     let degraded = port
-        .recall_admitted(request(scope, 60_000_000, false))
+        .recall_admitted(request(scope, 60_000_000, false), &live_signal())
         .await
         .expect("unavailable recall");
     let identity = degraded.result.provider();
@@ -602,7 +981,7 @@ async fn zero_results_and_unavailable_are_distinct_typed_outcomes() {
     .expect("mounted port");
     let scope = resolved_scope(Some("refs/heads/recall-port"));
     let zero = port
-        .recall_admitted(request(scope.clone(), 60_000_000, false))
+        .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
         .await
         .expect("zero-result recall");
     assert!(zero.result.is_complete(), "{:?}", zero.result);
@@ -624,7 +1003,7 @@ async fn zero_results_and_unavailable_are_distinct_typed_outcomes() {
     )
     .expect("mounted port");
     let unavailable = port
-        .recall_admitted(request(scope, 60_000_000, false))
+        .recall_admitted(request(scope, 60_000_000, false), &live_signal())
         .await
         .expect("unavailable recall");
     assert!(!unavailable.result.is_complete());
@@ -661,7 +1040,7 @@ async fn misconfigured_routing_is_refused_before_any_provider_contact() {
     )
     .expect("mounted port");
     let error = foreign
-        .recall_admitted(request(scope.clone(), 60_000_000, false))
+        .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
         .await
         .expect_err("an unregistered configured provider has no route");
     match error {
@@ -679,7 +1058,7 @@ async fn misconfigured_routing_is_refused_before_any_provider_contact() {
     )
     .expect("mounted port");
     let error = stale
-        .recall_admitted(request(scope, 60_000_000, false))
+        .recall_admitted(request(scope, 60_000_000, false), &live_signal())
         .await
         .expect_err("a stale pinned revision has no route");
     match error {
@@ -721,11 +1100,14 @@ async fn pinned_fallback_rule_alone_never_dispatches_a_second_provider() {
     )
     .expect("mounted port");
     let outcome = port
-        .recall_admitted(request(
-            resolved_scope(Some("refs/heads/recall-port")),
-            60_000_000,
-            false,
-        ))
+        .recall_admitted(
+            request(
+                resolved_scope(Some("refs/heads/recall-port")),
+                60_000_000,
+                false,
+            ),
+            &live_signal(),
+        )
         .await
         .expect("unavailable recall");
     assert_eq!(
@@ -758,5 +1140,356 @@ fn routing_policy_refuses_self_targeting_fallback() {
             FallbackRule::ExplicitPinned(pinned),
         )
         .is_err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// tdmem-0903: composed provider set (active + observers) and the
+// product-output differential over the real recall port.
+// ---------------------------------------------------------------------------
+
+/// Composes the bounded provider set the composition root can now mount: the
+/// Native provider in `mode`, plus one injected evaluation observer.
+fn compose_with_observer(
+    port: Arc<dyn NativeMemoryApplicationPort>,
+    mode: EnabledProviderMode,
+    observer: Arc<EvaluationObserverProvider>,
+) -> Arc<ProjectMemoryProviderComposition> {
+    Arc::new(
+        ProjectMemoryProviderComposition::compose_with_observers(
+            NativeProviderActivation::Enabled {
+                fabric_config: FabricConfig {
+                    max_registered_providers: 2,
+                    max_in_flight: 2,
+                },
+                port,
+                registration_revision: 31,
+                mode,
+            },
+            vec![ObserverProviderRegistration {
+                provider: observer,
+                registration_revision: 7,
+            }],
+        )
+        .expect("composed provider set"),
+    )
+}
+
+/// SHA-256 over the canonical serialization of the **final product-visible
+/// recall output** — the `CognitiveRecallResult` the application consumes,
+/// including its scope, request id, attributed provider identity, every
+/// admitted candidate's id, content, provenance and explanation, and the
+/// typed degradation.
+///
+/// This is the product-output digest tdmem-0903's first acceptance criterion
+/// is about. It is deliberately *not* a hash of `ProviderReply`, which is the
+/// upstream provider envelope one layer below and would not detect an
+/// observer-dependent transformation applied during admission, normalization,
+/// selection, or bridging.
+fn product_output_sha256(result: &tracedecay_application::memory::CognitiveRecallResult) -> String {
+    let canonical = serde_json::to_vec(result).expect("canonical product output");
+    sha256_hex(&canonical)
+}
+
+/// Runs one recall through the real port and returns the product-visible
+/// result together with its SHA-256.
+async fn product_output(
+    composition: Arc<ProjectMemoryProviderComposition>,
+    scope: ResolvedScope,
+) -> (
+    tracedecay_application::memory::CognitiveRecallResult,
+    String,
+) {
+    let port = mount(composition, Arc::new(LedgerObserver::default())).expect("mounted port");
+    let outcome = port
+        .recall_admitted(request(scope, 60_000_000, false), &live_signal())
+        .await
+        .expect("bridged recall");
+    let digest = product_output_sha256(&outcome.result);
+    (outcome.result, digest)
+}
+
+/// Hands the observer a real observation through the registry's observation
+/// route and returns the fabric's typed answer.
+fn deliver_to_observer(
+    composition: &ProjectMemoryProviderComposition,
+    scope: &ResolvedScope,
+) -> Result<
+    tracedecay_memory_provider_registry::ObserverReceipt,
+    tracedecay_memory_provider_registry::FabricError,
+> {
+    let registry = composition.registry().expect("enabled composition");
+    let exact_scope = TestScopeBinding
+        .bind_exact_scope(scope)
+        .expect("bound observer scope");
+    let handshake = registry
+        .handshake(&observer_handshake_request(exact_scope.clone(), 7))
+        .expect("observer handshake");
+    let ready_receipt = handshake
+        .ready_receipt_sha256
+        .clone()
+        .expect("observer ready receipt");
+    registry.deliver_observation(&observer_observation_call(exact_scope, 7, ready_receipt))
+}
+
+/// tdmem-0903, acceptance 1 and 2, at the product-output layer: the final
+/// recall result a request consumes is byte-identical with the observer
+/// absent, present and working, and present and failing.
+///
+/// The earlier proof for this criterion hashed `ProviderReply` — the upstream
+/// provider envelope — inside the fabric crate, which cannot see admission,
+/// normalization, selection, or the application bridge, and so could not
+/// detect an observer-dependent transformation anywhere downstream of the
+/// router. This test hashes the actual `CognitiveRecallResult` produced by
+/// the real `ProjectCognitiveRecallPortV1` over the real Native adapter, with
+/// SHA-256 over its canonical serialization.
+///
+/// Both observer runs assert the observer genuinely ran: the working observer
+/// records a handshake and an invocation and returns a receipt, and the
+/// failing observer records the same contacts while its delivery is refused
+/// with a typed `FabricError`. A digest that matched because the observer had
+/// quietly done nothing would fail those assertions.
+#[tokio::test]
+async fn product_output_is_identical_with_the_observer_absent_working_and_failing() {
+    let scope = resolved_scope(Some("refs/heads/recall-port"));
+
+    // Baseline: no observer registered anywhere in the composition.
+    let baseline_native = Arc::new(RecallFixturePort::new());
+    let (baseline_result, baseline_digest) = product_output(
+        compose_mode(baseline_native.clone(), EnabledProviderMode::Active),
+        scope.clone(),
+    )
+    .await;
+    assert!(!baseline_result.candidates().is_empty());
+    assert_eq!(baseline_native.recall_calls.load(Ordering::Relaxed), 1);
+
+    // Observer registered alongside the active provider, and actually fed a
+    // real observation before the recall runs.
+    let accompanied_native = Arc::new(RecallFixturePort::new());
+    let working_observer = Arc::new(EvaluationObserverProvider::new(ObserverBehaviour::Accepts));
+    let accompanied = compose_with_observer(
+        accompanied_native.clone(),
+        EnabledProviderMode::Active,
+        working_observer.clone(),
+    );
+    let receipt = deliver_to_observer(&accompanied, &scope).expect("observer receipt");
+    assert_eq!(
+        receipt.provider_id.as_str(),
+        EVALUATION_OBSERVER_PROVIDER_ID
+    );
+    assert_eq!(working_observer.handshake_count(), 1);
+    assert_eq!(working_observer.invocation_count(), 1);
+    let (accompanied_result, accompanied_digest) =
+        product_output(Arc::clone(&accompanied), scope.clone()).await;
+
+    // Observer registered alongside the active provider, and failing.
+    let failing_native = Arc::new(RecallFixturePort::new());
+    let failing_observer = Arc::new(EvaluationObserverProvider::new(
+        ObserverBehaviour::FailsDelivery,
+    ));
+    let accompanied_failing = compose_with_observer(
+        failing_native.clone(),
+        EnabledProviderMode::Active,
+        failing_observer.clone(),
+    );
+    let delivery = deliver_to_observer(&accompanied_failing, &scope);
+    assert!(
+        matches!(
+            delivery,
+            Err(
+                tracedecay_memory_provider_registry::FabricError::ResponseOperationKindMismatch {
+                    expected: ProviderOperation::Observe,
+                    returned: ProviderOperation::Recall,
+                }
+            )
+        ),
+        "{delivery:?}"
+    );
+    assert_eq!(failing_observer.handshake_count(), 1);
+    assert_eq!(failing_observer.invocation_count(), 1);
+    let (failing_result, failing_digest) =
+        product_output(Arc::clone(&accompanied_failing), scope).await;
+
+    assert_eq!(baseline_digest, accompanied_digest);
+    assert_eq!(baseline_digest, failing_digest);
+    assert_eq!(baseline_result, accompanied_result);
+    assert_eq!(baseline_result, failing_result);
+    assert_eq!(accompanied_native.recall_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(failing_native.recall_calls.load(Ordering::Relaxed), 1);
+}
+
+/// tdmem-0903, acceptance 3 and 4, at the composition layer: an observer in a
+/// composed provider set is refused by the registry's own authority, not only
+/// by the fabric's mode gate.
+///
+/// Two independent refusals are asserted:
+///
+/// * the routing policy can never name the observer — `route_active` refuses
+///   it before any provider contact, so an observer cannot answer a product
+///   recall even under an operator misconfiguration;
+/// * the registry records **no** recall scope binding for an observer, so
+///   recall admission has no authorization to admit anything it returned even
+///   if a route somehow reached it.
+///
+/// The Native provider's own binding is asserted present in the same
+/// composition, so "no bindings" is a real distinction and not an artifact of
+/// bindings being unrecorded for everyone.
+#[tokio::test]
+async fn a_composed_observer_can_never_be_routed_or_authorized_for_recall() {
+    let native = Arc::new(RecallFixturePort::new());
+    let observer = Arc::new(EvaluationObserverProvider::new(ObserverBehaviour::Accepts));
+    let composition = compose_with_observer(
+        native.clone(),
+        EnabledProviderMode::Active,
+        observer.clone(),
+    );
+    let registry = composition.registry().expect("enabled composition");
+
+    let statuses = registry.statuses().expect("statuses");
+    let modes: Vec<_> = statuses
+        .iter()
+        .map(|status| (status.provider_id.as_str().to_owned(), status.mode))
+        .collect();
+    assert_eq!(
+        modes,
+        vec![
+            (
+                EVALUATION_OBSERVER_PROVIDER_ID.to_owned(),
+                ProviderMode::Observer
+            ),
+            (NATIVE_PROVIDER_ID.to_owned(), ProviderMode::Active),
+        ]
+    );
+
+    // Recall authorization: recorded for the selected active provider, absent
+    // for the observer.
+    assert!(
+        registry
+            .recall_scope_bindings(&OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native id"))
+            .is_some()
+    );
+    assert!(
+        registry
+            .recall_scope_bindings(
+                &OwnedProviderId::new(EVALUATION_OBSERVER_PROVIDER_ID).expect("observer id")
+            )
+            .is_none()
+    );
+
+    // Routing: the observer can never answer a product recall.
+    let port = mount_routed(
+        Arc::clone(&composition),
+        Arc::new(LedgerObserver::default()),
+        budgets(),
+        routing(EVALUATION_OBSERVER_PROVIDER_ID, 7, FallbackRule::Forbidden),
+    )
+    .expect("mounted port");
+    let error = port
+        .recall_admitted(
+            request(
+                resolved_scope(Some("refs/heads/recall-port")),
+                60_000_000,
+                false,
+            ),
+            &live_signal(),
+        )
+        .await
+        .expect_err("observer must never be routable");
+    assert!(
+        matches!(
+            error,
+            CognitiveRecallPortError::ProviderNotActive {
+                ref provider_id,
+                mode: ProviderMode::Observer,
+            } if provider_id == EVALUATION_OBSERVER_PROVIDER_ID
+        ),
+        "{error:?}"
+    );
+    assert_eq!(observer.handshake_count(), 0);
+    assert_eq!(observer.invocation_count(), 0);
+    assert_eq!(native.recall_calls.load(Ordering::Relaxed), 0);
+}
+
+/// tdmem-0903: the composed provider set is validated as a whole before
+/// anything is registered.
+#[test]
+fn a_composed_provider_set_is_bounded_and_identity_disjoint() {
+    let native = Arc::new(RecallFixturePort::new());
+
+    // Capacity: the set must fit the finite registry the fabric was given.
+    let over_capacity = ProjectMemoryProviderComposition::compose_with_observers(
+        NativeProviderActivation::Enabled {
+            fabric_config: FabricConfig {
+                max_registered_providers: 1,
+                max_in_flight: 2,
+            },
+            port: native.clone(),
+            registration_revision: 31,
+            mode: EnabledProviderMode::Active,
+        },
+        vec![ObserverProviderRegistration {
+            provider: Arc::new(EvaluationObserverProvider::new(ObserverBehaviour::Accepts)),
+            registration_revision: 7,
+        }],
+    );
+    assert!(
+        matches!(
+            over_capacity,
+            Err(RegistryError::ProviderSetExceedsRegistryCapacity {
+                providers: 2,
+                maximum: 1
+            })
+        ),
+        "{:?}",
+        over_capacity.map(|_| ())
+    );
+
+    // Identity: two observers may not declare the same provider identity.
+    let duplicate = ProjectMemoryProviderComposition::compose_with_observers(
+        NativeProviderActivation::Enabled {
+            fabric_config: FabricConfig {
+                max_registered_providers: 4,
+                max_in_flight: 2,
+            },
+            port: native.clone(),
+            registration_revision: 31,
+            mode: EnabledProviderMode::Active,
+        },
+        vec![
+            ObserverProviderRegistration {
+                provider: Arc::new(EvaluationObserverProvider::new(ObserverBehaviour::Accepts)),
+                registration_revision: 7,
+            },
+            ObserverProviderRegistration {
+                provider: Arc::new(EvaluationObserverProvider::new(ObserverBehaviour::Accepts)),
+                registration_revision: 8,
+            },
+        ],
+    );
+    assert!(
+        matches!(
+            duplicate,
+            Err(RegistryError::DuplicateObserverProvider(ref provider))
+                if provider == EVALUATION_OBSERVER_PROVIDER_ID
+        ),
+        "{:?}",
+        duplicate.map(|_| ())
+    );
+
+    // Observers exist only inside an enabled composition.
+    let orphaned = ProjectMemoryProviderComposition::compose_with_observers(
+        NativeProviderActivation::Disabled,
+        vec![ObserverProviderRegistration {
+            provider: Arc::new(EvaluationObserverProvider::new(ObserverBehaviour::Accepts)),
+            registration_revision: 7,
+        }],
+    );
+    assert!(
+        matches!(
+            orphaned,
+            Err(RegistryError::ObserverWithoutEnabledComposition { observers: 1 })
+        ),
+        "{:?}",
+        orphaned.map(|_| ())
     );
 }

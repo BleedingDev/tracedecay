@@ -1,10 +1,12 @@
 //! Physical schema for the observation journal store.
 //!
-//! Six tables with six different jobs:
+//! Seven tables with seven different jobs:
 //!
 //! * `tdmem_observation_journal_v1` — immutable admitted content.
 //! * `tdmem_observation_delivery_v1` — the only mutable delivery authority.
 //! * `tdmem_observation_receipt_v1` — append-only attempt audit.
+//! * `tdmem_observation_attempt_refusal_v1` — append-only audit of answered
+//!   attempts whose provider terminal the host refused as delivery evidence.
 //! * `tdmem_observation_replay_cursor_v1` — the ingress replay position.
 //! * `tdmem_observation_target_cursor_v1` — per-registration admitted position.
 //! * `tdmem_observation_withheld_v2` — digests-only audit for refused events.
@@ -34,9 +36,40 @@ use crate::error::ObservationJournalError;
 use super::row::validate_withheld_rows;
 
 /// Schema version this build writes and understands.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 6;
 
 const LEGACY_SCHEMA_VERSION: i64 = 1;
+
+/// The version that predates the refused-terminal audit table. Upgrading from
+/// it adds a table and nothing else, so the DDL below is the whole migration.
+const WITHHELD_V2_SCHEMA_VERSION: i64 = 2;
+
+/// The version that predates the restart-recovery record. Upgrading from it
+/// adds one table and nothing else: an existing store simply has no
+/// acknowledged watermark yet, which is exactly the "first contact" shape the
+/// recovery runtime already handles, so no acknowledged history is invented.
+const PRE_RECOVERY_SCHEMA_VERSION: i64 = 3;
+
+/// The version whose recovery record counted repair attempts without an
+/// assessment identity to count them *per*. Upgrading from it adds the identity
+/// column and the accepted replay-position policy; both start `NULL`, which is
+/// the same "nothing accepted yet" shape a fresh target has.
+const PRE_ASSESSMENT_IDENTITY_SCHEMA_VERSION: i64 = 4;
+
+/// The version that predates the orphaned-attempt audit table. Upgrading from
+/// it adds one table and nothing else: attempts spent by leases that lapsed
+/// before this build has no orphan record, which is honest — the store never
+/// held that evidence and nothing invents it retroactively.
+const PRE_ATTEMPT_ORPHAN_SCHEMA_VERSION: i64 = 5;
+
+/// Columns added to the recovery record after version 4.
+const RECOVERY_V5_COLUMNS: [(&str, &str); 2] = [
+    ("last_assessment_id", "TEXT"),
+    (
+        "replay_position_retained",
+        "INTEGER CHECK (replay_position_retained IN (0, 1))",
+    ),
+];
 
 /// `synchronous = FULL` is what makes "survives restart" mean "survives power
 /// loss". `secure_delete = ON` is what makes privacy deletion zero freed pages
@@ -201,6 +234,68 @@ CREATE UNIQUE INDEX IF NOT EXISTS tdmem_observation_receipt_id_v1
 CREATE INDEX IF NOT EXISTS tdmem_observation_receipt_key_v1
     ON tdmem_observation_receipt_v1 (idempotency_key, attempt_number);
 
+-- Answered attempts whose terminal the host refused. Same key shape as the
+-- receipt table and the same append-only discipline, but deliberately a
+-- different table: a row here is evidence that an attempt number was spent on
+-- an answer the host would not accept, never evidence that a provider effect
+-- committed. Nothing addresses a delivery row by it and nothing reads content
+-- from it.
+CREATE TABLE IF NOT EXISTS tdmem_observation_attempt_refusal_v1 (
+    observation_id          TEXT    NOT NULL,
+    attempt_number          INTEGER NOT NULL CHECK (attempt_number >= 1),
+    idempotency_key         TEXT    NOT NULL,
+    provider_id             TEXT    NOT NULL,
+    provider_instance_id    TEXT    NOT NULL,
+    registration_revision   INTEGER NOT NULL CHECK (registration_revision > 0),
+    exact_scope_sha256      TEXT    NOT NULL,
+    category                TEXT    NOT NULL CHECK (category IN (
+        'terminal_identity_mismatch', 'receipt_not_admissible')),
+    refused_field           TEXT    NOT NULL,
+    expected_value          TEXT,
+    provided_value          TEXT,
+    detail                  TEXT    NOT NULL,
+    terminal_operation      TEXT    NOT NULL,
+    terminal_code           TEXT    NOT NULL,
+    terminal_operation_id   TEXT    NOT NULL,
+    provider_receipt_digest TEXT,
+    started_at_micros       INTEGER NOT NULL,
+    finished_at_micros      INTEGER NOT NULL,
+    recorded_at_micros      INTEGER NOT NULL,
+    PRIMARY KEY (observation_id, attempt_number)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS tdmem_observation_attempt_refusal_key_v1
+    ON tdmem_observation_attempt_refusal_v1 (idempotency_key, attempt_number);
+
+-- Attempt numbers spent by a lease that lapsed before any answer became
+-- durable. Same key shape and same append-only discipline as the receipt and
+-- refusal tables, and deliberately a third table: a row here says an attempt
+-- was consumed and the host does not know what became of it, which is the one
+-- thing neither of the other two may ever say. Nothing addresses a delivery row
+-- by it and it carries no committed-effect claim.
+CREATE TABLE IF NOT EXISTS tdmem_observation_attempt_orphan_v1 (
+    observation_id            TEXT    NOT NULL,
+    attempt_number            INTEGER NOT NULL CHECK (attempt_number >= 1),
+    idempotency_key           TEXT    NOT NULL,
+    provider_id               TEXT    NOT NULL,
+    provider_instance_id      TEXT,
+    registration_revision     INTEGER NOT NULL CHECK (registration_revision > 0),
+    exact_scope_sha256        TEXT    NOT NULL,
+    lease_id                  TEXT    NOT NULL,
+    lease_owner               TEXT    NOT NULL,
+    payload_sha256            TEXT    NOT NULL,
+    cause                     TEXT    NOT NULL CHECK (cause IN (
+        'lease_expired_without_answer')),
+    recovery                  TEXT    NOT NULL CHECK (recovery IN (
+        'redelivery_scheduled', 'attempts_exhausted')),
+    lease_expired_at_micros   INTEGER NOT NULL,
+    recorded_at_micros        INTEGER NOT NULL,
+    PRIMARY KEY (observation_id, attempt_number)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS tdmem_observation_attempt_orphan_key_v1
+    ON tdmem_observation_attempt_orphan_v1 (idempotency_key, attempt_number);
+
 CREATE TABLE IF NOT EXISTS tdmem_observation_replay_cursor_v1 (
     source_authority             TEXT    NOT NULL,
     exact_scope_sha256           TEXT    NOT NULL,
@@ -230,6 +325,39 @@ CREATE TABLE IF NOT EXISTS tdmem_observation_target_cursor_v1 (
     last_source_event_id       TEXT    NOT NULL,
     last_source_event_revision INTEGER NOT NULL CHECK (last_source_event_revision >= 0),
     updated_at_micros          INTEGER NOT NULL,
+    PRIMARY KEY (provider_id, registration_revision, source_authority,
+                 exact_scope_sha256, source_stream)
+) WITHOUT ROWID;
+
+-- Restart recovery for one provider registration on one stream: the durable
+-- acknowledged watermark, the provider state identity the last converged
+-- assessment accepted, and the bounded automatic repair counter.
+--
+-- The watermark is the reason this is a row rather than a query. A retention
+-- sweep or a privacy deletion legitimately removes an acknowledged delivery,
+-- and a watermark derived from surviving rows would then move backwards and
+-- re-propose work the provider already applied. The only statement that writes
+-- `acknowledged_sequence` refuses to lower it, so the sequence is monotonic by
+-- construction rather than by discipline.
+CREATE TABLE IF NOT EXISTS tdmem_observation_recovery_v1 (
+    provider_id                    TEXT    NOT NULL,
+    registration_revision          INTEGER NOT NULL CHECK (registration_revision > 0),
+    source_authority               TEXT    NOT NULL,
+    exact_scope_sha256             TEXT    NOT NULL,
+    source_stream                  TEXT    NOT NULL,
+    acknowledged_sequence          INTEGER CHECK (acknowledged_sequence >= 0),
+    acknowledged_observation_id    TEXT,
+    acknowledged_at_micros         INTEGER,
+    implementation_identity_sha256 TEXT,
+    state_schema_version           TEXT,
+    state_generation               INTEGER CHECK (state_generation >= 0),
+    replay_position_retained       INTEGER CHECK (replay_position_retained IN (0, 1)),
+    automatic_repair_attempts      INTEGER NOT NULL CHECK (automatic_repair_attempts >= 0),
+    last_defect                    TEXT,
+    last_assessment_id             TEXT,
+    updated_at_micros              INTEGER NOT NULL,
+    CHECK ((acknowledged_sequence IS NULL) = (acknowledged_at_micros IS NULL)),
+    CHECK ((acknowledged_sequence IS NULL) = (acknowledged_observation_id IS NULL)),
     PRIMARY KEY (provider_id, registration_revision, source_authority,
                  exact_scope_sha256, source_stream)
 ) WITHOUT ROWID;
@@ -284,7 +412,20 @@ pub(crate) fn initialize(connection: &mut Connection) -> Result<(), ObservationJ
     match version {
         0 => transaction.execute_batch(SCHEMA_DDL)?,
         LEGACY_SCHEMA_VERSION => migrate_v1_to_v2(&transaction)?,
-        SCHEMA_VERSION => transaction.execute_batch(SCHEMA_DDL)?,
+        // Version 2 gained the refused-terminal audit; every statement in the
+        // DDL is `IF NOT EXISTS`, so applying it adds the new table and its
+        // index without touching a single existing row.
+        WITHHELD_V2_SCHEMA_VERSION | PRE_RECOVERY_SCHEMA_VERSION => {
+            transaction.execute_batch(SCHEMA_DDL)?;
+        }
+        // Version 4 already has the recovery table, so `CREATE TABLE IF NOT
+        // EXISTS` cannot widen it: the two columns are added explicitly.
+        PRE_ASSESSMENT_IDENTITY_SCHEMA_VERSION
+        | PRE_ATTEMPT_ORPHAN_SCHEMA_VERSION
+        | SCHEMA_VERSION => {
+            transaction.execute_batch(SCHEMA_DDL)?;
+            add_recovery_v5_columns(&transaction)?;
+        }
         _ => {
             return Err(ObservationJournalError::Corrupt {
                 table: "sqlite_schema",
@@ -295,6 +436,28 @@ pub(crate) fn initialize(connection: &mut Connection) -> Result<(), ObservationJ
     validate_withheld_rows(&transaction)?;
     transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     transaction.commit()?;
+    Ok(())
+}
+
+/// Adds the version-5 recovery columns to a table that predates them.
+///
+/// `ALTER TABLE ... ADD COLUMN` is not idempotent, so each column is added only
+/// when the table does not already carry it; a store created fresh at version 5
+/// therefore passes through untouched.
+fn add_recovery_v5_columns(transaction: &Transaction<'_>) -> Result<(), ObservationJournalError> {
+    for (column, declaration) in RECOVERY_V5_COLUMNS {
+        let present: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tdmem_observation_recovery_v1') \
+             WHERE name = ?1",
+            [column],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            transaction.execute_batch(&format!(
+                "ALTER TABLE tdmem_observation_recovery_v1 ADD COLUMN {column} {declaration}"
+            ))?;
+        }
+    }
     Ok(())
 }
 

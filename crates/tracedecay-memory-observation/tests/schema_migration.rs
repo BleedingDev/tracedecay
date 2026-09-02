@@ -116,6 +116,86 @@ fn populated_legacy_audit_refuses_migration_without_inventing_evidence() -> Test
     Ok(())
 }
 
+/// A store written before the refused-terminal audit existed upgrades to it
+/// without losing a row.
+///
+/// The defect this catches: adding the audit table to the DDL alone would leave
+/// every existing store on schema 2 without it, so the first refused terminal on
+/// an upgraded daemon would fail its insert instead of being recorded.
+#[test]
+fn a_store_without_the_refusal_audit_gains_it_on_open() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("journal.sqlite3");
+    {
+        let store = journal(&path)?;
+        store.record_withheld_at(&withheld_at(7, "forget:session-1")?, 123_456)?;
+    }
+    // Simulate a store written by the previous build: drop the new table and
+    // wind the marker back to the version that predates it.
+    {
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "DROP TABLE tdmem_observation_attempt_refusal_v1; PRAGMA user_version = 2;",
+        )?;
+    }
+
+    drop(journal(&path)?);
+    let connection = Connection::open(path)?;
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    assert_eq!(version, SCHEMA_VERSION);
+    let table: String = connection.query_row(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' \
+         AND name = 'tdmem_observation_attempt_refusal_v1'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(table, "tdmem_observation_attempt_refusal_v1");
+    let preserved: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM tdmem_observation_withheld_v2",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(preserved, 1, "the upgrade dropped existing audit evidence");
+    Ok(())
+}
+
+#[test]
+fn a_store_without_the_orphaned_attempt_audit_gains_it_on_open() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("journal.sqlite3");
+    {
+        let store = journal(&path)?;
+        store.record_withheld_at(&withheld_at(7, "forget:session-1")?, 123_456)?;
+    }
+    // Simulate a store written by the build that predates the orphaned-attempt
+    // audit: drop the table and wind the marker back to that version.
+    {
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "DROP TABLE tdmem_observation_attempt_orphan_v1; PRAGMA user_version = 5;",
+        )?;
+    }
+
+    drop(journal(&path)?);
+    let connection = Connection::open(path)?;
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    assert_eq!(version, SCHEMA_VERSION);
+    let table: String = connection.query_row(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' \
+         AND name = 'tdmem_observation_attempt_orphan_v1'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(table, "tdmem_observation_attempt_orphan_v1");
+    let preserved: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM tdmem_observation_withheld_v2",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(preserved, 1, "the upgrade dropped existing audit evidence");
+    Ok(())
+}
+
 #[test]
 fn withheld_evidence_round_trips_exactly_through_sqlite() -> TestResult {
     let directory = tempfile::tempdir()?;
@@ -187,5 +267,83 @@ fn restart_rejects_every_persisted_withheld_receipt_perturbation() -> TestResult
             })
         ));
     }
+    Ok(())
+}
+
+/// The version-4 recovery record: no assessment identity, no accepted
+/// replay-position policy. A store written by that build must gain both
+/// columns on open without losing the acknowledged watermark or the repair
+/// counter it already holds.
+///
+/// The defect this catches: adding the two columns to the `CREATE TABLE IF NOT
+/// EXISTS` DDL alone leaves every existing store without them, and the first
+/// refusal on an upgraded daemon fails its insert instead of bounding the
+/// repair path.
+const V4_RECOVERY_DDL: &str = r#"
+CREATE TABLE tdmem_observation_recovery_v1 (
+    provider_id                    TEXT    NOT NULL,
+    registration_revision          INTEGER NOT NULL CHECK (registration_revision > 0),
+    source_authority               TEXT    NOT NULL,
+    exact_scope_sha256             TEXT    NOT NULL,
+    source_stream                  TEXT    NOT NULL,
+    acknowledged_sequence          INTEGER CHECK (acknowledged_sequence >= 0),
+    acknowledged_observation_id    TEXT,
+    acknowledged_at_micros         INTEGER,
+    implementation_identity_sha256 TEXT,
+    state_schema_version           TEXT,
+    state_generation               INTEGER CHECK (state_generation >= 0),
+    automatic_repair_attempts      INTEGER NOT NULL CHECK (automatic_repair_attempts >= 0),
+    last_defect                    TEXT,
+    updated_at_micros              INTEGER NOT NULL,
+    PRIMARY KEY (provider_id, registration_revision, source_authority,
+                 exact_scope_sha256, source_stream)
+) WITHOUT ROWID;
+PRAGMA user_version = 4;
+"#;
+
+#[test]
+fn a_recovery_record_without_an_assessment_identity_gains_one_on_open() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("journal.sqlite3");
+    {
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(V4_RECOVERY_DDL)?;
+        connection.execute(
+            "INSERT INTO tdmem_observation_recovery_v1 (
+                 provider_id, registration_revision, source_authority, exact_scope_sha256,
+                 source_stream, acknowledged_sequence, acknowledged_observation_id,
+                 acknowledged_at_micros, automatic_repair_attempts, updated_at_micros
+             ) VALUES ('tracedecay.native', 4, 'host_session', ?1, 'session-1', 9,
+                       'observation-9', 111, 2, 111)",
+            params![digest_hex(b"scope")],
+        )?;
+    }
+
+    drop(journal(&path)?);
+    let connection = Connection::open(path)?;
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    assert_eq!(version, SCHEMA_VERSION);
+    let columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('tdmem_observation_recovery_v1') \
+         WHERE name IN ('last_assessment_id', 'replay_position_retained')",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(columns, 2);
+    let (watermark, attempts, assessment): (i64, i64, Option<String>) = connection.query_row(
+        "SELECT acknowledged_sequence, automatic_repair_attempts, last_assessment_id \
+         FROM tdmem_observation_recovery_v1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(
+        watermark, 9,
+        "the upgrade lost the durable acknowledged watermark"
+    );
+    assert_eq!(
+        attempts, 2,
+        "the upgrade reset the bounded repair counter, buying a crash loop new attempts"
+    );
+    assert_eq!(assessment, None);
     Ok(())
 }

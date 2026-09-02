@@ -34,6 +34,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracedecay_memory_provider_api::contract::{TemporalMode, TerminalCode};
+
+use crate::recall_normalization::{
+    NativeScoreDefect, NativeScoreV1, ValidatedNativeScoreV1, validate_native_score,
+};
 use tracedecay_memory_provider_api::{
     ApiError, CanonicalPayload, OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall,
     ProviderReply,
@@ -308,6 +312,13 @@ pub enum RecallDenialReason {
     ContentDigestMismatch,
     /// The candidate carries neither or both of `content` / `content_ref`.
     ContentSelectionInvalid,
+    /// The provider-native score is absent, malformed, non-finite, or
+    /// contradicts the range the provider itself declared, so no honest
+    /// relevance can be established for the candidate.
+    NativeScoreMalformed {
+        /// The first defect found in contract field order.
+        defect: NativeScoreDefect,
+    },
 }
 
 impl RecallDenialReason {
@@ -328,6 +339,7 @@ impl RecallDenialReason {
             Self::InvalidValidityRecord { .. } => "invalid_validity_record",
             Self::ContentDigestMismatch => "content_digest_mismatch",
             Self::ContentSelectionInvalid => "content_selection_invalid",
+            Self::NativeScoreMalformed { .. } => "native_score_malformed",
         }
     }
 }
@@ -996,6 +1008,7 @@ pub struct AdmittedRecallCandidate {
     candidate: RecallCandidateV1,
     host_temporal_state: TemporalState,
     warnings: Vec<String>,
+    native_score: ValidatedNativeScoreV1,
 }
 
 impl AdmittedRecallCandidate {
@@ -1021,6 +1034,20 @@ impl AdmittedRecallCandidate {
     #[must_use]
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// Returns the provider-native score exactly as declared. Admission
+    /// established it is well formed; nothing here rewrites it.
+    #[must_use]
+    pub const fn native_score(&self) -> &NativeScoreV1 {
+        self.native_score.score()
+    }
+
+    /// Returns the framed digest of the declared native score, which host
+    /// normalization records as the input its value was derived from.
+    #[must_use]
+    pub fn native_score_sha256(&self) -> &str {
+        self.native_score.native_score_sha256()
     }
 
     /// Returns the verified content selection.
@@ -1077,6 +1104,17 @@ pub struct RecallAdmissionReport {
     pub authorized_scope_bindings: RecallScopeBindingsV1,
     /// Candidates the provider returned.
     pub received_count: usize,
+    /// Request-scoped identity of every candidate the provider returned, in
+    /// the provider's own order.
+    ///
+    /// The denial ledger and the admitted slice are each in provider order,
+    /// but neither alone recovers the interleaving of the two. This is the
+    /// one place a later stage — an explain trace, an audit query — can learn
+    /// the provider rank of *every* received candidate, so a per-candidate
+    /// reconciliation can be a complete, ordered partition rather than a
+    /// concatenation of per-stage groups. It carries identities only: the
+    /// report stays content-free.
+    pub received_candidate_ids: Vec<String>,
     /// Candidates admitted, in provider order.
     pub admitted_count: usize,
     /// Denied candidates, in provider order.
@@ -1239,16 +1277,21 @@ pub fn admit_recall_candidates(
         }
     }
     let received_count = candidates.len();
+    let received_candidate_ids: Vec<String> = candidates
+        .iter()
+        .map(|candidate| candidate.candidate_id.clone())
+        .collect();
     let mut admitted = Vec::new();
     let mut denied = Vec::new();
     let mut degraded = false;
     for candidate in candidates {
         match admit_one(admitted_scope, temporal, authorized, &candidate) {
-            Ok(decision) => {
+            Ok((decision, native_score)) => {
                 degraded |= decision.degrades_lane;
                 admitted.push(AdmittedRecallCandidate {
                     host_temporal_state: decision.host_temporal_state,
                     warnings: decision.warnings,
+                    native_score,
                     candidate,
                 });
             }
@@ -1280,6 +1323,7 @@ pub fn admit_recall_candidates(
             unknown_validity_policy: temporal.unknown_validity_policy,
             authorized_scope_bindings: authorized.clone(),
             received_count,
+            received_candidate_ids,
             admitted_count: admitted.len(),
             denied,
             degraded,
@@ -1300,10 +1344,16 @@ fn admit_one(
     temporal: &AdmittedTemporalQuery,
     authorized: &RecallScopeBindingsV1,
     candidate: &RecallCandidateV1,
-) -> Result<AdmitDecision, RecallDenialReason> {
+) -> Result<(AdmitDecision, ValidatedNativeScoreV1), RecallDenialReason> {
     check_scope(admitted_scope, authorized, &candidate.exact_scope_identity)?;
     check_content(candidate)?;
-    check_validity(temporal, &candidate.validity)
+    let decision = check_validity(temporal, &candidate.validity)?;
+    // Relevance inputs are admitted, never repaired: a score the host cannot
+    // project honestly denies the candidate here rather than reaching
+    // normalization as a neutral value.
+    let native_score = validate_native_score(&candidate.native_score)
+        .map_err(|defect| RecallDenialReason::NativeScoreMalformed { defect })?;
+    Ok((decision, native_score))
 }
 
 /// Applies the claimed scope binding's field rules byte-for-byte in contract

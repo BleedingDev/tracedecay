@@ -142,6 +142,13 @@ pub enum ObservationJournalError {
         /// Logical policy field name.
         field: &'static str,
     },
+    /// The backpressure policy cannot bound the lane, or reserves no headroom
+    /// between shedding optional work and refusing every class.
+    #[error("backpressure policy field {field} is invalid")]
+    InvalidBackpressurePolicy {
+        /// Logical policy field name.
+        field: &'static str,
+    },
     /// An observation identity was not a lowercase UUIDv7.
     #[error("observation id is not a lowercase uuid v7: {detail}")]
     InvalidObservationId {
@@ -200,6 +207,13 @@ pub enum ObservationJournalError {
     /// The journal mutex was poisoned by a panicking writer.
     #[error("observation journal connection lock is poisoned")]
     LockPoisoned,
+    /// The caller's remaining budget ran out while the operation was waiting
+    /// for the journal connection or for SQLite itself. Nothing was written.
+    #[error("observation journal operation {operation} exhausted its remaining budget")]
+    BudgetExhausted {
+        /// Logical operation that ran out of budget.
+        operation: &'static str,
+    },
 }
 
 impl ObservationJournalError {

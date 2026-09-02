@@ -15,8 +15,26 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
+# Canonical context tokenizer. The context-pack compiler measures every token
+# budget as an exact `o200k_base` BPE count, under the same estimator identity
+# the coding-memory conformance baseline records its admitted-context costs
+# with, so a pack budget and a baseline cost are one measurement rather than
+# two numbers that share a name. The vendored ranks are compile-time data;
+# nothing here reaches the filesystem or the network.
+tiktoken-rs = "0.12"
 tokio = { version = "1", default-features = false, features = ["rt"] }
-tracedecay-application = { path = "../tracedecay-application", version = "0.1.0" }
+# Contract surface only: port traits and value types.
+#
+# `default-features = false` states this crate's own intent and stops a future
+# `default` feature set from widening the edge. It does NOT make the linked
+# crate capability-free: Cargo unifies features per compiled crate instance,
+# `tracedecay-application` mounts a gix historical-blob reader behind its
+# optional `native-git` feature, and crates/tracedecay/Cargo.toml enables that
+# feature in the production root graph. What actually bounds this crate is the
+# source-import contract in product/architecture/memory-dependency-policy.json,
+# which admits an exact list of `tracedecay_application::` item paths and
+# refuses `NativeHistoricalBlobReaderV1` and everything else.
+tracedecay-application = { path = "../tracedecay-application", version = "0.1.0", default-features = false }
 tracedecay-memory-fabric = { path = "../tracedecay-memory-fabric" }
 tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
 tracedecay-memory-provider-native = { path = "../tracedecay-memory-provider-native" }

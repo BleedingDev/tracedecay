@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -87,6 +89,75 @@ EXPECTED_LANE_ORDER = [
     "provider_recall_candidates",
 ]
 
+DOC_LINE = re.compile(r"^\s*(?:///|//!)\s?(.*)$")
+ATTRIBUTE_LINE = re.compile(r"^\s*#!?\[")
+
+
+@dataclass(frozen=True)
+class DocAssertion:
+    """A rustdoc invariant that must survive as ONE attached assertion.
+
+    Rust doc comments wrap across `///` lines, so a literal substring check
+    cannot see a multi-line sentence. This marker instead normalizes each doc
+    block (line prefixes stripped, all whitespace collapsed to single spaces)
+    and requires two things at once:
+
+    * ``phrase`` must appear CONTIGUOUSLY in the normalized block, so the
+      clauses cannot be separated, reordered, or scattered into unrelated
+      comments elsewhere in the file; and
+    * the block must be the documentation attached to an item whose
+      declaration starts with ``item_prefix``, so the assertion has to
+      document the real production accessor it constrains rather than sit in
+      a detached historical note beside a contradicting implementation.
+    """
+
+    phrase: str
+    item_prefix: str
+
+    def describe(self) -> str:
+        return f"rustdoc assertion on `{self.item_prefix}`: {self.phrase!r}"
+
+
+def collapse_whitespace(value: str) -> str:
+    return " ".join(value.split())
+
+
+def rust_doc_blocks(text: str) -> list[tuple[str, str]]:
+    """Return ``(normalized doc text, attached item declaration)`` pairs.
+
+    A doc block ends at the first line that is not a doc line. Attributes
+    between the docs and the item are skipped (they still attach). Anything
+    else — including a blank line, which detaches the comment in Rust — ends
+    the block and becomes the "item", so a detached note yields an item that
+    matches no ``item_prefix``.
+    """
+    blocks: list[tuple[str, str]] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        matched = DOC_LINE.match(line)
+        if matched is not None:
+            current.append(matched.group(1))
+            continue
+        if not current:
+            continue
+        if ATTRIBUTE_LINE.match(line):
+            continue
+        blocks.append((collapse_whitespace(" ".join(current)), collapse_whitespace(line)))
+        current = []
+    if current:
+        blocks.append((collapse_whitespace(" ".join(current)), ""))
+    return blocks
+
+
+def doc_assertion_holds(text: str, assertion: DocAssertion) -> bool:
+    phrase = collapse_whitespace(assertion.phrase)
+    prefix = collapse_whitespace(assertion.item_prefix)
+    for doc, item in rust_doc_blocks(text):
+        if phrase in doc and item.startswith(prefix):
+            return True
+    return False
+
+
 SOURCE_MARKERS = {
     "crates/tracedecay/src/tracedecay/edits/file_authority.rs": [
         "struct SourceEditFileAuthority",
@@ -133,7 +204,23 @@ SOURCE_MARKERS = {
     "crates/tracedecay-usecases/src/configuration/runtime.rs": [
         "pub struct ProjectConfigurationRuntime",
         "transactional store handle",
-        "sole runtime configuration authority",
+        # Single-writer configuration authority. The assertion is one rustdoc
+        # sentence that wraps across a `///` line break in the source, so a
+        # plain substring check can never see it contiguously. `DocAssertion`
+        # normalizes the doc block (strips `///` prefixes, collapses
+        # whitespace) and then requires the WHOLE sentence contiguously, and
+        # requires that doc block to be the documentation attached to the
+        # public accessor it constrains. Splitting the sentence across
+        # unrelated comments, or leaving it as a free-floating historical
+        # note while the accessor documents a second authority, is rejected.
+        DocAssertion(
+            phrase=(
+                "Effective values and revisions must be read from "
+                "[`Self::client`] so the retained store remains the sole "
+                "runtime configuration authority."
+            ),
+            item_prefix="pub fn configuration_target",
+        ),
     ],
 }
 
@@ -483,6 +570,10 @@ def validate_paths(repo: Path, document: dict[str, Any], errors: list[str]) -> N
             continue
         text = path.read_text(encoding="utf-8")
         for marker in markers:
+            if isinstance(marker, DocAssertion):
+                if not doc_assertion_holds(text, marker):
+                    errors.append(f"{raw} is missing production {marker.describe()}")
+                continue
             if marker not in text:
                 errors.append(f"{raw} is missing production marker {marker!r}")
 

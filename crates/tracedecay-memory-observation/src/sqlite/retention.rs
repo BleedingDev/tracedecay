@@ -173,6 +173,14 @@ impl ObservationRetentionPortV1 for SqliteObservationJournal {
                     i64::try_from(receipts).unwrap_or(i64::MAX),
                     "receipts_deleted",
                 )?);
+                // The refused-terminal audit ages out with the attempt history
+                // it belongs to. It is keyed by observation, not by the journal
+                // row, so nothing cascades it: without this it would outlive
+                // every row it describes and grow without bound.
+                transaction.execute(
+                    "DELETE FROM tdmem_observation_attempt_refusal_v1 WHERE observation_id = ?1",
+                    params![&observation_id],
+                )?;
                 // The delivery row cascades with the journal row.
                 let deleted = transaction.execute(
                     "DELETE FROM tdmem_observation_journal_v1 WHERE idempotency_key = ?1",

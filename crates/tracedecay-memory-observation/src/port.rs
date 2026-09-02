@@ -7,10 +7,13 @@ use crate::identity::{
     SourceSequenceV1,
 };
 use crate::inspection::{
-    JournalInspectionFilterV1, JournalInspectionPageV1, QueuePressureV1, ReplayCursorV1,
+    JournalInspectionFilterV1, JournalInspectionPageV1, ObservationLaneKeyV1, QueuePressureV1,
+    ReplayCursorV1,
 };
 use crate::lease::{AttemptOutcomeV1, LeaseRequestV1, LeasedObservationV1};
+use crate::orphan::AttemptOrphanRecordV1;
 use crate::receipt::ObservationDeliveryReceiptV1;
+use crate::refusal::{AttemptRefusalOutcomeV1, AttemptRefusalRecordV1};
 use crate::retention::{
     ForgetReceiptV1, ForgetSourceRequestV1, ForgetVerificationV1, RetentionPolicyV1,
     RetentionSweepReceiptV1,
@@ -117,11 +120,27 @@ pub trait ObservationDispatchPortV1: Send + Sync {
         stream: &SourceStreamKeyV1,
     ) -> Result<Option<ReplayCursorV1>, ObservationJournalError>;
 
-    /// Reads bounded queue pressure against one provider instance.
+    /// Reads bounded queue pressure for one provider lane.
+    ///
+    /// Addressed by registration rather than by a proven readiness target, so
+    /// a caller can measure the lane before it has paid for the handshake that
+    /// would name an instance — which is what makes a pre-admission pressure
+    /// check cheap enough to run first.
+    fn lane_pressure(
+        &self,
+        lane: &ObservationLaneKeyV1,
+    ) -> Result<QueuePressureV1, ObservationJournalError>;
+
+    /// The same pressure, addressed by a target whose readiness is already
+    /// proven. One implementation, two ways in: the target is revalidated and
+    /// then reduced to the lane it addresses.
     fn queue_pressure(
         &self,
         target: &ProviderTargetV1,
-    ) -> Result<QueuePressureV1, ObservationJournalError>;
+    ) -> Result<QueuePressureV1, ObservationJournalError> {
+        target.validate()?;
+        self.lane_pressure(&ObservationLaneKeyV1::of(target))
+    }
 }
 
 /// Delivery side of the journal: lease, acknowledge, reap, inspect.
@@ -137,6 +156,18 @@ pub trait ObservationJournalReaderV1: Send + Sync {
         &self,
         receipt: &ObservationDeliveryReceiptV1,
     ) -> Result<AttemptOutcomeV1, ObservationJournalError>;
+
+    /// Records one immutable refusal of a provider terminal that the host
+    /// answered but could not accept as delivery evidence.
+    ///
+    /// This is deliberately *not* `record_attempt`: nothing about the delivery
+    /// row moves, no provider effect is attributed, and no receipt is minted.
+    /// It exists so a crash cannot erase the fact that an attempt number was
+    /// consumed by an answer the host refused.
+    fn record_attempt_refusal(
+        &self,
+        refusal: &AttemptRefusalRecordV1,
+    ) -> Result<AttemptRefusalOutcomeV1, ObservationJournalError>;
 
     /// Returns one lease to `Pending` with an explicit retry instant.
     fn release_lease(
@@ -163,6 +194,26 @@ pub trait ObservationJournalReaderV1: Send + Sync {
         &self,
         observation_id: &ObservationIdV1,
     ) -> Result<Vec<ObservationDeliveryReceiptV1>, ObservationJournalError>;
+
+    /// Reads every refused provider terminal recorded for one observation, in
+    /// attempt order.
+    fn attempt_refusals_for(
+        &self,
+        observation_id: &ObservationIdV1,
+    ) -> Result<Vec<AttemptRefusalRecordV1>, ObservationJournalError>;
+
+    /// Reads every orphaned attempt recorded for one observation, in attempt
+    /// order.
+    ///
+    /// Together with [`Self::receipts_for`] and [`Self::attempt_refusals_for`]
+    /// this closes the audit over a row's `attempt_number`: every attempt the
+    /// lease claim consumed is represented by a receipt, a refusal, or an
+    /// orphan record, so a crash between the claim and the answer leaves
+    /// durable evidence instead of an unexplained gap in the counter.
+    fn attempt_orphans_for(
+        &self,
+        observation_id: &ObservationIdV1,
+    ) -> Result<Vec<AttemptOrphanRecordV1>, ObservationJournalError>;
 }
 
 /// Retention and privacy deletion side of the journal.

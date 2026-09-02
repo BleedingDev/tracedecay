@@ -97,6 +97,7 @@ use tracedecay_runtime_core::privacy::{MemoryFactSanitizationV1, sanitize_memory
 mod credentials;
 pub mod findings;
 pub mod policy;
+pub mod recall_text;
 pub mod transient;
 
 pub use findings::{
@@ -107,6 +108,15 @@ pub use policy::{
     HygieneAction, HygieneClass, OBSERVATION_HYGIENE_POLICY_V1_CANONICAL_PATH,
     OBSERVATION_HYGIENE_POLICY_V1_EMBEDDED_PATH, OBSERVATION_HYGIENE_POLICY_V1_JSON,
     OBSERVATION_HYGIENE_SANITIZER_ID, ObservationHygienePolicyV1, PolicyError, RejectFloorSignals,
+};
+pub use recall_text::{
+    ADVISORY_CONTENT_CHARS_CEILING, ADVISORY_RECALL_HARDENING_POLICY_ID,
+    ADVISORY_RECALL_HARDENING_POLICY_REVISION, AdvisoryMetadataAdmissionV1,
+    AdvisoryMetadataFieldV1, AdvisoryRecallPolicyError, AdvisoryRecallPolicyV1,
+    AdvisoryTextAdmissionV1, AdvisoryTextFindingCountV1, AdvisoryTextFindingV1,
+    AdvisoryTextHardener, AdvisoryTextWithheldReasonV1, AdvisoryTrustTierV1,
+    HardenedAdvisoryTextV1, NEUTRALIZED_CONTROL_MARKUP, PINNED_ADVISORY_METADATA_CHARS,
+    UNTRUSTED_BOUNDARY_LABEL, is_contained_advisory_label,
 };
 pub use transient::{TransientMatch, transient_matches};
 

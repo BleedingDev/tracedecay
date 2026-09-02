@@ -18,6 +18,20 @@
 //! Re-presenting the whole batch afterwards is safe because the watermark skips
 //! what landed and the content-derived idempotency key catches the rest.
 //!
+//! # Bounds and pressure reach inside a record
+//!
+//! Everything expensive about a record happens inside one adapter call:
+//! hygiene walks the envelope, digests are derived over it, and a readiness
+//! proof may talk to a provider. So the caller's deadline and cancellation are
+//! checked *before* that call and again before the append, and the record's
+//! own lane is measured before it too — a lane that is refusing every class
+//! refuses this record whatever its content turns out to be, and that is the
+//! one answer that needs no classification and none of the admission cost.
+//! A caller-supplied [`IngressControlV1`] carries the deadline, the
+//! cancellation, and the instant every measurement is stamped with; a bound
+//! that stopped a batch produces a typed [`IngressStopV1`], never a silent
+//! return.
+//!
 //! # Why there are exactly two decisions
 //!
 //! The journal has two watermark-advancing primitives, so the adapter has two
@@ -28,10 +42,14 @@
 
 use crate::envelope::{AdmittedObservationV1, WithheldAdmissionV1};
 use crate::identity::SourceSequenceV1;
-use crate::inspection::ReplayDispositionV1;
+use crate::inspection::{ObservationLaneKeyV1, ReplayDispositionV1};
 use crate::port::{AppendOutcomeV1, ObservationDispatchPortV1};
 use crate::settlement::SourceStreamKeyV1;
 
+use super::backpressure::{
+    BackpressureDecisionV1, BackpressureGateV1, BackpressureHaltV1, ObservationLoadClassV1,
+    QueueBacklogV1,
+};
 use super::error::{AdapterFailureV1, ObservationRuntimeError};
 use super::wake::DeliveryWakeV1;
 
@@ -54,6 +72,77 @@ pub struct SourceRecordV1<T> {
     pub record: T,
 }
 
+/// The caller's bound on one ingest call, and the caller's clock.
+///
+/// Ingress owns no clock and no cancellation of its own. A record's admission
+/// is the slowest thing a coding agent waits behind — hygiene walks the whole
+/// envelope, a readiness proof may talk to a provider, and the append is an
+/// fsync'd transaction — so the caller's deadline and cancellation identity
+/// have to reach *inside* a record rather than only between records. Otherwise
+/// one record can outlive the pass that started it, and a project that is
+/// closing waits for work nobody will read.
+///
+/// Every method is answered by the caller, which is also what supplies the
+/// instant every backlog measurement is stamped with.
+pub trait IngressControlV1: std::fmt::Debug + Send + Sync {
+    /// The caller's current instant. Backlog age and the metrics stamp are
+    /// measured against this, so the runtime still mints no clock.
+    fn now_unix_micros(&self) -> i64;
+
+    /// The absolute instant the caller's work is no longer wanted.
+    fn deadline_unix_micros(&self) -> i64;
+
+    /// Whether the caller's cancellation has fired.
+    fn is_cancelled(&self) -> bool;
+
+    /// Budget left before the deadline, floored at zero.
+    fn remaining_micros(&self) -> i64 {
+        self.deadline_unix_micros()
+            .saturating_sub(self.now_unix_micros())
+            .max(0)
+    }
+
+    /// Whether the deadline has already passed.
+    fn is_expired(&self) -> bool {
+        self.remaining_micros() == 0
+    }
+}
+
+/// Why ingress stopped a batch on the caller's own bound.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum IngressStopReasonV1 {
+    /// The caller's cancellation fired.
+    Cancelled,
+    /// The caller's deadline elapsed.
+    DeadlineExceeded,
+}
+
+impl IngressStopReasonV1 {
+    /// Returns the canonical wire value.
+    #[must_use]
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
+        }
+    }
+}
+
+/// The typed terminal a caller's own bound produced, positioned in the stream.
+///
+/// Like every other stop in this module it is a refusal, not a drop: nothing
+/// was appended or withheld for this position, the watermark holds before it,
+/// and the canonical source still owns the record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IngressStopV1 {
+    /// Why the batch stopped.
+    pub reason: IngressStopReasonV1,
+    /// Position the batch stopped at.
+    pub source_sequence: SourceSequenceV1,
+    /// Settled event identity at that position.
+    pub source_event_id: String,
+}
+
 /// What admission decided about one record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdmissionDecisionV1 {
@@ -73,12 +162,49 @@ pub trait ObservationAdmissionAdapterV1 {
     type Record;
     /// The adapter's own failure type, preserved whole when it fails.
     type Error: std::error::Error + Send + Sync + 'static;
+    /// The concrete shape of the caller's bound.
+    ///
+    /// Ingress itself only ever uses it through [`IngressControlV1`]. The
+    /// adapter names the concrete type because a host's cancellation is an
+    /// *identity*, not a boolean: an adapter that has to rebuild one from a
+    /// flag would be minting a fresh token, which is exactly how a cancelled
+    /// project ends up waiting on work it already gave up on. An adapter with
+    /// no host type of its own uses `dyn IngressControlV1`.
+    type Control: IngressControlV1 + ?Sized;
 
-    /// Decides one record. Returning an error leaves the record undecided and
-    /// its replay position untouched.
+    /// The provider lane this record would be admitted into.
+    ///
+    /// Answered without hygiene, without digests, and without a readiness
+    /// handshake, because it exists so ingress can read the lane's real
+    /// pressure *before* it pays for any of those. A lane is a registration,
+    /// which the adapter already knows; it is not the instance a handshake
+    /// would prove.
+    fn lane(&self, record: &SourceRecordV1<Self::Record>) -> ObservationLaneKeyV1;
+
+    /// The load class this record's content puts it in, answered before
+    /// admission is paid for.
+    ///
+    /// This is not a producer declaring its own priority. The adapter answers
+    /// from the record's own settled content, exactly as it will when it fills
+    /// in the envelope's retention class, and ingress *re-derives* the class
+    /// from the admitted envelope afterwards and refuses the batch if the two
+    /// disagree. So a stream cannot buy itself out of shedding by answering
+    /// `Required` here: it would have to lie in the envelope too, and then the
+    /// lie is the envelope's and is caught by every other envelope check.
+    fn classify(&self, record: &SourceRecordV1<Self::Record>) -> ObservationLoadClassV1;
+
+    /// Decides one record, under the caller's own deadline and cancellation.
+    ///
+    /// The control is the caller's, propagated verbatim: an adapter that
+    /// proves readiness, talks to a provider, or does any other bounded work
+    /// inside a record derives that work's bound from this, so a cancelled
+    /// project or an elapsed pass reaches *inside* the record rather than
+    /// waiting for it. Returning an error leaves the record undecided and its
+    /// replay position untouched.
     fn decide(
         &self,
         record: &SourceRecordV1<Self::Record>,
+        control: &Self::Control,
     ) -> Result<AdmissionDecisionV1, Self::Error>;
 }
 
@@ -144,17 +270,35 @@ pub struct IngressBatchReportV1 {
     pub high_watermark: Option<SourceSequenceV1>,
     /// The typed refusal that stopped the batch, when one did.
     pub halted_on: Option<IngressHaltV1>,
-    /// Whether delivery was woken, which happens only when something new was
-    /// appended.
+    /// Records the backpressure gate refused before any append was attempted.
+    /// Refused, never discarded: the watermark holds at the first of them.
+    pub shed: u32,
+    /// The typed backpressure refusal that stopped the batch, when one did.
+    pub shed_on: Option<BackpressureHaltV1>,
+    /// The caller's own bound that stopped the batch, when one did. Nothing
+    /// was committed for the named position.
+    pub stopped_on: Option<IngressStopV1>,
+    /// The lane's backlog as of the *end* of this call. This is the metrics
+    /// surface — queue size, queue bytes, utilization, and backlog age — and
+    /// it describes the journal after everything this call committed, not the
+    /// journal as it was before the last append. A metric that stopped one
+    /// append short of a threshold would report a nominal lane at the exact
+    /// moment the lane started refusing.
+    pub backlog: Option<QueueBacklogV1>,
+    /// Whether delivery was woken. That happens when something new was
+    /// appended, and also when the gate shed — a lane that refused work is by
+    /// definition a lane that needs draining.
     pub delivery_signalled: bool,
 }
 
 /// Drives canonical records through admission into the journal.
 #[derive(Debug)]
-pub struct IngressRuntimeV1<'a, P: ?Sized, A> {
+pub struct IngressRuntimeV1<'a, P: ?Sized, A: ObservationAdmissionAdapterV1> {
     port: &'a P,
     adapter: &'a A,
     wake: &'a DeliveryWakeV1,
+    backpressure: &'a BackpressureGateV1,
+    control: &'a A::Control,
 }
 
 impl<'a, P, A> IngressRuntimeV1<'a, P, A>
@@ -162,14 +306,64 @@ where
     P: ObservationDispatchPortV1 + ?Sized,
     A: ObservationAdmissionAdapterV1,
 {
-    /// Binds one admission port, one adapter, and the delivery wake edge.
+    /// Binds one admission port, one adapter, the delivery wake edge, the
+    /// backpressure gate every admission is measured against, and the caller's
+    /// own deadline, cancellation, and clock.
+    ///
+    /// Neither the gate nor the control is optional. An ingress constructible
+    /// without a gate would be an ingress whose bounds are a convention, and
+    /// the first slow provider would turn that convention into an unbounded
+    /// journal; an ingress constructible without a control would be one whose
+    /// caller can never get out of a record it no longer wants.
     #[must_use]
-    pub const fn new(port: &'a P, adapter: &'a A, wake: &'a DeliveryWakeV1) -> Self {
+    pub const fn new(
+        port: &'a P,
+        adapter: &'a A,
+        wake: &'a DeliveryWakeV1,
+        backpressure: &'a BackpressureGateV1,
+        control: &'a A::Control,
+    ) -> Self {
         Self {
             port,
             adapter,
             wake,
+            backpressure,
+            control,
         }
+    }
+
+    /// Re-reads the lane and republishes its backlog on the caller's instant.
+    ///
+    /// This is the only way the published metric can describe the journal as
+    /// it is *now*: the gate remembers the last measurement it took, and a
+    /// measurement taken before an append describes a journal that no longer
+    /// exists. Callers publish through this after a pass, after a delivery
+    /// round, and at shutdown, so an idle lane's metric is still current
+    /// rather than frozen at whatever the last admission happened to see.
+    pub fn refresh_backlog(
+        &self,
+        lane: &ObservationLaneKeyV1,
+    ) -> Result<QueueBacklogV1, ObservationRuntimeError> {
+        let pressure = self.port.lane_pressure(lane)?;
+        Ok(self
+            .backpressure
+            .observe(&pressure, self.control.now_unix_micros()))
+    }
+
+    /// The caller's own bound, as a typed stop positioned at `record`.
+    fn caller_stop<T>(&self, record: &SourceRecordV1<T>) -> Option<IngressStopV1> {
+        let reason = if self.control.is_cancelled() {
+            IngressStopReasonV1::Cancelled
+        } else if self.control.is_expired() {
+            IngressStopReasonV1::DeadlineExceeded
+        } else {
+            return None;
+        };
+        Some(IngressStopV1 {
+            reason,
+            source_sequence: record.source_sequence,
+            source_event_id: record.source_event_id.clone(),
+        })
     }
 
     /// Reads one stream's durable replay position.
@@ -208,9 +402,11 @@ where
     /// checked rather than assumed: a batch that goes backwards would otherwise
     /// advance the watermark past events it never presented.
     ///
-    /// No clock is taken. Admission timestamps belong to the settled envelope,
-    /// and the journal stamps its own cursor instants; a runtime that minted its
-    /// own would be fabricating one.
+    /// No clock is minted. Admission timestamps belong to the settled
+    /// envelope, the journal stamps its own cursor instants, and every backlog
+    /// measurement is stamped with the instant the caller's own control
+    /// reports; a runtime that read a clock of its own would be fabricating
+    /// one.
     pub fn ingest(
         &self,
         resume: &IngressResumeV1,
@@ -218,6 +414,7 @@ where
     ) -> Result<IngressBatchReportV1, ObservationRuntimeError> {
         require_authoritative_order(resume, records)?;
         let mut report = IngressBatchReportV1::default();
+        let mut last_lane: Option<ObservationLaneKeyV1> = None;
 
         for record in records {
             let sequence = record.source_sequence.0;
@@ -228,7 +425,41 @@ where
                 continue;
             }
 
-            let decision = self.adapter.decide(record).map_err(|cause| {
+            // The caller's bound is checked before the expensive part of the
+            // record, not only between records: hygiene, digests, and a
+            // readiness proof are all paid inside `decide`, and a caller that
+            // has already given up must not be charged for them.
+            if let Some(stop) = self.caller_stop(record) {
+                report.stopped_on = Some(stop);
+                break;
+            }
+
+            // Cheap pressure first. The lane is named from the registration
+            // the adapter already knows, so this is one indexed read — and a
+            // lane that is refusing *every* class refuses this record whatever
+            // its content turns out to be, which is exactly the case where the
+            // answer needs no classification and none of the admission cost.
+            let lane = self.adapter.lane(record);
+            let pressure = self.port.lane_pressure(&lane)?;
+            let backlog = self
+                .backpressure
+                .observe(&pressure, self.control.now_unix_micros());
+            report.backlog = Some(backlog);
+            last_lane = Some(lane);
+            let declared_class = self.adapter.classify(record);
+            if let BackpressureDecisionV1::Shed(refusal) =
+                self.backpressure.decide(&backlog, declared_class, 0)
+            {
+                report.shed = report.shed.saturating_add(1);
+                report.shed_on = Some(BackpressureHaltV1 {
+                    source_sequence: record.source_sequence,
+                    source_event_id: record.source_event_id.clone(),
+                    refusal,
+                });
+                break;
+            }
+
+            let decision = self.adapter.decide(record, self.control).map_err(|cause| {
                 ObservationRuntimeError::Admission {
                     source_event_id: record.source_event_id.clone(),
                     source_sequence: sequence,
@@ -239,6 +470,43 @@ where
             match decision {
                 AdmissionDecisionV1::Admit(admitted) => {
                     verify_admitted(record, &admitted)?;
+                    // The class the pre-gate ran on has to be the class the
+                    // envelope actually carries, or the cheap gate would be a
+                    // hole a stream could declare its way through.
+                    let class = ObservationLoadClassV1::of(admitted.privacy.retention_class);
+                    if class != declared_class {
+                        return Err(ObservationRuntimeError::LoadClassMismatch {
+                            source_event_id: record.source_event_id.clone(),
+                            source_sequence: sequence,
+                            declared: declared_class.as_wire(),
+                            derived: class.as_wire(),
+                        });
+                    }
+                    // The caller may have cancelled or run out of budget while
+                    // admission was being paid for. Stopping here leaves the
+                    // watermark exactly where it was, so the record is still
+                    // the canonical source's to re-present.
+                    if let Some(stop) = self.caller_stop(record) {
+                        report.stopped_on = Some(stop);
+                        break;
+                    }
+                    // Now the size-aware decision, against the same real
+                    // pressure read and on the caller's own instant. A shed
+                    // stops the batch exactly like a journal refusal: nothing
+                    // is appended, the watermark holds here, and the canonical
+                    // source still holds the record for the next pass.
+                    if let BackpressureDecisionV1::Shed(refusal) =
+                        self.backpressure
+                            .decide(&backlog, class, admitted.queue_bytes())
+                    {
+                        report.shed = report.shed.saturating_add(1);
+                        report.shed_on = Some(BackpressureHaltV1 {
+                            source_sequence: record.source_sequence,
+                            source_event_id: record.source_event_id.clone(),
+                            refusal,
+                        });
+                        break;
+                    }
                     match self.port.append_admitted(&admitted)? {
                         AppendOutcomeV1::Appended { .. } => {
                             report.appended = report.appended.saturating_add(1);
@@ -268,7 +536,22 @@ where
             }
         }
 
-        if report.appended > 0 {
+        // Republish the lane *after* everything this call committed. The
+        // measurement the last record decided on described the journal one
+        // append ago, and a final append that crosses a threshold would
+        // otherwise leave the lane reporting nominal until some later call
+        // happened to measure it again.
+        if report.appended > 0
+            && let Some(lane) = last_lane
+        {
+            report.backlog = Some(self.refresh_backlog(&lane)?);
+        }
+
+        // A shed wakes delivery too. The lane refused work because it is not
+        // draining fast enough, so the one action that can clear the refusal is
+        // a delivery round — parking until the next poll would leave the lane
+        // shedding for no reason a drain could not have fixed.
+        if report.appended > 0 || report.shed > 0 {
             self.wake.signal();
             report.delivery_signalled = true;
         }
