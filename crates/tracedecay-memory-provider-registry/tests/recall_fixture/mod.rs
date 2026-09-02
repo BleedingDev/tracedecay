@@ -1,0 +1,561 @@
+//! Shared fixture for recall admission and recall port tests: a real fabric,
+//! the real Native adapter, and a fixture Native application port that
+//! returns a canonical recall outcome mixing in-scope, cross-scope, stale,
+//! and revoked candidates.
+#![allow(dead_code, clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tracedecay_memory_provider_api::contract::TerminalCode;
+use tracedecay_memory_provider_api::{
+    CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
+    HandshakeRequest, HandshakeRequestParts, HandshakeResponse, OperationControl, OwnedExactScope,
+    OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderCallParts, ProviderDescriptor,
+    ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
+};
+use tracedecay_memory_provider_native::{
+    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort, NativeObservation,
+};
+use tracedecay_memory_provider_registry::{
+    AdmittedTemporalQuery, EnabledProviderMode, FabricConfig, NativeProviderActivation,
+    ProjectMemoryProviderComposition, RECALL_PAYLOAD_CONTRACT_ID, RECALL_QUERY_CAPABILITY_ID,
+    RecallBudgetsV1, RecallCandidateV1, RecallRequestParts, RecallScopeBindingsV1, ScopeBinding,
+    build_recall_request_payload,
+};
+
+pub const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+pub const ONE_SHA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+pub const SCOPE_DIGEST: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+pub const STALE_SCOPE_DIGEST: &str =
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+pub const EVALUATION_TIME: &str = "2026-09-01T12:00:00.000000Z";
+pub const SECRET_CONTENT: &str = "SECRET-TOKEN-must-never-leak-into-prompts";
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+pub fn admitted_scope() -> OwnedExactScope {
+    OwnedExactScope::new(
+        "profile-recall",
+        "project-recall",
+        "repository-recall",
+        "worktree-recall",
+        "refs/heads/recall",
+        "session-recall",
+        SCOPE_DIGEST,
+    )
+    .expect("admitted scope")
+}
+
+pub fn scope_value(scope: &OwnedExactScope) -> Value {
+    json!({
+        "profile_id": scope.profile_id,
+        "project_id": scope.project_id,
+        "repository_identity": scope.repository_identity,
+        "worktree_identity": scope.worktree_identity,
+        "branch_identity": scope.branch_identity,
+        "agent_session_id": scope.agent_session_id,
+        "resolved_scope_digest": scope.resolved_scope_digest,
+    })
+}
+
+/// Bindings a unit test grants when it exercises the exact-scope rules
+/// directly, standing in for a registry record of an exact-scope provider.
+pub fn authorized_exact() -> RecallScopeBindingsV1 {
+    RecallScopeBindingsV1::new([ScopeBinding::ExactCodingScope])
+}
+
+/// The bindings the host records for the Native provider at registration.
+pub fn authorized_native() -> RecallScopeBindingsV1 {
+    RecallScopeBindingsV1::new([ScopeBinding::ProjectFacts, ScopeBinding::ProfileFacts])
+}
+
+/// Candidate scope identity as an exact-scope provider attests it: every
+/// field of the admitted scope plus the explicit binding.
+pub fn exact_scope_candidate_value(scope: &OwnedExactScope) -> Value {
+    let mut value = scope_value(scope);
+    value["scope_binding"] = json!("exact_coding_scope");
+    value
+}
+
+/// Candidate scope identity as the Native adapter attests a project-owned
+/// fact: profile and project bound, checkout identity carried, session and
+/// resolved-scope digest left empty because the binding forbids them.
+pub fn project_facts_candidate_value(scope: &OwnedExactScope) -> Value {
+    json!({
+        "scope_binding": "project_facts",
+        "profile_id": scope.profile_id,
+        "project_id": scope.project_id,
+        "repository_identity": scope.repository_identity,
+        "worktree_identity": scope.worktree_identity,
+        "branch_identity": scope.branch_identity,
+        "agent_session_id": "",
+        "resolved_scope_digest": "",
+    })
+}
+
+/// Builds one canonical candidate. A scope value without an explicit
+/// `scope_binding` is completed as `exact_coding_scope`, so unit tests that
+/// mutate one identity field keep exercising the exact-scope rules.
+pub fn candidate_value(candidate_id: &str, content: &str, scope: Value, validity: Value) -> Value {
+    let mut scope = scope;
+    if let Value::Object(fields) = &mut scope {
+        fields
+            .entry("scope_binding")
+            .or_insert_with(|| json!("exact_coding_scope"));
+    }
+    json!({
+        "candidate_id": candidate_id,
+        "stable_memory_ref": format!("memory:{candidate_id}"),
+        "content": content,
+        "content_ref": Value::Null,
+        "content_sha256": sha256_hex(content.as_bytes()),
+        "native_score": {
+            "score_domain_id": "test.score",
+            "score_domain_version": 1,
+            "raw_value": "0.500000",
+            "direction": "higher_is_better",
+            "declared_minimum": "0.000000",
+            "declared_maximum": "1.000000",
+            "calibration_state": "uncalibrated",
+            "semantics": "fixture",
+            "components": {},
+        },
+        "exact_scope_identity": scope,
+        "validity": validity,
+        "provenance": {
+            "state": "available",
+            "origin_refs": [format!("origin:{candidate_id}")],
+            "observation_refs": [],
+            "source_refs": [],
+            "transform_chain": [],
+            "provider_trace_refs": [],
+            "redaction_reason": Value::Null,
+        },
+        "explanation": {
+            "summary": "fixture match",
+            "matched_features": [],
+            "activation_trace_refs": [],
+            "limitations": [],
+        },
+        "source_refs": [],
+        "trace_refs": [],
+        "sensitivity": "unknown",
+        "memory_class": "project",
+        "warnings": [],
+        "extensions": [],
+    })
+}
+
+pub fn current_validity() -> Value {
+    json!({
+        "observed_at": "2026-08-01T00:00:00.000000Z",
+        "valid_from": "2026-08-01T00:00:00.000000Z",
+        "valid_until": Value::Null,
+        "superseded_at": Value::Null,
+        "superseded_by": Value::Null,
+        "revoked_at": Value::Null,
+        "source_revision": "rev-1",
+        "temporal_state": "current",
+    })
+}
+
+pub fn validity_with(state: &str, overrides: &[(&str, Value)]) -> Value {
+    let mut validity = current_validity();
+    validity["temporal_state"] = json!(state);
+    for (key, value) in overrides {
+        validity[*key] = value.clone();
+    }
+    validity
+}
+
+pub fn decode(value: Value) -> RecallCandidateV1 {
+    serde_json::from_value(value).expect("fixture candidate decodes")
+}
+
+pub fn candidate(id: &str, scope: Value, validity: Value) -> RecallCandidateV1 {
+    decode(candidate_value(
+        id,
+        &format!("content of {id}"),
+        scope,
+        validity,
+    ))
+}
+
+pub fn with_scope_field(field: &str, value: &str) -> Value {
+    let mut scope = scope_value(&admitted_scope());
+    scope[field] = json!(value);
+    scope
+}
+
+pub fn current_query() -> AdmittedTemporalQuery {
+    AdmittedTemporalQuery::current(EVALUATION_TIME).expect("current query")
+}
+
+// --- Real fabric + Native adapter path -----------------------------------
+
+pub struct RecallFixturePort {
+    pub descriptor: ProviderDescriptor,
+    pub handshake_calls: AtomicUsize,
+    pub recall_calls: AtomicUsize,
+    pub outcome_request_identity: Option<String>,
+    /// `Success` returns the mixed candidate outcome; `SuccessZeroResults`
+    /// returns a complete outcome with an empty candidate list; every other
+    /// code returns a payload-less failure terminal.
+    pub terminal_code: TerminalCode,
+}
+
+impl RecallFixturePort {
+    pub fn new() -> Self {
+        Self {
+            descriptor: descriptor(),
+            handshake_calls: AtomicUsize::new(0),
+            recall_calls: AtomicUsize::new(0),
+            outcome_request_identity: None,
+            terminal_code: TerminalCode::Success,
+        }
+    }
+
+    pub fn outcome_value(&self, call: &ProviderCall) -> Value {
+        let mut outcome = self.mixed_outcome_value(call);
+        if self.terminal_code == TerminalCode::SuccessZeroResults {
+            outcome["candidates"] = json!([]);
+            outcome["coverage"]["state"] = json!("zero_results");
+            for counter in ["scanned_items", "matched_items", "returned_items"] {
+                outcome["coverage"][counter] = json!(0);
+            }
+            outcome["terminal"]["terminal_code"] = json!("success_zero_results");
+        }
+        outcome
+    }
+
+    fn mixed_outcome_value(&self, call: &ProviderCall) -> Value {
+        let scope = scope_value(&call.exact_scope);
+        // Candidates attest what the Native adapter attests for project-owned
+        // facts; the host records Native as authorized for `project_facts`
+        // and `profile_facts` only.
+        let candidate_scope = project_facts_candidate_value(&call.exact_scope);
+        let foreign_worktree = {
+            let mut foreign = candidate_scope.clone();
+            foreign["worktree_identity"] = json!("worktree-other");
+            foreign
+        };
+        let foreign_repository = {
+            let mut foreign = candidate_scope.clone();
+            foreign["repository_identity"] = json!("repository-other");
+            foreign
+        };
+        // A full exact-scope attestation from a provider the host never
+        // authorized for `exact_coding_scope` is refused on the binding alone,
+        // before any field comparison.
+        let unauthorized_exact = {
+            let mut exact = exact_scope_candidate_value(&call.exact_scope);
+            exact["resolved_scope_digest"] = json!(STALE_SCOPE_DIGEST);
+            exact
+        };
+        let candidates = vec![
+            candidate_value(
+                "in-scope-1",
+                "first in-scope memory",
+                candidate_scope.clone(),
+                current_validity(),
+            ),
+            candidate_value(
+                "cross-worktree",
+                SECRET_CONTENT,
+                foreign_worktree,
+                current_validity(),
+            ),
+            candidate_value(
+                "revoked",
+                "revoked memory",
+                candidate_scope.clone(),
+                validity_with(
+                    "revoked",
+                    &[("revoked_at", json!("2026-08-15T00:00:00.000000Z"))],
+                ),
+            ),
+            candidate_value(
+                "cross-repository",
+                SECRET_CONTENT,
+                foreign_repository,
+                current_validity(),
+            ),
+            candidate_value(
+                "unauthorized-exact-scope",
+                "exact-scope memory from a project-facts provider",
+                unauthorized_exact,
+                current_validity(),
+            ),
+            candidate_value(
+                "in-scope-2",
+                "second in-scope memory",
+                candidate_scope,
+                current_validity(),
+            ),
+        ];
+        json!({
+            "provider_id": NATIVE_PROVIDER_ID,
+            "provider_instance_id": "native.recall-fixture",
+            "registration_revision": call.registration_revision,
+            "ready_receipt_digest": call.ready_receipt_sha256,
+            "request_identity": self
+                .outcome_request_identity
+                .clone()
+                .unwrap_or_else(|| call.request_id.clone()),
+            "exact_scope_identity": scope,
+            "provider_state_generation": call.expected_state_generation,
+            "candidates": candidates,
+            "coverage": {
+                "state": "complete",
+                "searched_scope_digest": call.exact_scope.exact_scope_sha256(),
+                "searched_temporal_digest": ZERO_SHA,
+                "scanned_items": 6,
+                "matched_items": 6,
+                "returned_items": 6,
+                "excluded_items": 0,
+                "truncated_items": 0,
+                "next_cursor": Value::Null,
+                "reasons": [],
+            },
+            "ordering": {
+                "score_domain_id": "test.score",
+                "direction": "higher_is_better",
+                "tie_breaker": "candidate_id_lexicographic_utf8",
+            },
+            "terminal": {"terminal_code": "success", "diagnostic_id": Value::Null},
+            "warnings": [],
+        })
+    }
+}
+
+pub fn unexpected<T>() -> T {
+    panic!("recall admission tests must not execute this provider operation")
+}
+
+impl NativeMemoryApplicationPort for RecallFixturePort {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        self.handshake_calls.fetch_add(1, Ordering::Relaxed);
+        HandshakeResponse {
+            terminal: TerminalRecord::new(
+                ProviderOperation::Handshake,
+                OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+                TerminalCode::Success,
+                CommittedEffectEvidence::none(Some(self.descriptor.state_generation)),
+                FallbackDirective::forbidden(),
+                request.request_id.clone(),
+                request.exact_scope.exact_scope_sha256(),
+                None,
+            )
+            .expect("handshake terminal"),
+            descriptor: Some(self.descriptor.clone()),
+            provider_instance_id: Some("native.recall-fixture".to_owned()),
+            state_namespace: Some("native.recall-scope".to_owned()),
+            accepted_scope: Some(request.exact_scope.clone()),
+            effective_limits: Some(request.host_limits.minimum(self.descriptor.limits)),
+            ready_receipt_sha256: Some(ONE_SHA.to_owned()),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn health(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn observe(&self, _observation: NativeObservation<'_>) -> ProviderReply {
+        unexpected()
+    }
+
+    fn recall(&self, call: &ProviderCall) -> ProviderReply {
+        self.recall_calls.fetch_add(1, Ordering::Relaxed);
+        let payload = if matches!(
+            self.terminal_code,
+            TerminalCode::Success | TerminalCode::SuccessZeroResults
+        ) {
+            let bytes = serde_json::to_vec(&self.outcome_value(call)).expect("outcome bytes");
+            let sha256 = sha256_hex(&bytes);
+            Some(
+                CanonicalPayload::new(
+                    OwnedVersionedId::new(RECALL_PAYLOAD_CONTRACT_ID).expect("contract"),
+                    bytes,
+                    sha256,
+                )
+                .expect("payload"),
+            )
+        } else {
+            None
+        };
+        ProviderReply {
+            terminal: TerminalRecord::new(
+                call.operation,
+                call.provider_id.clone(),
+                self.terminal_code,
+                CommittedEffectEvidence::none(Some(call.expected_state_generation)),
+                FallbackDirective::forbidden(),
+                call.operation_id.clone(),
+                call.exact_scope.exact_scope_sha256(),
+                (!matches!(
+                    self.terminal_code,
+                    TerminalCode::Success | TerminalCode::SuccessZeroResults
+                ))
+                .then(|| "native.recall-fixture.failure".to_owned()),
+            )
+            .expect("recall terminal"),
+            payload,
+            warnings: Vec::new(),
+            extensions: Vec::new(),
+            state_generation: call.expected_state_generation,
+        }
+    }
+
+    fn feedback(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn maintenance(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn inspection(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn correction(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn delete_by_source(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn snapshot_export(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn snapshot_restore(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+
+    fn replay(&self, _call: &ProviderCall) -> ProviderReply {
+        unexpected()
+    }
+}
+
+pub fn limits() -> ProviderLimits {
+    ProviderLimits {
+        request_bytes: 8_192,
+        response_bytes: 65_536,
+        observation_batch_items: 16,
+        recall_candidates: 32,
+        concurrent_operations: 4,
+        operation_millis: 1_000,
+        snapshot_bytes: 65_536,
+        inspection_items: 64,
+    }
+}
+
+pub fn descriptor() -> ProviderDescriptor {
+    ProviderDescriptor::new(
+        OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+        ZERO_SHA,
+        "recall-admission-test-v1",
+        5,
+        [
+            OwnedVersionedId::new("provider.health.v1").expect("health capability"),
+            OwnedVersionedId::new("observation.accept.v1").expect("observe capability"),
+            OwnedVersionedId::new(RECALL_QUERY_CAPABILITY_ID).expect("recall capability"),
+        ],
+        limits(),
+    )
+    .expect("descriptor")
+}
+
+pub fn budgets() -> RecallBudgetsV1 {
+    RecallBudgetsV1 {
+        maximum_candidates: 8,
+        maximum_candidate_content_bytes: 4_096,
+        maximum_total_content_bytes: 16_384,
+        maximum_source_refs_per_candidate: 8,
+        maximum_trace_refs_per_candidate: 8,
+        maximum_warnings: 8,
+        maximum_extensions_per_candidate: 8,
+    }
+}
+
+pub fn compose(port: Arc<RecallFixturePort>) -> ProjectMemoryProviderComposition {
+    ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
+        fabric_config: FabricConfig {
+            max_registered_providers: 1,
+            max_in_flight: 2,
+        },
+        port,
+        registration_revision: 31,
+        mode: EnabledProviderMode::Active,
+    })
+    .expect("enabled composition")
+}
+
+pub fn recall_call(response: &HandshakeResponse, temporal: &AdmittedTemporalQuery) -> ProviderCall {
+    let ready_receipt_sha256 = response
+        .ready_receipt_sha256
+        .clone()
+        .expect("ready receipt");
+    let payload = build_recall_request_payload(&RecallRequestParts {
+        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+        registration_revision: 31,
+        ready_receipt_sha256: ready_receipt_sha256.clone(),
+        exact_scope: admitted_scope(),
+        request_id: "recall-request-1".to_owned(),
+        objective: "search project memory".to_owned(),
+        query: "recall admission".to_owned(),
+        temporal: temporal.clone(),
+        budgets: budgets(),
+        policy_revision: 1,
+        deadline_utc_micros: i64::MAX,
+        remaining_millis: 1_000,
+    })
+    .expect("request payload");
+    ProviderCall::new(ProviderCallParts {
+        operation: ProviderOperation::Recall,
+        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+        registration_revision: 31,
+        ready_receipt_sha256,
+        exact_scope: admitted_scope(),
+        request_id: "recall-request-1".to_owned(),
+        operation_id: "recall-operation-1".to_owned(),
+        expected_state_generation: 5,
+        idempotency_key: None,
+        control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
+        payload,
+        required_capabilities: vec![
+            OwnedVersionedId::new(RECALL_QUERY_CAPABILITY_ID).expect("recall capability"),
+        ],
+        extensions: Vec::new(),
+    })
+    .expect("recall call")
+}
+
+pub fn handshake() -> HandshakeRequest {
+    HandshakeRequest::new(HandshakeRequestParts {
+        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+        registration_revision: 31,
+        exact_scope: admitted_scope(),
+        request_id: "recall-handshake".to_owned(),
+        required_capabilities: vec![
+            OwnedVersionedId::new(RECALL_QUERY_CAPABILITY_ID).expect("recall capability"),
+        ],
+        host_limits: limits(),
+        control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
+        challenge_nonce: [7; 32],
+    })
+    .expect("handshake request")
+}

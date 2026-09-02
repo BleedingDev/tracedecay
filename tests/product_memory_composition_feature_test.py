@@ -93,6 +93,9 @@ use tracedecay_memory_provider_registry::NativeMemoryApplicationPort;
 VALID_NATIVE_PROVIDER = (
     VALID_NATIVE_ADAPTER
     + '#[cfg(test)]\n'
+    + '#[path = "native_baseline_tests.rs"]\n'
+    + "mod baseline_tests;\n"
+    + '#[cfg(test)]\n'
     + '#[path = "native_provider_tests.rs"]\n'
     + "mod tests;\n"
 )
@@ -103,6 +106,7 @@ NATIVE_ADAPTER_PATHS = (
     Path(
         "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs"
     ),
+    Path("crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs"),
 )
 
 

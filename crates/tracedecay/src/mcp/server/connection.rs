@@ -1088,9 +1088,15 @@ impl McpServer {
 
     async fn shutdown_background_tasks_until(
         &self,
-        _deadline: tokio::time::Instant,
+        deadline: tokio::time::Instant,
     ) -> Vec<String> {
         let mut failures = Vec::new();
+        #[cfg(feature = "memory-provider-host")]
+        if let Some(journey) = self._observation_journey_mount.as_ref() {
+            for failure in journey.shutdown(deadline).await {
+                failures.push(failure.to_string());
+            }
+        }
         // The hosted dashboard is daemon-process state (`DASHBOARD_MANAGER`),
         // not project-server state. `tracedecay_dashboard` starts against the
         // Core server; the later Core→Full remount retires that server. Tearing

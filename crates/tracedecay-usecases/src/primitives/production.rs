@@ -57,7 +57,8 @@ use super::symbol_graph::{SymbolGraphCursorPort, symbol_record};
 use crate::code_index::CodeIndexIgnoredDependencyAdmissionPortV1;
 use crate::diagnostics_publication::CodeIndexPublicationIdentityPortV1;
 use crate::diagnostics_query::{
-    DiagnosticPageRequest, DiagnosticQueryCoverage, DiagnosticQueryCursor, DiagnosticsQuery,
+    CurrentDiagnosticGeneration, DiagnosticPageRequest, DiagnosticQueryCoverage,
+    DiagnosticQueryCursor, DiagnosticsQuery,
 };
 use crate::graph::health_delta::compute_verified_health_delta;
 use crate::graph::queries::{GraphQueryManager, is_test_marker};
@@ -197,6 +198,32 @@ fn diagnostics_unavailable(
     reason: OmissionReason,
 ) -> RetrievalPortOutcome<DiagnosticsPrimitiveResult> {
     evidence_unavailable(EvidenceDomain::Diagnostic, finished_at, reason, 0)
+}
+
+/// Resolves the published clean generation, or the reason there is none. A
+/// clean empty publication still carries `Some(generation)` and therefore
+/// remains a successful empty read.
+///
+/// Every "no current publication" answer is retryable. An uninitialized
+/// publication ledger and an initialized ledger with no current row mean the
+/// same thing — nothing is published for this project right now — and an
+/// explicit publisher run can settle both, so neither may claim a terminal
+/// absence. The diagnostics pillar has no per-project publisher registration
+/// to consult, so there is no evidence that could support a terminal "no
+/// authority exists" classification here.
+fn current_diagnostic_generation(
+    current: CurrentDiagnosticGeneration,
+) -> Result<CodeGenerationId, OmissionReason> {
+    match (current.generation, current.coverage) {
+        (Some(generation), DiagnosticQueryCoverage::Complete) => Ok(generation),
+        (
+            _,
+            DiagnosticQueryCoverage::Complete
+            | DiagnosticQueryCoverage::PublicationLedgerUninitialized
+            | DiagnosticQueryCoverage::Truncated
+            | DiagnosticQueryCoverage::StoreUnavailable { .. },
+        ) => Err(OmissionReason::Unavailable),
+    }
 }
 
 fn omitted_evidence<T>(
@@ -1929,13 +1956,11 @@ impl ExtendedPrimitivePort for TraceDecayExtendedPrimitivePortV1 {
                     return diagnostics_unavailable(finished_at, OmissionReason::Stale);
                 }
                 let query = DiagnosticsQuery::new(self.database.clone());
-                let current = query.current_generation().await;
-                let Some(current_generation) = current.generation else {
-                    return diagnostics_unavailable(finished_at, OmissionReason::Unavailable);
-                };
-                if !matches!(current.coverage, DiagnosticQueryCoverage::Complete) {
-                    return diagnostics_unavailable(finished_at, OmissionReason::Unavailable);
-                }
+                let current_generation =
+                    match current_diagnostic_generation(query.current_generation().await) {
+                        Ok(generation) => generation,
+                        Err(reason) => return diagnostics_unavailable(finished_at, reason),
+                    };
                 if current_generation != *identity.generation_id() {
                     return diagnostics_unavailable(finished_at, OmissionReason::Stale);
                 }
@@ -1982,7 +2007,8 @@ impl ExtendedPrimitivePort for TraceDecayExtendedPrimitivePortV1 {
                 };
                 match page.coverage {
                     DiagnosticQueryCoverage::Complete | DiagnosticQueryCoverage::Truncated => {}
-                    DiagnosticQueryCoverage::StoreUnavailable { .. } => {
+                    DiagnosticQueryCoverage::PublicationLedgerUninitialized
+                    | DiagnosticQueryCoverage::StoreUnavailable { .. } => {
                         return diagnostics_unavailable(finished_at, OmissionReason::Unavailable);
                     }
                 }
@@ -2893,6 +2919,46 @@ mod unavailable_evidence_tests {
                 domain: EvidenceDomain::Diagnostic,
                 completeness: CoverageCompleteness::Unknown,
             }]
+        );
+    }
+
+    #[test]
+    fn diagnostic_generation_state_distinguishes_absence_empty_and_store_failure() {
+        let generation = CodeGenerationId::new("generation.diagnostics.1").expect("generation");
+        assert_eq!(
+            current_diagnostic_generation(CurrentDiagnosticGeneration {
+                generation: Some(generation.clone()),
+                coverage: DiagnosticQueryCoverage::Complete,
+            }),
+            Ok(generation)
+        );
+        assert_eq!(
+            current_diagnostic_generation(CurrentDiagnosticGeneration {
+                generation: None,
+                coverage: DiagnosticQueryCoverage::PublicationLedgerUninitialized,
+            }),
+            Err(OmissionReason::Unavailable),
+            "an unpublished project settles once a publisher runs, so it never \
+             reports an absent authority"
+        );
+        assert_eq!(
+            current_diagnostic_generation(CurrentDiagnosticGeneration {
+                generation: None,
+                coverage: DiagnosticQueryCoverage::Complete,
+            }),
+            Err(OmissionReason::Unavailable),
+            "an initialized ledger without a publication may still settle"
+        );
+        assert_eq!(
+            current_diagnostic_generation(CurrentDiagnosticGeneration {
+                generation: None,
+                coverage: DiagnosticQueryCoverage::StoreUnavailable {
+                    operation: "diagnostics test",
+                    reason: "closed".to_owned(),
+                },
+            }),
+            Err(OmissionReason::Unavailable),
+            "a failed store read remains retryable"
         );
     }
 }

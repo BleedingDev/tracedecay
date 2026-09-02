@@ -72,7 +72,7 @@
       "worktree_id",
       "branch_ref",
       "agent_session_id",
-      "scope_revision"
+      "resolved_scope_digest"
     ],
     "identity_fields": [
       "profile_id",
@@ -81,7 +81,7 @@
       "worktree_id",
       "branch_ref",
       "agent_session_id",
-      "scope_revision"
+      "resolved_scope_digest"
     ],
     "optional_fields": ["branch_ref"],
     "evidence_only_fields": [
@@ -97,7 +97,7 @@
       "process_id",
       "timestamp_only"
     ],
-    "algorithm": "Copy the exact identity fields from the already validated ScopeAdmissionReceiptV1 attached to the host or application event; verify its scope revision and session binding, and never parse a path, CWD, repository name, process ID, or nearest project to invent scope.",
+    "algorithm": "Copy the exact identity fields from the already validated ScopeAdmissionReceiptV1 attached to the host or application event; verify its resolved-scope digest and session binding, and never parse a path, CWD, repository name, process ID, or nearest project to invent scope.",
     "failure": "exclude_scope_unresolved"
   },
   "source_provenance_derivation": {
@@ -139,7 +139,7 @@
   "admission_requirements": [
     "The event is a completed or committed coding outcome, not an intent or preview.",
     "The canonical source authority has emitted a settlement receipt before provider fan-out.",
-    "The exact scope receipt supplies profile, project, repository, worktree, branch, session, and revision identity.",
+    "The exact scope receipt supplies profile, project, repository, worktree, branch, session, and resolved-scope-digest identity.",
     "The source provenance receipt supplies authority, event ID, revision, digest, and settlement proof.",
     "The event is classified for durability, sensitivity, and coding relevance.",
     "Secret-like and unadmitted personal content is rejected or redacted before admission.",
@@ -401,7 +401,7 @@
           "source_cursor",
           "source_generation",
           "source_range",
-          "scope_revision",
+          "resolved_scope_digest",
           "settlement_digest"
         ],
         "ordering_authority": "The source cursor and generation supplied by the host adapter, not wall-clock arrival time.",
@@ -413,8 +413,8 @@
         "mode": "required_authoritative_receipt",
         "authority": "TraceDecay host-session admission",
         "receipt_name": "ScopeAdmissionReceiptV1",
-        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
-        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
         "optional_fields": ["branch_ref"],
         "evidence_only_fields": ["source_path", "working_directory"],
         "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
@@ -460,7 +460,7 @@
           "crates/tracedecay/src/mcp/server/dispatch_settlement.rs",
           "crates/tracedecay-usecases/src/observability/delivery_settlement.rs"
         ],
-        "receipt_fields": ["operation_id", "terminal_outcome", "committed_effect", "effect_digest", "scope_revision"],
+        "receipt_fields": ["operation_id", "terminal_outcome", "committed_effect", "effect_digest", "resolved_scope_digest"],
         "ordering_authority": "The operation settlement receipt and its source sequence, not request-start or response-arrival time.",
         "provider_fanout": "Only after the canonical tool result is settled; provider failure cannot change the tool result."
       },
@@ -470,12 +470,12 @@
         "mode": "required_authoritative_receipt",
         "authority": "TraceDecay application scope admission",
         "receipt_name": "ScopeAdmissionReceiptV1",
-        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
-        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
         "optional_fields": ["branch_ref"],
         "evidence_only_fields": ["tool_name", "source_path", "working_directory"],
         "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
-        "algorithm": "Copy scope fields from the operation's validated admission receipt and compare the settlement revision; never infer scope from a tool argument or path string.",
+        "algorithm": "Copy scope fields from the operation's validated admission receipt and require its resolved scope digest to match exactly; never infer scope from a tool argument or path string.",
         "failure": "exclude_scope_unresolved"
       },
       "source_provenance_derivation": {
@@ -527,8 +527,8 @@
         "mode": "required_authoritative_receipt",
         "authority": "TraceDecay exact-worktree admission",
         "receipt_name": "ScopeAdmissionReceiptV1",
-        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
-        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
         "optional_fields": ["branch_ref"],
         "evidence_only_fields": ["source_path", "file_name", "working_directory"],
         "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
@@ -571,7 +571,7 @@
         "authority": "TraceDecay test execution and result authority",
         "settled_state": "Test process reached a typed terminal result and result receipt was durably recorded",
         "source_paths": ["crates/tracedecay/src/daemon", "crates/tracedecay-usecases/src/observability/delivery_settlement.rs"],
-        "receipt_fields": ["execution_id", "source_generation", "terminal_status", "result_digest", "scope_revision"],
+        "receipt_fields": ["execution_id", "source_generation", "terminal_status", "result_digest", "resolved_scope_digest"],
         "ordering_authority": "Execution receipt and source generation, not process-start or log-line order.",
         "provider_fanout": "Only after the test result is terminal and durably recorded."
       },
@@ -581,8 +581,8 @@
         "mode": "required_authoritative_receipt",
         "authority": "TraceDecay test scope admission",
         "receipt_name": "ScopeAdmissionReceiptV1",
-        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
-        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
         "optional_fields": ["branch_ref"],
         "evidence_only_fields": ["test_path", "working_directory"],
         "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
@@ -628,7 +628,7 @@
           "crates/tracedecay-lsp/src/overlay/workspace_diagnostics.rs",
           "crates/tracedecay-lsp/src/diagnostics.rs"
         ],
-        "receipt_fields": ["snapshot_id", "source_generation", "coverage", "diagnostic_digest", "scope_revision"],
+        "receipt_fields": ["snapshot_id", "source_generation", "coverage", "diagnostic_digest", "resolved_scope_digest"],
         "ordering_authority": "Snapshot ID and source generation, not debounce arrival order.",
         "provider_fanout": "Only after complete snapshot settlement; partial/unavailable snapshots remain operational evidence."
       },
@@ -638,8 +638,8 @@
         "mode": "required_authoritative_receipt",
         "authority": "TraceDecay diagnostic scope admission",
         "receipt_name": "ScopeAdmissionReceiptV1",
-        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
-        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
         "optional_fields": ["branch_ref"],
         "evidence_only_fields": ["document_uri", "source_path", "working_directory"],
         "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
@@ -685,7 +685,7 @@
           "crates/tracedecay-runtime-core/src/branch.rs",
           "crates/tracedecay-sessions/src/runtime/observation/snapshot_observation.rs"
         ],
-        "receipt_fields": ["commit_sha", "repository_id", "worktree_id", "branch_ref", "parent_shas", "scope_revision"],
+        "receipt_fields": ["commit_sha", "repository_id", "worktree_id", "branch_ref", "parent_shas", "resolved_scope_digest"],
         "ordering_authority": "The Git commit graph and exact ref, not file mtime or branch display text.",
         "provider_fanout": "Only after Git evidence is verified; branch/status polling remains excluded noise."
       },
@@ -695,12 +695,12 @@
         "mode": "required_authoritative_receipt",
         "authority": "TraceDecay Git scope admission",
         "receipt_name": "ScopeAdmissionReceiptV1",
-        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
-        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
         "optional_fields": ["branch_ref"],
         "evidence_only_fields": ["git_common_dir", "display_branch", "working_directory"],
         "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
-        "algorithm": "Copy repository, worktree, branch, session, and revision from the validated scope and Git route receipts; never derive identity from a path or branch label.",
+        "algorithm": "Copy repository, worktree, branch, session, and resolved scope digest from the validated scope and Git route receipts; never derive identity from a path or branch label.",
         "failure": "exclude_scope_unresolved"
       },
       "source_provenance_derivation": {
@@ -742,7 +742,7 @@
           "crates/tracedecay-usecases/src/memory/project_memory.rs",
           "crates/tracedecay-global-db/src/native_integration"
         ],
-        "receipt_fields": ["fact_id", "promotion_operation_id", "lineage_digest", "privacy_receipt", "scope_revision"],
+        "receipt_fields": ["fact_id", "promotion_operation_id", "lineage_digest", "privacy_receipt", "resolved_scope_digest"],
         "ordering_authority": "Native fact log commit and lineage receipt, not a provider proposal timestamp.",
         "provider_fanout": "Only after explicit Native promotion; provider recall cannot implicitly promote a fact."
       },
@@ -752,8 +752,8 @@
         "mode": "required_authoritative_receipt",
         "authority": "TraceDecay Native owner scope admission",
         "receipt_name": "ScopeAdmissionReceiptV1",
-        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
-        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
         "optional_fields": ["branch_ref"],
         "evidence_only_fields": ["fact_store_path", "working_directory"],
         "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
@@ -796,7 +796,7 @@
         "authority": "TraceDecay feedback outcome authority",
         "settled_state": "Feedback source event and resulting trust/outcome transition are durably recorded",
         "source_paths": ["crates/tracedecay-usecases/src/feedback/observations.rs"],
-        "receipt_fields": ["feedback_event_id", "target_identity", "outcome", "transition_digest", "scope_revision"],
+        "receipt_fields": ["feedback_event_id", "target_identity", "outcome", "transition_digest", "resolved_scope_digest"],
         "ordering_authority": "Feedback log settlement and target identity, not UI preview order.",
         "provider_fanout": "Only after feedback is settled; provider output cannot rewrite Native feedback."
       },
@@ -806,8 +806,8 @@
         "mode": "required_authoritative_receipt",
         "authority": "TraceDecay feedback scope admission",
         "receipt_name": "ScopeAdmissionReceiptV1",
-        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
-        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
         "optional_fields": ["branch_ref"],
         "evidence_only_fields": ["ui_route", "working_directory"],
         "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
@@ -853,7 +853,7 @@
           "crates/tracedecay/src/daemon/automation_observation.rs",
           "crates/tracedecay/src/daemon/scheduler/automation_observation.rs"
         ],
-        "receipt_fields": ["run_id", "terminal_outcome", "input_digest", "effect_digest", "scope_revision"],
+        "receipt_fields": ["run_id", "terminal_outcome", "input_digest", "effect_digest", "resolved_scope_digest"],
         "ordering_authority": "Automation run ledger settlement and run identity, not scheduler intent or heartbeat timing.",
         "provider_fanout": "Only after the automation outcome is settled and privacy-checked."
       },
@@ -863,12 +863,12 @@
         "mode": "required_authoritative_receipt",
         "authority": "TraceDecay automation scope admission",
         "receipt_name": "ScopeAdmissionReceiptV1",
-        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
-        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "scope_revision"],
+        "required_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
+        "identity_fields": ["profile_id", "project_id", "repository_id", "worktree_id", "branch_ref", "agent_session_id", "resolved_scope_digest"],
         "optional_fields": ["branch_ref"],
         "evidence_only_fields": ["scheduler_path", "working_directory"],
         "forbidden_inference_inputs": ["cwd", "path_string", "repository_name", "nearest_project", "process_id"],
-        "algorithm": "Copy exact scope from the automation run's admission receipt and bind it to the run revision; never infer scope from a scheduler path or job label.",
+        "algorithm": "Copy exact scope from the automation run's admission receipt, including its resolved scope digest, and bind it to the settled run identity; never infer scope from a scheduler path or job label.",
         "failure": "exclude_scope_unresolved"
       },
       "source_provenance_derivation": {
@@ -1204,7 +1204,9 @@
     "Every excluded event carries a typed reason and is excluded before provider scope binding or payload dispatch.",
     "Speculative tool intent, proposed edits, rolled-back mutations, and uncommitted buffers never become observations.",
     "Raw secrets and unadmitted personal data are fail-closed regardless of whether a surrounding operation settled.",
-    "Exact profile, project, repository, worktree, branch, session, and scope revision come from an authoritative receipt, never path parsing.",
+    "Exact profile, project, repository, worktree, branch, session, and resolved-scope digest come from an authoritative receipt, never path parsing.",
+    "The resolved-scope digest is content identity for one admitted scope and is compared only for exact equality; it is never an ordering revision, version counter, watermark, or freshness signal, and a mismatch excludes the event instead of selecting a newer scope.",
+    "Replay and admission ordering come only from the source event revision, source cursor, and source generation supplied by the owning authority, never from the resolved-scope digest.",
     "Source authority, event ID, revision, digest, and canonical settlement receipt come from the owning authority, while paths are evidence anchors only.",
     "Unknown host or application events follow the default exclusion rule and require an explicit unclassified reason before any scope is bound.",
     "Provider latency, failure, or advisory output cannot alter canonical code, session, Native facts, tools, approvals, or settled source outcomes.",

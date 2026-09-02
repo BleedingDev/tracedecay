@@ -51,7 +51,7 @@
       "worktree_identity",
       "branch_identity",
       "agent_session_id",
-      "scope_revision"
+      "resolved_scope_digest"
     ],
     "match_semantics": "all_required_identity_fields_must_match_exactly",
     "wildcards_allowed": false,
@@ -181,6 +181,83 @@
     "provider_candidate_is_advisory": true,
     "provider_candidate_may_mutate_context": false,
     "provider_candidate_may_mutate_tracedecay_authority": false
+  },
+  "candidate_scope_binding": {
+    "type_name": "MemoryProviderRecallCandidateScopeIdentityV1",
+    "carried_in": "provider_candidate.exact_scope_identity",
+    "wire_field": "scope_binding",
+    "required_fields": [
+      "scope_binding",
+      "profile_id",
+      "project_id",
+      "repository_identity",
+      "worktree_identity",
+      "branch_identity",
+      "agent_session_id",
+      "resolved_scope_digest"
+    ],
+    "bindings": [
+      "exact_coding_scope",
+      "project_facts",
+      "profile_facts"
+    ],
+    "binding_source": "product/architecture/coding-memory-authority-matrix.json namespace variants",
+    "authorization_source": "tracedecay.memory.provider.registry.v1 registration_contract.recall_scope_bindings",
+    "authorization_carried_by": "host_admitted_call_never_provider_reply",
+    "missing_binding_policy": "reject_contract_violation",
+    "unknown_binding_policy": "reject_contract_violation",
+    "unauthorized_binding_policy": "reject_scope_binding_unauthorized",
+    "malformed_identity_policy": "reject_unknown_identity",
+    "forbidden_identity_policy": "reject_forbidden_identity",
+    "provider_may_widen_binding": false,
+    "binding_rules": [
+      {
+        "binding": "exact_coding_scope",
+        "required_equal": [
+          "profile_id",
+          "project_id",
+          "repository_identity",
+          "worktree_identity",
+          "branch_identity",
+          "agent_session_id",
+          "resolved_scope_digest"
+        ],
+        "optional_empty_or_equal": [],
+        "forbidden": [],
+        "resolved_scope_digest_mismatch_policy": "reject_stale_identity"
+      },
+      {
+        "binding": "project_facts",
+        "required_equal": [
+          "profile_id",
+          "project_id"
+        ],
+        "optional_empty_or_equal": [
+          "repository_identity",
+          "worktree_identity",
+          "branch_identity"
+        ],
+        "forbidden": [
+          "agent_session_id",
+          "resolved_scope_digest"
+        ]
+      },
+      {
+        "binding": "profile_facts",
+        "required_equal": [
+          "profile_id"
+        ],
+        "optional_empty_or_equal": [],
+        "forbidden": [
+          "project_id",
+          "repository_identity",
+          "worktree_identity",
+          "branch_identity",
+          "agent_session_id",
+          "resolved_scope_digest"
+        ]
+      }
+    ]
   },
   "content_reference": {
     "type_name": "MemoryProviderRecallContentReferenceV1",
@@ -410,7 +487,8 @@
     "Exclusions are mandatory, scope-bound, canonical, and ignored exclusions are contract violations.",
     "Successful zero results means a complete successful search returned no candidates; an empty list never signals provider failure or fallback eligibility.",
     "Fixed request, provider state, policy, and limits produce deterministic provider ordering and coverage.",
-    "TraceDecay alone admits, normalizes, deduplicates, budgets, explains, and assembles provider candidates into final coding context."
+    "TraceDecay alone admits, normalizes, deduplicates, budgets, explains, and assembles provider candidates into final coding context.",
+    "Every candidate declares an explicit scope binding; the host admits it only when the registry authorized that binding for the provider and the claimed identity satisfies the binding's required, optional, and forbidden field rules, so a missing, unknown, unauthorized, or over-claimed binding fails closed."
   ],
   "verification_beads": [
     "tdmem-0206",

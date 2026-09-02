@@ -12,8 +12,10 @@ use tracedecay_memory_provider_api::contract::{
 use tracedecay_memory_provider_api::{
     CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
     HandshakeRequest, HandshakeRequestParts, MemoryProvider, OperationControl, OwnedExactScope,
-    OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderCallParts,
-    ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
+    OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId, PayloadSanitizationReceipt,
+    PayloadSanitizationReceiptParts, ProviderCall, ProviderCallParts, ProviderDescriptor,
+    ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
+    observation_extensions_digest,
 };
 use tracedecay_memory_provider_ncm::{
     NCM_PROVIDER_ID, NcmAdapterError, NcmCognitiveSurface, NcmNamespace, NcmProviderAdapter,
@@ -26,6 +28,8 @@ const PROVIDER_RECEIPT_SHA: &str =
     "2222222222222222222222222222222222222222222222222222222222222222";
 const VERIFICATION_SHA: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 const EMPTY_OBJECT_SHA: &str = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+const RESOLVED_SCOPE_DIGEST: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const LARGE_EXTENSION_SHA: &str =
     "91e3faafd322bcdf160f3f0ce886acb092b9b9e2a1e8526b40f21a8898a8700b";
 
@@ -269,6 +273,38 @@ impl MockSurface {
         self
     }
 
+    fn reply_code_for(&self, operation: ProviderOperation, code: TerminalCode) -> TerminalCode {
+        if operation == ProviderOperation::Handshake {
+            self.handshake_code.unwrap_or(code)
+        } else {
+            self.reply_code.unwrap_or(code)
+        }
+    }
+
+    fn effect_state_for(
+        &self,
+        operation: ProviderOperation,
+        code: TerminalCode,
+        surface_idempotency_key: Option<&str>,
+    ) -> CommittedEffectState {
+        let default_effect = if code == TerminalCode::Success && operation.mutates_provider_state()
+        {
+            CommittedEffectState::Committed
+        } else {
+            CommittedEffectState::None
+        };
+        if operation == ProviderOperation::Handshake {
+            return default_effect;
+        }
+        match self.reply_effect.unwrap_or(default_effect) {
+            // A duplicate needs a key to have deduplicated. A read-only call
+            // never carries one, so the override degrades to the default rather
+            // than fabricating a binding the surface could not have had.
+            CommittedEffectState::Duplicate if surface_idempotency_key.is_none() => default_effect,
+            state => state,
+        }
+    }
+
     fn terminal(
         &self,
         operation_id: &str,
@@ -277,23 +313,10 @@ impl MockSurface {
         code: TerminalCode,
         state_generation_before: Option<u64>,
         aliases: &[String],
+        surface_idempotency_key: Option<&str>,
     ) -> TerminalRecord {
-        let code = if operation == ProviderOperation::Handshake {
-            self.handshake_code.unwrap_or(code)
-        } else {
-            self.reply_code.unwrap_or(code)
-        };
-        let default_effect = if code == TerminalCode::Success && operation.mutates_provider_state()
-        {
-            CommittedEffectState::Committed
-        } else {
-            CommittedEffectState::None
-        };
-        let effect_state = if operation == ProviderOperation::Handshake {
-            default_effect
-        } else {
-            self.reply_effect.unwrap_or(default_effect)
-        };
+        let code = self.reply_code_for(operation, code);
+        let effect_state = self.effect_state_for(operation, code, surface_idempotency_key);
         let effect = match effect_state {
             CommittedEffectState::None => CommittedEffectEvidence::none(state_generation_before),
             CommittedEffectState::Committed => {
@@ -336,6 +359,16 @@ impl MockSurface {
                     VERIFICATION_SHA,
                 )
                 .expect("partial effect")
+            }
+            CommittedEffectState::Duplicate => {
+                let before = state_generation_before.expect("duplicate generation before");
+                CommittedEffectEvidence::duplicate(
+                    before,
+                    surface_idempotency_key.expect("surface idempotency key"),
+                    "ncm.surface.operation-original.v1",
+                    PROVIDER_RECEIPT_SHA,
+                )
+                .expect("duplicate effect")
             }
             CommittedEffectState::Unknown => CommittedEffectEvidence::unknown(
                 PROVIDER_RECEIPT_SHA,
@@ -419,6 +452,7 @@ impl NcmCognitiveSurface for MockSurface {
                 TerminalCode::Success,
                 None,
                 &[],
+                None,
             ),
             descriptor: Some(descriptor.clone()),
             provider_instance_id: Some(provider_instance_id.to_owned()),
@@ -478,6 +512,7 @@ impl NcmCognitiveSurface for MockSurface {
                 TerminalCode::Success,
                 Some(call.expected_state_generation),
                 &aliases,
+                call.idempotency_key.as_deref(),
             ),
             payload: Some(payload),
             warnings: if self.leak_warning_aliases {
@@ -491,7 +526,14 @@ impl NcmCognitiveSurface for MockSurface {
                 .into_iter()
                 .collect(),
             state_generation: self.reply_state_generation.unwrap_or_else(|| {
-                if call.operation.mutates_provider_state() {
+                // A duplicate acknowledges an effect that already landed, so
+                // the generation it reports must not move.
+                let acknowledges_prior_effect = self.effect_state_for(
+                    call.operation,
+                    self.reply_code_for(call.operation, TerminalCode::Success),
+                    call.idempotency_key.as_deref(),
+                ) == CommittedEffectState::Duplicate;
+                if call.operation.mutates_provider_state() && !acknowledges_prior_effect {
                     call.expected_state_generation.saturating_add(1)
                 } else {
                     call.expected_state_generation
@@ -551,7 +593,7 @@ fn scope() -> OwnedExactScope {
         "worktree-a",
         "refs/heads/main",
         "session-a",
-        3,
+        RESOLVED_SCOPE_DIGEST,
     )
     .expect("scope")
 }
@@ -599,7 +641,33 @@ fn call(provider_id: &str, operation: ProviderOperation) -> ProviderCall {
         .collect::<Vec<_>>(),
         extensions: Vec::new(),
     })
+    .map(admitted)
     .expect("call")
+}
+
+/// Sanitizer revision this harness stands in for. The real revision is derived
+/// by `tracedecay-memory-hygiene` from the canonical policy document.
+const TEST_SANITIZER_REVISION: &str = "tracedecay.memory.observation.hygiene.v1+ncm-test";
+
+/// Attaches the receipt the admitted hygiene pipeline mints for a payload and
+/// extension set it read and left byte-identical. Observation dispatch fails
+/// closed without one, and the receipt binds the extensions as well as the
+/// payload, so a fixture that changes either has to re-admit the call.
+fn admitted(call: ProviderCall) -> ProviderCall {
+    if call.operation != ProviderOperation::Observe {
+        return call;
+    }
+    let extensions_digest =
+        observation_extensions_digest(&call.extensions).expect("admitted extension set");
+    let receipt = PayloadSanitizationReceipt::new(
+        PayloadSanitizationReceiptParts::accepted_unmodified_with_extensions(
+            TEST_SANITIZER_REVISION,
+            call.payload.sha256.clone(),
+            extensions_digest,
+        ),
+    )
+    .expect("accepted sanitization receipt");
+    call.with_sanitization(receipt)
 }
 
 fn operation_contract_id(operation: ProviderOperation) -> &'static str {
@@ -658,7 +726,9 @@ fn canonical_request_size(call: &ProviderCall) -> u64 {
     total = total.saturating_add(framed_size(call.provider_id.as_str()));
     total = total.saturating_add(8);
     total = total.saturating_add(framed_size(&call.ready_receipt_sha256));
-    total = total.saturating_add(8);
+    // Seven length-framed scope strings and no scalar, mirroring the
+    // provider-API authority: the resolved digest replaced the fixed-width
+    // revision counter.
     for value in [
         &call.exact_scope.profile_id,
         &call.exact_scope.project_id,
@@ -666,6 +736,7 @@ fn canonical_request_size(call: &ProviderCall) -> u64 {
         &call.exact_scope.worktree_identity,
         &call.exact_scope.branch_identity,
         &call.exact_scope.agent_session_id,
+        &call.exact_scope.resolved_scope_digest,
     ] {
         total = total.saturating_add(framed_size(value));
     }
@@ -775,7 +846,13 @@ fn canonical_committed_effect_size(effect: &CommittedEffectEvidence) -> u64 {
         effect.provider_receipt_sha256(),
     ));
     total = total.saturating_add(canonical_optional_str_size(effect.reconciliation_action()));
-    total.saturating_add(canonical_optional_str_size(effect.verification_sha256()))
+    total = total.saturating_add(canonical_optional_str_size(effect.verification_sha256()));
+    total = total.saturating_add(canonical_optional_str_size(
+        effect.duplicate_of_idempotency_key(),
+    ));
+    total.saturating_add(canonical_optional_str_size(
+        effect.duplicate_of_operation_id(),
+    ))
 }
 
 fn canonical_fallback_size(fallback: &FallbackDirective) -> u64 {
@@ -1001,6 +1078,7 @@ fn handshake_exposes_only_namespace_to_surface_and_reattaches_scope() {
         &request.exact_scope.worktree_identity,
         &request.exact_scope.branch_identity,
         &request.exact_scope.agent_session_id,
+        &request.exact_scope.resolved_scope_digest,
     ] {
         assert!(!captured.contains(component.as_str()));
     }
@@ -1421,7 +1499,7 @@ fn surface_capture_contains_no_public_ids_scope_or_extension_bytes() {
             "worktree_identity": exact_scope.worktree_identity.clone(),
             "branch_identity": exact_scope.branch_identity.clone(),
             "agent_session_id": exact_scope.agent_session_id.clone(),
-            "scope_revision": exact_scope.scope_revision
+            "resolved_scope_digest": exact_scope.resolved_scope_digest.clone()
         },
         "safe": {"kind": "observation"},
         "request_identity": request.request_id.clone(),
@@ -1443,6 +1521,9 @@ fn surface_capture_contains_no_public_ids_scope_or_extension_bytes() {
         .as_bytes(),
     );
     request.extensions.push(extension.clone());
+    // Re-admit: the receipt binds the payload digest, so a replaced payload
+    // needs a receipt for the bytes actually dispatched.
+    let request = admitted(request);
 
     let reply = provider.invoke(&request);
     assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
@@ -1487,6 +1568,7 @@ fn surface_capture_contains_no_public_ids_scope_or_extension_bytes() {
         &request.exact_scope.worktree_identity,
         &request.exact_scope.branch_identity,
         &request.exact_scope.agent_session_id,
+        &request.exact_scope.resolved_scope_digest,
     ] {
         assert!(!captured_call.contains(component.as_str()));
         assert!(!mapped_payload_text.contains(component.as_str()));
@@ -1497,19 +1579,23 @@ fn surface_capture_contains_no_public_ids_scope_or_extension_bytes() {
 fn raw_scope_outside_exact_scope_subtree_never_reaches_surface() {
     let surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
     let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
-    let mut request = ready_call(&provider, ProviderOperation::Recall);
-    let payload = format!(
-        "{{\"query\":\"find {}\"}}",
-        request.exact_scope.repository_identity
-    );
-    request.payload = canonical_payload(ProviderOperation::Recall, payload.as_bytes());
+    let base = ready_call(&provider, ProviderOperation::Recall);
 
-    let reply = provider.invoke(&request);
-    assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
-    assert_eq!(
-        reply.terminal.diagnostic_id(),
-        Some("ncm.request_contract_or_scope_projection_invalid")
-    );
+    for leaked_identity in [
+        &base.exact_scope.repository_identity,
+        &base.exact_scope.resolved_scope_digest,
+    ] {
+        let mut request = base.clone();
+        let payload = format!("{{\"query\":\"find {leaked_identity}\"}}");
+        request.payload = canonical_payload(ProviderOperation::Recall, payload.as_bytes());
+
+        let reply = provider.invoke(&request);
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
+        assert_eq!(
+            reply.terminal.diagnostic_id(),
+            Some("ncm.request_contract_or_scope_projection_invalid")
+        );
+    }
     assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 0);
 }
 
@@ -1903,6 +1989,40 @@ fn structured_terminal_api_prevents_a_read_reply_from_claiming_a_committed_effec
 }
 
 #[test]
+fn surface_duplicate_acknowledgement_is_rebound_to_the_hosts_own_idempotency_key() {
+    let surface = Arc::new(
+        MockSurface::new(NCM_PROVIDER_ID, &[], false)
+            .with_reply_effect(CommittedEffectState::Duplicate),
+    );
+    let provider = NcmProviderAdapter::new(surface).expect("adapter");
+    let request = ready_call(&provider, ProviderOperation::Observe);
+    let reply = provider.invoke(&request);
+    let effect = reply.terminal.committed_effect();
+
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(effect.state(), CommittedEffectState::Duplicate);
+    // The surface only ever saw the namespace-opaque key; the host-visible
+    // envelope must name the caller's own key so the journal can match it.
+    assert_eq!(
+        effect.duplicate_of_idempotency_key(),
+        request.idempotency_key.as_deref()
+    );
+    assert_eq!(
+        effect.duplicate_of_operation_id(),
+        Some("ncm.surface.operation-original.v1")
+    );
+    // A duplicate commits nothing, so the generation must not move.
+    assert_eq!(
+        effect.state_generation_before(),
+        Some(request.expected_state_generation)
+    );
+    assert_eq!(
+        effect.state_generation_after(),
+        Some(request.expected_state_generation)
+    );
+}
+
+#[test]
 fn malformed_unknown_effect_reply_is_replaced_by_a_dispatch_witness() {
     let surface = Arc::new(
         MockSurface::new(NCM_PROVIDER_ID, &[], false)
@@ -2003,10 +2123,23 @@ fn warning_overflow_is_rejected() {
 
 #[test]
 fn projected_surface_request_accepts_exact_limit_and_rejects_one_byte_over() {
-    let template = call(NCM_PROVIDER_ID, ProviderOperation::Recall);
+    // The projection replaces every caller identity with a fixed-width opaque
+    // digest, so a mutating call with minimal public identities is the shape
+    // whose projected encoding is strictly larger than its public encoding.
+    // That is what lets the projected limit, not the public one, decide.
+    // The identities stay short but use a letter that occurs in no hex digest
+    // and no reply vocabulary, so the alias-leak scan cannot match them by
+    // accident inside unrelated text.
+    let mut template = call(NCM_PROVIDER_ID, ProviderOperation::Observe);
+    template.request_id = "q1".to_owned();
+    template.operation_id = "q2".to_owned();
+    template.idempotency_key = Some("q3".to_owned());
     let public_bytes = canonical_request_size(&template);
     let encoded_bytes = canonical_surface_request_size(&template);
-    assert!(encoded_bytes > public_bytes);
+    assert!(
+        encoded_bytes > public_bytes,
+        "projected {encoded_bytes} must exceed public {public_bytes}"
+    );
     assert!(encoded_bytes > 1);
 
     let mut exact_limits = limits();
@@ -2021,7 +2154,12 @@ fn projected_surface_request_accepts_exact_limit_and_rejects_one_byte_over() {
     let mut exact_call = template.clone();
     exact_call.ready_receipt_sha256 = exact_receipt;
     let exact_reply = exact_provider.invoke(&exact_call);
-    assert_eq!(exact_reply.terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(
+        exact_reply.terminal.terminal_code(),
+        TerminalCode::Success,
+        "exact-limit call refused: {:?}",
+        exact_reply.terminal.diagnostic_id()
+    );
     assert_eq!(exact_surface.invoke_calls.load(Ordering::Relaxed), 1);
 
     let mut one_byte_too_small = exact_limits;
@@ -2054,6 +2192,9 @@ fn canonical_response_envelope_accepts_exact_limit_and_rejects_one_byte_over() {
     template
         .extensions
         .push(opaque_extension(&large_extension_payload));
+    // The hygiene receipt binds the extension set, so the admitted call is the
+    // one that carries this extension.
+    let template = admitted(template);
     let state_generation_after = template.expected_state_generation.saturating_add(1);
     let expected_reply = ProviderReply {
         terminal: TerminalRecord::new(
@@ -2250,8 +2391,15 @@ fn unknown_required_extension_never_reaches_surface() {
         )
         .expect("extension"),
     );
+    // Admit the extension set so the rejection proves the adapter refuses a
+    // required extension, not that the hygiene receipt failed to bind it.
+    let request = admitted(request);
     let reply = provider.invoke(&request);
     assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some("ncm.request_payload_or_extension_invalid")
+    );
     assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 0);
 }
 

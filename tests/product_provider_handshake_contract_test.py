@@ -187,13 +187,14 @@ class ProviderHandshakeContractTest(unittest.TestCase):
             "worktree_identity",
             "branch_identity",
             "agent_session_id",
+            "resolved_scope_digest",
         ]
         self.assertEqual(digest["string_field_order"], fields)
         self.assertEqual(
             digest["string_field_encoding"],
             "u64_big_endian_byte_length_then_utf8_bytes",
         )
-        self.assertEqual(digest["scope_revision_encoding"], "u64_big_endian")
+        self.assertNotIn("scope_revision_encoding", digest)
 
         golden = digest["golden_vector"]
         canonical = bytearray(digest["domain_ascii"].encode("ascii"))
@@ -202,7 +203,6 @@ class ProviderHandshakeContractTest(unittest.TestCase):
             encoded = golden[field].encode("utf-8")
             canonical.extend(len(encoded).to_bytes(8, "big"))
             canonical.extend(encoded)
-        canonical.extend(golden["scope_revision"].to_bytes(8, "big"))
 
         offset = len(digest["domain_ascii"].encode("ascii")) + 1
         for field in fields:
@@ -212,17 +212,16 @@ class ProviderHandshakeContractTest(unittest.TestCase):
             self.assertEqual(byte_length, len(encoded))
             self.assertEqual(canonical[offset : offset + byte_length], encoded)
             offset += byte_length
-        self.assertEqual(
-            canonical[offset:], golden["scope_revision"].to_bytes(8, "big")
-        )
+        self.assertEqual(offset, len(canonical))
         self.assertEqual(
             hashlib.sha256(canonical).hexdigest(),
-            "aa2f1ac9c33a448fb824abf783a6d40ab52050d91bcc580d907e6b0a3303938e",
+            "2f525c8c3d59bfa3d9729405c4f3f1307fade77494b6ddf251c89abc490f0a52",
         )
         self.assertEqual(
             golden["digest"],
-            "aa2f1ac9c33a448fb824abf783a6d40ab52050d91bcc580d907e6b0a3303938e",
+            "2f525c8c3d59bfa3d9729405c4f3f1307fade77494b6ddf251c89abc490f0a52",
         )
+        self.assertTrue(golden["resolved_scope_digest"].startswith("sha256:"))
 
     def test_exact_scope_digest_field_order_is_canonical(self) -> None:
         contract = copy.deepcopy(self.contract)
@@ -240,12 +239,23 @@ class ProviderHandshakeContractTest(unittest.TestCase):
             "exact scope digest string boundary encoding drifted",
         )
 
-    def test_exact_scope_digest_revision_is_big_endian_u64(self) -> None:
+    def test_exact_scope_digest_rejects_reintroduced_scope_revision_field(self) -> None:
         contract = copy.deepcopy(self.contract)
         contract["exact_scope_identity"]["digest"][
             "scope_revision_encoding"
-        ] = "utf8_decimal"
-        self.assert_rejected(contract, "exact scope digest revision encoding drifted")
+        ] = "u64_big_endian"
+        self.assert_rejected(contract, "exact_scope_identity.digest fields drifted")
+
+    def test_exact_scope_digest_uses_resolved_scope_digest_not_numeric_revision(
+        self,
+    ) -> None:
+        digest = self.contract["exact_scope_identity"]["digest"]
+        self.assertIn("resolved_scope_digest", digest["string_field_order"])
+        self.assertNotIn("scope_revision", digest["string_field_order"])
+        contract = copy.deepcopy(self.contract)
+        order = contract["exact_scope_identity"]["digest"]["string_field_order"]
+        order[order.index("resolved_scope_digest")] = "scope_revision"
+        self.assert_rejected(contract, "exact scope digest string field order drifted")
 
     def test_exact_scope_digest_domain_requires_trailing_nul(self) -> None:
         contract = copy.deepcopy(self.contract)

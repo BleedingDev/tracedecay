@@ -70,6 +70,8 @@ The idempotency key is SHA-256 over contract identity, target provider/registrat
 - same key + different canonical payload/extensions → `idempotency_conflict`;
 - a new canonical source revision → a new key.
 
+A provider proves the first case on the wire: it returns terminal `success` with committed-effect state `duplicate`, whose `duplicate_of_idempotency_key` equals the key on the request it is answering and whose `duplicate_of_operation_id` names the earlier operation that actually committed. The delivery receipt then records `duplicate_acknowledged` with committed effect `duplicate`. TraceDecay never infers a duplicate from an absent effect, an empty payload, a repeated attempt number, or the provider's identity; a provider that cannot name the mutation it deduplicated reports its effect truthfully as applied, none, or unknown instead.
+
 Random retry keys and timestamp-only keys are forbidden. Providers persist deduplication state strongly enough to survive the crash window after provider commit but before acknowledgement.
 
 ## Provenance and privacy

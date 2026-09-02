@@ -23,11 +23,25 @@
 //! Both reports bind the immutable fixture-controlled inputs through
 //! [`ScenarioIdentity`].
 
+mod baseline;
+mod canonical;
 mod error;
 mod fixture;
 mod report;
 mod runner;
+mod scenario_corpus;
 
+pub use baseline::{
+    AdjudicationRecord, BaselineComparison, BaselineError, BaselineLane, BaselineReport,
+    BaselineRunConfig, BaselineRunIdentity, BaselineRunOutput, BaselineRunner, BaselineStepRecord,
+    BaselineTimings, BatchBoundary, CallTiming, CheckRecord, CheckVerdict, ComparisonCell,
+    ComparisonRow, ContextAdmission, ContextEntry, CountRecord, HostConfigIdentity, LaneIdentity,
+    LaneKind, LimitsRecord, O200K_BASE_ESTIMATOR_ID, O200K_BASE_ESTIMATOR_REVISION,
+    O200kBaseTokenEstimator, ProviderCallRecord, ProviderIdentityRecord, ProviderLane,
+    ScenarioBaselineResult, ScenarioCostSummary, SharedInputs, StepOutcome, TerminalGate,
+    TokenEstimateError, TokenEstimator, TokenEstimatorIdentity, TokenRecord,
+};
+pub use canonical::{CanonicalJsonError, canonical_json, canonical_json_sha256};
 pub use error::EvaluationError;
 pub use fixture::{
     ContractIdentity, EffectGenerationExpectation, ExpectedCommittedEffect, FixtureIdentity,
@@ -42,3 +56,11 @@ pub use report::{
     ProductRunReport, ProductStepOutput, ProductStepResult, RunSummary, StepEvaluation, StepKind,
 };
 pub use runner::ProviderHarness;
+pub use scenario_corpus::{
+    AdjudicationPolicy, AdjudicationRubric, CodeEvidenceRevision, CorpusError, DigestStatus,
+    EvidenceDefinition, ExpectedAdmissibleBehavior, FileRevision, FixtureDefinition, FixtureFile,
+    FixturePolicy, ObservationDefinition, ProviderSelectionPolicy, RUBRIC_WEIGHT_BASIS_POINTS,
+    RecallBudgets, RecallExclusions, RecallRequestDefinition, RecallRequestOperation,
+    RecallTemporalQuery, RubricCheck, ScenarioCorpus, ScenarioDefinition, ScenarioStep, ScopeEntry,
+    basis_points,
+};

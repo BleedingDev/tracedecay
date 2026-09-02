@@ -26,6 +26,7 @@ TOP_LEVEL = {
     "exclusions",
     "extension_contract",
     "provider_candidate",
+    "candidate_scope_binding",
     "content_reference",
     "native_score",
     "host_normalized_score",
@@ -65,7 +66,7 @@ SCOPE_FIELDS = [
     "worktree_identity",
     "branch_identity",
     "agent_session_id",
-    "scope_revision",
+    "resolved_scope_digest",
 ]
 
 TEMPORAL_FIELDS = [
@@ -116,6 +117,43 @@ CANDIDATE_FIELDS = [
     "warnings",
     "extensions",
 ]
+
+SCOPE_BINDINGS = [
+    "exact_coding_scope",
+    "project_facts",
+    "profile_facts",
+]
+
+CANDIDATE_SCOPE_FIELDS = ["scope_binding", *SCOPE_FIELDS]
+
+BINDING_RULES = {
+    "exact_coding_scope": {
+        "required_equal": SCOPE_FIELDS,
+        "optional_empty_or_equal": [],
+        "forbidden": [],
+    },
+    "project_facts": {
+        "required_equal": ["profile_id", "project_id"],
+        "optional_empty_or_equal": [
+            "repository_identity",
+            "worktree_identity",
+            "branch_identity",
+        ],
+        "forbidden": ["agent_session_id", "resolved_scope_digest"],
+    },
+    "profile_facts": {
+        "required_equal": ["profile_id"],
+        "optional_empty_or_equal": [],
+        "forbidden": [
+            "project_id",
+            "repository_identity",
+            "worktree_identity",
+            "branch_identity",
+            "agent_session_id",
+            "resolved_scope_digest",
+        ],
+    },
+}
 
 NATIVE_SCORE_FIELDS = [
     "score_domain_id",
@@ -208,6 +246,7 @@ REQUIRED_DOC_PHRASES = [
     "unknown optional extensions round-trip as inert opaque data",
     "An empty candidate list is never a failure or fallback signal",
     "TraceDecay alone validates, normalizes, deduplicates, budgets, formats, explains, and assembles candidates",
+    "The host, not the provider, decides which bindings a provider may attest",
 ]
 
 REQUIRED_INVARIANT_PHRASES = [
@@ -227,6 +266,7 @@ REQUIRED_INVARIANT_PHRASES = [
     "Successful zero results",
     "deterministic provider ordering",
     "TraceDecay alone admits",
+    "explicit scope binding",
 ]
 
 BEAD_RE = re.compile(r"^tdmem-[0-9]{4}$")
@@ -790,6 +830,89 @@ def validate_candidate_scores(contract: dict[str, Any], errors: list[str]) -> No
     )
 
 
+def validate_candidate_scope_binding(contract: dict[str, Any], errors: list[str]) -> None:
+    binding = obj(
+        contract.get("candidate_scope_binding"), "candidate_scope_binding", errors
+    )
+    keys = {
+        "type_name",
+        "carried_in",
+        "wire_field",
+        "required_fields",
+        "bindings",
+        "binding_source",
+        "authorization_source",
+        "authorization_carried_by",
+        "missing_binding_policy",
+        "unknown_binding_policy",
+        "unauthorized_binding_policy",
+        "malformed_identity_policy",
+        "forbidden_identity_policy",
+        "provider_may_widen_binding",
+        "binding_rules",
+    }
+    exact_keys(binding, keys, "candidate_scope_binding", errors)
+    if binding.get("type_name") != "MemoryProviderRecallCandidateScopeIdentityV1":
+        errors.append("candidate scope binding type drifted")
+    if binding.get("carried_in") != "provider_candidate.exact_scope_identity":
+        errors.append("candidate scope binding must live in the candidate exact scope")
+    if binding.get("wire_field") != "scope_binding":
+        errors.append("candidate scope binding wire field must be scope_binding")
+    if binding.get("required_fields") != CANDIDATE_SCOPE_FIELDS:
+        errors.append("candidate scope fields must be scope_binding plus the exact scope")
+    if binding.get("bindings") != SCOPE_BINDINGS:
+        errors.append("candidate scope bindings must mirror the authority-matrix namespaces")
+    if "coding-memory-authority-matrix.json" not in str(binding.get("binding_source")):
+        errors.append("candidate scope bindings must cite the authority matrix")
+    if "registration_contract.recall_scope_bindings" not in str(
+        binding.get("authorization_source")
+    ):
+        errors.append("candidate scope binding authorization must come from registration")
+    if binding.get("authorization_carried_by") != (
+        "host_admitted_call_never_provider_reply"
+    ):
+        errors.append("scope binding authorization must travel with the admitted call")
+    for field, expected in (
+        ("missing_binding_policy", "reject_contract_violation"),
+        ("unknown_binding_policy", "reject_contract_violation"),
+        ("unauthorized_binding_policy", "reject_scope_binding_unauthorized"),
+        ("malformed_identity_policy", "reject_unknown_identity"),
+        ("forbidden_identity_policy", "reject_forbidden_identity"),
+    ):
+        if binding.get(field) != expected:
+            errors.append(f"candidate_scope_binding.{field} must be {expected}")
+    if binding.get("provider_may_widen_binding") is not False:
+        errors.append("candidate_scope_binding.provider_may_widen_binding must be false")
+    rules = arr(binding.get("binding_rules"), "candidate_scope_binding.binding_rules", errors)
+    seen: list[str] = []
+    for index, rule in enumerate(rules):
+        row = obj(rule, f"candidate_scope_binding.binding_rules[{index}]", errors)
+        name = row.get("binding")
+        if name not in BINDING_RULES or name in seen:
+            errors.append(f"binding rule {index} names an unknown or duplicate binding")
+            continue
+        seen.append(name)
+        expected = BINDING_RULES[name]
+        rule_keys = {"binding", "required_equal", "optional_empty_or_equal", "forbidden"}
+        if name == "exact_coding_scope":
+            rule_keys.add("resolved_scope_digest_mismatch_policy")
+            if row.get("resolved_scope_digest_mismatch_policy") != "reject_stale_identity":
+                errors.append("exact_coding_scope digest mismatch must be stale identity")
+        exact_keys(row, rule_keys, f"binding_rules[{name}]", errors)
+        for key in ("required_equal", "optional_empty_or_equal", "forbidden"):
+            if row.get(key) != expected[key]:
+                errors.append(f"binding rule {name}.{key} drifted from the authority matrix")
+        covered = (
+            list(row.get("required_equal") or [])
+            + list(row.get("optional_empty_or_equal") or [])
+            + list(row.get("forbidden") or [])
+        )
+        if sorted(covered) != sorted(SCOPE_FIELDS):
+            errors.append(f"binding rule {name} must classify every exact scope field once")
+    if seen != SCOPE_BINDINGS:
+        errors.append("binding rules must cover every binding in contract order")
+
+
 def validate_validity_provenance_explanation(
     contract: dict[str, Any], errors: list[str]
 ) -> None:
@@ -1005,8 +1128,8 @@ def validate_invariants_beads(
     contract: dict[str, Any], ids: set[str], errors: list[str]
 ) -> None:
     invariants = arr(contract.get("invariants"), "invariants", errors)
-    if len(invariants) < 16 or len(set(invariants)) != len(invariants):
-        errors.append("recall contract must state at least sixteen unique invariants")
+    if len(invariants) < 17 or len(set(invariants)) != len(invariants):
+        errors.append("recall contract must state at least seventeen unique invariants")
     serialized = " ".join(str(value) for value in invariants).casefold()
     for phrase in REQUIRED_INVARIANT_PHRASES:
         if phrase.casefold() not in serialized:
@@ -1051,8 +1174,8 @@ def validate_schema(schema: dict[str, Any], errors: list[str]) -> None:
         errors.append("recall schema must pin bead_id tdmem-0204")
     if properties.get("recall_specific_terminal_states", {}).get("minItems") != 17:
         errors.append("recall schema must require seventeen terminal states")
-    if properties.get("invariants", {}).get("minItems") != 16:
-        errors.append("recall schema must require sixteen invariants")
+    if properties.get("invariants", {}).get("minItems") != 17:
+        errors.append("recall schema must require seventeen invariants")
     definitions = obj(schema.get("$defs"), "schema.$defs", errors)
     for name in ("beadId", "object"):
         if name not in definitions:
@@ -1137,6 +1260,7 @@ def validate(
     validate_request_scope_temporal(contract, errors)
     validate_budgets_exclusions_extensions(contract, errors)
     validate_candidate_scores(contract, errors)
+    validate_candidate_scope_binding(contract, errors)
     validate_validity_provenance_explanation(contract, errors)
     validate_response_coverage_ordering(contract, errors)
     validate_invariants_beads(contract, ids, errors)
@@ -1185,6 +1309,7 @@ def main() -> int:
                 "provider_may_inject_context": contract["recall_response"][
                     "provider_may_inject_context"
                 ],
+                "scope_bindings": contract["candidate_scope_binding"]["bindings"],
             },
             indent=2,
             sort_keys=True,

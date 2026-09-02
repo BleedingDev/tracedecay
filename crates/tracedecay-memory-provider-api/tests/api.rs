@@ -11,14 +11,18 @@ use tracedecay_memory_provider_api::{
     ApiError, CancellationToken, CanonicalPayload, CommittedEffectEvidence,
     CommittedEffectEvidenceParts, FallbackDirective, HandshakeRequest, HandshakeRequestParts,
     HandshakeResponse, MAX_COMMITTED_EFFECT_ITEM_REF_BYTES, MAX_COMMITTED_EFFECT_ITEM_REFS,
-    MemoryProvider, OperationControl, OwnedExactScope, OwnedOpaqueExtension, OwnedProviderId,
-    OwnedVersionedId, PinnedFallbackPolicy, ProviderCall, ProviderCallParts, ProviderDescriptor,
-    ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
-    UNKNOWN_EFFECT_RECONCILIATION_ACTION,
+    MemoryProvider, OBSERVATION_HYGIENE_RECEIPT_ID_PREFIX, OperationControl, OwnedExactScope,
+    OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId, PayloadSanitizationReceipt,
+    PayloadSanitizationReceiptParts, PinnedFallbackPolicy, ProviderCall, ProviderCallParts,
+    ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply, SanitizationDisposition,
+    TerminalRecord, UNKNOWN_EFFECT_RECONCILIATION_ACTION, WithheldReason,
+    empty_opaque_extensions_digest, opaque_extensions_digest,
 };
 
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const ALT_DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const RESOLVED_SCOPE_DIGEST: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const EMPTY_OBJECT_DIGEST: &str =
     "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
@@ -38,7 +42,7 @@ fn scope() -> Result<OwnedExactScope, ApiError> {
         "worktree-1",
         "refs/heads/main",
         "session-1",
-        7,
+        RESOLVED_SCOPE_DIGEST,
     )
 }
 
@@ -108,13 +112,31 @@ fn effect_for_state(state: CommittedEffectState) -> Result<CommittedEffectEviden
             "resume:item-uncommitted",
             DIGEST,
         ),
+        CommittedEffectState::Duplicate => {
+            CommittedEffectEvidence::duplicate(7, DIGEST, "observe-operation-1", DIGEST)
+        }
         CommittedEffectState::Unknown => {
             CommittedEffectEvidence::unknown(DIGEST, "reconcile:operation")
         }
     }
 }
 
-fn effect_is_allowed(expectation: CommittedEffectExpectation, state: CommittedEffectState) -> bool {
+fn effect_is_allowed(
+    terminal_code: TerminalCode,
+    expectation: CommittedEffectExpectation,
+    state: CommittedEffectState,
+) -> bool {
+    // A duplicate acknowledgement is a complete success. `operation_specific`
+    // also covers the degraded `partial` terminal, so the expectation alone is
+    // not enough: the code must be `success` too.
+    if state == CommittedEffectState::Duplicate {
+        return terminal_code == TerminalCode::Success
+            && matches!(
+                expectation,
+                CommittedEffectExpectation::OperationSpecific
+                    | CommittedEffectExpectation::NoneOrOperationSpecific
+            );
+    }
     match expectation {
         CommittedEffectExpectation::OperationSpecific
         | CommittedEffectExpectation::NoneOrOperationSpecific => {
@@ -223,11 +245,11 @@ fn exact_scope_is_complete_and_borrowable() -> Result<(), ApiError> {
     let borrowed = scope.borrowed();
     assert_eq!(borrowed.project_id, "project-1");
     assert_eq!(borrowed.worktree_identity, "worktree-1");
-    assert_eq!(borrowed.scope_revision, 7);
+    assert_eq!(borrowed.resolved_scope_digest, RESOLVED_SCOPE_DIGEST);
     let digest = scope.exact_scope_sha256();
     assert_eq!(
         digest,
-        "aa2f1ac9c33a448fb824abf783a6d40ab52050d91bcc580d907e6b0a3303938e"
+        "2f525c8c3d59bfa3d9729405c4f3f1307fade77494b6ddf251c89abc490f0a52"
     );
     assert_eq!(digest, scope.clone().exact_scope_sha256());
     assert!(
@@ -256,7 +278,8 @@ fn exact_scope_is_complete_and_borrowable() -> Result<(), ApiError> {
     changed.agent_session_id.push_str("-changed");
     variants.push(changed);
     let mut changed = scope.clone();
-    changed.scope_revision = 8;
+    changed.resolved_scope_digest =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_owned();
     variants.push(changed);
     assert!(
         variants
@@ -264,10 +287,48 @@ fn exact_scope_is_complete_and_borrowable() -> Result<(), ApiError> {
             .all(|variant| variant.exact_scope_sha256() != digest)
     );
 
-    let left = OwnedExactScope::new("ab", "c", "repo", "worktree", "branch", "session", 1)?;
-    let right = OwnedExactScope::new("a", "bc", "repo", "worktree", "branch", "session", 1)?;
+    let left = OwnedExactScope::new(
+        "ab",
+        "c",
+        "repo",
+        "worktree",
+        "branch",
+        "session",
+        RESOLVED_SCOPE_DIGEST,
+    )?;
+    let right = OwnedExactScope::new(
+        "a",
+        "bc",
+        "repo",
+        "worktree",
+        "branch",
+        "session",
+        RESOLVED_SCOPE_DIGEST,
+    )?;
     assert_ne!(left.exact_scope_sha256(), right.exact_scope_sha256());
     Ok(())
+}
+
+#[test]
+fn exact_scope_rejects_malformed_resolved_scope_digests() {
+    for invalid in [
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sha256:1111",
+        "sha256:",
+    ] {
+        let error = OwnedExactScope::new(
+            "profile-1",
+            "project-1",
+            "repo-1",
+            "worktree-1",
+            "refs/heads/main",
+            "session-1",
+            invalid,
+        )
+        .expect_err("malformed resolved scope digest must fail closed");
+        assert_eq!(error, ApiError::InvalidSha256("resolved_scope_digest"));
+    }
 }
 
 #[test]
@@ -406,6 +467,122 @@ fn opaque_extension_revalidates_metadata_and_content_after_mutation() -> Result<
     assert_eq!(
         invalid.validate(),
         Err(ApiError::ContentDigestMismatch("extension_payload_sha256"))
+    );
+    Ok(())
+}
+
+/// Smallest request budget that admits `call`.
+///
+/// `validate_request_bytes` refuses when the accounted aggregate is strictly
+/// greater than the budget, so the smallest admitting budget *is* the accounted
+/// aggregate. Binary searching for it keeps the accounting private while still
+/// making it observable, which is what lets the boundary test below be
+/// falsifiable without pinning a magic byte count.
+fn accounted_request_bytes(call: &ProviderCall) -> u64 {
+    let mut low = 0_u64;
+    let mut high = 1_u64 << 24;
+    assert_eq!(
+        call.validate_request_bytes(high),
+        Ok(()),
+        "call must fit the search ceiling"
+    );
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if call.validate_request_bytes(middle).is_ok() {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    low
+}
+
+fn call_with_scope(exact_scope: OwnedExactScope) -> Result<ProviderCall, ApiError> {
+    ProviderCall::new(ProviderCallParts {
+        operation: ProviderOperation::Recall,
+        provider_id: provider_id()?,
+        registration_revision: 1,
+        ready_receipt_sha256: DIGEST.to_owned(),
+        exact_scope,
+        request_id: "request-boundary".to_owned(),
+        operation_id: "operation-boundary".to_owned(),
+        expected_state_generation: 0,
+        idempotency_key: None,
+        control: OperationControl::new(i64::MAX, 10, CancellationToken::new()),
+        payload: payload()?,
+        required_capabilities: vec![capability("recall.query.v1")?],
+        extensions: vec![extension()?],
+    })
+}
+
+/// Every one of the seven exact-scope strings must be length-framed into the
+/// request accounting — including `resolved_scope_digest`, the tagged digest
+/// that replaced the old fixed-width `scope_revision` counter.
+///
+/// A `resolved_scope_digest` that is not framed makes a call carrying a longer
+/// resolved scope look identical in size to one carrying a shorter one, so a
+/// provider's `request_bytes` limit stops bounding the largest thing the call
+/// actually carries. The seventh assertion below is the one the stale
+/// six-string accounting failed.
+#[test]
+fn request_accounting_frames_every_exact_scope_string() -> Result<(), ApiError> {
+    const PADDING: usize = 17;
+
+    let baseline = call_with_scope(scope()?)?;
+    let baseline_bytes = accounted_request_bytes(&baseline);
+
+    let extended = |mutate: fn(&mut OwnedExactScope)| -> Result<u64, ApiError> {
+        let mut exact_scope = scope()?;
+        mutate(&mut exact_scope);
+        exact_scope.validate()?;
+        Ok(accounted_request_bytes(&call_with_scope(exact_scope)?))
+    };
+
+    for (field, mutate) in [
+        (
+            "profile_id",
+            (|scope: &mut OwnedExactScope| {
+                scope.profile_id.push_str(&"p".repeat(PADDING));
+            }) as fn(&mut OwnedExactScope),
+        ),
+        ("project_id", |scope: &mut OwnedExactScope| {
+            scope.project_id.push_str(&"j".repeat(PADDING));
+        }),
+        ("repository_identity", |scope: &mut OwnedExactScope| {
+            scope.repository_identity.push_str(&"r".repeat(PADDING));
+        }),
+        ("worktree_identity", |scope: &mut OwnedExactScope| {
+            scope.worktree_identity.push_str(&"w".repeat(PADDING));
+        }),
+        ("branch_identity", |scope: &mut OwnedExactScope| {
+            scope.branch_identity.push_str(&"b".repeat(PADDING));
+        }),
+        ("agent_session_id", |scope: &mut OwnedExactScope| {
+            scope.agent_session_id.push_str(&"s".repeat(PADDING));
+        }),
+    ] {
+        assert_eq!(
+            extended(mutate)?,
+            baseline_bytes + PADDING as u64,
+            "exact-scope field {field} must be length-framed into the request accounting"
+        );
+    }
+
+    // The seventh string is fixed-length, so its presence is proven by removing
+    // it from the accounted value rather than by lengthening it: a call whose
+    // resolved scope digest is absent from the accounting would be admitted at
+    // a budget that cannot hold it.
+    let without_seventh = baseline_bytes
+        .checked_sub(8 + RESOLVED_SCOPE_DIGEST.len() as u64)
+        .expect("resolved_scope_digest must be inside the accounted aggregate");
+    assert_eq!(
+        baseline.validate_request_bytes(without_seventh),
+        Err(ApiError::BoundaryBytesExceeded {
+            field: "request",
+            maximum: without_seventh,
+        }),
+        "resolved_scope_digest must be counted; a budget short by exactly its \
+         framed size must refuse the call"
     );
     Ok(())
 }
@@ -905,6 +1082,165 @@ fn committed_effect_factories_retain_borrowed_structured_evidence() -> Result<()
     Ok(())
 }
 
+/// Builds a duplicate-acknowledgement terminal for `call` naming
+/// `deduplicated_key` as the key the provider matched.
+fn duplicate_terminal_naming(
+    call: &ProviderCall,
+    deduplicated_key: &str,
+) -> Result<TerminalRecord, ApiError> {
+    let effect = CommittedEffectEvidence::duplicate(
+        call.expected_state_generation,
+        deduplicated_key,
+        "operation-request-original",
+        DIGEST,
+    )?;
+    TerminalRecord::new(
+        call.operation,
+        call.provider_id.clone(),
+        TerminalCode::Success,
+        effect,
+        FallbackDirective::forbidden(),
+        call.operation_id.clone(),
+        call.exact_scope.exact_scope_sha256(),
+        None,
+    )
+}
+
+#[test]
+fn duplicate_acknowledgement_is_bound_to_the_calls_own_idempotency_key() -> Result<(), ApiError> {
+    let call = ProviderCall::new(observe_parts("request-duplicate")?)?;
+    let request_key = call
+        .idempotency_key
+        .clone()
+        .ok_or(ApiError::EmptyField("idempotency_key"))?;
+
+    let terminal = duplicate_terminal_naming(&call, &request_key)?;
+    let effect = terminal.committed_effect();
+    assert_eq!(terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(effect.state(), CommittedEffectState::Duplicate);
+    assert_eq!(effect.duplicate_of_idempotency_key(), Some(&*request_key));
+    assert_eq!(
+        effect.duplicate_of_operation_id(),
+        Some("operation-request-original")
+    );
+    // Nothing new committed, so the generation must not move.
+    assert_eq!(effect.state_generation_before(), Some(0));
+    assert_eq!(effect.state_generation_after(), Some(0));
+    assert_eq!(effect.provider_receipt_sha256(), Some(DIGEST));
+    assert!(effect.committed_item_refs().is_empty());
+    assert_eq!(effect.verification_sha256(), None);
+    assert_eq!(terminal.validate_duplicate_binding_for_call(&call), Ok(()));
+
+    // A duplicate that names some other mutation proves nothing about this
+    // delivery, so the dispatch boundary refuses it.
+    let misbound = duplicate_terminal_naming(&call, "idempotency-key-of-another-mutation")?;
+    assert_eq!(
+        misbound.validate_duplicate_binding_for_call(&call),
+        Err(ApiError::DuplicateEffectKeyMismatch)
+    );
+    Ok(())
+}
+
+#[test]
+fn duplicate_acknowledgement_is_refused_without_a_request_key_or_on_a_read() -> Result<(), ApiError>
+{
+    let call = ProviderCall::new(observe_parts("request-keyless")?)?;
+    let request_key = call
+        .idempotency_key
+        .clone()
+        .ok_or(ApiError::EmptyField("idempotency_key"))?;
+    let terminal = duplicate_terminal_naming(&call, &request_key)?;
+
+    let mut keyless = call;
+    // Public boundary fields are revalidated after mutation. A duplicate must
+    // still be impossible to settle once the validated call loses its key.
+    keyless.idempotency_key = None;
+    assert_eq!(
+        terminal.validate_duplicate_binding_for_call(&keyless),
+        Err(ApiError::DuplicateEffectWithoutRequestKey)
+    );
+
+    // A read operation cannot carry a committed effect at all, so a duplicate
+    // terminal for one cannot be constructed in the first place.
+    let recall = ProviderCall::new(ProviderCallParts {
+        operation: ProviderOperation::Recall,
+        provider_id: provider_id()?,
+        registration_revision: 1,
+        ready_receipt_sha256: DIGEST.to_owned(),
+        exact_scope: scope()?,
+        request_id: "request-recall-duplicate".to_owned(),
+        operation_id: "operation-recall-duplicate".to_owned(),
+        expected_state_generation: 0,
+        idempotency_key: None,
+        control: OperationControl::new(i64::MAX, 10, CancellationToken::new()),
+        payload: payload()?,
+        required_capabilities: vec![capability("recall.query.v1")?],
+        extensions: Vec::new(),
+    })?;
+    assert_eq!(
+        duplicate_terminal_naming(&recall, "any-key"),
+        Err(ApiError::ReadOnlyOperationEffect {
+            operation: ProviderOperation::Recall,
+            effect_state: CommittedEffectState::Duplicate,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn duplicate_evidence_rejects_moved_generations_and_unbound_or_misplaced_identity() {
+    // A duplicate that advances the generation is applying, not deduplicating.
+    let moved = CommittedEffectEvidence::from_parts(CommittedEffectEvidenceParts {
+        state: CommittedEffectState::Duplicate,
+        committed_boundary: None,
+        state_generation_before: Some(1),
+        state_generation_after: Some(2),
+        committed_item_refs: Vec::new(),
+        uncommitted_item_refs: Vec::new(),
+        provider_receipt_sha256: Some(DIGEST.to_owned()),
+        reconciliation_action: None,
+        verification_sha256: None,
+        duplicate_of_idempotency_key: Some(DIGEST.to_owned()),
+        duplicate_of_operation_id: Some("operation-original".to_owned()),
+    });
+    assert_eq!(moved, Err(ApiError::InvalidEffectGenerations));
+
+    let unnamed = CommittedEffectEvidence::from_parts(CommittedEffectEvidenceParts {
+        state: CommittedEffectState::Duplicate,
+        committed_boundary: None,
+        state_generation_before: Some(1),
+        state_generation_after: Some(1),
+        committed_item_refs: Vec::new(),
+        uncommitted_item_refs: Vec::new(),
+        provider_receipt_sha256: Some(DIGEST.to_owned()),
+        reconciliation_action: None,
+        verification_sha256: None,
+        duplicate_of_idempotency_key: None,
+        duplicate_of_operation_id: None,
+    });
+    assert!(matches!(unnamed, Err(ApiError::InvalidCommittedEffect(_))));
+
+    // Duplicate identity on any other state would let a provider decorate an
+    // ordinary commit with a deduplication claim.
+    let misplaced = CommittedEffectEvidence::from_parts(CommittedEffectEvidenceParts {
+        state: CommittedEffectState::Committed,
+        committed_boundary: None,
+        state_generation_before: Some(1),
+        state_generation_after: Some(2),
+        committed_item_refs: vec!["done".to_owned()],
+        uncommitted_item_refs: Vec::new(),
+        provider_receipt_sha256: Some(DIGEST.to_owned()),
+        reconciliation_action: None,
+        verification_sha256: Some(DIGEST.to_owned()),
+        duplicate_of_idempotency_key: Some(DIGEST.to_owned()),
+        duplicate_of_operation_id: Some("operation-original".to_owned()),
+    });
+    assert!(matches!(
+        misplaced,
+        Err(ApiError::InvalidCommittedEffect(_))
+    ));
+}
+
 #[test]
 fn committed_effect_rejects_generation_and_state_field_contradictions() {
     let none_with_one_generation =
@@ -918,6 +1254,8 @@ fn committed_effect_rejects_generation_and_state_field_contradictions() {
             provider_receipt_sha256: None,
             reconciliation_action: None,
             verification_sha256: None,
+            duplicate_of_idempotency_key: None,
+            duplicate_of_operation_id: None,
         });
     assert_eq!(
         none_with_one_generation,
@@ -934,6 +1272,8 @@ fn committed_effect_rejects_generation_and_state_field_contradictions() {
         provider_receipt_sha256: Some(DIGEST.to_owned()),
         reconciliation_action: None,
         verification_sha256: None,
+        duplicate_of_idempotency_key: None,
+        duplicate_of_operation_id: None,
     });
     assert!(matches!(
         none_with_receipt,
@@ -956,6 +1296,8 @@ fn committed_effect_rejects_generation_and_state_field_contradictions() {
             provider_receipt_sha256: Some(DIGEST.to_owned()),
             reconciliation_action: None,
             verification_sha256: Some(DIGEST.to_owned()),
+            duplicate_of_idempotency_key: None,
+            duplicate_of_operation_id: None,
         });
     assert!(matches!(
         committed_with_uncommitted,
@@ -973,6 +1315,8 @@ fn committed_effect_rejects_generation_and_state_field_contradictions() {
             provider_receipt_sha256: Some(DIGEST.to_owned()),
             reconciliation_action: Some("reconcile".to_owned()),
             verification_sha256: None,
+            duplicate_of_idempotency_key: None,
+            duplicate_of_operation_id: None,
         });
     assert!(matches!(
         unknown_with_generation,
@@ -1120,6 +1464,7 @@ fn every_terminal_code_enforces_generated_effect_and_fallback_matrix() -> Result
         for state in [
             CommittedEffectState::None,
             CommittedEffectState::Committed,
+            CommittedEffectState::Duplicate,
             CommittedEffectState::Partial,
             CommittedEffectState::Unknown,
         ] {
@@ -1135,7 +1480,7 @@ fn every_terminal_code_enforces_generated_effect_and_fallback_matrix() -> Result
             );
             assert_eq!(
                 result.is_ok(),
-                effect_is_allowed(policy.effect_expectation, state),
+                effect_is_allowed(policy.terminal_code, policy.effect_expectation, state),
                 "effect matrix drift for {} and {}",
                 policy.terminal_code.as_wire(),
                 state.as_wire()
@@ -1161,7 +1506,11 @@ fn every_terminal_code_enforces_generated_effect_and_fallback_matrix() -> Result
         );
         let expected = policy.maximum_fallback_eligibility
             == FallbackEligibility::ExplicitPolicyOnly
-            && effect_is_allowed(policy.effect_expectation, CommittedEffectState::None);
+            && effect_is_allowed(
+                policy.terminal_code,
+                policy.effect_expectation,
+                CommittedEffectState::None,
+            );
         assert_eq!(
             explicit_result.is_ok(),
             expected,
@@ -1586,4 +1935,373 @@ fn capability_set_is_deterministic() -> Result<(), ApiError> {
         ])
     );
     Ok(())
+}
+
+// -- observation sanitization receipts ------------------------------------------
+
+const SANITIZER_REVISION: &str = "tracedecay.memory.observation.hygiene.v1+test";
+const FINDINGS_DIGEST: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+fn accepted_receipt() -> Result<PayloadSanitizationReceipt, ApiError> {
+    PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts::accepted_unmodified(
+        SANITIZER_REVISION,
+        EMPTY_OBJECT_DIGEST,
+    ))
+}
+
+fn redacted_receipt() -> Result<PayloadSanitizationReceipt, ApiError> {
+    PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts {
+        sanitizer_revision: SANITIZER_REVISION.to_owned(),
+        source_payload_sha256: DIGEST.to_owned(),
+        sanitized_payload_sha256: EMPTY_OBJECT_DIGEST.to_owned(),
+        extensions_digest: empty_opaque_extensions_digest(),
+        disposition: SanitizationDisposition::Redacted,
+        finding_count: 2,
+        findings_digest: FINDINGS_DIGEST.to_owned(),
+    })
+}
+
+fn observe_parts(request_id: &str) -> Result<ProviderCallParts, ApiError> {
+    Ok(ProviderCallParts {
+        operation: ProviderOperation::Observe,
+        provider_id: provider_id()?,
+        registration_revision: 1,
+        ready_receipt_sha256: DIGEST.to_owned(),
+        exact_scope: scope()?,
+        request_id: request_id.to_owned(),
+        operation_id: format!("operation-{request_id}"),
+        expected_state_generation: 0,
+        idempotency_key: Some(format!("idempotency-{request_id}")),
+        control: OperationControl::new(i64::MAX, 10, CancellationToken::new()),
+        payload: payload()?,
+        required_capabilities: vec![capability("observation.accept.v1")?],
+        extensions: Vec::new(),
+    })
+}
+
+#[test]
+fn accepted_receipt_binds_identical_digests_and_redacted_receipt_binds_delivered_bytes()
+-> Result<(), ApiError> {
+    let accepted = accepted_receipt()?;
+    assert_eq!(accepted.disposition(), SanitizationDisposition::Accepted);
+    assert_eq!(accepted.source_payload_sha256(), EMPTY_OBJECT_DIGEST);
+    assert_eq!(accepted.sanitized_payload_sha256(), EMPTY_OBJECT_DIGEST);
+    assert_eq!(accepted.finding_count(), 0);
+    assert!(
+        accepted
+            .receipt_id()
+            .starts_with(OBSERVATION_HYGIENE_RECEIPT_ID_PREFIX)
+    );
+    accepted.validate()?;
+
+    let redacted = redacted_receipt()?;
+    assert_eq!(redacted.disposition(), SanitizationDisposition::Redacted);
+    assert_ne!(
+        redacted.sanitized_payload_sha256(),
+        redacted.source_payload_sha256()
+    );
+    redacted.validate()?;
+    assert_ne!(accepted.receipt_id(), redacted.receipt_id());
+    Ok(())
+}
+
+#[test]
+fn accepted_disposition_forbids_modified_bytes_and_redacted_forbids_unmodified() {
+    let modified = PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts {
+        sanitizer_revision: SANITIZER_REVISION.to_owned(),
+        source_payload_sha256: DIGEST.to_owned(),
+        sanitized_payload_sha256: ALT_DIGEST.to_owned(),
+        extensions_digest: empty_opaque_extensions_digest(),
+        disposition: SanitizationDisposition::Accepted,
+        finding_count: 0,
+        findings_digest: FINDINGS_DIGEST.to_owned(),
+    });
+    assert_eq!(modified, Err(ApiError::SanitizationAcceptedPayloadModified));
+
+    let unmodified = PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts {
+        sanitizer_revision: SANITIZER_REVISION.to_owned(),
+        source_payload_sha256: DIGEST.to_owned(),
+        sanitized_payload_sha256: DIGEST.to_owned(),
+        extensions_digest: empty_opaque_extensions_digest(),
+        disposition: SanitizationDisposition::Redacted,
+        finding_count: 1,
+        findings_digest: FINDINGS_DIGEST.to_owned(),
+    });
+    assert_eq!(
+        unmodified,
+        Err(ApiError::SanitizationRedactedPayloadUnmodified)
+    );
+}
+
+#[test]
+fn receipt_rejects_malformed_digests_and_revisions() {
+    let bad_revision = PayloadSanitizationReceipt::new(
+        PayloadSanitizationReceiptParts::accepted_unmodified("", EMPTY_OBJECT_DIGEST),
+    );
+    assert_eq!(bad_revision, Err(ApiError::InvalidSanitizerRevision));
+
+    let quoted_revision = PayloadSanitizationReceipt::new(
+        PayloadSanitizationReceiptParts::accepted_unmodified("rev\"1", EMPTY_OBJECT_DIGEST),
+    );
+    assert_eq!(quoted_revision, Err(ApiError::InvalidSanitizerRevision));
+
+    let bad_digest = PayloadSanitizationReceipt::new(
+        PayloadSanitizationReceiptParts::accepted_unmodified(SANITIZER_REVISION, "not-a-digest"),
+    );
+    assert_eq!(
+        bad_digest,
+        Err(ApiError::InvalidSha256("source_payload_sha256"))
+    );
+}
+
+#[test]
+fn receipt_identifier_is_derived_from_every_field() -> Result<(), ApiError> {
+    let base = redacted_receipt()?;
+    let mut perturbed = Vec::new();
+
+    perturbed.push(PayloadSanitizationReceipt::new(
+        PayloadSanitizationReceiptParts {
+            sanitizer_revision: format!("{SANITIZER_REVISION}.other"),
+            source_payload_sha256: DIGEST.to_owned(),
+            sanitized_payload_sha256: EMPTY_OBJECT_DIGEST.to_owned(),
+            extensions_digest: empty_opaque_extensions_digest(),
+            disposition: SanitizationDisposition::Redacted,
+            finding_count: 2,
+            findings_digest: FINDINGS_DIGEST.to_owned(),
+        },
+    )?);
+    perturbed.push(PayloadSanitizationReceipt::new(
+        PayloadSanitizationReceiptParts {
+            sanitizer_revision: SANITIZER_REVISION.to_owned(),
+            source_payload_sha256: ALT_DIGEST.to_owned(),
+            sanitized_payload_sha256: EMPTY_OBJECT_DIGEST.to_owned(),
+            extensions_digest: empty_opaque_extensions_digest(),
+            disposition: SanitizationDisposition::Redacted,
+            finding_count: 2,
+            findings_digest: FINDINGS_DIGEST.to_owned(),
+        },
+    )?);
+    perturbed.push(PayloadSanitizationReceipt::new(
+        PayloadSanitizationReceiptParts {
+            sanitizer_revision: SANITIZER_REVISION.to_owned(),
+            source_payload_sha256: DIGEST.to_owned(),
+            sanitized_payload_sha256: ALT_DIGEST.to_owned(),
+            extensions_digest: empty_opaque_extensions_digest(),
+            disposition: SanitizationDisposition::Redacted,
+            finding_count: 2,
+            findings_digest: FINDINGS_DIGEST.to_owned(),
+        },
+    )?);
+    perturbed.push(PayloadSanitizationReceipt::new(
+        PayloadSanitizationReceiptParts {
+            sanitizer_revision: SANITIZER_REVISION.to_owned(),
+            source_payload_sha256: DIGEST.to_owned(),
+            sanitized_payload_sha256: EMPTY_OBJECT_DIGEST.to_owned(),
+            extensions_digest: ALT_DIGEST.to_owned(),
+            disposition: SanitizationDisposition::Redacted,
+            finding_count: 2,
+            findings_digest: FINDINGS_DIGEST.to_owned(),
+        },
+    )?);
+    perturbed.push(PayloadSanitizationReceipt::new(
+        PayloadSanitizationReceiptParts {
+            sanitizer_revision: SANITIZER_REVISION.to_owned(),
+            source_payload_sha256: DIGEST.to_owned(),
+            sanitized_payload_sha256: EMPTY_OBJECT_DIGEST.to_owned(),
+            extensions_digest: empty_opaque_extensions_digest(),
+            disposition: SanitizationDisposition::Redacted,
+            finding_count: 3,
+            findings_digest: FINDINGS_DIGEST.to_owned(),
+        },
+    )?);
+    perturbed.push(PayloadSanitizationReceipt::new(
+        PayloadSanitizationReceiptParts {
+            sanitizer_revision: SANITIZER_REVISION.to_owned(),
+            source_payload_sha256: DIGEST.to_owned(),
+            sanitized_payload_sha256: EMPTY_OBJECT_DIGEST.to_owned(),
+            extensions_digest: empty_opaque_extensions_digest(),
+            disposition: SanitizationDisposition::Redacted,
+            finding_count: 2,
+            findings_digest: ALT_DIGEST.to_owned(),
+        },
+    )?);
+    // The accepted variant perturbs the disposition, which forces the digests
+    // to agree, so it is built separately.
+    perturbed.push(accepted_receipt()?);
+
+    for candidate in &perturbed {
+        assert_ne!(candidate.receipt_id(), base.receipt_id());
+        candidate.validate()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn receipt_json_round_trips_and_rejects_tampering() -> Result<(), ApiError> {
+    let receipt = redacted_receipt()?;
+    let encoded = receipt.to_json();
+    assert_eq!(PayloadSanitizationReceipt::from_json(&encoded)?, receipt);
+    // Whitespace is insignificant; a journal may reformat what it stores.
+    let spaced = encoded.replace(',', " , ");
+    assert_eq!(PayloadSanitizationReceipt::from_json(&spaced)?, receipt);
+
+    let repointed = encoded.replace(EMPTY_OBJECT_DIGEST, ALT_DIGEST);
+    assert_eq!(
+        PayloadSanitizationReceipt::from_json(&repointed),
+        Err(ApiError::SanitizationReceiptTampered)
+    );
+
+    let unknown_field = encoded.replace("{\"receipt_id\"", "{\"surprise\":\"x\",\"receipt_id\"");
+    assert_eq!(
+        PayloadSanitizationReceipt::from_json(&unknown_field),
+        Err(ApiError::MalformedSanitizationReceiptJson("unknown_field"))
+    );
+
+    let duplicate = encoded.replace("{\"receipt_id\"", "{\"receipt_id\":\"x\",\"receipt_id\"");
+    assert_eq!(
+        PayloadSanitizationReceipt::from_json(&duplicate),
+        Err(ApiError::MalformedSanitizationReceiptJson(
+            "duplicate_field"
+        ))
+    );
+
+    let missing = encoded.replace(&format!(",\"findings_digest\":\"{FINDINGS_DIGEST}\""), "");
+    assert_eq!(
+        PayloadSanitizationReceipt::from_json(&missing),
+        Err(ApiError::MalformedSanitizationReceiptJson("missing_field"))
+    );
+
+    let trailing = format!("{encoded} ");
+    assert_eq!(PayloadSanitizationReceipt::from_json(&trailing)?, receipt);
+    let junk = format!("{encoded}}}");
+    assert_eq!(
+        PayloadSanitizationReceipt::from_json(&junk),
+        Err(ApiError::MalformedSanitizationReceiptJson(
+            "trailing_content"
+        ))
+    );
+
+    let escaped = encoded.replace(SANITIZER_REVISION, "rev\\u0041");
+    assert_eq!(
+        PayloadSanitizationReceipt::from_json(&escaped),
+        Err(ApiError::MalformedSanitizationReceiptJson("string"))
+    );
+
+    assert_eq!(
+        PayloadSanitizationReceipt::from_json("{}"),
+        Err(ApiError::MalformedSanitizationReceiptJson("missing_field"))
+    );
+    assert_eq!(
+        PayloadSanitizationReceipt::from_json("[]"),
+        Err(ApiError::MalformedSanitizationReceiptJson("object"))
+    );
+    Ok(())
+}
+
+#[test]
+fn observe_calls_fail_closed_without_a_bound_receipt() -> Result<(), ApiError> {
+    let unsanitized = ProviderCall::new(observe_parts("request-unsanitized")?)?;
+    assert!(unsanitized.sanitization().is_none());
+    assert_eq!(
+        unsanitized.validate(),
+        Err(ApiError::UnsanitizedObservation)
+    );
+    assert_eq!(
+        unsanitized.validate_request_bytes(u64::MAX),
+        Err(ApiError::UnsanitizedObservation)
+    );
+
+    let mismatched = ProviderCall::new(observe_parts("request-mismatched")?)?.with_sanitization(
+        PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts::accepted_unmodified(
+            SANITIZER_REVISION,
+            DIGEST,
+        ))?,
+    );
+    assert_eq!(
+        mismatched.validate(),
+        Err(ApiError::SanitizationReceiptUnbound)
+    );
+
+    let admitted = ProviderCall::new(observe_parts("request-admitted")?)?
+        .with_sanitization(accepted_receipt()?);
+    admitted.validate()?;
+
+    let mut extension_parts = observe_parts("request-extension")?;
+    extension_parts.extensions.push(extension()?);
+    let extension_digest = opaque_extensions_digest(&extension_parts.extensions)?;
+    let extension_call = ProviderCall::new(extension_parts)?;
+    assert_eq!(
+        extension_call
+            .clone()
+            .with_sanitization(accepted_receipt()?)
+            .validate(),
+        Err(ApiError::SanitizationReceiptUnbound),
+        "a receipt for an empty extension set must not clear extension bytes",
+    );
+    extension_call
+        .with_sanitization(PayloadSanitizationReceipt::new(
+            PayloadSanitizationReceiptParts::accepted_unmodified_with_extensions(
+                SANITIZER_REVISION,
+                EMPTY_OBJECT_DIGEST,
+                extension_digest,
+            ),
+        )?)
+        .validate()?;
+    assert_eq!(
+        admitted
+            .sanitization()
+            .map(PayloadSanitizationReceipt::receipt_id),
+        Some(accepted_receipt()?.receipt_id())
+    );
+    Ok(())
+}
+
+#[test]
+fn non_observe_operations_validate_without_a_receipt() -> Result<(), ApiError> {
+    let recall = ProviderCall::new(ProviderCallParts {
+        operation: ProviderOperation::Recall,
+        provider_id: provider_id()?,
+        registration_revision: 1,
+        ready_receipt_sha256: DIGEST.to_owned(),
+        exact_scope: scope()?,
+        request_id: "request-recall-unsanitized".to_owned(),
+        operation_id: "operation-recall-unsanitized".to_owned(),
+        expected_state_generation: 0,
+        idempotency_key: None,
+        control: OperationControl::new(i64::MAX, 10, CancellationToken::new()),
+        payload: payload()?,
+        required_capabilities: vec![capability("recall.query.v1")?],
+        extensions: Vec::new(),
+    })?;
+    recall.validate()?;
+    assert!(recall.sanitization().is_none());
+    Ok(())
+}
+
+#[test]
+fn withheld_reasons_and_dispositions_have_stable_wire_spellings() {
+    assert_eq!(SanitizationDisposition::Accepted.as_str(), "accepted");
+    assert_eq!(SanitizationDisposition::Redacted.as_str(), "redacted");
+    assert_eq!(
+        SanitizationDisposition::from_wire("redacted"),
+        Some(SanitizationDisposition::Redacted)
+    );
+    assert_eq!(SanitizationDisposition::from_wire("rejected"), None);
+
+    assert_eq!(WithheldReason::SecretRejected.as_str(), "secret_rejected");
+    assert_eq!(WithheldReason::Quarantined.as_str(), "quarantined");
+    assert_eq!(
+        WithheldReason::UnclassifiablePayload.as_str(),
+        "unclassifiable_payload"
+    );
+    assert_eq!(
+        WithheldReason::from_wire("quarantined"),
+        Some(WithheldReason::Quarantined)
+    );
+    assert_eq!(
+        WithheldReason::from_wire("unclassifiable_payload"),
+        Some(WithheldReason::UnclassifiablePayload)
+    );
+    assert_eq!(WithheldReason::from_wire("accepted"), None);
+    assert_eq!(WithheldReason::from_wire("payload_too_large"), None);
 }

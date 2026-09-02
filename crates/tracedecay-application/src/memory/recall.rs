@@ -290,17 +290,93 @@ pub enum CognitiveRecallDegradation {
     BudgetExhausted,
 }
 
+/// Identity of the configured provider a recall result is attributed to.
+///
+/// The host pins `provider_id` and `registration_revision` in routing
+/// configuration before any provider is contacted, so every result — including
+/// one degraded before contact — names the provider the host selected rather
+/// than whichever provider happened to answer.  `provider_instance_id` is the
+/// runtime instance the readiness handshake reported and is absent only when
+/// no handshake preceded the outcome.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CognitiveRecallProviderIdentity {
+    provider_id: String,
+    registration_revision: u64,
+    provider_instance_id: Option<String>,
+}
+
+impl CognitiveRecallProviderIdentity {
+    /// Construct the identity of the host-configured provider before any
+    /// provider contact.
+    pub fn configured(
+        provider_id: impl Into<String>,
+        registration_revision: u64,
+    ) -> Result<Self, ApplicationContractError> {
+        let identity = Self {
+            provider_id: provider_id.into(),
+            registration_revision,
+            provider_instance_id: None,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    /// Attach the runtime instance identity a readiness handshake reported.
+    pub fn with_instance(
+        mut self,
+        provider_instance_id: impl Into<String>,
+    ) -> Result<Self, ApplicationContractError> {
+        self.provider_instance_id = Some(provider_instance_id.into());
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Validate that the identity is non-empty, bounded, and pinned to a
+    /// positive registration revision.
+    pub fn validate(&self) -> Result<(), ApplicationContractError> {
+        validate_reference(&self.provider_id, "cognitive recall provider id")?;
+        if self.registration_revision == 0 {
+            return Err(ApplicationContractError::ZeroValue {
+                field: "cognitive recall provider registration revision",
+            });
+        }
+        if let Some(instance) = &self.provider_instance_id {
+            validate_reference(instance, "cognitive recall provider instance id")?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    #[must_use]
+    pub fn registration_revision(&self) -> u64 {
+        self.registration_revision
+    }
+
+    #[must_use]
+    pub fn provider_instance_id(&self) -> Option<&str> {
+        self.provider_instance_id.as_deref()
+    }
+}
+
 /// One scope- and request-bound advisory recall result.
 ///
 /// `degradation == None` means the adapter completed its admitted search; an
 /// empty candidate vector is therefore an explicit successful zero-result,
 /// never an unavailable/fallback signal.  A non-empty degradation remains
-/// typed even when an adapter can return useful partial candidates.
+/// typed even when an adapter can return useful partial candidates.  Every
+/// result, complete or degraded, names the configured provider it is
+/// attributed to.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CognitiveRecallResult {
     scope: ResolvedScope,
     request_id: RequestId,
+    provider: CognitiveRecallProviderIdentity,
     candidates: Vec<CognitiveRecallCandidate>,
     degradation: Option<CognitiveRecallDegradation>,
 }
@@ -314,31 +390,35 @@ impl CognitiveRecallResult {
     pub fn complete(
         scope: ResolvedScope,
         request_id: RequestId,
+        provider: CognitiveRecallProviderIdentity,
         candidates: Vec<CognitiveRecallCandidate>,
     ) -> Result<Self, ApplicationContractError> {
-        Self::new(scope, request_id, candidates, None)
+        Self::new(scope, request_id, provider, candidates, None)
     }
 
     /// Construct a result with an explicit typed lane degradation.
     pub fn degraded(
         scope: ResolvedScope,
         request_id: RequestId,
+        provider: CognitiveRecallProviderIdentity,
         candidates: Vec<CognitiveRecallCandidate>,
         degradation: CognitiveRecallDegradation,
     ) -> Result<Self, ApplicationContractError> {
-        Self::new(scope, request_id, candidates, Some(degradation))
+        Self::new(scope, request_id, provider, candidates, Some(degradation))
     }
 
     /// Construct and validate a result without consulting wall-clock state.
     pub fn new(
         scope: ResolvedScope,
         request_id: RequestId,
+        provider: CognitiveRecallProviderIdentity,
         candidates: Vec<CognitiveRecallCandidate>,
         degradation: Option<CognitiveRecallDegradation>,
     ) -> Result<Self, ApplicationContractError> {
         let result = Self {
             scope,
             request_id,
+            provider,
             candidates,
             degradation,
         };
@@ -346,10 +426,12 @@ impl CognitiveRecallResult {
         Ok(result)
     }
 
-    /// Validate scope identity, candidate bounds, and request-scoped candidate
-    /// uniqueness.  Request-specific limits are checked by [`Self::validate_for`].
+    /// Validate scope identity, provider identity, candidate bounds, and
+    /// request-scoped candidate uniqueness.  Request-specific limits are
+    /// checked by [`Self::validate_for`].
     pub fn validate(&self) -> Result<(), ApplicationContractError> {
         self.scope.validate()?;
+        self.provider.validate()?;
         if self.candidates.len() > MAX_COGNITIVE_RECALL_CANDIDATES {
             return Err(ApplicationContractError::InvalidRange {
                 field: "cognitive recall candidates",
@@ -398,6 +480,12 @@ impl CognitiveRecallResult {
     #[must_use]
     pub fn request_id(&self) -> &RequestId {
         &self.request_id
+    }
+
+    /// The configured provider this result is attributed to.
+    #[must_use]
+    pub fn provider(&self) -> &CognitiveRecallProviderIdentity {
+        &self.provider
     }
 
     #[must_use]

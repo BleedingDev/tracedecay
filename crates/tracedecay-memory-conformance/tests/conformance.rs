@@ -31,6 +31,8 @@ const EFFECT_RECEIPT: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddd
 const OBSERVATION_PAYLOAD_SHA256: &str =
     "e2cb333c1f9ac5b0285bd10fd6844c1a578b9b4701c77a438cb332a50c0142c1";
 const REGISTRATION_REVISION: u64 = 41;
+const RESOLVED_SCOPE_DIGEST: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
 struct DummyMemoryProviderAdapter {
     inner: Mutex<canonical_dummy::DummyProvider>,
@@ -168,17 +170,37 @@ impl DummyMemoryProviderAdapter {
                 CommittedEffectEvidence::none(Some(terminal.state_generation))
             }
             CommittedEffectState::Committed => {
-                let committed_item_refs = call
-                    .idempotency_key
-                    .clone()
-                    .into_iter()
-                    .collect::<Vec<_>>();
+                let committed_item_refs =
+                    call.idempotency_key.clone().into_iter().collect::<Vec<_>>();
                 match CommittedEffectEvidence::committed(
                     call.expected_state_generation,
                     terminal.state_generation,
                     committed_item_refs,
                     EFFECT_RECEIPT,
                     &call.payload.sha256,
+                ) {
+                    Ok(effect) => effect,
+                    Err(_) => {
+                        return self.preflight_reply(call, TerminalCode::ContractViolation);
+                    }
+                }
+            }
+            // The dummy provider names the mutation it deduplicated; the
+            // adapter copies that binding through rather than re-deriving it,
+            // so a provider that names the wrong key is caught downstream
+            // instead of being quietly repaired here.
+            CommittedEffectState::Duplicate => {
+                let (Some(key), Some(committing_operation)) = (
+                    terminal.duplicate_of_idempotency_key.clone(),
+                    terminal.duplicate_of_operation_id.clone(),
+                ) else {
+                    return self.preflight_reply(call, TerminalCode::ContractViolation);
+                };
+                match CommittedEffectEvidence::duplicate(
+                    terminal.state_generation,
+                    key,
+                    committing_operation,
+                    EFFECT_RECEIPT,
                 ) {
                     Ok(effect) => effect,
                     Err(_) => {
@@ -474,11 +496,19 @@ impl MemoryProvider for EffectEvidenceVariantProvider {
                     "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                     "0000000000000000000000000000000000000000000000000000000000000000",
                 ),
-                _ => return self.inner.preflight_reply(call, TerminalCode::ContractViolation),
+                _ => {
+                    return self
+                        .inner
+                        .preflight_reply(call, TerminalCode::ContractViolation);
+                }
             };
             let variant_effect = match variant_effect {
                 Ok(effect) => effect,
-                Err(_) => return self.inner.preflight_reply(call, TerminalCode::ContractViolation),
+                Err(_) => {
+                    return self
+                        .inner
+                        .preflight_reply(call, TerminalCode::ContractViolation);
+                }
             };
             reply.terminal = validated_terminal(TerminalRecord::new(
                 reply.terminal.operation(),
@@ -491,6 +521,72 @@ impl MemoryProvider for EffectEvidenceVariantProvider {
                 reply.terminal.diagnostic_id().map(str::to_owned),
             ));
         }
+        reply
+    }
+}
+
+/// A provider that acknowledges a duplicate it never deduplicated: the claim is
+/// well-formed evidence, but it names a key the caller never sent. Nothing in
+/// the envelope's own shape can catch that — only the binding to the call can.
+struct DuplicateMisbindingProvider {
+    inner: DummyMemoryProviderAdapter,
+}
+
+impl DuplicateMisbindingProvider {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            inner: DummyMemoryProviderAdapter::new()?,
+        })
+    }
+}
+
+impl MemoryProvider for DuplicateMisbindingProvider {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        self.inner.handshake(request)
+    }
+
+    fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+        let mut reply = self.inner.invoke(call);
+        if reply.terminal.committed_effect().state() != CommittedEffectState::Duplicate {
+            return reply;
+        }
+        let current = reply.terminal.committed_effect();
+        let Some(generation) = current.state_generation_after() else {
+            return self
+                .inner
+                .preflight_reply(call, TerminalCode::ContractViolation);
+        };
+        let committing_operation = current
+            .duplicate_of_operation_id()
+            .unwrap_or("unknown-operation")
+            .to_owned();
+        let misbound = match CommittedEffectEvidence::duplicate(
+            generation,
+            "someone-elses-observation-key",
+            committing_operation,
+            EFFECT_RECEIPT,
+        ) {
+            Ok(effect) => effect,
+            Err(_) => {
+                return self
+                    .inner
+                    .preflight_reply(call, TerminalCode::ContractViolation);
+            }
+        };
+        reply.terminal = validated_terminal(TerminalRecord::new(
+            reply.terminal.operation(),
+            reply.terminal.provider_id().clone(),
+            reply.terminal.terminal_code(),
+            misbound,
+            reply.terminal.fallback().clone(),
+            reply.terminal.operation_id(),
+            reply.terminal.exact_scope_sha256(),
+            reply.terminal.diagnostic_id().map(str::to_owned),
+        ));
         reply
     }
 }
@@ -725,9 +821,15 @@ fn mandatory_suite_passes_against_canonical_dummy_provider() -> Result<(), Box<d
             return Err(io::Error::other("mandatory.observe returned a handshake output").into());
         }
     };
-    assert_eq!(observe.terminal.committed_effect().state(), CommittedEffectState::Committed);
     assert_eq!(
-        observe.terminal.committed_effect().state_generation_before(),
+        observe.terminal.committed_effect().state(),
+        CommittedEffectState::Committed
+    );
+    assert_eq!(
+        observe
+            .terminal
+            .committed_effect()
+            .state_generation_before(),
         Some(0)
     );
     assert_eq!(
@@ -738,7 +840,10 @@ fn mandatory_suite_passes_against_canonical_dummy_provider() -> Result<(), Box<d
         observe.terminal.committed_effect().committed_item_refs(),
         ["mandatory-observation-key"]
     );
-    assert_eq!(observe.terminal.provider_receipt_sha256(), Some(EFFECT_RECEIPT));
+    assert_eq!(
+        observe.terminal.provider_receipt_sha256(),
+        Some(EFFECT_RECEIPT)
+    );
     assert_eq!(
         observe.terminal.committed_effect().verification_sha256(),
         Some(OBSERVATION_PAYLOAD_SHA256)
@@ -831,10 +936,7 @@ fn cancelled_and_expired_handshakes_do_not_contact_provider_code() -> Result<(),
         assert_eq!(report.summary().host_preflight_steps, 1);
         assert_eq!(provider.handshake_calls(), 0);
         let handshake_step = &report.steps()[0];
-        assert_eq!(
-            handshake_step.evaluation().step_id(),
-            "mandatory.handshake"
-        );
+        assert_eq!(handshake_step.evaluation().step_id(), "mandatory.handshake");
         assert!(!handshake_step.provider_contacted());
         assert!(matches!(
             handshake_step.output(),
@@ -913,9 +1015,7 @@ fn differential_retains_structured_effect_evidence_beyond_coarse_state()
         observer_terminal.committed_effect().state()
     );
     assert_eq!(
-        product_terminal
-            .committed_effect()
-            .state_generation_after(),
+        product_terminal.committed_effect().state_generation_after(),
         observer_terminal
             .committed_effect()
             .state_generation_after()
@@ -932,8 +1032,41 @@ fn differential_retains_structured_effect_evidence_beyond_coarse_state()
 }
 
 #[test]
-fn differential_retains_complete_fallback_policy_beyond_eligibility()
--> Result<(), Box<dyn Error>> {
+fn duplicate_acknowledgement_naming_another_mutation_fails_the_step() -> Result<(), Box<dyn Error>>
+{
+    let provider = DuplicateMisbindingProvider::new()?;
+    let harness = ProviderHarness::new(&provider)?;
+    let fixture = mandatory_conformance_fixture(
+        harness.fixture_identity(),
+        exact_scope()?,
+        REGISTRATION_REVISION,
+    )?;
+
+    let report = harness.run_product(&fixture)?;
+    assert!(!report.passed());
+    let step = match report
+        .steps()
+        .iter()
+        .find(|step| step.evaluation().step_id() == "mandatory.observe_duplicate")
+    {
+        Some(step) => step,
+        None => return Err(io::Error::other("duplicate step was not executed").into()),
+    };
+    let fields = step
+        .evaluation()
+        .violations()
+        .iter()
+        .map(|violation| violation.field)
+        .collect::<Vec<_>>();
+    // The claim is refused for naming the wrong mutation, not for being
+    // malformed: the state, the receipt, and the frozen generation are all fine.
+    assert!(fields.contains(&"terminal.committed_effect.duplicate_of_idempotency_key_binding"));
+    Ok(())
+}
+
+#[test]
+fn differential_retains_complete_fallback_policy_beyond_eligibility() -> Result<(), Box<dyn Error>>
+{
     let product_provider = FallbackPolicyVariantProvider::new("test.fallback-a")?;
     let observer_provider = FallbackPolicyVariantProvider::new("test.fallback-b")?;
     let product_harness = ProviderHarness::new(&product_provider)?;
@@ -1013,12 +1146,12 @@ fn terminal_payload_substitution_fails_without_leaking_bytes_to_observer_reports
     let base_observed_projection = base_observer
         .steps()
         .iter()
-            .map(|step| step.observed().clone())
+        .map(|step| step.observed().clone())
         .collect::<Vec<_>>();
     let variant_observed_projection = variant_observer
         .steps()
         .iter()
-            .map(|step| step.observed().clone())
+        .map(|step| step.observed().clone())
         .collect::<Vec<_>>();
     assert_eq!(base_observed_projection, variant_observed_projection);
     assert!(
@@ -1611,7 +1744,7 @@ fn exact_scope() -> Result<OwnedExactScope, ApiError> {
         "worktree-conformance",
         "refs/heads/conformance",
         "session-conformance",
-        1,
+        RESOLVED_SCOPE_DIGEST,
     )
 }
 
@@ -1623,7 +1756,7 @@ fn alternate_scope() -> Result<OwnedExactScope, ApiError> {
         "worktree-conformance-alternate",
         "refs/heads/conformance",
         "session-conformance",
-        1,
+        RESOLVED_SCOPE_DIGEST,
     )
 }
 

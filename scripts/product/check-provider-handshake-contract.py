@@ -88,9 +88,9 @@ SCOPE_FIELDS = [
     "worktree_identity",
     "branch_identity",
     "agent_session_id",
-    "scope_revision",
+    "resolved_scope_digest",
 ]
-SCOPE_STRING_FIELDS = SCOPE_FIELDS[:-1]
+SCOPE_STRING_FIELDS = SCOPE_FIELDS
 EXACT_SCOPE_DIGEST_DOMAIN = b"tracedecay.memory-provider.exact-scope.v1\0"
 EXACT_SCOPE_GOLDEN_VECTOR: dict[str, str | int] = {
     "profile_id": "profile-1",
@@ -99,8 +99,8 @@ EXACT_SCOPE_GOLDEN_VECTOR: dict[str, str | int] = {
     "worktree_identity": "worktree-1",
     "branch_identity": "refs/heads/main",
     "agent_session_id": "session-1",
-    "scope_revision": 7,
-    "digest": "aa2f1ac9c33a448fb824abf783a6d40ab52050d91bcc580d907e6b0a3303938e",
+    "resolved_scope_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "digest": "2f525c8c3d59bfa3d9729405c4f3f1307fade77494b6ddf251c89abc490f0a52",
 }
 LIMITS = {
     "request_bytes": (1, 16777216, "bytes"),
@@ -497,7 +497,7 @@ def validate_identities(contract: dict[str, Any], errors: list[str]) -> None:
     if scope.get("type_name") != "MemoryProviderExactScopeIdentityV1":
         errors.append("exact scope identity type drifted")
     if scope.get("required_fields") != SCOPE_FIELDS:
-        errors.append("exact scope required fields must include profile/project/repository/worktree/branch/session/revision")
+        errors.append("exact scope required fields must include profile/project/repository/worktree/branch/session/resolved-scope digest")
     for field in ("wildcards_allowed", "provider_path_inference_allowed", "cwd_inference_allowed"):
         if scope.get(field) is not False:
             errors.append(f"exact_scope_identity.{field} must be false")
@@ -515,7 +515,6 @@ def validate_identities(contract: dict[str, Any], errors: list[str]) -> None:
             "domain_suffix_byte_hex",
             "string_field_order",
             "string_field_encoding",
-            "scope_revision_encoding",
             "output_encoding",
             "golden_vector",
         },
@@ -534,8 +533,6 @@ def validate_identities(contract: dict[str, Any], errors: list[str]) -> None:
         "u64_big_endian_byte_length_then_utf8_bytes"
     ):
         errors.append("exact scope digest string boundary encoding drifted")
-    if digest.get("scope_revision_encoding") != "u64_big_endian":
-        errors.append("exact scope digest revision encoding drifted")
     if digest.get("output_encoding") != "lowercase_hex_64":
         errors.append("exact scope digest output must be lowercase SHA-256 hex")
 
@@ -564,16 +561,6 @@ def validate_identities(contract: dict[str, Any], errors: list[str]) -> None:
         encoded = value.encode("utf-8")
         canonical.extend(len(encoded).to_bytes(8, "big"))
         canonical.extend(encoded)
-    revision = golden.get("scope_revision")
-    if (
-        not isinstance(revision, int)
-        or isinstance(revision, bool)
-        or not 0 <= revision <= (2**64 - 1)
-    ):
-        errors.append("exact scope digest golden scope_revision must be a u64")
-        canonical_input_valid = False
-    else:
-        canonical.extend(revision.to_bytes(8, "big"))
     golden_digest = golden.get("digest")
     if not isinstance(golden_digest, str) or SHA256_RE.fullmatch(golden_digest) is None:
         errors.append("exact scope digest golden output must be lowercase SHA-256 hex")
@@ -708,7 +695,7 @@ def validate_algorithm_states_receipt(contract: dict[str, Any], errors: list[str
         "digest_algorithm",
         "portable_across_provider_restart",
         "portable_across_registration_revision",
-        "portable_across_scope_revision",
+        "portable_across_resolved_scope_digest",
         "required_before_provider_mutation",
         "required_before_provider_recall",
     }
@@ -722,7 +709,7 @@ def validate_algorithm_states_receipt(contract: dict[str, Any], errors: list[str
     for field in (
         "portable_across_provider_restart",
         "portable_across_registration_revision",
-        "portable_across_scope_revision",
+        "portable_across_resolved_scope_digest",
     ):
         if receipt.get(field) is not False:
             errors.append(f"ready_receipt.{field} must be false")

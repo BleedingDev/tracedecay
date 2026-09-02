@@ -15,6 +15,7 @@
     "adjudication_policy",
     "scope_catalog",
     "fixtures",
+    "recall_requests",
     "scenarios"
   ],
   "properties": {
@@ -38,6 +39,12 @@
       "minItems": 1,
       "uniqueItems": true,
       "items": {"$ref": "#/$defs/fixture"}
+    },
+    "recall_requests": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/recallRequest"}
     },
     "scenarios": {
       "type": "array",
@@ -172,12 +179,236 @@
       }
     },
     "step": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "observation_id"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "observe"},
+            "observation_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "observation_id", "operation_id"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "observe"},
+            "observation_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+            "operation_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "revision_id"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "advance_code"},
+            "revision_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "request_id"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "recall"},
+            "request_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "request_id", "scope_id"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "recall"},
+            "request_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+            "scope_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "rubric"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "adjudicate"},
+            "rubric": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "scope_id"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "open_new_agent_session"},
+            "scope_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "restart_id"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "restart_provider"},
+            "restart_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "observation_id", "operation_id"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "replay"},
+            "observation_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+            "operation_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "batch_id"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "begin_observation_batch"},
+            "batch_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "item_id"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "commit_item"},
+            "item_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "cancel_id", "at_item"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "cancel"},
+            "cancel_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+            "at_item": {"type": "integer", "minimum": 1}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "resume_cursor"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "resume"},
+            "resume_cursor": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "state_id", "digest_status"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "load_provider_state"},
+            "state_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+            "digest_status": {"enum": ["match", "mismatch"]}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "request_id"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "health"},
+            "request_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "forget_source_key"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "delete_by_source"},
+            "forget_source_key": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["step", "action", "request_id"],
+          "properties": {
+            "step": {"type": "integer", "minimum": 1},
+            "action": {"const": "verify_absence"},
+            "request_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"}
+          }
+        }
+      ]
+    },
+    "recallRequest": {
       "type": "object",
-      "required": ["step", "action"],
+      "additionalProperties": false,
+      "required": ["request_id", "scenario_id", "operation", "scope_id", "temporal_query", "policy_revision"],
       "properties": {
-        "step": {"type": "integer", "minimum": 1},
-        "action": {"type": "string", "minLength": 1}
-      }
+        "request_id": {"type": "string", "pattern": "^request_[a-z0-9_]+$"},
+        "scenario_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+        "operation": {"enum": ["recall", "verify_absence", "health"]},
+        "scope_id": {"type": "string", "pattern": "^[a-z][a-z0-9_]+$"},
+        "objective": {"enum": ["search", "probe", "related", "reason"]},
+        "query": {"type": "string", "minLength": 1, "maxLength": 32768, "pattern": "^\\S(?:.*\\S)?$"},
+        "temporal_query": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "evaluation_time"],
+          "properties": {
+            "mode": {"const": "current"},
+            "evaluation_time": {"type": "string", "format": "date-time"}
+          }
+        },
+        "budgets": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["maximum_candidates", "maximum_candidate_content_bytes", "maximum_total_content_bytes", "maximum_source_refs_per_candidate", "maximum_trace_refs_per_candidate", "maximum_warnings", "maximum_extensions_per_candidate"],
+          "properties": {
+            "maximum_candidates": {"type": "integer", "minimum": 1},
+            "maximum_candidate_content_bytes": {"type": "integer", "minimum": 1},
+            "maximum_total_content_bytes": {"type": "integer", "minimum": 1},
+            "maximum_source_refs_per_candidate": {"type": "integer", "minimum": 1},
+            "maximum_trace_refs_per_candidate": {"type": "integer", "minimum": 1},
+            "maximum_warnings": {"type": "integer", "minimum": 1},
+            "maximum_extensions_per_candidate": {"type": "integer", "minimum": 1}
+          }
+        },
+        "exclusions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["stable_memory_refs", "candidate_ids", "source_refs", "trace_refs", "observation_ids", "content_sha256"],
+          "properties": {
+            "stable_memory_refs": {"type": "array", "items": {"type": "string"}},
+            "candidate_ids": {"type": "array", "items": {"type": "string"}},
+            "source_refs": {"type": "array", "items": {"type": "string"}},
+            "trace_refs": {"type": "array", "items": {"type": "string"}},
+            "observation_ids": {"type": "array", "items": {"type": "string"}},
+            "content_sha256": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "policy_revision": {"type": "integer", "minimum": 1}
+      },
+      "if": {"properties": {"operation": {"enum": ["recall", "verify_absence"]}}},
+      "then": {"required": ["objective", "query", "budgets", "exclusions"]},
+      "else": {"not": {"anyOf": [{"required": ["objective"]}, {"required": ["query"]}, {"required": ["budgets"]}, {"required": ["exclusions"]}]}}
     },
     "observation": {
       "type": "object",

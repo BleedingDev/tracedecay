@@ -316,6 +316,24 @@ class ProviderObservationContractTest(unittest.TestCase):
             "same key/same payload must acknowledge duplicate",
         )
 
+    def test_duplicate_acknowledgement_needs_bound_wire_evidence(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        contract["idempotency"][
+            "duplicate_acknowledgement_evidence"
+        ] = "provider_reported_no_effect"
+        self.assert_rejected(
+            contract,
+            "duplicate acknowledgement must be proven by bound duplicate committed-effect evidence",
+        )
+
+    def test_duplicate_acknowledgement_may_not_be_inferred(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        contract["idempotency"]["duplicate_acknowledgement_may_be_inferred"] = True
+        self.assert_rejected(
+            contract,
+            "idempotency.duplicate_acknowledgement_may_be_inferred must be false",
+        )
+
     def test_same_key_different_payload_must_conflict(self) -> None:
         contract = copy.deepcopy(self.contract)
         contract["idempotency"][

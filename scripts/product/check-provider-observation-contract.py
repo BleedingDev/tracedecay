@@ -667,6 +667,8 @@ def validate_normalization_and_idempotency(
         "provider_must_persist_deduplication",
         "same_key_same_payload_outcome",
         "same_key_different_payload_outcome",
+        "duplicate_acknowledgement_evidence",
+        "duplicate_acknowledgement_may_be_inferred",
         "same_source_new_revision_requires_new_key",
         "random_retry_key_allowed",
         "timestamp_only_key_allowed",
@@ -705,7 +707,17 @@ def validate_normalization_and_idempotency(
         errors.append("same key/same payload must acknowledge duplicate")
     if idem.get("same_key_different_payload_outcome") != "idempotency_conflict":
         errors.append("same key/different payload must be idempotency conflict")
-    for field in ("random_retry_key_allowed", "timestamp_only_key_allowed"):
+    if idem.get("duplicate_acknowledgement_evidence") != (
+        "terminal_committed_effect_state_duplicate_bound_to_request_idempotency_key"
+    ):
+        errors.append(
+            "duplicate acknowledgement must be proven by bound duplicate committed-effect evidence"
+        )
+    for field in (
+        "random_retry_key_allowed",
+        "timestamp_only_key_allowed",
+        "duplicate_acknowledgement_may_be_inferred",
+    ):
         if idem.get(field) is not False:
             errors.append(f"idempotency.{field} must be false")
 
@@ -1083,7 +1095,7 @@ def validate_dependencies(repo: Path, errors: list[str]) -> None:
         "worktree_identity",
         "branch_identity",
         "agent_session_id",
-        "scope_revision",
+        "resolved_scope_digest",
     ):
         if required not in scope_fields:
             errors.append(

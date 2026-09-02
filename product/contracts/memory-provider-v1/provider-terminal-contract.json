@@ -324,16 +324,19 @@
       "uncommitted_item_refs",
       "provider_receipt_digest",
       "reconciliation_action",
-      "verification_digest"
+      "verification_digest",
+      "duplicate_of_idempotency_key",
+      "duplicate_of_operation_id"
     ],
     "states": [
       "none",
       "committed",
+      "duplicate",
       "partial",
       "unknown"
     ],
     "read_only_operation_requires_none": true,
-    "success_mutation_requires_committed_or_none_if_no_effect": true,
+    "success_mutation_requires_committed_duplicate_or_none_if_no_effect": true,
     "partial_effect_terminal_requires_partial": true,
     "effect_unknown_terminal_requires_unknown": true,
     "deadline_or_cancelled_may_report_none_partial_or_unknown": true,
@@ -341,7 +344,13 @@
     "partial_requires_committed_and_uncommitted_item_sets": true,
     "unknown_requires_reconciliation_action": true,
     "effect_receipt_required_when_state_not_none": true,
-    "same_mutation_retry_requires_same_idempotency_key": true
+    "same_mutation_retry_requires_same_idempotency_key": true,
+    "duplicate_means_prior_delivery_of_this_mutation_already_committed": true,
+    "duplicate_requires_matching_request_idempotency_key": true,
+    "duplicate_requires_original_operation_identity": true,
+    "duplicate_requires_unchanged_state_generation": true,
+    "duplicate_identity_forbidden_unless_duplicate": true,
+    "duplicate_may_be_inferred_from_absent_effect": false
   },
   "request_control_precedence": {
     "already_cancelled_before_dispatch": "cancelled_without_provider_call",
@@ -384,7 +393,7 @@
     "Validate coverage state against success, zero-results, partial, and failure semantics.",
     "Validate retry directive exactly matches the selected terminal-code policy and bounded retry budget.",
     "Validate fallback directive exactly matches terminal eligibility and the current no-automatic-fallback product policy.",
-    "Validate committed-effect state against operation mutability, terminal code, generations, item sets, and receipt.",
+    "Validate committed-effect state against operation mutability, terminal code, generations, item sets, receipt, and the duplicate-acknowledgement identity binding.",
     "Validate cancellation and timeout are distinct and their monotonic precedence is preserved.",
     "Reject the entire response as contract_violation if any semantic relation is inconsistent."
   ],
@@ -392,7 +401,8 @@
     "Every mandatory provider operation returns one MemoryProviderTerminalEnvelopeV1; missing or empty responses are contract violations.",
     "The terminal-code table is closed and domain detail cannot alter terminal, retry, fallback, or authority semantics.",
     "Cancellation and deadline_exceeded are distinct, preserve monotonic event precedence, and can never be converted into success.",
-    "Read-only operations report committed-effect state none; mutating operations report none, committed, partial, or unknown truthfully.",
+    "Read-only operations report committed-effect state none; mutating operations report none, committed, duplicate, partial, or unknown truthfully.",
+    "A duplicate committed effect states that a prior delivery of this exact mutation already committed; it names the request idempotency key it deduplicated and the original committing operation, leaves the state generation unchanged, and is never inferred from an absent effect, an empty payload, or a provider identity.",
     "Partial effects identify the exact committed boundary, before/after generations, committed and uncommitted item sets, receipt, and reconciliation action.",
     "Unknown effects require reconciliation before any retry or fallback and never reuse a new idempotency key for the same mutation.",
     "Retryability is an explicit bounded directive and is never inferred from a provider error class, empty payload, or missing response.",

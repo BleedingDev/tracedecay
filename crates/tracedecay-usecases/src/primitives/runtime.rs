@@ -1925,7 +1925,7 @@ fn problem<T>(
 /// The distinction that matters to a caller is "no diagnostics exist" versus
 /// "no authority answered". Both used to render as an empty success page, so
 /// the reason the authority reported is carried into the problem code here and
-/// the retry directive follows it: a stale or absent producer is worth
+/// the retry directive follows it: an unpublished or stale producer is worth
 /// retrying, an unsupported scope never is.
 fn diagnostics_unavailable_problem<T>(
     context: &RequestContext,
@@ -1936,8 +1936,11 @@ fn diagnostics_unavailable_problem<T>(
 }
 
 /// Maps the diagnostic authority's own omission reason onto the typed state a
-/// caller can act on. An unsupported scope is terminal; every other absence is
-/// worth retrying once a producer publishes.
+/// caller can act on. Only an unsupported scope is terminal: it names a request
+/// no producer can ever serve. Every absence of a publication is retryable,
+/// because the diagnostics pillar has no per-project publisher registration to
+/// prove a publisher will never appear — the compiler publisher is reachable on
+/// every open project and an unpublished project settles as soon as it runs.
 fn diagnostics_absence_problem(
     reason: Option<OmissionReason>,
 ) -> Result<ApplicationProblem, ApplicationContractError> {
@@ -2050,11 +2053,11 @@ mod tests {
         );
     }
 
-    /// A diagnostics read that reached no publishing authority must not render
-    /// as an empty success page: "no diagnostics exist" and "no authority
-    /// answered" are different answers, and only the second is retryable.
+    /// A diagnostics read that produced no evidence must not render as an
+    /// empty success page. Publication absence and staleness remain distinct
+    /// retryable states; only an unsupported scope is terminal.
     #[test]
-    fn absent_diagnostics_authority_is_a_typed_state_not_an_empty_success() {
+    fn diagnostics_absence_is_a_typed_retryable_state_not_an_empty_success() {
         for (reason, kind, code) in [
             (
                 None,
@@ -2093,20 +2096,38 @@ mod tests {
             );
         }
 
-        // Only an unsupported scope is terminal; the rest invite a retry once a
-        // producer publishes.
+        // Only an unsupported scope is terminal — it names a request no
+        // producer can ever serve. Nothing a diagnostics read can observe
+        // proves a publisher will never appear, so every other reason, and the
+        // unnamed reason, keeps a legal retry.
         assert!(
             diagnostics_absence_problem(Some(OmissionReason::Unsupported))
-                .expect("unsupported")
+                .expect("terminal diagnostics scope")
                 .legal_actions()
                 .is_empty()
         );
-        assert!(
-            !diagnostics_absence_problem(Some(OmissionReason::Stale))
-                .expect("stale")
-                .legal_actions()
-                .is_empty()
-        );
+        for reason in [
+            None,
+            Some(OmissionReason::Stale),
+            Some(OmissionReason::Unavailable),
+            Some(OmissionReason::Failed),
+        ] {
+            let problem = diagnostics_absence_problem(reason).expect("retryable absence");
+            assert_eq!(
+                problem.kind(),
+                ApplicationProblemKind::Unavailable,
+                "reason {reason:?} must stay retryable"
+            );
+            assert_ne!(
+                problem.retry(),
+                RetryDirective::Never,
+                "reason {reason:?} must not be a terminal directive"
+            );
+            assert!(
+                !problem.legal_actions().is_empty(),
+                "reason {reason:?} must offer a retry"
+            );
+        }
     }
 
     #[test]

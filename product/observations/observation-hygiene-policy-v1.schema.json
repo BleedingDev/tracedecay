@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/schemas/product/observations/observation-hygiene-policy-v1.schema.json",
+  "title": "TraceDecay observation secret and transient-data hygiene policy V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "bead_id",
+    "title",
+    "status",
+    "authority",
+    "sanitizer_id",
+    "admission_boundary",
+    "detector_authority",
+    "severity_ladder",
+    "reject_floor_classes",
+    "dispositions",
+    "payload_limits",
+    "receipt",
+    "reject_floor_signals",
+    "classes",
+    "invariants"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "contract_id": { "const": "tracedecay.observation-hygiene-policy.v1" },
+    "bead_id": { "const": "tdmem-0507" },
+    "title": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["draft", "accepted"] },
+    "authority": { "const": "TraceDecay observation admission authority" },
+    "sanitizer_id": { "const": "tracedecay.memory.observation.hygiene.v1" },
+    "admission_boundary": { "$ref": "#/$defs/admissionBoundary" },
+    "detector_authority": { "$ref": "#/$defs/detectorAuthority" },
+    "severity_ladder": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/action" }
+    },
+    "reject_floor_classes": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "dispositions": { "$ref": "#/$defs/dispositions" },
+    "payload_limits": { "$ref": "#/$defs/payloadLimits" },
+    "receipt": { "$ref": "#/$defs/receipt" },
+    "reject_floor_signals": { "$ref": "#/$defs/rejectFloorSignals" },
+    "classes": {
+      "type": "array",
+      "minItems": 12,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/hygieneClass" }
+    },
+    "invariants": {
+      "type": "array",
+      "minItems": 8,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "$defs": {
+    "action": {
+      "enum": ["accept", "annotate", "redact", "quarantine", "reject"]
+    },
+    "withheldReason": {
+      "enum": ["secret_rejected", "quarantined", "unclassifiable_payload"]
+    },
+    "admissionBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runs_at",
+        "runs_before",
+        "single_admitted_pipeline",
+        "mutates_canonical_evidence",
+        "raw_secret_material_allowed",
+        "delivered_bytes_equal_journal_bytes",
+        "withheld_events_advance_replay_cursor",
+        "observation_contract",
+        "event_policy"
+      ],
+      "properties": {
+        "runs_at": { "const": "admission" },
+        "runs_before": { "const": "digest_and_idempotency_key_derivation" },
+        "single_admitted_pipeline": { "const": true },
+        "mutates_canonical_evidence": { "const": false },
+        "raw_secret_material_allowed": { "const": false },
+        "delivered_bytes_equal_journal_bytes": { "const": true },
+        "withheld_events_advance_replay_cursor": { "const": true },
+        "observation_contract": { "type": "string", "minLength": 1 },
+        "event_policy": { "type": "string", "minLength": 1 }
+      }
+    },
+    "detectorAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "credential_corpus",
+        "canonical_redaction",
+        "transient_corpus",
+        "reason"
+      ],
+      "properties": {
+        "credential_corpus": { "type": "string", "minLength": 1 },
+        "canonical_redaction": { "type": "string", "minLength": 1 },
+        "transient_corpus": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "dispositions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "delivered",
+        "withheld",
+        "accepted_requires_identical_bytes",
+        "redacted_requires_different_bytes"
+      ],
+      "properties": {
+        "delivered": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "enum": ["accepted", "redacted"] }
+        },
+        "withheld": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/withheldReason" }
+        },
+        "accepted_requires_identical_bytes": { "const": true },
+        "redacted_requires_different_bytes": { "const": true }
+      }
+    },
+    "payloadLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_canonical_bytes", "over_limit_outcome", "reason"],
+      "properties": {
+        "max_canonical_bytes": { "type": "integer", "minimum": 1024 },
+        "over_limit_outcome": { "const": "error" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id_prefix",
+        "withheld_id_prefix",
+        "digest_domain",
+        "withheld_digest_domain",
+        "findings_digest_domain",
+        "empty_findings_digest",
+        "framing",
+        "field_order",
+        "withheld_field_order",
+        "carries_matched_bytes",
+        "domain_separation_reason"
+      ],
+      "properties": {
+        "id_prefix": { "const": "obs-hygiene-receipt.v1." },
+        "withheld_id_prefix": { "const": "obs-hygiene-withheld.v1." },
+        "digest_domain": {
+          "const": "tracedecay.memory.observation.hygiene.receipt.v1"
+        },
+        "withheld_digest_domain": {
+          "const": "tracedecay.memory.observation.hygiene.withheld.v1"
+        },
+        "findings_digest_domain": {
+          "const": "tracedecay.memory.observation.hygiene.findings.v1"
+        },
+        "empty_findings_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "framing": { "const": "length_prefixed_sha256" },
+        "field_order": {
+          "type": "array",
+          "minItems": 7,
+          "maxItems": 7,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "withheld_field_order": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "carries_matched_bytes": { "const": false },
+        "domain_separation_reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "rejectFloorSignals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "candidate_separators",
+        "minimum_credential_run_length",
+        "entropy_candidate_minimum_length",
+        "maximum_detector_probes_per_payload",
+        "direct_signal_classes",
+        "probe_signal_classes",
+        "known_credential_prefixes",
+        "known_credential_prefixes_are_exhaustive"
+      ],
+      "properties": {
+        "reason": { "type": "string", "minLength": 1 },
+        "candidate_separators": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 1 }
+        },
+        "minimum_credential_run_length": { "type": "integer", "minimum": 8 },
+        "entropy_candidate_minimum_length": {
+          "type": "integer",
+          "minimum": 16
+        },
+        "maximum_detector_probes_per_payload": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "direct_signal_classes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+        },
+        "probe_signal_classes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+        },
+        "known_credential_prefixes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 2 }
+        },
+        "known_credential_prefixes_are_exhaustive": { "const": false }
+      }
+    },
+    "hygieneClass": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "class_id",
+        "action",
+        "withheld_reason",
+        "detector_reason",
+        "mutates_payload",
+        "rationale"
+      ],
+      "properties": {
+        "class_id": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "action": { "$ref": "#/$defs/action" },
+        "withheld_reason": {
+          "oneOf": [{ "$ref": "#/$defs/withheldReason" }, { "type": "null" }]
+        },
+        "detector_reason": { "type": "string", "minLength": 1 },
+        "mutates_payload": { "type": "boolean" },
+        "rationale": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

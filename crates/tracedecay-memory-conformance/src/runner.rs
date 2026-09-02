@@ -2,9 +2,10 @@ use std::collections::BTreeSet;
 
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
-    CommittedEffectEvidence, FallbackDirective, HandshakeRequest, HandshakeRequestParts,
-    HandshakeResponse, MemoryProvider, ProviderCall, ProviderCallParts, ProviderDescriptor,
-    ProviderReply, TerminalRecord,
+    ApiError, CommittedEffectEvidence, FallbackDirective, HandshakeRequest, HandshakeRequestParts,
+    HandshakeResponse, MemoryProvider, PayloadSanitizationReceipt, PayloadSanitizationReceiptParts,
+    ProviderCall, ProviderCallParts, ProviderDescriptor, ProviderOperation, ProviderReply,
+    TerminalRecord,
 };
 
 use crate::fixture::{
@@ -243,13 +244,39 @@ fn materialize_handshake(fixture: &ScenarioFixture) -> Result<HandshakeRequest, 
     })?)
 }
 
+/// Sanitizer revision the harness stamps on the receipts it mints.
+///
+/// Conformance is provider-neutral and deliberately does not depend on
+/// `tracedecay-memory-hygiene`; it exercises the boundary the real pipeline
+/// mints into, not the pipeline itself. Fixture payloads are literal contract
+/// documents that carry no credential material, so the harness admits them as
+/// read-and-unchanged.
+pub(crate) const CONFORMANCE_SANITIZER_REVISION: &str =
+    "tracedecay.memory.observation.hygiene.v1+conformance-harness";
+
+/// Attaches the receipt an admitted observation must carry.
+///
+/// `ProviderCall::validate` fails closed for observations without one, so every
+/// scenario step that observes is admitted here before dispatch.
+pub(crate) fn admitted(call: ProviderCall) -> Result<ProviderCall, ApiError> {
+    if call.operation != ProviderOperation::Observe {
+        return Ok(call);
+    }
+    let receipt =
+        PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts::accepted_unmodified(
+            CONFORMANCE_SANITIZER_REVISION,
+            call.payload.sha256.clone(),
+        ))?;
+    Ok(call.with_sanitization(receipt))
+}
+
 fn materialize_operation(
     fixture: &ScenarioFixture,
     operation: &OperationFixture,
     ready_receipt_sha256: &str,
     state_generation: u64,
 ) -> Result<ProviderCall, EvaluationError> {
-    Ok(ProviderCall::new(ProviderCallParts {
+    Ok(admitted(ProviderCall::new(ProviderCallParts {
         operation: operation.operation,
         provider_id: fixture.identity().provider().provider_id().clone(),
         registration_revision: fixture.registration_revision(),
@@ -263,7 +290,7 @@ fn materialize_operation(
         payload: operation.payload.clone(),
         required_capabilities: operation.required_capabilities.clone(),
         extensions: operation.extensions.clone(),
-    })?)
+    })?)?)
 }
 
 fn evaluate_handshake(
@@ -510,6 +537,12 @@ fn evaluate_operation(
         state_generation_before,
         reply.state_generation,
     );
+    evaluate_duplicate_binding(
+        &mut violations,
+        step_id,
+        call,
+        reply.terminal.committed_effect(),
+    );
     evaluate_fallback(
         &mut violations,
         step_id,
@@ -559,6 +592,44 @@ fn compare_terminal_code(
             "terminal_code",
             expected.as_wire(),
             actual.as_wire(),
+        ));
+    }
+}
+
+/// A duplicate acknowledgement is evidence about the mutation the caller
+/// actually sent. A provider that returns one naming a different key — or one
+/// for a call that never carried a key — is claiming credit for someone else's
+/// prior work, so the binding is checked against the call rather than against
+/// the fixture's own expectation.
+fn evaluate_duplicate_binding(
+    violations: &mut Vec<ConformanceViolation>,
+    step_id: &str,
+    call: &ProviderCall,
+    actual: &CommittedEffectEvidence,
+) {
+    if actual.state() != tracedecay_memory_provider_api::contract::CommittedEffectState::Duplicate {
+        return;
+    }
+    let request_key = call.idempotency_key.as_deref().unwrap_or_default();
+    let claimed_key = actual.duplicate_of_idempotency_key().unwrap_or_default();
+    if request_key.is_empty() || claimed_key != request_key {
+        violations.push(ConformanceViolation::new(
+            step_id,
+            "terminal.committed_effect.duplicate_of_idempotency_key_binding",
+            if request_key.is_empty() {
+                "request idempotency key".to_owned()
+            } else {
+                request_key.to_owned()
+            },
+            claimed_key.to_owned(),
+        ));
+    }
+    if actual.duplicate_of_operation_id().is_none_or(str::is_empty) {
+        violations.push(ConformanceViolation::new(
+            step_id,
+            "terminal.committed_effect.duplicate_of_operation_id_binding",
+            "present",
+            "absent",
         ));
     }
 }
@@ -627,13 +698,16 @@ fn evaluate_committed_effect(
         actual.provider_receipt_sha256(),
         true,
     );
-    let generations_explicitly_unknown = actual.state_generation_before().is_none()
-        && actual.state_generation_after().is_none();
+    let generations_explicitly_unknown =
+        actual.state_generation_before().is_none() && actual.state_generation_after().is_none();
     let requires_envelope_generation_binding = match actual.state() {
         tracedecay_memory_provider_api::contract::CommittedEffectState::None => {
             !generations_explicitly_unknown
         }
+        // A duplicate must name the generation too: it asserts the generation
+        // did not move, which is only checkable against the envelope.
         tracedecay_memory_provider_api::contract::CommittedEffectState::Committed
+        | tracedecay_memory_provider_api::contract::CommittedEffectState::Duplicate
         | tracedecay_memory_provider_api::contract::CommittedEffectState::Partial => true,
         tracedecay_memory_provider_api::contract::CommittedEffectState::Unknown => false,
     };
@@ -668,6 +742,28 @@ fn evaluate_committed_effect(
         &expected.verification_sha256,
         actual.verification_sha256(),
         true,
+    );
+    evaluate_optional_text(
+        violations,
+        step_id,
+        "terminal.committed_effect.duplicate_of_idempotency_key",
+        &expected.duplicate_of_idempotency_key,
+        actual.duplicate_of_idempotency_key(),
+        // Not shape-checked here: this field echoes the key the *caller* sent,
+        // whose encoding is the observation contract's business, and a scenario
+        // may drive a provider with a readable key. The binding that matters —
+        // that the echo is this call's own key — is checked against the call in
+        // `evaluate_duplicate_binding`, which no key encoding can satisfy by
+        // accident.
+        false,
+    );
+    evaluate_optional_text(
+        violations,
+        step_id,
+        "terminal.committed_effect.duplicate_of_operation_id",
+        &expected.duplicate_of_operation_id,
+        actual.duplicate_of_operation_id(),
+        false,
     );
 }
 

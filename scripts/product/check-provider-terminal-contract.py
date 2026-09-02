@@ -217,6 +217,9 @@ REQUIRED_DOC_PHRASES = [
     "An empty candidate list without typed terminal and coverage is a contract violation",
     "`partial` means degraded read/inspection coverage",
     "distinct from `partial_effect`",
+    "## Duplicate acknowledgement",
+    "`duplicate_of_idempotency_key` is the deterministic idempotency key the provider matched",
+    "A duplicate is never inferred from an absent effect",
 ]
 
 REQUIRED_INVARIANTS = [
@@ -235,6 +238,7 @@ REQUIRED_INVARIANTS = [
     "Result payloads are canonical",
     "exact-scope identities are retained",
     "Contract violations cannot be silently repaired",
+    "A duplicate committed effect states that a prior delivery of this exact mutation already committed",
 ]
 
 BEAD_RE = re.compile(r"^tdmem-[0-9]{4}$")
@@ -702,12 +706,9 @@ def validate_retry_fallback(contract: dict[str, Any], errors: list[str]) -> None
 
 def validate_effect_control(contract: dict[str, Any], errors: list[str]) -> None:
     effect = obj(contract.get("committed_effect"), "committed_effect", errors)
-    keys = {
-        "type_name",
-        "required_fields",
-        "states",
+    effect_true_fields = (
         "read_only_operation_requires_none",
-        "success_mutation_requires_committed_or_none_if_no_effect",
+        "success_mutation_requires_committed_duplicate_or_none_if_no_effect",
         "partial_effect_terminal_requires_partial",
         "effect_unknown_terminal_requires_unknown",
         "deadline_or_cancelled_may_report_none_partial_or_unknown",
@@ -716,6 +717,18 @@ def validate_effect_control(contract: dict[str, Any], errors: list[str]) -> None
         "unknown_requires_reconciliation_action",
         "effect_receipt_required_when_state_not_none",
         "same_mutation_retry_requires_same_idempotency_key",
+        "duplicate_means_prior_delivery_of_this_mutation_already_committed",
+        "duplicate_requires_matching_request_idempotency_key",
+        "duplicate_requires_original_operation_identity",
+        "duplicate_requires_unchanged_state_generation",
+        "duplicate_identity_forbidden_unless_duplicate",
+    )
+    keys = {
+        "type_name",
+        "required_fields",
+        "states",
+        "duplicate_may_be_inferred_from_absent_effect",
+        *effect_true_fields,
     }
     exact_keys(effect, keys, "committed_effect", errors)
     if effect.get("type_name") != "MemoryProviderCommittedEffectV1":
@@ -730,24 +743,25 @@ def validate_effect_control(contract: dict[str, Any], errors: list[str]) -> None
         "provider_receipt_digest",
         "reconciliation_action",
         "verification_digest",
+        "duplicate_of_idempotency_key",
+        "duplicate_of_operation_id",
     ]:
         errors.append("committed-effect fields drifted")
-    if effect.get("states") != ["none", "committed", "partial", "unknown"]:
+    if effect.get("states") != [
+        "none",
+        "committed",
+        "duplicate",
+        "partial",
+        "unknown",
+    ]:
         errors.append("committed-effect states drifted")
-    for field in (
-        "read_only_operation_requires_none",
-        "success_mutation_requires_committed_or_none_if_no_effect",
-        "partial_effect_terminal_requires_partial",
-        "effect_unknown_terminal_requires_unknown",
-        "deadline_or_cancelled_may_report_none_partial_or_unknown",
-        "partial_requires_committed_boundary",
-        "partial_requires_committed_and_uncommitted_item_sets",
-        "unknown_requires_reconciliation_action",
-        "effect_receipt_required_when_state_not_none",
-        "same_mutation_retry_requires_same_idempotency_key",
-    ):
+    for field in effect_true_fields:
         if effect.get(field) is not True:
             errors.append(f"committed_effect.{field} must be true")
+    if effect.get("duplicate_may_be_inferred_from_absent_effect") is not False:
+        errors.append(
+            "committed_effect.duplicate_may_be_inferred_from_absent_effect must be false"
+        )
 
     control = obj(
         contract.get("request_control_precedence"),

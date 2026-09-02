@@ -5,8 +5,9 @@ use std::task::{Context, Poll, Waker};
 
 use tracedecay_application::memory::{
     CognitiveRecallCandidate, CognitiveRecallDegradation, CognitiveRecallPort,
-    CognitiveRecallProvenance, CognitiveRecallRequest, CognitiveRecallResult,
-    MAX_COGNITIVE_RECALL_CANDIDATE_BYTES, MAX_COGNITIVE_RECALL_CANDIDATES,
+    CognitiveRecallProvenance, CognitiveRecallProviderIdentity, CognitiveRecallRequest,
+    CognitiveRecallResult, MAX_COGNITIVE_RECALL_CANDIDATE_BYTES, MAX_COGNITIVE_RECALL_CANDIDATES,
+    MAX_COGNITIVE_RECALL_REFERENCE_BYTES,
 };
 use tracedecay_application::{CancellationContext, Deadline, RequestId, ResolvedScope};
 use tracedecay_domain::{ProjectId, RepositoryId, UtcMicros, WorktreeId};
@@ -31,6 +32,13 @@ fn request(scope: ResolvedScope) -> CognitiveRecallRequest {
         2,
     )
     .unwrap()
+}
+
+fn provider() -> CognitiveRecallProviderIdentity {
+    CognitiveRecallProviderIdentity::configured("provider.fixture", 3)
+        .unwrap()
+        .with_instance("provider.fixture.instance-1")
+        .unwrap()
 }
 
 fn candidate(id: &str) -> CognitiveRecallCandidate {
@@ -58,6 +66,7 @@ impl CognitiveRecallPort for EchoRecallPort {
         Ok(CognitiveRecallResult::complete(
             request.scope().clone(),
             request.request_id().clone(),
+            provider(),
             vec![self.candidate.clone()],
         )
         .unwrap())
@@ -93,16 +102,19 @@ fn zero_results_and_degradation_are_distinct_typed_states() {
     let zero = CognitiveRecallResult::complete(
         request.scope().clone(),
         request.request_id().clone(),
+        provider(),
         Vec::new(),
     )
     .unwrap();
     assert!(zero.is_complete());
     assert_eq!(zero.degradation(), None);
+    assert_eq!(zero.provider(), &provider());
     zero.validate_for(&request).unwrap();
 
     let degraded = CognitiveRecallResult::degraded(
         request.scope().clone(),
         request.request_id().clone(),
+        provider(),
         vec![candidate("candidate-1")],
         CognitiveRecallDegradation::Unavailable,
     )
@@ -112,7 +124,58 @@ fn zero_results_and_degradation_are_distinct_typed_states() {
         degraded.degradation(),
         Some(CognitiveRecallDegradation::Unavailable)
     );
+    assert_eq!(degraded.provider().provider_id(), "provider.fixture");
     degraded.validate_for(&request).unwrap();
+}
+
+#[test]
+fn every_result_names_a_validated_configured_provider() {
+    let request = request(scope("project.cognitive-recall"));
+
+    // The configured identity exists before any provider contact: no
+    // instance yet, but a real provider id and a positive registration.
+    let configured = CognitiveRecallProviderIdentity::configured("provider.fixture", 3).unwrap();
+    assert_eq!(configured.provider_id(), "provider.fixture");
+    assert_eq!(configured.registration_revision(), 3);
+    assert_eq!(configured.provider_instance_id(), None);
+    let pre_contact = CognitiveRecallResult::degraded(
+        request.scope().clone(),
+        request.request_id().clone(),
+        configured.clone(),
+        Vec::new(),
+        CognitiveRecallDegradation::Cancelled,
+    )
+    .unwrap();
+    assert_eq!(pre_contact.provider(), &configured);
+    pre_contact.validate_for(&request).unwrap();
+
+    // A contacted provider adds the instance the handshake reported.
+    let contacted = configured
+        .clone()
+        .with_instance("provider.fixture.instance-1")
+        .unwrap();
+    assert_eq!(
+        contacted.provider_instance_id(),
+        Some("provider.fixture.instance-1")
+    );
+
+    // Unattributed or unpinned identities fail closed.
+    assert!(CognitiveRecallProviderIdentity::configured("", 3).is_err());
+    assert!(CognitiveRecallProviderIdentity::configured("provider.fixture", 0).is_err());
+    assert!(
+        CognitiveRecallProviderIdentity::configured(
+            "p".repeat(MAX_COGNITIVE_RECALL_REFERENCE_BYTES + 1),
+            3
+        )
+        .is_err()
+    );
+    assert!(configured.with_instance("").is_err());
+
+    // The identity is part of the serialized contract, never an implicit
+    // side channel.
+    let json = serde_json::to_value(&pre_contact).unwrap();
+    assert_eq!(json["provider"]["provider_id"], "provider.fixture");
+    assert_eq!(json["provider"]["registration_revision"], 3);
 }
 
 #[test]
@@ -122,6 +185,7 @@ fn result_validation_keeps_scope_and_candidate_budget_boundaries() {
     let wrong_scope_result = CognitiveRecallResult::complete(
         wrong_scope,
         request.request_id().clone(),
+        provider(),
         vec![candidate("candidate-1")],
     )
     .unwrap();
@@ -130,6 +194,7 @@ fn result_validation_keeps_scope_and_candidate_budget_boundaries() {
     let over_request_budget = CognitiveRecallResult::complete(
         request.scope().clone(),
         request.request_id().clone(),
+        provider(),
         vec![
             candidate("candidate-1"),
             candidate("candidate-2"),
@@ -142,6 +207,7 @@ fn result_validation_keeps_scope_and_candidate_budget_boundaries() {
     let duplicate = CognitiveRecallResult::complete(
         request.scope().clone(),
         request.request_id().clone(),
+        provider(),
         vec![candidate("duplicate"), candidate("duplicate")],
     );
     assert!(duplicate.is_err());

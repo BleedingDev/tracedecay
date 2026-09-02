@@ -35,15 +35,30 @@ Neither can become success. A mutating operation may have no, partial, or unknow
 
 ## Committed-effect boundary
 
-`MemoryProviderCommittedEffectV1` states are none, committed, partial, and unknown.
+`MemoryProviderCommittedEffectV1` states are none, committed, duplicate, partial, and unknown.
 
-Read-only operations require none. A successful mutation reports committed, or none only for an explicit no-effect success.
+Read-only operations require none. A successful mutation reports committed, duplicate, or none only for an explicit no-effect success.
 
 Partial effects identify the exact committed boundary, before/after state generations, committed and uncommitted item sets, provider receipt, and reconciliation or resume action.
 
 Unknown effects require reconciliation before any retry. `effect_unknown` carries a reconciliation action and forbids retry until that action resolves the committed boundary.
 
 A retry of the same mutation retains the same idempotency key; it never invents a fresh key to conceal a partial or uncertain effect.
+
+## Duplicate acknowledgement
+
+Delivery is at least once, so a provider that already committed a mutation will see it again. `duplicate` is the truthful committed-effect state for that redelivery: the effect exists, this attempt did not create it, and the operation still succeeded.
+
+Duplicate evidence is bound to the exact mutation, not asserted about the request in general:
+
+- `duplicate_of_idempotency_key` is the deterministic idempotency key the provider matched, and it must equal the key on the request being answered;
+- `duplicate_of_operation_id` names the earlier operation whose delivery actually committed;
+- `provider_receipt_digest` anchors the prior committed effect, exactly as it does for `committed`;
+- `state_generation_before` and `state_generation_after` are both known and equal, because a duplicate commits nothing new.
+
+Both duplicate identity fields are absent for every other state. A duplicate is never inferred from an absent effect, an empty result payload, a repeated attempt number, a diagnostic string, or the provider's identity. A provider that cannot prove which mutation it deduplicated reports `committed`, `none`, or `effect_unknown` truthfully instead.
+
+TraceDecay reads `success` plus `duplicate` as a duplicate acknowledgement and records it as such; it does not guess that from any other signal.
 
 ## Retry
 
@@ -61,7 +76,9 @@ Automatic retry defaults to disabled. It requires pinned policy and positive bud
 
 Fallback eligibility is `forbidden` or `explicit_policy_only`, defaulting to forbidden. Empty results and provider unavailability never imply fallback.
 
-The current product policy is **no automatic fallback**. A future permitted fallback would require a pinned policy/revision, explicit target provider, fresh handshake, exact scope admission, and no reuse of provider-specific state identity.
+The current product policy is **no automatic fallback**: the host rule defaults to `FallbackRule::Forbidden`, and a provider terminal that says `explicit_policy_only` is then returned as that provider's own failure with a typed `FallbackDeclinedReason::HostRuleForbidden`.
+
+Fallback is honoured only by `MemoryFabric::route_active` under an `ActiveRoutingPolicy` whose `FallbackRule::ExplicitPinned` carries the identical `PinnedFallbackPolicy` (policy id, positive revision, and target provider) that the failing provider's terminal carries, and only when the target is itself registered active under its accepted revision with the routed capability and passes a fresh handshake. The target then receives a call bound to its own identity, ready receipt, and state generation; provider-specific state identity is never reused. Any other condition — host rule forbidden, missing or mismatched policy, target unregistered, observer-only, capability undeclared, or handshake not ready — is a typed declined reason alongside the original reply. The host pins the rule through the `memory.provider_recall_routing.v1` configuration gate, whose default names no active provider and no fallback. Empty results never raise fallback, and Native facts are never an implicit target.
 
 ## Success and coverage
 

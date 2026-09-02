@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracedecay_application::retained_surfaces::{
     FactCommitDispositionV1, FactCommitOwnerV1, FactCommitReceiptV1, FactIdentitySourceResultV1,
     FactProjectionV1, FactTelemetryV1, FactV1,
@@ -18,10 +18,11 @@ use tracedecay_domain::{
 };
 use tracedecay_memory_provider_registry::{
     CancellationToken, CanonicalPayload, CommittedEffectState, HandshakeRequest,
-    NativeMemoryApplicationPort, NativeObservation, OperationControl, OwnedExactScope,
-    OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderCallParts, ProviderOperation,
-    ProviderReply, TerminalCode, NATIVE_FACT_PROMOTION_OBSERVATION_KIND,
-    NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID, NATIVE_PROVIDER_ID, OBSERVATION_CONTRACT_ID,
+    NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
+    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort, NativeObservation, OBSERVATION_CONTRACT_ID,
+    OperationControl, OwnedExactScope, OwnedProviderId, OwnedVersionedId,
+    PayloadSanitizationReceipt, PayloadSanitizationReceiptParts, ProviderCall, ProviderCallParts,
+    ProviderOperation, ProviderReply, TerminalCode,
 };
 use tracedecay_store::{
     FactReadControl, FactWriteControl, ProjectMemoryFactHistoryQueryV1, ProjectMemoryFactHistoryV1,
@@ -138,8 +139,25 @@ fn commit_for(
     }
 }
 
+/// Canonical tagged scope digest standing in for the authoritative
+/// project-open resolved scope in fixtures that do not vary it.
+const SCOPE_DIGEST: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+/// A distinct canonical tagged scope digest used where a fixture needs a
+/// resolved scope digest that differs from `SCOPE_DIGEST`.
+const OTHER_SCOPE_DIGEST: &str =
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+/// A routing fixture, deliberately not a dispatchable call.
+///
+/// The settled-write path under test never inspects the payload or the
+/// capability set, so this keeps the original opaque single-byte payload and
+/// empty capability set. `ProviderCall` now carries a private sanitization
+/// receipt, so the envelope is built through the constructor and the fixture's
+/// unvalidated fields are restored afterwards.
 fn call_for(project_id: &str) -> ProviderCall {
-    ProviderCall {
+    let mut call = ProviderCall::new(ProviderCallParts {
         operation: ProviderOperation::Observe,
         provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("valid provider id"),
         registration_revision: 1,
@@ -151,7 +169,7 @@ fn call_for(project_id: &str) -> ProviderCall {
             "worktree.native-bridge-test",
             "branch.native-bridge-test",
             "agent.native-bridge-test",
-            1,
+            SCOPE_DIGEST,
         )
         .expect("valid exact scope"),
         request_id: "request.native-bridge-test".to_owned(),
@@ -159,15 +177,22 @@ fn call_for(project_id: &str) -> ProviderCall {
         expected_state_generation: 0,
         idempotency_key: Some("idempotency.native-bridge-test".to_owned()),
         control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
-        payload: CanonicalPayload {
-            contract_id: OwnedVersionedId::new(OBSERVATION_CONTRACT_ID)
-                .expect("valid observation contract"),
-            bytes: vec![1],
-            sha256: "b".repeat(64),
-        },
-        required_capabilities: BTreeSet::new(),
+        payload: CanonicalPayload::new(
+            OwnedVersionedId::new(OBSERVATION_CONTRACT_ID).expect("valid observation contract"),
+            vec![1],
+            sha256_hex(&[1]),
+        )
+        .expect("valid fixture payload"),
+        required_capabilities: vec![
+            OwnedVersionedId::new(ProviderOperation::Observe.capability_id())
+                .expect("observe capability"),
+        ],
         extensions: Vec::new(),
-    }
+    })
+    .expect("valid fixture envelope");
+    call.payload.sha256 = "b".repeat(64);
+    call.required_capabilities = BTreeSet::new();
+    call
 }
 
 fn valid_observation_call(project_id: &str, canonical_payload: &Value) -> ProviderCall {
@@ -189,7 +214,7 @@ fn valid_observation_call(project_id: &str, canonical_payload: &Value) -> Provid
             "worktree.native-bridge-store",
             "branch.native-bridge-store",
             "agent.native-bridge-store",
-            1,
+            SCOPE_DIGEST,
         )
         .expect("valid exact scope"),
         request_id: "request.native-bridge-store".to_owned(),
@@ -203,13 +228,33 @@ fn valid_observation_call(project_id: &str, canonical_payload: &Value) -> Provid
             sha256_hex(&envelope_bytes),
         )
         .expect("valid observation payload"),
-        required_capabilities: vec![OwnedVersionedId::new(
-            ProviderOperation::Observe.capability_id(),
-        )
-        .expect("observe capability")],
+        required_capabilities: vec![
+            OwnedVersionedId::new(ProviderOperation::Observe.capability_id())
+                .expect("observe capability"),
+        ],
         extensions: Vec::new(),
     })
+    .map(admitted)
     .expect("valid provider call")
+}
+
+/// Sanitizer revision this harness stands in for. The real revision is derived
+/// by `tracedecay-memory-hygiene` from the canonical policy document.
+const TEST_SANITIZER_REVISION: &str = "tracedecay.memory.observation.hygiene.v1+native-bridge-test";
+
+/// Attaches the receipt the admitted hygiene pipeline mints for a payload it
+/// read and left byte-identical. Observation dispatch fails closed without one.
+fn admitted(call: ProviderCall) -> ProviderCall {
+    if call.operation != ProviderOperation::Observe {
+        return call;
+    }
+    let receipt =
+        PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts::accepted_unmodified(
+            TEST_SANITIZER_REVISION,
+            call.payload.sha256.clone(),
+        ))
+        .expect("accepted sanitization receipt");
+    call.with_sanitization(receipt)
 }
 
 fn settled_fixture() -> (ProviderCall, SettledNativeFactWriteV1) {
@@ -246,7 +291,7 @@ fn ready_request() -> HandshakeRequest {
             "worktree.native-bridge-ready",
             "branch.native-bridge-ready",
             "agent.native-bridge-ready",
-            2,
+            OTHER_SCOPE_DIGEST,
         )
         .expect("valid exact scope"),
         request_id: "request.native-bridge-ready".to_owned(),
@@ -394,6 +439,12 @@ async fn add_real_project_fact(graph: &TraceDecay, content: &str, source_label: 
     }
 }
 
+/// The daemon profile the port under test is mounted for; it is the profile
+/// every Native candidate attests, and the profile the recall requests name.
+fn test_profile_id() -> tracedecay_domain::UserProfileId {
+    tracedecay_domain::UserProfileId::new("profile.native-bridge-recall").expect("profile id")
+}
+
 fn recall_scope_value(project_id: &str) -> Value {
     json!({
         "profile_id": "profile.native-bridge-recall",
@@ -402,7 +453,7 @@ fn recall_scope_value(project_id: &str) -> Value {
         "worktree_identity": "worktree.native-bridge-recall",
         "branch_identity": "branch.native-bridge-recall",
         "agent_session_id": "agent.native-bridge-recall",
-        "scope_revision": 1,
+        "resolved_scope_digest": SCOPE_DIGEST,
     })
 }
 
@@ -493,7 +544,7 @@ fn valid_recall_call(project_id: &str, request: Value) -> ProviderCall {
             "worktree.native-bridge-recall",
             "branch.native-bridge-recall",
             "agent.native-bridge-recall",
-            1,
+            SCOPE_DIGEST,
         )
         .expect("valid recall exact scope"),
         request_id: "request.native-bridge-recall".to_owned(),
@@ -508,7 +559,7 @@ fn valid_recall_call(project_id: &str, request: Value) -> ProviderCall {
         )
         .expect("valid recall payload"),
         required_capabilities: vec![
-            OwnedVersionedId::new("recall.query.v1").expect("recall capability")
+            OwnedVersionedId::new("recall.query.v1").expect("recall capability"),
         ],
         extensions: Vec::new(),
     })
@@ -761,7 +812,7 @@ async fn native_observe_verifies_real_store_without_writing() {
         "commit": expected_commit.clone(),
     });
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
+    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root, test_profile_id())
         .expect("construct project Native application port");
     let call = valid_observation_call(project_id.as_str(), &canonical_payload);
     let reply = port.observe(observation_for(&call, canonical_payload.clone()));
@@ -829,7 +880,7 @@ async fn native_recall_current_preserves_order_and_projects_native_score_explain
     assert_eq!(expected_scores.len(), expected_facts.len());
 
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
+    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root, test_profile_id())
         .expect("construct project Native application port");
     let call = valid_recall_call(
         project_id.as_str(),
@@ -942,10 +993,30 @@ async fn native_recall_current_preserves_order_and_projects_native_score_explain
                 },
             })
         );
-        assert!(candidate["native_score"]
-            .get("host_normalized_score")
-            .is_none());
+        assert!(
+            candidate["native_score"]
+                .get("host_normalized_score")
+                .is_none()
+        );
+        // The adapter attests the fact as `project_facts`: the owner project
+        // the fact record proves and the profile fixed at mount. The optional
+        // checkout fields and the forbidden session/digest fields stay empty,
+        // so the host can never admit the candidate under the requester's
+        // worktree/branch/session identity.
         assert_eq!(
+            candidate["exact_scope_identity"],
+            json!({
+                "scope_binding": "project_facts",
+                "profile_id": "profile.native-bridge-recall",
+                "project_id": project_id.as_str(),
+                "repository_identity": "",
+                "worktree_identity": "",
+                "branch_identity": "",
+                "agent_session_id": "",
+                "resolved_scope_digest": "",
+            })
+        );
+        assert_ne!(
             candidate["exact_scope_identity"],
             recall_scope_value(project_id.as_str())
         );
@@ -976,10 +1047,12 @@ async fn native_recall_current_preserves_order_and_projects_native_score_explain
         assert_eq!(candidate["provenance"]["transform_chain"], json!([]));
         assert_eq!(candidate["provenance"]["provider_trace_refs"], json!([]));
         assert_eq!(candidate["provenance"]["redaction_reason"], Value::Null);
-        assert!(!candidate["explanation"]["summary"]
-            .as_str()
-            .unwrap_or_default()
-            .is_empty());
+        assert!(
+            !candidate["explanation"]["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
+        );
         assert_eq!(
             candidate["explanation"]["native_linkage_ref"],
             json!("provenance.native_linkage")
@@ -1010,7 +1083,7 @@ async fn native_recall_current_preserves_order_and_projects_native_score_explain
 async fn native_recall_zero_results_returns_success_zero_results_payload() {
     let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
+    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root, test_profile_id())
         .expect("construct project Native application port");
     let mut request = recall_request_value(project_id.as_str());
     request["query"] = json!("query-with-no-native-bridge-match");
@@ -1084,7 +1157,7 @@ async fn native_recall_rejects_malformed_unsupported_inputs_without_mutating_sto
     }
 
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
+    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root, test_profile_id())
         .expect("construct project Native application port");
     let base = recall_request_value(project_id.as_str());
     let cases = vec![
@@ -1194,7 +1267,7 @@ async fn native_recall_does_not_mutate_authoritative_fact_telemetry_or_history()
     }
 
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
+    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root, test_profile_id())
         .expect("construct project Native application port");
     for _ in 0..2 {
         let reply = port.recall(&valid_recall_call(
@@ -1220,4 +1293,47 @@ async fn native_recall_does_not_mutate_authoritative_fact_telemetry_or_history()
             "recall changed authoritative fact history"
         );
     }
+}
+
+/// A recall whose exact scope names a project other than the one this Native
+/// instance owns is a typed scope mismatch (a different authority), not an
+/// unavailable scope, and never touches the owning project's facts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_recall_for_foreign_project_scope_is_typed_scope_mismatch() {
+    let (_temporary, project_root, graph, owner, project_id) = real_project_fixture().await;
+    let fact = add_real_project_fact(
+        &graph,
+        "Native bridge foreign project recall fixture",
+        "native-bridge-recall-foreign-project",
+    )
+    .await;
+    let before = read_store_snapshot(&graph, &owner, &fact.fact_id).await;
+
+    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
+    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root, test_profile_id())
+        .expect("construct project Native application port");
+    let foreign_project_id = format!("{}-foreign", project_id.as_str());
+    assert_ne!(foreign_project_id, project_id.as_str());
+    let reply = port.recall(&valid_recall_call(
+        &foreign_project_id,
+        recall_request_value(&foreign_project_id),
+    ));
+    assert_recall_failure(
+        &reply,
+        TerminalCode::ScopeMismatch,
+        RECALL_SCOPE_MISMATCH_DIAGNOSTIC,
+    );
+    assert_eq!(reply.state_generation, 0);
+
+    // The owning project still answers its own scope after the refusal.
+    let own = port.recall(&valid_recall_call(
+        project_id.as_str(),
+        recall_request_value(project_id.as_str()),
+    ));
+    assert_eq!(own.terminal.terminal_code(), TerminalCode::Success);
+    let after = read_store_snapshot(&graph, &owner, &fact.fact_id).await;
+    assert_eq!(
+        after, before,
+        "foreign-scope recall changed the owning project's fact"
+    );
 }

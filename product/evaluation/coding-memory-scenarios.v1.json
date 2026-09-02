@@ -210,6 +210,148 @@
       ]
     }
   ],
+  "recall_requests": [
+    {
+      "request_id": "request_stale_001",
+      "scenario_id": "stale_project_change",
+      "operation": "recall",
+      "scope_id": "scope_main_agent_a",
+      "objective": "search",
+      "query": "is cache writing atomic now",
+      "temporal_query": {"mode": "current", "evaluation_time": "2026-08-30T09:06:00Z"},
+      "budgets": {"maximum_candidates": 8, "maximum_candidate_content_bytes": 4096, "maximum_total_content_bytes": 8192, "maximum_source_refs_per_candidate": 8, "maximum_trace_refs_per_candidate": 8, "maximum_warnings": 8, "maximum_extensions_per_candidate": 8},
+      "exclusions": {"stable_memory_refs": [], "candidate_ids": [], "source_refs": [], "trace_refs": [], "observation_ids": [], "content_sha256": []},
+      "policy_revision": 1
+    },
+    {
+      "request_id": "request_failed_001",
+      "scenario_id": "failed_approach",
+      "operation": "recall",
+      "scope_id": "scope_main_agent_a",
+      "objective": "search",
+      "query": "which retry approach should be used",
+      "temporal_query": {"mode": "current", "evaluation_time": "2026-08-30T10:16:00Z"},
+      "budgets": {"maximum_candidates": 8, "maximum_candidate_content_bytes": 4096, "maximum_total_content_bytes": 8192, "maximum_source_refs_per_candidate": 8, "maximum_trace_refs_per_candidate": 8, "maximum_warnings": 8, "maximum_extensions_per_candidate": 8},
+      "exclusions": {"stable_memory_refs": [], "candidate_ids": [], "source_refs": [], "trace_refs": [], "observation_ids": [], "content_sha256": []},
+      "policy_revision": 1
+    },
+    {
+      "request_id": "request_cross_agent_001",
+      "scenario_id": "cross_agent_reuse",
+      "operation": "recall",
+      "scope_id": "scope_main_agent_b",
+      "objective": "search",
+      "query": "what public API version is present",
+      "temporal_query": {"mode": "current", "evaluation_time": "2026-08-30T11:10:00Z"},
+      "budgets": {"maximum_candidates": 8, "maximum_candidate_content_bytes": 4096, "maximum_total_content_bytes": 8192, "maximum_source_refs_per_candidate": 8, "maximum_trace_refs_per_candidate": 8, "maximum_warnings": 8, "maximum_extensions_per_candidate": 8},
+      "exclusions": {"stable_memory_refs": [], "candidate_ids": [], "source_refs": [], "trace_refs": [], "observation_ids": [], "content_sha256": []},
+      "policy_revision": 1
+    },
+    {
+      "request_id": "request_scope_001",
+      "scenario_id": "project_worktree_scope",
+      "operation": "recall",
+      "scope_id": "scope_sibling_worktree",
+      "objective": "search",
+      "query": "what API version is in this feature worktree",
+      "temporal_query": {"mode": "current", "evaluation_time": "2026-08-30T12:05:00Z"},
+      "budgets": {"maximum_candidates": 8, "maximum_candidate_content_bytes": 4096, "maximum_total_content_bytes": 8192, "maximum_source_refs_per_candidate": 8, "maximum_trace_refs_per_candidate": 8, "maximum_warnings": 8, "maximum_extensions_per_candidate": 8},
+      "exclusions": {"stable_memory_refs": [], "candidate_ids": [], "source_refs": [], "trace_refs": [], "observation_ids": [], "content_sha256": []},
+      "policy_revision": 1
+    },
+    {
+      "request_id": "request_scope_002",
+      "scenario_id": "project_worktree_scope",
+      "operation": "recall",
+      "scope_id": "scope_other_project",
+      "objective": "search",
+      "query": "what API version is in this feature worktree",
+      "temporal_query": {"mode": "current", "evaluation_time": "2026-08-30T12:05:00Z"},
+      "budgets": {"maximum_candidates": 8, "maximum_candidate_content_bytes": 4096, "maximum_total_content_bytes": 8192, "maximum_source_refs_per_candidate": 8, "maximum_trace_refs_per_candidate": 8, "maximum_warnings": 8, "maximum_extensions_per_candidate": 8},
+      "exclusions": {"stable_memory_refs": [], "candidate_ids": [], "source_refs": [], "trace_refs": [], "observation_ids": [], "content_sha256": []},
+      "policy_revision": 1
+    },
+    {
+      "request_id": "request_contradiction_001",
+      "scenario_id": "contradiction",
+      "operation": "recall",
+      "scope_id": "scope_main_agent_a",
+      "objective": "search",
+      "query": "should a request timeout be retried",
+      "temporal_query": {"mode": "current", "evaluation_time": "2026-08-30T13:07:00Z"},
+      "budgets": {"maximum_candidates": 8, "maximum_candidate_content_bytes": 4096, "maximum_total_content_bytes": 8192, "maximum_source_refs_per_candidate": 8, "maximum_trace_refs_per_candidate": 8, "maximum_warnings": 8, "maximum_extensions_per_candidate": 8},
+      "exclusions": {"stable_memory_refs": [], "candidate_ids": [], "source_refs": [], "trace_refs": [], "observation_ids": [], "content_sha256": []},
+      "policy_revision": 1
+    },
+    {
+      "request_id": "request_restart_001",
+      "scenario_id": "restart",
+      "operation": "recall",
+      "scope_id": "scope_main_agent_a",
+      "objective": "search",
+      "query": "what public API version is present",
+      "temporal_query": {"mode": "current", "evaluation_time": "2026-08-30T14:03:00Z"},
+      "budgets": {"maximum_candidates": 8, "maximum_candidate_content_bytes": 4096, "maximum_total_content_bytes": 8192, "maximum_source_refs_per_candidate": 8, "maximum_trace_refs_per_candidate": 8, "maximum_warnings": 8, "maximum_extensions_per_candidate": 8},
+      "exclusions": {"stable_memory_refs": [], "candidate_ids": [], "source_refs": [], "trace_refs": [], "observation_ids": [], "content_sha256": []},
+      "policy_revision": 1
+    },
+    {
+      "request_id": "request_corrupt_health",
+      "scenario_id": "provider_corruption",
+      "operation": "health",
+      "scope_id": "scope_main_agent_a",
+      "temporal_query": {"mode": "current", "evaluation_time": "2026-08-30T16:02:00Z"},
+      "policy_revision": 1
+    },
+    {
+      "request_id": "request_corrupt_recall",
+      "scenario_id": "provider_corruption",
+      "operation": "recall",
+      "scope_id": "scope_main_agent_a",
+      "objective": "search",
+      "query": "what public API version is present",
+      "temporal_query": {"mode": "current", "evaluation_time": "2026-08-30T16:02:00Z"},
+      "budgets": {"maximum_candidates": 8, "maximum_candidate_content_bytes": 4096, "maximum_total_content_bytes": 8192, "maximum_source_refs_per_candidate": 8, "maximum_trace_refs_per_candidate": 8, "maximum_warnings": 8, "maximum_extensions_per_candidate": 8},
+      "exclusions": {"stable_memory_refs": [], "candidate_ids": [], "source_refs": [], "trace_refs": [], "observation_ids": [], "content_sha256": []},
+      "policy_revision": 1
+    },
+    {
+      "request_id": "request_privacy_before",
+      "scenario_id": "privacy_deletion",
+      "operation": "recall",
+      "scope_id": "scope_privacy_agent",
+      "objective": "search",
+      "query": "what sample value does the fixture note contain",
+      "temporal_query": {"mode": "current", "evaluation_time": "2026-08-30T17:05:00Z"},
+      "budgets": {"maximum_candidates": 8, "maximum_candidate_content_bytes": 4096, "maximum_total_content_bytes": 8192, "maximum_source_refs_per_candidate": 8, "maximum_trace_refs_per_candidate": 8, "maximum_warnings": 8, "maximum_extensions_per_candidate": 8},
+      "exclusions": {"stable_memory_refs": [], "candidate_ids": [], "source_refs": [], "trace_refs": [], "observation_ids": [], "content_sha256": []},
+      "policy_revision": 1
+    },
+    {
+      "request_id": "request_privacy_verify",
+      "scenario_id": "privacy_deletion",
+      "operation": "verify_absence",
+      "scope_id": "scope_privacy_agent",
+      "objective": "search",
+      "query": "what did the deleted fixture note contain",
+      "temporal_query": {"mode": "current", "evaluation_time": "2026-08-30T17:05:00Z"},
+      "budgets": {"maximum_candidates": 8, "maximum_candidate_content_bytes": 4096, "maximum_total_content_bytes": 8192, "maximum_source_refs_per_candidate": 8, "maximum_trace_refs_per_candidate": 8, "maximum_warnings": 8, "maximum_extensions_per_candidate": 8},
+      "exclusions": {"stable_memory_refs": [], "candidate_ids": [], "source_refs": [], "trace_refs": [], "observation_ids": [], "content_sha256": []},
+      "policy_revision": 1
+    },
+    {
+      "request_id": "request_privacy_after",
+      "scenario_id": "privacy_deletion",
+      "operation": "recall",
+      "scope_id": "scope_privacy_agent",
+      "objective": "search",
+      "query": "what did the deleted fixture note contain",
+      "temporal_query": {"mode": "current", "evaluation_time": "2026-08-30T17:05:00Z"},
+      "budgets": {"maximum_candidates": 8, "maximum_candidate_content_bytes": 4096, "maximum_total_content_bytes": 8192, "maximum_source_refs_per_candidate": 8, "maximum_trace_refs_per_candidate": 8, "maximum_warnings": 8, "maximum_extensions_per_candidate": 8},
+      "exclusions": {"stable_memory_refs": [], "candidate_ids": [], "source_refs": [], "trace_refs": [], "observation_ids": [], "content_sha256": []},
+      "policy_revision": 1
+    }
+  ],
   "scenarios": [
     {
       "id": "stale_project_change",

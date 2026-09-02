@@ -50,15 +50,7 @@ impl SessionSyncProjectContext {
         request: &tracedecay_application::session_sync::SessionSyncRequestV1,
         project_sessions: RegisteredGlobalDbLeaseV1,
     ) -> GitTopologySyncOutcome {
-        let scope = match crate::daemon::project_open_owners::resolved_scope_for_project(
-            &self.project_root,
-            &self.project_id,
-        ) {
-            Ok(scope) => scope,
-            Err(_) => {
-                return GitTopologySyncOutcome::Finished(Err(GitTopologySyncFailure::Unavailable));
-            }
-        };
+        let scope = self.scope.clone();
         let Some(runtime) = project_sessions.project_graph_runtime() else {
             return GitTopologySyncOutcome::Finished(Err(GitTopologySyncFailure::Unavailable));
         };

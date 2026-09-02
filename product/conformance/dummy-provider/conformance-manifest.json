@@ -53,7 +53,7 @@
     "representation": "BTreeMap_idempotency_key_to_canonical_observation",
     "source_sequence_monotonic": true,
     "state_generation_monotonic": true,
-    "duplicate_same_key_same_fingerprint": "duplicate_acknowledged_without_new_effect",
+    "duplicate_same_key_same_fingerprint": "duplicate_committed_effect_bound_to_request_key_and_committing_operation",
     "duplicate_same_key_different_fingerprint": "conflict_without_new_effect",
     "snapshot_encoding": "canonical_length_prefixed_binary_v1",
     "snapshot_digest": "sha256",

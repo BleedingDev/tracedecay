@@ -20,6 +20,9 @@ EXPECTED_DECISIONS = {
     "ADR-0007": "observer_isolation_and_activation",
     "ADR-0008": "upstream_convergence",
     "ADR-0009": "ncm_execution_topology",
+    "ADR-0010": "native_provider_parity_projection",
+    "ADR-0011": "patch_footprint_revision_v2",
+    "ADR-0012": "configuration_registry_additive_settings",
 }
 
 EXPECTED_PATHS = {
@@ -32,6 +35,9 @@ EXPECTED_PATHS = {
     "ADR-0007": "product/architecture/adr/ADR-0007-observer-isolation-and-activation.md",
     "ADR-0008": "product/architecture/adr/ADR-0008-upstream-convergence.md",
     "ADR-0009": "product/architecture/adr/ADR-0009-ncm-isolated-local-process.md",
+    "ADR-0010": "product/architecture/adr/ADR-0010-native-provider-parity-projection.md",
+    "ADR-0011": "product/architecture/adr/ADR-0011-patch-footprint-revision-v2.md",
+    "ADR-0012": "product/architecture/adr/ADR-0012-configuration-registry-additive-settings.md",
 }
 
 EXPECTED_STATUSES = {
@@ -44,6 +50,9 @@ EXPECTED_STATUSES = {
     "ADR-0007": "accepted",
     "ADR-0008": "accepted",
     "ADR-0009": "accepted_with_production_blockers",
+    "ADR-0010": "accepted",
+    "ADR-0011": "accepted",
+    "ADR-0012": "accepted",
 }
 
 REQUIRED_SECTIONS = [

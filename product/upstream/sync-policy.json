@@ -33,7 +33,109 @@
     "pull_request": 707,
     "sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
     "advancement_authority": "tdmem-1208",
-    "immutable_until_approved_train": true
+    "immutable_until_approved_train": true,
+    "pins": [
+      {
+        "path": "product/upstream/sync-policy.json",
+        "kind": "json_pointer",
+        "occurrences": 1,
+        "pointers": [
+          "/floor/sha"
+        ]
+      },
+      {
+        "path": "product/upstream/pr707-floor.json",
+        "kind": "derived_metadata_receipt",
+        "occurrences": 1,
+        "pointers": [
+          "/pinned_floor_sha"
+        ],
+        "metadata_pointer": "/canonical_metadata",
+        "blob_pointer": "/canonical_metadata_blob_sha"
+      },
+      {
+        "path": "product/upstream/convergence-map.json",
+        "kind": "json_pointer",
+        "occurrences": 1,
+        "pointers": [
+          "/upstream_floor_sha"
+        ],
+        "each_pointers": [
+          "/areas/*/last_verified_upstream_sha",
+          "/entries/*/last_verified_upstream_sha"
+        ],
+        "each_reason": "Every active area and mapped patch must record the accepted floor as its last verified upstream commit (check-upstream-ownership-registry.py fails otherwise). The train advances every stamp together with upstream_floor_sha in the candidate tree; the stamps are published only if the six tree-bound gates, which include the ownership registry checker and the entries' test lanes, pass on that exact tree."
+      },
+      {
+        "path": "product/upstream/patch-footprint-policy.json",
+        "kind": "json_pointer",
+        "occurrences": 2,
+        "pointers": [
+          "/upstream_floor/sha",
+          "/verification/branch_diff_command"
+        ]
+      },
+      {
+        "path": "product/upstream/README.md",
+        "kind": "anchored_line",
+        "occurrences": 1,
+        "line": "<!-- pinned-floor -->`{floor}`."
+      },
+      {
+        "path": "scripts/product/check-patch-footprint-policy.py",
+        "kind": "anchored_line",
+        "occurrences": 1,
+        "line": "EXPECTED_FLOOR = \"{floor}\""
+      },
+      {
+        "path": "tests/product_upstream_floor_test.sh",
+        "kind": "anchored_line",
+        "occurrences": 1,
+        "line": "  \"\\\"pinned_floor_sha\\\": \\\"{floor}\\\"\""
+      },
+      {
+        "path": "tests/product_upstream_vendor_floor_test.py",
+        "kind": "anchored_line",
+        "occurrences": 1,
+        "line": "EXPECTED_FLOOR = \"{floor}\""
+      },
+      {
+        "path": "tests/product_upstream_ownership_registry_test.py",
+        "kind": "anchored_line",
+        "occurrences": 1,
+        "line": "FLOOR = \"{floor}\""
+      }
+    ],
+    "pins_contract": "Every tracked file that hard-pins floor.sha is either the canonical metadata, declared here as a structured pin (exact JSON pointers or one anchored line, with its exact occurrence count), declared under archival_provenance, or lives under a historical_record_prefixes directory. prepare sweeps the product head with git grep and refuses any unclassified hit; advance-floor rewrites only the declared targets of every pin (fixed pointers, wildcard per-entry stamps, or one anchored line) inside the candidate tree and re-sweeps the candidate tree for both floors; publish repeats the sweep on the published tree. Prose must reference the canonical metadata instead of quoting the floor. The canonical metadata file is advanced separately and must not be listed.",
+    "historical_record_prefixes": [
+      ".beads/"
+    ],
+    "archival_provenance": [
+      {
+        "path": "product/baseline/tracedecay-v2-pr707-linux.json",
+        "reason": "Measured build/test baseline recorded against the floor it was produced on; a new floor requires a re-measured baseline in a follow-up commit, never a literal rewrite."
+      },
+      {
+        "path": "scripts/product/check-v2-baseline.py",
+        "reason": "Verifies the archival baseline receipt against the floor that receipt was measured on."
+      },
+      {
+        "path": "tests/product_v2_baseline_receipt_test.py",
+        "reason": "Fixture for the archival baseline receipt checker."
+      },
+      {
+        "path": "product/architecture/m0-go-no-go.json",
+        "reason": "M0 milestone report; historical finding about the original floor."
+      },
+      {
+        "path": "product/architecture/m0-go-no-go.md",
+        "reason": "M0 milestone report; historical finding about the original floor."
+      },
+      {
+        "path": "product/upstream/rehearsals/tdmem-1208-1bde084d86.json",
+        "reason": "tdmem-1208 rehearsal record of the real candidate refs/remotes/upstream/pr/707-current (1bde084d86): archived classification, the six conflict receipts and the aborted terminal receipt, all produced against the floor they name; a later train never rewrites it."
+      }
+    ]
   },
   "preflight": {
     "requires_clean_worktree": true,
@@ -83,7 +185,99 @@
       "scope_crash_security",
       "generated_drift"
     ],
-    "required_gate_status": "passed"
+    "required_gate_status": "passed",
+    "lanes": {
+      "upstream_required": {
+        "workflow": ".github/workflows/product-upstream.yml",
+        "job": "upstream_required",
+        "commands": [
+          "bash tests/product_upstream_floor_test.sh",
+          "python3 scripts/check-product-upstream-floor.py --repo . --metadata product/upstream/tracedecay-v2-pr707.json",
+          "python3 tests/product_upstream_vendor_floor_test.py",
+          "python3 tests/product_upstream_change_classification_test.py",
+          "python3 tests/product_upstream_ownership_registry_test.py",
+          "python3 scripts/product/check-upstream-ownership-registry.py --repo .",
+          "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers",
+          "cargo check --workspace --all-targets --features test-transport --locked",
+          "cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked"
+        ]
+      },
+      "product_contracts": {
+        "workflow": ".github/workflows/product-upstream.yml",
+        "job": "product_contracts",
+        "commands": [
+          "python3 tests/product_provider_registry_contract_test.py",
+          "python3 tests/product_provider_handshake_contract_test.py",
+          "python3 tests/product_provider_observation_contract_test.py",
+          "python3 tests/product_provider_recall_contract_test.py",
+          "python3 tests/product_provider_lifecycle_contract_test.py",
+          "python3 tests/product_provider_terminal_contract_test.py",
+          "python3 tests/product_memory_provider_contract_set_test.py",
+          "python3 tests/product_memory_provider_rust_bindings_test.py",
+          "python3 tests/product_memory_dependency_policy_test.py",
+          "python3 tests/product_memory_dependency_direction_test.py",
+          "python3 tests/product_patch_footprint_policy_test.py",
+          "python3 scripts/product/check-memory-provider-contract-set.py --repo .",
+          "python3 scripts/product/check-memory-provider-rust-bindings.py --repo .",
+          "python3 scripts/product/check-memory-dependency-policy.py --repo . --policy product/upstream/patch-footprint-policy.json",
+          "python3 scripts/product/check-memory-dependency-direction.py --repo . --policy product/architecture/memory-dependency-policy.json",
+          "python3 scripts/product/check-patch-footprint-policy.py --repo . --policy product/upstream/patch-footprint-policy.json --map product/upstream/convergence-map.json"
+        ]
+      },
+      "native_parity": {
+        "workflow": ".github/workflows/product-upstream.yml",
+        "job": "native_parity",
+        "commands": [
+          "cargo test -p tracedecay-memory-provider-native --locked",
+          "cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_recall_ -- --nocapture",
+          "cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_baseline -- --nocapture",
+          "python3 tests/product_memory_composition_feature_test.py",
+          "python3 scripts/product/check-memory-composition-feature.py --repo ."
+        ]
+      },
+      "provider_conformance": {
+        "workflow": ".github/workflows/product-upstream.yml",
+        "job": "provider_conformance",
+        "commands": [
+          "cargo test -p tracedecay-memory-provider-api --locked",
+          "cargo test -p tracedecay-memory-fabric --locked",
+          "cargo test -p tracedecay-memory-provider-registry --locked",
+          "cargo test -p tracedecay-memory-conformance --locked",
+          "cargo test --manifest-path product/conformance/dummy-provider/Cargo.toml --locked",
+          "python3 scripts/product/check-dummy-provider-conformance.py --repo .",
+          "python3 tests/product_dummy_provider_conformance_test.py"
+        ]
+      },
+      "scope_crash_security": {
+        "workflow": ".github/workflows/product-upstream.yml",
+        "job": "scope_crash_security",
+        "commands": [
+          "cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification",
+          "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline",
+          "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1",
+          "python3 tests/product_memory_fabric_disabled_mode_test.py"
+        ]
+      },
+      "generated_drift": {
+        "workflow": ".github/workflows/product-upstream.yml",
+        "job": "generated_drift",
+        "commands": [
+          "python3 scripts/product/generate-memory-provider-goldens.py --repo . --check",
+          "python3 scripts/product/check-memory-provider-contract-set.py --repo .",
+          "python3 scripts/product/generate-memory-provider-rust.py --repo . --check",
+          "python3 scripts/product/check-memory-provider-rust-bindings.py --repo .",
+          "cargo metadata --locked --format-version 1 --no-deps",
+          "git diff --check",
+          "git diff --exit-code",
+          "test -z \"$(git status --porcelain)\""
+        ]
+      }
+    },
+    "lane_contract": "Every required gate is bound to one job of the product-owned convergence workflow and to the exact command lines that job runs. record-gate accepts only a declared command (executed as its argv, or as `bash -euo pipefail -c <line>`), or a GitHub Actions run of the bound lane in the product repository that checked out the advanced candidate commit (--ci-run with --ci-head-sha), which stands for every declared command of that lane. Free-text evidence is not proof. record-gate also verifies each declared command against the bound workflow job in the candidate commit, so gates.lanes and the workflow cannot drift silently. A gate passes only when every declared command passed against the candidate tree.",
+    "external_evidence": {
+      "command": "--command <JSON argv> names one declared lane command that ran elsewhere against --tree-sha",
+      "ci_run": "--ci-run <https://github.com/<product repository>/actions/runs/<id>> with --ci-head-sha <advanced candidate commit> covers every declared command of the bound lane"
+    }
   },
   "finalization": {
     "method": "compare_and_swap",
@@ -125,6 +319,23 @@
       "partial_publication_forbidden": true,
       "receipt_terminal_state": "aborted",
       "sync_branch_may_be_retained_for_review": true
+    },
+    "rollback": {
+      "scope": "unpromoted_finalized_train_only",
+      "released_product_ref_unchanged": true,
+      "sync_ref_withdrawal": "compare_and_swap_on_finalized_commit",
+      "sync_branch_may_be_retained_for_review": true,
+      "promoted_product_ref_requires_forward_train": true,
+      "promoted_floor_reversal": "not_implemented_refused_with_typed_error",
+      "receipt_terminal_state": "rolled_back"
+    },
+    "gate_binding": {
+      "candidate_tree_recorded_by": "advance-floor",
+      "every_gate_bound_to_candidate_tree_sha": true,
+      "published_tree_may_differ_only_by": "convergence_receipt",
+      "lane_commands_declared_in": "gates.lanes",
+      "stamped_verification_commands_must_be_declared_by_a_lane": true,
+      "stamped_verification_commands_must_pass_before_publish": true
     }
   }
 }

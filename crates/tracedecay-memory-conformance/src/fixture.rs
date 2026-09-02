@@ -5,9 +5,9 @@ use tracedecay_memory_provider_api::contract::{
 };
 use tracedecay_memory_provider_api::{
     ApiError, CancellationToken, CanonicalPayload, CommittedEffectEvidence,
-    CommittedEffectEvidenceParts, FallbackDirective, OperationControl, OwnedExactScope,
-    OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId, ProviderDescriptor, ProviderLimits,
-    ProviderOperation, TerminalRecord, MAX_COMMITTED_EFFECT_ITEM_REFS,
+    CommittedEffectEvidenceParts, FallbackDirective, MAX_COMMITTED_EFFECT_ITEM_REFS,
+    OperationControl, OwnedExactScope, OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId,
+    ProviderDescriptor, ProviderLimits, ProviderOperation, TerminalRecord,
 };
 
 use crate::EvaluationError;
@@ -367,6 +367,10 @@ pub struct ExpectedCommittedEffect {
     pub reconciliation_action: OptionalTextExpectation,
     /// Verification-digest presence or exact value.
     pub verification_sha256: OptionalTextExpectation,
+    /// Deduplicated request idempotency key presence or exact value.
+    pub duplicate_of_idempotency_key: OptionalTextExpectation,
+    /// Original committing operation presence or exact value.
+    pub duplicate_of_operation_id: OptionalTextExpectation,
 }
 
 impl ExpectedCommittedEffect {
@@ -383,6 +387,8 @@ impl ExpectedCommittedEffect {
             provider_receipt_sha256: OptionalTextExpectation::Absent,
             reconciliation_action: OptionalTextExpectation::Absent,
             verification_sha256: OptionalTextExpectation::Absent,
+            duplicate_of_idempotency_key: OptionalTextExpectation::Absent,
+            duplicate_of_operation_id: OptionalTextExpectation::Absent,
         }
     }
 
@@ -399,6 +405,34 @@ impl ExpectedCommittedEffect {
             provider_receipt_sha256: OptionalTextExpectation::Present,
             reconciliation_action: OptionalTextExpectation::Absent,
             verification_sha256: OptionalTextExpectation::Present,
+            duplicate_of_idempotency_key: OptionalTextExpectation::Absent,
+            duplicate_of_operation_id: OptionalTextExpectation::Absent,
+        }
+    }
+
+    /// Requires a duplicate acknowledgement bound to the exact request key and
+    /// the operation whose earlier delivery actually committed.
+    ///
+    /// The generation must not move and no new partition may be claimed: a
+    /// duplicate reports an effect that already existed, so a provider that
+    /// advances state here is applying, not deduplicating.
+    #[must_use]
+    pub fn duplicate(
+        duplicate_of_idempotency_key: OptionalTextExpectation,
+        duplicate_of_operation_id: OptionalTextExpectation,
+    ) -> Self {
+        Self {
+            state: CommittedEffectState::Duplicate,
+            committed_boundary: OptionalTextExpectation::Absent,
+            state_generation_before: EffectGenerationExpectation::OperationBefore,
+            state_generation_after: EffectGenerationExpectation::OperationBefore,
+            committed_item_refs: ItemRefsExpectation::Empty,
+            uncommitted_item_refs: ItemRefsExpectation::Empty,
+            provider_receipt_sha256: OptionalTextExpectation::Present,
+            reconciliation_action: OptionalTextExpectation::Absent,
+            verification_sha256: OptionalTextExpectation::Absent,
+            duplicate_of_idempotency_key,
+            duplicate_of_operation_id,
         }
     }
 
@@ -415,6 +449,8 @@ impl ExpectedCommittedEffect {
             provider_receipt_sha256: OptionalTextExpectation::Present,
             reconciliation_action: OptionalTextExpectation::Present,
             verification_sha256: OptionalTextExpectation::Present,
+            duplicate_of_idempotency_key: OptionalTextExpectation::Absent,
+            duplicate_of_operation_id: OptionalTextExpectation::Absent,
         }
     }
 
@@ -431,6 +467,8 @@ impl ExpectedCommittedEffect {
             provider_receipt_sha256: OptionalTextExpectation::Present,
             reconciliation_action: OptionalTextExpectation::Present,
             verification_sha256: OptionalTextExpectation::Absent,
+            duplicate_of_idempotency_key: OptionalTextExpectation::Absent,
+            duplicate_of_operation_id: OptionalTextExpectation::Absent,
         }
     }
 
@@ -439,8 +477,8 @@ impl ExpectedCommittedEffect {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let generations = match self.state {
             CommittedEffectState::None => {
-                let before_unknown = self.state_generation_before
-                    == EffectGenerationExpectation::Unknown;
+                let before_unknown =
+                    self.state_generation_before == EffectGenerationExpectation::Unknown;
                 let after_unknown =
                     self.state_generation_after == EffectGenerationExpectation::Unknown;
                 if before_unknown != after_unknown {
@@ -449,10 +487,8 @@ impl ExpectedCommittedEffect {
                 if let (
                     EffectGenerationExpectation::Exact(before),
                     EffectGenerationExpectation::Exact(after),
-                ) = (
-                    self.state_generation_before,
-                    self.state_generation_after,
-                ) && before != after
+                ) = (self.state_generation_before, self.state_generation_after)
+                    && before != after
                 {
                     return Err(ApiError::InvalidEffectGenerations);
                 }
@@ -471,14 +507,21 @@ impl ExpectedCommittedEffect {
                 if let (
                     EffectGenerationExpectation::Exact(before),
                     EffectGenerationExpectation::Exact(after),
-                ) = (
-                    self.state_generation_before,
-                    self.state_generation_after,
-                ) && after < before
+                ) = (self.state_generation_before, self.state_generation_after)
+                    && after < before
                 {
                     return Err(ApiError::InvalidEffectGenerations);
                 }
                 (Some(1), Some(2))
+            }
+            CommittedEffectState::Duplicate => {
+                if self.state_generation_before == EffectGenerationExpectation::Unknown
+                    || self.state_generation_after == EffectGenerationExpectation::Unknown
+                    || self.state_generation_before != self.state_generation_after
+                {
+                    return Err(ApiError::InvalidEffectGenerations);
+                }
+                (Some(1), Some(1))
             }
             CommittedEffectState::Unknown => {
                 if self.state_generation_before != EffectGenerationExpectation::Unknown
@@ -536,6 +579,14 @@ impl ExpectedCommittedEffect {
                 "validation-reconciliation-action",
             ),
             verification_sha256: text(&self.verification_sha256, VALIDATION_DIGEST),
+            duplicate_of_idempotency_key: text(
+                &self.duplicate_of_idempotency_key,
+                VALIDATION_DIGEST,
+            ),
+            duplicate_of_operation_id: text(
+                &self.duplicate_of_operation_id,
+                "validation-duplicate-of-operation",
+            ),
         })
     }
 }
@@ -922,7 +973,13 @@ pub fn mandatory_conformance_fixture(
             live_control,
             OperationExpectation {
                 terminal: TerminalExpectation::exactly(TerminalCode::Success),
-                committed_effect: ExpectedCommittedEffect::none(),
+                // The redelivery carries the first observe's idempotency key
+                // under its own operation id, so the acknowledgement has to name
+                // the key it deduplicated and the operation that committed.
+                committed_effect: ExpectedCommittedEffect::duplicate(
+                    OptionalTextExpectation::Exact("mandatory-observation-key".to_owned()),
+                    OptionalTextExpectation::Exact("mandatory-observe-operation".to_owned()),
+                ),
                 fallback: FallbackDirective::forbidden(),
                 state_generation: GenerationExpectation::Unchanged,
                 payload: PayloadExpectation::Exact(canonical_payload(

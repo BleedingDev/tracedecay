@@ -7,24 +7,30 @@ on:
       - ".github/workflows/product-memory-contracts.yml"
       - "product/contracts/memory-provider-v1/**"
       - "product/observations/**"
+      - "crates/tracedecay-memory-hygiene/policy/**"
       - "product/evaluation/**"
       - "scripts/product/**"
       - "tests/product_memory_provider_*"
       - "tests/product_provider_*"
       - "tests/product_host_event_observation_policy_test.py"
+      - "tests/product_observation_hygiene_policy_test.py"
       - "tests/product_tdmem_0901_scenario_corpus_test.py"
+      - "tests/product_tdmem_0904_metric_catalog_test.py"
   push:
     paths:
       - ".beads/issues.jsonl"
       - ".github/workflows/product-memory-contracts.yml"
       - "product/contracts/memory-provider-v1/**"
       - "product/observations/**"
+      - "crates/tracedecay-memory-hygiene/policy/**"
       - "product/evaluation/**"
       - "scripts/product/**"
       - "tests/product_memory_provider_*"
       - "tests/product_provider_*"
       - "tests/product_host_event_observation_policy_test.py"
+      - "tests/product_observation_hygiene_policy_test.py"
       - "tests/product_tdmem_0901_scenario_corpus_test.py"
+      - "tests/product_tdmem_0904_metric_catalog_test.py"
   workflow_dispatch:
 
 permissions:
@@ -67,7 +73,9 @@ jobs:
             tests/product_memory_provider_contract_set_test.py \
             tests/product_memory_provider_rust_bindings_test.py \
             tests/product_host_event_observation_policy_test.py \
-            tests/product_tdmem_0901_scenario_corpus_test.py
+            tests/product_observation_hygiene_policy_test.py \
+            tests/product_tdmem_0901_scenario_corpus_test.py \
+            tests/product_tdmem_0904_metric_catalog_test.py
           do
             python3 "$test_file"
           done

@@ -317,16 +317,20 @@
     },
     {
       "id": "provider_observation_journal",
-      "implementation_state": "planned",
+      "implementation_state": "implemented_unmounted",
       "authority_class": "canonical",
       "owner": "product_observation_dispatcher",
-      "canonical_writer": "TraceDecay product observation dispatcher writing one bounded idempotent provider-observation journal/outbox.",
+      "canonical_writer": "TraceDecay product observation dispatcher writing one bounded idempotent provider-observation journal/outbox, implemented by the tracedecay-memory-observation crate.",
       "write_interfaces": [
-        "planned ObservationDispatchPortV1 after canonical host or operation settlement"
+        "ObservationDispatchPortV1::append_admitted after canonical host or operation settlement",
+        "ObservationDispatchPortV1::record_withheld for a source event admission refused before journalling",
+        "ObservationJournalReaderV1::record_attempt for provider acknowledgement receipts",
+        "ObservationRetentionPortV1::sweep_expired and forget_source for retention expiry and privacy deletion"
       ],
       "read_interfaces": [
-        "planned provider delivery worker",
-        "planned inspection and reconciliation API"
+        "ObservationJournalReaderV1::lease_pending for the provider delivery worker",
+        "ObservationJournalReaderV1::inspect and receipts_for for inspection and reconciliation",
+        "ObservationDispatchPortV1::replay_cursor and queue_pressure for restart recovery and backpressure"
       ],
       "consistency_model": "At-least-once delivery from a durable journal, deduplicated by operation ID plus provider and exact scope. Provider acknowledgements are receipts; queue capacity and retry policy are bounded.",
       "failure_behavior": "Observer-mode dispatch failure is recorded and retryable but cannot alter prompts, Native facts, source edits, session ingest, or the already-settled host action. Capacity exhaustion returns a typed terminal outcome and never drops silently.",
@@ -352,6 +356,11 @@
         "provider adapter writing journal records without dispatcher admission"
       ],
       "source_paths": [
+        "crates/tracedecay-memory-observation/src/port.rs",
+        "crates/tracedecay-memory-observation/src/sqlite/append.rs",
+        "crates/tracedecay-memory-observation/src/sqlite/dispatch.rs",
+        "crates/tracedecay-memory-observation/src/sqlite/retention.rs",
+        "crates/tracedecay-memory-observation/src/sqlite/schema.rs",
         "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
         "crates/tracedecay/src/daemon/service/invocation/feedback.rs",
         "product/architecture/native-memory-surface-map.json"
@@ -550,7 +559,7 @@
     },
     {
       "id": "no_silent_fallback",
-      "rule": "Provider selection occurs only in the capability registry under pinned configuration. Failure never switches providers or routes to Native implicitly; any future fallback policy must be explicit, observable, and separately accepted."
+      "rule": "Provider selection occurs only in the capability registry under pinned configuration: the memory.provider_recall_routing.v1 gate names the one active recall provider and MemoryFabric::route_active refuses observer, disabled, unregistered, or mis-revisioned registrations before any contact. Failure never switches providers or routes to Native implicitly; fallback dispatches only when the provider terminal is explicit_policy_only and the host FallbackRule::ExplicitPinned carries the identical policy id, revision, and target, otherwise the original reply is returned with a typed, observable FallbackDeclinedReason. Every routed result names the provider it is attributed to, so any fallback that does occur is explicit, observable, and separately accepted."
     },
     {
       "id": "provider_name_isolation",

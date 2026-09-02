@@ -54,6 +54,8 @@ pub const INDEX_EXTRACT_DOCSTRINGS_SETTING_KEY: &str = "index.extract_docstrings
 pub const INDEX_TRACK_CALL_SITES_SETTING_KEY: &str = "index.track_call_sites.v1";
 pub const INDEX_GIT_IGNORE_SETTING_KEY: &str = "index.git_ignore.v1";
 pub const INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY: &str = "index.native_graph_activation.v1";
+pub const MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY: &str = "memory.provider_native_enabled.v1";
+pub const MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY: &str = "memory.provider_recall_routing.v1";
 pub const DIAGNOSTICS_PREWARM_SETTING_KEY: &str = "diagnostics.prewarm.v1";
 pub const SEMANTIC_RUNTIME_SETTING_KEY: &str = "semantic.runtime.v1";
 pub const SYNC_AUTO_WATCH_SETTING_KEY: &str = "sync.auto_watch.v1";
@@ -99,6 +101,8 @@ pub const CONFIGURATION_SETTING_KEYS_V1: &[&str] = &[
     INDEX_TRACK_CALL_SITES_SETTING_KEY,
     INDEX_GIT_IGNORE_SETTING_KEY,
     INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
+    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
     DIAGNOSTICS_PREWARM_SETTING_KEY,
     SEMANTIC_RUNTIME_SETTING_KEY,
     SYNC_AUTO_WATCH_SETTING_KEY,
@@ -925,6 +929,73 @@ impl ContextScoutConfigurationLimitsV1 {
             return Err(DomainError::NonCanonical {
                 field: "context scout configuration limits",
             });
+        }
+        Ok(())
+    }
+}
+
+/// Host-pinned fallback rule for cognitive recall: the one alternate
+/// provider a failing active provider may hand a recall to, and only when the
+/// provider's own terminal carries this identical policy identity, revision,
+/// and target.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryProviderRecallFallbackV1 {
+    pub policy_id: String,
+    pub policy_revision: u64,
+    pub target_provider: String,
+}
+
+/// Explicit routing gate for cognitive recall.
+///
+/// `active_provider` names the one provider allowed to answer product recall;
+/// `None` (the default) leaves every enabled provider an observer, so turning
+/// the provider host on never promotes a provider to active output on its
+/// own. `fallback` is `None` (no fallback, whatever a provider suggests)
+/// unless an operator pins a complete rule whose target differs from the
+/// active provider. The value is stored as canonical JSON text under
+/// [`MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryProviderRecallRoutingV1 {
+    #[serde(default)]
+    pub active_provider: Option<String>,
+    #[serde(default)]
+    pub fallback: Option<MemoryProviderRecallFallbackV1>,
+}
+
+impl MemoryProviderRecallRoutingV1 {
+    /// Rejects blank identities, a zero fallback revision, a fallback pinned
+    /// without an active provider, and a fallback that targets the active
+    /// provider itself.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if let Some(active) = &self.active_provider {
+            validate_canonical_label(active, "memory provider recall active provider")?;
+        }
+        if let Some(fallback) = &self.fallback {
+            let Some(active) = &self.active_provider else {
+                return Err(DomainError::NonCanonical {
+                    field: "memory provider recall fallback without active provider",
+                });
+            };
+            validate_canonical_label(
+                &fallback.policy_id,
+                "memory provider recall fallback policy id",
+            )?;
+            validate_canonical_label(
+                &fallback.target_provider,
+                "memory provider recall fallback target provider",
+            )?;
+            if fallback.policy_revision == 0 {
+                return Err(DomainError::NonCanonical {
+                    field: "memory provider recall fallback policy revision",
+                });
+            }
+            if &fallback.target_provider == active {
+                return Err(DomainError::NonCanonical {
+                    field: "memory provider recall fallback target equals active provider",
+                });
+            }
         }
         Ok(())
     }

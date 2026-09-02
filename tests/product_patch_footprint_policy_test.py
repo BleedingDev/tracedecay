@@ -206,9 +206,9 @@ class PatchFootprintPolicyTest(unittest.TestCase):
 
     def test_budget_cannot_be_silently_loosened(self) -> None:
         policy = copy.deepcopy(self.policy)
-        policy["initial_budget"]["max_total_upstream_changed_lines"] = 901
+        policy["initial_budget"]["max_total_upstream_changed_lines"] = 3301
         self.assert_rejected(
-            "initial_budget.max_total_upstream_changed_lines must be 900",
+            "initial_budget.max_total_upstream_changed_lines must be 3300",
             policy=policy,
         )
 
@@ -247,6 +247,7 @@ class PatchFootprintPolicyTest(unittest.TestCase):
     def test_shutdown_and_harness_touch_points_cannot_be_removed(self) -> None:
         for touch_id in (
             "daemon_shutdown_deadline",
+            "production_harness_shutdown",
             "integration_test_runtime_isolation",
         ):
             with self.subTest(touch_id=touch_id):
@@ -273,6 +274,10 @@ class PatchFootprintPolicyTest(unittest.TestCase):
             ),
             "crates/tracedecay/src/daemon/invocation_state.rs": (
                 "daemon_shutdown_deadline",
+                "shutdown_deadline",
+            ),
+            "crates/tracedecay/src/daemon/production_harness.rs": (
+                "production_harness_shutdown",
                 "shutdown_deadline",
             ),
             "crates/tracedecay/src/daemon/service/invocation/lsp.rs": (
@@ -318,6 +323,39 @@ class PatchFootprintPolicyTest(unittest.TestCase):
                 )
                 self.assertEqual(entries[path]["touch_point"], touch_id)
                 self.assertEqual(entries[path]["area_id"], area_id)
+
+    def test_cognitive_recall_contract_paths_have_exact_authority(self) -> None:
+        paths = {
+            "crates/tracedecay-application/src/memory.rs",
+            "crates/tracedecay-application/src/memory/recall.rs",
+            "crates/tracedecay-application/tests/cognitive_recall_port.rs",
+            "crates/tracedecay/tests/application_production_reachability.rs",
+        }
+        touches = {
+            row["id"]: row for row in self.policy["allowed_touch_points"]
+        }
+        areas = {row["id"]: row for row in self.convergence_map["areas"]}
+        entries = {
+            row["path"]: row for row in self.convergence_map["entries"]
+        }
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertEqual(
+                    CHECKER_MODULE.matching_touch_points(path, touches),
+                    ["cognitive_recall_contract"],
+                )
+                self.assertEqual(
+                    CHECKER_MODULE.matching_active_area_ids(
+                        path, areas, "upstream_owned"
+                    ),
+                    ["application_recall_contract"],
+                )
+                self.assertEqual(
+                    entries[path]["touch_point"], "cognitive_recall_contract"
+                )
+                self.assertEqual(
+                    entries[path]["area_id"], "application_recall_contract"
+                )
 
     def test_missing_dependency_direction_rule_is_rejected(self) -> None:
         policy = copy.deepcopy(self.policy)

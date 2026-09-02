@@ -235,7 +235,16 @@ production = [
 # Product-owned provider composition is mounted at the daemon project-server
 # lifetime boundary. Keeping the dependency optional leaves feature-minimal
 # builds free of provider-registry code.
-memory-provider-host = ["dep:tracedecay-memory-provider-registry"]
+#
+# The durable observation journal and the hygiene pipeline join the same
+# feature rather than getting one of their own: a mounted provider host that
+# cannot journal or sanitize would be a dispatch path with no outbox and no
+# secret gate, which is worse than no mount at all.
+memory-provider-host = [
+    "dep:tracedecay-memory-provider-registry",
+    "dep:tracedecay-memory-observation",
+    "dep:tracedecay-memory-hygiene",
+]
 
 # Exact token counting for the Savings & Cost dashboard (tiktoken BPE).
 # Embeds the o200k_base/cl100k_base vocabularies (~4 MB of binary weight);
@@ -432,6 +441,8 @@ tracedecay-mcp = { path = "../tracedecay-mcp", version = "0.1.0" }
 tracedecay-lsp = { path = "../tracedecay-lsp", version = "0.1.0" }
 tracedecay-maintenance = { path = "../tracedecay-maintenance", version = "0.1.0" }
 tracedecay-memory-provider-registry = { path = "../tracedecay-memory-provider-registry", optional = true }
+tracedecay-memory-observation = { path = "../tracedecay-memory-observation", optional = true }
+tracedecay-memory-hygiene = { path = "../tracedecay-memory-hygiene", optional = true }
 tracedecay-global-db = { path = "../tracedecay-global-db", version = "0.1.0" }
 tracedecay-graph-db = { path = "../tracedecay-graph-db", version = "0.1.0" }
 tracedecay-policy = { path = "../tracedecay-policy", version = "0.1.0" }
@@ -525,6 +536,8 @@ criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 jsonschema = { version = "0.46.8", default-features = false }
 tracedecay-sdk = { path = "../tracedecay-sdk", version = "0.1.0" }
+# Root-only Native baseline over the coding-memory scenario corpus (tdmem-0902).
+tracedecay-memory-conformance = { path = "../tracedecay-memory-conformance" }
 # Test builds opt into the query kernel's `*_for_test` constructors; the
 # feature stays off for production builds.
 tracedecay-query = { path = "../tracedecay-query", version = "0.1.0", features = ["test-helpers"] }

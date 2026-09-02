@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tracedecay.dev/schemas/product/upstream/sync-train-receipt.schema.json",
   "title": "TraceDecay upstream sync-train convergence receipt",
-  "description": "A terminal, product-owned receipt for one isolated upstream convergence train. It records the immutable starting point, conflict decisions, gate outcomes, and the compare-and-swap publication result.",
+  "description": "A terminal, product-owned receipt for one isolated upstream convergence train. It records the immutable starting point, conflict decisions, gate outcomes bound to the exact gated candidate tree, the floor advancement, and the compare-and-swap publication result. A rolled_back receipt covers only an unpromoted train: the isolated sync ref was withdrawn and the released product ref never moved; reversing a promoted floor is not a rollback and has no receipt state here.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -21,6 +21,7 @@
     "sync",
     "conflicts",
     "gates",
+    "floor_advancement",
     "terminal",
     "finalization"
   ],
@@ -77,6 +78,9 @@
       "items": {
         "$ref": "#/$defs/gate"
       }
+    },
+    "floor_advancement": {
+      "$ref": "#/$defs/floor_advancement"
     },
     "terminal": {
       "$ref": "#/$defs/terminal"
@@ -167,6 +171,24 @@
                 }
               }
             }
+          },
+          "floor_advancement": {
+            "properties": {
+              "outcome": {
+                "const": "advanced"
+              },
+              "gated_tree_sha": {
+                "$ref": "#/$defs/sha"
+              },
+              "verification_coverage": {
+                "type": "object",
+                "properties": {
+                  "uncovered_commands": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -211,6 +233,109 @@
                   "result": {
                     "enum": [
                       "mismatch_aborted",
+                      "not_attempted"
+                    ]
+                  }
+                }
+              },
+              "same_commit": {
+                "properties": {
+                  "verified": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          },
+          "floor_advancement": {
+            "properties": {
+              "outcome": {
+                "const": "not_advanced"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal": {
+            "properties": {
+              "state": {
+                "const": "rolled_back"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "gates": {
+            "minItems": 6,
+            "maxItems": 6,
+            "prefixItems": [
+              {
+                "$ref": "#/$defs/passed_upstream_required_gate"
+              },
+              {
+                "$ref": "#/$defs/passed_product_contracts_gate"
+              },
+              {
+                "$ref": "#/$defs/passed_native_parity_gate"
+              },
+              {
+                "$ref": "#/$defs/passed_provider_conformance_gate"
+              },
+              {
+                "$ref": "#/$defs/passed_scope_crash_security_gate"
+              },
+              {
+                "$ref": "#/$defs/passed_generated_drift_gate"
+              }
+            ]
+          },
+          "floor_advancement": {
+            "properties": {
+              "outcome": {
+                "const": "withdrawn"
+              },
+              "gated_tree_sha": {
+                "$ref": "#/$defs/sha"
+              },
+              "verification_coverage": {
+                "type": "object",
+                "properties": {
+                  "uncovered_commands": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          },
+          "finalization": {
+            "properties": {
+              "outcome": {
+                "const": "withdrawn"
+              },
+              "sync_head_sha": {
+                "$ref": "#/$defs/sha"
+              },
+              "released_head_sha": {
+                "$ref": "#/$defs/sha"
+              },
+              "released_ref_update": {
+                "properties": {
+                  "mode": {
+                    "const": "unchanged"
+                  }
+                }
+              },
+              "cas": {
+                "properties": {
+                  "result": {
+                    "enum": [
+                      "matched_and_withdrawn",
                       "not_attempted"
                     ]
                   }
@@ -290,8 +415,26 @@
             },
             "status": {
               "const": "passed"
+            },
+            "tree_sha": {
+              "$ref": "#/$defs/sha"
+            },
+            "coverage": {
+              "type": "object",
+              "properties": {
+                "missing": {
+                  "maxItems": 0
+                }
+              }
+            },
+            "commands": {
+              "type": "array",
+              "minItems": 1
             }
-          }
+          },
+          "required": [
+            "tree_sha"
+          ]
         }
       ]
     },
@@ -499,7 +642,8 @@
             "passed",
             "failed",
             "skipped",
-            "not_run"
+            "not_run",
+            "in_progress"
           ]
         },
         "command": {
@@ -523,6 +667,35 @@
         "summary": {
           "type": "string",
           "minLength": 1
+        },
+        "tree_sha": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/sha"
+            }
+          ],
+          "description": "The exact candidate tree SHA the gate ran against; null only while a gate has not run."
+        },
+        "commands": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/gate_command"
+          },
+          "description": "One record per declared lane command; a gate passes only when every declared command passed against the candidate tree."
+        },
+        "coverage": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/gate_coverage"
+            }
+          ]
         }
       }
     },
@@ -538,7 +711,8 @@
           "enum": [
             "succeeded",
             "failed",
-            "aborted"
+            "aborted",
+            "rolled_back"
           ]
         },
         "reason": {
@@ -564,7 +738,8 @@
         "outcome": {
           "enum": [
             "published",
-            "not_published"
+            "not_published",
+            "withdrawn"
           ]
         },
         "sync_ref": {
@@ -671,6 +846,7 @@
         "result": {
           "enum": [
             "matched_and_published",
+            "matched_and_withdrawn",
             "mismatch_aborted",
             "not_attempted"
           ]
@@ -723,6 +899,264 @@
             "floor_metadata",
             "convergence_receipt"
           ]
+        }
+      }
+    },
+    "floor_pin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "kind",
+        "occurrences",
+        "each_occurrences"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": [
+            "json_pointer",
+            "anchored_line",
+            "derived_metadata_receipt"
+          ]
+        },
+        "occurrences": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "each_occurrences": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many of the occurrences came from wildcard per-entry pointers (verification stamps advanced together with the floor)."
+        }
+      }
+    },
+    "archival_provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "reason",
+        "blob_sha"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "blob_sha": {
+          "$ref": "#/$defs/sha"
+        }
+      }
+    },
+    "floor_advancement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outcome",
+        "previous_floor_sha",
+        "candidate_floor_sha",
+        "canonical_metadata",
+        "gated_tree_sha",
+        "pins",
+        "archival_provenance",
+        "verification_coverage"
+      ],
+      "properties": {
+        "outcome": {
+          "enum": [
+            "advanced",
+            "not_advanced",
+            "withdrawn"
+          ]
+        },
+        "previous_floor_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "candidate_floor_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "canonical_metadata": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pins": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/floor_pin"
+          }
+        },
+        "archival_provenance": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/archival_provenance"
+          }
+        },
+        "gated_tree_sha": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/sha"
+            }
+          ],
+          "description": "Tree SHA (code, resolved conflicts, advanced metadata and pins, no receipt) every recorded gate is bound to. The published tree differs from it only by the convergence receipt."
+        },
+        "verification_coverage": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/verification_coverage"
+            }
+          ]
+        }
+      }
+    },
+    "gate_command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "source",
+        "status",
+        "exit_code",
+        "evidence",
+        "tree_sha",
+        "recorded_at"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The declared lane command, verbatim from sync policy gates.lanes."
+        },
+        "source": {
+          "enum": [
+            "executed",
+            "external_command",
+            "ci_run"
+          ]
+        },
+        "status": {
+          "enum": [
+            "passed",
+            "failed"
+          ]
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "tree_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "recorded_at": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "gate_coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "declared",
+        "passed",
+        "missing"
+      ],
+      "properties": {
+        "declared": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "missing": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "verification_coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stamped_targets",
+        "required_commands",
+        "covered_commands",
+        "uncovered_commands",
+        "lane_commands"
+      ],
+      "description": "Which verification/tests commands the wildcard-stamped convergence targets require and whether the recorded gate lanes covered them; publication requires uncovered_commands to be empty.",
+      "properties": {
+        "stamped_targets": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "required_commands": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "covered_commands": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "uncovered_commands": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "lane_commands": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "declared",
+              "passed"
+            ],
+            "properties": {
+              "declared": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "passed": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
         }
       }
     }

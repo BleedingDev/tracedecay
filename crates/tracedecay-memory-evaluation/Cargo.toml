@@ -1,0 +1,30 @@
+[package]
+name = "tracedecay-memory-evaluation"
+version.workspace = true
+edition.workspace = true
+publish = false
+license = "MIT"
+description = "Versioned memory-quality, safety, cost, and latency metrics over coding-memory scenario runs"
+repository = "https://github.com/BleedingDev/tracedecay"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracedecay-memory-conformance = { path = "../tracedecay-memory-conformance" }
+tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+warnings = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"

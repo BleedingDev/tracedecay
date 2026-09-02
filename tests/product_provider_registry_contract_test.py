@@ -233,6 +233,38 @@ class ProviderRegistryContractTest(unittest.TestCase):
         )
         self.assert_rejected("branches on a concrete provider name")
 
+    def test_rejects_provider_self_declared_or_widened_recall_scope_bindings(self) -> None:
+        self.mutate_contract(
+            lambda contract: contract["registration_contract"]["recall_scope_bindings"].__setitem__(
+                "provider_may_self_declare", True
+            )
+        )
+        self.assert_rejected("providers cannot self-declare recall scope bindings")
+
+    def test_rejects_widened_native_recall_scope_bindings(self) -> None:
+        self.mutate_contract(
+            lambda contract: contract["registration_contract"]["recall_scope_bindings"][
+                "provider_declarations"
+            ]["tracedecay.native"].append("exact_coding_scope")
+        )
+        self.assert_rejected("tracedecay.native must be authorized for project_facts and profile_facts only")
+
+    def test_rejects_ncm_recall_scope_bindings_beyond_exact_coding_scope(self) -> None:
+        self.mutate_contract(
+            lambda contract: contract["registration_contract"]["recall_scope_bindings"][
+                "provider_declarations"
+            ].__setitem__("ncm", ["project_facts"])
+        )
+        self.assert_rejected("ncm must be authorized for exact_coding_scope only")
+
+    def test_rejects_registration_without_recall_scope_bindings_field(self) -> None:
+        self.mutate_contract(
+            lambda contract: contract["registration_contract"]["required_fields"].remove(
+                "recall_scope_bindings"
+            )
+        )
+        self.assert_rejected("registration required_fields drifted")
+
     def test_rejects_silent_fallback(self) -> None:
         self.mutate_contract(lambda contract: contract["selection_contract"].__setitem__("silent_fallback", True))
         self.assert_rejected("silent_fallback must be False")

@@ -11,9 +11,10 @@ use tracedecay_memory_provider_api::contract::{
 use tracedecay_memory_provider_api::{
     CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
     HandshakeRequest, HandshakeRequestParts, HandshakeResponse, OperationControl, OwnedExactScope,
-    OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId, PinnedFallbackPolicy, ProviderCall,
-    ProviderCallParts, ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply,
-    TerminalRecord,
+    OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId, PayloadSanitizationReceipt,
+    PayloadSanitizationReceiptParts, PinnedFallbackPolicy, ProviderCall, ProviderCallParts,
+    ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
+    observation_extensions_digest,
 };
 use tracedecay_memory_provider_native::{
     NATIVE_PROVIDER_ID, NativeAdapterError, NativeMemoryApplicationPort, NativeObservation,
@@ -21,7 +22,7 @@ use tracedecay_memory_provider_native::{
 use tracedecay_memory_provider_registry::{
     EnabledProviderMode, FabricConfig, FabricError, NativeProviderActivation, ObserverReceipt,
     ProjectMemoryProviderComposition, ProviderCapabilityAvailability, ProviderMode,
-    ProviderReadiness, RegistryError,
+    ProviderReadiness, ReadinessTargetError, RegistryError,
 };
 
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -32,6 +33,8 @@ const REGISTRY_PAYLOAD_SHA: &str =
 const OPAQUE_PAYLOAD_SHA: &str = "a4ebe309c7d7eaf1b08aec54feea5668a4b10a564770d162dbd7a131990d0de8";
 const OBSERVATION_PAYLOAD_SHA: &str =
     "b6c0cb54c14eb8485ba9f86925c370bbcb8e464687f875b7fa1085a1d1b9b1fe";
+const RESOLVED_SCOPE_DIGEST: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const OBSERVATION_PAYLOAD: &[u8] = br#"{"canonical_payload":{"kind":"settled_native_fact_write","fact":{"fixture":true},"commit":{"fixture":true}},"observation_kind":"native.fact_promoted.v1","payload_contract":"tracedecay.memory.observation.native-fact-promotion.v1"}"#;
 
 struct MockNativePort {
@@ -111,6 +114,7 @@ struct EvidenceNativePort {
     descriptor: ProviderDescriptor,
     handshake_terminal_operation: ProviderOperation,
     handshake_terminal_provider_id: OwnedProviderId,
+    handshake_accepted_scope: Option<OwnedExactScope>,
     handshake_calls: AtomicUsize,
     health_calls: AtomicUsize,
     observe_calls: AtomicUsize,
@@ -123,6 +127,7 @@ impl EvidenceNativePort {
             handshake_terminal_operation: ProviderOperation::Handshake,
             handshake_terminal_provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID)
                 .expect("native provider"),
+            handshake_accepted_scope: None,
             handshake_calls: AtomicUsize::new(0),
             health_calls: AtomicUsize::new(0),
             observe_calls: AtomicUsize::new(0),
@@ -133,6 +138,14 @@ impl EvidenceNativePort {
         self.handshake_terminal_operation = operation;
         self.handshake_terminal_provider_id =
             OwnedProviderId::new(provider_id).expect("terminal provider");
+        self
+    }
+
+    /// Makes the mock lie about the accepted exact scope, standing in for a
+    /// provider that echoes a foreign or stale coding-scope identity instead
+    /// of the one the request actually carried.
+    fn with_handshake_accepted_scope(mut self, scope: OwnedExactScope) -> Self {
+        self.handshake_accepted_scope = Some(scope);
         self
     }
 
@@ -220,7 +233,11 @@ impl NativeMemoryApplicationPort for EvidenceNativePort {
             descriptor: Some(self.descriptor.clone()),
             provider_instance_id: Some("native.registry-instance".to_owned()),
             state_namespace: Some("native.registry-scope".to_owned()),
-            accepted_scope: Some(request.exact_scope.clone()),
+            accepted_scope: Some(
+                self.handshake_accepted_scope
+                    .clone()
+                    .unwrap_or_else(|| request.exact_scope.clone()),
+            ),
             effective_limits: Some(request.host_limits.minimum(self.descriptor.limits)),
             ready_receipt_sha256: Some(ONE_SHA.to_owned()),
             warnings: Vec::new(),
@@ -318,9 +335,22 @@ fn exact_scope() -> OwnedExactScope {
         "worktree-registry",
         "refs/heads/registry",
         "session-registry",
-        3,
+        RESOLVED_SCOPE_DIGEST,
     )
     .expect("exact scope")
+}
+
+fn foreign_exact_scope() -> OwnedExactScope {
+    OwnedExactScope::new(
+        "profile-foreign",
+        "project-foreign",
+        "repository-foreign",
+        "worktree-foreign",
+        "refs/heads/foreign",
+        "session-foreign",
+        RESOLVED_SCOPE_DIGEST,
+    )
+    .expect("foreign exact scope")
 }
 
 fn call_after_handshake(
@@ -390,7 +420,35 @@ fn call_after_handshake(
             .expect("optional extension"),
         ],
     })
+    .map(admitted)
     .expect("provider call")
+}
+
+/// Sanitizer revision this harness stands in for. The real revision is derived
+/// by `tracedecay-memory-hygiene` from the canonical policy document.
+const TEST_SANITIZER_REVISION: &str = "tracedecay.memory.observation.hygiene.v1+registry-test";
+
+/// Attaches the receipt the admitted hygiene pipeline mints for a payload it
+/// read and left byte-identical. Observation dispatch fails closed without one.
+fn admitted(call: ProviderCall) -> ProviderCall {
+    if call.operation != ProviderOperation::Observe {
+        return call;
+    }
+    // The receipt binds the sanitized payload *and* the exact opaque
+    // extensions dispatched with it; a receipt over the empty extension set
+    // would be rejected as unbound for the optional extension this fixture
+    // carries.
+    let extensions_digest =
+        observation_extensions_digest(&call.extensions).expect("observation extensions digest");
+    let receipt = PayloadSanitizationReceipt::new(
+        PayloadSanitizationReceiptParts::accepted_unmodified_with_extensions(
+            TEST_SANITIZER_REVISION,
+            call.payload.sha256.clone(),
+            extensions_digest,
+        ),
+    )
+    .expect("accepted sanitization receipt");
+    call.with_sanitization(receipt)
 }
 
 fn handshake() -> HandshakeRequest {
@@ -806,5 +864,122 @@ fn observer_route_strips_output_but_preserves_structured_effect_evidence()
     assert_eq!(terminal.fallback().source_provider_id(), None);
     assert_eq!(terminal.fallback().policy(), None);
     assert_eq!(terminal.fallback().reason(), None);
+    Ok(())
+}
+
+#[test]
+fn readiness_target_derives_only_from_validated_handshake_evidence() -> Result<(), Box<dyn Error>> {
+    let port = Arc::new(EvidenceNativePort::new());
+    let composition =
+        ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
+            fabric_config: config(1, 2),
+            port,
+            registration_revision: 31,
+            mode: EnabledProviderMode::Active,
+        })?;
+    let registry = composition.registry().expect("enabled registry");
+
+    let target = registry.readiness_target(&handshake())?;
+
+    assert_eq!(target.provider_id().as_str(), NATIVE_PROVIDER_ID);
+    assert_eq!(target.provider_instance_id(), "native.registry-instance");
+    assert_eq!(target.registration_revision(), 31);
+    assert_eq!(target.ready_receipt_sha256(), ONE_SHA);
+    Ok(())
+}
+
+#[test]
+fn readiness_target_rejects_stale_registration_revision() -> Result<(), Box<dyn Error>> {
+    let port = Arc::new(EvidenceNativePort::new());
+    let composition =
+        ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
+            fabric_config: config(1, 2),
+            port,
+            registration_revision: 31,
+            mode: EnabledProviderMode::Active,
+        })?;
+    let registry = composition.registry().expect("enabled registry");
+
+    let mut stale_request_parts = HandshakeRequestParts {
+        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider"),
+        registration_revision: 30,
+        exact_scope: exact_scope(),
+        request_id: "registry-handshake-stale-revision".to_owned(),
+        required_capabilities: vec![
+            OwnedVersionedId::new("provider.health.v1").expect("health capability"),
+            OwnedVersionedId::new("observation.accept.v1").expect("observation capability"),
+            OwnedVersionedId::new("recall.query.v1").expect("recall capability"),
+        ],
+        host_limits: limits(),
+        control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
+        challenge_nonce: [7; 32],
+    };
+    let stale_request =
+        HandshakeRequest::new(stale_request_parts.clone()).expect("stale handshake request");
+
+    let result = registry.readiness_target(&stale_request);
+    assert_eq!(
+        result,
+        Err(ReadinessTargetError::Fabric(
+            FabricError::RegistrationRevisionMismatch {
+                accepted: 31,
+                requested: 30,
+            }
+        ))
+    );
+
+    // A stale revision never derives a target even once corrected on a later
+    // call: readiness_target re-validates every call independently instead
+    // of trusting a previously rejected request's cached shape.
+    stale_request_parts.registration_revision = 31;
+    stale_request_parts.request_id = "registry-handshake-corrected-revision".to_owned();
+    let corrected_request =
+        HandshakeRequest::new(stale_request_parts).expect("corrected handshake request");
+    let target = registry.readiness_target(&corrected_request)?;
+    assert_eq!(target.registration_revision(), 31);
+    assert_eq!(target.ready_receipt_sha256(), ONE_SHA);
+    Ok(())
+}
+
+#[test]
+fn readiness_target_rejects_foreign_accepted_scope() -> Result<(), Box<dyn Error>> {
+    let port =
+        Arc::new(EvidenceNativePort::new().with_handshake_accepted_scope(foreign_exact_scope()));
+    let composition =
+        ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
+            fabric_config: config(1, 2),
+            port,
+            registration_revision: 31,
+            mode: EnabledProviderMode::Active,
+        })?;
+    let registry = composition.registry().expect("enabled registry");
+
+    let result = registry.readiness_target(&handshake());
+    assert_eq!(
+        result,
+        Err(ReadinessTargetError::Fabric(
+            FabricError::SuccessfulHandshakeScopeMismatch
+        ))
+    );
+
+    // The registry retains no readiness from the rejected attempt: status
+    // still reports NotReady, so no stale scope could leak into a later
+    // target derivation either.
+    let statuses = registry.statuses()?;
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].readiness, ProviderReadiness::NotReady);
+    Ok(())
+}
+
+#[test]
+fn disabled_composition_has_no_receiver_for_readiness_target() -> Result<(), Box<dyn Error>> {
+    let composition =
+        ProjectMemoryProviderComposition::compose(NativeProviderActivation::Disabled)?;
+
+    // Disabled composition constructs no fabric, adapter, or registration,
+    // so there is no `ProjectMemoryProviderRegistry` value to call
+    // `readiness_target` on: the type system itself keeps disabled
+    // composition from ever activating a readiness target.
+    assert!(composition.registry().is_none());
     Ok(())
 }

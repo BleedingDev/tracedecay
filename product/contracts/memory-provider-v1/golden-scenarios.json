@@ -194,11 +194,17 @@
       "input": {
         "idempotency_key": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "first_payload_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "retry_payload_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        "retry_payload_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "first_operation_id": "observe-operation-1",
+        "retry_operation_id": "observe-operation-2"
       },
       "expected": {
         "terminal_code": "success",
         "acceptance_outcome": "duplicate_acknowledged",
+        "committed_effect": "duplicate",
+        "duplicate_of_idempotency_key": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "duplicate_of_operation_id": "observe-operation-1",
+        "state_generation_unchanged": true,
         "second_provider_effect_created": false
       }
     },
@@ -317,8 +323,8 @@
       "contract_id": "tracedecay.memory.provider.recall.v1",
       "operation": "recall",
       "input": {
-        "request_scope_revision": 12,
-        "ready_receipt_scope_revision": 11,
+        "request_resolved_scope_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "ready_receipt_resolved_scope_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "request_worktree": "worktree-a",
         "candidate_worktree": "worktree-a"
       },
@@ -336,7 +342,7 @@
       "input": {
         "temporal_mode": "current",
         "evaluation_time": "2026-08-30T15:00:00Z",
-        "scope_revision": 12,
+        "resolved_scope_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
         "maximum_candidates": 3
       },
       "expected": {
@@ -354,7 +360,7 @@
       "operation": "recall",
       "input": {
         "query": "unknown symbol convention",
-        "scope_revision": 12
+        "resolved_scope_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
       },
       "expected": {
         "terminal_code": "success_zero_results",

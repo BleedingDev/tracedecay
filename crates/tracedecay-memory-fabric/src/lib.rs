@@ -29,6 +29,13 @@ use tracedecay_memory_provider_api::{
     ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
 };
 
+pub mod routing;
+pub use routing::{
+    ActiveCallPlan, ActiveRoutingPolicy, FallbackDecision, FallbackDeclinedReason, FallbackRule,
+    ReadyRouteTarget, RouteTarget, RoutedActiveReply, RoutedProviderIdentity, RoutingError,
+    RoutingPolicyError,
+};
+
 /// Provider participation mode selected by TraceDecay configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderMode {
@@ -830,6 +837,14 @@ impl MemoryFabric {
             self.invalidate_matching_readiness(call)?;
             return Err(error);
         }
+        // A duplicate acknowledgement settles a delivery without the provider
+        // doing anything, so it has to name the key of the call it answers.
+        // Only the host knows which mutation it delivered; a provider that
+        // deduplicated something else is refused here rather than believed.
+        if let Err(error) = reply.terminal.validate_duplicate_binding_for_call(call) {
+            self.invalidate_matching_readiness(call)?;
+            return Err(error.into());
+        }
         self.settle_readiness(
             call,
             reply.terminal.committed_effect().state_generation_after(),
@@ -875,6 +890,14 @@ impl MemoryFabric {
         ) {
             self.invalidate_matching_readiness(call)?;
             return Err(error);
+        }
+        // A duplicate acknowledgement settles a delivery without the provider
+        // doing anything, so it has to name the key of the call it answers.
+        // Only the host knows which mutation it delivered; a provider that
+        // deduplicated something else is refused here rather than believed.
+        if let Err(error) = reply.terminal.validate_duplicate_binding_for_call(call) {
+            self.invalidate_matching_readiness(call)?;
+            return Err(error.into());
         }
         self.settle_readiness(
             call,

@@ -78,6 +78,10 @@ pub struct Terminal<T> {
     pub diagnostic_id: Option<String>,
     /// Provider state generation observed after the call.
     pub state_generation: u64,
+    /// Request idempotency key a duplicate acknowledgement deduplicated.
+    pub duplicate_of_idempotency_key: Option<String>,
+    /// Operation whose earlier delivery actually committed the effect.
+    pub duplicate_of_operation_id: Option<String>,
 }
 
 impl<T> Terminal<T> {
@@ -89,6 +93,32 @@ impl<T> Terminal<T> {
             payload: Some(payload),
             diagnostic_id: None,
             state_generation,
+            duplicate_of_idempotency_key: None,
+            duplicate_of_operation_id: None,
+        }
+    }
+
+    /// Reports a redelivery of a mutation this provider already committed.
+    ///
+    /// The generation is unchanged because nothing new was written, and the
+    /// evidence names both the key that matched and the operation that
+    /// originally committed, so the host can tell this is the same mutation
+    /// rather than a second effect.
+    fn duplicate(
+        payload: T,
+        state_generation: u64,
+        duplicate_of_idempotency_key: String,
+        duplicate_of_operation_id: String,
+    ) -> Self {
+        Self {
+            terminal_code: TerminalCode::Success,
+            committed_effect: CommittedEffectState::Duplicate,
+            fallback: FallbackEligibility::Forbidden,
+            payload: Some(payload),
+            diagnostic_id: None,
+            state_generation,
+            duplicate_of_idempotency_key: Some(duplicate_of_idempotency_key),
+            duplicate_of_operation_id: Some(duplicate_of_operation_id),
         }
     }
 
@@ -100,6 +130,8 @@ impl<T> Terminal<T> {
             payload: Some(payload),
             diagnostic_id: None,
             state_generation,
+            duplicate_of_idempotency_key: None,
+            duplicate_of_operation_id: None,
         }
     }
 
@@ -111,6 +143,8 @@ impl<T> Terminal<T> {
             payload: None,
             diagnostic_id: Some(format!("dummy.{}", code.as_wire())),
             state_generation,
+            duplicate_of_idempotency_key: None,
+            duplicate_of_operation_id: None,
         }
     }
 }
@@ -265,6 +299,10 @@ pub struct RestoreResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StoredObservation {
     observation_id: String,
+    /// Operation whose delivery actually committed this observation. Retained
+    /// so a later redelivery under the same key can name what already ran
+    /// instead of claiming a fresh effect.
+    committed_by_operation_id: String,
     source_sequence: u64,
     canonical_content: String,
     payload_sha256: String,
@@ -413,14 +451,15 @@ impl DummyProvider {
                 if existing.get().fingerprint_sha256 != fingerprint_sha256 {
                     return Terminal::failure(TerminalCode::Conflict, self.state_generation);
                 }
-                Terminal::success(
+                Terminal::duplicate(
                     ObservationResult {
                         acceptance: ObservationAcceptance::DuplicateAcknowledged,
                         acknowledged_sequence: self.acknowledged_sequence,
                         stored_fingerprint_sha256: fingerprint_sha256,
                     },
                     self.state_generation,
-                    CommittedEffectState::None,
+                    context.idempotency_key.clone(),
+                    existing.get().committed_by_operation_id.clone(),
                 )
             }
             Entry::Vacant(vacant) => {
@@ -433,6 +472,7 @@ impl DummyProvider {
                 }
                 vacant.insert(StoredObservation {
                     observation_id: observation.observation_id,
+                    committed_by_operation_id: context.operation_id.clone(),
                     source_sequence: observation.source_sequence,
                     canonical_content: observation.canonical_content,
                     payload_sha256: observation.payload_sha256,
@@ -701,6 +741,7 @@ fn encode_snapshot(provider: &DummyProvider) -> Result<Vec<u8>, SnapshotCodecErr
     for (idempotency_key, observation) in &provider.observations {
         write_string(&mut output, idempotency_key)?;
         write_string(&mut output, &observation.observation_id)?;
+        write_string(&mut output, &observation.committed_by_operation_id)?;
         write_u64(&mut output, observation.source_sequence);
         write_string(&mut output, &observation.canonical_content)?;
         write_string(&mut output, &observation.payload_sha256)?;
@@ -797,6 +838,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotCodecError> 
     for _ in 0..observation_count {
         let idempotency_key = cursor.read_string()?;
         let observation_id = cursor.read_string()?;
+        let committed_by_operation_id = cursor.read_string()?;
         let source_sequence = cursor.read_u64()?;
         let canonical_content = cursor.read_string()?;
         let payload_sha256 = cursor.read_string()?;
@@ -826,6 +868,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotCodecError> 
             idempotency_key,
             StoredObservation {
                 observation_id,
+                committed_by_operation_id,
                 source_sequence,
                 canonical_content,
                 payload_sha256,

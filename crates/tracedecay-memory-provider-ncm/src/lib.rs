@@ -39,6 +39,16 @@ use tracedecay_memory_provider_api::{
 
 /// Stable logical provider identity reserved for NCM.
 pub const NCM_PROVIDER_ID: &str = "ncm";
+
+/// Recall candidate scope bindings the host authorizes NCM to attest, in the
+/// wire vocabulary of `tracedecay.memory.provider.recall.v1`
+/// `candidate_scope_binding.bindings`. NCM memories are bound to the exact
+/// coding scope namespace the adapter derives from the admitted call, so
+/// every candidate the adapter re-asserts must carry
+/// `scope_binding: "exact_coding_scope"`; the registry records this
+/// declaration at registration and passes it to admission with the admitted
+/// call, never from a reply.
+pub const NCM_RECALL_SCOPE_BINDINGS: &[&str] = &["exact_coding_scope"];
 const NAMESPACE_DOMAIN: &[u8] = b"tracedecay.ncm.scope.v1\0";
 const CHALLENGE_DOMAIN: &[u8] = b"tracedecay.ncm.handshake-proof.v1\0";
 const OPAQUE_ID_DOMAIN: &[u8] = b"tracedecay.ncm.opaque-id.v1\0";
@@ -94,11 +104,11 @@ impl NcmNamespace {
             scope.worktree_identity.as_bytes(),
             scope.branch_identity.as_bytes(),
             scope.agent_session_id.as_bytes(),
+            scope.resolved_scope_digest.as_bytes(),
         ] {
             digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
             digest.update(value);
         }
-        digest.update(scope.scope_revision.to_be_bytes());
         Self(hex_digest(&digest.finalize()))
     }
 
@@ -386,7 +396,7 @@ impl NcmProviderAdapter {
     fn capped_control(
         control: &OperationControl,
         limits: ProviderLimits,
-    ) -> Result<(RequestControl, OperationControl), TerminalCode> {
+    ) -> Result<OperationControl, TerminalCode> {
         let snapshot = control.snapshot()?;
         let remaining_millis = snapshot.remaining_millis.min(limits.operation_millis);
         if remaining_millis == 0 {
@@ -401,7 +411,7 @@ impl NcmProviderAdapter {
                 control.cancellation(),
             )
         };
-        Ok((snapshot, surface_control))
+        Ok(surface_control)
     }
 
     fn operation_contract_id(operation: ProviderOperation) -> Option<&'static str> {
@@ -470,7 +480,7 @@ impl NcmProviderAdapter {
         }
     }
 
-    fn valid_request(call: &ProviderCall, control: RequestControl, limits: ProviderLimits) -> bool {
+    fn valid_request(call: &ProviderCall, limits: ProviderLimits) -> bool {
         let extension_bytes = call.extensions.iter().fold(0_u64, |total, extension| {
             total.saturating_add(
                 u64::try_from(extension.canonical_payload.len()).unwrap_or(u64::MAX),
@@ -510,7 +520,11 @@ impl NcmProviderAdapter {
                     && extension.payload_sha256
                         == hex_digest(&Sha256::digest(&extension.canonical_payload))
             })
-            && encoded_request_bytes(call, control) <= limits.request_bytes
+            // The public envelope is measured by the provider-API authority, not
+            // by an adapter-local copy of it: the fabric admits a call against
+            // exactly this count, so a private encoder that drifts from it would
+            // reject an admitted call as an unexplained invalid request.
+            && call.validate_request_bytes(limits.request_bytes).is_ok()
     }
 
     fn success_terminal(code: TerminalCode) -> bool {
@@ -520,7 +534,11 @@ impl NcmProviderAdapter {
         )
     }
 
-    fn valid_terminal_semantics(call: &ProviderCall, reply: &ProviderReply) -> bool {
+    fn valid_terminal_semantics(
+        call: &ProviderCall,
+        surface_call: &NcmSurfaceCall,
+        reply: &ProviderReply,
+    ) -> bool {
         let terminal = &reply.terminal;
         let terminal_code = terminal.terminal_code();
         let committed_effect = terminal.committed_effect();
@@ -567,6 +585,25 @@ impl NcmProviderAdapter {
                     && committed_effect
                         .provider_receipt_sha256()
                         .is_some_and(Self::valid_sha256)
+            }
+            // A redelivery the surface recognised: the effect exists, the
+            // generation did not move, and the claim must name this call's own
+            // idempotency key so it cannot acknowledge a different mutation.
+            CommittedEffectState::Duplicate => {
+                terminal_code == TerminalCode::Success
+                    && committed_effect
+                        .provider_receipt_sha256()
+                        .is_some_and(Self::valid_sha256)
+                    && committed_effect.state_generation_before()
+                        == committed_effect.state_generation_after()
+                    && reply.state_generation == call.expected_state_generation
+                    && committed_effect.duplicate_of_idempotency_key()
+                        == surface_call.idempotency_key.as_deref()
+                    && surface_call.idempotency_key.is_some()
+                    && call.idempotency_key.is_some()
+                    && committed_effect
+                        .duplicate_of_operation_id()
+                        .is_some_and(|value| !value.is_empty())
             }
             CommittedEffectState::Partial => {
                 matches!(
@@ -622,6 +659,12 @@ impl NcmProviderAdapter {
             && effect
                 .verification_sha256()
                 .is_none_or(|value| !text_contains_any(value, &forbidden))
+            // The deduplicated key is a TraceDecay-derived value the caller
+            // already holds, but the operation the surface names is
+            // provider-authored text and gets the same scope scan.
+            && effect
+                .duplicate_of_operation_id()
+                .is_none_or(|value| !text_contains_any(value, &forbidden))
             && reply
                 .terminal
                 .diagnostic_id()
@@ -652,14 +695,44 @@ impl NcmProviderAdapter {
         provider_id: OwnedProviderId,
         operation_id: impl Into<String>,
         exact_scope_sha256: impl Into<String>,
+        host_idempotency_key: Option<&str>,
     ) -> Option<TerminalRecord> {
         if terminal.operation() != operation || terminal.provider_id() != &provider_id {
             return None;
         }
-        terminal
-            .clone()
-            .try_with_identity(operation_id, exact_scope_sha256)
-            .ok()
+        let effect = terminal.committed_effect();
+        if effect.state() != CommittedEffectState::Duplicate {
+            return terminal
+                .clone()
+                .try_with_identity(operation_id, exact_scope_sha256)
+                .ok();
+        }
+        // The surface deduplicated against the namespace-opaque key it was
+        // given. The host's journal matches the duplicate against the
+        // observation it actually delivered, so the opaque key is replaced by
+        // the caller's own key here — after `valid_terminal_semantics` has
+        // already proved the surface named the opaque projection of exactly
+        // that key. The committing operation stays opaque: it names the
+        // surface's own prior operation, which has no host-side identity.
+        let host_idempotency_key = host_idempotency_key?;
+        let rebound_effect = CommittedEffectEvidence::duplicate(
+            effect.state_generation_after()?,
+            host_idempotency_key,
+            effect.duplicate_of_operation_id()?,
+            effect.provider_receipt_sha256()?,
+        )
+        .ok()?;
+        TerminalRecord::new(
+            terminal.operation(),
+            provider_id,
+            terminal.terminal_code(),
+            rebound_effect,
+            terminal.fallback().clone(),
+            operation_id,
+            exact_scope_sha256,
+            terminal.diagnostic_id().map(str::to_owned),
+        )
+        .ok()
     }
 
     fn handshake_failure(
@@ -699,7 +772,9 @@ impl NcmProviderAdapter {
             code,
             &call.operation_id,
             call.exact_scope.exact_scope_sha256(),
-            None,
+            // No state was touched, so the addressed generation is the
+            // observed one; the fabric refuses replies that omit it.
+            Some(call.expected_state_generation),
             diagnostic_id,
         );
         ProviderReply {
@@ -735,7 +810,7 @@ impl NcmProviderAdapter {
                 TerminalCode::ContractViolation,
                 &call.operation_id,
                 call.exact_scope.exact_scope_sha256(),
-                None,
+                Some(call.expected_state_generation),
                 "ncm.surface_contract_violation",
             )
         };
@@ -775,7 +850,7 @@ impl NcmProviderAdapter {
                             && !json_contains_surface_identity(&value, surface_call)
                     })
             })
-            && Self::valid_terminal_semantics(call, reply)
+            && Self::valid_terminal_semantics(call, surface_call, reply)
     }
 }
 
@@ -840,7 +915,7 @@ impl MemoryProvider for NcmProviderAdapter {
             );
         }
         let surface_control = match Self::capped_control(&request.control, effective_limits) {
-            Ok((_, control)) => control,
+            Ok(control) => control,
             Err(code) => {
                 return Self::handshake_failure(request, code, "ncm.request_control_terminal");
             }
@@ -935,6 +1010,7 @@ impl MemoryProvider for NcmProviderAdapter {
             request.provider_id.clone(),
             request.request_id.clone(),
             request.exact_scope.exact_scope_sha256(),
+            None,
         ) else {
             return Self::handshake_failure(
                 request,
@@ -1131,14 +1207,14 @@ impl MemoryProvider for NcmProviderAdapter {
                 "ncm.required_capability_missing",
             );
         }
-        let (control_snapshot, surface_control) =
-            match Self::capped_control(&call.control, readiness.effective_limits) {
-                Ok(control) => control,
-                Err(code) => {
-                    return Self::invoke_failure(call, code, "ncm.request_control_terminal");
-                }
-            };
-        if !Self::valid_request(call, control_snapshot, readiness.effective_limits) {
+        let surface_control = match Self::capped_control(&call.control, readiness.effective_limits)
+        {
+            Ok(control) => control,
+            Err(code) => {
+                return Self::invoke_failure(call, code, "ncm.request_control_terminal");
+            }
+        };
+        if !Self::valid_request(call, readiness.effective_limits) {
             return Self::invoke_failure(
                 call,
                 TerminalCode::InvalidRequest,
@@ -1198,6 +1274,7 @@ impl MemoryProvider for NcmProviderAdapter {
                 call.provider_id.clone(),
                 call.operation_id.clone(),
                 call.exact_scope.exact_scope_sha256(),
+                call.idempotency_key.as_deref(),
             ) else {
                 return Self::surface_contract_failure(call, &surface_call, &reply);
             };
@@ -1338,7 +1415,12 @@ fn encoded_terminal_bytes(terminal: &TerminalRecord) -> u64 {
     let mut total = framed_str_bytes(terminal.operation().as_wire());
     total = total.saturating_add(framed_str_bytes(terminal.provider_id().as_str()));
     total = total.saturating_add(framed_str_bytes(terminal.terminal_code().as_wire()));
-    total = total.saturating_add(encoded_committed_effect_bytes(terminal.committed_effect()));
+    // Handshake terminals never answer a host mutation, so there is no host
+    // idempotency key to reattach to a duplicate effect.
+    total = total.saturating_add(encoded_committed_effect_bytes(
+        terminal.committed_effect(),
+        None,
+    ));
     total = total.saturating_add(encoded_fallback_bytes(terminal.fallback()));
     total = total.saturating_add(framed_str_bytes(terminal.operation_id()));
     total = total.saturating_add(framed_str_bytes(terminal.exact_scope_sha256()));
@@ -1359,41 +1441,10 @@ fn encoded_descriptor_bytes(descriptor: &ProviderDescriptor) -> u64 {
     total.saturating_add(8 * 8)
 }
 
-fn encoded_request_bytes(call: &ProviderCall, control: RequestControl) -> u64 {
-    // The runtime envelope has no serde wire type. Count its canonical binary
-    // framing explicitly: fixed-width scalars at their wire width and every
-    // variable field as an unsigned 64-bit length followed by its bytes.
-    let mut total = framed_str_bytes(call.operation.capability_id());
-    total = total.saturating_add(framed_str_bytes(call.provider_id.as_str()));
-    total = total.saturating_add(8);
-    total = total.saturating_add(framed_str_bytes(&call.ready_receipt_sha256));
-    total = total.saturating_add(encoded_scope_bytes(&call.exact_scope));
-    total = total.saturating_add(framed_str_bytes(&call.request_id));
-    total = total.saturating_add(framed_str_bytes(&call.operation_id));
-    total = total.saturating_add(8);
-    total = total.saturating_add(encoded_optional_str_bytes(call.idempotency_key.as_deref()));
-    total = total.saturating_add(8);
-    total = total.saturating_add(8);
-    total = total.saturating_add(match control.cancellation {
-        tracedecay_memory_provider_api::contract::CancellationState::Live => {
-            framed_str_bytes("live")
-        }
-        tracedecay_memory_provider_api::contract::CancellationState::Cancelled => {
-            framed_str_bytes("cancelled")
-        }
-    });
-    total = total.saturating_add(encoded_payload_bytes(&call.payload));
-    total = total.saturating_add(8);
-    for capability in &call.required_capabilities {
-        total = total.saturating_add(framed_str_bytes(capability.as_str()));
-    }
-    total = total.saturating_add(8);
-    for extension in &call.extensions {
-        total = total.saturating_add(encoded_extension_bytes(extension));
-    }
-    total
-}
-
+/// Counts the projected surface envelope, which has no serde wire type: every
+/// fixed-width scalar at its wire width and every variable field as an unsigned
+/// 64-bit length followed by its bytes, matching the provider-API framing the
+/// public envelope is measured with.
 fn encoded_surface_request_bytes(call: &NcmSurfaceCall, control: RequestControl) -> u64 {
     let mut total = framed_str_bytes(call.operation.capability_id());
     total = total.saturating_add(framed_str_bytes(call.namespace.as_str()));
@@ -1433,6 +1484,7 @@ fn encoded_response_bytes(call: &ProviderCall, reply: &ProviderReply) -> u64 {
     total = total.saturating_add(framed_str_bytes(reply.terminal.terminal_code().as_wire()));
     total = total.saturating_add(encoded_committed_effect_bytes(
         reply.terminal.committed_effect(),
+        call.idempotency_key.as_deref(),
     ));
     total = total.saturating_add(encoded_fallback_bytes(reply.terminal.fallback()));
     total = total.saturating_add(framed_str_bytes(&call.operation_id));
@@ -1453,7 +1505,10 @@ fn encoded_response_bytes(call: &ProviderCall, reply: &ProviderReply) -> u64 {
     total.saturating_add(8)
 }
 
-fn encoded_committed_effect_bytes(effect: &CommittedEffectEvidence) -> u64 {
+fn encoded_committed_effect_bytes(
+    effect: &CommittedEffectEvidence,
+    host_idempotency_key: Option<&str>,
+) -> u64 {
     let mut total = framed_str_bytes(effect.state().as_wire());
     total = total.saturating_add(encoded_optional_str_bytes(effect.committed_boundary()));
     total = total.saturating_add(encoded_optional_u64_bytes(effect.state_generation_before()));
@@ -1462,7 +1517,16 @@ fn encoded_committed_effect_bytes(effect: &CommittedEffectEvidence) -> u64 {
     total = total.saturating_add(encoded_string_vector_bytes(effect.uncommitted_item_refs()));
     total = total.saturating_add(encoded_optional_str_bytes(effect.provider_receipt_sha256()));
     total = total.saturating_add(encoded_optional_str_bytes(effect.reconciliation_action()));
-    total.saturating_add(encoded_optional_str_bytes(effect.verification_sha256()))
+    total = total.saturating_add(encoded_optional_str_bytes(effect.verification_sha256()));
+    let duplicate_of_idempotency_key = if effect.state() == CommittedEffectState::Duplicate {
+        host_idempotency_key
+    } else {
+        effect.duplicate_of_idempotency_key()
+    };
+    total = total.saturating_add(encoded_optional_str_bytes(duplicate_of_idempotency_key));
+    total.saturating_add(encoded_optional_str_bytes(
+        effect.duplicate_of_operation_id(),
+    ))
 }
 
 fn encoded_fallback_bytes(fallback: &FallbackDirective) -> u64 {
@@ -1490,7 +1554,9 @@ fn encoded_string_vector_bytes(values: &[String]) -> u64 {
 }
 
 fn encoded_scope_bytes(scope: &OwnedExactScope) -> u64 {
-    let mut total = 8_u64;
+    // Seven length-framed strings and no scalar: the scope carries a resolved
+    // digest, not the fixed-width revision counter it replaced.
+    let mut total = 0_u64;
     for value in [
         &scope.profile_id,
         &scope.project_id,
@@ -1498,6 +1564,7 @@ fn encoded_scope_bytes(scope: &OwnedExactScope) -> u64 {
         &scope.worktree_identity,
         &scope.branch_identity,
         &scope.agent_session_id,
+        &scope.resolved_scope_digest,
     ] {
         total = total.saturating_add(framed_str_bytes(value));
     }
@@ -1614,6 +1681,7 @@ fn json_contains_scope_component(value: &Value, scope: &OwnedExactScope) -> bool
         scope.worktree_identity.as_str(),
         scope.branch_identity.as_str(),
         scope.agent_session_id.as_str(),
+        scope.resolved_scope_digest.as_str(),
     ];
     json_contains_any(value, &components)
 }
@@ -1677,6 +1745,7 @@ fn serialized_contains_scope_component(bytes: &[u8], scope: &OwnedExactScope) ->
         scope.worktree_identity.as_bytes(),
         scope.branch_identity.as_bytes(),
         scope.agent_session_id.as_bytes(),
+        scope.resolved_scope_digest.as_bytes(),
     ]
     .into_iter()
     .any(|component| {
@@ -1728,6 +1797,7 @@ fn surface_forbidden_identities<'a>(
         call.exact_scope.worktree_identity.as_str(),
         call.exact_scope.branch_identity.as_str(),
         call.exact_scope.agent_session_id.as_str(),
+        call.exact_scope.resolved_scope_digest.as_str(),
         call.request_id.as_str(),
         call.operation_id.as_str(),
         call.ready_receipt_sha256.as_str(),
@@ -1758,6 +1828,7 @@ fn handshake_metadata_is_scope_safe(
         request.exact_scope.worktree_identity.as_str(),
         request.exact_scope.branch_identity.as_str(),
         request.exact_scope.agent_session_id.as_str(),
+        request.exact_scope.resolved_scope_digest.as_str(),
         request.request_id.as_str(),
         public_scope_digest.as_str(),
         surface_request.namespace.as_str(),
@@ -1791,10 +1862,10 @@ fn digest_public_call(digest: &mut Sha256, call: &ProviderCall) {
         &call.exact_scope.worktree_identity,
         &call.exact_scope.branch_identity,
         &call.exact_scope.agent_session_id,
+        &call.exact_scope.resolved_scope_digest,
     ] {
         digest_field(digest, component.as_bytes());
     }
-    digest.update(call.exact_scope.scope_revision.to_be_bytes());
     digest_field(digest, call.exact_scope.exact_scope_sha256().as_bytes());
     digest_field(digest, call.request_id.as_bytes());
     digest_field(digest, call.operation_id.as_bytes());

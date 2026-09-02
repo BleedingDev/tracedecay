@@ -85,6 +85,11 @@ pub(crate) struct DaemonSessionSyncConfig {
     pub project_id: ProjectId,
     pub profile_root: std::path::PathBuf,
     pub project_root: std::path::PathBuf,
+    /// The authoritative project-open scope resolved once at project-open
+    /// time. Session-sync work must reuse this exact scope rather than
+    /// re-deriving repository/worktree/reference identity from
+    /// `project_root` at sync time.
+    pub scope: tracedecay_application::ResolvedScope,
     pub transcript_source_home: Option<std::path::PathBuf>,
     pub project_sessions: RegisteredGlobalDbLeaseV1,
     pub user_sessions: RegisteredGlobalDbLeaseV1,

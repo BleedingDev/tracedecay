@@ -1,0 +1,1966 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "record_kind": "tracedecay.upstream-sync-train-rehearsal.v1",
+  "schema_version": 1,
+  "bead_id": "tdmem-1208",
+  "authority": "product-owned",
+  "recorded_at": "2026-09-02T04:23:58Z",
+  "outcome": "rehearsed_not_advanced",
+  "outcome_reason": "The candidate produced six Git conflicts whose content resolution is upstream-integration work outside this bead; every receipt was recorded, every later step was refused fail-closed on the unresolved tree, and abort restored the product ref, floor metadata and a clean checkout. The floor in product/upstream/tracedecay-v2-pr707.json did not move.",
+  "provenance": {
+    "sandbox": "Isolated clone of the product worktree at its committed head plus the tdmem-1208 train tooling committed on top; the worktree's refs, index and stashes were never touched, nothing was fetched from or pushed to a remote, and the remote URLs were set to the policy repositories only so the vendor-floor preflight could run.",
+    "product_branch": "refs/heads/feat/pluggable-memory-providers-v2",
+    "product_head_sha": "ce0dc0e30378b72148be69842fab70615c46b984",
+    "committed_worktree_head_sha": "ee5963faa9077306001566499850f16d57851399",
+    "policy_revision": "sync-train.v1",
+    "workflow": "run-upstream-sync-train",
+    "sandbox_policy_difference": "floor.archival_provenance did not yet list this record, which cannot exist before the rehearsal that produces it; the final policy declares it so a later train leaves it byte-identical.",
+    "receipts_source": "outputs of scripts/product/run-upstream-sync-train.py, check-upstream-vendor-floor.py and classify-upstream-changes.py in that sandbox, embedded verbatim below"
+  },
+  "candidate": {
+    "ref": "refs/remotes/upstream/pr/707-current",
+    "sha": "1bde084d861bfa67bebec368ff28f747bcffa78f",
+    "previous_floor_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+    "relationship": "descendant_of_floor",
+    "vendor_floor_preflight": {
+      "floor_pull_request": 707,
+      "floor_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "ok": true,
+      "product_branch": "refs/heads/feat/pluggable-memory-providers-v2",
+      "product_head_sha": "ce0dc0e30378b72148be69842fab70615c46b984",
+      "product_patch_owners": [
+        "BleedingDev"
+      ],
+      "product_repository": "BleedingDev/tracedecay",
+      "review_owner": "ScriptedAlchemy",
+      "source_merge_base": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "source_ref": "refs/remotes/upstream/pr/707-current",
+      "source_relationship": "descendant_of_floor",
+      "source_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f",
+      "sync_branch": "refs/heads/sync/upstream/1bde084d861b",
+      "sync_head_sha": "ce0dc0e30378b72148be69842fab70615c46b984",
+      "sync_owner": "BleedingDev",
+      "tree_state": "clean",
+      "upstream_repository": "ScriptedAlchemy/tracedecay"
+    }
+  },
+  "classification": {
+    "report_kind": "tracedecay.upstream-change-classification.v1",
+    "inputs": {
+      "candidate_floor": {
+        "commit": "1bde084d861bfa67bebec368ff28f747bcffa78f",
+        "requested": "refs/remotes/upstream/pr/707-current",
+        "tree": "b9572e45c69df062e6a44da6892f340ac0ab22d4"
+      },
+      "old_floor": {
+        "commit": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+        "requested": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+        "tree": "981129210683d0eb36a6c14b3be0e71b9ef9935e"
+      }
+    },
+    "relationship": {
+      "merge_base": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "old_is_ancestor": true
+    },
+    "summary": {
+      "auto_accept": false,
+      "change_set_kind": "mixed",
+      "changed_crate_count": 45,
+      "changed_file_count": 2203,
+      "conflict_counts": {
+        "high": 16,
+        "none": 1778,
+        "review_required": 409
+      },
+      "generated_file_count": 1,
+      "mapped_product_patch_count": 16,
+      "review_gate": "fail",
+      "semantic_file_count": 2202,
+      "status_counts": {
+        "added": 514,
+        "deleted": 432,
+        "modified": 1257
+      },
+      "unmapped_file_count": 409
+    },
+    "affected_zones": [
+      {
+        "changed_file_count": 174,
+        "default_policy": "forbidden",
+        "id": "code_index_internals"
+      },
+      {
+        "changed_file_count": 1,
+        "default_policy": "generated_only",
+        "id": "generated_contracts"
+      },
+      {
+        "changed_file_count": 55,
+        "default_policy": "forbidden",
+        "id": "host_specific_adapters"
+      },
+      {
+        "changed_file_count": 161,
+        "default_policy": "forbidden",
+        "id": "native_database_internals"
+      },
+      {
+        "changed_file_count": 2,
+        "default_policy": "forbidden",
+        "id": "toolchain_build_and_ci_policy"
+      }
+    ],
+    "affected_touch_points": [
+      {
+        "changed_file_count": 2,
+        "id": "application_contract_mount"
+      },
+      {
+        "changed_file_count": 3,
+        "id": "configuration_registry_mount"
+      },
+      {
+        "changed_file_count": 10,
+        "id": "daemon_composition_mount"
+      },
+      {
+        "changed_file_count": 5,
+        "id": "daemon_shutdown_deadline"
+      },
+      {
+        "changed_file_count": 2,
+        "id": "integration_test_runtime_isolation"
+      },
+      {
+        "changed_file_count": 3,
+        "id": "normalized_observation_mount"
+      },
+      {
+        "changed_file_count": 2,
+        "id": "post_settlement_feedback_mount"
+      },
+      {
+        "changed_file_count": 4,
+        "id": "recall_context_mount"
+      },
+      {
+        "changed_file_count": 2,
+        "id": "workspace_wiring"
+      }
+    ],
+    "affected_authorities": [
+      {
+        "changed_file_count": 2187,
+        "id": "canonical_upstream",
+        "kind": "repository_owner",
+        "owner": "ScriptedAlchemy",
+        "ownership_class": "upstream_owned"
+      },
+      {
+        "changed_file_count": 7,
+        "id": "composition_mount",
+        "kind": "ownership_area",
+        "owner": "ScriptedAlchemy",
+        "ownership_class": "upstream_owned"
+      },
+      {
+        "changed_file_count": 2,
+        "id": "integration_test_harness",
+        "kind": "ownership_area",
+        "owner": "ScriptedAlchemy",
+        "ownership_class": "upstream_owned"
+      },
+      {
+        "changed_file_count": 5,
+        "id": "shutdown_deadline",
+        "kind": "ownership_area",
+        "owner": "ScriptedAlchemy",
+        "ownership_class": "upstream_owned"
+      },
+      {
+        "changed_file_count": 2,
+        "id": "workspace_wiring",
+        "kind": "ownership_area",
+        "owner": "ScriptedAlchemy",
+        "ownership_class": "upstream_owned"
+      }
+    ],
+    "changed_crates": [
+      {
+        "changed_file_count": 747,
+        "manifest": "crates/tracedecay/Cargo.toml",
+        "name": "tracedecay",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay"
+      },
+      {
+        "changed_file_count": 52,
+        "manifest": "crates/tracedecay-agent-hosts/Cargo.toml",
+        "name": "tracedecay-agent-hosts",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-agent-hosts"
+      },
+      {
+        "changed_file_count": 7,
+        "manifest": "crates/tracedecay-api/Cargo.toml",
+        "name": "tracedecay-api",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-api"
+      },
+      {
+        "changed_file_count": 31,
+        "manifest": "crates/tracedecay-application/Cargo.toml",
+        "name": "tracedecay-application",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-application"
+      },
+      {
+        "changed_file_count": 1,
+        "manifest": "crates/tracedecay-automation/Cargo.toml",
+        "name": "tracedecay-automation",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-automation"
+      },
+      {
+        "changed_file_count": 44,
+        "manifest": "crates/tracedecay-automation-runtime/Cargo.toml",
+        "name": "tracedecay-automation-runtime",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-automation-runtime"
+      },
+      {
+        "changed_file_count": 63,
+        "manifest": "crates/tracedecay-cli/Cargo.toml",
+        "name": "tracedecay-cli",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-cli"
+      },
+      {
+        "changed_file_count": 3,
+        "manifest": "crates/tracedecay-code-extraction/Cargo.toml",
+        "name": "tracedecay-code-extraction",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-code-extraction"
+      },
+      {
+        "changed_file_count": 23,
+        "manifest": "crates/tracedecay-code-index/Cargo.toml",
+        "name": "tracedecay-code-index",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-code-index"
+      },
+      {
+        "changed_file_count": 8,
+        "manifest": "crates/tracedecay-code-index-retention/Cargo.toml",
+        "name": "tracedecay-code-index-retention",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-code-index-retention"
+      },
+      {
+        "changed_file_count": 64,
+        "manifest": "crates/tracedecay-code-index-runtime/Cargo.toml",
+        "name": "tracedecay-code-index-runtime",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-code-index-runtime"
+      },
+      {
+        "changed_file_count": 15,
+        "manifest": "crates/tracedecay-configuration/Cargo.toml",
+        "name": "tracedecay-configuration",
+        "present_after": true,
+        "present_before": false,
+        "root": "crates/tracedecay-configuration"
+      },
+      {
+        "changed_file_count": 10,
+        "manifest": "crates/tracedecay-daemon-control/Cargo.toml",
+        "name": "tracedecay-daemon-control",
+        "present_after": true,
+        "present_before": false,
+        "root": "crates/tracedecay-daemon-control"
+      },
+      {
+        "changed_file_count": 6,
+        "manifest": "crates/tracedecay-daemon-identity/Cargo.toml",
+        "name": "tracedecay-daemon-identity",
+        "present_after": true,
+        "present_before": false,
+        "root": "crates/tracedecay-daemon-identity"
+      },
+      {
+        "changed_file_count": 15,
+        "manifest": "crates/tracedecay-daemon-protocol/Cargo.toml",
+        "name": "tracedecay-daemon-protocol",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-daemon-protocol"
+      },
+      {
+        "changed_file_count": 65,
+        "manifest": "crates/tracedecay-daemon-service/Cargo.toml",
+        "name": "tracedecay-daemon-service",
+        "present_after": true,
+        "present_before": false,
+        "root": "crates/tracedecay-daemon-service"
+      },
+      {
+        "changed_file_count": 29,
+        "manifest": "crates/tracedecay-dashboard-api/Cargo.toml",
+        "name": "tracedecay-dashboard-api",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-dashboard-api"
+      },
+      {
+        "changed_file_count": 10,
+        "manifest": "crates/tracedecay-domain/Cargo.toml",
+        "name": "tracedecay-domain",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-domain"
+      },
+      {
+        "changed_file_count": 2,
+        "manifest": "crates/tracedecay-framing/Cargo.toml",
+        "name": "tracedecay-framing",
+        "present_after": true,
+        "present_before": false,
+        "root": "crates/tracedecay-framing"
+      },
+      {
+        "changed_file_count": 74,
+        "manifest": "crates/tracedecay-global-db/Cargo.toml",
+        "name": "tracedecay-global-db",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-global-db"
+      },
+      {
+        "changed_file_count": 51,
+        "manifest": "crates/tracedecay-graph-db/Cargo.toml",
+        "name": "tracedecay-graph-db",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-graph-db"
+      },
+      {
+        "changed_file_count": 15,
+        "manifest": "crates/tracedecay-graph-query/Cargo.toml",
+        "name": "tracedecay-graph-query",
+        "present_after": true,
+        "present_before": false,
+        "root": "crates/tracedecay-graph-query"
+      },
+      {
+        "changed_file_count": 1,
+        "manifest": "crates/tracedecay-hooks/Cargo.toml",
+        "name": "tracedecay-hooks",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-hooks"
+      },
+      {
+        "changed_file_count": 7,
+        "manifest": "crates/tracedecay-host-admission/Cargo.toml",
+        "name": "tracedecay-host-admission",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-host-admission"
+      },
+      {
+        "changed_file_count": 45,
+        "manifest": "crates/tracedecay-lcm/Cargo.toml",
+        "name": "tracedecay-lcm",
+        "present_after": true,
+        "present_before": false,
+        "root": "crates/tracedecay-lcm"
+      },
+      {
+        "changed_file_count": 20,
+        "manifest": "crates/tracedecay-lsp/Cargo.toml",
+        "name": "tracedecay-lsp",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-lsp"
+      },
+      {
+        "changed_file_count": 7,
+        "manifest": "crates/tracedecay-maintenance/Cargo.toml",
+        "name": "tracedecay-maintenance",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-maintenance"
+      },
+      {
+        "changed_file_count": 63,
+        "manifest": "crates/tracedecay-mcp/Cargo.toml",
+        "name": "tracedecay-mcp",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-mcp"
+      },
+      {
+        "changed_file_count": 2,
+        "manifest": "crates/tracedecay-private-fs/Cargo.toml",
+        "name": "tracedecay-private-fs",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-private-fs"
+      },
+      {
+        "changed_file_count": 46,
+        "manifest": "crates/tracedecay-query/Cargo.toml",
+        "name": "tracedecay-query",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-query"
+      },
+      {
+        "changed_file_count": 77,
+        "manifest": "crates/tracedecay-runtime-core/Cargo.toml",
+        "name": "tracedecay-runtime-core",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-runtime-core"
+      },
+      {
+        "changed_file_count": 15,
+        "manifest": "crates/tracedecay-rusqlite-runtime/Cargo.toml",
+        "name": "tracedecay-rusqlite-runtime",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-rusqlite-runtime"
+      },
+      {
+        "changed_file_count": 1,
+        "manifest": "sdks/codegen/Cargo.toml",
+        "name": "tracedecay-sdk-codegen",
+        "present_after": true,
+        "present_before": true,
+        "root": "sdks/codegen"
+      },
+      {
+        "changed_file_count": 32,
+        "manifest": "crates/tracedecay-search-eval/Cargo.toml",
+        "name": "tracedecay-search-eval",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-search-eval"
+      },
+      {
+        "changed_file_count": 30,
+        "manifest": "crates/tracedecay-semantic/Cargo.toml",
+        "name": "tracedecay-semantic",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-semantic"
+      },
+      {
+        "changed_file_count": 7,
+        "manifest": "crates/tracedecay-semantic-contracts/Cargo.toml",
+        "name": "tracedecay-semantic-contracts",
+        "present_after": true,
+        "present_before": false,
+        "root": "crates/tracedecay-semantic-contracts"
+      },
+      {
+        "changed_file_count": 53,
+        "manifest": "crates/tracedecay-session-memory/Cargo.toml",
+        "name": "tracedecay-session-memory",
+        "present_after": true,
+        "present_before": false,
+        "root": "crates/tracedecay-session-memory"
+      },
+      {
+        "changed_file_count": 29,
+        "manifest": "crates/tracedecay-session-runtime/Cargo.toml",
+        "name": "tracedecay-session-runtime",
+        "present_after": true,
+        "present_before": false,
+        "root": "crates/tracedecay-session-runtime"
+      },
+      {
+        "changed_file_count": 18,
+        "manifest": "crates/tracedecay-session-temporal-store/Cargo.toml",
+        "name": "tracedecay-session-temporal-store",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-session-temporal-store"
+      },
+      {
+        "changed_file_count": 107,
+        "manifest": "crates/tracedecay-sessions/Cargo.toml",
+        "name": "tracedecay-sessions",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-sessions"
+      },
+      {
+        "changed_file_count": 10,
+        "manifest": "crates/tracedecay-source-edit/Cargo.toml",
+        "name": "tracedecay-source-edit",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-source-edit"
+      },
+      {
+        "changed_file_count": 13,
+        "manifest": "crates/tracedecay-store/Cargo.toml",
+        "name": "tracedecay-store",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-store"
+      },
+      {
+        "changed_file_count": 32,
+        "manifest": "crates/tracedecay-store-runtime/Cargo.toml",
+        "name": "tracedecay-store-runtime",
+        "present_after": true,
+        "present_before": false,
+        "root": "crates/tracedecay-store-runtime"
+      },
+      {
+        "changed_file_count": 2,
+        "manifest": "crates/tracedecay-tool-catalog/Cargo.toml",
+        "name": "tracedecay-tool-catalog",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-tool-catalog"
+      },
+      {
+        "changed_file_count": 160,
+        "manifest": "crates/tracedecay-usecases/Cargo.toml",
+        "name": "tracedecay-usecases",
+        "present_after": true,
+        "present_before": true,
+        "root": "crates/tracedecay-usecases"
+      }
+    ],
+    "mapped_product_patches": [
+      {
+        "area_id": "workspace_wiring",
+        "bead_ids": [
+          "tdmem-0301",
+          "tdmem-0302",
+          "tdmem-0303",
+          "tdmem-0304",
+          "tdmem-0305",
+          "tdmem-0307",
+          "tdmem-0308"
+        ],
+        "changed_files": [
+          {
+            "path": "Cargo.lock",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": {
+          "generator_path": "Cargo.toml",
+          "reproduction": "cargo metadata --format-version 1 --no-deps",
+          "zero_drift_check": "cargo metadata --locked --format-version 1 --no-deps"
+        },
+        "path": "Cargo.lock",
+        "touch_point": "workspace_wiring"
+      },
+      {
+        "area_id": "workspace_wiring",
+        "bead_ids": [
+          "tdmem-0301",
+          "tdmem-0302",
+          "tdmem-0303",
+          "tdmem-0304",
+          "tdmem-0305",
+          "tdmem-0307",
+          "tdmem-0308"
+        ],
+        "changed_files": [
+          {
+            "path": "Cargo.toml",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "Cargo.toml",
+        "touch_point": "workspace_wiring"
+      },
+      {
+        "area_id": "composition_mount",
+        "bead_ids": [
+          "tdmem-0307",
+          "tdmem-0308"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/Cargo.toml",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/Cargo.toml",
+        "touch_point": "daemon_composition_mount"
+      },
+      {
+        "area_id": "shutdown_deadline",
+        "bead_ids": [
+          "tdmem-0404",
+          "tdmem-1204"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/src/daemon/bootstrap.rs",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/src/daemon/bootstrap.rs",
+        "touch_point": "daemon_shutdown_deadline"
+      },
+      {
+        "area_id": "shutdown_deadline",
+        "bead_ids": [
+          "tdmem-0404",
+          "tdmem-1204"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/src/daemon/engine/shutdown.rs",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/src/daemon/engine/shutdown.rs",
+        "touch_point": "daemon_shutdown_deadline"
+      },
+      {
+        "area_id": "shutdown_deadline",
+        "bead_ids": [
+          "tdmem-0404",
+          "tdmem-1204"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/src/daemon/invocation_state.rs",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/src/daemon/invocation_state.rs",
+        "touch_point": "daemon_shutdown_deadline"
+      },
+      {
+        "area_id": "composition_mount",
+        "bead_ids": [
+          "tdmem-0307",
+          "tdmem-0308"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/src/daemon/project_composition.rs",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/src/daemon/project_composition.rs",
+        "touch_point": "daemon_composition_mount"
+      },
+      {
+        "area_id": "composition_mount",
+        "bead_ids": [
+          "tdmem-0401",
+          "tdmem-0402",
+          "tdmem-0403",
+          "tdmem-0404",
+          "tdmem-0405",
+          "tdmem-1204"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/src/daemon/retained_owner.rs",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/src/daemon/retained_owner.rs",
+        "touch_point": "daemon_composition_mount"
+      },
+      {
+        "area_id": "composition_mount",
+        "bead_ids": [
+          "tdmem-0401",
+          "tdmem-0402",
+          "tdmem-0405",
+          "tdmem-1204"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/src/daemon/retained_owner/memory.rs",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/src/daemon/retained_owner/memory.rs",
+        "touch_point": "daemon_composition_mount"
+      },
+      {
+        "area_id": "shutdown_deadline",
+        "bead_ids": [
+          "tdmem-0404",
+          "tdmem-1204"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/src/daemon/service/invocation/lsp.rs",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/src/daemon/service/invocation/lsp.rs",
+        "touch_point": "daemon_shutdown_deadline"
+      },
+      {
+        "area_id": "shutdown_deadline",
+        "bead_ids": [
+          "tdmem-0404",
+          "tdmem-1204"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs",
+        "touch_point": "daemon_shutdown_deadline"
+      },
+      {
+        "area_id": "composition_mount",
+        "bead_ids": [
+          "tdmem-0307",
+          "tdmem-0308"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/src/daemon/tests/ownership.rs",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/src/daemon/tests/ownership.rs",
+        "touch_point": "daemon_composition_mount"
+      },
+      {
+        "area_id": "composition_mount",
+        "bead_ids": [
+          "tdmem-0307",
+          "tdmem-0308"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/src/mcp/server.rs",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/src/mcp/server.rs",
+        "touch_point": "daemon_composition_mount"
+      },
+      {
+        "area_id": "composition_mount",
+        "bead_ids": [
+          "tdmem-0307",
+          "tdmem-0308"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/src/mcp/server/construction.rs",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/src/mcp/server/construction.rs",
+        "touch_point": "daemon_composition_mount"
+      },
+      {
+        "area_id": "integration_test_harness",
+        "bead_ids": [
+          "tdmem-0404",
+          "tdmem-1204"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/tests/common/mod.rs",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/tests/common/mod.rs",
+        "touch_point": "integration_test_runtime_isolation"
+      },
+      {
+        "area_id": "integration_test_harness",
+        "bead_ids": [
+          "tdmem-0404",
+          "tdmem-1204"
+        ],
+        "changed_files": [
+          {
+            "path": "crates/tracedecay/tests/memory_suite/memory_eval_test.rs",
+            "relation": "direct_path"
+          }
+        ],
+        "generated": null,
+        "path": "crates/tracedecay/tests/memory_suite/memory_eval_test.rs",
+        "touch_point": "integration_test_runtime_isolation"
+      }
+    ],
+    "diagnostics_by_code": {
+      "unmapped_touched_area": 50
+    },
+    "unmapped_paths": [
+      ".github/workflows/ci.yml",
+      ".github/workflows/release.yml",
+      "crates/tracedecay-agent-hosts/Cargo.toml",
+      "crates/tracedecay-agent-hosts/build.rs",
+      "crates/tracedecay-agent-hosts/src/agents/claude.rs",
+      "crates/tracedecay-agent-hosts/src/agents/claude/tests.rs",
+      "crates/tracedecay-agent-hosts/src/agents/cline.rs",
+      "crates/tracedecay-agent-hosts/src/agents/codex.rs",
+      "crates/tracedecay-agent-hosts/src/agents/codex/plugin_registry.rs",
+      "crates/tracedecay-agent-hosts/src/agents/codex/tests.rs",
+      "crates/tracedecay-agent-hosts/src/agents/context_scout_model.rs",
+      "crates/tracedecay-agent-hosts/src/agents/context_scout_owner.rs",
+      "crates/tracedecay-agent-hosts/src/agents/context_scout_ports.rs",
+      "crates/tracedecay-agent-hosts/src/agents/context_scout_v2.rs",
+      "crates/tracedecay-agent-hosts/src/agents/context_scout_v2/evidence.rs",
+      "crates/tracedecay-agent-hosts/src/agents/context_scout_v2/store.rs",
+      "crates/tracedecay-agent-hosts/src/agents/context_scout_v2/store_tests.rs",
+      "crates/tracedecay-agent-hosts/src/agents/cursor.rs",
+      "crates/tracedecay-agent-hosts/src/agents/hermes.rs",
+      "crates/tracedecay-agent-hosts/src/agents/hermes/templates.rs",
+      "crates/tracedecay-agent-hosts/src/agents/host_bundle_registry.rs",
+      "crates/tracedecay-agent-hosts/src/agents/host_bundle_v2.rs",
+      "crates/tracedecay-agent-hosts/src/agents/host_component_registration.rs",
+      "crates/tracedecay-agent-hosts/src/agents/kilo.rs",
+      "crates/tracedecay-agent-hosts/src/agents/kimi.rs",
+      "crates/tracedecay-agent-hosts/src/agents/kiro.rs",
+      "crates/tracedecay-agent-hosts/src/agents/kiro/tests.rs",
+      "crates/tracedecay-agent-hosts/src/agents/mod.rs",
+      "crates/tracedecay-agent-hosts/src/agents/opencode.rs",
+      "crates/tracedecay-agent-hosts/src/agents/opencode/plugin_cli.rs",
+      "crates/tracedecay-agent-hosts/src/agents/plugin_bundle.rs",
+      "crates/tracedecay-agent-hosts/src/agents/prompt_rules.rs",
+      "crates/tracedecay-agent-hosts/src/agents/roo_code.rs",
+      "crates/tracedecay-agent-hosts/src/agents/text_file_transaction.rs",
+      "crates/tracedecay-agent-hosts/src/hooks/claude.rs",
+      "crates/tracedecay-agent-hosts/src/hooks/cursor.rs",
+      "crates/tracedecay-agent-hosts/src/hooks/cursor_compact.rs",
+      "crates/tracedecay-agent-hosts/src/hooks/daemon_ports.rs",
+      "crates/tracedecay-agent-hosts/src/hooks/dispatch.rs",
+      "crates/tracedecay-agent-hosts/src/hooks/dispatch/tests.rs",
+      "crates/tracedecay-agent-hosts/src/hooks/hint_outcomes.rs",
+      "crates/tracedecay-agent-hosts/src/hooks/hint_outcomes/settlement.rs",
+      "crates/tracedecay-agent-hosts/src/hooks/mod.rs",
+      "crates/tracedecay-agent-hosts/src/hooks/wire_stdin_bound_tests.rs",
+      "crates/tracedecay-agent-hosts/src/lib.rs",
+      "crates/tracedecay-agent-hosts/src/native_integration/registry.rs",
+      "crates/tracedecay-agent-hosts/src/native_integration/store.rs",
+      "crates/tracedecay-agent-hosts/src/native_integration/worktree_cleanup.rs",
+      "crates/tracedecay-agent-hosts/src/ports/pricing.rs",
+      "crates/tracedecay-agent-hosts/src/product_version.rs",
+      "crates/tracedecay-agent-hosts/src/product_version/root_manifest.rs",
+      "crates/tracedecay-agent-hosts/src/task_classifier.rs",
+      "crates/tracedecay-agent-hosts/tests/context_scout_evidence.rs",
+      "crates/tracedecay-agent-hosts/tests/hooks_boundary.rs",
+      "crates/tracedecay-application/src/lib.rs",
+      "crates/tracedecay-code-extraction/Cargo.toml",
+      "crates/tracedecay-code-extraction/src/lib.rs",
+      "crates/tracedecay-code-extraction/src/redundancy.rs",
+      "crates/tracedecay-code-index-retention/src/code_index_generations.rs",
+      "crates/tracedecay-code-index-retention/src/code_index_generations/generation_transactions.rs",
+      "crates/tracedecay-code-index-retention/src/code_index_generations/graph_replay_release.rs",
+      "crates/tracedecay-code-index-retention/src/code_index_generations/tests.rs",
+      "crates/tracedecay-code-index-retention/src/code_index_generations/tests/graph_replay_pool_lock_tests.rs",
+      "crates/tracedecay-code-index-retention/src/code_index_generations/tests/graph_replay_release_tests.rs",
+      "crates/tracedecay-code-index-retention/src/code_index_generations/text_artifacts.rs",
+      "crates/tracedecay-code-index-retention/src/hotpath_observe.rs",
+      "crates/tracedecay-code-index-runtime/Cargo.toml",
+      "crates/tracedecay-code-index-runtime/src/code_graph_seat.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_branch_diff.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_executor.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/activation.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/branch_generations.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/cadence.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/classification.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/freshness_witness.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/git_tree_capture.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/graph_activation.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/identity.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/ignored_dependencies.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/ignored_dependencies_tests.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/ignored_dependencies_tests/branch_publication_tests.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/memory_tests.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/observability.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/queries.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/queries/graph_control.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/query_runtime.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/reconcile_panic_guard.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/registry.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/registry/convergence_park_tests.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/registry/ignored_dependencies.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/registry/resident_memory.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/registry/runtime_generation_census_tests.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/registry/watch_ingress.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/semantic_query_runtime.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/semantic_vector_graph.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/semantic_vector_graph/retention_inventory.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/tests.rs",
+      "crates/tracedecay-code-index-runtime/src/code_index_scheduler/tests/semantic_schedule_order_tests.rs",
+      "crates/tracedecay-code-index-runtime/src/config.rs",
+      "crates/tracedecay-code-index-runtime/src/git_index_transactions.rs",
+      "crates/tracedecay-code-index-runtime/src/git_index_transactions/patch.rs",
+      "crates/tracedecay-code-index-runtime/src/git_index_transactions/process.rs",
+      "crates/tracedecay-code-index-runtime/src/git_index_transactions/safety.rs",
+      "crates/tracedecay-code-index-runtime/src/git_transactions/native.rs",
+      "crates/tracedecay-code-index-runtime/src/git_transactions/owner.rs",
+      "crates/tracedecay-code-index-runtime/src/git_transactions/queue.rs",
+      "crates/tracedecay-code-index-runtime/src/git_transactions/recovery.rs",
+      "crates/tracedecay-code-index-runtime/src/git_transactions/registry.rs",
+      "crates/tracedecay-code-index-runtime/src/git_transactions/service.rs",
+      "crates/tracedecay-code-index-runtime/src/git_transactions/store.rs",
+      "crates/tracedecay-code-index-runtime/src/git_transactions/tests.rs",
+      "crates/tracedecay-code-index-runtime/src/git_watch.rs",
+      "crates/tracedecay-code-index-runtime/src/git_watch/admission.rs",
+      "crates/tracedecay-code-index-runtime/src/git_watch/health.rs",
+      "crates/tracedecay-code-index-runtime/src/git_watch/identity.rs",
+      "crates/tracedecay-code-index-runtime/src/git_watch/overflow.rs",
+      "crates/tracedecay-code-index-runtime/src/git_watch/ownership.rs",
+      "crates/tracedecay-code-index-runtime/src/git_watch/state.rs",
+      "crates/tracedecay-code-index-runtime/src/git_watch/tests.rs",
+      "crates/tracedecay-code-index-runtime/src/git_watch/tests/lifecycle.rs",
+      "crates/tracedecay-code-index-runtime/src/git_watch/watch_plan.rs",
+      "crates/tracedecay-code-index-runtime/src/lib.rs",
+      "crates/tracedecay-code-index-runtime/src/logging.rs",
+      "crates/tracedecay-code-index-runtime/src/mcp_admission.rs",
+      "crates/tracedecay-code-index-runtime/src/ports.rs",
+      "crates/tracedecay-code-index-runtime/src/runtime_telemetry.rs",
+      "crates/tracedecay-code-index-runtime/src/semantic_activation_reconciler.rs",
+      "crates/tracedecay-code-index-runtime/src/semantic_evaluation.rs",
+      "crates/tracedecay-code-index-runtime/src/semantic_evaluation_shutdown.rs",
+      "crates/tracedecay-code-index/Cargo.toml",
+      "crates/tracedecay-code-index/benches/code_index_chunks.rs",
+      "crates/tracedecay-code-index/examples/sealed_decode_profile.rs",
+      "crates/tracedecay-code-index/src/chunks.rs",
+      "crates/tracedecay-code-index/src/chunks/artifacts.rs",
+      "crates/tracedecay-code-index/src/generations.rs",
+      "crates/tracedecay-code-index/src/git_projection.rs",
+      "crates/tracedecay-code-index/src/graph_projection.rs",
+      "crates/tracedecay-code-index/src/graph_projection/builder.rs",
+      "crates/tracedecay-code-index/src/graph_projection/interactive.rs",
+      "crates/tracedecay-code-index/src/graph_projection/interactive/tests.rs",
+      "crates/tracedecay-code-index/src/graph_projection/interactive/tests/bundle_artifact.rs",
+      "crates/tracedecay-code-index/src/graph_projection/reader.rs",
+      "crates/tracedecay-code-index/src/incremental.rs",
+      "crates/tracedecay-code-index/src/lineage.rs",
+      "crates/tracedecay-code-index/src/parallelism.rs",
+      "crates/tracedecay-code-index/src/production/helpers.rs",
+      "crates/tracedecay-code-index/src/production/lexical_page_source.rs",
+      "crates/tracedecay-code-index/src/production/mod.rs",
+      "crates/tracedecay-code-index/src/production/sealed_codec.rs",
+      "crates/tracedecay-code-index/tests/code_index_suite/chunk_incremental.rs",
+      "crates/tracedecay-code-index/tests/code_index_suite/lineage.rs",
+      "crates/tracedecay-code-index/tests/code_index_suite/sealed_generation_restore.rs",
+      "crates/tracedecay-global-db/Cargo.toml",
+      "crates/tracedecay-global-db/benches/lcm_expansion.rs",
+      "crates/tracedecay-global-db/src/api_types.rs",
+      "crates/tracedecay-global-db/src/configuration/mod.rs",
+      "crates/tracedecay-global-db/src/configuration/registry.rs",
+      "crates/tracedecay-global-db/src/configuration/semantic.rs",
+      "crates/tracedecay-global-db/src/configuration/store.rs",
+      "crates/tracedecay-global-db/src/configuration/store/audit.rs",
+      "crates/tracedecay-global-db/src/configuration/store/codec.rs",
+      "crates/tracedecay-global-db/src/configuration/store/mutation.rs",
+      "crates/tracedecay-global-db/src/configuration/store/revision.rs",
+      "crates/tracedecay-global-db/src/git_correlation_adapter.rs",
+      "crates/tracedecay-global-db/src/git_index_transactions/database.rs",
+      "crates/tracedecay-global-db/src/git_index_transactions/schema.rs",
+      "crates/tracedecay-global-db/src/git_index_transactions/store.rs",
+      "crates/tracedecay-global-db/src/git_index_transactions/tests.rs",
+      "crates/tracedecay-global-db/src/git_topology_anchor.rs",
+      "crates/tracedecay-global-db/src/lib.rs",
+      "crates/tracedecay-global-db/src/native_integration/schema.rs",
+      "crates/tracedecay-global-db/src/native_integration/store.rs",
+      "crates/tracedecay-global-db/src/native_integration/worktree_cleanup.rs",
+      "crates/tracedecay-global-db/src/observability_rollup/schema.rs",
+      "crates/tracedecay-global-db/src/observation/reset.rs",
+      "crates/tracedecay-global-db/src/observation/reset/tests.rs",
+      "crates/tracedecay-global-db/src/observation/retention.rs",
+      "crates/tracedecay-global-db/src/observation/retention/restore.rs",
+      "crates/tracedecay-global-db/src/observation/schema.rs",
+      "crates/tracedecay-global-db/src/observation_projection/apply.rs",
+      "crates/tracedecay-global-db/src/observation_projection/rebuild.rs",
+      "crates/tracedecay-global-db/src/observation_projection/schema.rs",
+      "crates/tracedecay-global-db/src/observation_projection/state.rs",
+      "crates/tracedecay-global-db/src/project_registry.rs",
+      "crates/tracedecay-global-db/src/registered.rs",
+      "crates/tracedecay-global-db/src/registered/session_relation_graph.rs",
+      "crates/tracedecay-global-db/src/registered/workflow_schema_tests.rs",
+      "crates/tracedecay-global-db/src/registered_accounting.rs",
+      "crates/tracedecay-global-db/src/registered_dashboard.rs",
+      "crates/tracedecay-global-db/src/registered_lcm.rs",
+      "crates/tracedecay-global-db/src/registered_lcm_privacy.rs",
+      "crates/tracedecay-global-db/src/registered_legacy_relations.rs",
+      "crates/tracedecay-global-db/src/registered_maintenance.rs",
+      "crates/tracedecay-global-db/src/registered_session_sync.rs",
+      "crates/tracedecay-global-db/src/registered_sessions.rs",
+      "crates/tracedecay-global-db/src/registry_maintenance.rs",
+      "crates/tracedecay-global-db/src/registry_maintenance/lifecycle.rs",
+      "crates/tracedecay-global-db/src/registry_maintenance/orphan.rs",
+      "crates/tracedecay-global-db/src/registry_maintenance/tests.rs",
+      "crates/tracedecay-global-db/src/remote_deletion.rs",
+      "crates/tracedecay-global-db/src/schema_contract/invariants.rs",
+      "crates/tracedecay-global-db/src/schema_contract/invariants/audit.rs",
+      "crates/tracedecay-global-db/src/schema_contract/invariants/repair.rs",
+      "crates/tracedecay-global-db/src/schema_contract/invariants/rows.rs",
+      "crates/tracedecay-global-db/src/schema_contract/invariants/triggers.rs",
+      "crates/tracedecay-global-db/src/schema_contract/pragma.rs",
+      "crates/tracedecay-global-db/src/schema_contract/validation.rs",
+      "crates/tracedecay-global-db/src/schema_stages.rs",
+      "crates/tracedecay-global-db/src/session_handle.rs",
+      "crates/tracedecay-global-db/src/session_temporal_handle.rs",
+      "crates/tracedecay-global-db/src/session_temporal_schema.rs",
+      "crates/tracedecay-global-db/src/session_temporal_schema/admission.rs",
+      "crates/tracedecay-global-db/src/sqlite_persist.rs",
+      "crates/tracedecay-global-db/src/stack_delivery.rs",
+      "crates/tracedecay-global-db/src/support.rs",
+      "crates/tracedecay-global-db/src/tests.rs",
+      "crates/tracedecay-global-db/src/tests/harness.rs",
+      "crates/tracedecay-global-db/src/tests/lcm_privacy_rescan.rs",
+      "crates/tracedecay-global-db/src/tests/lcm_schema/lcm_schema_contract.rs",
+      "crates/tracedecay-global-db/src/tests/lcm_schema/mod.rs",
+      "crates/tracedecay-global-db/src/tests/session_sync.rs",
+      "crates/tracedecay-global-db/src/transcript.rs",
+      "crates/tracedecay-global-db/src/workflow_adapter.rs",
+      "crates/tracedecay-global-db/tests/hotpath_coverage.rs",
+      "crates/tracedecay-global-db/tests/registered_schema_fail_closed.rs",
+      "crates/tracedecay-global-db/tests/session_relation_graph.rs",
+      "crates/tracedecay-graph-db/Cargo.toml",
+      "crates/tracedecay-graph-db/benches/publication_scale.rs",
+      "crates/tracedecay-graph-db/benches/support/mismatch.rs",
+      "crates/tracedecay-graph-db/src/backup.rs",
+      "crates/tracedecay-graph-db/src/bundle.rs",
+      "crates/tracedecay-graph-db/src/error.rs",
+      "crates/tracedecay-graph-db/src/generation.rs",
+      "crates/tracedecay-graph-db/src/generation/identity.rs",
+      "crates/tracedecay-graph-db/src/generation/recovered.rs",
+      "crates/tracedecay-graph-db/src/generation/replay.rs",
+      "crates/tracedecay-graph-db/src/generation_runtime.rs",
+      "crates/tracedecay-graph-db/src/generation_staging_runtime.rs",
+      "crates/tracedecay-graph-db/src/generation_staging_runtime/native_contract.rs",
+      "crates/tracedecay-graph-db/src/hotpath_observe.rs",
+      "crates/tracedecay-graph-db/src/lease.rs",
+      "crates/tracedecay-graph-db/src/lib.rs",
+      "crates/tracedecay-graph-db/src/location.rs",
+      "crates/tracedecay-graph-db/src/mutation.rs",
+      "crates/tracedecay-graph-db/src/owner.rs",
+      "crates/tracedecay-graph-db/src/point_read.rs",
+      "crates/tracedecay-graph-db/src/projection.rs",
+      "crates/tracedecay-graph-db/src/projection_identity_index.rs",
+      "crates/tracedecay-graph-db/src/projection_read.rs",
+      "crates/tracedecay-graph-db/src/publication.rs",
+      "crates/tracedecay-graph-db/src/recovery.rs",
+      "crates/tracedecay-graph-db/src/registry.rs",
+      "crates/tracedecay-graph-db/src/registry/identity.rs",
+      "crates/tracedecay-graph-db/src/registry/publication.rs",
+      "crates/tracedecay-graph-db/src/registry/publication_support.rs",
+      "crates/tracedecay-graph-db/src/registry/staging.rs",
+      "crates/tracedecay-graph-db/src/registry/support.rs",
+      "crates/tracedecay-graph-db/src/registry/vector_retirement.rs",
+      "crates/tracedecay-graph-db/src/runtime.rs",
+      "crates/tracedecay-graph-db/src/runtime/tests.rs",
+      "crates/tracedecay-graph-db/src/schema.rs",
+      "crates/tracedecay-graph-db/src/sealed_store.rs",
+      "crates/tracedecay-graph-db/src/semantic_vector_native.rs",
+      "crates/tracedecay-graph-db/src/state.rs",
+      "crates/tracedecay-graph-db/src/store_quarantine.rs",
+      "crates/tracedecay-graph-db/src/traversal.rs",
+      "crates/tracedecay-graph-db/src/vector.rs",
+      "crates/tracedecay-graph-db/src/verified_marker.rs",
+      "crates/tracedecay-graph-db/tests/backup_contract.rs",
+      "crates/tracedecay-graph-db/tests/durability_crash_contract.rs",
+      "crates/tracedecay-graph-db/tests/generation_cycle_rss.rs",
+      "crates/tracedecay-graph-db/tests/registry_contract.rs",
+      "crates/tracedecay-graph-db/tests/runtime_contract.rs",
+      "crates/tracedecay-graph-db/tests/semantic_vector_staging_contract.rs",
+      "crates/tracedecay-graph-db/tests/verified_generation_contract.rs",
+      "crates/tracedecay-graph-db/tests/verified_generation_contract/metadata_replay.rs",
+      "crates/tracedecay-graph-db/tests/verified_generation_contract/sealed_store.rs",
+      "crates/tracedecay-hooks/Cargo.toml",
+      "crates/tracedecay-query/Cargo.toml",
+      "crates/tracedecay-query/assets/native-qualification-v1.json.gz",
+      "crates/tracedecay-query/assets/runtime-root/evals/agent_adoption/fixture/Cargo.lock",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/context_eval_project/src/auth/login.rs",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/context_eval_project/src/storage/config_store.rs",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/sample.dockerfile",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/search_quality/corpus/cargo-slot/src/main.rust.fixture",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/search_quality/corpus/crates/tracedecay-domain/src/integration.rs",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/search_quality/corpus/crates/tracedecay-domain/src/repository.rs",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/search_quality/corpus/crates/tracedecay-domain/src/research/canonical.rs",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/search_quality/corpus/crates/tracedecay-domain/src/research/coverage.rs",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/search_quality/corpus/crates/tracedecay-domain/src/research/error.rs",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/search_quality/corpus/crates/tracedecay-domain/src/research/time.rs",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/search_quality/corpus/crates/tracedecay-domain/src/research/watermark.rs",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/search_quality/corpus/crates/tracedecay-domain/src/session.rs",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/search_quality/incremental/time-after.rs",
+      "crates/tracedecay-query/assets/runtime-root/tests/fixtures/search_quality/query-semantic-candidate-workload-v1.json",
+      "crates/tracedecay-query/benches/semantic_flat_scan.rs",
+      "crates/tracedecay-query/src/bin/tracedecay_search_bench.rs",
+      "crates/tracedecay-query/src/lib.rs",
+      "crates/tracedecay-query/src/retrieval/exact.rs",
+      "crates/tracedecay-query/src/retrieval/exact/tests.rs",
+      "crates/tracedecay-query/src/retrieval/graph/tests.rs",
+      "crates/tracedecay-query/src/retrieval/lexical.rs",
+      "crates/tracedecay-query/src/retrieval/lexical/projection.rs",
+      "crates/tracedecay-query/src/retrieval/lexical/projection/artifact.rs",
+      "crates/tracedecay-query/src/retrieval/lexical/projection/artifact/builder.rs",
+      "crates/tracedecay-query/src/retrieval/lexical/projection/artifact/format.rs",
+      "crates/tracedecay-query/src/retrieval/lexical/projection/artifact/reader.rs",
+      "crates/tracedecay-query/src/retrieval/lexical/tests.rs",
+      "crates/tracedecay-query/src/retrieval/ports.rs",
+      "crates/tracedecay-query/src/retrieval/semantic.rs",
+      "crates/tracedecay-query/src/retrieval/semantic/tests.rs",
+      "crates/tracedecay-query/src/search_quality/candidate_output.rs",
+      "crates/tracedecay-query/src/search_quality/evaluate.rs",
+      "crates/tracedecay-query/src/search_quality/mod.rs",
+      "crates/tracedecay-query/src/search_quality/native_qualification.rs",
+      "crates/tracedecay-query/src/search_quality/packaged.rs",
+      "crates/tracedecay-query/src/search_quality/report.rs",
+      "crates/tracedecay-query/src/search_quality/semantic_native.rs",
+      "crates/tracedecay-query/src/search_quality/semantic_native/fallback.rs",
+      "crates/tracedecay-query/src/search_quality/semantic_native/profile_requirements.rs",
+      "crates/tracedecay-query/src/search_quality/semantic_native/resource_contract.rs",
+      "crates/tracedecay-query/tests/search_quality_suite/candidate_producers.rs",
+      "crates/tracedecay-query/tests/search_quality_suite/scaling.rs",
+      "crates/tracedecay-query/tests/search_quality_suite/single_root.rs",
+      "crates/tracedecay-runtime-core/src/store/memory/crud/add.rs",
+      "crates/tracedecay-runtime-core/src/store/memory/dashboard.rs",
+      "crates/tracedecay-runtime-core/src/store/memory/graph.rs",
+      "crates/tracedecay-runtime-core/src/store/memory/graph_manifest.rs",
+      "crates/tracedecay-runtime-core/src/store/memory/graph_tests.rs",
+      "crates/tracedecay-runtime-core/src/store/memory/runtime.rs",
+      "crates/tracedecay-runtime-core/src/store/memory/scoring.rs",
+      "crates/tracedecay-runtime-core/src/store/memory/search.rs",
+      "crates/tracedecay-rusqlite-runtime/src/reader/pool/lease.rs",
+      "crates/tracedecay-rusqlite-runtime/src/reader/pool/mod.rs",
+      "crates/tracedecay-rusqlite-runtime/src/reader/tests.rs",
+      "crates/tracedecay-rusqlite-runtime/src/reader/worker.rs",
+      "crates/tracedecay-rusqlite-runtime/src/repository/external_source.rs",
+      "crates/tracedecay-rusqlite-runtime/src/repository/external_source/reads.rs",
+      "crates/tracedecay-rusqlite-runtime/src/repository/external_source/tests.rs",
+      "crates/tracedecay-rusqlite-runtime/src/repository/graph_publication.rs",
+      "crates/tracedecay-rusqlite-runtime/src/repository/graph_publication/exact.rs",
+      "crates/tracedecay-rusqlite-runtime/src/repository/graph_publication/support.rs",
+      "crates/tracedecay-rusqlite-runtime/src/repository/graph_publication/tests.rs",
+      "crates/tracedecay-rusqlite-runtime/src/repository/semantic_vector_staging/aggregate.rs",
+      "crates/tracedecay-rusqlite-runtime/src/repository/semantic_vector_staging/tests.rs",
+      "crates/tracedecay-rusqlite-runtime/src/repository/semantic_vector_staging_schema.sql",
+      "crates/tracedecay-rusqlite-runtime/tests/hotpath_coverage.rs",
+      "crates/tracedecay-semantic/Cargo.toml",
+      "crates/tracedecay-semantic/src/artifact_store.rs",
+      "crates/tracedecay-semantic/src/artifact_store/gc_recovery.rs",
+      "crates/tracedecay-semantic/src/artifact_store/import.rs",
+      "crates/tracedecay-semantic/src/artifact_store/io_primitives.rs",
+      "crates/tracedecay-semantic/src/artifact_store/lease_admission.rs",
+      "crates/tracedecay-semantic/src/artifact_store/paths.rs",
+      "crates/tracedecay-semantic/src/artifact_store/tests.rs",
+      "crates/tracedecay-semantic/src/fastembed_adapter.rs",
+      "crates/tracedecay-semantic/src/generation_resume.rs",
+      "crates/tracedecay-semantic/src/hotpath_observe.rs",
+      "crates/tracedecay-semantic/src/lib.rs",
+      "crates/tracedecay-semantic/src/manifest.rs",
+      "crates/tracedecay-semantic/src/model_catalog.rs",
+      "crates/tracedecay-semantic/src/model_lifecycle.rs",
+      "crates/tracedecay-semantic/src/model_lifecycle/distribution_acquisition_acceptance.rs",
+      "crates/tracedecay-semantic/src/model_lifecycle/local_evaluation.rs",
+      "crates/tracedecay-semantic/src/model_lifecycle/owner.rs",
+      "crates/tracedecay-semantic/src/model_lifecycle/reconciliation.rs",
+      "crates/tracedecay-semantic/src/model_lifecycle/shared.rs",
+      "crates/tracedecay-semantic/src/model_lifecycle/tests_first.rs",
+      "crates/tracedecay-semantic/src/projector.rs",
+      "crates/tracedecay-semantic/src/rerank_adapter.rs",
+      "crates/tracedecay-semantic/src/runtime_query.rs",
+      "crates/tracedecay-semantic/src/runtime_service.rs",
+      "crates/tracedecay-semantic/src/runtime_service/scheduling.rs",
+      "crates/tracedecay-semantic/src/semantic_evaluation.rs",
+      "crates/tracedecay-semantic/src/session_pool.rs",
+      "crates/tracedecay-semantic/src/session_pool/cold_load_tests.rs",
+      "crates/tracedecay-semantic/tests/deadline_authority.rs",
+      "crates/tracedecay-store/src/configuration.rs",
+      "crates/tracedecay-store/src/external_source/mod.rs",
+      "crates/tracedecay-store/src/external_source/reducer.rs",
+      "crates/tracedecay-store/src/git_index_transactions.rs",
+      "crates/tracedecay-store/src/lib.rs",
+      "crates/tracedecay-store/src/native_integration.rs",
+      "crates/tracedecay-store/src/retrieval_anchor.rs",
+      "crates/tracedecay-store/src/runtime/graph_publication.rs",
+      "crates/tracedecay-store/src/runtime/graph_publication/operation.rs",
+      "crates/tracedecay-store/src/runtime/graph_publication/store.rs",
+      "crates/tracedecay-store/src/runtime/semantic_vector_staging/manifest.rs",
+      "crates/tracedecay-store/src/runtime/semantic_vector_staging/types.rs",
+      "crates/tracedecay-store/src/session/common.rs",
+      "crates/tracedecay-usecases/src/configuration/operations.rs",
+      "crates/tracedecay-usecases/src/configuration/runtime.rs",
+      "crates/tracedecay-usecases/src/context/mod.rs",
+      "crates/tracedecay-usecases/src/context/read_modes.rs",
+      "crates/tracedecay/src/application_surface.rs",
+      "crates/tracedecay/src/config.rs",
+      "crates/tracedecay/src/daemon/project_open_owners.rs",
+      "crates/tracedecay/src/daemon/retained_owner/memory_tracking.rs",
+      "crates/tracedecay/src/daemon/service/invocation/feedback.rs",
+      "crates/tracedecay/src/daemon/service/invocation/observability_producer.rs",
+      "crates/tracedecay/src/daemon/service/project_runtime.rs",
+      "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
+      "crates/tracedecay/src/daemon/session_retrieval/contract.rs",
+      "crates/tracedecay/src/mcp/server/hook_writes.rs",
+      "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/context_scout.rs",
+      "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/hermes.rs",
+      "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
+      "crates/tracedecay/src/runtime_ports.rs"
+    ],
+    "changed_files_omitted": "2203 changed-file records summarized by summary.status_counts; the classifier reproduces them from the two immutable inputs"
+  },
+  "train": {
+    "prepare": {
+      "action": "prepare",
+      "conflict_paths": [
+        "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
+        "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
+        "crates/tracedecay/src/daemon/bootstrap.rs",
+        "crates/tracedecay/src/daemon/production_harness.rs",
+        "crates/tracedecay/src/daemon/retained_owner.rs",
+        "crates/tracedecay/tests/common/mod.rs"
+      ],
+      "floor_pins": [
+        "product/upstream/sync-policy.json",
+        "product/upstream/pr707-floor.json",
+        "product/upstream/convergence-map.json",
+        "product/upstream/patch-footprint-policy.json",
+        "product/upstream/README.md",
+        "scripts/product/check-patch-footprint-policy.py",
+        "tests/product_upstream_floor_test.sh",
+        "tests/product_upstream_vendor_floor_test.py",
+        "tests/product_upstream_ownership_registry_test.py"
+      ],
+      "floor_references": {
+        "archival_provenance": [
+          "product/architecture/m0-go-no-go.json",
+          "product/architecture/m0-go-no-go.md",
+          "product/baseline/tracedecay-v2-pr707-linux.json",
+          "scripts/product/check-v2-baseline.py",
+          "tests/product_v2_baseline_receipt_test.py"
+        ],
+        "canonical_metadata": [
+          "product/upstream/tracedecay-v2-pr707.json"
+        ],
+        "floor_pin": [
+          "product/upstream/README.md",
+          "product/upstream/convergence-map.json",
+          "product/upstream/patch-footprint-policy.json",
+          "product/upstream/pr707-floor.json",
+          "product/upstream/sync-policy.json",
+          "scripts/product/check-patch-footprint-policy.py",
+          "tests/product_upstream_floor_test.sh",
+          "tests/product_upstream_ownership_registry_test.py",
+          "tests/product_upstream_vendor_floor_test.py"
+        ],
+        "historical_record": [
+          ".beads/README.md",
+          ".beads/issues.jsonl",
+          ".beads/operations/applied/tdmem-0100.json",
+          ".beads/operations/applied/tdmem-0101.json",
+          ".beads/operations/prepare/tdmem-0307.py",
+          ".beads/receipts/tdmem-0100.json",
+          ".beads/receipts/tdmem-0101.json",
+          ".beads/receipts/tdmem-0102.json",
+          ".beads/receipts/tdmem-0103.json",
+          ".beads/receipts/tdmem-0104.json",
+          ".beads/receipts/tdmem-0105.json",
+          ".beads/receipts/tdmem-0106.json",
+          ".beads/receipts/tdmem-0107.json",
+          ".beads/receipts/tdmem-0200.json",
+          ".beads/receipts/tdmem-0201.json",
+          ".beads/receipts/tdmem-0202.json",
+          ".beads/receipts/tdmem-0203.json",
+          ".beads/receipts/tdmem-0204.json",
+          ".beads/receipts/tdmem-0205.json",
+          ".beads/receipts/tdmem-0206.json",
+          ".beads/receipts/tdmem-0207.json",
+          ".beads/receipts/tdmem-0208.json",
+          ".beads/receipts/tdmem-0209.json",
+          ".beads/receipts/tdmem-0301.json",
+          ".beads/receipts/tdmem-0302.json",
+          ".beads/receipts/tdmem-0303.json",
+          ".beads/receipts/tdmem-0304.json",
+          ".beads/receipts/tdmem-0305.json",
+          ".beads/receipts/tdmem-0306.json"
+        ]
+      },
+      "floor_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "ok": true,
+      "product_branch": "refs/heads/feat/pluggable-memory-providers-v2",
+      "product_head_sha": "ce0dc0e30378b72148be69842fab70615c46b984",
+      "source_ref": "refs/remotes/upstream/pr/707-current",
+      "source_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f",
+      "status": "conflicted",
+      "sync_head_sha": "ce0dc0e30378b72148be69842fab70615c46b984",
+      "sync_ref": "refs/heads/sync/upstream/1bde084d861b",
+      "train_dir": "/private/tmp/claude-501/-Users-satan-side-experiments-tracedecay/cb3419b1-4743-4eea-a5a8-f462919c422a/scratchpad/rehearsal3/train-real"
+    },
+    "conflict_receipts": [
+      {
+        "action": "record-conflict",
+        "ok": true,
+        "owner": "upstream",
+        "path": "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
+        "rationale": "upstream 25369faa relocated the LSP invocation seam (from crates/tracedecay/src/daemon/service/invocation/lsp.rs) into crates/tracedecay-daemon-service; re-apply expire_all_until(deadline) on the relocated file (ADR-0008 review trigger)",
+        "resolution": "adopt_upstream_relocation",
+        "source": {
+          "blob_sha": "1519b8fa6fa4b22b5afcad18a9e0d786733bb19b",
+          "commit_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f",
+          "path": "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
+          "ref": "refs/remotes/upstream/pr/707-current",
+          "sha": "1bde084d861bfa67bebec368ff28f747bcffa78f"
+        },
+        "status": "conflicted",
+        "train_dir": "/private/tmp/claude-501/-Users-satan-side-experiments-tracedecay/cb3419b1-4743-4eea-a5a8-f462919c422a/scratchpad/rehearsal3/train-real"
+      },
+      {
+        "action": "record-conflict",
+        "ok": true,
+        "owner": "upstream",
+        "path": "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
+        "rationale": "upstream relocated the shutdown seam (from crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs); re-apply shut_down_all_until and the blocking-drain deadline test on the relocated file",
+        "resolution": "adopt_upstream_relocation",
+        "source": {
+          "blob_sha": "60abd08e8a8aed601c47c51f38f8e9e5b4ff4dd7",
+          "commit_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f",
+          "path": "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
+          "ref": "refs/remotes/upstream/pr/707-current",
+          "sha": "1bde084d861bfa67bebec368ff28f747bcffa78f"
+        },
+        "status": "conflicted",
+        "train_dir": "/private/tmp/claude-501/-Users-satan-side-experiments-tracedecay/cb3419b1-4743-4eea-a5a8-f462919c422a/scratchpad/rehearsal3/train-real"
+      },
+      {
+        "action": "record-conflict",
+        "ok": true,
+        "owner": "shared",
+        "path": "crates/tracedecay/src/daemon/bootstrap.rs",
+        "rationale": "upstream added shutdown_watchdog::arm_shutdown_exit_bound(); product bootstrap mount retained; semantic decision for ScriptedAlchemy review",
+        "resolution": "merge_both_sides",
+        "source": {
+          "blob_sha": "83256c11119f43ab673a75a169148e71f75b9ea0",
+          "commit_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f",
+          "path": "crates/tracedecay/src/daemon/bootstrap.rs",
+          "ref": "refs/remotes/upstream/pr/707-current",
+          "sha": "1bde084d861bfa67bebec368ff28f747bcffa78f"
+        },
+        "status": "conflicted",
+        "train_dir": "/private/tmp/claude-501/-Users-satan-side-experiments-tracedecay/cb3419b1-4743-4eea-a5a8-f462919c422a/scratchpad/rehearsal3/train-real"
+      },
+      {
+        "action": "record-conflict",
+        "ok": true,
+        "owner": "product",
+        "path": "crates/tracedecay/src/daemon/production_harness.rs",
+        "rationale": "upstream open now returns ProductionHarnessOpenFuture; keep the ProjectMemoryProviderActivation mount on the new signature",
+        "resolution": "retain_product_mount",
+        "source": {
+          "blob_sha": "98cc6e36eb2031b44bdf4933728f22d5eced74f9",
+          "commit_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f",
+          "path": "crates/tracedecay/src/daemon/production_harness.rs",
+          "ref": "refs/remotes/upstream/pr/707-current",
+          "sha": "1bde084d861bfa67bebec368ff28f747bcffa78f"
+        },
+        "status": "conflicted",
+        "train_dir": "/private/tmp/claude-501/-Users-satan-side-experiments-tracedecay/cb3419b1-4743-4eea-a5a8-f462919c422a/scratchpad/rehearsal3/train-real"
+      },
+      {
+        "action": "record-conflict",
+        "ok": true,
+        "owner": "product",
+        "path": "crates/tracedecay/src/daemon/retained_owner.rs",
+        "rationale": "upstream re-exports memory_tracking; keep the memory-provider-host native_provider mounts",
+        "resolution": "retain_product_mount",
+        "source": {
+          "blob_sha": "2720af5963345d0ddab3513284d8b1e99ead848d",
+          "commit_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f",
+          "path": "crates/tracedecay/src/daemon/retained_owner.rs",
+          "ref": "refs/remotes/upstream/pr/707-current",
+          "sha": "1bde084d861bfa67bebec368ff28f747bcffa78f"
+        },
+        "status": "conflicted",
+        "train_dir": "/private/tmp/claude-501/-Users-satan-side-experiments-tracedecay/cb3419b1-4743-4eea-a5a8-f462919c422a/scratchpad/rehearsal3/train-real"
+      },
+      {
+        "action": "record-conflict",
+        "ok": true,
+        "owner": "shared",
+        "path": "crates/tracedecay/tests/common/mod.rs",
+        "rationale": "additive test helpers on both sides",
+        "resolution": "merge_both_sides",
+        "source": {
+          "blob_sha": "87c8190d5b3e5b849531a5af301ee7c4d4381749",
+          "commit_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f",
+          "path": "crates/tracedecay/tests/common/mod.rs",
+          "ref": "refs/remotes/upstream/pr/707-current",
+          "sha": "1bde084d861bfa67bebec368ff28f747bcffa78f"
+        },
+        "status": "conflicted",
+        "train_dir": "/private/tmp/claude-501/-Users-satan-side-experiments-tracedecay/cb3419b1-4743-4eea-a5a8-f462919c422a/scratchpad/rehearsal3/train-real"
+      }
+    ],
+    "inspect": {
+      "state_status": "conflicted",
+      "conflicts_recorded": 6,
+      "unresolved_paths": [
+        "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
+        "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
+        "crates/tracedecay/src/daemon/bootstrap.rs",
+        "crates/tracedecay/src/daemon/production_harness.rs",
+        "crates/tracedecay/src/daemon/retained_owner.rs",
+        "crates/tracedecay/tests/common/mod.rs"
+      ]
+    },
+    "refusals_on_unresolved_tree": {
+      "record_gate": "cannot record a gate in a conflicted train; run advance-floor so gates can run against the exact candidate tree",
+      "advance_floor": "unresolved Git conflicts remain: crates/tracedecay-daemon-service/src/invocation/lsp.rs, crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs, crates/tracedecay/src/daemon/bootstrap.rs, crates/tracedecay/src/daemon/production_harness.rs, crates/tracedecay/src/daemon/retained_owner.rs, crates/tracedecay/tests/common/mod.rs",
+      "publish": "cannot publish a conflicted train; advance-floor must produce the gated candidate tree first"
+    },
+    "abort": {
+      "action": "abort",
+      "checkout_head_sha": "ce0dc0e30378b72148be69842fab70615c46b984",
+      "checkout_mode": "product_branch",
+      "current_branch": "refs/heads/feat/pluggable-memory-providers-v2",
+      "floor_metadata_sha256": "0bc87a2ca9902b95ca2769fc4a221e3fa36f1b8d08a1b5ea62e6fa50f4cf9c72",
+      "ok": true,
+      "product_branch": "refs/heads/feat/pluggable-memory-providers-v2",
+      "product_head_sha": "ce0dc0e30378b72148be69842fab70615c46b984",
+      "status": "aborted",
+      "sync_ref_removed": true,
+      "terminal_receipt": "/private/tmp/claude-501/-Users-satan-side-experiments-tracedecay/cb3419b1-4743-4eea-a5a8-f462919c422a/scratchpad/rehearsal3/train-real/terminal-receipt.json",
+      "train_dir": "/private/tmp/claude-501/-Users-satan-side-experiments-tracedecay/cb3419b1-4743-4eea-a5a8-f462919c422a/scratchpad/rehearsal3/train-real",
+      "worktree_clean": true
+    },
+    "terminal_receipt": {
+      "$id": "https://tracedecay.dev/schemas/product/upstream/sync-train-receipt.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "bead_id": "tdmem-1208",
+      "completed_at": "2026-09-02T04:21:32Z",
+      "conflicts": [
+        {
+          "owner": "upstream",
+          "path": "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
+          "rationale": "upstream 25369faa relocated the LSP invocation seam (from crates/tracedecay/src/daemon/service/invocation/lsp.rs) into crates/tracedecay-daemon-service; re-apply expire_all_until(deadline) on the relocated file (ADR-0008 review trigger)",
+          "resolution": "adopt_upstream_relocation",
+          "source": "refs/remotes/upstream/pr/707-current:1bde084d861bfa67bebec368ff28f747bcffa78f",
+          "source_path": "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
+          "source_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f"
+        },
+        {
+          "owner": "upstream",
+          "path": "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
+          "rationale": "upstream relocated the shutdown seam (from crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs); re-apply shut_down_all_until and the blocking-drain deadline test on the relocated file",
+          "resolution": "adopt_upstream_relocation",
+          "source": "refs/remotes/upstream/pr/707-current:1bde084d861bfa67bebec368ff28f747bcffa78f",
+          "source_path": "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
+          "source_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f"
+        },
+        {
+          "owner": "shared",
+          "path": "crates/tracedecay/src/daemon/bootstrap.rs",
+          "rationale": "upstream added shutdown_watchdog::arm_shutdown_exit_bound(); product bootstrap mount retained; semantic decision for ScriptedAlchemy review",
+          "resolution": "merge_both_sides",
+          "source": "refs/remotes/upstream/pr/707-current:1bde084d861bfa67bebec368ff28f747bcffa78f",
+          "source_path": "crates/tracedecay/src/daemon/bootstrap.rs",
+          "source_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f"
+        },
+        {
+          "owner": "product",
+          "path": "crates/tracedecay/src/daemon/production_harness.rs",
+          "rationale": "upstream open now returns ProductionHarnessOpenFuture; keep the ProjectMemoryProviderActivation mount on the new signature",
+          "resolution": "retain_product_mount",
+          "source": "refs/remotes/upstream/pr/707-current:1bde084d861bfa67bebec368ff28f747bcffa78f",
+          "source_path": "crates/tracedecay/src/daemon/production_harness.rs",
+          "source_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f"
+        },
+        {
+          "owner": "product",
+          "path": "crates/tracedecay/src/daemon/retained_owner.rs",
+          "rationale": "upstream re-exports memory_tracking; keep the memory-provider-host native_provider mounts",
+          "resolution": "retain_product_mount",
+          "source": "refs/remotes/upstream/pr/707-current:1bde084d861bfa67bebec368ff28f747bcffa78f",
+          "source_path": "crates/tracedecay/src/daemon/retained_owner.rs",
+          "source_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f"
+        },
+        {
+          "owner": "shared",
+          "path": "crates/tracedecay/tests/common/mod.rs",
+          "rationale": "additive test helpers on both sides",
+          "resolution": "merge_both_sides",
+          "source": "refs/remotes/upstream/pr/707-current:1bde084d861bfa67bebec368ff28f747bcffa78f",
+          "source_path": "crates/tracedecay/tests/common/mod.rs",
+          "source_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f"
+        }
+      ],
+      "contract_id": "tracedecay.upstream-sync-train-receipt.v1",
+      "finalization": {
+        "cas": {
+          "attempted": false,
+          "expected_product_head_sha": "ce0dc0e30378b72148be69842fab70615c46b984",
+          "observed_product_head_sha": "ce0dc0e30378b72148be69842fab70615c46b984",
+          "required": true,
+          "result": "not_attempted"
+        },
+        "outcome": "not_published",
+        "released_head_sha": "ce0dc0e30378b72148be69842fab70615c46b984",
+        "released_ref": "refs/heads/feat/pluggable-memory-providers-v2",
+        "released_ref_update": {
+          "mode": "unchanged",
+          "new_sha": "ce0dc0e30378b72148be69842fab70615c46b984",
+          "old_sha": "ce0dc0e30378b72148be69842fab70615c46b984"
+        },
+        "same_commit": {
+          "bundle_commit_sha": null,
+          "members": [
+            "code",
+            "floor_metadata",
+            "convergence_receipt"
+          ],
+          "required": true,
+          "verified": false
+        },
+        "sync_head_sha": null,
+        "sync_ref": null
+      },
+      "floor_advancement": {
+        "archival_provenance": [
+          {
+            "blob_sha": "9f19e06b7858717a630f337782b4e830d983857a",
+            "path": "product/baseline/tracedecay-v2-pr707-linux.json",
+            "reason": "Measured build/test baseline recorded against the floor it was produced on; a new floor requires a re-measured baseline in a follow-up commit, never a literal rewrite."
+          },
+          {
+            "blob_sha": "d69401095ca7ba892f9e620db6cfec20b3460363",
+            "path": "scripts/product/check-v2-baseline.py",
+            "reason": "Verifies the archival baseline receipt against the floor that receipt was measured on."
+          },
+          {
+            "blob_sha": "6a3f6a46d9fee6606622bcf0ebf5bc50bafe5010",
+            "path": "tests/product_v2_baseline_receipt_test.py",
+            "reason": "Fixture for the archival baseline receipt checker."
+          },
+          {
+            "blob_sha": "ffba1bba23d56b1dde1c8c8acbdda61c801924a1",
+            "path": "product/architecture/m0-go-no-go.json",
+            "reason": "M0 milestone report; historical finding about the original floor."
+          },
+          {
+            "blob_sha": "cf0fccae35bd61e4ebc362ad76643503551684d0",
+            "path": "product/architecture/m0-go-no-go.md",
+            "reason": "M0 milestone report; historical finding about the original floor."
+          }
+        ],
+        "candidate_floor_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f",
+        "canonical_metadata": "product/upstream/tracedecay-v2-pr707.json",
+        "gated_tree_sha": null,
+        "outcome": "not_advanced",
+        "pins": [
+          {
+            "each_occurrences": 0,
+            "kind": "json_pointer",
+            "occurrences": 1,
+            "path": "product/upstream/sync-policy.json"
+          },
+          {
+            "each_occurrences": 0,
+            "kind": "derived_metadata_receipt",
+            "occurrences": 1,
+            "path": "product/upstream/pr707-floor.json"
+          },
+          {
+            "each_occurrences": 29,
+            "kind": "json_pointer",
+            "occurrences": 30,
+            "path": "product/upstream/convergence-map.json"
+          },
+          {
+            "each_occurrences": 0,
+            "kind": "json_pointer",
+            "occurrences": 2,
+            "path": "product/upstream/patch-footprint-policy.json"
+          },
+          {
+            "each_occurrences": 0,
+            "kind": "anchored_line",
+            "occurrences": 1,
+            "path": "product/upstream/README.md"
+          },
+          {
+            "each_occurrences": 0,
+            "kind": "anchored_line",
+            "occurrences": 1,
+            "path": "scripts/product/check-patch-footprint-policy.py"
+          },
+          {
+            "each_occurrences": 0,
+            "kind": "anchored_line",
+            "occurrences": 1,
+            "path": "tests/product_upstream_floor_test.sh"
+          },
+          {
+            "each_occurrences": 0,
+            "kind": "anchored_line",
+            "occurrences": 1,
+            "path": "tests/product_upstream_vendor_floor_test.py"
+          },
+          {
+            "each_occurrences": 0,
+            "kind": "anchored_line",
+            "occurrences": 1,
+            "path": "tests/product_upstream_ownership_registry_test.py"
+          }
+        ],
+        "previous_floor_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+        "verification_coverage": null
+      },
+      "gates": [
+        {
+          "command": "upstream_required (not recorded)",
+          "commands": [],
+          "coverage": null,
+          "evidence": [
+            "not run"
+          ],
+          "id": "upstream_required",
+          "owner": "BleedingDev",
+          "phase": "upstream",
+          "required": true,
+          "status": "not_run",
+          "tree_sha": null
+        },
+        {
+          "command": "product_contracts (not recorded)",
+          "commands": [],
+          "coverage": null,
+          "evidence": [
+            "not run"
+          ],
+          "id": "product_contracts",
+          "owner": "BleedingDev",
+          "phase": "product",
+          "required": true,
+          "status": "not_run",
+          "tree_sha": null
+        },
+        {
+          "command": "native_parity (not recorded)",
+          "commands": [],
+          "coverage": null,
+          "evidence": [
+            "not run"
+          ],
+          "id": "native_parity",
+          "owner": "BleedingDev",
+          "phase": "product",
+          "required": true,
+          "status": "not_run",
+          "tree_sha": null
+        },
+        {
+          "command": "provider_conformance (not recorded)",
+          "commands": [],
+          "coverage": null,
+          "evidence": [
+            "not run"
+          ],
+          "id": "provider_conformance",
+          "owner": "BleedingDev",
+          "phase": "product",
+          "required": true,
+          "status": "not_run",
+          "tree_sha": null
+        },
+        {
+          "command": "scope_crash_security (not recorded)",
+          "commands": [],
+          "coverage": null,
+          "evidence": [
+            "not run"
+          ],
+          "id": "scope_crash_security",
+          "owner": "BleedingDev",
+          "phase": "product",
+          "required": true,
+          "status": "not_run",
+          "tree_sha": null
+        },
+        {
+          "command": "generated_drift (not recorded)",
+          "commands": [],
+          "coverage": null,
+          "evidence": [
+            "not run"
+          ],
+          "id": "generated_drift",
+          "owner": "BleedingDev",
+          "phase": "product",
+          "required": true,
+          "status": "not_run",
+          "tree_sha": null
+        }
+      ],
+      "policy_revision": "sync-train.v1",
+      "product": {
+        "floor_metadata_path": "product/upstream/tracedecay-v2-pr707.json",
+        "released_ref": "refs/heads/feat/pluggable-memory-providers-v2",
+        "repository": "BleedingDev/tracedecay",
+        "starting_floor_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+        "starting_head_sha": "ce0dc0e30378b72148be69842fab70615c46b984",
+        "starting_ref": "refs/heads/feat/pluggable-memory-providers-v2"
+      },
+      "receipt_id": "sync-train-1bde084d861b",
+      "schema_version": 1,
+      "started_at": "2026-09-02T04:21:28Z",
+      "sync": {
+        "base_floor_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+        "base_product_head_sha": "ce0dc0e30378b72148be69842fab70615c46b984",
+        "branch_ref": "refs/heads/sync/upstream/1bde084d861b",
+        "created_at": "2026-09-02T04:21:28Z",
+        "strategy": "merge"
+      },
+      "terminal": {
+        "reason": "sync train aborted before isolated publication",
+        "state": "aborted"
+      },
+      "upstream": {
+        "candidate_ref": "refs/remotes/upstream/pr/707-current",
+        "candidate_sha": "1bde084d861bfa67bebec368ff28f747bcffa78f",
+        "repository": "ScriptedAlchemy/tracedecay",
+        "selected_at": "2026-09-02T04:21:28Z"
+      },
+      "workflow": {
+        "name": "run-upstream-sync-train",
+        "policy_path": "product/upstream/sync-policy.json",
+        "receipt_schema_path": "product/upstream/sync-train-receipt.schema.json"
+      }
+    }
+  },
+  "verification_coverage_at_product_head": {
+    "measured_by": "run-upstream-sync-train.py stamped_verification_commands + verification_coverage against gates.lanes, and verify_lane_in_workflow for all six lanes",
+    "lanes_verified_against_workflow_job_blocks": true,
+    "coverage": {
+      "stamped_targets": 45,
+      "required_commands": 27,
+      "covered_commands": 19,
+      "uncovered_commands": [
+        "cargo test --locked -p tracedecay --features memory-provider-host native_observe_verifies_real_store_without_writing",
+        "cargo test --locked -p tracedecay --features memory-provider-host native_recall_current_preserves_order_and_projects_native_score_explain_provenance",
+        "cargo test --locked -p tracedecay --features memory-provider-host native_recall_does_not_mutate_authoritative_fact_telemetry_or_history",
+        "cargo test --locked -p tracedecay --features memory-provider-host native_recall_matches_direct_search_semantically_on_identical_stores",
+        "cargo test --locked -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss",
+        "cargo test -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss --locked",
+        "cargo test -p tracedecay-memory-provider-ncm --locked",
+        "python3 tests/product_ncm_surface_audit_test.py"
+      ],
+      "lane_commands": {
+        "upstream_required": {
+          "declared": 9,
+          "passed": 0
+        },
+        "product_contracts": {
+          "declared": 16,
+          "passed": 0
+        },
+        "native_parity": {
+          "declared": 5,
+          "passed": 0
+        },
+        "provider_conformance": {
+          "declared": 7,
+          "passed": 0
+        },
+        "scope_crash_security": {
+          "declared": 4,
+          "passed": 0
+        },
+        "generated_drift": {
+          "declared": 8,
+          "passed": 0
+        }
+      }
+    },
+    "required_command_targets": {
+      "cargo metadata --locked --format-version 1 --no-deps": [
+        "product/upstream/convergence-map.json#/entries/0/verification",
+        "product/upstream/convergence-map.json#/entries/1/verification",
+        "product/upstream/convergence-map.json#/entries/2/verification"
+      ],
+      "cargo test --locked -p tracedecay --features memory-provider-host native_observe_verifies_real_store_without_writing": [
+        "product/upstream/convergence-map.json#/areas/10/tests",
+        "product/upstream/convergence-map.json#/entries/8/tests"
+      ],
+      "cargo test --locked -p tracedecay --features memory-provider-host native_recall_current_preserves_order_and_projects_native_score_explain_provenance": [
+        "product/upstream/convergence-map.json#/areas/10/tests",
+        "product/upstream/convergence-map.json#/entries/8/tests"
+      ],
+      "cargo test --locked -p tracedecay --features memory-provider-host native_recall_does_not_mutate_authoritative_fact_telemetry_or_history": [
+        "product/upstream/convergence-map.json#/areas/10/tests",
+        "product/upstream/convergence-map.json#/entries/8/tests"
+      ],
+      "cargo test --locked -p tracedecay --features memory-provider-host native_recall_matches_direct_search_semantically_on_identical_stores": [
+        "product/upstream/convergence-map.json#/areas/10/tests"
+      ],
+      "cargo test --locked -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss": [
+        "product/upstream/convergence-map.json#/entries/7/tests"
+      ],
+      "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1": [
+        "product/upstream/convergence-map.json#/areas/12/tests",
+        "product/upstream/convergence-map.json#/entries/14/verification",
+        "product/upstream/convergence-map.json#/entries/14/tests",
+        "product/upstream/convergence-map.json#/entries/15/verification",
+        "product/upstream/convergence-map.json#/entries/15/tests"
+      ],
+      "cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification": [
+        "product/upstream/convergence-map.json#/areas/11/tests",
+        "product/upstream/convergence-map.json#/entries/13/verification",
+        "product/upstream/convergence-map.json#/entries/13/tests"
+      ],
+      "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline": [
+        "product/upstream/convergence-map.json#/areas/11/tests",
+        "product/upstream/convergence-map.json#/entries/9/verification",
+        "product/upstream/convergence-map.json#/entries/9/tests",
+        "product/upstream/convergence-map.json#/entries/10/verification",
+        "product/upstream/convergence-map.json#/entries/10/tests",
+        "product/upstream/convergence-map.json#/entries/11/verification",
+        "product/upstream/convergence-map.json#/entries/11/tests",
+        "product/upstream/convergence-map.json#/entries/12/verification",
+        "product/upstream/convergence-map.json#/entries/12/tests",
+        "product/upstream/convergence-map.json#/entries/13/verification",
+        "product/upstream/convergence-map.json#/entries/13/tests"
+      ],
+      "cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_recall_ -- --nocapture": [
+        "product/upstream/convergence-map.json#/areas/3/tests"
+      ],
+      "cargo test -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss --locked": [
+        "product/upstream/convergence-map.json#/areas/10/tests",
+        "product/upstream/convergence-map.json#/entries/2/tests",
+        "product/upstream/convergence-map.json#/entries/3/tests",
+        "product/upstream/convergence-map.json#/entries/4/tests",
+        "product/upstream/convergence-map.json#/entries/5/tests",
+        "product/upstream/convergence-map.json#/entries/6/tests"
+      ],
+      "cargo test -p tracedecay-memory-conformance --locked": [
+        "product/upstream/convergence-map.json#/areas/5/tests",
+        "product/upstream/convergence-map.json#/areas/9/tests",
+        "product/upstream/convergence-map.json#/entries/0/tests"
+      ],
+      "cargo test -p tracedecay-memory-fabric --locked": [
+        "product/upstream/convergence-map.json#/areas/1/tests",
+        "product/upstream/convergence-map.json#/entries/1/tests"
+      ],
+      "cargo test -p tracedecay-memory-provider-api --locked": [
+        "product/upstream/convergence-map.json#/areas/0/tests",
+        "product/upstream/convergence-map.json#/areas/9/tests",
+        "product/upstream/convergence-map.json#/entries/1/tests"
+      ],
+      "cargo test -p tracedecay-memory-provider-native --locked": [
+        "product/upstream/convergence-map.json#/areas/3/tests"
+      ],
+      "cargo test -p tracedecay-memory-provider-ncm --locked": [
+        "product/upstream/convergence-map.json#/areas/4/tests"
+      ],
+      "cargo test -p tracedecay-memory-provider-registry --locked": [
+        "product/upstream/convergence-map.json#/areas/2/tests",
+        "product/upstream/convergence-map.json#/entries/0/tests"
+      ],
+      "git diff --check": [
+        "product/upstream/convergence-map.json#/entries/0/verification",
+        "product/upstream/convergence-map.json#/entries/1/verification",
+        "product/upstream/convergence-map.json#/entries/2/verification",
+        "product/upstream/convergence-map.json#/entries/3/verification",
+        "product/upstream/convergence-map.json#/entries/4/verification",
+        "product/upstream/convergence-map.json#/entries/5/verification",
+        "product/upstream/convergence-map.json#/entries/6/verification",
+        "product/upstream/convergence-map.json#/entries/7/verification",
+        "product/upstream/convergence-map.json#/entries/8/verification",
+        "product/upstream/convergence-map.json#/entries/9/verification",
+        "product/upstream/convergence-map.json#/entries/10/verification",
+        "product/upstream/convergence-map.json#/entries/11/verification",
+        "product/upstream/convergence-map.json#/entries/12/verification",
+        "product/upstream/convergence-map.json#/entries/13/verification",
+        "product/upstream/convergence-map.json#/entries/14/verification",
+        "product/upstream/convergence-map.json#/entries/15/verification"
+      ],
+      "python3 scripts/product/check-memory-composition-feature.py --repo .": [
+        "product/upstream/convergence-map.json#/entries/7/verification",
+        "product/upstream/convergence-map.json#/entries/8/verification"
+      ],
+      "python3 scripts/product/check-upstream-ownership-registry.py --repo .": [
+        "product/upstream/convergence-map.json#/entries/7/verification",
+        "product/upstream/convergence-map.json#/entries/8/verification"
+      ],
+      "python3 tests/product_dummy_provider_conformance_test.py": [
+        "product/upstream/convergence-map.json#/areas/5/tests"
+      ],
+      "python3 tests/product_memory_composition_feature_test.py": [
+        "product/upstream/convergence-map.json#/areas/3/tests",
+        "product/upstream/convergence-map.json#/areas/10/tests",
+        "product/upstream/convergence-map.json#/entries/7/tests"
+      ],
+      "python3 tests/product_memory_fabric_disabled_mode_test.py": [
+        "product/upstream/convergence-map.json#/areas/10/tests",
+        "product/upstream/convergence-map.json#/entries/7/tests"
+      ],
+      "python3 tests/product_memory_provider_contract_set_test.py": [
+        "product/upstream/convergence-map.json#/areas/0/tests"
+      ],
+      "python3 tests/product_ncm_surface_audit_test.py": [
+        "product/upstream/convergence-map.json#/areas/4/tests"
+      ],
+      "python3 tests/product_patch_footprint_policy_test.py": [
+        "product/upstream/convergence-map.json#/areas/8/tests"
+      ],
+      "python3 tests/product_upstream_ownership_registry_test.py": [
+        "product/upstream/convergence-map.json#/areas/6/tests",
+        "product/upstream/convergence-map.json#/areas/7/tests",
+        "product/upstream/convergence-map.json#/areas/8/tests"
+      ]
+    },
+    "synthetic_floor_descendant_rehearsal": {
+      "purpose": "prove advance-floor refuses to stamp targets whose verification commands no lane runs, before any ref moves",
+      "candidate_sha": "842033015da6f6990ce0a7997158b040fa74ed97",
+      "prepare_status": "prepared",
+      "advance_floor_refused": "8 of 27 verification commands declared by stamped convergence targets are run by no gate lane in sync policy: cargo test --locked -p tracedecay --features memory-provider-host native_observe_verifies_real_store_without_writing <- product/upstream/convergence-map.json#/areas/10/tests, product/upstream/convergence-map.json#/entries/8/tests; cargo test --locked -p tracedecay --features memory-provider-host native_recall_current_preserves_order_and_projects_native_score_explain_provenance <- product/upstream/convergence-map.json#/areas/10/tests, product/upstream/convergence-map.json#/entries/8/tests; cargo test --locked -p tracedecay --features memory-provider-host native_recall_does_not_mutate_authoritative_fact_telemetry_or_history <- product/upstream/convergence-map.json#/areas/10/tests, product/upstream/convergence-map.json#/entries/8/tests; cargo test --locked -p tracedecay --features memory-provider-host native_recall_matches_direct_search_semantically_on_identical_stores <- product/upstream/convergence-map.json#/areas/10/tests; cargo test --locked -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss <- product/upstream/convergence-map.json#/entries/7/tests; cargo test -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss --locked <- product/upstream/convergence-map.json#/areas/10/tests, product/upstream/convergence-map.json#/entries/2/tests, product/upstream/convergence-map.json#/entries/3/tests; cargo test -p tracedecay-memory-provider-ncm --locked <- product/upstream/convergence-map.json#/areas/4/tests; python3 tests/product_ncm_surface_audit_test.py <- product/upstream/convergence-map.json#/areas/4/tests",
+      "abort": {
+        "ok": true,
+        "status": "aborted",
+        "sync_ref_removed": true,
+        "worktree_clean": true,
+        "checkout_mode": "product_branch"
+      }
+    }
+  }
+}

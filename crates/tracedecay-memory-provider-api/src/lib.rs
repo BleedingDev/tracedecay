@@ -32,6 +32,14 @@ use sha2::{Digest, Sha256};
 /// Generated dependency-free values from the canonical Memory Provider V1 contracts.
 pub mod contract;
 
+mod hygiene;
+
+pub use hygiene::{
+    OBSERVATION_HYGIENE_RECEIPT_ID_PREFIX, OBSERVATION_HYGIENE_WITHHELD_ID_PREFIX,
+    PayloadSanitizationReceipt, PayloadSanitizationReceiptParts, SANITIZER_REVISION_MAX_BYTES,
+    SanitizationDisposition, WithheldReason, derive_withheld_receipt_id, empty_findings_digest,
+};
+
 use contract::{
     CancellationState, CapabilityId, CommittedEffectExpectation, CommittedEffectState,
     ExactScopeIdentity, FallbackEligibility, IdentifierError, OpaqueExtension, RequestControl,
@@ -102,6 +110,8 @@ pub enum ApiError {
     MissingOperationCapability(&'static str),
     /// An opaque extension version was zero.
     InvalidExtensionVersion,
+    /// Opaque extensions were not in canonical ascending, duplicate-free order.
+    UnorderedExtensions,
     /// Canonical bytes no longer matched their declared SHA-256 digest.
     ContentDigestMismatch(&'static str),
     /// A bounded collection exceeded its maximum item count.
@@ -172,6 +182,13 @@ pub enum ApiError {
         /// Maximum UTF-8 bytes accepted.
         maximum: usize,
     },
+    /// A duplicate acknowledgement named an idempotency key other than the one
+    /// on the request it answered, so it does not prove *this* mutation was
+    /// already delivered.
+    DuplicateEffectKeyMismatch,
+    /// A duplicate acknowledgement was built for a call that carries no
+    /// idempotency key, so there is nothing for it to deduplicate.
+    DuplicateEffectWithoutRequestKey,
     /// A read-only provider operation claimed a committed effect.
     ReadOnlyOperationEffect {
         /// Read-only operation.
@@ -181,6 +198,22 @@ pub enum ApiError {
     },
     /// A fallback directive was built for a provider other than the terminal provider.
     FallbackSourceProviderMismatch,
+    /// An observation reached the dispatch boundary without a sanitization
+    /// receipt, so nothing proves it passed secret and transient hygiene.
+    UnsanitizedObservation,
+    /// A sanitization receipt no longer matched its derived identifier.
+    SanitizationReceiptTampered,
+    /// A sanitization receipt described bytes other than the payload being
+    /// dispatched.
+    SanitizationReceiptUnbound,
+    /// A sanitizer revision label was empty, oversized, or non-canonical.
+    InvalidSanitizerRevision,
+    /// An accepted receipt claimed delivered bytes that differ from source.
+    SanitizationAcceptedPayloadModified,
+    /// A redacted receipt claimed delivered bytes identical to source.
+    SanitizationRedactedPayloadUnmodified,
+    /// A persisted sanitization receipt could not be parsed back.
+    MalformedSanitizationReceiptJson(&'static str),
 }
 
 impl fmt::Display for ApiError {
@@ -228,6 +261,9 @@ impl fmt::Display for ApiError {
             Self::InvalidExtensionVersion => {
                 formatter.write_str("opaque extension version must be positive")
             }
+            Self::UnorderedExtensions => formatter.write_str(
+                "opaque extensions must be in ascending, duplicate-free extension-id order",
+            ),
             Self::ContentDigestMismatch(field) => {
                 write!(
                     formatter,
@@ -311,6 +347,12 @@ impl fmt::Display for ApiError {
             Self::TerminalTextTooLong { field, maximum } => {
                 write!(formatter, "terminal field {field} exceeds {maximum} bytes")
             }
+            Self::DuplicateEffectKeyMismatch => formatter.write_str(
+                "duplicate committed effect names an idempotency key other than the request's",
+            ),
+            Self::DuplicateEffectWithoutRequestKey => formatter.write_str(
+                "duplicate committed effect requires a request idempotency key to deduplicate",
+            ),
             Self::ReadOnlyOperationEffect {
                 operation,
                 effect_state,
@@ -322,6 +364,30 @@ impl fmt::Display for ApiError {
             ),
             Self::FallbackSourceProviderMismatch => {
                 formatter.write_str("fallback directive source does not match terminal provider")
+            }
+            Self::UnsanitizedObservation => {
+                formatter.write_str("observation call carries no sanitization receipt")
+            }
+            Self::SanitizationReceiptTampered => {
+                formatter.write_str("sanitization receipt does not match its derived identifier")
+            }
+            Self::SanitizationReceiptUnbound => {
+                formatter.write_str("sanitization receipt does not bind the dispatched payload")
+            }
+            Self::InvalidSanitizerRevision => {
+                formatter.write_str("sanitizer revision is empty, oversized, or non-canonical")
+            }
+            Self::SanitizationAcceptedPayloadModified => {
+                formatter.write_str("accepted sanitization receipt reports modified bytes")
+            }
+            Self::SanitizationRedactedPayloadUnmodified => {
+                formatter.write_str("redacted sanitization receipt reports unmodified bytes")
+            }
+            Self::MalformedSanitizationReceiptJson(part) => {
+                write!(
+                    formatter,
+                    "sanitization receipt json is malformed at {part}"
+                )
             }
         }
     }
@@ -372,6 +438,13 @@ fn require_sha256(value: &str, field: &'static str) -> Result<(), ApiError> {
     } else {
         Err(ApiError::InvalidSha256(field))
     }
+}
+
+fn require_tagged_sha256(value: &str, field: &'static str) -> Result<(), ApiError> {
+    value
+        .strip_prefix("sha256:")
+        .ok_or(ApiError::InvalidSha256(field))
+        .and_then(|digest| require_sha256(digest, field))
 }
 
 fn lowercase_sha256_hex(value: [u8; 32]) -> String {
@@ -437,8 +510,8 @@ pub struct OwnedExactScope {
     pub branch_identity: String,
     /// Exact coding-agent session identity.
     pub agent_session_id: String,
-    /// Monotonic TraceDecay scope revision.
-    pub scope_revision: u64,
+    /// Canonical digest copied from the authoritative project-open resolved scope.
+    pub resolved_scope_digest: String,
 }
 
 impl OwnedExactScope {
@@ -450,7 +523,7 @@ impl OwnedExactScope {
         worktree_identity: impl Into<String>,
         branch_identity: impl Into<String>,
         agent_session_id: impl Into<String>,
-        scope_revision: u64,
+        resolved_scope_digest: impl Into<String>,
     ) -> Result<Self, ApiError> {
         let scope = Self {
             profile_id: profile_id.into(),
@@ -459,7 +532,7 @@ impl OwnedExactScope {
             worktree_identity: worktree_identity.into(),
             branch_identity: branch_identity.into(),
             agent_session_id: agent_session_id.into(),
-            scope_revision,
+            resolved_scope_digest: resolved_scope_digest.into(),
         };
         scope.validate()?;
         Ok(scope)
@@ -473,6 +546,7 @@ impl OwnedExactScope {
         require_non_empty(&self.worktree_identity, "worktree_identity")?;
         require_non_empty(&self.branch_identity, "branch_identity")?;
         require_non_empty(&self.agent_session_id, "agent_session_id")?;
+        require_tagged_sha256(&self.resolved_scope_digest, "resolved_scope_digest")?;
         Ok(())
     }
 
@@ -486,7 +560,7 @@ impl OwnedExactScope {
             worktree_identity: &self.worktree_identity,
             branch_identity: &self.branch_identity,
             agent_session_id: &self.agent_session_id,
-            scope_revision: self.scope_revision,
+            resolved_scope_digest: &self.resolved_scope_digest,
         }
     }
 
@@ -503,11 +577,11 @@ impl OwnedExactScope {
             self.worktree_identity.as_bytes(),
             self.branch_identity.as_bytes(),
             self.agent_session_id.as_bytes(),
+            self.resolved_scope_digest.as_bytes(),
         ] {
             digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
             digest.update(value);
         }
-        digest.update(self.scope_revision.to_be_bytes());
         let value = digest.finalize();
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut output = String::with_capacity(value.len().saturating_mul(2));
@@ -1014,6 +1088,100 @@ impl OwnedOpaqueExtension {
     }
 }
 
+/// Digest of the empty canonical opaque-extension set.
+#[must_use]
+pub fn empty_opaque_extensions_digest() -> String {
+    const DOMAIN: &[u8] = b"tracedecay.memory-provider.observation-extensions.v1\0";
+    let mut digest = Sha256::new();
+    digest.update(DOMAIN);
+    digest.update(0_u64.to_be_bytes());
+    lowercase_sha256_hex(digest.finalize().into())
+}
+
+/// Validates and digests the exact extension set carried by an observation.
+///
+/// This is the shared pre-dispatch and pre-sanitization boundary: at most 32
+/// extensions, at most 256 KiB each, at most 512 KiB in aggregate, and canonical
+/// ascending duplicate-free identity order.
+pub fn observation_extensions_digest(
+    extensions: &[OwnedOpaqueExtension],
+) -> Result<String, ApiError> {
+    validate_extension_boundary(extensions, 32, 262_144, Some(524_288))?;
+    opaque_extensions_digest(extensions)
+}
+
+/// Digest over one canonical opaque-extension set.
+///
+/// Extensions are framed in ascending, duplicate-free `extension_id` order.
+/// The digest covers each extension's identity, version, criticality, and
+/// canonical payload digest, so a hygiene receipt cannot be reattached after an
+/// extension is added, removed, reordered, or re-pointed at other bytes.
+pub fn opaque_extensions_digest(extensions: &[OwnedOpaqueExtension]) -> Result<String, ApiError> {
+    const DOMAIN: &[u8] = b"tracedecay.memory-provider.observation-extensions.v1\0";
+
+    let mut previous: Option<&str> = None;
+    let mut digest = Sha256::new();
+    digest.update(DOMAIN);
+    digest.update(
+        u64::try_from(extensions.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for extension in extensions {
+        extension.validate()?;
+        let id = extension.extension_id.as_str();
+        if previous.is_some_and(|last| last >= id) {
+            return Err(ApiError::UnorderedExtensions);
+        }
+        previous = Some(id);
+        for value in [
+            id.as_bytes(),
+            &u64::from(extension.extension_version).to_be_bytes(),
+            &[u8::from(extension.required)],
+            extension.payload_sha256.as_bytes(),
+        ] {
+            digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+            digest.update(value);
+        }
+    }
+    Ok(lowercase_sha256_hex(digest.finalize().into()))
+}
+
+fn validate_extension_boundary(
+    extensions: &[OwnedOpaqueExtension],
+    maximum_extensions: usize,
+    maximum_extension_bytes: u64,
+    maximum_total_bytes: Option<u64>,
+) -> Result<(), ApiError> {
+    if extensions.len() > maximum_extensions {
+        return Err(ApiError::TooManyBoundaryItems {
+            field: "extensions",
+            maximum: maximum_extensions,
+        });
+    }
+    let mut total_extension_bytes = 0_u64;
+    for extension in extensions {
+        extension.validate()?;
+        let extension_bytes = u64::try_from(extension.canonical_payload.len()).unwrap_or(u64::MAX);
+        if extension_bytes > maximum_extension_bytes {
+            return Err(ApiError::BoundaryBytesExceeded {
+                field: "extension_canonical_payload",
+                maximum: maximum_extension_bytes,
+            });
+        }
+        total_extension_bytes = total_extension_bytes.saturating_add(extension_bytes);
+    }
+    if let Some(maximum) = maximum_total_bytes
+        && total_extension_bytes > maximum
+    {
+        return Err(ApiError::BoundaryBytesExceeded {
+            field: "extensions",
+            maximum,
+        });
+    }
+    Ok(())
+}
+
 /// Owned runtime provider call built from canonical wire bytes.
 #[derive(Clone, Debug)]
 pub struct ProviderCall {
@@ -1043,10 +1211,22 @@ pub struct ProviderCall {
     pub required_capabilities: BTreeSet<OwnedVersionedId>,
     /// Opaque extensions.
     pub extensions: Vec<OwnedOpaqueExtension>,
+    /// Proof that the payload passed the admitted observation-hygiene
+    /// pipeline. Private so the only way to attach one is
+    /// [`ProviderCall::with_sanitization`], and the only way to read one is
+    /// [`ProviderCall::sanitization`].
+    sanitization: Option<PayloadSanitizationReceipt>,
 }
 
 impl ProviderCall {
     /// Validates a complete runtime call.
+    ///
+    /// This checks the call envelope. It deliberately does not require a
+    /// sanitization receipt: a dispatcher that reconstructs a call from a
+    /// durable journal builds the envelope first and re-attaches the persisted
+    /// receipt with [`ProviderCall::with_sanitization`]. The receipt is
+    /// mandatory at [`ProviderCall::validate`], which every dispatch path runs
+    /// before a provider sees the call.
     pub fn new(parts: ProviderCallParts) -> Result<Self, ApiError> {
         let mut required_capabilities = BTreeSet::new();
         for capability in parts.required_capabilities {
@@ -1069,13 +1249,50 @@ impl ProviderCall {
             payload: parts.payload,
             required_capabilities,
             extensions: parts.extensions,
+            sanitization: None,
         };
-        call.validate()?;
+        call.validate_envelope()?;
         Ok(call)
     }
 
-    /// Revalidates the complete public call envelope after mutation.
+    /// Attaches the sanitization receipt that admitted this payload.
+    ///
+    /// Attaching is infallible on purpose; a receipt that does not describe
+    /// this payload is caught by [`ProviderCall::validate`], which is the one
+    /// place the boundary decides whether a call may be dispatched.
+    #[must_use]
+    pub fn with_sanitization(mut self, receipt: PayloadSanitizationReceipt) -> Self {
+        self.sanitization = Some(receipt);
+        self
+    }
+
+    /// Returns the attached sanitization receipt, if any.
+    #[must_use]
+    pub fn sanitization(&self) -> Option<&PayloadSanitizationReceipt> {
+        self.sanitization.as_ref()
+    }
+
+    /// Revalidates the complete public call envelope after mutation, and — for
+    /// [`ProviderOperation::Observe`] — fails closed unless a self-consistent
+    /// sanitization receipt binds the exact canonical payload being dispatched.
+    ///
+    /// The fabric runs this as the first statement of observation delivery, so
+    /// an unsanitized or mis-bound observation never reaches provider
+    /// registration, readiness, or a concurrency permit.
     pub fn validate(&self) -> Result<(), ApiError> {
+        self.validate_envelope()?;
+        if self.operation != ProviderOperation::Observe {
+            return Ok(());
+        }
+        let receipt = self
+            .sanitization
+            .as_ref()
+            .ok_or(ApiError::UnsanitizedObservation)?;
+        let extensions_digest = observation_extensions_digest(&self.extensions)?;
+        receipt.verify_binding(&self.payload.sha256, &extensions_digest)
+    }
+
+    fn validate_envelope(&self) -> Result<(), ApiError> {
         contract::ProviderId::new(self.provider_id.as_str())
             .map_err(ApiError::InvalidProviderId)?;
         if self.registration_revision == 0 {
@@ -1118,36 +1335,21 @@ impl ProviderCall {
         }
         self.payload.validate()?;
 
-        let (maximum_extensions, maximum_extension_bytes) =
-            if self.operation == ProviderOperation::Recall {
-                (16, 131_072_u64)
-            } else {
-                (32, 262_144_u64)
-            };
-        if self.extensions.len() > maximum_extensions {
-            return Err(ApiError::TooManyBoundaryItems {
-                field: "extensions",
-                maximum: maximum_extensions,
-            });
-        }
-        let mut total_extension_bytes = 0_u64;
-        for extension in &self.extensions {
-            extension.validate()?;
-            let extension_bytes =
-                u64::try_from(extension.canonical_payload.len()).unwrap_or(u64::MAX);
-            if extension_bytes > maximum_extension_bytes {
-                return Err(ApiError::BoundaryBytesExceeded {
-                    field: "extension_canonical_payload",
-                    maximum: maximum_extension_bytes,
-                });
-            }
-            total_extension_bytes = total_extension_bytes.saturating_add(extension_bytes);
-        }
-        if self.operation == ProviderOperation::Observe && total_extension_bytes > 524_288 {
-            return Err(ApiError::BoundaryBytesExceeded {
-                field: "extensions",
-                maximum: 524_288,
-            });
+        if self.operation == ProviderOperation::Observe {
+            observation_extensions_digest(&self.extensions)?;
+        } else {
+            let (maximum_extensions, maximum_extension_bytes) =
+                if self.operation == ProviderOperation::Recall {
+                    (16, 131_072_u64)
+                } else {
+                    (32, 262_144_u64)
+                };
+            validate_extension_boundary(
+                &self.extensions,
+                maximum_extensions,
+                maximum_extension_bytes,
+                None,
+            )?;
         }
         Ok(())
     }
@@ -1219,6 +1421,10 @@ pub struct CommittedEffectEvidenceParts {
     pub reconciliation_action: Option<String>,
     /// Digest verifying the known committed partition.
     pub verification_sha256: Option<String>,
+    /// Request idempotency key a duplicate acknowledgement deduplicated.
+    pub duplicate_of_idempotency_key: Option<String>,
+    /// Operation whose earlier delivery actually committed the effect.
+    pub duplicate_of_operation_id: Option<String>,
 }
 
 /// Validated provider-local committed-effect evidence.
@@ -1233,6 +1439,8 @@ pub struct CommittedEffectEvidence {
     provider_receipt_sha256: Option<String>,
     reconciliation_action: Option<String>,
     verification_sha256: Option<String>,
+    duplicate_of_idempotency_key: Option<String>,
+    duplicate_of_operation_id: Option<String>,
 }
 
 impl CommittedEffectEvidence {
@@ -1259,10 +1467,39 @@ impl CommittedEffectEvidence {
         if let Some(verification) = &parts.verification_sha256 {
             require_sha256(verification, "verification_sha256")?;
         }
+        if let Some(key) = &parts.duplicate_of_idempotency_key {
+            // The runtime API does not constrain idempotency-key encoding on
+            // `ProviderCall`, so it does not constrain it here either; the
+            // observation contract pins the key to lowercase hex-64 and the
+            // journal checks the value against the observation it delivered.
+            // What matters at this layer is that the key is bounded canonical
+            // text, so it cannot smuggle unbounded provider data.
+            require_bounded_canonical_text(
+                key,
+                "duplicate_of_idempotency_key",
+                contract::TERMINAL_OPERATION_ID_MAX_BYTES,
+            )?;
+        }
+        if let Some(operation_id) = &parts.duplicate_of_operation_id {
+            require_bounded_canonical_text(
+                operation_id,
+                "duplicate_of_operation_id",
+                contract::TERMINAL_OPERATION_ID_MAX_BYTES,
+            )?;
+        }
+        if parts.state != CommittedEffectState::Duplicate
+            && (parts.duplicate_of_idempotency_key.is_some()
+                || parts.duplicate_of_operation_id.is_some())
+        {
+            return Err(ApiError::InvalidCommittedEffect(
+                "duplicate identity belongs only to a duplicate acknowledgement",
+            ));
+        }
 
         match parts.state {
             CommittedEffectState::None => validate_none_effect(&parts)?,
             CommittedEffectState::Committed => validate_committed_effect(&parts)?,
+            CommittedEffectState::Duplicate => validate_duplicate_effect(&parts)?,
             CommittedEffectState::Partial => validate_partial_effect(&parts)?,
             CommittedEffectState::Unknown => validate_unknown_effect(&parts)?,
         }
@@ -1277,6 +1514,8 @@ impl CommittedEffectEvidence {
             provider_receipt_sha256: parts.provider_receipt_sha256,
             reconciliation_action: parts.reconciliation_action,
             verification_sha256: parts.verification_sha256,
+            duplicate_of_idempotency_key: parts.duplicate_of_idempotency_key,
+            duplicate_of_operation_id: parts.duplicate_of_operation_id,
         })
     }
 
@@ -1294,6 +1533,8 @@ impl CommittedEffectEvidence {
             provider_receipt_sha256: None,
             reconciliation_action: None,
             verification_sha256: None,
+            duplicate_of_idempotency_key: None,
+            duplicate_of_operation_id: None,
         }
     }
 
@@ -1315,6 +1556,41 @@ impl CommittedEffectEvidence {
             provider_receipt_sha256: Some(provider_receipt_sha256.into()),
             reconciliation_action: None,
             verification_sha256: Some(verification_sha256.into()),
+            duplicate_of_idempotency_key: None,
+            duplicate_of_operation_id: None,
+        })
+    }
+
+    /// Creates evidence that a prior delivery of this exact mutation already
+    /// committed.
+    ///
+    /// `duplicate_of_idempotency_key` is the key the provider matched. It must
+    /// be the key carried on the request being answered; the host side proves
+    /// that rather than trusting it, because only the host knows which
+    /// observation it delivered. The durable journal refuses a duplicate whose
+    /// key is not the key of the delivery it answers, so an adapter that names
+    /// somebody else's mutation produces no duplicate receipt.
+    /// `duplicate_of_operation_id` names the earlier operation that actually
+    /// committed. The generation is unchanged because a duplicate commits
+    /// nothing new.
+    pub fn duplicate(
+        state_generation: u64,
+        duplicate_of_idempotency_key: impl Into<String>,
+        duplicate_of_operation_id: impl Into<String>,
+        provider_receipt_sha256: impl Into<String>,
+    ) -> Result<Self, ApiError> {
+        Self::from_parts(CommittedEffectEvidenceParts {
+            state: CommittedEffectState::Duplicate,
+            committed_boundary: None,
+            state_generation_before: Some(state_generation),
+            state_generation_after: Some(state_generation),
+            committed_item_refs: Vec::new(),
+            uncommitted_item_refs: Vec::new(),
+            provider_receipt_sha256: Some(provider_receipt_sha256.into()),
+            reconciliation_action: None,
+            verification_sha256: None,
+            duplicate_of_idempotency_key: Some(duplicate_of_idempotency_key.into()),
+            duplicate_of_operation_id: Some(duplicate_of_operation_id.into()),
         })
     }
 
@@ -1340,6 +1616,8 @@ impl CommittedEffectEvidence {
             provider_receipt_sha256: Some(provider_receipt_sha256.into()),
             reconciliation_action: Some(reconciliation_action.into()),
             verification_sha256: Some(verification_sha256.into()),
+            duplicate_of_idempotency_key: None,
+            duplicate_of_operation_id: None,
         })
     }
 
@@ -1358,6 +1636,8 @@ impl CommittedEffectEvidence {
             provider_receipt_sha256: Some(provider_receipt_sha256.into()),
             reconciliation_action: Some(reconciliation_action.into()),
             verification_sha256: None,
+            duplicate_of_idempotency_key: None,
+            duplicate_of_operation_id: None,
         })
     }
 
@@ -1396,6 +1676,8 @@ impl CommittedEffectEvidence {
             provider_receipt_sha256: Some(lowercase_sha256_hex(provider_receipt_sha256)),
             reconciliation_action: Some(reconciliation_action),
             verification_sha256: None,
+            duplicate_of_idempotency_key: None,
+            duplicate_of_operation_id: None,
         }
     }
 
@@ -1453,6 +1735,20 @@ impl CommittedEffectEvidence {
         self.verification_sha256.as_deref()
     }
 
+    /// Returns the request idempotency key this duplicate acknowledgement
+    /// deduplicated, if the state is duplicate.
+    #[must_use]
+    pub fn duplicate_of_idempotency_key(&self) -> Option<&str> {
+        self.duplicate_of_idempotency_key.as_deref()
+    }
+
+    /// Returns the operation whose earlier delivery actually committed the
+    /// effect, if the state is duplicate.
+    #[must_use]
+    pub fn duplicate_of_operation_id(&self) -> Option<&str> {
+        self.duplicate_of_operation_id.as_deref()
+    }
+
     /// Borrows the generated canonical shape.
     #[must_use]
     pub fn borrowed(&self) -> contract::CommittedEffectEvidence<'_> {
@@ -1466,6 +1762,8 @@ impl CommittedEffectEvidence {
             provider_receipt_digest: self.provider_receipt_sha256(),
             reconciliation_action: self.reconciliation_action(),
             verification_digest: self.verification_sha256(),
+            duplicate_of_idempotency_key: self.duplicate_of_idempotency_key(),
+            duplicate_of_operation_id: self.duplicate_of_operation_id(),
         }
     }
 }
@@ -1550,6 +1848,36 @@ fn validate_committed_effect(parts: &CommittedEffectEvidenceParts) -> Result<(),
     {
         return Err(ApiError::InvalidCommittedEffect(
             "committed requires receipt and verification with no uncommitted partition",
+        ));
+    }
+    Ok(())
+}
+
+/// A duplicate is an *already committed* effect that this attempt did not
+/// create, so it carries the prior receipt, names the exact mutation it
+/// deduplicated, and leaves the generation where it was. Anything that would
+/// let a provider claim a duplicate without naming the mutation — a missing
+/// key, a missing original operation, a moved generation, a fabricated item
+/// partition — is refused here rather than reinterpreted downstream.
+fn validate_duplicate_effect(parts: &CommittedEffectEvidenceParts) -> Result<(), ApiError> {
+    let generation_unchanged = match (parts.state_generation_before, parts.state_generation_after) {
+        (Some(before), Some(after)) => before == after,
+        _ => false,
+    };
+    if !generation_unchanged {
+        return Err(ApiError::InvalidEffectGenerations);
+    }
+    if parts.duplicate_of_idempotency_key.is_none()
+        || parts.duplicate_of_operation_id.is_none()
+        || parts.provider_receipt_sha256.is_none()
+        || parts.committed_boundary.is_some()
+        || !parts.committed_item_refs.is_empty()
+        || !parts.uncommitted_item_refs.is_empty()
+        || parts.reconciliation_action.is_some()
+        || parts.verification_sha256.is_some()
+    {
+        return Err(ApiError::InvalidCommittedEffect(
+            "duplicate requires the deduplicated key, the committing operation, and the prior receipt, and claims no new partition",
         ));
     }
     Ok(())
@@ -1792,6 +2120,18 @@ impl TerminalRecord {
                 effect_state: committed_effect.state(),
             });
         }
+        // `operation_specific` also covers `partial`, which is degraded read
+        // coverage. A duplicate acknowledgement is a complete success, so pin
+        // it to `success` rather than letting the expectation table admit it
+        // under a degraded terminal.
+        if committed_effect.state() == CommittedEffectState::Duplicate
+            && terminal_code != TerminalCode::Success
+        {
+            return Err(ApiError::TerminalEffectMismatch {
+                terminal_code,
+                effect_state: committed_effect.state(),
+            });
+        }
         if policy.maximum_fallback_eligibility == FallbackEligibility::Forbidden
             && fallback.eligibility() != FallbackEligibility::Forbidden
         {
@@ -1827,6 +2167,34 @@ impl TerminalRecord {
             exact_scope_sha256,
             diagnostic_id,
         })
+    }
+
+    /// Proves a duplicate acknowledgement deduplicated *this* call.
+    ///
+    /// A provider that answers `success` with a `duplicate` committed effect
+    /// is claiming a prior delivery of the same mutation already committed.
+    /// Only the host knows which mutation it actually delivered, so the claim
+    /// is checked here rather than trusted: the deduplicated key must be the
+    /// idempotency key carried on the call being answered, and a call that
+    /// carries no key cannot be deduplicated at all. Without this, a provider
+    /// could acknowledge somebody else's mutation and the host would settle a
+    /// delivery that never reached it.
+    ///
+    /// Non-duplicate terminals pass unchanged; the fabric applies this to
+    /// every reply, so the check costs one comparison on the ordinary path.
+    pub fn validate_duplicate_binding_for_call(&self, call: &ProviderCall) -> Result<(), ApiError> {
+        let effect = self.committed_effect();
+        if effect.state() != CommittedEffectState::Duplicate {
+            return Ok(());
+        }
+        let request_key = call
+            .idempotency_key
+            .as_deref()
+            .ok_or(ApiError::DuplicateEffectWithoutRequestKey)?;
+        if effect.duplicate_of_idempotency_key() != Some(request_key) {
+            return Err(ApiError::DuplicateEffectKeyMismatch);
+        }
+        Ok(())
     }
 
     /// Creates a sanitized, effect-free failure before provider dispatch.
@@ -1932,10 +2300,17 @@ impl TerminalRecord {
             contract::TERMINAL_DIAGNOSTIC_ID_MAX_BYTES,
             INTERNAL_FAILURE_DIAGNOSTIC_ID,
         );
-        let committed_effect = if call.operation.mutates_provider_state() {
-            committed_effect
-        } else {
+        // A duplicate acknowledgement cannot survive a failure terminal: the
+        // internal-failure policy admits none, partial, or unknown, and this
+        // attempt itself committed nothing, so effect-free evidence at the
+        // call's expected generation is the truthful degradation. The prior
+        // committed effect is still anchored by the earlier attempt's receipt.
+        let committed_effect = if !call.operation.mutates_provider_state()
+            || committed_effect.state() == CommittedEffectState::Duplicate
+        {
             CommittedEffectEvidence::none(Some(call.expected_state_generation))
+        } else {
+            committed_effect
         };
         let terminal_code = if committed_effect.state() == CommittedEffectState::Committed {
             TerminalCode::Partial
@@ -1988,8 +2363,12 @@ impl TerminalRecord {
         reconciliation_action: &str,
         diagnostic_id: impl AsRef<str>,
     ) -> Self {
+        // The envelope, not the dispatch gate: this factory mints a terminal
+        // for a call the fabric already admitted, so re-running the
+        // sanitization check here would turn a genuine post-dispatch
+        // uncertainty into a spurious internal failure.
         let valid_mutating_call =
-            call.operation.mutates_provider_state() && call.validate().is_ok();
+            call.operation.mutates_provider_state() && call.validate_envelope().is_ok();
         if !valid_mutating_call {
             return Self::internal_failure_before_dispatch_for_call(call, diagnostic_id);
         }
@@ -2108,11 +2487,16 @@ const fn effect_matches_expectation(
     state: CommittedEffectState,
 ) -> bool {
     match expectation {
+        // A duplicate acknowledgement is an operation-specific success: the
+        // effect exists, this attempt did not create it, and delivery is at
+        // least once, so every mutating operation can legitimately produce one.
         CommittedEffectExpectation::OperationSpecific
         | CommittedEffectExpectation::NoneOrOperationSpecific => {
             matches!(
                 state,
-                CommittedEffectState::None | CommittedEffectState::Committed
+                CommittedEffectState::None
+                    | CommittedEffectState::Committed
+                    | CommittedEffectState::Duplicate
             )
         }
         CommittedEffectExpectation::None => matches!(state, CommittedEffectState::None),
@@ -2287,6 +2671,12 @@ fn encoded_committed_effect_bytes(effect: &CommittedEffectEvidence) -> u64 {
     total = total.saturating_add(encoded_string_vector_bytes(effect.committed_item_refs()));
     total = total.saturating_add(encoded_string_vector_bytes(effect.uncommitted_item_refs()));
     total = total.saturating_add(encoded_optional_str_bytes(effect.provider_receipt_sha256()));
+    total = total.saturating_add(encoded_optional_str_bytes(
+        effect.duplicate_of_idempotency_key(),
+    ));
+    total = total.saturating_add(encoded_optional_str_bytes(
+        effect.duplicate_of_operation_id(),
+    ));
     total = total.saturating_add(encoded_optional_str_bytes(effect.reconciliation_action()));
     total.saturating_add(encoded_optional_str_bytes(effect.verification_sha256()))
 }
@@ -2316,7 +2706,13 @@ fn encoded_string_vector_bytes(values: &[String]) -> u64 {
 }
 
 fn encoded_scope_bytes(scope: &OwnedExactScope) -> u64 {
-    let mut total = 8_u64;
+    // Seven length-framed strings and no scalar. The exact scope carries a
+    // `resolved_scope_digest` string, not the fixed-width `scope_revision`
+    // counter it replaced, so the accounting must frame that seventh string
+    // and must not keep charging eight bytes for a field that no longer
+    // exists. `OwnedExactScope::exact_scope_sha256` absorbs exactly the same
+    // seven length-framed values; the two must not disagree.
+    let mut total = 0_u64;
     for value in [
         &scope.profile_id,
         &scope.project_id,
@@ -2324,6 +2720,7 @@ fn encoded_scope_bytes(scope: &OwnedExactScope) -> u64 {
         &scope.worktree_identity,
         &scope.branch_identity,
         &scope.agent_session_id,
+        &scope.resolved_scope_digest,
     ] {
         total = total.saturating_add(framed_str_bytes(value));
     }

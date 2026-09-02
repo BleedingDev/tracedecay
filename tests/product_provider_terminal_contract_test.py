@@ -101,7 +101,8 @@ class ProviderTerminalContractTest(unittest.TestCase):
         self.assertEqual(receipt["fallback_default"], "forbidden")
         self.assertEqual(receipt["current_fallback_policy"], "no_automatic_fallback")
         self.assertEqual(
-            receipt["effect_states"], ["none", "committed", "partial", "unknown"]
+            receipt["effect_states"],
+            ["none", "committed", "duplicate", "partial", "unknown"],
         )
         self.assertTrue(receipt["cancelled_distinct_from_timeout"])
 
@@ -289,6 +290,44 @@ class ProviderTerminalContractTest(unittest.TestCase):
             contract,
             "committed_effect.effect_receipt_required_when_state_not_none must be true",
         )
+
+    def test_duplicate_acknowledgement_must_bind_the_request_key(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        contract["committed_effect"][
+            "duplicate_requires_matching_request_idempotency_key"
+        ] = False
+        self.assert_rejected(
+            contract,
+            "committed_effect.duplicate_requires_matching_request_idempotency_key must be true",
+        )
+
+    def test_duplicate_acknowledgement_must_name_the_committing_operation(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        contract["committed_effect"][
+            "duplicate_requires_original_operation_identity"
+        ] = False
+        self.assert_rejected(
+            contract,
+            "committed_effect.duplicate_requires_original_operation_identity must be true",
+        )
+
+    def test_duplicate_cannot_be_inferred_from_an_absent_effect(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        contract["committed_effect"]["duplicate_may_be_inferred_from_absent_effect"] = True
+        self.assert_rejected(
+            contract,
+            "committed_effect.duplicate_may_be_inferred_from_absent_effect must be false",
+        )
+
+    def test_duplicate_state_must_stay_in_the_closed_effect_table(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        contract["committed_effect"]["states"] = [
+            "none",
+            "committed",
+            "partial",
+            "unknown",
+        ]
+        self.assert_rejected(contract, "committed-effect states drifted")
 
     def test_already_cancelled_never_calls_provider(self) -> None:
         contract = copy.deepcopy(self.contract)

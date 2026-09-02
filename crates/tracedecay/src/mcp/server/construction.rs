@@ -48,6 +48,16 @@ pub(crate) type RetainedProjectServerResolver =
 pub(crate) type MemoryProviderHostMount =
     Arc<tracedecay_memory_provider_registry::ProjectMemoryProviderComposition>;
 
+#[cfg(feature = "memory-provider-host")]
+pub(crate) type ObservationJourneyMount =
+    Arc<crate::daemon::retained_owner::observation_journey::ProjectObservationJourneyV1>;
+
+/// Cognitive-recall route retained for exactly one project-server lifetime;
+/// session ports are minted from it on demand.
+#[cfg(feature = "memory-provider-host")]
+pub(crate) type CognitiveRecallMount =
+    Arc<crate::daemon::retained_owner::cognitive_recall::ProjectCognitiveRecallMountV1>;
+
 /// Dashboard admission erases the concrete graph only at its consumer
 /// boundary.
 pub(crate) fn dashboard_retained_project_graph_resolver(
@@ -148,6 +158,10 @@ pub(crate) struct McpServerConstructionContext {
         Option<Arc<tracedecay_usecases::observability::BoundedDeliverySettlementRecorderV1>>,
     #[cfg(feature = "memory-provider-host")]
     pub(crate) memory_provider_host_mount: Option<MemoryProviderHostMount>,
+    #[cfg(feature = "memory-provider-host")]
+    pub(crate) observation_journey_mount: Option<ObservationJourneyMount>,
+    #[cfg(feature = "memory-provider-host")]
+    pub(crate) cognitive_recall_mount: Option<CognitiveRecallMount>,
     pub(crate) project_server_live: Option<Arc<AtomicBool>>,
     #[cfg(any(test, feature = "test-transport"))]
     pub(crate) host_admission_test_runtime:
@@ -256,6 +270,10 @@ impl McpServerConstructionContext {
             delivery_settlement_recorder: None,
             #[cfg(feature = "memory-provider-host")]
             memory_provider_host_mount: None,
+            #[cfg(feature = "memory-provider-host")]
+            observation_journey_mount: None,
+            #[cfg(feature = "memory-provider-host")]
+            cognitive_recall_mount: None,
             project_server_live: None,
             #[cfg(any(test, feature = "test-transport"))]
             host_admission_test_runtime: None,
@@ -356,6 +374,10 @@ impl McpServerConstructionContext {
             delivery_settlement_recorder: Some(delivery_settlement_recorder),
             #[cfg(feature = "memory-provider-host")]
             memory_provider_host_mount: None,
+            #[cfg(feature = "memory-provider-host")]
+            observation_journey_mount: None,
+            #[cfg(feature = "memory-provider-host")]
+            cognitive_recall_mount: None,
             project_server_live: None,
             #[cfg(any(test, feature = "test-transport"))]
             host_admission_test_runtime: None,
@@ -422,6 +444,10 @@ impl McpServerConstructionContext {
             delivery_settlement_recorder: None,
             #[cfg(feature = "memory-provider-host")]
             memory_provider_host_mount: None,
+            #[cfg(feature = "memory-provider-host")]
+            observation_journey_mount: None,
+            #[cfg(feature = "memory-provider-host")]
+            cognitive_recall_mount: None,
             project_server_live: None,
             #[cfg(any(test, feature = "test-transport"))]
             host_admission_test_runtime: None,
@@ -605,6 +631,21 @@ impl McpServerConstructionContext {
         mount: MemoryProviderHostMount,
     ) -> Self {
         self.memory_provider_host_mount = Some(mount);
+        self
+    }
+
+    #[cfg(feature = "memory-provider-host")]
+    pub(crate) fn with_observation_journey_mount(
+        mut self,
+        mount: ObservationJourneyMount,
+    ) -> Self {
+        self.observation_journey_mount = Some(mount);
+        self
+    }
+
+    #[cfg(feature = "memory-provider-host")]
+    pub(crate) fn with_cognitive_recall_mount(mut self, mount: CognitiveRecallMount) -> Self {
+        self.cognitive_recall_mount = Some(mount);
         self
     }
 

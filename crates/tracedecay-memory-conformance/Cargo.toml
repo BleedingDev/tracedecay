@@ -8,10 +8,12 @@ description = "Provider-neutral conformance and differential evaluation for Trac
 repository = "https://github.com/BleedingDev/tracedecay"
 
 [dependencies]
-tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
-
-[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.11"
+# Exact o200k_base token counts for baseline context cost (same pinned release as the agent hosts).
+tiktoken-rs = "0.12"
+tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
 
 [lints.rust]
 missing_docs = "deny"

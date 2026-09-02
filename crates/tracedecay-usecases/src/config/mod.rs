@@ -8,7 +8,9 @@ pub mod analyzer;
 pub mod retrieval;
 pub mod scope_control;
 
-pub use tracedecay_domain::configuration::SEMANTIC_RUNTIME_SETTING_KEY;
+pub use tracedecay_domain::configuration::{
+    MemoryProviderRecallFallbackV1, MemoryProviderRecallRoutingV1, SEMANTIC_RUNTIME_SETTING_KEY,
+};
 pub use tracedecay_global_db::configuration::semantic::{
     SemanticConfig, SemanticProfileSelection, SemanticResourceCeilings,
 };
@@ -27,7 +29,8 @@ use tracedecay_domain::configuration::{
     DIAGNOSTICS_PREWARM_SETTING_KEY, INDEX_EXCLUDE_SETTING_KEY,
     INDEX_EXTRACT_DOCSTRINGS_SETTING_KEY, INDEX_GIT_IGNORE_SETTING_KEY, INDEX_INCLUDE_SETTING_KEY,
     INDEX_MAX_FILE_SIZE_SETTING_KEY, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
-    INDEX_TRACK_CALL_SITES_SETTING_KEY, SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
+    INDEX_TRACK_CALL_SITES_SETTING_KEY, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
     SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY, TELEMETRY_TIMINGS_SETTING_KEY,
 };
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
@@ -44,6 +47,8 @@ pub struct TraceDecayConfig {
     pub git_ignore: bool,
     pub diagnostics_prewarm: bool,
     pub native_graph_activation: bool,
+    pub memory_provider_native_enabled: bool,
+    pub memory_provider_recall_routing: MemoryProviderRecallRoutingV1,
     pub semantic: SemanticConfig,
     pub sync: SyncConfig,
     pub telemetry: TelemetryConfig,
@@ -60,6 +65,8 @@ impl Default for TraceDecayConfig {
             git_ignore: true,
             diagnostics_prewarm: false,
             native_graph_activation: true,
+            memory_provider_native_enabled: false,
+            memory_provider_recall_routing: MemoryProviderRecallRoutingV1::default(),
             semantic: SemanticConfig::default(),
             sync: SyncConfig::default(),
             telemetry: TelemetryConfig::default(),
@@ -223,6 +230,11 @@ fn runtime_config_from_snapshot(snapshot: &ConfigurationSnapshotV1) -> Result<Tr
             snapshot,
             INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
         )?,
+        memory_provider_native_enabled: required_bool(
+            snapshot,
+            MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+        )?,
+        memory_provider_recall_routing: memory_provider_recall_routing_from_snapshot(snapshot)?,
         semantic: SemanticConfig::default(),
         sync: SyncConfig {
             auto_track_pr_branches: required_bool(
@@ -270,6 +282,30 @@ fn required_unsigned(snapshot: &ConfigurationSnapshotV1, key: &str) -> Result<u6
             "resolved configuration setting '{key}' is not unsigned"
         ))),
     }
+}
+
+fn memory_provider_recall_routing_from_snapshot(
+    snapshot: &ConfigurationSnapshotV1,
+) -> Result<MemoryProviderRecallRoutingV1> {
+    let routing: MemoryProviderRecallRoutingV1 =
+        match required_setting(snapshot, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY)? {
+            ConfigurationValueV1::Text(value) => serde_json::from_str(value).map_err(|error| {
+                config_error(format!(
+                    "resolved configuration setting '{MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY}' is not a recall routing document: {error}"
+                ))
+            })?,
+            _ => {
+                return Err(config_error(format!(
+                    "resolved configuration setting '{MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY}' is not text"
+                )));
+            }
+        };
+    routing.validate().map_err(|error| {
+        config_error(format!(
+            "resolved configuration setting '{MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY}' is invalid: {error}"
+        ))
+    })?;
+    Ok(routing)
 }
 
 fn required_string_list(snapshot: &ConfigurationSnapshotV1, key: &str) -> Result<Vec<String>> {

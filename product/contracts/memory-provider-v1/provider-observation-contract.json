@@ -178,6 +178,8 @@
     "provider_must_persist_deduplication": true,
     "same_key_same_payload_outcome": "duplicate_acknowledged",
     "same_key_different_payload_outcome": "idempotency_conflict",
+    "duplicate_acknowledgement_evidence": "terminal_committed_effect_state_duplicate_bound_to_request_idempotency_key",
+    "duplicate_acknowledgement_may_be_inferred": false,
     "same_source_new_revision_requires_new_key": true,
     "random_retry_key_allowed": false,
     "timestamp_only_key_allowed": false
@@ -279,7 +281,7 @@
     "Canonicalize payload and extensions and derive payload digest, extension digest, observation ID, idempotency key, and envelope digest.",
     "Append the admitted immutable envelope to the durable bounded observation journal.",
     "Dispatch at least once subject to effective batch, byte, concurrency, deadline, and cancellation limits.",
-    "Require the provider to deduplicate by idempotency key and compare payload and extension digests.",
+    "Require the provider to deduplicate by idempotency key, compare payload and extension digests, and return duplicate committed-effect evidence naming that exact key when a prior delivery already committed.",
     "Persist a delivery receipt for every acknowledged, duplicate, rejected, partial, cancelled, timed-out, or unknown-effect attempt.",
     "Never alter the already-settled canonical source outcome because provider admission or delivery failed."
   ],
@@ -362,6 +364,7 @@
     "An observation is an admitted input event, not a provider memory record; one observation may create zero, one, or many opaque provider-local effects.",
     "Idempotency keys are deterministic across retries and crashes and never depend only on timestamps or random retry values.",
     "The same idempotency key with the same payload and extensions is a duplicate acknowledgement; the same key with different canonical content is an explicit conflict.",
+    "A duplicate acknowledgement is proven by terminal committed-effect evidence in state duplicate that names the request's own idempotency key and the original committing operation; it is never inferred from an absent effect, a repeated attempt, or the provider's identity.",
     "Providers persist deduplication state strongly enough to survive acknowledgement loss and provider restart.",
     "Delivery is at least once, may be out of order, and always carries source sequence and immutable occurrence/admission times.",
     "Unknown payload contracts, missing provenance/privacy, unadmitted secrets, oversize payloads, scope mismatch, and malformed canonical JSON fail closed.",

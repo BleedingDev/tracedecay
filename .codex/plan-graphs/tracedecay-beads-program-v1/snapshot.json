@@ -1,0 +1,4676 @@
+{
+  "generated_at": "2026-08-31T10:55:50.490414+00:00",
+  "graph_id": "tracedecay-beads-program-v1",
+  "plan_set_hash": "0e5095291f",
+  "selection_hash": "45df14cf2c",
+  "plan_count": 83,
+  "edge_count": 300,
+  "plans_root": ".codex/plans/beads-runnable",
+  "selected_globs": [
+    "*.plan.md"
+  ],
+  "selected_plan_paths": [
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0401.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0402.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0403.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0404.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0405.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0406.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0501.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0502.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0503.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0504.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0505.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0506.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0507.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0508.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0601.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0602.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0603.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0604.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0605.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0606.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0607.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0608.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0609.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0701.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0702.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0703.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0704.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0705.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0706.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0707.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0708.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0709.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0710.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0711.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0801.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0802.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0803.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0804.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0805.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0806.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0807.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0808.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0809.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0901.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0902.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0903.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0904.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0905.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0906.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0907.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0908.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0909.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1001.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1002.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1003.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1004.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1005.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1006.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1007.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1008.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1009.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1101.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1102.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1103.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1104.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1105.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1106.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1107.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1108.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1109.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1204.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1205.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1206.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1208.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1401.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1402.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1403.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1404.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1405.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1406.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1407.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1408.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1409.plan.md"
+  ],
+  "edges": [
+    {
+      "source": "tdmem-0401",
+      "target": "tdmem-0402"
+    },
+    {
+      "source": "tdmem-0402",
+      "target": "tdmem-0403"
+    },
+    {
+      "source": "tdmem-0402",
+      "target": "tdmem-0405"
+    },
+    {
+      "source": "tdmem-0402",
+      "target": "tdmem-0807"
+    },
+    {
+      "source": "tdmem-0403",
+      "target": "tdmem-0404"
+    },
+    {
+      "source": "tdmem-0403",
+      "target": "tdmem-0406"
+    },
+    {
+      "source": "tdmem-0403",
+      "target": "tdmem-1206"
+    },
+    {
+      "source": "tdmem-0404",
+      "target": "tdmem-0406"
+    },
+    {
+      "source": "tdmem-0404",
+      "target": "tdmem-1204"
+    },
+    {
+      "source": "tdmem-0404",
+      "target": "tdmem-1403"
+    },
+    {
+      "source": "tdmem-0405",
+      "target": "tdmem-0406"
+    },
+    {
+      "source": "tdmem-0405",
+      "target": "tdmem-1103"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0501"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0502"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0503"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0504"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0505"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0506"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0507"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0508"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0601"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0602"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0603"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0604"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0605"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0606"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0607"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0608"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0609"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0901"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0902"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0903"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0904"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0905"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0906"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0907"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0908"
+    },
+    {
+      "source": "tdmem-0406",
+      "target": "tdmem-0909"
+    },
+    {
+      "source": "tdmem-0501",
+      "target": "tdmem-0502"
+    },
+    {
+      "source": "tdmem-0501",
+      "target": "tdmem-0507"
+    },
+    {
+      "source": "tdmem-0502",
+      "target": "tdmem-0503"
+    },
+    {
+      "source": "tdmem-0502",
+      "target": "tdmem-1106"
+    },
+    {
+      "source": "tdmem-0503",
+      "target": "tdmem-0504"
+    },
+    {
+      "source": "tdmem-0503",
+      "target": "tdmem-0505"
+    },
+    {
+      "source": "tdmem-0503",
+      "target": "tdmem-0506"
+    },
+    {
+      "source": "tdmem-0503",
+      "target": "tdmem-1102"
+    },
+    {
+      "source": "tdmem-0504",
+      "target": "tdmem-0505"
+    },
+    {
+      "source": "tdmem-0504",
+      "target": "tdmem-0506"
+    },
+    {
+      "source": "tdmem-0504",
+      "target": "tdmem-0702"
+    },
+    {
+      "source": "tdmem-0504",
+      "target": "tdmem-1009"
+    },
+    {
+      "source": "tdmem-0504",
+      "target": "tdmem-1107"
+    },
+    {
+      "source": "tdmem-0505",
+      "target": "tdmem-0508"
+    },
+    {
+      "source": "tdmem-0505",
+      "target": "tdmem-1101"
+    },
+    {
+      "source": "tdmem-0505",
+      "target": "tdmem-1108"
+    },
+    {
+      "source": "tdmem-0506",
+      "target": "tdmem-0508"
+    },
+    {
+      "source": "tdmem-0506",
+      "target": "tdmem-0601"
+    },
+    {
+      "source": "tdmem-0506",
+      "target": "tdmem-0602"
+    },
+    {
+      "source": "tdmem-0506",
+      "target": "tdmem-0603"
+    },
+    {
+      "source": "tdmem-0506",
+      "target": "tdmem-0604"
+    },
+    {
+      "source": "tdmem-0506",
+      "target": "tdmem-0605"
+    },
+    {
+      "source": "tdmem-0506",
+      "target": "tdmem-0606"
+    },
+    {
+      "source": "tdmem-0506",
+      "target": "tdmem-0607"
+    },
+    {
+      "source": "tdmem-0506",
+      "target": "tdmem-0608"
+    },
+    {
+      "source": "tdmem-0506",
+      "target": "tdmem-0609"
+    },
+    {
+      "source": "tdmem-0506",
+      "target": "tdmem-0707"
+    },
+    {
+      "source": "tdmem-0507",
+      "target": "tdmem-0508"
+    },
+    {
+      "source": "tdmem-0507",
+      "target": "tdmem-0704"
+    },
+    {
+      "source": "tdmem-0507",
+      "target": "tdmem-1105"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-0701"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-0702"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-0703"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-0704"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-0705"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-0706"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-0707"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-0708"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-0709"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-0710"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-0711"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-1001"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-1002"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-1003"
+    },
+    {
+      "source": "tdmem-0508",
+      "target": "tdmem-1006"
+    },
+    {
+      "source": "tdmem-0601",
+      "target": "tdmem-0602"
+    },
+    {
+      "source": "tdmem-0601",
+      "target": "tdmem-0603"
+    },
+    {
+      "source": "tdmem-0601",
+      "target": "tdmem-0607"
+    },
+    {
+      "source": "tdmem-0602",
+      "target": "tdmem-0604"
+    },
+    {
+      "source": "tdmem-0602",
+      "target": "tdmem-0705"
+    },
+    {
+      "source": "tdmem-0603",
+      "target": "tdmem-0604"
+    },
+    {
+      "source": "tdmem-0603",
+      "target": "tdmem-0606"
+    },
+    {
+      "source": "tdmem-0603",
+      "target": "tdmem-1005"
+    },
+    {
+      "source": "tdmem-0604",
+      "target": "tdmem-0605"
+    },
+    {
+      "source": "tdmem-0605",
+      "target": "tdmem-0606"
+    },
+    {
+      "source": "tdmem-0605",
+      "target": "tdmem-0608"
+    },
+    {
+      "source": "tdmem-0605",
+      "target": "tdmem-1105"
+    },
+    {
+      "source": "tdmem-0606",
+      "target": "tdmem-0608"
+    },
+    {
+      "source": "tdmem-0606",
+      "target": "tdmem-0609"
+    },
+    {
+      "source": "tdmem-0607",
+      "target": "tdmem-0608"
+    },
+    {
+      "source": "tdmem-0607",
+      "target": "tdmem-0903"
+    },
+    {
+      "source": "tdmem-0607",
+      "target": "tdmem-1009"
+    },
+    {
+      "source": "tdmem-0608",
+      "target": "tdmem-0609"
+    },
+    {
+      "source": "tdmem-0608",
+      "target": "tdmem-0801"
+    },
+    {
+      "source": "tdmem-0608",
+      "target": "tdmem-1102"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0701"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0702"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0703"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0704"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0705"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0706"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0707"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0708"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0709"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0710"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0711"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0801"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0802"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0803"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0804"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0805"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0806"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0807"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0808"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0809"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0901"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0902"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0903"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0904"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0905"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0906"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0907"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0908"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-0909"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-1001"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-1002"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-1003"
+    },
+    {
+      "source": "tdmem-0609",
+      "target": "tdmem-1108"
+    },
+    {
+      "source": "tdmem-0701",
+      "target": "tdmem-0702"
+    },
+    {
+      "source": "tdmem-0702",
+      "target": "tdmem-0703"
+    },
+    {
+      "source": "tdmem-0703",
+      "target": "tdmem-0704"
+    },
+    {
+      "source": "tdmem-0703",
+      "target": "tdmem-0705"
+    },
+    {
+      "source": "tdmem-0703",
+      "target": "tdmem-1101"
+    },
+    {
+      "source": "tdmem-0704",
+      "target": "tdmem-0706"
+    },
+    {
+      "source": "tdmem-0704",
+      "target": "tdmem-0707"
+    },
+    {
+      "source": "tdmem-0705",
+      "target": "tdmem-0706"
+    },
+    {
+      "source": "tdmem-0705",
+      "target": "tdmem-0708"
+    },
+    {
+      "source": "tdmem-0705",
+      "target": "tdmem-0801"
+    },
+    {
+      "source": "tdmem-0706",
+      "target": "tdmem-0708"
+    },
+    {
+      "source": "tdmem-0706",
+      "target": "tdmem-0709"
+    },
+    {
+      "source": "tdmem-0706",
+      "target": "tdmem-1106"
+    },
+    {
+      "source": "tdmem-0707",
+      "target": "tdmem-0709"
+    },
+    {
+      "source": "tdmem-0707",
+      "target": "tdmem-1006"
+    },
+    {
+      "source": "tdmem-0707",
+      "target": "tdmem-1106"
+    },
+    {
+      "source": "tdmem-0707",
+      "target": "tdmem-1403"
+    },
+    {
+      "source": "tdmem-0707",
+      "target": "tdmem-1405"
+    },
+    {
+      "source": "tdmem-0708",
+      "target": "tdmem-0709"
+    },
+    {
+      "source": "tdmem-0708",
+      "target": "tdmem-1103"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-0710"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-0801"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-0802"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-0803"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-0804"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-0805"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-0806"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-0807"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-0808"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-0809"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-0905"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1001"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1002"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1003"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1004"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1005"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1006"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1007"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1008"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1009"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1101"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1102"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1103"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1104"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1105"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1106"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1107"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1108"
+    },
+    {
+      "source": "tdmem-0709",
+      "target": "tdmem-1109"
+    },
+    {
+      "source": "tdmem-0710",
+      "target": "tdmem-0711"
+    },
+    {
+      "source": "tdmem-0710",
+      "target": "tdmem-1407"
+    },
+    {
+      "source": "tdmem-0711",
+      "target": "tdmem-1408"
+    },
+    {
+      "source": "tdmem-0801",
+      "target": "tdmem-0802"
+    },
+    {
+      "source": "tdmem-0801",
+      "target": "tdmem-1102"
+    },
+    {
+      "source": "tdmem-0802",
+      "target": "tdmem-0803"
+    },
+    {
+      "source": "tdmem-0802",
+      "target": "tdmem-0809"
+    },
+    {
+      "source": "tdmem-0802",
+      "target": "tdmem-1007"
+    },
+    {
+      "source": "tdmem-0803",
+      "target": "tdmem-0804"
+    },
+    {
+      "source": "tdmem-0803",
+      "target": "tdmem-0806"
+    },
+    {
+      "source": "tdmem-0803",
+      "target": "tdmem-0807"
+    },
+    {
+      "source": "tdmem-0804",
+      "target": "tdmem-0805"
+    },
+    {
+      "source": "tdmem-0804",
+      "target": "tdmem-0806"
+    },
+    {
+      "source": "tdmem-0805",
+      "target": "tdmem-0808"
+    },
+    {
+      "source": "tdmem-0805",
+      "target": "tdmem-1008"
+    },
+    {
+      "source": "tdmem-0806",
+      "target": "tdmem-0807"
+    },
+    {
+      "source": "tdmem-0806",
+      "target": "tdmem-0808"
+    },
+    {
+      "source": "tdmem-0806",
+      "target": "tdmem-1008"
+    },
+    {
+      "source": "tdmem-0807",
+      "target": "tdmem-0808"
+    },
+    {
+      "source": "tdmem-0808",
+      "target": "tdmem-0809"
+    },
+    {
+      "source": "tdmem-0808",
+      "target": "tdmem-1104"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1001"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1002"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1003"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1004"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1005"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1006"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1007"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1008"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1009"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1101"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1102"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1103"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1104"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1105"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1106"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1107"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1108"
+    },
+    {
+      "source": "tdmem-0809",
+      "target": "tdmem-1109"
+    },
+    {
+      "source": "tdmem-0901",
+      "target": "tdmem-0902"
+    },
+    {
+      "source": "tdmem-0901",
+      "target": "tdmem-0904"
+    },
+    {
+      "source": "tdmem-0902",
+      "target": "tdmem-0905"
+    },
+    {
+      "source": "tdmem-0903",
+      "target": "tdmem-0710"
+    },
+    {
+      "source": "tdmem-0903",
+      "target": "tdmem-0905"
+    },
+    {
+      "source": "tdmem-0904",
+      "target": "tdmem-0905"
+    },
+    {
+      "source": "tdmem-0904",
+      "target": "tdmem-0909"
+    },
+    {
+      "source": "tdmem-0904",
+      "target": "tdmem-1007"
+    },
+    {
+      "source": "tdmem-0905",
+      "target": "tdmem-0906"
+    },
+    {
+      "source": "tdmem-0905",
+      "target": "tdmem-0907"
+    },
+    {
+      "source": "tdmem-0906",
+      "target": "tdmem-0907"
+    },
+    {
+      "source": "tdmem-0907",
+      "target": "tdmem-0908"
+    },
+    {
+      "source": "tdmem-0908",
+      "target": "tdmem-0711"
+    },
+    {
+      "source": "tdmem-1001",
+      "target": "tdmem-1004"
+    },
+    {
+      "source": "tdmem-1001",
+      "target": "tdmem-1005"
+    },
+    {
+      "source": "tdmem-1001",
+      "target": "tdmem-1006"
+    },
+    {
+      "source": "tdmem-1001",
+      "target": "tdmem-1007"
+    },
+    {
+      "source": "tdmem-1001",
+      "target": "tdmem-1009"
+    },
+    {
+      "source": "tdmem-1002",
+      "target": "tdmem-1004"
+    },
+    {
+      "source": "tdmem-1002",
+      "target": "tdmem-1005"
+    },
+    {
+      "source": "tdmem-1002",
+      "target": "tdmem-1009"
+    },
+    {
+      "source": "tdmem-1002",
+      "target": "tdmem-1401"
+    },
+    {
+      "source": "tdmem-1003",
+      "target": "tdmem-1401"
+    },
+    {
+      "source": "tdmem-1005",
+      "target": "tdmem-1008"
+    },
+    {
+      "source": "tdmem-1008",
+      "target": "tdmem-0711"
+    },
+    {
+      "source": "tdmem-1008",
+      "target": "tdmem-1408"
+    },
+    {
+      "source": "tdmem-1009",
+      "target": "tdmem-0711"
+    },
+    {
+      "source": "tdmem-1009",
+      "target": "tdmem-1401"
+    },
+    {
+      "source": "tdmem-1009",
+      "target": "tdmem-1402"
+    },
+    {
+      "source": "tdmem-1009",
+      "target": "tdmem-1403"
+    },
+    {
+      "source": "tdmem-1009",
+      "target": "tdmem-1404"
+    },
+    {
+      "source": "tdmem-1009",
+      "target": "tdmem-1405"
+    },
+    {
+      "source": "tdmem-1009",
+      "target": "tdmem-1406"
+    },
+    {
+      "source": "tdmem-1009",
+      "target": "tdmem-1407"
+    },
+    {
+      "source": "tdmem-1009",
+      "target": "tdmem-1408"
+    },
+    {
+      "source": "tdmem-1009",
+      "target": "tdmem-1409"
+    },
+    {
+      "source": "tdmem-1101",
+      "target": "tdmem-1109"
+    },
+    {
+      "source": "tdmem-1102",
+      "target": "tdmem-1103"
+    },
+    {
+      "source": "tdmem-1102",
+      "target": "tdmem-1109"
+    },
+    {
+      "source": "tdmem-1103",
+      "target": "tdmem-1104"
+    },
+    {
+      "source": "tdmem-1105",
+      "target": "tdmem-1404"
+    },
+    {
+      "source": "tdmem-1106",
+      "target": "tdmem-1404"
+    },
+    {
+      "source": "tdmem-1106",
+      "target": "tdmem-1407"
+    },
+    {
+      "source": "tdmem-1107",
+      "target": "tdmem-1404"
+    },
+    {
+      "source": "tdmem-1108",
+      "target": "tdmem-1109"
+    },
+    {
+      "source": "tdmem-1108",
+      "target": "tdmem-1409"
+    },
+    {
+      "source": "tdmem-1109",
+      "target": "tdmem-1401"
+    },
+    {
+      "source": "tdmem-1109",
+      "target": "tdmem-1402"
+    },
+    {
+      "source": "tdmem-1109",
+      "target": "tdmem-1403"
+    },
+    {
+      "source": "tdmem-1109",
+      "target": "tdmem-1404"
+    },
+    {
+      "source": "tdmem-1109",
+      "target": "tdmem-1405"
+    },
+    {
+      "source": "tdmem-1109",
+      "target": "tdmem-1406"
+    },
+    {
+      "source": "tdmem-1109",
+      "target": "tdmem-1407"
+    },
+    {
+      "source": "tdmem-1109",
+      "target": "tdmem-1408"
+    },
+    {
+      "source": "tdmem-1109",
+      "target": "tdmem-1409"
+    },
+    {
+      "source": "tdmem-1204",
+      "target": "tdmem-1205"
+    },
+    {
+      "source": "tdmem-1205",
+      "target": "tdmem-1206"
+    },
+    {
+      "source": "tdmem-1206",
+      "target": "tdmem-1208"
+    },
+    {
+      "source": "tdmem-1206",
+      "target": "tdmem-1402"
+    },
+    {
+      "source": "tdmem-1208",
+      "target": "tdmem-1401"
+    },
+    {
+      "source": "tdmem-1208",
+      "target": "tdmem-1402"
+    },
+    {
+      "source": "tdmem-1208",
+      "target": "tdmem-1403"
+    },
+    {
+      "source": "tdmem-1208",
+      "target": "tdmem-1404"
+    },
+    {
+      "source": "tdmem-1208",
+      "target": "tdmem-1405"
+    },
+    {
+      "source": "tdmem-1208",
+      "target": "tdmem-1406"
+    },
+    {
+      "source": "tdmem-1208",
+      "target": "tdmem-1407"
+    },
+    {
+      "source": "tdmem-1208",
+      "target": "tdmem-1408"
+    },
+    {
+      "source": "tdmem-1208",
+      "target": "tdmem-1409"
+    },
+    {
+      "source": "tdmem-1401",
+      "target": "tdmem-1402"
+    },
+    {
+      "source": "tdmem-1402",
+      "target": "tdmem-1406"
+    },
+    {
+      "source": "tdmem-1403",
+      "target": "tdmem-1406"
+    },
+    {
+      "source": "tdmem-1404",
+      "target": "tdmem-1406"
+    },
+    {
+      "source": "tdmem-1405",
+      "target": "tdmem-1406"
+    },
+    {
+      "source": "tdmem-1406",
+      "target": "tdmem-1407"
+    },
+    {
+      "source": "tdmem-1406",
+      "target": "tdmem-1409"
+    },
+    {
+      "source": "tdmem-1407",
+      "target": "tdmem-1408"
+    }
+  ],
+  "plans": [
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0401.plan.md",
+      "slug": "tdmem-0401",
+      "name": "tdmem-0401",
+      "overview": "Translate provider observations into existing Native memory operations only where semantics match.",
+      "todos": [
+        {
+          "id": "tdmem-0401-deliver",
+          "content": "Deliver Bead tdmem-0401: Implement Native observe mapping through existing application ports; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "in_progress",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0402.plan.md",
+      "slug": "tdmem-0402",
+      "name": "tdmem-0402",
+      "overview": "Expose existing Native capabilities through provider-neutral calls.",
+      "todos": [
+        {
+          "id": "tdmem-0402-deliver",
+          "content": "Deliver Bead tdmem-0402: Implement Native recall, feedback, maintenance, and inspection mappings; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0403.plan.md",
+      "slug": "tdmem-0403",
+      "name": "tdmem-0403",
+      "overview": "Run identical fixtures through current Native surfaces and the adapter route.",
+      "todos": [
+        {
+          "id": "tdmem-0403-deliver",
+          "content": "Deliver Bead tdmem-0403: Build direct-versus-provider Native golden parity tests; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0404.plan.md",
+      "slug": "tdmem-0404",
+      "name": "tdmem-0404",
+      "overview": "Ensure users who do not enable the feature experience the pinned upstream V2 behavior.",
+      "todos": [
+        {
+          "id": "tdmem-0404-deliver",
+          "content": "Deliver Bead tdmem-0404: Prove disabled Memory Fabric mode is behaviorally inert; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0405.plan.md",
+      "slug": "tdmem-0405",
+      "name": "tdmem-0405",
+      "overview": "Make Native behavior inspectable through the common provider status and explain surfaces.",
+      "todos": [
+        {
+          "id": "tdmem-0405-deliver",
+          "content": "Deliver Bead tdmem-0405: Expose Native provider capability and explanation metadata; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0406.plan.md",
+      "slug": "tdmem-0406",
+      "name": "tdmem-0406",
+      "overview": "Exercise an actual supported host path through observe, recall, context injection, outcome, and later recall.",
+      "todos": [
+        {
+          "id": "tdmem-0406-deliver",
+          "content": "Deliver Bead tdmem-0406: Run a real Native-provider coding-agent journey; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0501.plan.md",
+      "slug": "tdmem-0501",
+      "name": "tdmem-0501",
+      "overview": "Classify TraceDecay events by durability, sensitivity, relevance, and whether they may leave the canonical transaction boundary.",
+      "todos": [
+        {
+          "id": "tdmem-0501-deliver",
+          "content": "Deliver Bead tdmem-0501: Enumerate post-commit host events eligible for provider observation; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0502.plan.md",
+      "slug": "tdmem-0502",
+      "name": "tdmem-0502",
+      "overview": "Create the durable boundary between committed TraceDecay actions and provider delivery.",
+      "todos": [
+        {
+          "id": "tdmem-0502-deliver",
+          "content": "Deliver Bead tdmem-0502: Define and persist the provider outbox/journal authority; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0503.plan.md",
+      "slug": "tdmem-0503",
+      "name": "tdmem-0503",
+      "overview": "Deliver outbox observations to configured providers with deadlines, retry policy, and receipts.",
+      "todos": [
+        {
+          "id": "tdmem-0503-deliver",
+          "content": "Deliver Bead tdmem-0503: Implement the idempotent bounded dispatcher; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0504.plan.md",
+      "slug": "tdmem-0504",
+      "name": "tdmem-0504",
+      "overview": "Start, monitor, restart, and stop provider instances without crashing or wedging TraceDecay.",
+      "todos": [
+        {
+          "id": "tdmem-0504-deliver",
+          "content": "Deliver Bead tdmem-0504: Implement provider lifecycle supervision and crash isolation; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0505.plan.md",
+      "slug": "tdmem-0505",
+      "name": "tdmem-0505",
+      "overview": "Prevent slow providers from consuming unbounded memory or silently losing observations.",
+      "todos": [
+        {
+          "id": "tdmem-0505-deliver",
+          "content": "Deliver Bead tdmem-0505: Implement backpressure, load shedding, and no-silent-drop invariants; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0506.plan.md",
+      "slug": "tdmem-0506",
+      "name": "tdmem-0506",
+      "overview": "Recover provider delivery after host/provider restart and verify provider state aligns with acknowledged sequence.",
+      "todos": [
+        {
+          "id": "tdmem-0506-deliver",
+          "content": "Deliver Bead tdmem-0506: Implement recovery replay and exact-effect verification; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0507.plan.md",
+      "slug": "tdmem-0507",
+      "name": "tdmem-0507",
+      "overview": "Ensure provider observations do not accidentally persist credentials, high-entropy secrets, temporary paths, ports, PIDs, or raw noisy logs.",
+      "todos": [
+        {
+          "id": "tdmem-0507-deliver",
+          "content": "Deliver Bead tdmem-0507: Apply secret and transient-data hygiene before provider dispatch; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0508.plan.md",
+      "slug": "tdmem-0508",
+      "name": "tdmem-0508",
+      "overview": "Exercise failures at every boundary from host commit through provider ACK persistence.",
+      "todos": [
+        {
+          "id": "tdmem-0508-deliver",
+          "content": "Deliver Bead tdmem-0508: Prove crash safety between host commit and provider acknowledgement; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0601.plan.md",
+      "slug": "tdmem-0601",
+      "name": "tdmem-0601",
+      "overview": "Introduce the narrow application boundary that requests advisory recall from the fabric.",
+      "todos": [
+        {
+          "id": "tdmem-0601-deliver",
+          "content": "Deliver Bead tdmem-0601: Add a CognitiveRecallPort to the TraceDecay application layer; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0602.plan.md",
+      "slug": "tdmem-0602",
+      "name": "tdmem-0602",
+      "overview": "Convert provider outputs into a common candidate space suitable for host policy.",
+      "todos": [
+        {
+          "id": "tdmem-0602-deliver",
+          "content": "Deliver Bead tdmem-0602: Normalize provider recall candidates without erasing native semantics; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0603.plan.md",
+      "slug": "tdmem-0603",
+      "name": "tdmem-0603",
+      "overview": "Prevent cross-project/worktree/session leakage and stale or revoked provider content from reaching context.",
+      "todos": [
+        {
+          "id": "tdmem-0603-deliver",
+          "content": "Deliver Bead tdmem-0603: Enforce exact scope, identity, temporal validity, and revocation before admission; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0604.plan.md",
+      "slug": "tdmem-0604",
+      "name": "tdmem-0604",
+      "overview": "Avoid flooding context with semantically redundant memories or repeated reconstructions.",
+      "todos": [
+        {
+          "id": "tdmem-0604-deliver",
+          "content": "Deliver Bead tdmem-0604: Implement provider-candidate deduplication and diversity selection; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0605.plan.md",
+      "slug": "tdmem-0605",
+      "name": "tdmem-0605",
+      "overview": "Integrate admitted candidates with existing code, session, evidence, and Native fact sections.",
+      "todos": [
+        {
+          "id": "tdmem-0605-deliver",
+          "content": "Deliver Bead tdmem-0605: Bridge cognitive candidates into the canonical token-budgeted context compiler; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0606.plan.md",
+      "slug": "tdmem-0606",
+      "name": "tdmem-0606",
+      "overview": "Resolve provider source refs to TraceDecay evidence when possible and prevent uncited synthesis from masquerading as evidence.",
+      "todos": [
+        {
+          "id": "tdmem-0606-deliver",
+          "content": "Deliver Bead tdmem-0606: Hydrate provenance and represent provenance-unavailable explicitly; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0607.plan.md",
+      "slug": "tdmem-0607",
+      "name": "tdmem-0607",
+      "overview": "Choose active provider and allowed degraded behavior without hidden substitutions.",
+      "todos": [
+        {
+          "id": "tdmem-0607-deliver",
+          "content": "Deliver Bead tdmem-0607: Implement explicit provider routing and fallback policy; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0608.plan.md",
+      "slug": "tdmem-0608",
+      "name": "tdmem-0608",
+      "overview": "Explain which provider items were requested, denied, selected, deduplicated, truncated, or injected.",
+      "todos": [
+        {
+          "id": "tdmem-0608-deliver",
+          "content": "Deliver Bead tdmem-0608: Expose context selection and provider contribution traces; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0609.plan.md",
+      "slug": "tdmem-0609",
+      "name": "tdmem-0609",
+      "overview": "Exercise host request through provider recall, admission, hydration, packing, and injection.",
+      "todos": [
+        {
+          "id": "tdmem-0609-deliver",
+          "content": "Deliver Bead tdmem-0609: Run the full cognitive-recall read-path product journey; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0701.plan.md",
+      "slug": "tdmem-0701",
+      "name": "tdmem-0701",
+      "overview": "Inventory callable operations, persistence, lifecycle, threading, errors, inspectability, and current platform behavior of the new licensed implementation.",
+      "todos": [
+        {
+          "id": "tdmem-0701-deliver",
+          "content": "Deliver Bead tdmem-0701: Audit the licensed Biomem/NCM surface against the provider contract; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0702.plan.md",
+      "slug": "tdmem-0702",
+      "name": "tdmem-0702",
+      "overview": "Choose in-process crate, isolated local process, or another bounded topology for the first TraceDecay integration.",
+      "todos": [
+        {
+          "id": "tdmem-0702-deliver",
+          "content": "Deliver Bead tdmem-0702: Select and document the first NCM integration topology; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0703.plan.md",
+      "slug": "tdmem-0703",
+      "name": "tdmem-0703",
+      "overview": "Expose the actual NCM build and state model through the provider identity contract.",
+      "todos": [
+        {
+          "id": "tdmem-0703-deliver",
+          "content": "Deliver Bead tdmem-0703: Implement NCM handshake, manifest, capabilities, and health; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0704.plan.md",
+      "slug": "tdmem-0704",
+      "name": "tdmem-0704",
+      "overview": "Translate admitted provider-neutral observations into NCM inputs.",
+      "todos": [
+        {
+          "id": "tdmem-0704-deliver",
+          "content": "Deliver Bead tdmem-0704: Implement NCM observation ingestion with idempotency and exact coding scope; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0705.plan.md",
+      "slug": "tdmem-0705",
+      "name": "tdmem-0705",
+      "overview": "Translate recall requests into NCM retrieval and map latent results to provider candidates.",
+      "todos": [
+        {
+          "id": "tdmem-0705-deliver",
+          "content": "Deliver Bead tdmem-0705: Implement NCM recall and score/explanation mapping; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0706.plan.md",
+      "slug": "tdmem-0706",
+      "name": "tdmem-0706",
+      "overview": "Expose the subset of lifecycle controls truly supported by NCM.",
+      "todos": [
+        {
+          "id": "tdmem-0706-deliver",
+          "content": "Deliver Bead tdmem-0706: Implement NCM feedback, maintenance, correction, and forgetting capabilities; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0707.plan.md",
+      "slug": "tdmem-0707",
+      "name": "tdmem-0707",
+      "overview": "Make NCM state recoverable across process and host restarts.",
+      "todos": [
+        {
+          "id": "tdmem-0707-deliver",
+          "content": "Deliver Bead tdmem-0707: Implement NCM snapshot, restore, replay position, and state compatibility; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0708.plan.md",
+      "slug": "tdmem-0708",
+      "name": "tdmem-0708",
+      "overview": "Expose enough information to understand NCM state changes without pretending latent state is a simple fact table.",
+      "todos": [
+        {
+          "id": "tdmem-0708-deliver",
+          "content": "Deliver Bead tdmem-0708: Map NCM inspection into redaction-safe common surfaces; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0709.plan.md",
+      "slug": "tdmem-0709",
+      "name": "tdmem-0709",
+      "overview": "Run NCM through the neutral conformance suite, including negative and recovery cases.",
+      "todos": [
+        {
+          "id": "tdmem-0709-deliver",
+          "content": "Deliver Bead tdmem-0709: Pass NCM mandatory and declared-capability conformance; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0710.plan.md",
+      "slug": "tdmem-0710",
+      "name": "tdmem-0710",
+      "overview": "Feed NCM real coding observations and collect recall outputs without allowing them into prompts or canonical state.",
+      "todos": [
+        {
+          "id": "tdmem-0710-deliver",
+          "content": "Deliver Bead tdmem-0710: Run NCM in mechanically isolated observer mode; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0711.plan.md",
+      "slug": "tdmem-0711",
+      "name": "tdmem-0711",
+      "overview": "Allow NCM recall to influence coding-agent context only under explicit opt-in configuration.",
+      "todos": [
+        {
+          "id": "tdmem-0711-deliver",
+          "content": "Deliver Bead tdmem-0711: Enable guarded active NCM experiment after objective gates pass; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0801.plan.md",
+      "slug": "tdmem-0801",
+      "name": "tdmem-0801",
+      "overview": "Create a durable link from an agent-visible provider item to later task feedback.",
+      "todos": [
+        {
+          "id": "tdmem-0801-deliver",
+          "content": "Deliver Bead tdmem-0801: Attribute context-pack outcomes to exact recalled items; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0802.plan.md",
+      "slug": "tdmem-0802",
+      "name": "tdmem-0802",
+      "overview": "Deliver outcome signals to capable providers and Native audit state.",
+      "todos": [
+        {
+          "id": "tdmem-0802-deliver",
+          "content": "Deliver Bead tdmem-0802: Implement helpful, harmful, ignored, and indeterminate feedback flow; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0803.plan.md",
+      "slug": "tdmem-0803",
+      "name": "tdmem-0803",
+      "overview": "Model candidate, established, proven, deprecated, and retired lifecycle for explicit procedural lessons.",
+      "todos": [
+        {
+          "id": "tdmem-0803-deliver",
+          "content": "Deliver Bead tdmem-0803: Define provider-neutral lesson maturity and promotion policy; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0804.plan.md",
+      "slug": "tdmem-0804",
+      "name": "tdmem-0804",
+      "overview": "Preserve what failed, under which conditions, and the safer alternative instead of simply deleting bad advice.",
+      "todos": [
+        {
+          "id": "tdmem-0804-deliver",
+          "content": "Deliver Bead tdmem-0804: Represent negative knowledge and failed approaches as first-class candidates; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0805.plan.md",
+      "slug": "tdmem-0805",
+      "name": "tdmem-0805",
+      "overview": "Implement blocked-resurrection detection for explicit curated lessons.",
+      "todos": [
+        {
+          "id": "tdmem-0805-deliver",
+          "content": "Deliver Bead tdmem-0805: Prevent forgotten harmful lessons from reappearing unchanged; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0806.plan.md",
+      "slug": "tdmem-0806",
+      "name": "tdmem-0806",
+      "overview": "Detect conflicting explicit lessons or provider-derived candidates and propose keep, supersede, scope-split, or merge actions.",
+      "todos": [
+        {
+          "id": "tdmem-0806-deliver",
+          "content": "Deliver Bead tdmem-0806: Implement contradiction and supersession proposal flow; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0807.plan.md",
+      "slug": "tdmem-0807",
+      "name": "tdmem-0807",
+      "overview": "Allow validated provider-derived lessons to become explicit canonical project memory.",
+      "todos": [
+        {
+          "id": "tdmem-0807-deliver",
+          "content": "Deliver Bead tdmem-0807: Create the audited promotion path into TraceDecay Native facts/rules; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0808.plan.md",
+      "slug": "tdmem-0808",
+      "name": "tdmem-0808",
+      "overview": "Make all lifecycle mutations reviewable and reversible where policy permits.",
+      "todos": [
+        {
+          "id": "tdmem-0808-deliver",
+          "content": "Deliver Bead tdmem-0808: Add human/agent curation receipts, dry-run, apply, and undo; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0809.plan.md",
+      "slug": "tdmem-0809",
+      "name": "tdmem-0809",
+      "overview": "Exercise recall \\u2192 use \\u2192 feedback \\u2192 maturity/curation \\u2192 later recall, including a harmful stale lesson.",
+      "todos": [
+        {
+          "id": "tdmem-0809-deliver",
+          "content": "Deliver Bead tdmem-0809: Run the complete learning and forgetting product journey; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0901.plan.md",
+      "slug": "tdmem-0901",
+      "name": "tdmem-0901",
+      "overview": "Version realistic but hermetic scenarios for long-running coding-agent memory behavior.",
+      "todos": [
+        {
+          "id": "tdmem-0901-deliver",
+          "content": "Deliver Bead tdmem-0901: Create the deterministic coding-memory scenario corpus; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0902.plan.md",
+      "slug": "tdmem-0902",
+      "name": "tdmem-0902",
+      "overview": "Provide strong baselines so NCM is measured against realistic alternatives rather than only no memory.",
+      "todos": [
+        {
+          "id": "tdmem-0902-deliver",
+          "content": "Deliver Bead tdmem-0902: Implement no-memory, explicit-doc, and Native baselines; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0903.plan.md",
+      "slug": "tdmem-0903",
+      "name": "tdmem-0903",
+      "overview": "Ensure evaluation observers cannot affect product outputs or canonical state.",
+      "todos": [
+        {
+          "id": "tdmem-0903-deliver",
+          "content": "Deliver Bead tdmem-0903: Mechanically prove observer-provider isolation; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0904.plan.md",
+      "slug": "tdmem-0904",
+      "name": "tdmem-0904",
+      "overview": "Measure provider usefulness and harm in coding work.",
+      "todos": [
+        {
+          "id": "tdmem-0904-deliver",
+          "content": "Deliver Bead tdmem-0904: Implement memory-quality, safety, cost, and latency metrics; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0905.plan.md",
+      "slug": "tdmem-0905",
+      "name": "tdmem-0905",
+      "overview": "Run identical observations and recall requests against Native and NCM and record comparable outputs.",
+      "todos": [
+        {
+          "id": "tdmem-0905-deliver",
+          "content": "Deliver Bead tdmem-0905: Implement Native versus NCM differential runner; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0906.plan.md",
+      "slug": "tdmem-0906",
+      "name": "tdmem-0906",
+      "overview": "Ensure evaluation can add OCEAN without changing scenario or metric contracts.",
+      "todos": [
+        {
+          "id": "tdmem-0906-deliver",
+          "content": "Deliver Bead tdmem-0906: Reserve a generic future-provider differential slot; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0907.plan.md",
+      "slug": "tdmem-0907",
+      "name": "tdmem-0907",
+      "overview": "Persist reports that can be compared across provider and upstream versions.",
+      "todos": [
+        {
+          "id": "tdmem-0907-deliver",
+          "content": "Deliver Bead tdmem-0907: Produce reproducible signed evaluation reports and artifacts; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0908.plan.md",
+      "slug": "tdmem-0908",
+      "name": "tdmem-0908",
+      "overview": "Define gates that prevent unsafe provider regressions and premature active NCM rollout.",
+      "todos": [
+        {
+          "id": "tdmem-0908-deliver",
+          "content": "Deliver Bead tdmem-0908: Set CI regression and active-provider activation thresholds; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0909.plan.md",
+      "slug": "tdmem-0909",
+      "name": "tdmem-0909",
+      "overview": "Support review of whether a recalled item was useful, harmful, stale, irrelevant, or unverifiable.",
+      "todos": [
+        {
+          "id": "tdmem-0909-deliver",
+          "content": "Deliver Bead tdmem-0909: Create human adjudication workflow for ambiguous recalls; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1001.plan.md",
+      "slug": "tdmem-1001",
+      "name": "tdmem-1001",
+      "overview": "Exercise TraceDecay's real Claude Code integration with provider recall and observation.",
+      "todos": [
+        {
+          "id": "tdmem-1001-deliver",
+          "content": "Deliver Bead tdmem-1001: Integrate and test Claude Code memory hooks; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1002.plan.md",
+      "slug": "tdmem-1002",
+      "name": "tdmem-1002",
+      "overview": "Exercise the real Codex host path with the same provider contracts and policies.",
+      "todos": [
+        {
+          "id": "tdmem-1002-deliver",
+          "content": "Deliver Bead tdmem-1002: Integrate and test Codex memory hooks; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1003.plan.md",
+      "slug": "tdmem-1003",
+      "name": "tdmem-1003",
+      "overview": "Validate Cursor through its supported TraceDecay V2 integration surface.",
+      "todos": [
+        {
+          "id": "tdmem-1003-deliver",
+          "content": "Deliver Bead tdmem-1003: Integrate and test Cursor memory context delivery; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1004.plan.md",
+      "slug": "tdmem-1004",
+      "name": "tdmem-1004",
+      "overview": "Run concurrent coding agents in one repository without confusing sessions, outcomes, or provider namespaces.",
+      "todos": [
+        {
+          "id": "tdmem-1004-deliver",
+          "content": "Deliver Bead tdmem-1004: Prove multi-agent same-repository isolation and coordination; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1005.plan.md",
+      "slug": "tdmem-1005",
+      "name": "tdmem-1005",
+      "overview": "Ensure a lesson tied to one branch/worktree revision is not blindly injected into an incompatible one.",
+      "todos": [
+        {
+          "id": "tdmem-1005-deliver",
+          "content": "Deliver Bead tdmem-1005: Prove branch and worktree validity boundaries; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1006.plan.md",
+      "slug": "tdmem-1006",
+      "name": "tdmem-1006",
+      "overview": "Run an agent in a fresh sandbox, restart provider/daemon, and continue without losing or duplicating experience.",
+      "todos": [
+        {
+          "id": "tdmem-1006-deliver",
+          "content": "Deliver Bead tdmem-1006: Prove coding-agent sandbox and provider restart lifecycle; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1007.plan.md",
+      "slug": "tdmem-1007",
+      "name": "tdmem-1007",
+      "overview": "Have one coding-agent session learn a project-specific useful lesson and a later session use it successfully.",
+      "todos": [
+        {
+          "id": "tdmem-1007-deliver",
+          "content": "Deliver Bead tdmem-1007: Prove cross-session useful-experience reuse; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1008.plan.md",
+      "slug": "tdmem-1008",
+      "name": "tdmem-1008",
+      "overview": "Create a valid lesson, change the project so it becomes wrong, then verify correction/forgetting.",
+      "todos": [
+        {
+          "id": "tdmem-1008-deliver",
+          "content": "Deliver Bead tdmem-1008: Prove stale-memory correction and non-resurrection; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1009.plan.md",
+      "slug": "tdmem-1009",
+      "name": "tdmem-1009",
+      "overview": "Validate host behavior when the active provider is down, slow, cancelled, corrupt, or reset-required.",
+      "todos": [
+        {
+          "id": "tdmem-1009-deliver",
+          "content": "Deliver Bead tdmem-1009: Prove typed provider unavailability, timeout, cancellation, and rollback; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1101.plan.md",
+      "slug": "tdmem-1101",
+      "name": "tdmem-1101",
+      "overview": "Add common status surfaces for configured, active, observer, and unavailable providers.",
+      "todos": [
+        {
+          "id": "tdmem-1101-deliver",
+          "content": "Deliver Bead tdmem-1101: Expose provider health, identity, capabilities, and readiness; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1102.plan.md",
+      "slug": "tdmem-1102",
+      "name": "tdmem-1102",
+      "overview": "Let developers trace why an experience entered a provider and how it affected a coding session.",
+      "todos": [
+        {
+          "id": "tdmem-1102-deliver",
+          "content": "Deliver Bead tdmem-1102: Expose observation \\u2192 recall \\u2192 pack \\u2192 outcome audit traces; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1103.plan.md",
+      "slug": "tdmem-1103",
+      "name": "tdmem-1103",
+      "overview": "Show Native explicit records and NCM cognitive summaries through one shell without flattening their semantics.",
+      "todos": [
+        {
+          "id": "tdmem-1103-deliver",
+          "content": "Deliver Bead tdmem-1103: Add provider-aware memory lifecycle inspection; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1104.plan.md",
+      "slug": "tdmem-1104",
+      "name": "tdmem-1104",
+      "overview": "Allow a developer to intervene in memory lifecycle safely.",
+      "todos": [
+        {
+          "id": "tdmem-1104-deliver",
+          "content": "Deliver Bead tdmem-1104: Add manual correct, forget, pin, and quarantine controls with receipts; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1105.plan.md",
+      "slug": "tdmem-1105",
+      "name": "tdmem-1105",
+      "overview": "Prevent memory content from becoming an untrusted command channel or secret exfiltration vector.",
+      "todos": [
+        {
+          "id": "tdmem-1105-deliver",
+          "content": "Deliver Bead tdmem-1105: Harden secret, prompt-injection, and untrusted-memory boundaries; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1106.plan.md",
+      "slug": "tdmem-1106",
+      "name": "tdmem-1106",
+      "overview": "Delete a prohibited source's future influence, including retained provider state.",
+      "todos": [
+        {
+          "id": "tdmem-1106-deliver",
+          "content": "Deliver Bead tdmem-1106: Implement verifiable privacy deletion across journal, provider, cache, and snapshots; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1107.plan.md",
+      "slug": "tdmem-1107",
+      "name": "tdmem-1107",
+      "overview": "Treat provider implementations as isolated but potentially faulty components.",
+      "todos": [
+        {
+          "id": "tdmem-1107-deliver",
+          "content": "Deliver Bead tdmem-1107: Test malicious, crashing, hanging, and protocol-violating providers; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1108.plan.md",
+      "slug": "tdmem-1108",
+      "name": "tdmem-1108",
+      "overview": "Expose operational signals needed to debug and price the memory layer.",
+      "todos": [
+        {
+          "id": "tdmem-1108-deliver",
+          "content": "Deliver Bead tdmem-1108: Add latency, queue, storage, recall-quality, and maintenance telemetry; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1109.plan.md",
+      "slug": "tdmem-1109",
+      "name": "tdmem-1109",
+      "overview": "Package enough state to diagnose provider and integration failures without sharing memory content by default.",
+      "todos": [
+        {
+          "id": "tdmem-1109-deliver",
+          "content": "Deliver Bead tdmem-1109: Create a redaction-safe support bundle and diagnostics workflow; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1204.plan.md",
+      "slug": "tdmem-1204",
+      "name": "tdmem-1204",
+      "overview": "Make product patches understandable to future sync agents.",
+      "todos": [
+        {
+          "id": "tdmem-1204-deliver",
+          "content": "Deliver Bead tdmem-1204: Record semantic invariants and parity tests for every upstream touch point; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1205.plan.md",
+      "slug": "tdmem-1205",
+      "name": "tdmem-1205",
+      "overview": "Advance upstream in reviewable trains rather than continuous rebases on every commit.",
+      "todos": [
+        {
+          "id": "tdmem-1205-deliver",
+          "content": "Deliver Bead tdmem-1205: Define the isolated sync-train workflow and conflict receipts; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1206.plan.md",
+      "slug": "tdmem-1206",
+      "name": "tdmem-1206",
+      "overview": "Gate every sync candidate on Zack parity and our provider product journeys.",
+      "todos": [
+        {
+          "id": "tdmem-1206-deliver",
+          "content": "Deliver Bead tdmem-1206: Build convergence CI: upstream parity plus product regression; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1208.plan.md",
+      "slug": "tdmem-1208",
+      "name": "tdmem-1208",
+      "overview": "Advance from the initial PR #707 floor to a later approved Zack checkpoint using only the documented workflow.",
+      "todos": [
+        {
+          "id": "tdmem-1208-deliver",
+          "content": "Deliver Bead tdmem-1208: Rehearse the first full Zack convergence train; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1401.plan.md",
+      "slug": "tdmem-1401",
+      "name": "tdmem-1401",
+      "overview": "State supported OS/architecture, coding-agent hosts, provider modes, features, and known exclusions.",
+      "todos": [
+        {
+          "id": "tdmem-1401-deliver",
+          "content": "Deliver Bead tdmem-1401: Define the alpha support matrix and product defaults; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1402.plan.md",
+      "slug": "tdmem-1402",
+      "name": "tdmem-1402",
+      "overview": "Produce reproducible binaries/artifacts for supported platforms and features.",
+      "todos": [
+        {
+          "id": "tdmem-1402-deliver",
+          "content": "Deliver Bead tdmem-1402: Build the alpha CI and release artifact matrix; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1403.plan.md",
+      "slug": "tdmem-1403",
+      "name": "tdmem-1403",
+      "overview": "Ensure existing TraceDecay users can install the derivative without accidental provider activation or data loss.",
+      "todos": [
+        {
+          "id": "tdmem-1403-deliver",
+          "content": "Deliver Bead tdmem-1403: Define config defaults, upgrade, migration, rollback, and reset behavior; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1404.plan.md",
+      "slug": "tdmem-1404",
+      "name": "tdmem-1404",
+      "overview": "Document realistic risks of long-lived coding-agent memory and the implemented controls.",
+      "todos": [
+        {
+          "id": "tdmem-1404-deliver",
+          "content": "Deliver Bead tdmem-1404: Write the alpha threat model, privacy model, and known limitations; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1405.plan.md",
+      "slug": "tdmem-1405",
+      "name": "tdmem-1405",
+      "overview": "Define what can upgrade independently and how incompatibility is surfaced.",
+      "todos": [
+        {
+          "id": "tdmem-1405-deliver",
+          "content": "Deliver Bead tdmem-1405: Publish protocol, provider, state, and upstream compatibility policy; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1406.plan.md",
+      "slug": "tdmem-1406",
+      "name": "tdmem-1406",
+      "overview": "Release the new provider architecture with only the proven Native path active.",
+      "todos": [
+        {
+          "id": "tdmem-1406-deliver",
+          "content": "Deliver Bead tdmem-1406: Cut and verify a Native-only alpha release candidate; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1407.plan.md",
+      "slug": "tdmem-1407",
+      "name": "tdmem-1407",
+      "overview": "Ship NCM evaluation to selected users without allowing NCM recall into prompts.",
+      "todos": [
+        {
+          "id": "tdmem-1407-deliver",
+          "content": "Deliver Bead tdmem-1407: Cut and verify an NCM observer alpha release candidate; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1408.plan.md",
+      "slug": "tdmem-1408",
+      "name": "tdmem-1408",
+      "overview": "Enable opt-in NCM context influence for a controlled alpha cohort.",
+      "todos": [
+        {
+          "id": "tdmem-1408-deliver",
+          "content": "Deliver Bead tdmem-1408: Cut guarded active-NCM alpha only after activation gates pass; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1409.plan.md",
+      "slug": "tdmem-1409",
+      "name": "tdmem-1409",
+      "overview": "Collect product evidence needed to decide further investment without ingesting private memory content.",
+      "todos": [
+        {
+          "id": "tdmem-1409-deliver",
+          "content": "Deliver Bead tdmem-1409: Establish post-alpha evidence and feedback loop; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    }
+  ],
+  "frontier": [
+    {
+      "plan_slug": "tdmem-0401",
+      "plan_name": "tdmem-0401",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0401.plan.md",
+      "plan_status": "in_progress",
+      "state": "in_progress",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "tdmem-0401-deliver",
+          "content": "Deliver Bead tdmem-0401: Implement Native observe mapping through existing application ports; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "in_progress",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0402",
+      "plan_name": "tdmem-0402",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0402.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0401"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0402-deliver",
+          "content": "Deliver Bead tdmem-0402: Implement Native recall, feedback, maintenance, and inspection mappings; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0403",
+      "plan_name": "tdmem-0403",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0403.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0402"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0403-deliver",
+          "content": "Deliver Bead tdmem-0403: Build direct-versus-provider Native golden parity tests; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0404",
+      "plan_name": "tdmem-0404",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0404.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0403"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0404-deliver",
+          "content": "Deliver Bead tdmem-0404: Prove disabled Memory Fabric mode is behaviorally inert; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0405",
+      "plan_name": "tdmem-0405",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0405.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0402"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0405-deliver",
+          "content": "Deliver Bead tdmem-0405: Expose Native provider capability and explanation metadata; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0406",
+      "plan_name": "tdmem-0406",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0406.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0403",
+        "tdmem-0404",
+        "tdmem-0405"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0406-deliver",
+          "content": "Deliver Bead tdmem-0406: Run a real Native-provider coding-agent journey; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0501",
+      "plan_name": "tdmem-0501",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0501.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0501-deliver",
+          "content": "Deliver Bead tdmem-0501: Enumerate post-commit host events eligible for provider observation; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0502",
+      "plan_name": "tdmem-0502",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0502.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0501"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0502-deliver",
+          "content": "Deliver Bead tdmem-0502: Define and persist the provider outbox/journal authority; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0503",
+      "plan_name": "tdmem-0503",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0503.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0502"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0503-deliver",
+          "content": "Deliver Bead tdmem-0503: Implement the idempotent bounded dispatcher; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0504",
+      "plan_name": "tdmem-0504",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0504.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0503"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0504-deliver",
+          "content": "Deliver Bead tdmem-0504: Implement provider lifecycle supervision and crash isolation; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0505",
+      "plan_name": "tdmem-0505",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0505.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0503",
+        "tdmem-0504"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0505-deliver",
+          "content": "Deliver Bead tdmem-0505: Implement backpressure, load shedding, and no-silent-drop invariants; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0506",
+      "plan_name": "tdmem-0506",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0506.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0503",
+        "tdmem-0504"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0506-deliver",
+          "content": "Deliver Bead tdmem-0506: Implement recovery replay and exact-effect verification; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0507",
+      "plan_name": "tdmem-0507",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0507.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0501"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0507-deliver",
+          "content": "Deliver Bead tdmem-0507: Apply secret and transient-data hygiene before provider dispatch; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0508",
+      "plan_name": "tdmem-0508",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0508.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0505",
+        "tdmem-0506",
+        "tdmem-0507"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0508-deliver",
+          "content": "Deliver Bead tdmem-0508: Prove crash safety between host commit and provider acknowledgement; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0601",
+      "plan_name": "tdmem-0601",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0601.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0506"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0601-deliver",
+          "content": "Deliver Bead tdmem-0601: Add a CognitiveRecallPort to the TraceDecay application layer; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0602",
+      "plan_name": "tdmem-0602",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0602.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0506",
+        "tdmem-0601"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0602-deliver",
+          "content": "Deliver Bead tdmem-0602: Normalize provider recall candidates without erasing native semantics; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0603",
+      "plan_name": "tdmem-0603",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0603.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0506",
+        "tdmem-0601"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0603-deliver",
+          "content": "Deliver Bead tdmem-0603: Enforce exact scope, identity, temporal validity, and revocation before admission; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0604",
+      "plan_name": "tdmem-0604",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0604.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0506",
+        "tdmem-0602",
+        "tdmem-0603"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0604-deliver",
+          "content": "Deliver Bead tdmem-0604: Implement provider-candidate deduplication and diversity selection; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0605",
+      "plan_name": "tdmem-0605",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0605.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0506",
+        "tdmem-0604"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0605-deliver",
+          "content": "Deliver Bead tdmem-0605: Bridge cognitive candidates into the canonical token-budgeted context compiler; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0606",
+      "plan_name": "tdmem-0606",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0606.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0506",
+        "tdmem-0603",
+        "tdmem-0605"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0606-deliver",
+          "content": "Deliver Bead tdmem-0606: Hydrate provenance and represent provenance-unavailable explicitly; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0607",
+      "plan_name": "tdmem-0607",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0607.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0506",
+        "tdmem-0601"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0607-deliver",
+          "content": "Deliver Bead tdmem-0607: Implement explicit provider routing and fallback policy; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0608",
+      "plan_name": "tdmem-0608",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0608.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0506",
+        "tdmem-0605",
+        "tdmem-0606",
+        "tdmem-0607"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0608-deliver",
+          "content": "Deliver Bead tdmem-0608: Expose context selection and provider contribution traces; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0609",
+      "plan_name": "tdmem-0609",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0609.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0506",
+        "tdmem-0606",
+        "tdmem-0608"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0609-deliver",
+          "content": "Deliver Bead tdmem-0609: Run the full cognitive-recall read-path product journey; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0701",
+      "plan_name": "tdmem-0701",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0701.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0508",
+        "tdmem-0609"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0701-deliver",
+          "content": "Deliver Bead tdmem-0701: Audit the licensed Biomem/NCM surface against the provider contract; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0702",
+      "plan_name": "tdmem-0702",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0702.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0504",
+        "tdmem-0508",
+        "tdmem-0609",
+        "tdmem-0701"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0702-deliver",
+          "content": "Deliver Bead tdmem-0702: Select and document the first NCM integration topology; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0703",
+      "plan_name": "tdmem-0703",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0703.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0508",
+        "tdmem-0609",
+        "tdmem-0702"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0703-deliver",
+          "content": "Deliver Bead tdmem-0703: Implement NCM handshake, manifest, capabilities, and health; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0704",
+      "plan_name": "tdmem-0704",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0704.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0507",
+        "tdmem-0508",
+        "tdmem-0609",
+        "tdmem-0703"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0704-deliver",
+          "content": "Deliver Bead tdmem-0704: Implement NCM observation ingestion with idempotency and exact coding scope; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0705",
+      "plan_name": "tdmem-0705",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0705.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0508",
+        "tdmem-0602",
+        "tdmem-0609",
+        "tdmem-0703"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0705-deliver",
+          "content": "Deliver Bead tdmem-0705: Implement NCM recall and score/explanation mapping; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0706",
+      "plan_name": "tdmem-0706",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0706.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0508",
+        "tdmem-0609",
+        "tdmem-0704",
+        "tdmem-0705"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0706-deliver",
+          "content": "Deliver Bead tdmem-0706: Implement NCM feedback, maintenance, correction, and forgetting capabilities; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0707",
+      "plan_name": "tdmem-0707",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0707.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0506",
+        "tdmem-0508",
+        "tdmem-0609",
+        "tdmem-0704"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0707-deliver",
+          "content": "Deliver Bead tdmem-0707: Implement NCM snapshot, restore, replay position, and state compatibility; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0708",
+      "plan_name": "tdmem-0708",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0708.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0508",
+        "tdmem-0609",
+        "tdmem-0705",
+        "tdmem-0706"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0708-deliver",
+          "content": "Deliver Bead tdmem-0708: Map NCM inspection into redaction-safe common surfaces; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0709",
+      "plan_name": "tdmem-0709",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0709.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0508",
+        "tdmem-0609",
+        "tdmem-0706",
+        "tdmem-0707",
+        "tdmem-0708"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0709-deliver",
+          "content": "Deliver Bead tdmem-0709: Pass NCM mandatory and declared-capability conformance; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0710",
+      "plan_name": "tdmem-0710",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0710.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0508",
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0903"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0710-deliver",
+          "content": "Deliver Bead tdmem-0710: Run NCM in mechanically isolated observer mode; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0711",
+      "plan_name": "tdmem-0711",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0711.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0508",
+        "tdmem-0609",
+        "tdmem-0710",
+        "tdmem-0908",
+        "tdmem-1008",
+        "tdmem-1009"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0711-deliver",
+          "content": "Deliver Bead tdmem-0711: Enable guarded active NCM experiment after objective gates pass; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0801",
+      "plan_name": "tdmem-0801",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0801.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0608",
+        "tdmem-0609",
+        "tdmem-0705",
+        "tdmem-0709"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0801-deliver",
+          "content": "Deliver Bead tdmem-0801: Attribute context-pack outcomes to exact recalled items; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0802",
+      "plan_name": "tdmem-0802",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0802.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0801"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0802-deliver",
+          "content": "Deliver Bead tdmem-0802: Implement helpful, harmful, ignored, and indeterminate feedback flow; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0803",
+      "plan_name": "tdmem-0803",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0803.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0802"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0803-deliver",
+          "content": "Deliver Bead tdmem-0803: Define provider-neutral lesson maturity and promotion policy; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0804",
+      "plan_name": "tdmem-0804",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0804.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0803"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0804-deliver",
+          "content": "Deliver Bead tdmem-0804: Represent negative knowledge and failed approaches as first-class candidates; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0805",
+      "plan_name": "tdmem-0805",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0805.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0804"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0805-deliver",
+          "content": "Deliver Bead tdmem-0805: Prevent forgotten harmful lessons from reappearing unchanged; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0806",
+      "plan_name": "tdmem-0806",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0806.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0803",
+        "tdmem-0804"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0806-deliver",
+          "content": "Deliver Bead tdmem-0806: Implement contradiction and supersession proposal flow; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0807",
+      "plan_name": "tdmem-0807",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0807.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0402",
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0803",
+        "tdmem-0806"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0807-deliver",
+          "content": "Deliver Bead tdmem-0807: Create the audited promotion path into TraceDecay Native facts/rules; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0808",
+      "plan_name": "tdmem-0808",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0808.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0805",
+        "tdmem-0806",
+        "tdmem-0807"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0808-deliver",
+          "content": "Deliver Bead tdmem-0808: Add human/agent curation receipts, dry-run, apply, and undo; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0809",
+      "plan_name": "tdmem-0809",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0809.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0802",
+        "tdmem-0808"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0809-deliver",
+          "content": "Deliver Bead tdmem-0809: Run the complete learning and forgetting product journey; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0901",
+      "plan_name": "tdmem-0901",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0901.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0609"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0901-deliver",
+          "content": "Deliver Bead tdmem-0901: Create the deterministic coding-memory scenario corpus; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0902",
+      "plan_name": "tdmem-0902",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0902.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0609",
+        "tdmem-0901"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0902-deliver",
+          "content": "Deliver Bead tdmem-0902: Implement no-memory, explicit-doc, and Native baselines; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0903",
+      "plan_name": "tdmem-0903",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0903.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0607",
+        "tdmem-0609"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0903-deliver",
+          "content": "Deliver Bead tdmem-0903: Mechanically prove observer-provider isolation; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0904",
+      "plan_name": "tdmem-0904",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0904.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0609",
+        "tdmem-0901"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0904-deliver",
+          "content": "Deliver Bead tdmem-0904: Implement memory-quality, safety, cost, and latency metrics; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0905",
+      "plan_name": "tdmem-0905",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0905.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0902",
+        "tdmem-0903",
+        "tdmem-0904"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0905-deliver",
+          "content": "Deliver Bead tdmem-0905: Implement Native versus NCM differential runner; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0906",
+      "plan_name": "tdmem-0906",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0906.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0609",
+        "tdmem-0905"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0906-deliver",
+          "content": "Deliver Bead tdmem-0906: Reserve a generic future-provider differential slot; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0907",
+      "plan_name": "tdmem-0907",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0907.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0609",
+        "tdmem-0905",
+        "tdmem-0906"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0907-deliver",
+          "content": "Deliver Bead tdmem-0907: Produce reproducible signed evaluation reports and artifacts; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0908",
+      "plan_name": "tdmem-0908",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0908.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0609",
+        "tdmem-0907"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0908-deliver",
+          "content": "Deliver Bead tdmem-0908: Set CI regression and active-provider activation thresholds; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-0909",
+      "plan_name": "tdmem-0909",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0909.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0406",
+        "tdmem-0609",
+        "tdmem-0904"
+      ],
+      "active": [
+        {
+          "id": "tdmem-0909-deliver",
+          "content": "Deliver Bead tdmem-0909: Create human adjudication workflow for ambiguous recalls; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1001",
+      "plan_name": "tdmem-1001",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1001.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0508",
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0809"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1001-deliver",
+          "content": "Deliver Bead tdmem-1001: Integrate and test Claude Code memory hooks; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1002",
+      "plan_name": "tdmem-1002",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1002.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0508",
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0809"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1002-deliver",
+          "content": "Deliver Bead tdmem-1002: Integrate and test Codex memory hooks; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1003",
+      "plan_name": "tdmem-1003",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1003.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0508",
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0809"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1003-deliver",
+          "content": "Deliver Bead tdmem-1003: Integrate and test Cursor memory context delivery; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1004",
+      "plan_name": "tdmem-1004",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1004.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0709",
+        "tdmem-0809",
+        "tdmem-1001",
+        "tdmem-1002"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1004-deliver",
+          "content": "Deliver Bead tdmem-1004: Prove multi-agent same-repository isolation and coordination; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1005",
+      "plan_name": "tdmem-1005",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1005.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0603",
+        "tdmem-0709",
+        "tdmem-0809",
+        "tdmem-1001",
+        "tdmem-1002"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1005-deliver",
+          "content": "Deliver Bead tdmem-1005: Prove branch and worktree validity boundaries; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1006",
+      "plan_name": "tdmem-1006",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1006.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0508",
+        "tdmem-0707",
+        "tdmem-0709",
+        "tdmem-0809",
+        "tdmem-1001"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1006-deliver",
+          "content": "Deliver Bead tdmem-1006: Prove coding-agent sandbox and provider restart lifecycle; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1007",
+      "plan_name": "tdmem-1007",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1007.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0709",
+        "tdmem-0802",
+        "tdmem-0809",
+        "tdmem-0904",
+        "tdmem-1001"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1007-deliver",
+          "content": "Deliver Bead tdmem-1007: Prove cross-session useful-experience reuse; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1008",
+      "plan_name": "tdmem-1008",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1008.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0709",
+        "tdmem-0805",
+        "tdmem-0806",
+        "tdmem-0809",
+        "tdmem-1005"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1008-deliver",
+          "content": "Deliver Bead tdmem-1008: Prove stale-memory correction and non-resurrection; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1009",
+      "plan_name": "tdmem-1009",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1009.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0504",
+        "tdmem-0607",
+        "tdmem-0709",
+        "tdmem-0809",
+        "tdmem-1001",
+        "tdmem-1002"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1009-deliver",
+          "content": "Deliver Bead tdmem-1009: Prove typed provider unavailability, timeout, cancellation, and rollback; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1101",
+      "plan_name": "tdmem-1101",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1101.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0505",
+        "tdmem-0703",
+        "tdmem-0709",
+        "tdmem-0809"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1101-deliver",
+          "content": "Deliver Bead tdmem-1101: Expose provider health, identity, capabilities, and readiness; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1102",
+      "plan_name": "tdmem-1102",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1102.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0503",
+        "tdmem-0608",
+        "tdmem-0709",
+        "tdmem-0801",
+        "tdmem-0809"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1102-deliver",
+          "content": "Deliver Bead tdmem-1102: Expose observation \\u2192 recall \\u2192 pack \\u2192 outcome audit traces; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1103",
+      "plan_name": "tdmem-1103",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1103.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0405",
+        "tdmem-0708",
+        "tdmem-0709",
+        "tdmem-0809",
+        "tdmem-1102"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1103-deliver",
+          "content": "Deliver Bead tdmem-1103: Add provider-aware memory lifecycle inspection; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1104",
+      "plan_name": "tdmem-1104",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1104.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0709",
+        "tdmem-0808",
+        "tdmem-0809",
+        "tdmem-1103"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1104-deliver",
+          "content": "Deliver Bead tdmem-1104: Add manual correct, forget, pin, and quarantine controls with receipts; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1105",
+      "plan_name": "tdmem-1105",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1105.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0507",
+        "tdmem-0605",
+        "tdmem-0709",
+        "tdmem-0809"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1105-deliver",
+          "content": "Deliver Bead tdmem-1105: Harden secret, prompt-injection, and untrusted-memory boundaries; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1106",
+      "plan_name": "tdmem-1106",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1106.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0502",
+        "tdmem-0706",
+        "tdmem-0707",
+        "tdmem-0709",
+        "tdmem-0809"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1106-deliver",
+          "content": "Deliver Bead tdmem-1106: Implement verifiable privacy deletion across journal, provider, cache, and snapshots; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1107",
+      "plan_name": "tdmem-1107",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1107.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0504",
+        "tdmem-0709",
+        "tdmem-0809"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1107-deliver",
+          "content": "Deliver Bead tdmem-1107: Test malicious, crashing, hanging, and protocol-violating providers; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1108",
+      "plan_name": "tdmem-1108",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1108.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0505",
+        "tdmem-0609",
+        "tdmem-0709",
+        "tdmem-0809"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1108-deliver",
+          "content": "Deliver Bead tdmem-1108: Add latency, queue, storage, recall-quality, and maintenance telemetry; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1109",
+      "plan_name": "tdmem-1109",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1109.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0709",
+        "tdmem-0809",
+        "tdmem-1101",
+        "tdmem-1102",
+        "tdmem-1108"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1109-deliver",
+          "content": "Deliver Bead tdmem-1109: Create a redaction-safe support bundle and diagnostics workflow; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1204",
+      "plan_name": "tdmem-1204",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1204.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0404"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1204-deliver",
+          "content": "Deliver Bead tdmem-1204: Record semantic invariants and parity tests for every upstream touch point; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1205",
+      "plan_name": "tdmem-1205",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1205.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-1204"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1205-deliver",
+          "content": "Deliver Bead tdmem-1205: Define the isolated sync-train workflow and conflict receipts; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1206",
+      "plan_name": "tdmem-1206",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1206.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0403",
+        "tdmem-1205"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1206-deliver",
+          "content": "Deliver Bead tdmem-1206: Build convergence CI: upstream parity plus product regression; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1208",
+      "plan_name": "tdmem-1208",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1208.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-1206"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1208-deliver",
+          "content": "Deliver Bead tdmem-1208: Rehearse the first full Zack convergence train; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1401",
+      "plan_name": "tdmem-1401",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1401.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-1002",
+        "tdmem-1003",
+        "tdmem-1009",
+        "tdmem-1109",
+        "tdmem-1208"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1401-deliver",
+          "content": "Deliver Bead tdmem-1401: Define the alpha support matrix and product defaults; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1402",
+      "plan_name": "tdmem-1402",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1402.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-1009",
+        "tdmem-1109",
+        "tdmem-1206",
+        "tdmem-1208",
+        "tdmem-1401"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1402-deliver",
+          "content": "Deliver Bead tdmem-1402: Build the alpha CI and release artifact matrix; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1403",
+      "plan_name": "tdmem-1403",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1403.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0404",
+        "tdmem-0707",
+        "tdmem-1009",
+        "tdmem-1109",
+        "tdmem-1208"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1403-deliver",
+          "content": "Deliver Bead tdmem-1403: Define config defaults, upgrade, migration, rollback, and reset behavior; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1404",
+      "plan_name": "tdmem-1404",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1404.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-1009",
+        "tdmem-1105",
+        "tdmem-1106",
+        "tdmem-1107",
+        "tdmem-1109",
+        "tdmem-1208"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1404-deliver",
+          "content": "Deliver Bead tdmem-1404: Write the alpha threat model, privacy model, and known limitations; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1405",
+      "plan_name": "tdmem-1405",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1405.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0707",
+        "tdmem-1009",
+        "tdmem-1109",
+        "tdmem-1208"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1405-deliver",
+          "content": "Deliver Bead tdmem-1405: Publish protocol, provider, state, and upstream compatibility policy; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1406",
+      "plan_name": "tdmem-1406",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1406.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-1009",
+        "tdmem-1109",
+        "tdmem-1208",
+        "tdmem-1402",
+        "tdmem-1403",
+        "tdmem-1404",
+        "tdmem-1405"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1406-deliver",
+          "content": "Deliver Bead tdmem-1406: Cut and verify a Native-only alpha release candidate; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1407",
+      "plan_name": "tdmem-1407",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1407.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0710",
+        "tdmem-1009",
+        "tdmem-1106",
+        "tdmem-1109",
+        "tdmem-1208",
+        "tdmem-1406"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1407-deliver",
+          "content": "Deliver Bead tdmem-1407: Cut and verify an NCM observer alpha release candidate; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1408",
+      "plan_name": "tdmem-1408",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1408.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-0711",
+        "tdmem-1008",
+        "tdmem-1009",
+        "tdmem-1109",
+        "tdmem-1208",
+        "tdmem-1407"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1408-deliver",
+          "content": "Deliver Bead tdmem-1408: Cut guarded active-NCM alpha only after activation gates pass; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1409",
+      "plan_name": "tdmem-1409",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1409.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "tdmem-1009",
+        "tdmem-1108",
+        "tdmem-1109",
+        "tdmem-1208",
+        "tdmem-1406"
+      ],
+      "active": [
+        {
+          "id": "tdmem-1409-deliver",
+          "content": "Deliver Bead tdmem-1409: Establish post-alpha evidence and feedback loop; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    }
+  ],
+  "errors": [],
+  "warnings": [],
+  "graph_source": "explicit"
+}

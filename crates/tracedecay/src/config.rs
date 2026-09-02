@@ -15,7 +15,8 @@ use tracedecay_domain::configuration::{
     INDEX_EXCLUDE_SETTING_KEY, INDEX_EXTRACT_DOCSTRINGS_SETTING_KEY, INDEX_GIT_IGNORE_SETTING_KEY,
     INDEX_INCLUDE_SETTING_KEY, INDEX_MAX_FILE_SIZE_SETTING_KEY,
     INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY, INDEX_TRACK_CALL_SITES_SETTING_KEY,
-    SOURCE_BINDINGS_SETTING_KEY, SYNC_AUTO_INIT_SETTING_KEY,
+    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    MemoryProviderRecallRoutingV1, SOURCE_BINDINGS_SETTING_KEY, SYNC_AUTO_INIT_SETTING_KEY,
     SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY, SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY,
     SYNC_AUTO_WATCH_SETTING_KEY, SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY,
     SYNC_BRANCH_GC_DAYS_SETTING_KEY, SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY,
@@ -175,6 +176,17 @@ pub struct TraceDecayConfig {
     /// graph capability as unavailable.
     #[serde(default = "default_native_graph_activation")]
     pub native_graph_activation: bool,
+    /// Whether the project-owned Native memory provider host is explicitly enabled.
+    /// The default is false so disabled projects construct no provider fabric,
+    /// adapter, journal, or background work.
+    #[serde(default)]
+    pub memory_provider_native_enabled: bool,
+    /// Explicit recall routing gate: which enabled provider, if any, may
+    /// answer product recall, and the only fallback rule that may extend it.
+    /// Defaults to no active provider, so enabling the host alone never
+    /// promotes a provider to active output.
+    #[serde(default)]
+    pub memory_provider_recall_routing: MemoryProviderRecallRoutingV1,
     /// Optional installed local semantic profile selection. Missing or
     /// unavailable semantics never disables exact, lexical, or graph search.
     #[serde(default)]
@@ -588,6 +600,8 @@ impl Default for TraceDecayConfig {
             git_ignore: default_git_ignore(),
             diagnostics_prewarm: false,
             native_graph_activation: default_native_graph_activation(),
+            memory_provider_native_enabled: false,
+            memory_provider_recall_routing: MemoryProviderRecallRoutingV1::default(),
             semantic: SemanticConfig::default(),
             sync: SyncConfig::default(),
             telemetry: TelemetryConfig::default(),
@@ -1436,6 +1450,11 @@ pub fn runtime_config_from_snapshot(
             snapshot,
             INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
         )?,
+        memory_provider_native_enabled: required_bool(
+            snapshot,
+            MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+        )?,
+        memory_provider_recall_routing: memory_provider_recall_routing_from_snapshot(snapshot)?,
         semantic: semantic_config_from_snapshot(snapshot)?,
         sync: SyncConfig {
             auto_watch: required_bool(snapshot, SYNC_AUTO_WATCH_SETTING_KEY)?,
@@ -1501,6 +1520,33 @@ fn semantic_config_from_snapshot(snapshot: &ConfigurationSnapshotV1) -> Result<S
     };
     semantic.validate()?;
     Ok(semantic)
+}
+
+fn memory_provider_recall_routing_from_snapshot(
+    snapshot: &ConfigurationSnapshotV1,
+) -> Result<MemoryProviderRecallRoutingV1> {
+    let routing: MemoryProviderRecallRoutingV1 = match required_setting(
+        snapshot,
+        MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    )? {
+        ConfigurationValueV1::Text(value) => serde_json::from_str(value).map_err(|error| {
+            config_error(format!(
+                "resolved memory provider recall routing setting is invalid: {error}"
+            ))
+        })?,
+        value => {
+            return Err(config_error(format!(
+                "resolved configuration setting '{MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY}' has wrong type: expected text, got {:?}",
+                value.kind()
+            )));
+        }
+    };
+    routing.validate().map_err(|error| {
+        config_error(format!(
+            "resolved memory provider recall routing setting is invalid: {error}"
+        ))
+    })?;
+    Ok(routing)
 }
 
 fn retention_config_from_snapshot(snapshot: &ConfigurationSnapshotV1) -> Result<RetentionConfig> {

@@ -19,7 +19,7 @@ Every other optional V1 lifecycle capability returns the typed `capability_unsup
 
 ## State model
 
-Provider-local state is a deterministic `BTreeMap` keyed by the observation idempotency key. New observations require the next monotonic source sequence and the expected provider-state generation. A retry with the same key and identical canonical fingerprint returns `DuplicateAcknowledged` without a second effect. The same key with different canonical content returns typed conflict.
+Provider-local state is a deterministic `BTreeMap` keyed by the observation idempotency key. New observations require the next monotonic source sequence and the expected provider-state generation. A retry with the same key and identical canonical fingerprint returns `DuplicateAcknowledged` without a second effect: the terminal is `success` with committed-effect state `duplicate`, naming the idempotency key that matched and the operation whose earlier delivery actually committed, with the state generation unchanged. The map therefore retains the committing operation alongside each observation. The same key with different canonical content returns typed conflict.
 
 Recall is a bounded, case-sensitive substring search over the deterministic map order. It returns advisory candidates only. Zero matches produce `SuccessZeroResults`, not failure or fallback.
 

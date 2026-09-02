@@ -104,6 +104,74 @@ class ProviderRecallContractTest(unittest.TestCase):
         self.assertEqual(receipt["terminal_state_count"], 17)
         self.assertFalse(receipt["provider_may_inject_context"])
 
+    def test_candidate_scope_binding_is_required_and_closed(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        del contract["candidate_scope_binding"]
+        self.assert_rejected(contract, "candidate_scope_binding must be an object")
+
+        contract = copy.deepcopy(self.contract)
+        contract["candidate_scope_binding"]["bindings"].append("repository_facts")
+        self.assert_rejected(
+            contract,
+            "candidate scope bindings must mirror the authority-matrix namespaces",
+        )
+
+        contract = copy.deepcopy(self.contract)
+        contract["candidate_scope_binding"]["required_fields"].remove("scope_binding")
+        self.assert_rejected(
+            contract, "candidate scope fields must be scope_binding plus the exact scope"
+        )
+
+    def test_candidate_scope_binding_authorization_is_host_owned(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        contract["candidate_scope_binding"]["provider_may_widen_binding"] = True
+        self.assert_rejected(
+            contract, "candidate_scope_binding.provider_may_widen_binding must be false"
+        )
+
+        contract = copy.deepcopy(self.contract)
+        contract["candidate_scope_binding"]["authorization_carried_by"] = "provider_reply"
+        self.assert_rejected(
+            contract, "scope binding authorization must travel with the admitted call"
+        )
+
+        contract = copy.deepcopy(self.contract)
+        contract["candidate_scope_binding"]["unauthorized_binding_policy"] = "allow"
+        self.assert_rejected(
+            contract,
+            "candidate_scope_binding.unauthorized_binding_policy must be "
+            "reject_scope_binding_unauthorized",
+        )
+
+    def test_candidate_scope_binding_rules_mirror_authority_matrix(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        rules = {
+            rule["binding"]: rule
+            for rule in contract["candidate_scope_binding"]["binding_rules"]
+        }
+        rules["project_facts"]["forbidden"].remove("agent_session_id")
+        rules["project_facts"]["optional_empty_or_equal"].append("agent_session_id")
+        self.assert_rejected(
+            contract, "binding rule project_facts.optional_empty_or_equal drifted"
+        )
+
+        contract = copy.deepcopy(self.contract)
+        rules = {
+            rule["binding"]: rule
+            for rule in contract["candidate_scope_binding"]["binding_rules"]
+        }
+        rules["profile_facts"]["required_equal"].append("project_id")
+        rules["profile_facts"]["forbidden"].remove("project_id")
+        self.assert_rejected(
+            contract, "binding rule profile_facts.required_equal drifted"
+        )
+
+        contract = copy.deepcopy(self.contract)
+        contract["candidate_scope_binding"]["binding_rules"].pop()
+        self.assert_rejected(
+            contract, "binding rules must cover every binding in contract order"
+        )
+
     def test_request_must_carry_exact_scope(self) -> None:
         contract = copy.deepcopy(self.contract)
         contract["recall_request"]["required_fields"].remove("exact_scope_identity")

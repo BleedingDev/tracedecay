@@ -79,6 +79,8 @@ REQUIRED_SOURCE_MARKERS = {
     "TerminalCode::StaleIdentity",
     "TerminalCode::StateIncompatible",
     "CommittedEffectState::None",
+    "CommittedEffectState::Duplicate",
+    "committed_by_operation_id",
     "FallbackEligibility::Forbidden",
     "SNAPSHOT_MAGIC",
     "sha256_hex",
@@ -86,6 +88,7 @@ REQUIRED_SOURCE_MARKERS = {
 REQUIRED_DOC_MARKERS = {
     "intentionally small, deterministic, capability-poor",
     "same key and identical canonical fingerprint",
+    "committed-effect state `duplicate`",
     "SuccessZeroResults",
     "refuses implicit overwrite",
     "Unknown optional observation extensions are preserved byte-for-byte",
@@ -276,7 +279,9 @@ def validate_manifest(
         "representation": "BTreeMap_idempotency_key_to_canonical_observation",
         "source_sequence_monotonic": True,
         "state_generation_monotonic": True,
-        "duplicate_same_key_same_fingerprint": "duplicate_acknowledged_without_new_effect",
+        "duplicate_same_key_same_fingerprint": (
+            "duplicate_committed_effect_bound_to_request_key_and_committing_operation"
+        ),
         "duplicate_same_key_different_fingerprint": "conflict_without_new_effect",
         "snapshot_encoding": "canonical_length_prefixed_binary_v1",
         "snapshot_digest": "sha256",

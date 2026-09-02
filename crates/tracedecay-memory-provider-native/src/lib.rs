@@ -34,6 +34,14 @@ use tracedecay_memory_provider_api::{
 /// Stable logical provider identity for TraceDecay Native memory.
 pub const NATIVE_PROVIDER_ID: &str = "tracedecay.native";
 
+/// Recall candidate scope bindings the host authorizes Native to attest, in
+/// the wire vocabulary of `tracedecay.memory.provider.recall.v1`
+/// `candidate_scope_binding.bindings`. Native facts carry only their owner
+/// (a project or the profile), so Native never attests the exact coding
+/// scope; the registry records this declaration at registration and passes
+/// it to admission with the admitted call.
+pub const NATIVE_RECALL_SCOPE_BINDINGS: &[&str] = &["project_facts", "profile_facts"];
+
 /// Provider-neutral contract carried by an admitted observation call.
 pub const OBSERVATION_CONTRACT_ID: &str = "tracedecay.memory.provider.observation.v1";
 
@@ -279,7 +287,12 @@ impl NativeProvider {
                 call.operation_id.as_str()
             },
             exact_scope_sha256,
-            None,
+            // A pre-dispatch refusal touches no state, so the generation the
+            // call was addressed to is exactly the generation observed. The
+            // fabric requires that evidence on every non-handshake reply;
+            // omitting it turns a typed refusal into a protocol violation the
+            // host would retry until exhaustion.
+            Some(call.expected_state_generation),
             diagnostic_id,
         );
         ProviderReply {
@@ -287,8 +300,6 @@ impl NativeProvider {
             payload: None,
             warnings: Vec::new(),
             extensions: Vec::new(),
-            // ProviderReply still requires a scalar even when structured
-            // evidence truthfully records that no generation was observed.
             state_generation: call.expected_state_generation,
         }
     }

@@ -1,0 +1,225 @@
+{
+  "schema_version": 1,
+  "contract_id": "tracedecay.observation-hygiene-policy.v1",
+  "bead_id": "tdmem-0507",
+  "title": "Observation secret and transient-data hygiene policy",
+  "status": "accepted",
+  "authority": "TraceDecay observation admission authority",
+  "sanitizer_id": "tracedecay.memory.observation.hygiene.v1",
+  "admission_boundary": {
+    "runs_at": "admission",
+    "runs_before": "digest_and_idempotency_key_derivation",
+    "single_admitted_pipeline": true,
+    "mutates_canonical_evidence": false,
+    "raw_secret_material_allowed": false,
+    "delivered_bytes_equal_journal_bytes": true,
+    "withheld_events_advance_replay_cursor": true,
+    "observation_contract": "product/contracts/memory-provider-v1/provider-observation-contract.json",
+    "event_policy": "product/observations/host-event-observation-policy.json"
+  },
+  "detector_authority": {
+    "credential_corpus": "tracedecay_runtime_core::memory::hygiene::detect_secret_like",
+    "canonical_redaction": "tracedecay_runtime_core::privacy::sanitize_memory_fact_payload",
+    "transient_corpus": "tracedecay_memory_hygiene::transient",
+    "reason": "The vendored credential catalogue has exactly one owner. This policy binds class identities to that owner's public detectors instead of restating its patterns; only the transient corpus, which needs byte spans the upstream surface does not expose, is implemented here."
+  },
+  "severity_ladder": ["accept", "annotate", "redact", "quarantine", "reject"],
+  "reject_floor_classes": [
+    "private_key",
+    "bearer_token",
+    "known_credential_prefix",
+    "high_entropy_token",
+    "detector_unavailable"
+  ],
+  "dispositions": {
+    "delivered": ["accepted", "redacted"],
+    "withheld": ["secret_rejected", "quarantined", "unclassifiable_payload"],
+    "accepted_requires_identical_bytes": true,
+    "redacted_requires_different_bytes": true
+  },
+  "payload_limits": {
+    "max_canonical_bytes": 2097152,
+    "over_limit_outcome": "error",
+    "reason": "A bounded ceiling is checked before any regular expression runs, so a hostile payload cannot force unbounded scan work. It bounds the canonical JSON bytes of the whole provider-bound envelope the pipeline is handed — the settled canonical record plus the observation kind and payload contract wrapper the journey adds — not the canonical record alone. Exceeding it is an admission error, not a classification: nothing about the payload's content has been examined. The ceiling is deliberately above the canonical store's 1 MiB record ceiling plus that wrapper, and the structural depth ceiling is derived from the store's depth ceiling plus envelope headroom, so a record the host already settled can never trip either; only input that no store would have accepted does. A mounted journey that still meets this error over evidence the host already settled records it as a withheld row with reason unclassifiable_payload — digests only, zero findings — so the replay cursor advances and the canonical record stays untouched."
+  },
+  "receipt": {
+    "id_prefix": "obs-hygiene-receipt.v1.",
+    "withheld_id_prefix": "obs-hygiene-withheld.v1.",
+    "digest_domain": "tracedecay.memory.observation.hygiene.receipt.v1",
+    "withheld_digest_domain": "tracedecay.memory.observation.hygiene.withheld.v1",
+    "findings_digest_domain": "tracedecay.memory.observation.hygiene.findings.v1",
+    "empty_findings_digest": "9f21f3d3e3e28e675039a08f38efafeb731863d3f252422f67ab617256f9f7ec",
+    "framing": "length_prefixed_sha256",
+    "field_order": [
+      "sanitizer_revision",
+      "source_payload_sha256",
+      "sanitized_payload_sha256",
+      "extensions_digest",
+      "disposition",
+      "finding_count",
+      "findings_digest"
+    ],
+    "withheld_field_order": [
+      "sanitizer_revision",
+      "source_payload_sha256",
+      "extensions_digest",
+      "reason",
+      "finding_count",
+      "findings_digest"
+    ],
+    "carries_matched_bytes": false,
+    "domain_separation_reason": "A delivered receipt and a withheld audit row are different objects with different field sets, so they are framed under different domains. Reusing the receipt domain for a withheld identity would let one derivation's input be replayed as the other's."
+  },
+  "reject_floor_signals": {
+    "reason": "The shared credential corpus is reached through detect_secret_like, which reports only the FIRST pattern that matched a string. A string carrying a credential-like assignment and a live issuer token therefore reports whichever pattern the catalogue happens to order first, and attributing that single reason to the whole string is how a payload that must be withheld ends up merely redacted. Admission runs an independent multi-signal pass: the declared direct signals are checked against the whole string, and the shared detector is re-probed over bounded candidate substrings so a class the first answer hid is still proven. The pass may only ADD reject-floor classes; it never lowers a class the shared corpus already proved, it stores no matched byte, and an exhausted probe budget classifies as detector_unavailable so the pipeline fails closed.",
+    "candidate_separators": ["=", ":"],
+    "minimum_credential_run_length": 16,
+    "entropy_candidate_minimum_length": 36,
+    "maximum_detector_probes_per_payload": 2048,
+    "direct_signal_classes": [
+      "private_key",
+      "bearer_token",
+      "known_credential_prefix"
+    ],
+    "probe_signal_classes": ["high_entropy_token", "detector_unavailable"],
+    "known_credential_prefixes": [
+      "AIza",
+      "AKIA",
+      "ASIA",
+      "doo_v1_",
+      "dop_v1_",
+      "ghp_",
+      "gho_",
+      "ghr_",
+      "ghs_",
+      "ghu_",
+      "github_pat_",
+      "glpat-",
+      "hf_",
+      "npm_",
+      "rk_live_",
+      "shpat_",
+      "shpss_",
+      "sk-",
+      "sk_live_",
+      "xapp-",
+      "xoxa-",
+      "xoxb-",
+      "xoxp-",
+      "xoxr-"
+    ],
+    "known_credential_prefixes_are_exhaustive": false
+  },
+  "classes": [
+    {
+      "class_id": "private_key",
+      "action": "reject",
+      "withheld_reason": "secret_rejected",
+      "detector_reason": "PEM private-key block",
+      "mutates_payload": false,
+      "rationale": "A PEM block is a self-identifying live credential. Shipping the surrounding structure with the key excised normalizes leak-adjacent traffic, and the neighbouring context is usually the same key in another encoding."
+    },
+    {
+      "class_id": "bearer_token",
+      "action": "reject",
+      "withheld_reason": "secret_rejected",
+      "detector_reason": "bearer token",
+      "mutates_payload": false,
+      "rationale": "A presented bearer token is usable the moment it is read; the event that carried it should never have been observed."
+    },
+    {
+      "class_id": "known_credential_prefix",
+      "action": "reject",
+      "withheld_reason": "secret_rejected",
+      "detector_reason": "known credential prefix",
+      "mutates_payload": false,
+      "rationale": "AKIA, gh[pousr]_, sk- and the rest of the vendored catalogue identify a specific issuer's live credential."
+    },
+    {
+      "class_id": "high_entropy_token",
+      "action": "reject",
+      "withheld_reason": "secret_rejected",
+      "detector_reason": "high-entropy token",
+      "mutates_payload": false,
+      "rationale": "The public detector proves a high-entropy token is present but does not expose its byte span, so it cannot be redacted in place without guessing. Withholding the provider-bound copy is the fail-closed answer; the canonical evidence is retained untouched."
+    },
+    {
+      "class_id": "detector_unavailable",
+      "action": "reject",
+      "withheld_reason": "secret_rejected",
+      "detector_reason": "credential detector unavailable",
+      "mutates_payload": false,
+      "rationale": "A detector that failed to compile has proven nothing about the payload. Fail closed."
+    },
+    {
+      "class_id": "credential_assignment",
+      "action": "redact",
+      "withheld_reason": null,
+      "detector_reason": "credential-like key=value assignment",
+      "mutates_payload": true,
+      "rationale": "A bounded value inside otherwise durable structure. The canonical redactor knows the exact span, so the fact survives without the credential."
+    },
+    {
+      "class_id": "sensitive_field",
+      "action": "redact",
+      "withheld_reason": null,
+      "detector_reason": "key-proven sensitive field",
+      "mutates_payload": true,
+      "rationale": "The object key proves the value is a credential. Sibling keys are durable knowledge and are preserved verbatim."
+    },
+    {
+      "class_id": "credential_bearing_key",
+      "action": "quarantine",
+      "withheld_reason": "quarantined",
+      "detector_reason": "credential material in an object key",
+      "mutates_payload": false,
+      "rationale": "Credential material in a key cannot be redacted in place without guessing a span, and a guessed span can leave the real value intact. Quarantine is the fail-closed answer the canonical sanitizer already models."
+    },
+    {
+      "class_id": "transient_process_id",
+      "action": "redact",
+      "withheld_reason": null,
+      "detector_reason": "process id",
+      "mutates_payload": true,
+      "rationale": "A pid is unambiguous ephemeral instance data with an exact span, and the sentence around it is often durable."
+    },
+    {
+      "class_id": "transient_temp_path",
+      "action": "redact",
+      "withheld_reason": null,
+      "detector_reason": "instance-shaped temporary path",
+      "mutates_payload": true,
+      "rationale": "Only an instance-shaped leaf is redacted: a final component of at least eight characters containing a digit. A documented stable path such as /tmp/cache is durable knowledge and is left alone."
+    },
+    {
+      "class_id": "transient_ephemeral_port",
+      "action": "annotate",
+      "withheld_reason": null,
+      "detector_reason": "ephemeral local port",
+      "mutates_payload": false,
+      "rationale": "Ordinary code facts routinely document a bind address. The finding is recorded on the receipt and the bytes are left untouched; retention is the provider's decision, not a silent rewrite of the fact."
+    },
+    {
+      "class_id": "transient_run_log",
+      "action": "annotate",
+      "withheld_reason": null,
+      "detector_reason": "run-log output",
+      "mutates_payload": false,
+      "rationale": "Run-log phrasing appears inside legitimate prose about behaviour. Annotate rather than rewrite."
+    }
+  ],
+  "invariants": [
+    "Sanitization runs once, at admission, before any digest, observation identity, or idempotency key is derived.",
+    "The pipeline reads canonical evidence through a shared reference and returns a new provider-bound value; it never mutates, consumes, or deletes its input.",
+    "A transient detection can at most redact a span inside the provider-bound copy; it can never withhold an observation and can never remove canonical evidence.",
+    "A withheld observation is never dispatched and never acquires a terminal code; its receipt identity and source digest let the journal advance its replay cursor without persisting a payload.",
+    "Every delivered receipt binds the exact sanitized bytes: accepted receipts report identical source and sanitized digests, redacted receipts report different ones.",
+    "No matched byte, redacted value, or source text ever enters a finding, a receipt, a receipt identifier, or an error.",
+    "An object key that is itself credential material never enters a structural location, including the location of a finding on any value nested beneath that key; the key slot is named by an opaque marker instead.",
+    "The reject floor is evaluated over every class a string carries, not only the first class the shared detector reports.",
+    "A byte difference between the source payload and the canonical redactor's output that no finding explains is an admission error, never a fabricated finding.",
+    "The canonical redactor runs a wider detector profile than the classification scan, so a class only it can prove still withholds the observation when the policy withholds for that class; its rewritten bytes are discarded rather than delivered.",
+    "A payload with no findings is delivered byte-identical to its source; the pipeline never re-encodes a clean payload.",
+    "A reject-floor class can be raised in severity by configuration but never lowered."
+  ]
+}

@@ -12,21 +12,22 @@ use tracedecay_domain::configuration::{
     INDEX_EXCLUDE_SETTING_KEY, INDEX_EXTRACT_DOCSTRINGS_SETTING_KEY, INDEX_GIT_IGNORE_SETTING_KEY,
     INDEX_INCLUDE_SETTING_KEY, INDEX_MAX_FILE_SIZE_SETTING_KEY,
     INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY, INDEX_TRACK_CALL_SITES_SETTING_KEY,
-    PROJECT_WORK_EXPERTISE_CONSENT_SETTING_KEY, RestartRequirementV1, SEMANTIC_RUNTIME_SETTING_KEY,
-    SOURCE_BINDINGS_SETTING_KEY, SYNC_AUTO_INIT_SETTING_KEY,
-    SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY, SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY,
-    SYNC_AUTO_WATCH_SETTING_KEY, SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY,
-    SYNC_BRANCH_GC_DAYS_SETTING_KEY, SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY,
-    SYNC_MAX_CONCURRENT_SYNCS_SETTING_KEY, SYNC_ORPHAN_DB_GC_DAYS_SETTING_KEY,
-    SYNC_READ_COOLDOWN_SECS_SETTING_KEY, SYNC_READ_REFRESH_SETTING_KEY,
-    SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY, SYNC_SESSION_START_SYNC_SETTING_KEY,
-    SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY, SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY,
-    SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, SettingDefinitionV1, SettingKey, SettingScopeV1,
-    SettingSensitivityV1, TELEMETRY_TIMINGS_SETTING_KEY, USER_CODE_INDEX_WORKERS_SETTING_KEY,
-    USER_EXTRACTION_TIMEOUT_SECS_SETTING_KEY, USER_UPLOAD_ENABLED_SETTING_KEY,
-    USER_WATCHER_DEBOUNCE_MS_SETTING_KEY, USER_WORK_EXPERTISE_CONSENT_SETTING_KEY,
-    WORK_EXECUTABLE_BINDINGS_SETTING_KEY, WORK_TOPOLOGY_POLICY_SETTING_KEY, WorkExpertiseConsentV1,
-    safe_work_topology_policy_v1,
+    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    MemoryProviderRecallRoutingV1, PROJECT_WORK_EXPERTISE_CONSENT_SETTING_KEY,
+    RestartRequirementV1, SEMANTIC_RUNTIME_SETTING_KEY, SOURCE_BINDINGS_SETTING_KEY,
+    SYNC_AUTO_INIT_SETTING_KEY, SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
+    SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY, SYNC_AUTO_WATCH_SETTING_KEY,
+    SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY, SYNC_BRANCH_GC_DAYS_SETTING_KEY,
+    SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY, SYNC_MAX_CONCURRENT_SYNCS_SETTING_KEY,
+    SYNC_ORPHAN_DB_GC_DAYS_SETTING_KEY, SYNC_READ_COOLDOWN_SECS_SETTING_KEY,
+    SYNC_READ_REFRESH_SETTING_KEY, SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY,
+    SYNC_SESSION_START_SYNC_SETTING_KEY, SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY,
+    SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY, SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, SettingDefinitionV1,
+    SettingKey, SettingScopeV1, SettingSensitivityV1, TELEMETRY_TIMINGS_SETTING_KEY,
+    USER_CODE_INDEX_WORKERS_SETTING_KEY, USER_EXTRACTION_TIMEOUT_SECS_SETTING_KEY,
+    USER_UPLOAD_ENABLED_SETTING_KEY, USER_WATCHER_DEBOUNCE_MS_SETTING_KEY,
+    USER_WORK_EXPERTISE_CONSENT_SETTING_KEY, WORK_EXECUTABLE_BINDINGS_SETTING_KEY,
+    WORK_TOPOLOGY_POLICY_SETTING_KEY, WorkExpertiseConsentV1, safe_work_topology_policy_v1,
 };
 use tracedecay_domain::feedback::PROXIMITY_RISK_THRESHOLD_SETTING_KEY_V1;
 
@@ -443,6 +444,7 @@ struct ProjectDefaults {
     git_ignore: bool,
     diagnostics_prewarm: bool,
     native_graph_activation: bool,
+    memory_provider_native_enabled: bool,
     telemetry_timings: bool,
     sync: SyncDefaults,
 }
@@ -511,6 +513,7 @@ impl Default for ProjectDefaults {
             git_ignore: true,
             diagnostics_prewarm: false,
             native_graph_activation: true,
+            memory_provider_native_enabled: false,
             telemetry_timings: true,
             sync: SyncDefaults::default(),
         }
@@ -523,6 +526,15 @@ fn register_project_settings(
 ) -> Result<(), ConfigurationRegistryError> {
     let defaults = ProjectDefaults::default();
     let sync = defaults.sync;
+    let recall_routing_default = MemoryProviderRecallRoutingV1::default();
+    recall_routing_default
+        .validate()
+        .map_err(ConfigurationRegistryError::InvalidDefinition)?;
+    let recall_routing_default = serde_json::to_string(&recall_routing_default).map_err(|_| {
+        ConfigurationRegistryError::InvalidDefinition(DomainError::NonCanonical {
+            field: "memory provider recall routing default encoding",
+        })
+    })?;
     let settings = vec![
         (
             INDEX_EXCLUDE_SETTING_KEY,
@@ -569,6 +581,18 @@ fn register_project_settings(
         (
             INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
             ConfigurationValueV1::Boolean(defaults.native_graph_activation),
+            SettingSensitivityV1::Public,
+            RestartRequirementV1::DaemonRestart,
+        ),
+        (
+            MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+            ConfigurationValueV1::Boolean(defaults.memory_provider_native_enabled),
+            SettingSensitivityV1::Public,
+            RestartRequirementV1::DaemonRestart,
+        ),
+        (
+            MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+            ConfigurationValueV1::Text(recall_routing_default),
             SettingSensitivityV1::Public,
             RestartRequirementV1::DaemonRestart,
         ),

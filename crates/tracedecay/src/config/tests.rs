@@ -432,6 +432,113 @@ fn diagnostics_prewarm_round_trips_and_defaults_off() {
 }
 
 #[test]
+fn memory_provider_native_enabled_round_trips_and_defaults_off() {
+    let config = TraceDecayConfig::default();
+    assert!(
+        !config.memory_provider_native_enabled,
+        "provider must default off so disabled projects construct no provider fabric"
+    );
+    let json = serde_json::to_string(&config).unwrap();
+    let parsed: TraceDecayConfig = serde_json::from_str(&json).unwrap();
+    assert!(!parsed.memory_provider_native_enabled);
+
+    // Explicit true round-trips, and old configs without the key default off.
+    let mut on = config.clone();
+    on.memory_provider_native_enabled = true;
+    let parsed: TraceDecayConfig =
+        serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+    assert!(parsed.memory_provider_native_enabled);
+
+    let legacy = r#"{
+        "version": 1,
+        "root_dir": "/tmp/proj",
+        "exclude": [],
+        "max_file_size": 1048576,
+        "extract_docstrings": true,
+        "track_call_sites": true
+    }"#;
+    let parsed: TraceDecayConfig = serde_json::from_str(legacy).unwrap();
+    assert!(!parsed.memory_provider_native_enabled);
+}
+
+#[test]
+fn memory_provider_recall_routing_defaults_to_no_active_provider_and_validates() {
+    use tracedecay_domain::configuration::{
+        MemoryProviderRecallFallbackV1, MemoryProviderRecallRoutingV1,
+    };
+
+    let config = TraceDecayConfig::default();
+    assert_eq!(
+        config.memory_provider_recall_routing,
+        MemoryProviderRecallRoutingV1::default(),
+        "no provider may answer recall unless the routing gate names it"
+    );
+    assert_eq!(config.memory_provider_recall_routing.active_provider, None);
+    assert_eq!(config.memory_provider_recall_routing.fallback, None);
+
+    // Legacy configs without the key default to the closed gate.
+    let legacy = r#"{
+        "version": 1,
+        "root_dir": "/tmp/proj",
+        "exclude": [],
+        "max_file_size": 1048576,
+        "extract_docstrings": true,
+        "track_call_sites": true,
+        "memory_provider_native_enabled": true
+    }"#;
+    let parsed: TraceDecayConfig = serde_json::from_str(legacy).unwrap();
+    assert!(parsed.memory_provider_native_enabled);
+    assert_eq!(parsed.memory_provider_recall_routing.active_provider, None);
+
+    // An explicit pin round-trips.
+    let mut pinned = config.clone();
+    pinned.memory_provider_recall_routing = MemoryProviderRecallRoutingV1 {
+        active_provider: Some("tracedecay.native".to_owned()),
+        fallback: Some(MemoryProviderRecallFallbackV1 {
+            policy_id: "policy.memory-failover".to_owned(),
+            policy_revision: 7,
+            target_provider: "provider.other".to_owned(),
+        }),
+    };
+    pinned.memory_provider_recall_routing.validate().unwrap();
+    let parsed: TraceDecayConfig =
+        serde_json::from_str(&serde_json::to_string(&pinned).unwrap()).unwrap();
+    assert_eq!(
+        parsed.memory_provider_recall_routing,
+        pinned.memory_provider_recall_routing
+    );
+
+    // Contradictory or incomplete gates fail closed.
+    let self_target = MemoryProviderRecallRoutingV1 {
+        active_provider: Some("tracedecay.native".to_owned()),
+        fallback: Some(MemoryProviderRecallFallbackV1 {
+            policy_id: "policy.memory-failover".to_owned(),
+            policy_revision: 7,
+            target_provider: "tracedecay.native".to_owned(),
+        }),
+    };
+    assert!(self_target.validate().is_err());
+    let fallback_without_active = MemoryProviderRecallRoutingV1 {
+        active_provider: None,
+        fallback: Some(MemoryProviderRecallFallbackV1 {
+            policy_id: "policy.memory-failover".to_owned(),
+            policy_revision: 7,
+            target_provider: "provider.other".to_owned(),
+        }),
+    };
+    assert!(fallback_without_active.validate().is_err());
+    let zero_revision = MemoryProviderRecallRoutingV1 {
+        active_provider: Some("tracedecay.native".to_owned()),
+        fallback: Some(MemoryProviderRecallFallbackV1 {
+            policy_id: "policy.memory-failover".to_owned(),
+            policy_revision: 0,
+            target_provider: "provider.other".to_owned(),
+        }),
+    };
+    assert!(zero_revision.validate().is_err());
+}
+
+#[test]
 fn config_without_sync_key_deserializes_to_default_sync() {
     // Old config.json files predate the `sync` table; the field-level
     // `#[serde(default)]` must fill it in.
@@ -1102,8 +1209,8 @@ mod runtime_configuration_cutover {
         ConfigurationMutationGrantReceiptV1, ConfigurationMutationOperationV1,
         ConfigurationMutationSinkV1, ConfigurationRevisionId, ConfigurationValueV1,
         DIAGNOSTICS_PREWARM_SETTING_KEY, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
-        SOURCE_BINDINGS_SETTING_KEY, SYNC_AUTO_WATCH_SETTING_KEY, ScopeSourceBinding, SettingKey,
-        SourceBindingId,
+        MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, SOURCE_BINDINGS_SETTING_KEY,
+        SYNC_AUTO_WATCH_SETTING_KEY, ScopeSourceBinding, SettingKey, SourceBindingId,
     };
     use tracedecay_domain::{AccessPolicyDigest, ActorId, ProjectId, UtcMicros};
 
@@ -1397,7 +1504,7 @@ mod runtime_configuration_cutover {
     }
 
     #[tokio::test]
-    async fn existing_snapshot_converges_new_native_graph_default_before_materialization() {
+    async fn existing_snapshot_converges_registered_additive_defaults_before_materialization() {
         use tracedecay_runtime_core::db::engine::params;
 
         let _profile = crate::config::PinnedUserDataDir::new();
@@ -1422,12 +1529,18 @@ mod runtime_configuration_cutover {
         let database = runtime
             .registered_database_arc(tracedecay_sessions::admission::HostAdmissionScope::Project)
             .expect("bind registered project database");
-        let setting = SettingKey::new(INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY)
-            .expect("native graph setting key");
+        let settings = [
+            SettingKey::new(INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY)
+                .expect("native graph setting key"),
+            SettingKey::new(MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY)
+                .expect("memory provider setting key"),
+        ];
         let mut values = initial.snapshot.effective_values.clone();
         let mut provenance = initial.snapshot.provenance.clone();
-        values.remove(&setting);
-        provenance.remove(&setting);
+        for setting in &settings {
+            values.remove(setting);
+            provenance.remove(setting);
+        }
         let pre_key_snapshot =
             tracedecay_domain::configuration::ConfigurationSnapshotV1::new(values, provenance)
                 .expect("pre-key snapshot remains internally canonical");
@@ -1444,13 +1557,15 @@ mod runtime_configuration_cutover {
             .execute("DROP TRIGGER configuration_revisions_immutable_update", ())
             .await
             .expect("open immutable revision fixture seam");
-        transaction
-            .execute(
-                "DELETE FROM configuration_entries WHERE revision_id = ?1 AND key = ?2",
-                params![initial.revision_id.as_str(), setting.as_str()],
-            )
-            .await
-            .expect("remove post-snapshot setting from fixture");
+        for setting in &settings {
+            transaction
+                .execute(
+                    "DELETE FROM configuration_entries WHERE revision_id = ?1 AND key = ?2",
+                    params![initial.revision_id.as_str(), setting.as_str()],
+                )
+                .await
+                .expect("remove post-snapshot setting from fixture");
+        }
         transaction
             .execute(
                 "UPDATE configuration_revisions
@@ -1493,9 +1608,14 @@ mod runtime_configuration_cutover {
             .expect("registered default must converge before runtime materialization");
         assert_ne!(converged.revision_id, initial.revision_id);
         assert!(converged.config.native_graph_activation);
+        assert!(!converged.config.memory_provider_native_enabled);
         assert_eq!(
-            converged.snapshot.effective_values.get(&setting),
+            converged.snapshot.effective_values.get(&settings[0]),
             Some(&ConfigurationValueV1::Boolean(true))
+        );
+        assert_eq!(
+            converged.snapshot.effective_values.get(&settings[1]),
+            Some(&ConfigurationValueV1::Boolean(false))
         );
         let reopened = runtime
             .ensure_runtime_configuration_for_test(root.path(), &layout)

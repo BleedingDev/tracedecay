@@ -53,6 +53,9 @@ async fn register(
         .unwrap();
     let brain_id = project_sessions.binding().shard_id.brain_id.clone();
     let profile_id = project_sessions.binding().shard_id.profile_id.clone();
+    let scope =
+        crate::daemon::project_open_owners::resolved_scope_for_project(&project_root, &project_id)
+            .unwrap();
     service
         .register_project(DaemonSessionSyncConfig {
             brain_id,
@@ -60,6 +63,7 @@ async fn register(
             project_id,
             profile_root: root.path().to_path_buf(),
             project_root,
+            scope,
             transcript_source_home: None,
             project_sessions: project_sessions.clone(),
             user_sessions: profile_sessions.clone(),
@@ -448,6 +452,9 @@ async fn registration_recovery_fences_concurrent_execute() {
     let brain_id = project_sessions.binding().shard_id.brain_id.clone();
     let profile_id = project_sessions.binding().shard_id.profile_id.clone();
     let profile_root = root.path().to_path_buf();
+    let resolved_scope =
+        crate::daemon::project_open_owners::resolved_scope_for_project(&project_root, &project_id)
+            .unwrap();
     let request = SessionSyncRequestV1::new(
         RequestId::new("session-sync.registration-race").unwrap(),
         IdempotencyKey::new("session-sync.registration-race").unwrap(),
@@ -477,6 +484,7 @@ async fn registration_recovery_fences_concurrent_execute() {
                 project_id,
                 profile_root,
                 project_root,
+                scope: resolved_scope,
                 transcript_source_home: None,
                 project_sessions,
                 user_sessions: profile_sessions.clone(),
@@ -582,6 +590,9 @@ async fn terminal_recovered_alias_does_not_suppress_startup_import() {
             .await
             .unwrap();
     }
+    let resolved_scope =
+        crate::daemon::project_open_owners::resolved_scope_for_project(&project_root, &project_id)
+            .unwrap();
     service
         .register_project(DaemonSessionSyncConfig {
             brain_id,
@@ -589,6 +600,7 @@ async fn terminal_recovered_alias_does_not_suppress_startup_import() {
             project_id,
             profile_root: root.path().to_path_buf(),
             project_root,
+            scope: resolved_scope,
             transcript_source_home: None,
             project_sessions,
             user_sessions: profile_sessions.clone(),

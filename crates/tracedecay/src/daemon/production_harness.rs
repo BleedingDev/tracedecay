@@ -10,8 +10,8 @@ use super::bootstrap::set_owner_only_permissions;
 // directly under the same gate the harness itself is compiled behind.
 #[cfg(any(test, feature = "test-transport"))]
 use super::project_composition::{
-    ProjectMemoryProviderActivation, daemon_transcript_source_home,
-    production_project_server_with_activation,
+    ProjectMemoryProviderActivation, ProjectMemoryProviderActivationSelector,
+    daemon_transcript_source_home, production_project_server_with_activation,
 };
 #[cfg(any(test, feature = "test-transport"))]
 use super::project_server_lifecycle::{detach_project_servers, shutdown_detached_project_servers};
@@ -102,7 +102,7 @@ impl ProductionProjectCompositionHarnessV1 {
             live_profile_root,
             None,
             false,
-            ProjectMemoryProviderActivation::Disabled,
+            ProjectMemoryProviderActivationSelector::FromRuntimeConfiguration,
         )
         .await
     }
@@ -124,7 +124,9 @@ impl ProductionProjectCompositionHarnessV1 {
             live_profile_root,
             None,
             false,
-            ProjectMemoryProviderActivation::NativeActive,
+            ProjectMemoryProviderActivationSelector::Pinned(
+                ProjectMemoryProviderActivation::NativeActive,
+            ),
         )
         .await
     }
@@ -141,7 +143,7 @@ impl ProductionProjectCompositionHarnessV1 {
             live_profile_root,
             Some(scope_prefix.into()),
             false,
-            ProjectMemoryProviderActivation::Disabled,
+            ProjectMemoryProviderActivationSelector::FromRuntimeConfiguration,
         )
         .await
     }
@@ -152,7 +154,7 @@ impl ProductionProjectCompositionHarnessV1 {
         live_profile_root: Option<PathBuf>,
         scope_prefix: Option<String>,
         long_lived_session_maintenance_for_test: bool,
-        memory_provider_activation: ProjectMemoryProviderActivation,
+        memory_provider_activation: ProjectMemoryProviderActivationSelector,
     ) -> Result<Self> {
         let (isolation_root, profile_root, project_roots) = hotpath::measure_block!(
             "daemon.harness.isolate",
@@ -389,7 +391,7 @@ impl ProductionProjectCompositionHarnessV1 {
             Some(live_profile_root),
             None,
             false,
-            ProjectMemoryProviderActivation::Disabled,
+            ProjectMemoryProviderActivationSelector::FromRuntimeConfiguration,
         )
         .await
     }
@@ -405,7 +407,7 @@ impl ProductionProjectCompositionHarnessV1 {
             None,
             None,
             true,
-            ProjectMemoryProviderActivation::Disabled,
+            ProjectMemoryProviderActivationSelector::FromRuntimeConfiguration,
         )
         .await
     }
@@ -782,16 +784,14 @@ async fn shutdown_production_project_harness(mut resources: ProductionProjectHar
         label = "daemon.harness.shutdown_sessions"
     )
     .await;
+    let shutdown_deadline = tokio::time::Instant::now() + super::DAEMON_SHUTDOWN_DEADLINE;
     hotpath::future!(
-        resources.invocation.shutdown(),
+        resources.invocation.shutdown_until(shutdown_deadline),
         label = "daemon.harness.shutdown_invocation"
     )
     .await;
     hotpath::future!(
-        shutdown_detached_project_servers(
-            tokio::time::Instant::now() + super::DAEMON_SHUTDOWN_DEADLINE,
-            servers,
-        ),
+        shutdown_detached_project_servers(shutdown_deadline, servers),
         label = "daemon.harness.shutdown_detached"
     )
     .await;

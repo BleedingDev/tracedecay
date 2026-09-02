@@ -1,0 +1,391 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/product/evaluation/recall-adjudication.v1.schema.json",
+  "title": "Human recall adjudication workflow v1",
+  "description": "Versioned record of human review over recalled items drawn from the tdmem-0901 scenario corpus. Reviewers are blinded to the provider by default, every multi-reviewer item carries an explicit disagreement record and resolution, labels are projected onto the tdmem-0904 metric catalog only, and every free-text field is bound to the observation hygiene policy's redaction classes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "workflow_id",
+    "workflow_version",
+    "bead_id",
+    "title",
+    "corpus_binding",
+    "metric_catalog_binding",
+    "hygiene_policy_binding",
+    "label_vocabulary",
+    "blinding_policy",
+    "review_policy",
+    "effective_label_rule",
+    "metrics_feed",
+    "redaction_policy",
+    "reviewers",
+    "recall_items",
+    "reviews",
+    "item_adjudications"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "workflow_id": { "const": "tracedecay.coding-memory.recall-adjudication.v1" },
+    "workflow_version": { "type": "integer", "minimum": 1 },
+    "bead_id": { "const": "tdmem-0909" },
+    "title": { "type": "string", "minLength": 1 },
+    "corpus_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["corpus_id", "schema_version", "bead_id"],
+      "properties": {
+        "corpus_id": { "const": "tracedecay.coding-memory.scenarios.v1" },
+        "schema_version": { "const": 1 },
+        "bead_id": { "const": "tdmem-0901" }
+      }
+    },
+    "metric_catalog_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["catalog_id", "catalog_version", "label_vocabulary_version", "bead_id"],
+      "properties": {
+        "catalog_id": { "const": "tracedecay.coding-memory.metrics.v1" },
+        "catalog_version": { "type": "integer", "minimum": 1 },
+        "label_vocabulary_version": { "type": "integer", "minimum": 1 },
+        "bead_id": { "const": "tdmem-0904" }
+      }
+    },
+    "hygiene_policy_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_id", "schema_version", "path", "canonical_redaction"],
+      "properties": {
+        "contract_id": { "const": "tracedecay.observation-hygiene-policy.v1" },
+        "schema_version": { "const": 1 },
+        "path": { "const": "product/observations/observation-hygiene-policy-v1.json" },
+        "canonical_redaction": { "type": "string", "minLength": 1 }
+      }
+    },
+    "label_vocabulary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "reviewer_labels", "derived_labels", "definitions"],
+      "properties": {
+        "version": { "type": "integer", "minimum": 1 },
+        "reviewer_labels": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/reviewer_label" }
+        },
+        "derived_labels": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/derived_label" }
+        },
+        "definitions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["useful", "harmful", "stale", "irrelevant", "unverifiable", "indeterminate", "missing"],
+          "properties": {
+            "useful": { "type": "string", "minLength": 1 },
+            "harmful": { "type": "string", "minLength": 1 },
+            "stale": { "type": "string", "minLength": 1 },
+            "irrelevant": { "type": "string", "minLength": 1 },
+            "unverifiable": { "type": "string", "minLength": 1 },
+            "indeterminate": { "type": "string", "minLength": 1 },
+            "missing": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "blinding_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "default_blinded_to_provider",
+        "fields_hidden_from_blinded_reviewers",
+        "unblinded_review_requires_reason",
+        "blinding_reason_is_the_only_field_that_may_name_a_provider",
+        "unblinded_reviews_are_flagged_to_metrics"
+      ],
+      "properties": {
+        "default_blinded_to_provider": { "const": true },
+        "fields_hidden_from_blinded_reviewers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "unblinded_review_requires_reason": { "const": true },
+        "blinding_reason_is_the_only_field_that_may_name_a_provider": { "const": true },
+        "unblinded_reviews_are_flagged_to_metrics": { "const": true }
+      }
+    },
+    "review_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimum_reviewers_per_item",
+        "resolver_must_not_have_reviewed_the_item",
+        "every_multi_reviewer_item_has_an_adjudication_record",
+        "open_disagreement_is_indeterminate",
+        "reviews_are_append_only",
+        "clock"
+      ],
+      "properties": {
+        "minimum_reviewers_per_item": { "type": "integer", "minimum": 2 },
+        "resolver_must_not_have_reviewed_the_item": { "const": true },
+        "every_multi_reviewer_item_has_an_adjudication_record": { "const": true },
+        "open_disagreement_is_indeterminate": { "const": true },
+        "reviews_are_append_only": { "const": true },
+        "clock": { "const": "fixed_utc_timestamps" }
+      }
+    },
+    "effective_label_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["no_reviews", "below_minimum_reviewers", "unanimous", "conflict_resolved", "conflict_open"],
+      "properties": {
+        "no_reviews": { "const": "missing" },
+        "below_minimum_reviewers": { "const": "indeterminate" },
+        "unanimous": { "const": "the shared reviewer label" },
+        "conflict_resolved": { "const": "resolution.resolved_label" },
+        "conflict_open": { "const": "indeterminate" }
+      }
+    },
+    "metrics_feed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "consumer",
+        "ingest_seam",
+        "label_projection",
+        "unresolved_representation",
+        "provider_feedback_forwarding",
+        "feedback_capability_invoked",
+        "forbidden_provider_capabilities",
+        "training_signal",
+        "unblinded_review_flag"
+      ],
+      "properties": {
+        "consumer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["catalog_id", "catalog_version", "caller_status"],
+          "properties": {
+            "catalog_id": { "const": "tracedecay.coding-memory.metrics.v1" },
+            "catalog_version": { "type": "integer", "minimum": 1 },
+            "caller_status": { "type": "string", "minLength": 1 }
+          }
+        },
+        "ingest_seam": { "type": "string", "minLength": 1 },
+        "label_projection": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["label", "counted_in_numerator_of", "counted_in_denominator_of", "unresolved"],
+            "properties": {
+              "label": { "$ref": "#/$defs/effective_label" },
+              "counted_in_numerator_of": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "counted_in_denominator_of": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "unresolved": { "type": "boolean" }
+            }
+          }
+        },
+        "unresolved_representation": { "const": "explicit" },
+        "provider_feedback_forwarding": { "const": "forbidden" },
+        "feedback_capability_invoked": { "const": false },
+        "forbidden_provider_capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "training_signal": { "const": "none" },
+        "unblinded_review_flag": { "type": "string", "minLength": 1 }
+      }
+    },
+    "redaction_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_reference",
+        "free_text_fields",
+        "excerpt_limits",
+        "rules",
+        "secret_marker_lint",
+        "code_secret_policy"
+      ],
+      "properties": {
+        "policy_reference": { "const": "product/observations/observation-hygiene-policy-v1.json" },
+        "free_text_fields": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/free_text_field" }
+        },
+        "excerpt_limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["max_bytes", "source", "raw_candidate_content_allowed"],
+          "properties": {
+            "max_bytes": { "type": "integer", "minimum": 1 },
+            "source": { "type": "string", "minLength": 1 },
+            "raw_candidate_content_allowed": { "const": false }
+          }
+        },
+        "rules": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["rule_id", "applies_to", "detector_class", "action", "on_hit"],
+            "properties": {
+              "rule_id": { "type": "string", "pattern": "^redact_[a-z0-9_]+$" },
+              "applies_to": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "$ref": "#/$defs/free_text_field" }
+              },
+              "detector_class": { "type": "string", "minLength": 1 },
+              "action": { "enum": ["accept", "annotate", "redact", "quarantine", "reject"] },
+              "on_hit": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "secret_marker_lint": { "const": true },
+        "code_secret_policy": { "type": "string", "minLength": 1 }
+      }
+    },
+    "reviewers": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reviewer_id", "role", "identity"],
+        "properties": {
+          "reviewer_id": { "$ref": "#/$defs/reviewer_id" },
+          "role": { "enum": ["reviewer", "resolver"] },
+          "identity": { "const": "opaque" }
+        }
+      }
+    },
+    "recall_items": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item_id", "scenario_id", "step", "request_id", "candidate_ref", "content_sha256", "presented_to_reviewers"],
+        "properties": {
+          "item_id": { "$ref": "#/$defs/item_id" },
+          "scenario_id": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+          "step": { "type": "integer", "minimum": 1 },
+          "request_id": { "type": "string", "pattern": "^request_[a-z0-9_]+$" },
+          "candidate_ref": { "type": "string", "pattern": "^candidate_[a-z0-9_]+$" },
+          "content_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "presented_to_reviewers": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["excerpt", "excerpt_redaction", "evidence_refs", "provider_identity_visible"],
+            "properties": {
+              "excerpt": { "type": "string", "minLength": 1 },
+              "excerpt_redaction": { "enum": ["accepted", "redacted"] },
+              "evidence_refs": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": { "$ref": "#/$defs/evidence_ref" }
+              },
+              "provider_identity_visible": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    "reviews": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["review_id", "item_id", "reviewer_id", "blinded_to_provider", "label", "reason", "evidence_refs", "reviewed_at"],
+        "properties": {
+          "review_id": { "type": "string", "pattern": "^review_[a-z0-9_]+$" },
+          "item_id": { "$ref": "#/$defs/item_id" },
+          "reviewer_id": { "$ref": "#/$defs/reviewer_id" },
+          "blinded_to_provider": { "type": "boolean" },
+          "blinding_reason": { "type": "string", "minLength": 1 },
+          "label": { "$ref": "#/$defs/reviewer_label" },
+          "reason": { "type": "string", "minLength": 1 },
+          "evidence_refs": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": { "$ref": "#/$defs/evidence_ref" }
+          },
+          "reviewed_at": { "$ref": "#/$defs/utc_timestamp" }
+        }
+      }
+    },
+    "item_adjudications": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item_id", "reviewer_labels", "disagreement_kind", "resolution", "effective_label"],
+        "properties": {
+          "item_id": { "$ref": "#/$defs/item_id" },
+          "reviewer_labels": {
+            "type": "object",
+            "additionalProperties": { "$ref": "#/$defs/reviewer_label" }
+          },
+          "disagreement_kind": { "enum": ["none", "label_conflict", "insufficient_reviews"] },
+          "resolution": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["status"],
+            "properties": {
+              "status": { "enum": ["not_required", "open", "resolved"] },
+              "resolved_label": { "$ref": "#/$defs/reviewer_label" },
+              "resolver_id": { "$ref": "#/$defs/reviewer_id" },
+              "rationale": { "type": "string", "minLength": 1 },
+              "resolved_at": { "$ref": "#/$defs/utc_timestamp" },
+              "blocked_on": { "type": "string", "minLength": 1 }
+            }
+          },
+          "effective_label": { "$ref": "#/$defs/effective_label" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "reviewer_label": { "enum": ["useful", "harmful", "stale", "irrelevant", "unverifiable"] },
+    "derived_label": { "enum": ["indeterminate", "missing"] },
+    "effective_label": { "enum": ["useful", "harmful", "stale", "irrelevant", "unverifiable", "indeterminate", "missing"] },
+    "free_text_field": {
+      "enum": ["excerpt", "reason", "rationale", "blinding_reason", "blocked_on", "evidence_refs"]
+    },
+    "reviewer_id": { "type": "string", "pattern": "^(?:reviewer|resolver)_[a-z0-9]+$" },
+    "item_id": { "type": "string", "pattern": "^item_[a-z0-9_]+$" },
+    "evidence_ref": {
+      "type": "string",
+      "pattern": "^(?:observation|revision|request|check|health):[a-z][a-z0-9_]*$"
+    },
+    "utc_timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    }
+  }
+}

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 EXPECTED_FLOOR = "08fbe33a7c7f403191fd5d6e356c7b6681b96403"
-EXPECTED_POLICY_REVISION = "patch-footprint.v1"
+EXPECTED_POLICY_REVISION = "patch-footprint.v2"
 EXPECTED_CONVERGENCE_SCHEMA = "product/upstream/convergence-map.schema.json"
 EXPECTED_CONVERGENCE_SCHEMA_VERSION = 2
 EXPECTED_CLASSIFICATION_PRECEDENCE = [
@@ -29,17 +29,24 @@ EXPECTED_ENTRY_RULES = [
     "Retired rows preserve history without granting current execution authority.",
 ]
 BEAD_ID_RE = re.compile(r"^tdmem-[0-9]{4}$")
+# Revision patch-footprint.v2 (ADR-0011): each cap is the M4 journey mount,
+# M5 recall port, Native configuration, and session-sync scope footprint
+# measured at that revision's tree plus at most ~15% headroom. Per-entry
+# line budgets in the convergence map remain the binding per-file limit.
 EXPECTED_BUDGET = {
-    "max_upstream_existing_production_files": 12,
-    "max_upstream_existing_test_or_fixture_files": 6,
-    "max_total_upstream_changed_lines": 900,
-    "max_changed_lines_per_upstream_file": 180,
-    "max_composition_root_files": 6,
-    # 5 covers the dormant daemon composition mount (manifest, compose root,
-    # lifetime-retention pair, focused ownership test); every other category
-    # stays tighter through its local max_files, which binds via min().
-    "max_allowed_touch_point_files_per_category": 5,
-    "default_max_exception_zone_files": 0,
+    "max_upstream_existing_production_files": 34,
+    "max_upstream_existing_test_or_fixture_files": 9,
+    "max_total_upstream_changed_lines": 3300,
+    "max_changed_lines_per_upstream_file": 560,
+    "max_composition_root_files": 15,
+    # 15 covers the daemon composition mount once the observation journey,
+    # cognitive recall, and Native configuration seams are live; every other
+    # category stays tighter through its local max_files, which binds via min().
+    "max_allowed_touch_point_files_per_category": 15,
+    # Revision v2 raises this from zero to exactly the two additive
+    # configuration-registry files approved by ADR-0012; the per-ADR cap of 2
+    # keeps that ADR from being stretched to a third file.
+    "default_max_exception_zone_files": 2,
     "max_exception_files_per_adr": 2,
     "max_workspace_manifest_files": 2,
     "manual_generated_file_edits": 0,
@@ -59,20 +66,27 @@ EXPECTED_PRODUCT_PATTERNS = {
     "crates/tracedecay-memory-provider-native/**",
     "crates/tracedecay-memory-provider-ncm/**",
     "crates/tracedecay-memory-observation/**",
+    "crates/tracedecay-memory-hygiene/**",
     "crates/tracedecay-memory-context/**",
     "crates/tracedecay-memory-conformance/**",
+    "crates/tracedecay-memory-evaluation/**",
     "crates/tracedecay/tests/product_memory_provider/**",
     "crates/tracedecay/tests/product_memory_provider_*.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs",
+    "crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs",
+    "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs",
+    "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs",
 }
 EXPECTED_ADMINISTRATIVE_EXCLUSIONS = {".codex/**"}
 EXPECTED_TOUCH_POINTS = {
     "workspace_wiring",
     "application_contract_mount",
+    "cognitive_recall_contract",
     "daemon_composition_mount",
     "daemon_shutdown_deadline",
+    "production_harness_shutdown",
     "integration_test_runtime_isolation",
     "normalized_observation_mount",
     "recall_context_mount",
@@ -231,6 +245,9 @@ EXPECTED_PROTECTED_PACKAGE_IDENTITIES = {
     Path(
         "crates/tracedecay-memory-conformance/Cargo.toml"
     ): "tracedecay-memory-conformance",
+    Path(
+        "crates/tracedecay-memory-evaluation/Cargo.toml"
+    ): "tracedecay-memory-evaluation",
 }
 EXPECTED_POLICY_MAP_FIELDS = {
     "path",

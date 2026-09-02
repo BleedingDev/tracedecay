@@ -23,19 +23,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tracedecay_application::RetainedSurfaceExecutionErrorV1;
 use tracedecay_application::retained_surfaces::{
     FactCommitOwnerV1, FactCommitReceiptV1, FactIdentitySourceResultV1, FactProjectionV1,
     FactSearchGraphCoverageV1, FactV1, MemoryScopeV1,
 };
-use tracedecay_application::RetainedSurfaceExecutionErrorV1;
-use tracedecay_domain::{FactOwnerV1, ProjectId};
+use tracedecay_domain::{FactOwnerV1, ProjectId, UserProfileId};
 use tracedecay_memory_provider_registry::{
     ApiError, CanonicalPayload, CommittedEffectEvidence, FallbackDirective, HandshakeRequest,
-    HandshakeResponse, NativeMemoryApplicationPort, NativeObservation, OperationControl,
-    OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderDescriptor, ProviderLimits,
-    ProviderOperation, ProviderReply, TerminalCode, TerminalRecord,
-    NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
-    NATIVE_PROVIDER_ID, OBSERVATION_CONTRACT_ID,
+    HandshakeResponse, NATIVE_FACT_PROMOTION_OBSERVATION_KIND,
+    NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID, NATIVE_PROVIDER_ID, NativeMemoryApplicationPort,
+    NativeObservation, OBSERVATION_CONTRACT_ID, OperationControl, OwnedProviderId,
+    OwnedVersionedId, ProviderCall, ProviderDescriptor, ProviderLimits, ProviderOperation,
+    ProviderReply, TerminalCode, TerminalRecord, rfc3339_utc_micros,
 };
 use tracedecay_store::{
     FactReadControl, ProjectMemoryFactHistoryQueryV1, ProjectMemoryFactHistoryV1,
@@ -45,9 +45,12 @@ use tracedecay_store::{
 
 use super::memory::memory_application;
 use super::memory_mapping;
-use super::memory_target::{open_project_retained_memory_target, MemoryTargetAccessV1};
+use super::memory_target::{MemoryTargetAccessV1, open_project_retained_memory_target};
 use crate::tracedecay::TraceDecay;
 
+#[cfg(test)]
+#[path = "native_baseline_tests.rs"]
+mod baseline_tests;
 #[cfg(test)]
 #[path = "native_provider_tests.rs"]
 mod tests;
@@ -55,7 +58,7 @@ mod tests;
 const IMPLEMENTATION_IDENTITY_SHA256: &str =
     "7fe6923361d4caa6c213e0760d438c9f3b9bda60d4c1195812130bfe66c2fa16";
 const STATE_SCHEMA_VERSION: &str = "native-application-port-v1";
-const PROVIDER_INSTANCE_ID: &str = "tracedecay.native.project";
+pub(crate) const PROVIDER_INSTANCE_ID: &str = "tracedecay.native.project";
 const STATE_NAMESPACE: &str = "tracedecay.native.project";
 const READY_RECEIPT_DOMAIN: &[u8] = b"tracedecay.native.application-ready.v1\0";
 const ACTOR_THREAD_NAME: &str = "tracedecay-native-memory-read";
@@ -133,25 +136,34 @@ pub(crate) struct ProjectNativeMemoryApplicationPort {
 
 /// Builds the project-owned Native application port behind the provider
 /// registry's neutral trait object.
+///
+/// `profile_id` is the daemon's own profile identity, supplied by the
+/// composition root at mount time. It is the only profile the adapter ever
+/// attests on a recall candidate; the profile named in a call's exact scope
+/// is never copied into an attestation.
 pub(crate) fn project_native_memory_application_port(
     cg: Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
     project_root: PathBuf,
+    profile_id: UserProfileId,
 ) -> Result<Arc<dyn NativeMemoryApplicationPort>, NativeMemoryApplicationPortBuildError> {
     Ok(Arc::new(ProjectNativeMemoryApplicationPort::new(
         cg,
         project_root,
+        profile_id,
     )?))
 }
 
 impl ProjectNativeMemoryApplicationPort {
-    /// Creates one bounded actor-backed port over the live project graph cell.
+    /// Creates one bounded actor-backed port over the live project graph cell
+    /// for the daemon profile `profile_id`.
     pub(crate) fn new(
         cg: Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
         project_root: PathBuf,
+        profile_id: UserProfileId,
     ) -> Result<Self, NativeMemoryApplicationPortBuildError> {
         let descriptor =
             native_descriptor().map_err(NativeMemoryApplicationPortBuildError::Descriptor)?;
-        let actor = NativeReadActor::new(cg, project_root)?;
+        let actor = NativeReadActor::new(cg, project_root, profile_id)?;
         Ok(Self { descriptor, actor })
     }
 
@@ -379,6 +391,19 @@ impl NativeMemoryApplicationPort for ProjectNativeMemoryApplicationPort {
     }
 }
 
+pub(crate) const fn native_provider_limits() -> ProviderLimits {
+    ProviderLimits {
+        request_bytes: 4_096,
+        response_bytes: 8_192,
+        observation_batch_items: 16,
+        recall_candidates: 32,
+        concurrent_operations: 4,
+        operation_millis: NATIVE_OPERATION_MILLIS,
+        snapshot_bytes: 65_536,
+        inspection_items: 64,
+    }
+}
+
 fn native_descriptor() -> Result<ProviderDescriptor, ApiError> {
     let provider_id = OwnedProviderId::new(NATIVE_PROVIDER_ID)?;
     // `ProviderDescriptor` requires the mandatory recall capability. The
@@ -395,16 +420,7 @@ fn native_descriptor() -> Result<ProviderDescriptor, ApiError> {
         STATE_SCHEMA_VERSION,
         0,
         capabilities,
-        ProviderLimits {
-            request_bytes: 4_096,
-            response_bytes: 8_192,
-            observation_batch_items: 16,
-            recall_candidates: 32,
-            concurrent_operations: 4,
-            operation_millis: NATIVE_OPERATION_MILLIS,
-            snapshot_bytes: 65_536,
-            inspection_items: 64,
-        },
+        native_provider_limits(),
     )
 }
 
@@ -546,7 +562,7 @@ struct NativeRecallScopeV1 {
     worktree_identity: String,
     branch_identity: String,
     agent_session_id: String,
-    scope_revision: u64,
+    resolved_scope_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -633,7 +649,7 @@ fn native_recall_scope(call: &ProviderCall) -> NativeRecallScopeV1 {
         worktree_identity: call.exact_scope.worktree_identity.clone(),
         branch_identity: call.exact_scope.branch_identity.clone(),
         agent_session_id: call.exact_scope.agent_session_id.clone(),
-        scope_revision: call.exact_scope.scope_revision,
+        resolved_scope_digest: call.exact_scope.resolved_scope_digest.clone(),
     }
 }
 
@@ -724,9 +740,16 @@ fn parse_rfc3339_micros(value: &str) -> Option<i64> {
     }
     let offset_minutes = match bytes.get(index..) {
         Some([b'Z']) => 0_i64,
-        Some([sign, hour_tz_tens, hour_tz_ones, b':', minute_tz_tens, minute_tz_ones])
-            if *sign == b'+' || *sign == b'-' =>
-        {
+        Some(
+            [
+                sign,
+                hour_tz_tens,
+                hour_tz_ones,
+                b':',
+                minute_tz_tens,
+                minute_tz_ones,
+            ],
+        ) if *sign == b'+' || *sign == b'-' => {
             if !hour_tz_tens.is_ascii_digit()
                 || !hour_tz_ones.is_ascii_digit()
                 || !minute_tz_tens.is_ascii_digit()
@@ -741,11 +764,7 @@ fn parse_rfc3339_micros(value: &str) -> Option<i64> {
                 return None;
             }
             let signed = hour_tz.checked_mul(60)?.checked_add(minute_tz)?;
-            if *sign == b'+' {
-                signed
-            } else {
-                -signed
-            }
+            if *sign == b'+' { signed } else { -signed }
         }
         _ => return None,
     };
@@ -1077,6 +1096,7 @@ impl NativeReadActor {
     fn new(
         cg: Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
         project_root: PathBuf,
+        profile_id: UserProfileId,
     ) -> Result<Self, NativeMemoryApplicationPortBuildError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1085,7 +1105,7 @@ impl NativeReadActor {
         let (sender, receiver) = mpsc::sync_channel(1);
         let join = thread::Builder::new()
             .name(ACTOR_THREAD_NAME.to_owned())
-            .spawn(move || native_read_actor_main(receiver, cg, project_root, runtime))
+            .spawn(move || native_read_actor_main(receiver, cg, project_root, profile_id, runtime))
             .map_err(NativeMemoryApplicationPortBuildError::ActorThread)?;
         Ok(Self {
             sender: Mutex::new(Some(sender)),
@@ -1205,6 +1225,7 @@ fn native_read_actor_main(
     receiver: mpsc::Receiver<NativeReadCommand>,
     cg: Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
     project_root: PathBuf,
+    profile_id: UserProfileId,
     runtime: tokio::runtime::Runtime,
 ) {
     while let Ok(command) = receiver.recv() {
@@ -1223,7 +1244,8 @@ fn native_read_actor_main(
                 request,
                 reply,
             } => {
-                let outcome = recall_with_runtime(&runtime, &cg, &project_root, call, request);
+                let outcome =
+                    recall_with_runtime(&runtime, &cg, &project_root, &profile_id, call, request);
                 let _ = reply.send(outcome);
             }
         }
@@ -1234,6 +1256,7 @@ fn recall_with_runtime(
     runtime: &tokio::runtime::Runtime,
     cg: &Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
     project_root: &Path,
+    profile_id: &UserProfileId,
     call: ProviderCall,
     request: NativeRecallRequestV1,
 ) -> NativeRecallOutcome {
@@ -1251,7 +1274,7 @@ fn recall_with_runtime(
     match runtime.block_on(async {
         tokio::time::timeout(
             Duration::from_millis(timeout_millis),
-            recall_project_memory(cg, project_root, &call, &request),
+            recall_project_memory(cg, project_root, profile_id, &call, &request),
         )
         .await
     }) {
@@ -1263,6 +1286,7 @@ fn recall_with_runtime(
 async fn recall_project_memory(
     cg: &Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
     project_root: &Path,
+    profile_id: &UserProfileId,
     call: &ProviderCall,
     request: &NativeRecallRequestV1,
 ) -> NativeRecallOutcome {
@@ -1276,6 +1300,19 @@ async fn recall_project_memory(
     let current = Arc::clone(&*cg.read().await);
     if let Err(failure) = control_failure(&call.control) {
         return NativeRecallOutcome::Failed(failure);
+    }
+    // A recall scoped to a project other than the one this Native instance
+    // owns is a scope mismatch (a different authority), not an unavailable
+    // scope: the owning project is present, it is simply not the requested
+    // one. Decide this before opening the target so the memory-target
+    // authorization denial is reserved for a missing or unauthorized owner.
+    let expected_owner = FactOwnerV1::Project {
+        project_id: project_id.clone(),
+    };
+    match current.project_memory_owner() {
+        Ok(owner) if owner == expected_owner => {}
+        Ok(_) => return NativeRecallOutcome::Failed(NativeReadFailure::RecallScopeMismatch),
+        Err(_) => return NativeRecallOutcome::Failed(NativeReadFailure::ProviderUnavailable),
     }
     let target = match open_project_retained_memory_target(
         &current,
@@ -1291,11 +1328,7 @@ async fn recall_project_memory(
         Err(error) => return NativeRecallOutcome::Failed(map_retained_error(error)),
     };
     let owner = target.owner().clone();
-    if owner
-        != (FactOwnerV1::Project {
-            project_id: project_id.clone(),
-        })
-    {
+    if owner != expected_owner {
         return NativeRecallOutcome::Failed(NativeReadFailure::RecallScopeMismatch);
     }
     let memory = match memory_application(target.database(), owner.clone()) {
@@ -1341,7 +1374,7 @@ async fn recall_project_memory(
     if let Err(failure) = control_failure(&call.control) {
         return NativeRecallOutcome::Failed(failure);
     }
-    match build_native_recall_reply(call, request, &page) {
+    match build_native_recall_reply(call, request, profile_id, &page) {
         Ok(reply) => NativeRecallOutcome::Reply(reply),
         Err(failure) => NativeRecallOutcome::Failed(failure),
     }
@@ -1382,6 +1415,7 @@ fn native_recall_search_query(
 fn build_native_recall_reply(
     call: &ProviderCall,
     request: &NativeRecallRequestV1,
+    profile_id: &UserProfileId,
     page: &ProjectMemoryFactSearchPageV1,
 ) -> Result<ProviderReply, NativeReadFailure> {
     let mapped = memory_mapping::search_page(page)
@@ -1439,7 +1473,7 @@ fn build_native_recall_reply(
             return Err(NativeReadFailure::RecallInvalidRequest);
         }
         total_content_bytes = total_content_bytes.saturating_add(content_bytes);
-        candidates.push(native_recall_candidate(call, &hit.fact, hit)?);
+        candidates.push(native_recall_candidate(call, profile_id, &hit.fact, hit)?);
     }
 
     if mapped.next_after.is_some() {
@@ -1517,6 +1551,7 @@ const NATIVE_RESPONSE_BYTES: u64 = 8_192;
 
 fn native_recall_candidate(
     call: &ProviderCall,
+    profile_id: &UserProfileId,
     fact: &FactV1,
     hit: &tracedecay_application::retained_surfaces::FactSearchHitV1,
 ) -> Result<Value, NativeReadFailure> {
@@ -1538,6 +1573,10 @@ fn native_recall_candidate(
         "holographic_score_millionths": scores.holographic_score_millionths,
         "trust_score_millionths": scores.trust_score_millionths,
     });
+    let observed_at = rfc3339_utc_micros(fact.projected_as_of.0)
+        .ok_or(NativeReadFailure::RecallProjectionInvalid)?;
+    let valid_from = rfc3339_utc_micros(fact.telemetry.created_at.0)
+        .ok_or(NativeReadFailure::RecallProjectionInvalid)?;
     let full_lineage_unavailable = serde_json::json!({
         "state": "unavailable",
         "reason": RECALL_HISTORY_UNAVAILABLE_REASON,
@@ -1568,10 +1607,13 @@ fn native_recall_candidate(
             "semantics": "project-memory combined score; fixed-point millionths",
             "components": score_components,
         },
-        "exact_scope_identity": exact_scope_value(call),
+        "exact_scope_identity": native_fact_scope_attestation(fact, profile_id),
+        // The contract fixes validity instants as utc_rfc3339_nanos; the
+        // host admission authority denies any other representation as an
+        // invalid validity record, so the Native micros are projected here.
         "validity": {
-            "observed_at": fact.projected_as_of,
-            "valid_from": fact.telemetry.created_at,
+            "observed_at": observed_at,
+            "valid_from": valid_from,
             "valid_until": Value::Null,
             "superseded_at": Value::Null,
             "superseded_by": Value::Null,
@@ -1620,6 +1662,11 @@ fn fact_source_refs(fact: &FactV1) -> Vec<String> {
     }
 }
 
+/// Outcome-envelope scope binding: the request scope this reply answers,
+/// which the adapter verified byte-for-byte against the call before
+/// searching. It is a binding to the request, never an attestation about any
+/// candidate; per-candidate scope comes from
+/// [`native_fact_scope_attestation`].
 fn exact_scope_value(call: &ProviderCall) -> Value {
     serde_json::json!({
         "profile_id": call.exact_scope.profile_id,
@@ -1628,7 +1675,39 @@ fn exact_scope_value(call: &ProviderCall) -> Value {
         "worktree_identity": call.exact_scope.worktree_identity,
         "branch_identity": call.exact_scope.branch_identity,
         "agent_session_id": call.exact_scope.agent_session_id,
-        "scope_revision": call.exact_scope.scope_revision,
+        "resolved_scope_digest": call.exact_scope.resolved_scope_digest,
+    })
+}
+
+/// Scope identity the adapter attests for one Native fact, under the
+/// binding that names exactly which fields it vouches for.
+///
+/// A Native fact record carries only its owner; the retained project store
+/// has no repository, worktree, branch, session, or resolved-scope dimension,
+/// and the current-fact search returns every fact of the project regardless
+/// of which checkout or session committed it. A project-owned fact is
+/// therefore attested as `project_facts`: the project identity proven by the
+/// fact owner and the profile identity of the daemon that mounted this
+/// adapter (never the profile named in the call), with the optional checkout
+/// fields left empty and the forbidden session and digest fields empty. A
+/// profile-owned fact is attested as `profile_facts` with only the mount
+/// profile. The host admission authority applies the binding's rules, so a
+/// candidate can never be admitted wearing the requester's worktree, branch,
+/// or session identity.
+fn native_fact_scope_attestation(fact: &FactV1, profile_id: &UserProfileId) -> Value {
+    let (scope_binding, project_id) = match &fact.owner {
+        FactCommitOwnerV1::Project { project_id } => ("project_facts", project_id.as_str()),
+        FactCommitOwnerV1::Profile => ("profile_facts", ""),
+    };
+    serde_json::json!({
+        "scope_binding": scope_binding,
+        "profile_id": profile_id.as_str(),
+        "project_id": project_id,
+        "repository_identity": "",
+        "worktree_identity": "",
+        "branch_identity": "",
+        "agent_session_id": "",
+        "resolved_scope_digest": "",
     })
 }
 

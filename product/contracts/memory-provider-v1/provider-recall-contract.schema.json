@@ -20,6 +20,7 @@
     "exclusions",
     "extension_contract",
     "provider_candidate",
+    "candidate_scope_binding",
     "content_reference",
     "native_score",
     "host_normalized_score",
@@ -55,6 +56,7 @@
     "exclusions": { "$ref": "#/$defs/object" },
     "extension_contract": { "$ref": "#/$defs/object" },
     "provider_candidate": { "$ref": "#/$defs/object" },
+    "candidate_scope_binding": { "$ref": "#/$defs/object" },
     "content_reference": { "$ref": "#/$defs/object" },
     "native_score": { "$ref": "#/$defs/object" },
     "host_normalized_score": { "$ref": "#/$defs/object" },
@@ -73,7 +75,7 @@
     },
     "invariants": {
       "type": "array",
-      "minItems": 16,
+      "minItems": 17,
       "uniqueItems": true,
       "items": { "type": "string", "minLength": 20 }
     },

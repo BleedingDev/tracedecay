@@ -27,6 +27,9 @@ pub(super) struct SessionSyncProjectContext {
     pub(super) project_id: ProjectId,
     pub(super) profile_root: PathBuf,
     pub(super) project_root: PathBuf,
+    /// The authoritative project-open scope, propagated verbatim from
+    /// `DaemonSessionSyncConfig`. Never re-derived from `project_root`.
+    pub(super) scope: tracedecay_application::ResolvedScope,
     pub(super) transcript_source_home: Option<PathBuf>,
     pub(super) project_sessions: RwLock<Option<RegisteredGlobalDbLeaseV1>>,
     project_sessions_locator: VerifiedStoreLocatorV1,
@@ -292,6 +295,7 @@ impl DaemonSessionSyncService {
             project_id: config.project_id,
             profile_root: config.profile_root,
             project_root: config.project_root,
+            scope: config.scope,
             transcript_source_home: config.transcript_source_home,
             project_sessions: RwLock::new(None),
             project_sessions_locator,

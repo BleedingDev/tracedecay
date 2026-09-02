@@ -24,6 +24,20 @@ All identity fields match exactly. Cross-worktree, cross-branch, cross-session, 
 
 The provider may internally maintain broader abstractions, but every returned candidate is labelled with the exact admitted scope from which it was derived. TraceDecay revalidates scope before any candidate is considered for context.
 
+## Scope binding
+
+Every candidate's `exact_scope_identity` carries an explicit `scope_binding` that names which identity namespace the provider attests: `exact_coding_scope`, `project_facts`, or `profile_facts`. The values mirror the namespace variants of the accepted coding-memory authority matrix. A missing or unknown binding is a contract violation.
+
+The host, not the provider, decides which bindings a provider may attest: the registry records `recall_scope_bindings` at registration and passes them to admission with the admitted call. A candidate whose binding the registry did not authorize for its provider is denied `scope_binding_unauthorized`. Bindings are never read from a provider reply and cannot widen the admitted scope.
+
+Per binding, every identity field is required, optional, or forbidden:
+
+- `exact_coding_scope`: all seven fields required and byte-equal to the admitted scope; a differing `resolved_scope_digest` alone is `stale_identity`.
+- `project_facts`: `profile_id` and `project_id` required and equal; `repository_identity`, `worktree_identity`, and `branch_identity` optional (empty or equal); `agent_session_id` and `resolved_scope_digest` forbidden.
+- `profile_facts`: `profile_id` required and equal; every other field forbidden.
+
+An empty required field is `unknown_identity`, a differing required or optional field is `scope_mismatch`, a non-empty forbidden field is `forbidden_identity`, and a malformed field (surrounding whitespace or control characters) is `unknown_identity`. Missing identity fails closed.
+
 ## Temporal semantics
 
 Four modes are explicit:

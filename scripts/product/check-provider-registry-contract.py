@@ -382,6 +382,7 @@ def validate_registration(contract: dict[str, Any], errors: list[str]) -> None:
         'registration_states', 'immutable_after_registration', 'revision_rule',
         'mandatory_capability_rule', 'unknown_capability_rule', 'duplicate_provider_id_policy',
         'unknown_provider_policy', 'adapter_construction_boundary', 'public_surface_provider_branching',
+        'recall_scope_bindings',
     }
     row = exact_keys(contract.get('registration_contract'), expected_fields, 'registration_contract', errors)
     if row.get('type_name') != 'MemoryProviderRegistrationV1' or row.get('registry_writer') != contract.get('authority'):
@@ -391,6 +392,7 @@ def validate_registration(contract: dict[str, Any], errors: list[str]) -> None:
     required = {
         'provider_id', 'adapter_contract_version', 'registration_state', 'known_capabilities',
         'opaque_unknown_capabilities', 'implementation_identity', 'registration_revision',
+        'recall_scope_bindings',
     }
     fields = array(row.get('required_fields'), 'registration_contract.required_fields', errors)
     if set(fields) != required or len(fields) != len(required):
@@ -407,6 +409,37 @@ def validate_registration(contract: dict[str, Any], errors: list[str]) -> None:
         errors.append('registration provider failure policies drifted')
     if 'Only the provider registry/composition layer may branch on provider_id' not in str(row.get('adapter_construction_boundary')):
         errors.append('adapter construction boundary must be registry-only')
+    bindings = exact_keys(
+        row.get('recall_scope_bindings'),
+        {
+            'declared_by', 'provider_may_self_declare', 'values', 'value_source',
+            'provider_declarations', 'admission_input', 'unauthorized_binding_policy',
+        },
+        'registration_contract.recall_scope_bindings',
+        errors,
+    )
+    scope_binding_values = ['exact_coding_scope', 'project_facts', 'profile_facts']
+    if bindings.get('provider_may_self_declare') is not False:
+        errors.append('providers cannot self-declare recall scope bindings')
+    if bindings.get('values') != scope_binding_values:
+        errors.append('recall scope binding values drifted from the recall contract')
+    if bindings.get('admission_input') != 'recorded_registration_passed_with_the_admitted_call':
+        errors.append('recall scope bindings must reach admission through the admitted call')
+    if bindings.get('unauthorized_binding_policy') != 'reject_scope_binding_unauthorized':
+        errors.append('unauthorized recall scope bindings must be rejected explicitly')
+    declarations = bindings.get('provider_declarations')
+    if not isinstance(declarations, dict) or not declarations:
+        errors.append('recall scope binding provider declarations must be a non-empty object')
+        declarations = {}
+    for provider_id, declared in declarations.items():
+        if not isinstance(declared, list) or not declared or len(set(declared)) != len(declared):
+            errors.append(f'recall scope bindings for {provider_id} must be a unique non-empty list')
+        elif any(value not in scope_binding_values for value in declared):
+            errors.append(f'recall scope bindings for {provider_id} name an unknown binding')
+    if declarations.get('tracedecay.native') != ['project_facts', 'profile_facts']:
+        errors.append('tracedecay.native must be authorized for project_facts and profile_facts only')
+    if declarations.get('ncm') != ['exact_coding_scope']:
+        errors.append('ncm must be authorized for exact_coding_scope only')
 
 
 def validate_selection(contract: dict[str, Any], errors: list[str]) -> None:

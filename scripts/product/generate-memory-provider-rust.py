@@ -294,6 +294,10 @@ def required_fields(contracts: dict[str, dict[str, Any]]) -> dict[str, list[str]
             recall.get("provider_candidate", {}).get("required_fields"),
             "recall candidate fields",
         ),
+        "RECALL_CANDIDATE_SCOPE_REQUIRED_FIELDS": list_strings(
+            recall.get("candidate_scope_binding", {}).get("required_fields"),
+            "recall candidate scope fields",
+        ),
         "RECALL_RESPONSE_REQUIRED_FIELDS": list_strings(
             recall.get("recall_response", {}).get("required_fields"),
             "recall response fields",
@@ -341,6 +345,10 @@ def enum_sources(contracts: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
         ),
         "ProvenanceState": list_strings(
             recall.get("provenance", {}).get("states"), "provenance states"
+        ),
+        "RecallScopeBinding": list_strings(
+            recall.get("candidate_scope_binding", {}).get("bindings"),
+            "recall candidate scope bindings",
         ),
         "TerminalCode": [
             row["code"]
@@ -478,7 +486,6 @@ def render_rust(
         "domain_suffix_byte_hex",
         "string_field_order",
         "string_field_encoding",
-        "scope_revision_encoding",
         "output_encoding",
         "golden_vector",
     }
@@ -495,6 +502,7 @@ def render_rust(
         "worktree_identity",
         "branch_identity",
         "agent_session_id",
+        "resolved_scope_digest",
     ]:
         raise GenerationError("exact-scope digest string field order drifted")
     if digest_spec.get("algorithm") != "sha256":
@@ -508,14 +516,11 @@ def render_rust(
         "u64_big_endian_byte_length_then_utf8_bytes"
     ):
         raise GenerationError("exact-scope digest string boundary encoding drifted")
-    if digest_spec.get("scope_revision_encoding") != "u64_big_endian":
-        raise GenerationError("exact-scope digest scope revision encoding drifted")
     if digest_spec.get("output_encoding") != "lowercase_hex_64":
         raise GenerationError("exact-scope digest output encoding drifted")
 
     golden = digest_spec.get("golden_vector")
     if not isinstance(golden, dict) or set(golden) != set(digest_string_fields) | {
-        "scope_revision",
         "digest",
     }:
         raise GenerationError("exact-scope digest golden vector fields drifted")
@@ -530,14 +535,6 @@ def render_rust(
         encoded = value.encode("utf-8")
         golden_bytes.extend(len(encoded).to_bytes(8, "big"))
         golden_bytes.extend(encoded)
-    golden_revision = golden.get("scope_revision")
-    if (
-        not isinstance(golden_revision, int)
-        or isinstance(golden_revision, bool)
-        or not 0 <= golden_revision <= (2**64 - 1)
-    ):
-        raise GenerationError("exact-scope digest golden revision must be a u64")
-    golden_bytes.extend(golden_revision.to_bytes(8, "big"))
     golden_digest = golden.get("digest")
     if (
         not isinstance(golden_digest, str)
@@ -647,16 +644,12 @@ def render_rust(
         "];",
         "/// Canonical framing for every exact-scope string field.",
         f"pub const EXACT_SCOPE_DIGEST_STRING_FIELD_ENCODING: &str = {rust_string(str(digest_spec['string_field_encoding']))};",
-        "/// Canonical exact-scope revision encoding.",
-        f"pub const EXACT_SCOPE_DIGEST_SCOPE_REVISION_ENCODING: &str = {rust_string(str(digest_spec['scope_revision_encoding']))};",
         "/// Canonical exact-scope digest output encoding.",
         f"pub const EXACT_SCOPE_DIGEST_OUTPUT_ENCODING: &str = {rust_string(str(digest_spec['output_encoding']))};",
         "/// Canonical string values for the fixed exact-scope digest golden vector.",
         "pub const EXACT_SCOPE_DIGEST_GOLDEN_STRINGS: &[&str] = &[",
         *[f"    {rust_string(value)}," for value in golden_strings],
         "];",
-        "/// Scope revision for the fixed exact-scope digest golden vector.",
-        f"pub const EXACT_SCOPE_DIGEST_GOLDEN_SCOPE_REVISION: u64 = {golden_revision};",
         "/// Expected lowercase SHA-256 for the fixed exact-scope digest golden vector.",
         f"pub const EXACT_SCOPE_DIGEST_GOLDEN_SHA256: &str = {rust_string(golden_digest)};",
         "",
@@ -958,8 +951,8 @@ def render_rust(
             "    pub branch_identity: &'a str,",
             "    /// Exact coding-agent session identity.",
             "    pub agent_session_id: &'a str,",
-            "    /// Monotonic TraceDecay scope revision.",
-            "    pub scope_revision: u64,",
+            "    /// Canonical digest copied from the authoritative resolved scope.",
+            "    pub resolved_scope_digest: &'a str,",
             "}",
             "",
             "/// Request cancellation state at dispatch.",
@@ -1018,6 +1011,10 @@ def render_rust(
             "    pub reconciliation_action: Option<&'a str>,",
             "    /// Digest that verifies the known committed partition.",
             "    pub verification_digest: Option<&'a str>,",
+            "    /// Request idempotency key a duplicate acknowledgement deduplicated.",
+            "    pub duplicate_of_idempotency_key: Option<&'a str>,",
+            "    /// Operation whose earlier delivery actually committed the effect.",
+            "    pub duplicate_of_operation_id: Option<&'a str>,",
             "}",
             "",
             "/// Borrowed host policy pin required before any fallback is eligible.",

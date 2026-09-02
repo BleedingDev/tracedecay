@@ -50,7 +50,7 @@ def valid_metadata() -> dict[str, Any]:
             ),
             package(
                 "tracedecay-memory-provider-native",
-                ["tracedecay-memory-provider-api"],
+                ["serde_json", "tracedecay-memory-provider-api"],
             ),
             package(
                 "tracedecay-memory-provider-ncm",
@@ -58,7 +58,17 @@ def valid_metadata() -> dict[str, Any]:
             ),
             package(
                 "tracedecay-memory-conformance",
-                ["tracedecay-memory-provider-api"],
+                ["serde", "serde_json", "sha2", "tiktoken-rs", "tracedecay-memory-provider-api"],
+            ),
+            package(
+                "tracedecay-memory-evaluation",
+                [
+                    "serde",
+                    "serde_json",
+                    "thiserror",
+                    "tracedecay-memory-conformance",
+                    "tracedecay-memory-provider-api",
+                ],
             ),
             package(
                 "tracedecay-memory-provider-registry",
@@ -66,6 +76,30 @@ def valid_metadata() -> dict[str, Any]:
                     "tracedecay-memory-fabric",
                     "tracedecay-memory-provider-api",
                     "tracedecay-memory-provider-native",
+                ],
+            ),
+            package(
+                "tracedecay-memory-observation",
+                [
+                    "rusqlite",
+                    "serde",
+                    "serde_json",
+                    "sha2",
+                    "thiserror",
+                    "tracedecay-memory-provider-api",
+                ],
+            ),
+            package(
+                "tracedecay-memory-hygiene",
+                [
+                    "regex",
+                    "serde",
+                    "serde_json",
+                    "sha2",
+                    "thiserror",
+                    "tracedecay-domain",
+                    "tracedecay-memory-provider-api",
+                    "tracedecay-runtime-core",
                 ],
             ),
             package("tracedecay-cli", []),

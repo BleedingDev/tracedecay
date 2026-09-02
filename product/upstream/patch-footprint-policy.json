@@ -51,6 +51,32 @@
     },
     {
       "allowed_changes": [
+        "define a provider-neutral advisory cognitive-recall port",
+        "carry exact scope, deadline, cancellation, provenance, and typed degradation",
+        "add focused application and production-reachability contract tests"
+      ],
+      "category": "application",
+      "forbidden_changes": [
+        "provider-name branching or concrete provider types",
+        "provider authority over canonical facts or final context assembly",
+        "silent fallback or fabricated empty success"
+      ],
+      "id": "cognitive_recall_contract",
+      "max_changed_lines": 940,
+      "max_files": 4,
+      "paths": [
+        "crates/tracedecay-application/src/memory.rs",
+        "crates/tracedecay-application/src/memory/recall.rs",
+        "crates/tracedecay-application/tests/cognitive_recall_port.rs",
+        "crates/tracedecay/tests/application_production_reachability.rs"
+      ],
+      "required_verification": [
+        "application cognitive-recall contract tests",
+        "application production-reachability test"
+      ]
+    },
+    {
+      "allowed_changes": [
         "construct and retain product-owned capability registries and lifecycle ports",
         "inject provider-neutral observation, recall, feedback, maintenance, and inspection capabilities",
         "bind exact project/worktree/provider scope at startup",
@@ -64,8 +90,8 @@
         "provider authority over source, sessions, Native facts, or configuration"
       ],
       "id": "daemon_composition_mount",
-      "max_changed_lines": 260,
-      "max_files": 5,
+      "max_changed_lines": 810,
+      "max_files": 15,
       "paths": [
         "crates/tracedecay/Cargo.toml",
         "crates/tracedecay/src/daemon/project_composition.rs",
@@ -76,7 +102,13 @@
         "crates/tracedecay/src/runtime_ports.rs",
         "crates/tracedecay/src/daemon/tests/ownership.rs",
         "crates/tracedecay/src/mcp/server.rs",
-        "crates/tracedecay/src/mcp/server/construction.rs"
+        "crates/tracedecay/src/mcp/server/construction.rs",
+        "crates/tracedecay/src/mcp/server/connection.rs",
+        "crates/tracedecay/src/daemon/session_sync.rs",
+        "crates/tracedecay/src/daemon/session_sync/git_topology.rs",
+        "crates/tracedecay/src/daemon/session_sync/project_lifecycle.rs",
+        "crates/tracedecay/src/daemon/session_sync/project_lifecycle_tests.rs",
+        "crates/tracedecay/src/daemon/session_sync_tests.rs"
       ],
       "required_verification": [
         "daemon composition/restart tests",
@@ -111,6 +143,28 @@
         "blocking drain deadline regression test",
         "exhausted runtime deadline regression test",
         "feature ownership shutdown journey"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "use the deadline-aware shutdown API in the production test-transport harness",
+        "reuse one absolute deadline across invocation and detached-server teardown"
+      ],
+      "category": "shutdown",
+      "forbidden_changes": [
+        "creating a fresh deadline budget between production-harness teardown stages",
+        "reordering unrelated production-harness teardown phases",
+        "adding provider or memory integration logic"
+      ],
+      "id": "production_harness_shutdown",
+      "max_changed_lines": 62,
+      "max_files": 1,
+      "paths": [
+        "crates/tracedecay/src/daemon/production_harness.rs"
+      ],
+      "required_verification": [
+        "test-transport library compilation",
+        "production harness shutdown journey"
       ]
     },
     {
@@ -178,13 +232,17 @@
         "silent fallback to another provider"
       ],
       "id": "recall_context_mount",
-      "max_changed_lines": 260,
-      "max_files": 3,
+      "max_changed_lines": 340,
+      "max_files": 5,
       "paths": [
         "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
         "crates/tracedecay/src/daemon/session_retrieval/contract.rs",
         "crates/tracedecay-usecases/src/context/mod.rs",
-        "crates/tracedecay-usecases/src/context/read_modes.rs"
+        "crates/tracedecay-usecases/src/context/read_modes.rs",
+        "crates/tracedecay-usecases/src/diagnostics_query.rs",
+        "crates/tracedecay-usecases/src/diagnostics_store.rs",
+        "crates/tracedecay-usecases/src/primitives/production.rs",
+        "crates/tracedecay-usecases/src/primitives/runtime.rs"
       ],
       "required_verification": [
         "context compiler conformance",
@@ -229,12 +287,15 @@
         "configuration bypassing transactional revision and audit"
       ],
       "id": "configuration_registry_mount",
-      "max_changed_lines": 180,
-      "max_files": 2,
+      "max_changed_lines": 360,
+      "max_files": 5,
       "paths": [
         "crates/tracedecay/src/config.rs",
         "crates/tracedecay-usecases/src/configuration/runtime.rs",
-        "crates/tracedecay-usecases/src/configuration/operations.rs"
+        "crates/tracedecay-usecases/src/configuration/operations.rs",
+        "crates/tracedecay-domain/src/configuration.rs",
+        "crates/tracedecay-usecases/src/config/mod.rs",
+        "crates/tracedecay/src/config/tests.rs"
       ],
       "required_verification": [
         "configuration authorization and rollback tests",
@@ -559,24 +620,25 @@
     }
   ],
   "initial_budget": {
-    "default_max_exception_zone_files": 0,
+    "default_max_exception_zone_files": 2,
     "manual_generated_file_edits": 0,
-    "max_allowed_touch_point_files_per_category": 5,
-    "max_changed_lines_per_upstream_file": 180,
-    "max_composition_root_files": 6,
+    "max_allowed_touch_point_files_per_category": 15,
+    "max_changed_lines_per_upstream_file": 560,
+    "max_composition_root_files": 15,
     "max_exception_files_per_adr": 2,
-    "max_total_upstream_changed_lines": 900,
-    "max_upstream_existing_production_files": 12,
-    "max_upstream_existing_test_or_fixture_files": 6,
+    "max_total_upstream_changed_lines": 3300,
+    "max_upstream_existing_production_files": 34,
+    "max_upstream_existing_test_or_fixture_files": 9,
     "max_workspace_manifest_files": 2,
     "notes": [
+      "Revision patch-footprint.v2 is approved by product/architecture/adr/ADR-0011-patch-footprint-revision-v2.md: every cap equals the M4 observation-journey mount, M5 cognitive-recall port, Native configuration registration, and session-sync exact-scope footprint measured at that revision's tree plus at most roughly fifteen percent headroom. Per-entry line_budget values in the convergence map remain the binding limit for an individual file.",
       "Added files under product_owned_paths are excluded from the upstream footprint totals.",
       "Renaming or copying an upstream file counts as touching the destination and source.",
       "Changed lines are additions plus deletions from git numstat against the immutable upstream floor.",
       "Cargo.lock is a generated dependency-resolution output: it may change only with a workspace-manifest touch and a focused cargo metadata/build receipt; it is not a manually editable contract."
     ]
   },
-  "policy_revision": "patch-footprint.v1",
+  "policy_revision": "patch-footprint.v2",
   "principles": [
     "Add product-owned crates and tests instead of embedding provider logic in Zack-owned crates.",
     "Mount product behavior only at narrow application, daemon-composition, observation, recall, feedback, and configuration seams.",
@@ -600,16 +662,21 @@
     "crates/tracedecay-memory-provider-native/**",
     "crates/tracedecay-memory-provider-ncm/**",
     "crates/tracedecay-memory-observation/**",
+    "crates/tracedecay-memory-hygiene/**",
     "crates/tracedecay-memory-context/**",
     "crates/tracedecay-memory-conformance/**",
+    "crates/tracedecay-memory-evaluation/**",
     "crates/tracedecay/tests/product_memory_provider/**",
     "crates/tracedecay/tests/product_memory_provider_*.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs",
-    "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs"
+    "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs",
+    "crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs",
+    "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs",
+    "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs"
   ],
   "schema_version": 1,
-  "scope": "Initial pluggable-memory implementation through Native parity and NCM observer admission. Later phases must either remain inside these caps or approve a new policy revision by ADR.",
+  "scope": "Pluggable-memory implementation through Native parity, NCM observer admission, the mounted observation journey (M4), cognitive recall integration (M5), and evaluation baselines (M8). Revision patch-footprint.v2 (ADR-0011) replaced the v1 caps with the footprint measured at its revision tree plus bounded headroom. Later phases must either remain inside these caps or approve a new policy revision by ADR.",
   "title": "TraceDecay V2 provider patch-footprint policy",
   "upstream_floor": {
     "metadata": "product/upstream/tracedecay-v2-pr707.json",

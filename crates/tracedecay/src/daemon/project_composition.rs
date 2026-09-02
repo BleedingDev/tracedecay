@@ -31,35 +31,209 @@ pub(super) struct ProductionProjectComposition {
 
 /// Typed product activation seam for a project-scoped provider host.
 ///
-/// Production intentionally supplies `Disabled` today. A future enabled
-/// caller cannot omit the Native application port because that authority is a
-/// required field of the `NativeProviderActivation::Enabled` variant.
+/// An enabled caller cannot omit the Native application port, because that
+/// authority is a required field of the `NativeProviderActivation::Enabled`
+/// variant.
+///
+/// The two enabled variants are deliberately distinct rather than one variant
+/// carrying a mode. `memory.provider_native_enabled.v1` alone selects Observer
+/// and nothing else: inferring active output from the boolean that merely
+/// turns the host on would be exactly the silent promotion the activation
+/// gate exists to prevent. `NativeActive` requires the separately pinned
+/// routing gate `memory.provider_recall_routing.v1` to name the Native
+/// provider as the active recall provider; that same gate is the only source
+/// of the recall route's routing policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ProjectMemoryProviderActivation {
     /// Keep the provider host fully dormant.
     Disabled,
-    /// Construct and mount the project-owned Native provider.
-    #[cfg(any(test, feature = "test-transport"))]
+    /// Construct and mount the project-owned Native provider as an observer:
+    /// it receives admitted observations and contributes no active output.
+    NativeObserver,
+    /// Construct and mount the project-owned Native provider in active mode:
+    /// the routing gate explicitly named it as the active recall provider.
     NativeActive,
 }
+
+/// How one project composition decides its provider activation.
+///
+/// Normal production has exactly one answer — read the authoritative runtime
+/// configuration — and cannot express any other. Only the daemon's own test
+/// harness can pin an activation directly, which is what keeps a compiled
+/// feature from implying activation: building with `memory-provider-host` makes
+/// the code reachable, and the configuration decides whether it runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ProjectMemoryProviderActivationSelector {
+    /// Resolve from the authoritative runtime configuration this open already
+    /// loaded. Default-false configuration yields
+    /// [`ProjectMemoryProviderActivation::Disabled`].
+    FromRuntimeConfiguration,
+    /// Pin one activation explicitly. Test and transport builds only.
+    #[cfg(any(test, feature = "test-transport"))]
+    Pinned(ProjectMemoryProviderActivation),
+}
+
+impl ProjectMemoryProviderActivationSelector {
+    /// Resolves the activation against the configuration the open already
+    /// holds.
+    ///
+    /// `memory_provider_native_enabled` and `memory_provider_recall_routing`
+    /// are consumed here and nowhere else, so there is one place to read to
+    /// know what turns the host on and what promotes a provider to active
+    /// output. A routing gate that names a provider the host cannot mount, or
+    /// names one while the host is disabled, fails project open as a typed
+    /// configuration error instead of silently degrading to Observer.
+    fn resolve(
+        self,
+        runtime_configuration: &tracedecay_usecases::config::PinnedRuntimeConfiguration,
+    ) -> Result<ProjectMemoryProviderActivation> {
+        match self {
+            Self::FromRuntimeConfiguration => {
+                resolve_memory_provider_activation(&runtime_configuration.config)
+            }
+            #[cfg(any(test, feature = "test-transport"))]
+            Self::Pinned(activation) => Ok(activation),
+        }
+    }
+}
+
+/// The one reading of the host and routing gates. Pure so the selection table
+/// is unit-testable without a resolved snapshot.
+fn resolve_memory_provider_activation(
+    config: &tracedecay_usecases::config::TraceDecayConfig,
+) -> Result<ProjectMemoryProviderActivation> {
+    let routing = &config.memory_provider_recall_routing;
+    routing
+        .validate()
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("memory provider recall routing configuration is invalid: {error}"),
+        })?;
+    match (
+        config.memory_provider_native_enabled,
+        routing.active_provider.as_deref(),
+    ) {
+        (false, None) => Ok(ProjectMemoryProviderActivation::Disabled),
+        (false, Some(provider)) => Err(TraceDecayError::Config {
+            message: format!(
+                "memory provider recall routing names active provider '{provider}' but the \
+                 memory provider host is disabled; enable memory.provider_native_enabled.v1 or \
+                 clear the active provider"
+            ),
+        }),
+        (true, None) => Ok(ProjectMemoryProviderActivation::NativeObserver),
+        (true, Some(provider)) if is_mountable_active_provider(provider) => {
+            Ok(ProjectMemoryProviderActivation::NativeActive)
+        }
+        (true, Some(provider)) => Err(TraceDecayError::Config {
+            message: format!(
+                "memory provider recall routing names active provider '{provider}', which this \
+                 project composition cannot mount as an active provider"
+            ),
+        }),
+    }
+}
+
+/// Whether the routing gate names the one provider this composition can
+/// mount in active mode. Only the host feature knows the Native identity; a
+/// build without the host cannot honour any active provider.
+#[cfg(feature = "memory-provider-host")]
+fn is_mountable_active_provider(provider: &str) -> bool {
+    provider == tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID
+}
+
+#[cfg(not(feature = "memory-provider-host"))]
+fn is_mountable_active_provider(_provider: &str) -> bool {
+    false
+}
+
+/// Builds the recall routing policy for an active composition from the
+/// pinned routing gate: the Native provider under the product registration
+/// revision, with fallback forbidden unless the gate pins a complete rule.
+/// Observer and disabled activations have no recall route and yield `None`.
+#[cfg(feature = "memory-provider-host")]
+fn project_recall_routing_policy(
+    activation: ProjectMemoryProviderActivation,
+    config: &tracedecay_usecases::config::TraceDecayConfig,
+) -> Result<Option<tracedecay_memory_provider_registry::ActiveRoutingPolicy>> {
+    use tracedecay_memory_provider_registry::{
+        ActiveRoutingPolicy, FallbackRule, NATIVE_PROVIDER_ID, OwnedProviderId,
+        PinnedFallbackPolicy,
+    };
+    if activation != ProjectMemoryProviderActivation::NativeActive {
+        return Ok(None);
+    }
+    let contract = |message: String| TraceDecayError::Config { message };
+    let active_provider = OwnedProviderId::new(NATIVE_PROVIDER_ID)
+        .map_err(|error| contract(format!("Native provider identity is invalid: {error}")))?;
+    let fallback = match &config.memory_provider_recall_routing.fallback {
+        None => FallbackRule::Forbidden,
+        Some(rule) => {
+            let target = OwnedProviderId::new(rule.target_provider.as_str()).map_err(|error| {
+                contract(format!(
+                    "memory provider recall fallback target '{}' is invalid: {error}",
+                    rule.target_provider
+                ))
+            })?;
+            FallbackRule::ExplicitPinned(
+                PinnedFallbackPolicy::new(rule.policy_id.as_str(), rule.policy_revision, target)
+                    .map_err(|error| {
+                        contract(format!(
+                            "memory provider recall fallback rule is invalid: {error}"
+                        ))
+                    })?,
+            )
+        }
+    };
+    ActiveRoutingPolicy::new(
+        active_provider,
+        PROJECT_NATIVE_REGISTRATION_REVISION,
+        fallback,
+    )
+    .map(Some)
+    .map_err(|error| {
+        contract(format!(
+            "memory provider recall routing policy is invalid: {error}"
+        ))
+    })
+}
+
+/// Product-owned registration revision for the project-scoped Native
+/// provider. One composition registers one provider once, so the revision is
+/// constant per mount; it is carried into the readiness handshake and into the
+/// journal's idempotency key, which is why it may not be zero.
+#[cfg(feature = "memory-provider-host")]
+pub(super) const PROJECT_NATIVE_REGISTRATION_REVISION: u64 = 1;
 
 #[cfg(feature = "memory-provider-host")]
 fn mount_project_memory_provider_host(
     activation: ProjectMemoryProviderActivation,
-    _cg: &Arc<crate::tracedecay::TraceDecay>,
-    _canonical_project_path: &Path,
+    cg: &Arc<crate::tracedecay::TraceDecay>,
+    canonical_project_path: &Path,
+    profile_id: &tracedecay_domain::UserProfileId,
 ) -> Result<crate::mcp::server::MemoryProviderHostMount> {
-    let activation = match activation {
-        ProjectMemoryProviderActivation::Disabled => {
-            tracedecay_memory_provider_registry::NativeProviderActivation::Disabled
+    // Disabled composition constructs no port, no fabric, no adapter, and no
+    // registration: the Native application port below is built only inside the
+    // enabled arms, so a default-false configuration allocates nothing.
+    let enabled_mode = match activation {
+        ProjectMemoryProviderActivation::Disabled => None,
+        ProjectMemoryProviderActivation::NativeObserver => {
+            Some(tracedecay_memory_provider_registry::EnabledProviderMode::Observer)
         }
-        #[cfg(any(test, feature = "test-transport"))]
         ProjectMemoryProviderActivation::NativeActive => {
-            let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(_cg)));
+            Some(tracedecay_memory_provider_registry::EnabledProviderMode::Active)
+        }
+    };
+    let activation = match enabled_mode {
+        None => tracedecay_memory_provider_registry::NativeProviderActivation::Disabled,
+        Some(mode) => {
+            let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(cg)));
             let port =
                 super::retained_owner::native_provider::project_native_memory_application_port(
                     graph_cell,
-                    _canonical_project_path.to_path_buf(),
+                    canonical_project_path.to_path_buf(),
+                    // The adapter attests the daemon's own profile on every
+                    // candidate; it is fixed at mount, never read from a call.
+                    profile_id.clone(),
                 )
                 .map_err(|error| TraceDecayError::Config {
                     message: format!(
@@ -72,8 +246,8 @@ fn mount_project_memory_provider_host(
                     max_in_flight: 1,
                 },
                 port,
-                registration_revision: 1,
-                mode: tracedecay_memory_provider_registry::EnabledProviderMode::Active,
+                registration_revision: PROJECT_NATIVE_REGISTRATION_REVISION,
+                mode,
             }
         }
     };
@@ -284,17 +458,21 @@ pub(super) async fn production_project_server(
         handshake,
         runtime,
         cancellation,
-        ProjectMemoryProviderActivation::Disabled,
+        ProjectMemoryProviderActivationSelector::FromRuntimeConfiguration,
         #[cfg(test)]
         project_open_attempts,
     )
     .await
 }
 
-/// Opens one project composition with an explicit product-provider
-/// activation. The selector is private to the daemon and its test harness;
-/// normal production/open callers use [`production_project_server`], which
-/// always selects [`ProjectMemoryProviderActivation::Disabled`].
+/// Opens one project composition with an explicit activation *selector*.
+///
+/// The selector is private to the daemon and its test harness. Normal
+/// production and every open path go through [`production_project_server`],
+/// which can only pass
+/// [`ProjectMemoryProviderActivationSelector::FromRuntimeConfiguration`]; the
+/// pinned variant exists solely so the harness can exercise an activation the
+/// configuration does not yet expose.
 pub(super) async fn production_project_server_with_activation(
     store_administration: &StoreAdministration,
     project_open_gates: &tokio::sync::Mutex<ProjectOpenGates>,
@@ -304,7 +482,7 @@ pub(super) async fn production_project_server_with_activation(
     handshake: &DaemonHandshake,
     runtime: ProductionProjectCompositionRuntime,
     cancellation: &CancellationToken,
-    activation: ProjectMemoryProviderActivation,
+    activation: ProjectMemoryProviderActivationSelector,
     #[cfg(test)] project_open_attempts: Option<&Arc<AtomicUsize>>,
 ) -> Result<ProductionProjectComposition> {
     Box::pin(production_project_server_inner(
@@ -332,7 +510,7 @@ async fn production_project_server_inner(
     handshake: &DaemonHandshake,
     runtime: ProductionProjectCompositionRuntime,
     cancellation: &CancellationToken,
-    activation: ProjectMemoryProviderActivation,
+    activation: ProjectMemoryProviderActivationSelector,
     #[cfg(test)] project_open_attempts: Option<&Arc<AtomicUsize>>,
 ) -> Result<ProductionProjectComposition> {
     let project_open_started = Instant::now();
@@ -457,14 +635,14 @@ async fn production_project_server_inner(
         ));
     }
 
-    // Mount only after every cache lookup has missed, and before either MCP
-    // candidate can be published. Disabled composition creates no fabric,
-    // provider adapter, storage, or background work.
-    #[cfg(feature = "memory-provider-host")]
-    let memory_provider_host_mount =
-        mount_project_memory_provider_host(activation, &cg, canonical_project_path)?;
-    #[cfg(not(feature = "memory-provider-host"))]
-    let _ = activation;
+    // Resolving the activation here, from the configuration this open already
+    // loaded, is what keeps `memory_provider_native_enabled` the only thing
+    // that turns the host on and `memory_provider_recall_routing` the only
+    // thing that promotes a provider to active output. The *mount* happens
+    // further down, once the authoritative code-index scope exists: a provider
+    // host is addressed by an exact coding scope, and mounting before that
+    // scope is resolved would leave the only available identity a path.
+    let memory_provider_activation = activation.resolve(&runtime_configuration)?;
 
     let current_key = Arc::new(tokio::sync::Mutex::new(key.clone()));
     let current_project_path = Arc::new(tokio::sync::Mutex::new(
@@ -516,6 +694,60 @@ async fn production_project_server_inner(
         &route_registered,
         project_database_is_read_only,
     )?;
+
+    // Mount only now: every cache lookup has missed, no MCP candidate has been
+    // published yet, and `code_search_scope` is the authoritative
+    // project/repository/worktree/reference identity the provider boundary
+    // needs. Disabled composition still creates no fabric, provider adapter,
+    // storage, or background work.
+    #[cfg(feature = "memory-provider-host")]
+    let memory_provider_host_mount = mount_project_memory_provider_host(
+        memory_provider_activation,
+        &cg,
+        canonical_project_path,
+        profile_identity.profile_id(),
+    )?;
+    #[cfg(not(feature = "memory-provider-host"))]
+    let _ = memory_provider_activation;
+
+    // The recall route is mounted against the same authoritative scope and
+    // profile the observation journey binds to, so one host session derives
+    // exactly one provider-visible identity per checkout. Its admission
+    // ledger is opened here: an unwritable placement fails project open, not
+    // the first recall. Only an activation whose routing gate names an active
+    // provider has a route: disabled and observer-only compositions mount
+    // none, so an observer can never be selected for product output.
+    #[cfg(feature = "memory-provider-host")]
+    let cognitive_recall_mount = match (
+        memory_provider_host_mount.registry().is_some(),
+        project_recall_routing_policy(memory_provider_activation, &runtime_configuration.config)?,
+    ) {
+        (true, Some(routing)) => {
+            let mount = super::retained_owner::cognitive_recall::mount_project_cognitive_recall(
+                super::retained_owner::cognitive_recall::CognitiveRecallMountInputsV1 {
+                    composition: Arc::clone(&memory_provider_host_mount),
+                    profile_id: profile_identity.profile_id().clone(),
+                    scope: code_search_scope.clone(),
+                    authoritative_project_id: code_search_project_id.clone(),
+                    store_data_root: cg.store_layout().data_root.clone(),
+                    routing,
+                    host_limits: super::retained_owner::native_provider::native_provider_limits(),
+                },
+            )
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("could not mount project cognitive recall route: {error}"),
+            })?;
+            tracing::info!(
+                event = "memory_cognitive_recall_mounted",
+                ledger = %mount.ledger_path().display(),
+                active_provider = %mount.routing().active_provider().as_str(),
+                "project cognitive recall route mounted"
+            );
+            Some(mount)
+        }
+        _ => None,
+    };
+
     let code_index_mount = code_index_activation_mount(CodeIndexActivationMountInputs {
         invocation: invocation.clone(),
         project_id: code_search_project_id.clone(),
@@ -658,6 +890,9 @@ async fn production_project_server_inner(
     {
         core_context =
             core_context.with_memory_provider_host_mount(Arc::clone(&memory_provider_host_mount));
+        if let Some(mount) = cognitive_recall_mount.as_ref() {
+            core_context = core_context.with_cognitive_recall_mount(Arc::clone(mount));
+        }
     }
     if let Some(reconciler) = automation_scheduler_reconciler.as_ref() {
         core_context = core_context.with_automation_scheduler_reconciler(Arc::clone(reconciler));
@@ -856,6 +1091,36 @@ async fn production_project_server_inner(
             );
             let session_db = registered_project_session_db.clone();
             let user_session_db = registered_user_session_db.clone();
+            #[cfg(feature = "memory-provider-host")]
+            let observation_journey_mount = if memory_provider_host_mount.registry().is_some() {
+                Some(
+                    Box::pin(super::retained_owner::observation_journey::mount_and_replay(
+                        super::retained_owner::observation_journey::ObservationJourneyMountInputsV1 {
+                            composition: Arc::clone(&memory_provider_host_mount),
+                            profile_id: profile_identity.profile_id().clone(),
+                            scope: code_search_scope.clone(),
+                            authoritative_project_id: code_search_project_id.clone(),
+                            store_data_root: cg.store_layout().data_root.clone(),
+                            registration_revision: PROJECT_NATIVE_REGISTRATION_REVISION,
+                            host_limits: super::retained_owner::native_provider::native_provider_limits(),
+                            policy: super::retained_owner::observation_journey::ObservationJourneyPolicyV1::project_default(),
+                        },
+                        registered_project_session_db.observation_store(),
+                        cancellation,
+                    ))
+                    .await
+                    .map_err(|error| match error {
+                        super::retained_owner::observation_journey::ObservationJourneyError::Cancelled { .. } => {
+                            project_open_cancellation_error()
+                        }
+                        error => TraceDecayError::Config {
+                            message: format!("could not mount project observation journey: {error}"),
+                        },
+                    })?,
+                )
+            } else {
+                None
+            };
             Box::pin(invocation.service.mount_session_holder_databases([
                     registered_profile_db.clone(),
                     user_session_db.clone(),
@@ -930,6 +1195,7 @@ async fn production_project_server_inner(
                     project_id: code_search_project_id.clone(),
                     profile_root: profile_identity.profile_root().to_path_buf(),
                     project_root: canonical_project_path.to_path_buf(),
+                    scope: code_search_scope.clone(),
                     transcript_source_home: transcript_source_home.clone(),
                     project_sessions: session_db.clone(),
                     user_sessions: user_session_db.clone(),
@@ -1045,6 +1311,12 @@ async fn production_project_server_inner(
             {
                 full_context = full_context
                     .with_memory_provider_host_mount(Arc::clone(&memory_provider_host_mount));
+                if let Some(journey) = observation_journey_mount {
+                    full_context = full_context.with_observation_journey_mount(journey);
+                }
+                if let Some(mount) = cognitive_recall_mount {
+                    full_context = full_context.with_cognitive_recall_mount(mount);
+                }
             }
             if let Some(reconciler) = automation_scheduler_reconciler {
                 full_context = full_context.with_automation_scheduler_reconciler(reconciler);
@@ -1624,4 +1896,107 @@ async fn retire_failed_project_open_owner(
         Some(Arc::clone(route_registered)),
     )
     .await;
+}
+
+#[cfg(test)]
+mod memory_provider_routing_tests {
+    //! The activation table is the only reading of the host and routing
+    //! gates; these tests pin it without a resolved snapshot.
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use tracedecay_usecases::config::{
+        MemoryProviderRecallFallbackV1, MemoryProviderRecallRoutingV1, TraceDecayConfig,
+    };
+
+    use super::{ProjectMemoryProviderActivation, resolve_memory_provider_activation};
+
+    fn config(native_enabled: bool, active_provider: Option<&str>) -> TraceDecayConfig {
+        let mut config = TraceDecayConfig::default();
+        config.memory_provider_native_enabled = native_enabled;
+        config.memory_provider_recall_routing = MemoryProviderRecallRoutingV1 {
+            active_provider: active_provider.map(str::to_owned),
+            fallback: None,
+        };
+        config
+    }
+
+    #[test]
+    fn host_boolean_alone_selects_observer_never_active() {
+        assert_eq!(
+            resolve_memory_provider_activation(&config(false, None)).unwrap(),
+            ProjectMemoryProviderActivation::Disabled
+        );
+        assert_eq!(
+            resolve_memory_provider_activation(&config(true, None)).unwrap(),
+            ProjectMemoryProviderActivation::NativeObserver
+        );
+    }
+
+    #[test]
+    fn active_provider_without_the_host_is_a_typed_configuration_error() {
+        let error = resolve_memory_provider_activation(&config(false, Some("tracedecay.native")))
+            .expect_err("an active provider needs the host");
+        assert!(
+            error
+                .to_string()
+                .contains("memory provider host is disabled")
+        );
+    }
+
+    #[cfg(feature = "memory-provider-host")]
+    #[test]
+    fn routing_gate_naming_native_selects_active_and_builds_the_pinned_policy() {
+        use tracedecay_memory_provider_registry::{FallbackRule, NATIVE_PROVIDER_ID};
+
+        use super::{PROJECT_NATIVE_REGISTRATION_REVISION, project_recall_routing_policy};
+
+        let mut config = config(true, Some(NATIVE_PROVIDER_ID));
+        let activation = resolve_memory_provider_activation(&config).unwrap();
+        assert_eq!(activation, ProjectMemoryProviderActivation::NativeActive);
+        let policy = project_recall_routing_policy(activation, &config)
+            .unwrap()
+            .expect("active composition has a routing policy");
+        assert_eq!(policy.active_provider().as_str(), NATIVE_PROVIDER_ID);
+        assert_eq!(
+            policy.registration_revision(),
+            PROJECT_NATIVE_REGISTRATION_REVISION
+        );
+        assert_eq!(policy.fallback(), &FallbackRule::Forbidden);
+
+        // Observer and disabled activations have no route at all.
+        assert!(
+            project_recall_routing_policy(ProjectMemoryProviderActivation::NativeObserver, &config)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            project_recall_routing_policy(ProjectMemoryProviderActivation::Disabled, &config)
+                .unwrap()
+                .is_none()
+        );
+
+        // A pinned fallback rule is carried into the policy verbatim.
+        config.memory_provider_recall_routing.fallback = Some(MemoryProviderRecallFallbackV1 {
+            policy_id: "policy.memory-failover".to_owned(),
+            policy_revision: 7,
+            target_provider: "provider.ncm-local".to_owned(),
+        });
+        let policy = project_recall_routing_policy(activation, &config)
+            .unwrap()
+            .expect("routing policy");
+        match policy.fallback() {
+            FallbackRule::ExplicitPinned(pinned) => {
+                assert_eq!(pinned.policy_id(), "policy.memory-failover");
+                assert_eq!(pinned.policy_revision(), 7);
+                assert_eq!(pinned.target_provider_id().as_str(), "provider.ncm-local");
+            }
+            FallbackRule::Forbidden => panic!("pinned rule must be carried"),
+        }
+
+        // Any other provider name is refused rather than mapped onto Native.
+        let error =
+            resolve_memory_provider_activation(&self::config(true, Some("provider.ncm-local")))
+                .expect_err("unknown active provider");
+        assert!(error.to_string().contains("cannot mount"));
+    }
 }

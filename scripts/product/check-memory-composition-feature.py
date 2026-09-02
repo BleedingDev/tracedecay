@@ -36,10 +36,14 @@ NATIVE_PROVIDER_TESTS_FILE = Path(
 NATIVE_PROVIDER_PARITY_TESTS_FILE = Path(
     "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs"
 )
+NATIVE_BASELINE_TESTS_FILE = Path(
+    "crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs"
+)
 NATIVE_ADAPTER_FILES = (
     NATIVE_PROVIDER_FILE,
     NATIVE_PROVIDER_TESTS_FILE,
     NATIVE_PROVIDER_PARITY_TESTS_FILE,
+    NATIVE_BASELINE_TESTS_FILE,
 )
 NATIVE_PROVIDER_MODULE_FILE = Path("crates/tracedecay/src/daemon/retained_owner.rs")
 NATIVE_PROVIDER_MODULE_DECLARATION = (
@@ -50,6 +54,11 @@ NATIVE_PROVIDER_TESTS_MODULE_DECLARATION = (
     '#[cfg(test)]\n'
     '#[path = "native_provider_tests.rs"]\n'
     "mod tests;"
+)
+NATIVE_BASELINE_TESTS_MODULE_DECLARATION = (
+    '#[cfg(test)]\n'
+    '#[path = "native_baseline_tests.rs"]\n'
+    "mod baseline_tests;"
 )
 NATIVE_PROVIDER_PARITY_TESTS_MODULE_DECLARATION = (
     f'#[cfg(all(test, feature = "{FEATURE}"))]\n'
@@ -72,6 +81,10 @@ NATIVE_ADAPTER_CONSTRAINTS = {
             NATIVE_PROVIDER_MODULE_FILE,
             NATIVE_PROVIDER_PARITY_TESTS_MODULE_DECLARATION,
         ),
+    ),
+    NATIVE_BASELINE_TESTS_FILE: (
+        (NATIVE_PROVIDER_MODULE_FILE, NATIVE_PROVIDER_MODULE_DECLARATION),
+        (NATIVE_PROVIDER_FILE, NATIVE_BASELINE_TESTS_MODULE_DECLARATION),
     ),
 }
 ROOT_SOURCE = Path("crates/tracedecay/src")

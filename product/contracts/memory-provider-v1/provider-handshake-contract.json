@@ -111,7 +111,7 @@
       "worktree_identity",
       "branch_identity",
       "agent_session_id",
-      "scope_revision"
+      "resolved_scope_digest"
     ],
     "wildcards_allowed": false,
     "missing_identity_policy": "reject_scope_unavailable",
@@ -128,10 +128,10 @@
         "repository_identity",
         "worktree_identity",
         "branch_identity",
-        "agent_session_id"
+        "agent_session_id",
+        "resolved_scope_digest"
       ],
       "string_field_encoding": "u64_big_endian_byte_length_then_utf8_bytes",
-      "scope_revision_encoding": "u64_big_endian",
       "output_encoding": "lowercase_hex_64",
       "golden_vector": {
         "profile_id": "profile-1",
@@ -140,8 +140,8 @@
         "worktree_identity": "worktree-1",
         "branch_identity": "refs/heads/main",
         "agent_session_id": "session-1",
-        "scope_revision": 7,
-        "digest": "aa2f1ac9c33a448fb824abf783a6d40ab52050d91bcc580d907e6b0a3303938e"
+        "resolved_scope_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "digest": "2f525c8c3d59bfa3d9729405c4f3f1307fade77494b6ddf251c89abc490f0a52"
       }
     }
   },
@@ -290,7 +290,7 @@
     "digest_algorithm": "sha256_over_canonical_json",
     "portable_across_provider_restart": false,
     "portable_across_registration_revision": false,
-    "portable_across_scope_revision": false,
+    "portable_across_resolved_scope_digest": false,
     "required_before_provider_mutation": true,
     "required_before_provider_recall": true
   },
@@ -309,7 +309,8 @@
     "Provider ID, registration revision, protocol version, implementation identity, state identity, exact scope, capabilities, and limits are independently verified.",
     "Process existence, an open socket, a database path, or non-empty state never proves readiness.",
     "Provider runtime location is diagnostic metadata and never provider or state authority.",
-    "Exact scope contains profile, project, repository, worktree, branch, agent session, and scope revision with no wildcards or CWD inference.",
+    "Exact scope contains profile, project, repository, worktree, branch, agent session, and the resolved scope digest with no wildcards or CWD inference.",
+    "The resolved scope digest is the algorithm-tagged digest copied verbatim from the validated resolved scope; it is identity evidence compared only for exact equality, never an ordering revision, version counter, or freshness signal. A direct request/provider mismatch yields scope_mismatch, while a readiness receipt bound to a different exact scope yields stale_identity and requires identity refresh; neither case selects a newer digest.",
     "Provider state owner, schema, namespace, and scope must match the selected provider registration and request.",
     "Protocol major compatibility requires an exact intersection; minor selection is deterministic and cannot silently downgrade across majors.",
     "Every effective limit is finite, positive, known, and no larger than either host or provider ceiling.",

@@ -780,7 +780,8 @@
       "known_capabilities",
       "opaque_unknown_capabilities",
       "implementation_identity",
-      "registration_revision"
+      "registration_revision",
+      "recall_scope_bindings"
     ],
     "registration_states": [
       "registered",
@@ -792,6 +793,27 @@
       "provider_id",
       "implementation_identity"
     ],
+    "recall_scope_bindings": {
+      "declared_by": "TraceDecay provider registry composition root at registration",
+      "provider_may_self_declare": false,
+      "values": [
+        "exact_coding_scope",
+        "project_facts",
+        "profile_facts"
+      ],
+      "value_source": "tracedecay.memory.provider.recall.v1 candidate_scope_binding.bindings",
+      "provider_declarations": {
+        "tracedecay.native": [
+          "project_facts",
+          "profile_facts"
+        ],
+        "ncm": [
+          "exact_coding_scope"
+        ]
+      },
+      "admission_input": "recorded_registration_passed_with_the_admitted_call",
+      "unauthorized_binding_policy": "reject_scope_binding_unauthorized"
+    },
     "revision_rule": "Every accepted registry mutation increments registration_revision exactly once.",
     "mandatory_capability_rule": "registered providers must declare every mandatory capability before readiness",
     "unknown_capability_rule": "opaque unknown declarations are preserved but never become supported or active",
@@ -897,7 +919,8 @@
     "All provider capabilities are advisory with respect to TraceDecay canonical authorities.",
     "No provider capability directly mutates current code, exact scope identity, sessions, accepted Native facts, curated rules, tools, approvals, or final context.",
     "The NCM slot does not select an execution topology before tdmem-0701 and tdmem-0702.",
-    "The OCEAN slot reserves identity only and cannot count as implemented without a versioned specification."
+    "The OCEAN slot reserves identity only and cannot count as implemented without a versioned specification.",
+    "Recall scope bindings a provider may attest are recorded by the registry at registration and reach admission only through the admitted call; a provider reply can neither declare nor widen them."
   ],
   "verification_beads": [
     "tdmem-0202",

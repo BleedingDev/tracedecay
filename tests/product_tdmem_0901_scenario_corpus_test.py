@@ -166,6 +166,7 @@ class CodingMemoryScenarioCorpusTest(unittest.TestCase):
                 "adjudication_policy",
                 "scope_catalog",
                 "fixtures",
+                "recall_requests",
                 "scenarios",
             },
         )
@@ -323,6 +324,109 @@ class CodingMemoryScenarioCorpusTest(unittest.TestCase):
                 self.assertEqual(
                     scenario["steps"][-1]["rubric"], scenario["id"]
                 )
+
+    def test_every_step_matches_exactly_one_typed_action_shape(self) -> None:
+        shapes = {
+            "observe": ({"observation_id"}, {"operation_id"}),
+            "advance_code": ({"revision_id"}, set()),
+            "recall": ({"request_id"}, {"scope_id"}),
+            "adjudicate": ({"rubric"}, set()),
+            "open_new_agent_session": ({"scope_id"}, set()),
+            "restart_provider": ({"restart_id"}, set()),
+            "replay": ({"observation_id", "operation_id"}, set()),
+            "begin_observation_batch": ({"batch_id"}, set()),
+            "commit_item": ({"item_id"}, set()),
+            "cancel": ({"cancel_id", "at_item"}, set()),
+            "resume": ({"resume_cursor"}, set()),
+            "load_provider_state": ({"state_id", "digest_status"}, set()),
+            "health": ({"request_id"}, set()),
+            "delete_by_source": ({"forget_source_key"}, set()),
+            "verify_absence": ({"request_id"}, set()),
+        }
+        schema_actions = {
+            shape["properties"]["action"]["const"]
+            for shape in self.schema["$defs"]["step"]["oneOf"]
+        }
+        self.assertEqual(schema_actions, set(shapes))
+        for scenario in self.corpus["scenarios"]:
+            revision_ids = {
+                revision["revision_id"]
+                for revision in scenario["code_evidence_revisions"]
+            }
+            observation_ids = {
+                observation["observation_id"]
+                for observation in scenario["observations"]
+            }
+            for step in scenario["steps"]:
+                with self.subTest(scenario=scenario["id"], step=step["step"]):
+                    required, optional = shapes[step["action"]]
+                    keys = set(step) - {"step", "action"}
+                    self.assertTrue(required <= keys, step)
+                    self.assertTrue(keys <= required | optional, step)
+                    if "observation_id" in step:
+                        self.assertIn(step["observation_id"], observation_ids)
+                    if "revision_id" in step:
+                        self.assertIn(step["revision_id"], revision_ids)
+                    if "scope_id" in step:
+                        self.assertIn(step["scope_id"], self.scopes)
+
+    def test_recall_request_catalog_fully_specifies_every_request_step(self) -> None:
+        catalog = {
+            request["request_id"]: request
+            for request in self.corpus["recall_requests"]
+        }
+        self.assertEqual(len(catalog), len(self.corpus["recall_requests"]))
+        referenced: dict[str, int] = defaultdict(int)
+        step_operations = {
+            "recall": "recall",
+            "verify_absence": "verify_absence",
+            "health": "health",
+        }
+        for scenario in self.corpus["scenarios"]:
+            latest_observation = max(
+                observation["occurred_at"] for observation in scenario["observations"]
+            )
+            for step in scenario["steps"]:
+                if step["action"] not in step_operations:
+                    continue
+                with self.subTest(scenario=scenario["id"], step=step["step"]):
+                    self.assertIn(step["request_id"], catalog, step)
+                    request = catalog[step["request_id"]]
+                    referenced[step["request_id"]] += 1
+                    self.assertEqual(request["scenario_id"], scenario["id"])
+                    self.assertEqual(
+                        request["operation"], step_operations[step["action"]]
+                    )
+                    expected_scope = step.get("scope_id", scenario["target_scope_id"])
+                    self.assertEqual(request["scope_id"], expected_scope)
+                    self.assertIn(request["scope_id"], self.scopes)
+                    self.assertEqual(request["temporal_query"]["mode"], "current")
+                    self.assertGreaterEqual(
+                        request["temporal_query"]["evaluation_time"],
+                        latest_observation,
+                    )
+                    self.assertRegex(
+                        request["temporal_query"]["evaluation_time"],
+                        r"^2026-08-30T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+                    )
+                    self.assertGreaterEqual(request["policy_revision"], 1)
+                    if request["operation"] == "health":
+                        for absent in ("objective", "query", "budgets", "exclusions"):
+                            self.assertNotIn(absent, request)
+                        continue
+                    self.assertEqual(request["objective"], "search")
+                    self.assertEqual(request["query"], request["query"].strip())
+                    self.assertTrue(request["query"])
+                    self.assertTrue(
+                        all(value >= 1 for value in request["budgets"].values()),
+                        request["budgets"],
+                    )
+                    self.assertTrue(
+                        all(value == [] for value in request["exclusions"].values()),
+                        request["exclusions"],
+                    )
+        self.assertEqual(set(referenced), set(catalog))
+        self.assertTrue(all(count == 1 for count in referenced.values()), referenced)
 
     def test_corpus_has_no_concrete_provider_names(self) -> None:
         for value in strings(self.corpus):

@@ -15,6 +15,8 @@ use crate::tracedecay::TraceDecay;
 use tracedecay_runtime_core::errors::TraceDecayError;
 
 mod automation;
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod cognitive_recall;
 mod lcm;
 mod memory;
 mod memory_mapping;
@@ -26,6 +28,8 @@ pub(crate) mod native_provider;
 #[cfg(all(test, feature = "memory-provider-host"))]
 #[path = "retained_owner/native_provider_parity_tests.rs"]
 mod native_provider_parity_tests;
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod observation_journey;
 mod profile;
 pub(crate) mod receipts;
 mod session;

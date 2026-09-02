@@ -86,8 +86,8 @@ them in an operation envelope.
 
 ## Rejected alternatives
 
-- **Compare the complete provider envelope byte-for-byte with direct Native
-  output.** Rejected because transport/readiness IDs and timing are envelope
+- **Compare the complete provider envelope byte-for-byte with direct Native output.**
+  Rejected because transport/readiness IDs and timing are envelope
   mechanics, not Native semantic behavior, and would make valid parity depend
   on an incarnation or clock.
 - **Treat the provider exact-scope envelope as a Native project/profile owner.**

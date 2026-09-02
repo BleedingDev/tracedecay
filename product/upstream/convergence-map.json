@@ -2,7 +2,7 @@
   "$schema": "product/upstream/convergence-map.schema.json",
   "schema_version": 2,
   "bead_id": "tdmem-0308",
-  "policy_revision": "patch-footprint.v1",
+  "policy_revision": "patch-footprint.v2",
   "upstream_floor_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
   "owners": {
     "product": {
@@ -73,7 +73,8 @@
       ],
       "bead_ids": [
         "tdmem-0302",
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0607"
       ],
       "rationale": "Keep routing, admission, and provider-neutral lifecycle behavior outside every concrete adapter and upstream host crate.",
       "semantic_invariants": [
@@ -105,15 +106,22 @@
       "bead_ids": [
         "tdmem-0303",
         "tdmem-0307",
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0603",
+        "tdmem-0607"
       ],
-      "rationale": "Own provider construction and activation outside the host while exposing one typed project-scoped composition object.",
+      "rationale": "Own provider construction and activation outside the host while exposing one typed project-scoped composition object, the rank-final recall admission authority, and the application cognitive-recall port implementation the composition root mounts.",
       "semantic_invariants": [
         "Disabled activation constructs no fabric, provider, storage, queue, or background worker.",
-        "Enabled Native activation requires the canonical application port explicitly."
+        "Enabled Native activation requires the canonical application port explicitly.",
+        "Recall admission compares every candidate's seven exact-scope identity fields byte-for-byte against the scope the host dispatched; stale resolved-scope digests and unresolvable identities are distinct typed denials, never generic mismatches.",
+        "Validity windows, revocation, supersession, and unknown-validity policy are evaluated by the host after provider ordering and before any normalization or packing; denied candidates survive only as content-free ledger rows.",
+        "The recall bridge maps every non-success terminal and fabric error to a typed degradation or error and never reports an empty success."
       ],
       "tests": [
-        "cargo test -p tracedecay-memory-provider-registry --locked"
+        "cargo test -p tracedecay-memory-provider-registry --locked",
+        "cargo test -p tracedecay-memory-provider-registry --test recall_admission --locked",
+        "cargo test -p tracedecay-memory-provider-registry --test recall_port --locked"
       ],
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
       "upstreamability": {
@@ -131,7 +139,8 @@
         "crates/tracedecay-memory-provider-native/**",
         "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
         "crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs",
-        "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs"
+        "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs",
+        "crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs"
       ],
       "touch_points": [
         "workspace_wiring",
@@ -144,18 +153,24 @@
         "tdmem-0402",
         "tdmem-0403",
         "tdmem-0405",
-        "tdmem-1204"
+        "tdmem-1204",
+        "tdmem-0603",
+        "tdmem-0902"
       ],
       "rationale": "Adapt canonical Native application operations through one root-private application port while keeping its implementation and parity fixtures explicitly product-owned.",
       "semantic_invariants": [
         "The adapter delegates all canonical effects through the injected Native application port.",
         "Provider terminals cannot claim effects that the Native application port did not report.",
-        "Native recall is read-only, exact-scope bound, and semantically equal to the direct Native search after ADR-documented envelope normalization."
+        "Native recall is read-only, exact-scope bound, and semantically equal to the direct Native search after ADR-documented envelope normalization.",
+        "Native recall candidates carry validity instants as utc_rfc3339_nanos strings so the host admission authority can evaluate them; Native emits only current active-fact projections and never fabricates revocation or supersession.",
+        "A Native recall candidate's exact_scope_identity attests only the identity the fact record proves (its owner project); profile, repository, worktree, branch, session, and resolved-scope fields are emitted empty because the retained project store has no such dimension, so the host admission authority denies every Native candidate as unknown_identity with an audit row. Native recall stays scope-denied until fact scope is persisted at commit; the adapter never echoes the request scope onto a candidate.",
+        "The Native baseline runs the production adapter and application port over the provider-neutral scenario corpus and records measured terminals without fabricating admission."
       ],
       "tests": [
         "cargo test -p tracedecay-memory-provider-native --locked",
         "cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_recall_ -- --nocapture",
-        "python3 tests/product_memory_composition_feature_test.py"
+        "python3 tests/product_memory_composition_feature_test.py",
+        "cargo test --locked -p tracedecay --features memory-provider-host native_baseline"
       ],
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
       "upstreamability": {
@@ -213,16 +228,21 @@
       ],
       "bead_ids": [
         "tdmem-0305",
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0902"
       ],
       "rationale": "Keep black-box provider conformance, dummy-provider fixtures, and product host journeys in one observer-isolated test boundary.",
       "semantic_invariants": [
         "Observer reports contain structural outcomes and never retain provider payload bytes.",
-        "Differential runs compare full identity, terminal, effect, and retained outcome semantics."
+        "Differential runs compare full identity, terminal, effect, and retained outcome semantics.",
+        "Baseline lanes are typed runner behaviors: the no-memory and explicit-documentation lanes never construct a MemoryProvider, and no lane falls back to another.",
+        "Every baseline report binds one shared-inputs digest over corpus, fixture, scope and recall catalogs, rubrics, contract set, and host configuration; reports with differing shared inputs are never comparable.",
+        "Baseline context cost is exact admitted bytes; token counts appear only under a pinned versioned estimator identity and are otherwise typed indeterminate."
       ],
       "tests": [
         "cargo test -p tracedecay-memory-conformance --locked",
-        "python3 tests/product_dummy_provider_conformance_test.py"
+        "python3 tests/product_dummy_provider_conformance_test.py",
+        "cargo test -p tracedecay-memory-conformance --test baseline --locked"
       ],
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
       "upstreamability": {
@@ -231,8 +251,40 @@
       }
     },
     {
+      "id": "memory_evaluation",
+      "status": "active",
+      "owner": "BleedingDev",
+      "ownership_class": "product_owned",
+      "feature": "memory-evaluation",
+      "path_patterns": [
+        "crates/tracedecay-memory-evaluation/**"
+      ],
+      "touch_points": [
+        "workspace_wiring"
+      ],
+      "bead_ids": [
+        "tdmem-0904"
+      ],
+      "rationale": "Hold the versioned memory-quality, safety, cost, and latency metric catalog and its evaluator in one provider-neutral crate that consumes the conformance baseline report and never touches host, store, or adapter internals.",
+      "semantic_invariants": [
+        "The embedded metric catalog and the computed metric set are validated against each other on load; a metric cannot exist in only one of them.",
+        "The aggregate task score, the safety gate, and the verdict are separate report fields; the verdict fails whenever any safety metric exceeds its ceiling or is indeterminate, any safety-critical rubric check is not a pass, or a terminal gate failed, regardless of the aggregate.",
+        "Unresolved candidate labels are never coerced to zero or to pass; label-based metrics report labeled, unlabeled, and indeterminate counts and become indeterminate when every candidate is unresolved.",
+        "Latency percentiles, token, curation, correction, and discovery values are typed indeterminate when the runner supplied no samples; nothing is fabricated and provider identity is metadata only."
+      ],
+      "tests": [
+        "cargo test -p tracedecay-memory-evaluation --locked",
+        "python3 tests/product_tdmem_0904_metric_catalog_test.py"
+      ],
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Provider-neutral metric definitions and their evaluator can be upstreamed with the conformance harness independently from product provider implementations."
+      }
+    },
+    {
       "id": "memory_observation",
-      "status": "planned",
+      "status": "active",
       "owner": "BleedingDev",
       "ownership_class": "product_owned",
       "feature": "memory-observation",
@@ -243,20 +295,193 @@
         "normalized_observation_mount"
       ],
       "bead_ids": [
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0502"
       ],
-      "rationale": "Reserve a product-owned normalized observation boundary before any observer implementation is admitted.",
+      "rationale": "Hold the durable observation journal, its delivery state machine, and its retention and privacy deletion authority in one removable product-owned boundary.",
       "semantic_invariants": [
-        "Planned observation paths grant no classification authority until the area becomes active.",
-        "Canonical host ingest remains independent from provider delivery and provider failure."
+        "Canonical host ingest remains independent from provider delivery and provider failure.",
+        "Journal rows are causally bound to a committed host action and carry a content-derived idempotency key with an exact source sequence.",
+        "Delivery state, attempt history, and replay position survive process restart.",
+        "Retention expiry and privacy deletion purge observation content while leaving a digest-only audit trail."
       ],
       "tests": [
+        "cargo test -p tracedecay-memory-observation --locked",
         "python3 tests/product_upstream_ownership_registry_test.py"
       ],
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
       "upstreamability": {
         "kind": "upstream_candidate",
-        "rationale": "The reserved provider-neutral observation seam can converge only after behavioral implementation exists."
+        "rationale": "The provider-neutral observation journal carries no provider implementation and can be proposed on its own once its delivery contract settles."
+      }
+    },
+    {
+      "id": "memory_hygiene",
+      "status": "active",
+      "owner": "BleedingDev",
+      "ownership_class": "product_owned",
+      "feature": "memory-hygiene",
+      "path_patterns": [
+        "crates/tracedecay-memory-hygiene/**"
+      ],
+      "touch_points": [
+        "normalized_observation_mount"
+      ],
+      "bead_ids": [
+        "tdmem-0308",
+        "tdmem-0507"
+      ],
+      "rationale": "Hold observation sanitization and its receipts in one removable product-owned boundary that runs before anything is journalled.",
+      "semantic_invariants": [
+        "Sanitization runs at admission, so only sanitized payload bytes ever reach the observation journal.",
+        "A withheld observation produces a receipt and never produces provider delivery work."
+      ],
+      "tests": [
+        "cargo test -p tracedecay-memory-hygiene --locked",
+        "python3 tests/product_upstream_ownership_registry_test.py"
+      ],
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "product_only",
+        "rationale": "The crate-local hygiene boundary takes over the canonical JSON encoding from tracedecay-domain and reuses the vendored detector corpus exposed by tracedecay-runtime-core's public surface, so it cannot be lifted out as an independently extractable upstream candidate without also carrying those upstream-owned internals into a separate ownership area."
+      }
+    },
+    {
+      "id": "observation_journey_mount",
+      "status": "active",
+      "owner": "BleedingDev",
+      "ownership_class": "product_owned",
+      "feature": "memory-provider-host",
+      "path_patterns": [
+        "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs"
+      ],
+      "touch_points": [
+        "daemon_composition_mount"
+      ],
+      "bead_ids": [
+        "tdmem-0502",
+        "tdmem-0507"
+      ],
+      "rationale": "Hold the one product-owned seam where the canonical observation store, the durable observation journal, the hygiene pipeline, and the provider registry meet, as a single file inside the retained-owner tree that the composition root mounts only under the optional host feature.",
+      "semantic_invariants": [
+        "Every canonical record is sanitized through ObservationSanitizer::admit_observation before any digest, idempotency key, journal append, or provider call is derived from it.",
+        "A withheld admission persists a typed reason and digests only, advances the replay cursor, and never creates delivery work; the canonical record is never rewritten or deleted.",
+        "Journalled payload bytes are the sanitized bytes and carry a sanitization binding whose receipt names exactly those bytes; delivery sends journal bytes verbatim.",
+        "Exact project and per-session scope is copied from the authoritative resolved scope and never re-derived from paths, CWD, or journal placement.",
+        "The delivery worker drives the journal's bounded retention sweep on an explicit cadence: expired rows are terminalized with a receipt before their content is purged, a backlog converges over worker turns, and a failed sweep is logged and waits out its backoff.",
+        "mount_and_replay is the single product-owned mount sequence the composition root calls: mount, authoritative startup replay, then the bounded live replay edge over the same registered store."
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::observation_journey::tests",
+        "python3 tests/product_upstream_ownership_registry_test.py",
+        "cargo test --locked -p tracedecay --features memory-provider-host remount_sweeps_rows_that_expired_while_the_journey_was_down",
+        "cargo test -p tracedecay-memory-observation --test retention_sweep_cadence --locked"
+      ],
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "product_only",
+        "rationale": "The journey composes product-owned journal and hygiene crates against the upstream store and Native application port; it is removable with the host feature and has no upstream counterpart to converge with."
+      }
+    },
+    {
+      "id": "cognitive_recall_mount",
+      "status": "active",
+      "owner": "BleedingDev",
+      "ownership_class": "product_owned",
+      "feature": "memory-provider-host",
+      "path_patterns": [
+        "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs"
+      ],
+      "touch_points": [
+        "daemon_composition_mount"
+      ],
+      "bead_ids": [
+        "tdmem-0603",
+        "tdmem-0607"
+      ],
+      "rationale": "Hold the one product-owned seam where the daemon's authoritative resolved scope, the provider-qualified session identity, the durable recall admission ledger, and the registry's rank-final recall port meet, as a single file inside the retained-owner tree that the composition root mounts only under the optional host feature.",
+      "semantic_invariants": [
+        "Every recall request is bound to the authoritative resolved scope the composition root resolved at project open; a request that disagrees on project, repository, worktree, reference, or scope digest is refused with a typed scope disagreement before any provider contact.",
+        "The provider-qualified agent_session_id is derived only through observation_journey::provider_agent_session_id, so one host session has exactly one provider identity per checkout across observation and recall.",
+        "Every admission report is retained in the project-owned SQLite ledger before the result is delivered; an unwritable ledger fails the recall with a typed audit error rather than delivering content whose denials are not audit-visible.",
+        "Ledger rows carry denial identities, typed reasons, and provider-claimed digests only; no table has a content column, and a replay of an identical report is idempotent while a divergent replay is a typed conflict.",
+        "On the production Native route a same-project fact committed from any checkout is denied per candidate by the host scope check (unknown_identity, because Native attests no worktree, branch, or session) and lands in the ledger; the application result carries no candidate content for it.",
+        "The mount holds the host-pinned ActiveRoutingPolicy and hands it to every session port unchanged; no port or provider can select a different provider than the one the routing gate named, and observer registrations are refused by routing before any handshake."
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::cognitive_recall::tests",
+        "cargo test --locked -p tracedecay-memory-provider-registry --test recall_port",
+        "python3 tests/product_upstream_ownership_registry_test.py"
+      ],
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "product_only",
+        "rationale": "The mount composes the product-owned registry recall port and a product-owned admission ledger against the daemon's resolved scope; it is removable with the host feature and has no upstream counterpart to converge with."
+      }
+    },
+    {
+      "id": "observation_policy_contracts",
+      "status": "active",
+      "owner": "BleedingDev",
+      "ownership_class": "product_owned",
+      "feature": "memory-observation-policy",
+      "path_patterns": [
+        "product/observations/**"
+      ],
+      "touch_points": [
+        "normalized_observation_mount"
+      ],
+      "bead_ids": [
+        "tdmem-0308",
+        "tdmem-0501",
+        "tdmem-0502",
+        "tdmem-0507"
+      ],
+      "rationale": "Keep the versioned observation hygiene and retention policy documents under product ownership so their revisions are reviewable apart from the crates that read them.",
+      "semantic_invariants": [
+        "Policy documents are versioned data and grant no execution authority on their own.",
+        "A policy revision referenced by a sanitization receipt remains resolvable for the life of the audit trail."
+      ],
+      "tests": [
+        "python3 tests/product_observation_hygiene_policy_test.py",
+        "python3 tests/product_upstream_ownership_registry_test.py"
+      ],
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "product_only",
+        "rationale": "The policy documents describe TraceDecay's own observation governance and have no upstream counterpart to converge with."
+      }
+    },
+    {
+      "id": "coding_memory_evaluation",
+      "status": "active",
+      "owner": "BleedingDev",
+      "ownership_class": "product_owned",
+      "feature": "coding-memory-evaluation",
+      "path_patterns": [
+        "product/evaluation/**"
+      ],
+      "touch_points": [
+        "recall_context_mount"
+      ],
+      "bead_ids": [
+        "tdmem-0901",
+        "tdmem-0902"
+      ],
+      "rationale": "Own the deterministic provider-neutral coding-memory scenario corpus, schema, and operator guidance outside upstream runtime crates.",
+      "semantic_invariants": [
+        "Scenario fixtures contain no live credentials, network dependency, randomness, or provider-specific adjudication.",
+        "Canonical provider terminal outcomes are loaded from the provider contract rather than duplicated in the corpus gate.",
+        "Every recall, verify_absence, and health step resolves exactly one catalogued recall request, so all baselines issue identical requests for one scenario."
+      ],
+      "tests": [
+        "python3 tests/product_tdmem_0901_scenario_corpus_test.py",
+        "python3 tests/product_upstream_ownership_registry_test.py"
+      ],
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "product_only",
+        "rationale": "The scenario corpus evaluates TraceDecay product behavior and has no upstream runtime surface to converge."
       }
     },
     {
@@ -331,6 +556,42 @@
       }
     },
     {
+      "id": "application_recall_contract",
+      "status": "active",
+      "owner": "ScriptedAlchemy",
+      "ownership_class": "upstream_owned",
+      "feature": "cognitive-recall-contract",
+      "path_patterns": [
+        "crates/tracedecay-application/src/memory.rs",
+        "crates/tracedecay-application/src/memory/recall.rs",
+        "crates/tracedecay-application/tests/cognitive_recall_port.rs",
+        "crates/tracedecay/tests/application_production_reachability.rs"
+      ],
+      "touch_points": [
+        "cognitive_recall_contract"
+      ],
+      "bead_ids": [
+        "tdmem-0601",
+        "tdmem-1208",
+        "tdmem-0607"
+      ],
+      "rationale": "Track the provider-neutral advisory recall application port, its bounded contract tests, and the compile-clean production reachability suite as one upstream-sensitive capability.",
+      "semantic_invariants": [
+        "Recall requests preserve exact admitted scope, request identity, deadline, and cancellation without provider-specific transport types.",
+        "Recall candidates remain advisory, provenance-labelled, bounded, and unable to mutate Native facts or own final context assembly.",
+        "Existing application production journeys retain their behavior while compiling without stale imports."
+      ],
+      "tests": [
+        "cargo test -p tracedecay-application --locked",
+        "cargo test -p tracedecay --features test-helpers --test application_production_reachability --locked"
+      ],
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "The application port is provider-neutral and can converge independently from every product-owned adapter and context compiler."
+      }
+    },
+    {
       "id": "workspace_wiring",
       "status": "active",
       "owner": "ScriptedAlchemy",
@@ -350,7 +611,8 @@
         "tdmem-0304",
         "tdmem-0305",
         "tdmem-0307",
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0904"
       ],
       "rationale": "Track the two upstream-owned root workspace files separately from every additive product crate.",
       "semantic_invariants": [
@@ -380,7 +642,8 @@
         "crates/tracedecay/src/daemon/retained_owner.rs",
         "crates/tracedecay/src/daemon/retained_owner/memory.rs",
         "crates/tracedecay/src/mcp/server.rs",
-        "crates/tracedecay/src/mcp/server/construction.rs"
+        "crates/tracedecay/src/mcp/server/construction.rs",
+        "crates/tracedecay/src/mcp/server/connection.rs"
       ],
       "touch_points": [
         "daemon_composition_mount"
@@ -393,13 +656,18 @@
         "tdmem-0403",
         "tdmem-0404",
         "tdmem-0405",
-        "tdmem-1204"
+        "tdmem-1204",
+        "tdmem-0507",
+        "tdmem-0502",
+        "tdmem-0607"
       ],
       "rationale": "Track the exact default-off host feature, project composition, and the two upstream retained-owner seams that expose existing Native authority to the optional provider host.",
       "semantic_invariants": [
         "Disabled composition creates no provider registry, adapter, storage, queue, or background work.",
         "The provider host mount is retained and retired with exactly one cached project server.",
-        "No concrete provider implementation leaks into MCP routes or public host contracts; product-owned Native adapter and test files remain outside this upstream area."
+        "No concrete provider implementation leaks into MCP routes or public host contracts; product-owned Native adapter and test files remain outside this upstream area.",
+        "Active output is gated twice: memory.provider_native_enabled.v1 selects Observer only, and memory.provider_recall_routing.v1 must name the Native provider before NativeActive is composed; a routing gate that names any other provider, or names one while the host is disabled, fails project open as a typed configuration error rather than degrading silently.",
+        "The cognitive recall route is mounted only for an active composition and receives its ActiveRoutingPolicy from the routing gate once; observer-only compositions mount no recall route and report NoActiveProviderConfigured, never CompositionDisabled or an empty success."
       ],
       "tests": [
         "cargo test -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss --locked",
@@ -426,17 +694,19 @@
         "crates/tracedecay/src/daemon/bootstrap.rs",
         "crates/tracedecay/src/daemon/engine/shutdown.rs",
         "crates/tracedecay/src/daemon/invocation_state.rs",
+        "crates/tracedecay/src/daemon/production_harness.rs",
         "crates/tracedecay/src/daemon/service/invocation/lsp.rs",
         "crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs"
       ],
       "touch_points": [
-        "daemon_shutdown_deadline"
+        "daemon_shutdown_deadline",
+        "production_harness_shutdown"
       ],
       "bead_ids": [
         "tdmem-0404",
         "tdmem-1204"
       ],
-      "rationale": "Constrain the five existing daemon shutdown layers that must share one caller deadline and expose incomplete blocking drain truthfully.",
+      "rationale": "Constrain the six existing daemon shutdown and production-harness layers that must share one caller deadline and expose incomplete blocking drain truthfully.",
       "semantic_invariants": [
         "Upstream behavior: daemon shutdown preserves lifecycle ordering and always completes terminal teardown after reporting the observed outcome.",
         "Product behavior: one caller-supplied absolute deadline bounds every nested shutdown and blocking-drain step without refresh."
@@ -481,6 +751,116 @@
         "kind": "upstream_candidate",
         "rationale": "Deterministic same-checkout integration-test isolation is provider-neutral and can be proposed upstream without product runtime changes."
       }
+    },
+    {
+      "id": "memory_provider_configuration_gate",
+      "status": "active",
+      "owner": "ScriptedAlchemy",
+      "ownership_class": "upstream_owned",
+      "feature": "memory-provider-host",
+      "path_patterns": [
+        "crates/tracedecay-domain/src/configuration.rs",
+        "crates/tracedecay-usecases/src/config/mod.rs",
+        "crates/tracedecay/src/config.rs",
+        "crates/tracedecay/src/config/tests.rs",
+        "crates/tracedecay-global-db/src/configuration/registry.rs",
+        "crates/tracedecay-global-db/src/configuration/store.rs"
+      ],
+      "touch_points": [
+        "configuration_registry_mount"
+      ],
+      "bead_ids": [
+        "tdmem-0607"
+      ],
+      "rationale": "Carry the two additive memory-provider settings (memory.provider_native_enabled.v1 and memory.provider_recall_routing.v1) through the upstream typed configuration registry so the host activation and the explicit recall routing gate are pinned runtime configuration rather than environment or code constants.",
+      "semantic_invariants": [
+        "Both settings default closed: the host boolean is false and the routing gate names no active provider, so an upstream configuration that never heard of them composes no provider and routes no recall.",
+        "The routing gate is a validated typed document (MemoryProviderRecallRoutingV1): blank identities, a zero fallback revision, a fallback without an active provider, and a fallback that targets the active provider are rejected at parse time.",
+        "No other upstream configuration key, default, or resolver behavior changes."
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host config::tests::memory_provider_recall_routing_defaults_to_no_active_provider_and_validates",
+        "cargo test --locked -p tracedecay --features memory-provider-host config::tests::memory_provider_native_enabled_round_trips_and_defaults_off",
+        "cargo test --locked -p tracedecay-global-db configuration"
+      ],
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Two additive typed settings with closed defaults are the smallest configuration patch and can be proposed upstream independently of any provider implementation."
+      }
+    },
+    {
+      "id": "session_sync_scope_mount",
+      "status": "active",
+      "owner": "ScriptedAlchemy",
+      "ownership_class": "upstream_owned",
+      "feature": "memory-provider-host",
+      "path_patterns": [
+        "crates/tracedecay/src/daemon/session_sync.rs",
+        "crates/tracedecay/src/daemon/session_sync/git_topology.rs",
+        "crates/tracedecay/src/daemon/session_sync/project_lifecycle.rs",
+        "crates/tracedecay/src/daemon/session_sync/project_lifecycle_tests.rs",
+        "crates/tracedecay/src/daemon/session_sync_tests.rs"
+      ],
+      "touch_points": [
+        "daemon_composition_mount"
+      ],
+      "bead_ids": [
+        "tdmem-0603",
+        "tdmem-0502"
+      ],
+      "rationale": "Thread the exact project-open ResolvedScope into DaemonSessionSyncConfig and SessionSyncProjectContext so session-sync git-topology resolution reuses the one authoritative scope the daemon already bound at project open instead of re-deriving repository, worktree, and reference identity from project_root a second time.",
+      "semantic_invariants": [
+        "Session-sync git-topology resolution never re-derives scope from project_root; it consumes the identical ResolvedScope value the daemon composition root bound at project-open.",
+        "A project-open scope-resolution failure is never silently retried or substituted inside session-sync; the scope is carried through configuration and context, not recomputed.",
+        "Existing session-sync outcomes, cursors, and lease behavior are unchanged for callers that already supplied a resolvable scope."
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay daemon::session_sync",
+        "cargo test --locked -p tracedecay daemon::session_sync::git_topology",
+        "cargo test --locked -p tracedecay daemon::session_sync::project_lifecycle"
+      ],
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Removing a redundant identity re-derivation in favor of the already-bound scope is a provider-neutral correctness fix upstream can take independently of any provider work."
+      }
+    },
+    {
+      "id": "diagnostics_publication_evidence_mount",
+      "status": "active",
+      "owner": "ScriptedAlchemy",
+      "ownership_class": "upstream_owned",
+      "feature": "memory-provider-host",
+      "path_patterns": [
+        "crates/tracedecay-usecases/src/diagnostics_query.rs",
+        "crates/tracedecay-usecases/src/diagnostics_store.rs",
+        "crates/tracedecay-usecases/src/primitives/production.rs",
+        "crates/tracedecay-usecases/src/primitives/runtime.rs"
+      ],
+      "touch_points": [
+        "recall_context_mount"
+      ],
+      "bead_ids": [
+        "tdmem-1009"
+      ],
+      "rationale": "Distinguish an uninitialized diagnostics publication ledger (nothing has published yet) from a genuine store fault, so the typed per-lane coverage and degradation reported to context assembly never launders a normal unpublished project state into a terminal unavailable one.",
+      "semantic_invariants": [
+        "An absent publication ledger table is read-only evidence of 'nothing published yet' and is never created by a reader on a publisher's behalf.",
+        "Every non-Complete diagnostics coverage state remains retryable; only an unsupported scope is a terminal application-problem classification.",
+        "A genuine store fault against an initialized ledger is never reclassified as an unpublished-project state."
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-usecases diagnostics_query",
+        "cargo test --locked -p tracedecay-usecases diagnostics_store",
+        "cargo test --locked -p tracedecay-usecases primitives::production",
+        "cargo test --locked -p tracedecay-usecases primitives::runtime"
+      ],
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "The ledger-uninitialized-versus-fault distinction is a general diagnostics-evidence correctness fix, independent of any concrete memory provider, and upstream can adopt it directly."
+      }
     }
   ],
   "entries": [
@@ -510,7 +890,9 @@
         "tdmem-0304",
         "tdmem-0305",
         "tdmem-0307",
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0902",
+        "tdmem-0904"
       ],
       "line_budget": 180,
       "rebase_or_removal_plan": "Regenerate Cargo.lock after removing product workspace members and retain every unrelated upstream resolution.",
@@ -552,7 +934,8 @@
         "tdmem-0304",
         "tdmem-0305",
         "tdmem-0307",
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0904"
       ],
       "line_budget": 80,
       "rebase_or_removal_plan": "Remove only the additive product workspace member lines while preserving every upstream workspace setting.",
@@ -564,15 +947,140 @@
       }
     },
     {
+      "path": "crates/tracedecay-application/src/memory.rs",
+      "area_id": "application_recall_contract",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "cognitive_recall_contract",
+      "rationale": "Expose the additive provider-neutral cognitive-recall contract through the existing application memory module.",
+      "semantic_invariants": [
+        "Existing canonical and public memory contracts retain their names and authority.",
+        "The recall module is additive and exports no concrete provider implementation type."
+      ],
+      "verification": [
+        "git diff --check",
+        "kache cargo -- check -p tracedecay-application --locked"
+      ],
+      "tests": [
+        "cargo test -p tracedecay-application --locked"
+      ],
+      "bead_ids": [
+        "tdmem-0601"
+      ],
+      "line_budget": 4,
+      "rebase_or_removal_plan": "Remove the recall module declaration and re-export together if the upstream application boundary adopts a different equivalent port.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "The two additive module lines are the narrow public mount for a provider-neutral application contract."
+      }
+    },
+    {
+      "path": "crates/tracedecay-application/src/memory/recall.rs",
+      "area_id": "application_recall_contract",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "cognitive_recall_contract",
+      "rationale": "Define bounded application-owned recall requests, advisory candidates, provenance, degradation, results, and the asynchronous port without provider-specific types.",
+      "semantic_invariants": [
+        "Every request carries exact resolved scope, request identity, deadline, cancellation, query, and candidate budget.",
+        "Results distinguish complete zero-result success from typed degradation and validate against the exact request.",
+        "Candidates remain advisory evidence and cannot become canonical facts, retrieval anchors, or final context packs.",
+        "Every result carries a validated CognitiveRecallProviderIdentity (configured provider id, positive registration revision, optional handshake instance) so degraded and complete results alike name the provider they are attributed to."
+      ],
+      "verification": [
+        "git diff --check",
+        "kache cargo -- clippy -p tracedecay-application --all-targets --locked -- -D warnings"
+      ],
+      "tests": [
+        "cargo test -p tracedecay-application --locked"
+      ],
+      "bead_ids": [
+        "tdmem-0601",
+        "tdmem-0607"
+      ],
+      "line_budget": 630,
+      "rebase_or_removal_plan": "Decompose the oversized module below the hard per-file cap, then remove the local contract if upstream adopts an equivalent typed recall port.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "The contract is provider-neutral application vocabulary and can be proposed independently from product-owned implementations."
+      }
+    },
+    {
+      "path": "crates/tracedecay-application/tests/cognitive_recall_port.rs",
+      "area_id": "application_recall_contract",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "cognitive_recall_contract",
+      "rationale": "Prove exact scope, request, deadline, cancellation, candidate bounds, zero-result semantics, and typed degradation at the application port.",
+      "semantic_invariants": [
+        "The port future remains Send and receives the exact admitted request values.",
+        "Invalid scope identity, duplicate candidates, and exceeded budgets fail closed.",
+        "Results without a validated provider identity fail closed, and the identity is part of the serialized contract."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test -p tracedecay-application --test cognitive_recall_port --locked"
+      ],
+      "bead_ids": [
+        "tdmem-0601",
+        "tdmem-0607"
+      ],
+      "line_budget": 300,
+      "rebase_or_removal_plan": "Keep these contract tests with any upstreamed recall port and remove them only with the corresponding application vocabulary.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "The tests exercise only provider-neutral application semantics and can accompany the port upstream."
+      }
+    },
+    {
+      "path": "crates/tracedecay/tests/application_production_reachability.rs",
+      "area_id": "application_recall_contract",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "cognitive_recall_contract",
+      "rationale": "Keep the application production-reachability suite compile-clean after the retained application boundary no longer consumes the daemon handshake import.",
+      "semantic_invariants": [
+        "The production reachability journeys and assertions remain byte-for-byte unchanged.",
+        "Removing the stale import changes no runtime or test behavior."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test -p tracedecay --features test-helpers --test application_production_reachability --locked"
+      ],
+      "bead_ids": [
+        "tdmem-1208"
+      ],
+      "line_budget": 2,
+      "rebase_or_removal_plan": "Drop this entry when upstream removes the same stale import or the floor advances past that cleanup.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "The one-line stale-import cleanup is behavior-neutral and appropriate for direct upstream convergence."
+      }
+    },
+    {
       "path": "crates/tracedecay/Cargo.toml",
       "area_id": "composition_mount",
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "daemon_composition_mount",
-      "rationale": "Declare one optional registry dependency and product host feature at the TraceDecay package boundary.",
+      "rationale": "Declare the optional registry, observation-journal, and hygiene dependencies behind one product host feature at the TraceDecay package boundary.",
       "semantic_invariants": [
-        "Feature-minimal builds remain free of provider-registry code and dependencies.",
-        "The host package depends only on the provider registry and never on a concrete adapter."
+        "Feature-minimal builds remain free of provider-registry, observation-journal, and hygiene code and dependencies.",
+        "The host package depends only on the provider registry, the observation journal, and the hygiene pipeline, and never on a concrete adapter.",
+        "The three product dependencies are activated together by memory-provider-host: a mounted provider host can never dispatch without an outbox and a secret gate.",
+        "The tracedecay-memory-conformance dev-dependency is test-only, activates no feature, and reaches production builds through no path."
       ],
       "verification": [
         "cargo metadata --locked --format-version 1 --no-deps",
@@ -583,10 +1091,12 @@
       ],
       "bead_ids": [
         "tdmem-0307",
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0507",
+        "tdmem-0902"
       ],
       "line_budget": 40,
-      "rebase_or_removal_plan": "Remove the optional dependency, memory-provider-host feature, and its feature-list membership together.",
+      "rebase_or_removal_plan": "Remove the three optional dependencies, the memory-provider-host feature, its feature-list membership, and the conformance dev-dependency together.",
       "status": "active",
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
       "upstreamability": {
@@ -600,22 +1110,38 @@
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "daemon_composition_mount",
-      "rationale": "Compose one disabled provider host after cache misses and retain it across both MCP construction paths.",
+      "rationale": "Compose one disabled provider host after cache misses, retain it across both MCP construction paths, mount the product-owned observation journey through one call once the code-index authorities and the registered project session database are open, and hand the daemon profile identity to the Native application port so recall candidates attest a host-owned profile under the project_facts scope binding.",
       "semantic_invariants": [
         "Disabled activation constructs no provider infrastructure or background work.",
-        "The mount is created once per project server and reused across retained construction paths."
+        "The mount is created once per project server and reused across retained construction paths.",
+        "The observation journey mount runs the single admitted hygiene pipeline over every canonical record before any journal append, digest, or provider dispatch.",
+        "The cognitive recall route is mounted once per enabled composition against the same profile and resolved scope as the observation journey, opens its admission ledger at project open, and is retained across both MCP construction paths.",
+        "The observation journey mounts only after project_code_index_authorities and the registered project session database are open, because the exact scope and the canonical replay source exist only then; disabled activation mounts no journey, journal, worker, or replay task.",
+        "The journey mount is one call into observation_journey::mount_and_replay; a mount or live-replay-start refusal is a typed TraceDecayError::Config, and a startup replay refusal is logged at error level with the journal path while the durable watermark and the live replay task carry recovery.",
+        "NativeActive is selected only when memory.provider_recall_routing.v1 names the Native provider and the host boolean is on; resolve_memory_provider_activation is the sole reading of both gates and any contradiction is a typed TraceDecayError::Config at project open.",
+        "project_recall_routing_policy builds the one ActiveRoutingPolicy (Native under PROJECT_NATIVE_REGISTRATION_REVISION, fallback forbidden unless the gate pins a complete rule) and the recall route is mounted only when it exists.",
+        "The daemon profile identity is threaded into the Native application port at mount (mount_project_memory_provider_host takes profile_identity.profile_id()); it is the only profile the Native adapter attests on a recall candidate, fixed at mount and never copied from a call's exact scope.",
+        "The journey mount receives every worker bound (journal retention, dispatch lease/batch/attempt budget/reap budget, park, sweep cadence) as one validated ObservationJourneyPolicyV1 from the composition root; a policy that cannot bound the worker refuses the mount with a typed error, and the composition root passes the product default rather than the journey minting limits."
       ],
       "verification": [
         "git diff --check"
       ],
       "tests": [
-        "cargo test -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss --locked"
+        "cargo test -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss --locked",
+        "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::observation_journey::tests",
+        "cargo test --locked -p tracedecay --features memory-provider-host remount_sweeps_rows_that_expired_while_the_journey_was_down",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers daemon::project_composition::memory_provider_routing_tests"
       ],
       "bead_ids": [
         "tdmem-0307",
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0507",
+        "tdmem-0603",
+        "tdmem-0502",
+        "tdmem-0607",
+        "tdmem-0503"
       ],
-      "line_budget": 80,
+      "line_budget": 560,
       "rebase_or_removal_plan": "Remove the typed mount helper, disabled activation, and two construction-context injections as one bounded patch.",
       "status": "active",
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
@@ -663,7 +1189,8 @@
       "rationale": "Retain the opaque provider host mount for exactly the cached MCP project-server lifetime.",
       "semantic_invariants": [
         "MCP routes never inspect or branch on concrete provider implementations.",
-        "The retained mount has no authority over source, sessions, tools, or Native storage."
+        "The retained mount has no authority over source, sessions, tools, or Native storage.",
+        "cognitive_recall_port_for_session distinguishes an enabled observer-only composition (NoActiveProviderConfigured) from a disabled composition (CompositionDisabled); neither is ever an empty recall."
       ],
       "verification": [
         "git diff --check"
@@ -673,9 +1200,11 @@
       ],
       "bead_ids": [
         "tdmem-0307",
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0603",
+        "tdmem-0607"
       ],
-      "line_budget": 50,
+      "line_budget": 68,
       "rebase_or_removal_plan": "Remove the feature-gated retained field, constructor transfer, and test accessor without changing MCP routes.",
       "status": "active",
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
@@ -703,15 +1232,49 @@
       ],
       "bead_ids": [
         "tdmem-0307",
-        "tdmem-0308"
+        "tdmem-0308",
+        "tdmem-0603"
       ],
-      "line_budget": 60,
+      "line_budget": 74,
       "rebase_or_removal_plan": "Remove the feature-gated type alias, optional construction field, defaults, and builder method together.",
       "status": "active",
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
       "upstreamability": {
         "kind": "minimal_mount",
         "rationale": "The optional construction field is a bounded transport for project ownership and can be removed atomically."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/mcp/server/connection.rs",
+      "area_id": "composition_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_composition_mount",
+      "rationale": "Project-server shutdown drains the mounted observation journey inside the daemon's one shared shutdown deadline, so the delivery worker and live replay task are retired with the project server that mounted them and never outlive it.",
+      "semantic_invariants": [
+        "Upstream behavior: shutdown_background_tasks_until keeps its caller-supplied absolute deadline and its existing teardown order when the provider host feature is absent.",
+        "Enabled product behavior: shutdown_background_tasks_until awaits journey.shutdown(deadline) before the dashboard, dispatch, replay, and catch-up teardown, bounding the worker join and lease reap by the same deadline rather than a fresh budget.",
+        "Enabled product behavior: every journey shutdown failure (worker or replay task past the deadline, outstanding leases, failed reap) is appended to the typed failure list that becomes ShutdownStatus::Failed; none is hidden behind a clean terminal."
+      ],
+      "verification": [
+        "git diff --check",
+        "python3 scripts/product/check-upstream-ownership-registry.py --repo .",
+        "python3 scripts/product/check-patch-footprint-policy.py --repo ."
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::observation_journey::tests",
+        "cargo test --locked -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss"
+      ],
+      "bead_ids": [
+        "tdmem-0502"
+      ],
+      "line_budget": 12,
+      "rebase_or_removal_plan": "Remove the feature-gated journey shutdown block and restore the unused deadline binding; the remaining shutdown sequence is upstream-owned and unchanged.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "minimal_mount",
+        "rationale": "One feature-gated await on the existing deadline-bearing shutdown path; removable atomically with the optional host feature."
       }
     },
     {
@@ -724,7 +1287,8 @@
       "semantic_invariants": [
         "Upstream behavior: retained project and profile operations continue to resolve through the owner-bound Native memory authority when the provider host feature is absent.",
         "Enabled product behavior: memory-provider-host gates only the Native adapter module and parity fixture; provider calls remain behind registry composition and cannot replace canonical Native ownership.",
-        "The retained owner keeps exact project scope, request admission, cancellation, deadlines, receipts, and terminal mappings independent of provider availability."
+        "The retained owner keeps exact project scope, request admission, cancellation, deadlines, receipts, and terminal mappings independent of provider availability.",
+        "Enabled product behavior: the observation_journey module declaration is the only retained-owner seam for the durable observation journal; the journal is delivery-status authority only and never a second authority for Native facts."
       ],
       "verification": [
         "git diff --check",
@@ -734,7 +1298,8 @@
       "tests": [
         "python3 tests/product_memory_composition_feature_test.py",
         "python3 tests/product_memory_fabric_disabled_mode_test.py",
-        "cargo test --locked -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss"
+        "cargo test --locked -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss",
+        "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::observation_journey::tests"
       ],
       "bead_ids": [
         "tdmem-0401",
@@ -742,7 +1307,8 @@
         "tdmem-0403",
         "tdmem-0404",
         "tdmem-0405",
-        "tdmem-1204"
+        "tdmem-1204",
+        "tdmem-0502"
       ],
       "line_budget": 12,
       "rebase_or_removal_plan": "Remove the two feature-gated module declarations and parity module path while leaving all existing retained project/profile authorities and their disabled behavior unchanged.",
@@ -884,6 +1450,38 @@
       }
     },
     {
+      "path": "crates/tracedecay/src/daemon/production_harness.rs",
+      "area_id": "shutdown_deadline",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "production_harness_shutdown",
+      "rationale": "Use the production absolute-deadline shutdown API in the test-transport harness instead of the cfg(test)-only convenience method.",
+      "semantic_invariants": [
+        "Upstream behavior: the production-composition harness retains its established teardown order and waits for invocation shutdown before detached project servers.",
+        "Product behavior: test-transport builds consume the same bounded daemon shutdown deadline and compile without a cfg(test)-only method."
+      ],
+      "verification": [
+        "git diff --check",
+        "kache cargo -- check -p tracedecay --lib --features test-transport --locked",
+        "cargo test -p tracedecay fresh_profile_first_reconcile_makes_query_authority_ready_within_existing_bound --locked"
+      ],
+      "tests": [
+        "cargo test -p tracedecay fresh_profile_first_reconcile_makes_query_authority_ready_within_existing_bound --locked"
+      ],
+      "bead_ids": [
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "line_budget": 62,
+      "rebase_or_removal_plan": "Drop this caller adaptation when upstream exposes the same bounded production-harness shutdown path or removes the cfg(test)-only convenience method.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Calling the production deadline-aware API from test transport is a provider-neutral lifecycle correctness fix."
+      }
+    },
+    {
       "path": "crates/tracedecay/src/daemon/service/invocation/lsp.rs",
       "area_id": "shutdown_deadline",
       "owner": "BleedingDev",
@@ -1007,6 +1605,470 @@
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The memory-suite harness reuse is a deterministic integration-test correction suitable for upstream convergence."
+      }
+    },
+    {
+      "path": "crates/tracedecay-global-db/src/configuration/registry.rs",
+      "area_id": "memory_provider_configuration_gate",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "exception",
+      "exception": {
+        "zone": "native_database_internals",
+        "adr": "product/architecture/adr/ADR-0012-configuration-registry-additive-settings.md",
+        "why_unavoidable": "ConfigurationRegistry::core() is the only place a project setting can be declared with a scope, sensitivity, restart requirement, default, and a place in the transactional revision/rollback machinery. The application layer consumes an already-produced snapshot and the composition root reads settings rather than declaring them, so no product-owned crate can make these two settings exist.",
+        "alternatives_rejected": [
+          "Read the memory settings from a product-owned side table instead of the registry",
+          "Fork the configuration registry into a product-owned crate",
+          "Hard-code the provider composition as always-on and drop the settings",
+          "Gate the provider on an environment variable or build feature only"
+        ],
+        "policy_revision": "patch-footprint.v2",
+        "rollback_plan": "Delete the two setting registrations and the validated routing default from register_project_settings; the surrounding settings vector and every other key are untouched, so the file returns to its upstream shape."
+      },
+      "rationale": "Declare memory.provider_native_enabled.v1 (Boolean, default false) and the recall-routing setting (validated MemoryProviderRecallRoutingV1 document) beside the settings the registry already owns, both Public and DaemonRestart.",
+      "semantic_invariants": [
+        "Additive only: no existing setting's default, scope, sensitivity, or restart requirement changes.",
+        "The Native provider default stays false, so mounting the provider composition remains an explicit per-project decision.",
+        "The routing default is validated before registration and a validation failure is a typed InvalidDefinition rather than a silently skipped setting.",
+        "No schema, migration, transaction, lineage, or recovery path in the zone is touched."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-global-db configuration"
+      ],
+      "bead_ids": [
+        "tdmem-0402",
+        "tdmem-0607"
+      ],
+      "line_budget": 40,
+      "rebase_or_removal_plan": "Re-apply two additive registrations onto the upstream settings vector; remove them entirely if upstream gains a settings-extension seam a product crate can use.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Two additive settings with closed defaults; upstream could adopt them or offer an extension seam that removes the exception."
+      }
+    },
+    {
+      "path": "crates/tracedecay-global-db/src/configuration/store.rs",
+      "area_id": "memory_provider_configuration_gate",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "exception",
+      "exception": {
+        "zone": "native_database_internals",
+        "adr": "product/architecture/adr/ADR-0012-configuration-registry-additive-settings.md",
+        "why_unavoidable": "Additive-key reconciliation is what lets a profile created before a setting existed gain it instead of failing; the list lives beside the registry in the same zone and has no seam above it.",
+        "alternatives_rejected": [
+          "Read the memory settings from a product-owned side table instead of the registry",
+          "Fork the configuration registry into a product-owned crate",
+          "Hard-code the provider composition as always-on and drop the settings",
+          "Gate the provider on an environment variable or build feature only"
+        ],
+        "policy_revision": "patch-footprint.v2",
+        "rollback_plan": "Remove the two keys from the additive-key list; the list returns to its single upstream entry and pre-existing stored values become inert rows the registry ignores."
+      },
+      "rationale": "Add the two memory-provider setting keys to the existing additive-key reconciliation list next to INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY so existing profiles gain them on reconciliation.",
+      "semantic_invariants": [
+        "Additive only: the reconciliation rule itself is unchanged and the pre-existing key keeps its behavior.",
+        "Reconciliation stays idempotent for a profile that already carries the keys.",
+        "No protected-change, rollback, or snapshot semantics are altered."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-global-db configuration"
+      ],
+      "bead_ids": [
+        "tdmem-0402",
+        "tdmem-0607"
+      ],
+      "line_budget": 20,
+      "rebase_or_removal_plan": "Re-apply two entries to the additive-key list, or delete them with the registrations.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Mechanical additive-list extension that upstream would carry with the settings themselves."
+      }
+    },
+    {
+      "path": "crates/tracedecay-domain/src/configuration.rs",
+      "area_id": "memory_provider_configuration_gate",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "configuration_registry_mount",
+      "rationale": "Declare the memory.provider_native_enabled.v1 and memory.provider_recall_routing.v1 setting keys and the typed MemoryProviderRecallRoutingV1 document with its validation.",
+      "semantic_invariants": [
+        "The key list stays the single registry contract; both keys are additive and typed.",
+        "MemoryProviderRecallRoutingV1::validate rejects blank identities, zero fallback revisions, fallback without an active provider, and self-targeting fallback."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-domain configuration"
+      ],
+      "bead_ids": [
+        "tdmem-0607"
+      ],
+      "line_budget": 90,
+      "rebase_or_removal_plan": "Remove the two key constants and the routing document type as one additive patch if upstream adopts equivalent settings.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Additive typed setting with a closed default."
+      }
+    },
+    {
+      "path": "crates/tracedecay-usecases/src/config/mod.rs",
+      "area_id": "memory_provider_configuration_gate",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "configuration_registry_mount",
+      "rationale": "Read the two memory-provider settings from the resolved snapshot into the use-case runtime configuration the daemon composition consumes.",
+      "semantic_invariants": [
+        "Both fields are required from the snapshot and the routing document is validated before the configuration is pinned; a malformed document fails project open as a typed configuration error."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-usecases config"
+      ],
+      "bead_ids": [
+        "tdmem-0607"
+      ],
+      "line_budget": 60,
+      "rebase_or_removal_plan": "Delete the two fields and the routing reader together with the composition-root consumer.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Additive typed setting with a closed default."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/config.rs",
+      "area_id": "memory_provider_configuration_gate",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "configuration_registry_mount",
+      "rationale": "Mirror the two memory-provider settings on the legacy config shape with serde defaults so migration fixtures and snapshot materialization stay complete.",
+      "semantic_invariants": [
+        "Legacy config.json without the keys decodes to the closed defaults.",
+        "Snapshot materialization validates the routing document the same way the use-case reader does."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host config::tests::memory_provider_recall_routing_defaults_to_no_active_provider_and_validates"
+      ],
+      "bead_ids": [
+        "tdmem-0607"
+      ],
+      "line_budget": 60,
+      "rebase_or_removal_plan": "Delete the two fields and the routing reader as one additive patch.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Additive typed setting with a closed default."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/config/tests.rs",
+      "area_id": "memory_provider_configuration_gate",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "configuration_registry_mount",
+      "rationale": "Prove the closed defaults, legacy decoding, round-trip, and fail-closed validation of the two memory-provider settings.",
+      "semantic_invariants": [
+        "Defaults are off/none; contradictory routing documents are rejected."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host config::tests::memory_provider_recall_routing_defaults_to_no_active_provider_and_validates"
+      ],
+      "bead_ids": [
+        "tdmem-0607"
+      ],
+      "line_budget": 175,
+      "rebase_or_removal_plan": "Delete the two tests with the fields.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Additive typed setting with a closed default."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/session_sync.rs",
+      "area_id": "session_sync_scope_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_composition_mount",
+      "rationale": "Add the project-open ResolvedScope field to DaemonSessionSyncConfig so the composition root can hand session-sync the exact scope it already resolved once, instead of session-sync deriving its own.",
+      "semantic_invariants": [
+        "The scope field carries the authoritative project-open ResolvedScope verbatim; no other configuration field changes shape."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay daemon::session_sync"
+      ],
+      "bead_ids": [
+        "tdmem-0603",
+        "tdmem-0502"
+      ],
+      "line_budget": 5,
+      "rebase_or_removal_plan": "Remove the scope field and its doc comment.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A configuration field carrying an already-resolved value is a narrow, provider-neutral plumbing change."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/session_sync/git_topology.rs",
+      "area_id": "session_sync_scope_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_composition_mount",
+      "rationale": "Replace the re-derivation of ResolvedScope from project_root with the scope carried on SessionSyncProjectContext, removing a duplicate identity-resolution path and its distinct failure mode.",
+      "semantic_invariants": [
+        "Git-topology sync never calls resolved_scope_for_project itself; it clones the context's already-bound scope.",
+        "The prior Unavailable failure path for a scope-resolution error at sync time is removed because that resolution no longer happens here."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay daemon::session_sync::git_topology"
+      ],
+      "bead_ids": [
+        "tdmem-0603",
+        "tdmem-0502"
+      ],
+      "line_budget": 10,
+      "rebase_or_removal_plan": "Restore the resolved_scope_for_project(...) call in place of self.scope.clone().",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Removing a redundant identity re-derivation is a general correctness fix upstream can take independently."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/session_sync/project_lifecycle.rs",
+      "area_id": "session_sync_scope_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_composition_mount",
+      "rationale": "Add the scope field to SessionSyncProjectContext and wire it from DaemonSessionSyncConfig at registration, so the context carries the same authoritative scope its config was given.",
+      "semantic_invariants": [
+        "SessionSyncProjectContext.scope is populated only from config.scope at register_project time; it is never independently resolved."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay daemon::session_sync::project_lifecycle"
+      ],
+      "bead_ids": [
+        "tdmem-0603",
+        "tdmem-0502"
+      ],
+      "line_budget": 4,
+      "rebase_or_removal_plan": "Remove the scope field and its assignment in register_project.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A one-field plumbing change to carry an already-resolved value."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/session_sync/project_lifecycle_tests.rs",
+      "area_id": "session_sync_scope_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_composition_mount",
+      "rationale": "Update the project-lifecycle test fixtures to resolve and pass the new required scope field on DaemonSessionSyncConfig so existing registration and recovery tests keep constructing a valid config.",
+      "semantic_invariants": [
+        "Each fixture resolves scope through the same resolved_scope_for_project used by production callers before construction, so tests exercise the real production shape."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay daemon::session_sync::project_lifecycle"
+      ],
+      "bead_ids": [
+        "tdmem-0603",
+        "tdmem-0502"
+      ],
+      "line_budget": 12,
+      "rebase_or_removal_plan": "Drop the resolved scope local bindings and the scope field from each fixture's config construction.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Test-fixture updates that mirror a narrow production field addition."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/session_sync_tests.rs",
+      "area_id": "session_sync_scope_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_composition_mount",
+      "rationale": "Update the session-sync test fixture to resolve and pass the new required scope field on DaemonSessionSyncConfig so the existing cancel/alias-activation regression test keeps constructing a valid config.",
+      "semantic_invariants": [
+        "The fixture resolves scope through the same resolved_scope_for_project used by production callers before construction."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay daemon::session_sync"
+      ],
+      "bead_ids": [
+        "tdmem-0603",
+        "tdmem-0502"
+      ],
+      "line_budget": 4,
+      "rebase_or_removal_plan": "Drop the resolved scope local binding and the scope field from the fixture's config construction.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Test-fixture update mirroring a narrow production field addition."
+      }
+    },
+    {
+      "path": "crates/tracedecay-usecases/src/diagnostics_query.rs",
+      "area_id": "diagnostics_publication_evidence_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "recall_context_mount",
+      "rationale": "Add a PublicationLedgerUninitialized coverage variant and classify current_generation()'s read failure against the ledger's own existence, so a fresh project with no publication yet is distinguished from a genuine store fault instead of both rendering as StoreUnavailable.",
+      "semantic_invariants": [
+        "An absent publication ledger yields PublicationLedgerUninitialized, never StoreUnavailable; a read failure against an existing ledger stays StoreUnavailable.",
+        "The raw engine 'no such table' error text is never surfaced as a store-fault reason for an uninitialized ledger."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-usecases diagnostics_query"
+      ],
+      "bead_ids": [
+        "tdmem-1009"
+      ],
+      "line_budget": 115,
+      "rebase_or_removal_plan": "Remove the PublicationLedgerUninitialized variant and revert current_generation() to report every read failure as StoreUnavailable.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A general diagnostics-evidence correctness fix independent of any concrete memory provider."
+      }
+    },
+    {
+      "path": "crates/tracedecay-usecases/src/diagnostics_store.rs",
+      "area_id": "diagnostics_publication_evidence_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "recall_context_mount",
+      "rationale": "Add a read-only publication_ledger_initialized() probe that checks whether the generation-publications table exists, without ever creating it, so diagnostics_query can tell an unpublished project apart from a store fault.",
+      "semantic_invariants": [
+        "publication_ledger_initialized() never creates the ledger table; it is a pure existence check.",
+        "ensure_schema() remains the only path that creates the publication ledger, and only a publisher calls it."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-usecases diagnostics_store"
+      ],
+      "bead_ids": [
+        "tdmem-1009"
+      ],
+      "line_budget": 36,
+      "rebase_or_removal_plan": "Remove publication_ledger_initialized() and the GENERATION_PUBLICATIONS_TABLE constant.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A narrow read-only existence probe supporting the same general diagnostics-evidence fix."
+      }
+    },
+    {
+      "path": "crates/tracedecay-usecases/src/primitives/production.rs",
+      "area_id": "diagnostics_publication_evidence_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "recall_context_mount",
+      "rationale": "Add current_diagnostic_generation() to map the new PublicationLedgerUninitialized coverage (and every other non-Complete coverage) onto OmissionReason::Unavailable, so extended-primitive evidence never claims a terminal absence for a state that settles once a publisher runs.",
+      "semantic_invariants": [
+        "current_diagnostic_generation() maps only (Some(generation), Complete) to a resolved generation; every other combination is Unavailable, never a silently-defaulted value.",
+        "No coverage variant is treated as terminal here; only OmissionReason::Unsupported (handled elsewhere) is terminal."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-usecases primitives::production"
+      ],
+      "bead_ids": [
+        "tdmem-1009"
+      ],
+      "line_budget": 84,
+      "rebase_or_removal_plan": "Remove current_diagnostic_generation() and restore the inline current.generation/coverage match at its call site.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A typed mapping helper supporting the same general diagnostics-evidence fix."
+      }
+    },
+    {
+      "path": "crates/tracedecay-usecases/src/primitives/runtime.rs",
+      "area_id": "diagnostics_publication_evidence_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "recall_context_mount",
+      "rationale": "Update diagnostics_absence_problem() and its documentation/tests so every non-terminal OmissionReason (including the new unpublished-ledger case) stays retryable, and only OmissionReason::Unsupported remains a terminal application problem.",
+      "semantic_invariants": [
+        "Only OmissionReason::Unsupported yields a terminal, empty-legal-actions problem; every other reason (None, Stale, Unavailable, Failed) yields a retryable ApplicationProblemKind::Unavailable with a non-Never retry directive."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-usecases primitives::runtime"
+      ],
+      "bead_ids": [
+        "tdmem-1009"
+      ],
+      "line_budget": 53,
+      "rebase_or_removal_plan": "Restore the prior doc wording and the two-reason (Stale-only-retryable) test assertions.",
+      "status": "active",
+      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A doc/test-only clarification of retry semantics supporting the same general diagnostics-evidence fix."
       }
     }
   ],

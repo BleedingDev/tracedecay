@@ -845,6 +845,9 @@ async fn cancel_in_alias_activation_gap_mirrors_primary_terminal_receipt() {
     let profile_sessions = runtime
         .registered_database_arc(tracedecay_sessions::admission::HostAdmissionScope::Profile)
         .unwrap();
+    let scope =
+        crate::daemon::project_open_owners::resolved_scope_for_project(&project_root, &project_id)
+            .unwrap();
     let service = DaemonSessionSyncService::default();
     service
         .register_project(DaemonSessionSyncConfig {
@@ -853,6 +856,7 @@ async fn cancel_in_alias_activation_gap_mirrors_primary_terminal_receipt() {
             project_id: project_id.clone(),
             profile_root: profile_root.path().to_path_buf(),
             project_root,
+            scope,
             transcript_source_home: None,
             project_sessions,
             user_sessions: profile_sessions.clone(),

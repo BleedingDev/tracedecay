@@ -200,10 +200,27 @@ fn duplicate_observation_is_idempotent() -> Result<(), Box<dyn Error>> {
     let item = observation(1, "same observation");
     let first = provider.observe(&request, item.clone());
     assert_eq!(first.terminal_code, TerminalCode::Success);
+    assert_eq!(first.committed_effect, CommittedEffectState::Committed);
     let generation = provider.state_generation();
-    let duplicate = provider.observe(&request, item);
+    // An at-least-once redelivery reaches the provider as a *new* operation that
+    // carries the same idempotency key, so the acknowledgement has to name the
+    // earlier operation that actually committed the effect.
+    let redelivery = OperationContext {
+        operation_id: "operation-duplicate-retry".to_owned(),
+        ..context(SCOPE_A, generation, "duplicate")
+    };
+    let duplicate = provider.observe(&redelivery, item);
     assert_eq!(duplicate.terminal_code, TerminalCode::Success);
-    assert_eq!(duplicate.committed_effect, CommittedEffectState::None);
+    assert_eq!(duplicate.committed_effect, CommittedEffectState::Duplicate);
+    assert_eq!(
+        duplicate.duplicate_of_idempotency_key.as_deref(),
+        Some("duplicate")
+    );
+    assert_eq!(
+        duplicate.duplicate_of_operation_id.as_deref(),
+        Some("operation-duplicate")
+    );
+    assert_eq!(duplicate.state_generation, generation);
     let result = payload(duplicate, "duplicate observe")?;
     assert_eq!(
         result.acceptance,

@@ -450,6 +450,12 @@ pub struct McpServer {
     /// project-server lifetime. Disabled composition is an inert enum value.
     #[cfg(feature = "memory-provider-host")]
     _memory_provider_host_mount: Option<MemoryProviderHostMount>,
+    #[cfg(feature = "memory-provider-host")]
+    _observation_journey_mount: Option<ObservationJourneyMount>,
+    /// Retains the cognitive-recall route so session recall ports can be
+    /// minted against this project server's exact scope and admission ledger.
+    #[cfg(feature = "memory-provider-host")]
+    cognitive_recall_mount: Option<CognitiveRecallMount>,
     /// Daemon-owned route liveness. A failed post-open health check revokes
     /// every tool on retained transports before cache retirement can await.
     project_server_live: Option<Arc<AtomicBool>>,
@@ -789,6 +795,10 @@ impl McpServer {
             delivery_settlement_recorder,
             #[cfg(feature = "memory-provider-host")]
             memory_provider_host_mount,
+            #[cfg(feature = "memory-provider-host")]
+            observation_journey_mount,
+            #[cfg(feature = "memory-provider-host")]
+            cognitive_recall_mount,
             project_server_live,
             #[cfg(any(test, feature = "test-transport"))]
             host_admission_test_runtime,
@@ -1071,6 +1081,10 @@ impl McpServer {
             delivery_settlement_recorder,
             #[cfg(feature = "memory-provider-host")]
             _memory_provider_host_mount: memory_provider_host_mount,
+            #[cfg(feature = "memory-provider-host")]
+            _observation_journey_mount: observation_journey_mount,
+            #[cfg(feature = "memory-provider-host")]
+            cognitive_recall_mount,
             project_server_live,
             project_server_lifecycle: ProjectServerResponseLifecycle::default(),
             dispatch_authority: RetainedDispatchAuthority::new(dispatch_server.clone()),
@@ -1134,6 +1148,35 @@ impl McpServer {
     /// Returns the active scope prefix, if the server was launched from a subdirectory.
     pub fn scope_prefix(&self) -> Option<&str> {
         self.scope_prefix.as_deref()
+    }
+
+    /// Mints the cognitive-recall port for one canonical host session over
+    /// this project server's provider composition.
+    ///
+    /// The port binds every request to the exact scope this server was
+    /// opened for and retains each admission report in the project's durable
+    /// admission ledger before delivering a result. A server whose provider
+    /// composition is disabled has no recall route, which is a typed state.
+    #[cfg(feature = "memory-provider-host")]
+    pub fn cognitive_recall_port_for_session(
+        &self,
+        canonical_session_id: &str,
+    ) -> std::result::Result<
+        tracedecay_memory_provider_registry::ProjectCognitiveRecallPortV1,
+        crate::daemon::retained_owner::cognitive_recall::CognitiveRecallMountError,
+    > {
+        use crate::daemon::retained_owner::cognitive_recall::CognitiveRecallMountError;
+        match self.cognitive_recall_mount.as_ref() {
+            Some(mount) => mount.port_for_session(canonical_session_id),
+            None if self
+                ._memory_provider_host_mount
+                .as_ref()
+                .is_some_and(|mount| mount.registry().is_some()) =>
+            {
+                Err(CognitiveRecallMountError::NoActiveProviderConfigured)
+            }
+            None => Err(CognitiveRecallMountError::CompositionDisabled),
+        }
     }
 
     #[cfg(all(test, feature = "memory-provider-host"))]

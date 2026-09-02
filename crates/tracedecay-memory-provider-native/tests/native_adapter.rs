@@ -12,8 +12,9 @@ use tracedecay_memory_provider_api::contract::{
 use tracedecay_memory_provider_api::{
     ApiError, CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
     HandshakeRequest, HandshakeRequestParts, HandshakeResponse, MemoryProvider, OperationControl,
-    OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderCallParts,
-    ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
+    OwnedExactScope, OwnedProviderId, OwnedVersionedId, PayloadSanitizationReceipt,
+    PayloadSanitizationReceiptParts, ProviderCall, ProviderCallParts, ProviderDescriptor,
+    ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
 };
 use tracedecay_memory_provider_native::{
     NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
@@ -23,6 +24,8 @@ use tracedecay_memory_provider_native::{
 
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const ONE_SHA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const RESOLVED_SCOPE_DIGEST: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const FIXTURE_SHA: &str = "ffbc2dfc402782325da71132100e74ff511d1585dd80e4ea196ed4bcace3fef2";
 const FACT_SHAPED_OBSERVATION_SHA: &str =
     "345f350426c8d55ebaa4b10c41862eaeae8b910cd3dceb939ef3d256885c5c6d";
@@ -305,7 +308,7 @@ fn scope() -> OwnedExactScope {
         "worktree-a",
         "refs/heads/main",
         "session-a",
-        3,
+        RESOLVED_SCOPE_DIGEST,
     )
     .expect("scope")
 }
@@ -387,7 +390,27 @@ fn call(provider_id: &str, operation: ProviderOperation) -> ProviderCall {
         ],
         extensions: Vec::new(),
     })
+    .map(admitted)
     .expect("call")
+}
+
+/// Sanitizer revision this harness stands in for. The real revision is derived
+/// by `tracedecay-memory-hygiene` from the canonical policy document.
+const TEST_SANITIZER_REVISION: &str = "tracedecay.memory.observation.hygiene.v1+native-test";
+
+/// Attaches the receipt the admitted hygiene pipeline mints for a payload it
+/// read and left byte-identical. Observation dispatch fails closed without one.
+fn admitted(call: ProviderCall) -> ProviderCall {
+    if call.operation != ProviderOperation::Observe {
+        return call;
+    }
+    let receipt =
+        PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts::accepted_unmodified(
+            TEST_SANITIZER_REVISION,
+            call.payload.sha256.clone(),
+        ))
+        .expect("accepted sanitization receipt");
+    call.with_sanitization(receipt)
 }
 
 fn observation_call(json: &str, payload_sha256: &str) -> ProviderCall {
@@ -398,7 +421,9 @@ fn observation_call(json: &str, payload_sha256: &str) -> ProviderCall {
         payload_sha256,
     )
     .expect("observation payload");
-    request
+    // The receipt binds the payload digest, so replacing the payload requires
+    // re-admitting the call rather than carrying a receipt for other bytes.
+    admitted(request)
 }
 
 fn handshake(provider_id: &str) -> HandshakeRequest {
@@ -966,13 +991,15 @@ fn undeclared_optional_operations_are_unsupported_without_port_contact() {
             reply.terminal.committed_effect().state(),
             CommittedEffectState::None
         );
+        // A pre-dispatch refusal observes exactly the generation the call was
+        // addressed to; the fabric refuses replies that omit that evidence.
         assert_eq!(
             reply.terminal.committed_effect().state_generation_before(),
-            None
+            Some(request.expected_state_generation)
         );
         assert_eq!(
             reply.terminal.committed_effect().state_generation_after(),
-            None
+            Some(request.expected_state_generation)
         );
         assert_eq!(
             reply.terminal.fallback().eligibility(),
@@ -1246,6 +1273,9 @@ fn fact_shaped_generic_observation_is_rejected_by_native_authority() {
         FACT_SHAPED_OBSERVATION_SHA,
     )
     .expect("fact-shaped observation");
+    // Re-admit: the receipt binds the payload digest, so a replaced payload
+    // needs a receipt for the bytes actually dispatched.
+    let request = admitted(request);
     let reply = provider.invoke(&request);
     assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
     assert_eq!(
@@ -1258,11 +1288,11 @@ fn fact_shaped_generic_observation_is_rejected_by_native_authority() {
     );
     assert_eq!(
         reply.terminal.committed_effect().state_generation_before(),
-        None
+        Some(request.expected_state_generation)
     );
     assert_eq!(
         reply.terminal.committed_effect().state_generation_after(),
-        None
+        Some(request.expected_state_generation)
     );
     assert_eq!(reply.terminal.provider_receipt_sha256(), None);
     assert_eq!(reply.payload, None);

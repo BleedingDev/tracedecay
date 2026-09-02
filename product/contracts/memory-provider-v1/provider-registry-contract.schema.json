@@ -478,7 +478,8 @@
         "duplicate_provider_id_policy",
         "unknown_provider_policy",
         "adapter_construction_boundary",
-        "public_surface_provider_branching"
+        "public_surface_provider_branching",
+        "recall_scope_bindings"
       ],
       "properties": {
         "type_name": {
@@ -492,7 +493,7 @@
         },
         "required_fields": {
           "type": "array",
-          "minItems": 7,
+          "minItems": 8,
           "uniqueItems": true,
           "items": {
             "type": "string"
@@ -536,6 +537,60 @@
         },
         "public_surface_provider_branching": {
           "const": false
+        },
+        "recall_scope_bindings": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "declared_by",
+            "provider_may_self_declare",
+            "values",
+            "value_source",
+            "provider_declarations",
+            "admission_input",
+            "unauthorized_binding_policy"
+          ],
+          "properties": {
+            "declared_by": {
+              "type": "string",
+              "minLength": 1
+            },
+            "provider_may_self_declare": {
+              "const": false
+            },
+            "values": {
+              "const": [
+                "exact_coding_scope",
+                "project_facts",
+                "profile_facts"
+              ]
+            },
+            "value_source": {
+              "type": "string",
+              "minLength": 1
+            },
+            "provider_declarations": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "enum": [
+                    "exact_coding_scope",
+                    "project_facts",
+                    "profile_facts"
+                  ]
+                }
+              }
+            },
+            "admission_input": {
+              "const": "recorded_registration_passed_with_the_admitted_call"
+            },
+            "unauthorized_binding_policy": {
+              "const": "reject_scope_binding_unauthorized"
+            }
+          }
         }
       }
     },

@@ -303,6 +303,52 @@
         "ADR-0002",
         "ADR-0006"
       ]
+    },
+    {
+      "id": "ADR-0011",
+      "topic": "patch_footprint_revision_v2",
+      "title": "Revise the patch-footprint policy to v2 for the mounted memory milestones",
+      "path": "product/architecture/adr/ADR-0011-patch-footprint-revision-v2.md",
+      "status": "accepted",
+      "decision_summary": "Adopt policy revision patch-footprint.v2, setting each hard upstream cap to the footprint measured at the revision tree plus at most roughly fifteen percent headroom, while leaving allowed touch points, exception zones, product-owned paths, dependency rules, and per-entry line budgets unchanged.",
+      "required_rejections": [
+        "Leave the v1 caps and let the gate fail",
+        "Raise the caps far above the measurement to avoid future ADRs",
+        "Move the mounts into product-owned crates to stay inside v1",
+        "Delete the per-entry line budgets and keep only the aggregate caps"
+      ],
+      "verification_beads": [
+        "tdmem-0105",
+        "tdmem-1204",
+        "tdmem-1208"
+      ],
+      "depends_on_adrs": [
+        "ADR-0003",
+        "ADR-0008"
+      ]
+    },
+    {
+      "id": "ADR-0012",
+      "topic": "configuration_registry_additive_settings",
+      "title": "Register memory-provider settings in the upstream configuration registry as a bounded exception",
+      "path": "product/architecture/adr/ADR-0012-configuration-registry-additive-settings.md",
+      "status": "accepted",
+      "decision_summary": "Grant a two-file, additive-only exception in the native_database_internals zone so the upstream configuration registry can declare memory.provider_native_enabled.v1 and the recall-routing setting with a disabled default, a daemon-restart requirement, and additive reconciliation for existing profiles.",
+      "required_rejections": [
+        "Read the memory settings from a product-owned side table instead of the registry",
+        "Fork the configuration registry into a product-owned crate",
+        "Hard-code the provider composition as always-on and drop the settings",
+        "Gate the provider on an environment variable or build feature only"
+      ],
+      "verification_beads": [
+        "tdmem-0402",
+        "tdmem-0607"
+      ],
+      "depends_on_adrs": [
+        "ADR-0002",
+        "ADR-0008",
+        "ADR-0011"
+      ]
     }
   ]
 }

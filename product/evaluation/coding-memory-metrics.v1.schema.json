@@ -1,0 +1,261 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracedecay.dev/product/evaluation/coding-memory-metrics.v1.schema.json",
+  "title": "Coding-memory metric catalog v1",
+  "description": "Versioned, provider-neutral definitions of the quality, safety, cost, and latency metrics computed over runs of the tdmem-0901 scenario corpus. Every metric pins its numerator, denominator population, unresolved-label policy, zero-population policy, unit, direction, aggregation, determinism, and safety-gating flag.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "catalog_id",
+    "catalog_version",
+    "bead_id",
+    "title",
+    "corpus_binding",
+    "terminal_contract_binding",
+    "label_vocabulary",
+    "task_outcome_vocabulary",
+    "provenance_state_vocabulary",
+    "percentile_method",
+    "unresolved_label_policies",
+    "zero_population_policies",
+    "safety_gate",
+    "aggregate_task_score",
+    "verdict_rule",
+    "safety_critical_checks",
+    "metrics"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "catalog_id": { "const": "tracedecay.coding-memory.metrics.v1" },
+    "catalog_version": { "type": "integer", "minimum": 1 },
+    "bead_id": { "const": "tdmem-0904" },
+    "title": { "type": "string", "minLength": 1 },
+    "corpus_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["corpus_id", "schema_version", "bead_id"],
+      "properties": {
+        "corpus_id": { "const": "tracedecay.coding-memory.scenarios.v1" },
+        "schema_version": { "const": 1 },
+        "bead_id": { "const": "tdmem-0901" }
+      }
+    },
+    "terminal_contract_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_id", "schema_version"],
+      "properties": {
+        "contract_id": { "const": "tracedecay.memory.provider.terminal.v1" },
+        "schema_version": { "const": 1 }
+      }
+    },
+    "label_vocabulary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "labels", "resolved_labels", "unresolved_labels", "reconciliation"],
+      "properties": {
+        "version": { "type": "integer", "minimum": 1 },
+        "labels": { "$ref": "#/$defs/label_list" },
+        "resolved_labels": { "$ref": "#/$defs/label_list" },
+        "unresolved_labels": { "$ref": "#/$defs/label_list" },
+        "reconciliation": { "type": "string", "minLength": 1 }
+      }
+    },
+    "task_outcome_vocabulary": {
+      "type": "array",
+      "minItems": 3,
+      "uniqueItems": true,
+      "items": { "enum": ["pass", "fail", "indeterminate"] }
+    },
+    "provenance_state_vocabulary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["complete", "incomplete", "rationale"],
+      "properties": {
+        "complete": { "$ref": "#/$defs/provenance_state_list" },
+        "incomplete": { "$ref": "#/$defs/provenance_state_list" },
+        "rationale": { "type": "string", "minLength": 1 }
+      }
+    },
+    "percentile_method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "definition"],
+      "properties": {
+        "name": { "const": "nearest_rank" },
+        "definition": { "type": "string", "minLength": 1 }
+      }
+    },
+    "unresolved_label_policies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exclude_and_report", "indeterminate_if_any", "not_label_based"],
+      "properties": {
+        "exclude_and_report": { "type": "string", "minLength": 1 },
+        "indeterminate_if_any": { "type": "string", "minLength": 1 },
+        "not_label_based": { "type": "string", "minLength": 1 }
+      }
+    },
+    "zero_population_policies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["not_applicable", "indeterminate"],
+      "properties": {
+        "not_applicable": { "type": "string", "minLength": 1 },
+        "indeterminate": { "type": "string", "minLength": 1 }
+      }
+    },
+    "safety_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule",
+        "indeterminate_policy",
+        "missing_evidence_policy",
+        "provider_failure_policy",
+        "aggregate_task_score_can_hide_safety"
+      ],
+      "properties": {
+        "rule": { "type": "string", "minLength": 1 },
+        "indeterminate_policy": { "const": "record_indeterminate_and_fail_the_safety_gate" },
+        "missing_evidence_policy": { "const": "indeterminate" },
+        "provider_failure_policy": { "const": "record_typed_failure_without_inference" },
+        "aggregate_task_score_can_hide_safety": { "const": false }
+      }
+    },
+    "aggregate_task_score": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["definition", "coverage_fields"],
+      "properties": {
+        "definition": { "type": "string", "minLength": 1 },
+        "coverage_fields": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "enum": ["resolved_scenarios", "indeterminate_scenarios"] }
+        }
+      }
+    },
+    "verdict_rule": { "type": "string", "minLength": 1 },
+    "safety_critical_checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/check_binding" }
+    },
+    "metrics": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/metric" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "label_list": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": ["useful", "harmful", "stale", "irrelevant", "unverifiable", "indeterminate", "missing"]
+      }
+    },
+    "provenance_state_list": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["available", "redacted", "unavailable", "missing"] }
+    },
+    "check_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scenario_id", "check_ids"],
+      "properties": {
+        "scenario_id": { "$ref": "#/$defs/identifier" },
+        "check_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric_id",
+        "version",
+        "class",
+        "title",
+        "description",
+        "numerator",
+        "denominator",
+        "unit",
+        "direction",
+        "aggregation",
+        "determinism",
+        "safety_gating",
+        "ceiling",
+        "inputs",
+        "applicable_scenarios",
+        "rubric_check_bindings"
+      ],
+      "properties": {
+        "metric_id": { "$ref": "#/$defs/identifier" },
+        "version": { "type": "integer", "minimum": 1 },
+        "class": { "enum": ["quality", "safety", "cost", "latency"] },
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 },
+        "numerator": { "type": "string", "minLength": 1 },
+        "denominator": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["population", "unresolved_label_policy", "zero_population_policy"],
+          "properties": {
+            "population": { "type": "string", "minLength": 1 },
+            "unresolved_label_policy": {
+              "enum": ["exclude_and_report", "indeterminate_if_any", "not_label_based"]
+            },
+            "zero_population_policy": { "enum": ["not_applicable", "indeterminate"] }
+          }
+        },
+        "unit": { "enum": ["ratio", "count", "microseconds", "seconds", "tokens"] },
+        "direction": { "enum": ["higher_is_better", "lower_is_better"] },
+        "aggregation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["per_scenario", "per_provider"],
+          "properties": {
+            "per_scenario": { "enum": ["single_value", "ratio", "nearest_rank_percentile"] },
+            "per_provider": {
+              "enum": ["pooled_ratio", "sum", "mean", "pooled_nearest_rank_percentile"]
+            }
+          }
+        },
+        "determinism": { "enum": ["deterministic", "nondeterministic"] },
+        "safety_gating": { "type": "boolean" },
+        "ceiling": { "type": ["number", "null"], "minimum": 0 },
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9_.]*$" }
+        },
+        "applicable_scenarios": {
+          "type": ["array", "null"],
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "rubric_check_bindings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/check_binding" }
+        }
+      }
+    }
+  }
+}

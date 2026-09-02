@@ -47,6 +47,12 @@ const CURSOR_PREFIX: &str = "dq1:";
 pub enum DiagnosticQueryCoverage {
     /// The lane returned every matching record.
     Complete,
+    /// The durable publication ledger does not exist yet: no generation has
+    /// ever been published into this project. The store itself is healthy, so
+    /// this is a definite answer rather than a read failure — but it is not
+    /// terminal. The ledger is created by a publisher's first publication, so
+    /// the read settles once one runs.
+    PublicationLedgerUninitialized,
     /// The lane hit the page limit; resume with the page's `next_cursor`.
     Truncated,
     /// The store could not answer (for example a closed connection). The
@@ -312,6 +318,11 @@ impl<'a> DiagnosticsQuery<'a> {
     /// Reads the clean-generation publication pointer. A completed empty
     /// publication returns `Some(generation)` even when it contains no
     /// findings; no pointer is distinct from a clean result.
+    ///
+    /// A failed read is classified against the ledger itself: if the ledger has
+    /// never been created the failure is the expected "nothing published yet"
+    /// state, and the raw engine error (`no such table …`) is not reported as a
+    /// store fault. Any other failure stays a store fault carrying its reason.
     #[hotpath::measure(label = "usecases.diagnostics_query.current_generation", future = true)]
     pub async fn current_generation(&self) -> CurrentDiagnosticGeneration {
         let operation = "diagnostics query current_generation";
@@ -320,13 +331,19 @@ impl<'a> DiagnosticsQuery<'a> {
                 generation,
                 coverage: DiagnosticQueryCoverage::Complete,
             },
-            Err(error) => CurrentDiagnosticGeneration {
-                generation: None,
-                coverage: DiagnosticQueryCoverage::StoreUnavailable {
-                    operation,
-                    reason: error.to_string(),
-                },
-            },
+            Err(error) => {
+                let coverage = match self.store.publication_ledger_initialized().await {
+                    Ok(false) => DiagnosticQueryCoverage::PublicationLedgerUninitialized,
+                    Ok(true) | Err(_) => DiagnosticQueryCoverage::StoreUnavailable {
+                        operation,
+                        reason: error.to_string(),
+                    },
+                };
+                CurrentDiagnosticGeneration {
+                    generation: None,
+                    coverage,
+                }
+            }
         }
     }
 
@@ -1086,7 +1103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_generation_distinguishes_clean_empty_from_unavailable() {
+    async fn current_generation_distinguishes_clean_empty_publication_from_none() {
         let temp = tempfile::tempdir().unwrap();
         let conn = open_store(&temp.path().join("diagnostics.db")).await;
         DiagnosticsStore::new_runtime(&conn)
@@ -1097,16 +1114,82 @@ mod tests {
         let current = query.current_generation().await;
         assert_eq!(current.generation, Some(id(GEN1)));
         assert_eq!(current.coverage, DiagnosticQueryCoverage::Complete);
+    }
 
-        conn.execute_batch("DROP TABLE diagnostic_generation_publications;")
+    /// A project nothing has published into yet is the ordinary fresh-project
+    /// state, not a fault and not a terminal absence: the publication ledger is
+    /// created by the first publication, and the read settles the moment one
+    /// runs. The store read fails with a raw `no such table` engine error, so
+    /// this also pins that the error text is never reported as a store fault.
+    #[tokio::test]
+    async fn unpublished_project_reports_an_uninitialized_ledger_that_later_settles() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = TestConnection::open(&temp.path().join("diagnostics.db"));
+        let query = DiagnosticsQuery::new_runtime(&conn);
+
+        let fresh = query.current_generation().await;
+        assert!(fresh.generation.is_none());
+        assert_eq!(
+            fresh.coverage,
+            DiagnosticQueryCoverage::PublicationLedgerUninitialized
+        );
+
+        // The publisher installs the ledger on its first run; the very same
+        // read now answers Complete, which is what makes the prior state
+        // transient rather than terminal.
+        let store = DiagnosticsStore::new_runtime(&conn);
+        store
+            .ensure_schema()
             .await
-            .expect("drop current-generation authority");
-        let unavailable = query.current_generation().await;
-        assert!(unavailable.generation.is_none());
-        assert!(matches!(
-            unavailable.coverage,
-            DiagnosticQueryCoverage::StoreUnavailable { .. }
-        ));
+            .expect("ensure diagnostics schema");
+        let initialized = query.current_generation().await;
+        assert!(initialized.generation.is_none());
+        assert_eq!(initialized.coverage, DiagnosticQueryCoverage::Complete);
+
+        store
+            .publish_clean_generation(&id(GEN1), &[])
+            .await
+            .expect("publish clean empty generation");
+        let published = query.current_generation().await;
+        assert_eq!(published.generation, Some(id(GEN1)));
+        assert_eq!(published.coverage, DiagnosticQueryCoverage::Complete);
+    }
+
+    /// An initialized ledger keeps read faults typed as faults. This is the
+    /// other half of the distinction: only a *missing* ledger means "nothing
+    /// published", so a ledger that exists but cannot be answered is never
+    /// laundered into that state.
+    #[tokio::test]
+    async fn store_failure_on_an_initialized_ledger_stays_a_store_fault() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = open_store(&temp.path().join("diagnostics.db")).await;
+        DiagnosticsStore::new_runtime(&conn)
+            .publish_clean_generation(&id(GEN1), &[])
+            .await
+            .expect("publish clean empty generation");
+
+        // Break the ledger's single-current invariant behind the reader's back:
+        // the table still exists, so the failing read is a fault.
+        conn.execute_batch(
+            "DROP INDEX idx_diagnostic_generation_current;
+             INSERT INTO diagnostic_generation_publications (
+                 generation_id, record_state, state_generation, published_at
+             ) VALUES ('generation.clean.2', 'current', NULL, 1);",
+        )
+        .await
+        .expect("break the single-current ledger invariant");
+
+        let query = DiagnosticsQuery::new_runtime(&conn);
+        let broken = query.current_generation().await;
+        assert!(broken.generation.is_none());
+        assert!(
+            matches!(
+                broken.coverage,
+                DiagnosticQueryCoverage::StoreUnavailable { .. }
+            ),
+            "an initialized ledger that cannot be read is a fault, got {:?}",
+            broken.coverage
+        );
     }
 
     #[tokio::test]

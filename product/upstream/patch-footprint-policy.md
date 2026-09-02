@@ -8,7 +8,7 @@ Machine-readable policy: [`patch-footprint-policy.json`](./patch-footprint-polic
 
 Keep the pluggable-memory product removable, reviewable, and rebaseable over future TraceDecay V2 checkpoints. Provider contracts, registries, adapters, context compilation, observation delivery, conformance, and provider-specific code belong in additive product-owned crates. Zack-owned code receives only narrow capability mounts.
 
-The immutable comparison floor is PR #707 commit `08fbe33a7c7f403191fd5d6e356c7b6681b96403`.
+The comparison floor is `upstream_floor.sha` in [`patch-footprint-policy.json`](./patch-footprint-policy.json); the sync train advances it together with the canonical metadata `product/upstream/tracedecay-v2-pr707.json`. The first floor was the PR #707 creation head.
 
 ## Quantitative initial budget
 
@@ -82,6 +82,7 @@ files:
 - `crates/tracedecay/src/daemon/tests/ownership.rs`
 - `crates/tracedecay/src/mcp/server.rs`
 - `crates/tracedecay/src/mcp/server/construction.rs`
+- `crates/tracedecay/src/mcp/server/connection.rs`
 
 Provider logic, global mutable provider singletons, unbounded workers, or authority over source/session/Native/configuration state are prohibited.
 

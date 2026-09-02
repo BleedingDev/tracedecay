@@ -113,6 +113,7 @@ jobs:
           set -euo pipefail
           cargo test -p tracedecay-memory-provider-native --locked
           cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_recall_ -- --nocapture
+          cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_baseline -- --nocapture
           python3 tests/product_memory_composition_feature_test.py
           python3 scripts/product/check-memory-composition-feature.py --repo .
       - name: Record Native parity ownership

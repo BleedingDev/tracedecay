@@ -5928,6 +5928,9 @@ dependencies = [
  "tracedecay-lsp",
  "tracedecay-maintenance",
  "tracedecay-mcp",
+ "tracedecay-memory-conformance",
+ "tracedecay-memory-hygiene",
+ "tracedecay-memory-observation",
  "tracedecay-memory-provider-registry",
  "tracedecay-policy",
  "tracedecay-private-fs",
@@ -6521,7 +6524,21 @@ dependencies = [
 name = "tracedecay-memory-conformance"
 version = "0.1.0-beta.37"
 dependencies = [
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
+ "tiktoken-rs",
+ "tracedecay-memory-provider-api",
+]
+
+[[package]]
+name = "tracedecay-memory-evaluation"
+version = "0.1.0-beta.37"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tracedecay-memory-conformance",
  "tracedecay-memory-provider-api",
 ]
 
@@ -6529,6 +6546,33 @@ dependencies = [
 name = "tracedecay-memory-fabric"
 version = "0.1.0-beta.37"
 dependencies = [
+ "tracedecay-memory-provider-api",
+]
+
+[[package]]
+name = "tracedecay-memory-hygiene"
+version = "0.1.0-beta.37"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.19",
+ "tracedecay-domain",
+ "tracedecay-memory-provider-api",
+ "tracedecay-runtime-core",
+]
+
+[[package]]
+name = "tracedecay-memory-observation"
+version = "0.1.0-beta.37"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.19",
  "tracedecay-memory-provider-api",
 ]
 
@@ -6560,6 +6604,16 @@ dependencies = [
 name = "tracedecay-memory-provider-registry"
 version = "0.1.0-beta.37"
 dependencies = [
+ "chrono",
+ "getrandom 0.2.17",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracedecay-application",
+ "tracedecay-domain",
  "tracedecay-memory-fabric",
  "tracedecay-memory-provider-api",
  "tracedecay-memory-provider-native",

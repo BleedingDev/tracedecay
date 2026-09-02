@@ -60,13 +60,38 @@
     {
       "package": "tracedecay-memory-conformance",
       "allowed_direct_dependencies": [
+        "serde",
+        "serde_json",
         "sha2",
+        "tiktoken-rs",
         "tracedecay-memory-provider-api"
       ],
       "required_direct_dependencies": [
+        "serde",
+        "serde_json",
+        "sha2",
+        "tiktoken-rs",
         "tracedecay-memory-provider-api"
       ],
-      "reason": "Conformance remains provider-neutral and dashboard-independent; sha2 is a dev-dependency for fixture identity digests."
+      "reason": "Conformance remains provider-neutral and dashboard-independent; serde and serde_json load the deterministic scenario corpus and emit canonical baseline reports, sha2 binds fixture, corpus, and report identity digests, and tiktoken-rs counts admitted context tokens under the pinned o200k_base estimator identity."
+    },
+    {
+      "package": "tracedecay-memory-evaluation",
+      "allowed_direct_dependencies": [
+        "serde",
+        "serde_json",
+        "thiserror",
+        "tracedecay-memory-conformance",
+        "tracedecay-memory-provider-api"
+      ],
+      "required_direct_dependencies": [
+        "serde",
+        "serde_json",
+        "thiserror",
+        "tracedecay-memory-conformance",
+        "tracedecay-memory-provider-api"
+      ],
+      "reason": "The metric catalog is embedded JSON parsed with serde/serde_json, failures are typed with thiserror, the conformance baseline report is the production input, and the provider API supplies the canonical terminal-code vocabulary."
     },
     {
       "package": "tracedecay-memory-provider-registry",
@@ -81,6 +106,51 @@
         "tracedecay-memory-provider-native"
       ],
       "reason": "The default-off composition registry is the one product-owned crate allowed to construct the Native adapter behind the provider-neutral fabric."
+    },
+    {
+      "package": "tracedecay-memory-observation",
+      "allowed_direct_dependencies": [
+        "rusqlite",
+        "serde",
+        "serde_json",
+        "sha2",
+        "tempfile",
+        "thiserror",
+        "tracedecay-memory-provider-api"
+      ],
+      "required_direct_dependencies": [
+        "rusqlite",
+        "serde",
+        "serde_json",
+        "sha2",
+        "thiserror",
+        "tracedecay-memory-provider-api"
+      ],
+      "reason": "The bounded observation journal persists delivery receipts through its own bundled rusqlite storage and exposes only the provider-neutral boundary; tempfile is a dev-dependency for isolated journal fixtures."
+    },
+    {
+      "package": "tracedecay-memory-hygiene",
+      "allowed_direct_dependencies": [
+        "regex",
+        "serde",
+        "serde_json",
+        "sha2",
+        "thiserror",
+        "tracedecay-domain",
+        "tracedecay-memory-provider-api",
+        "tracedecay-runtime-core"
+      ],
+      "required_direct_dependencies": [
+        "regex",
+        "serde",
+        "serde_json",
+        "sha2",
+        "thiserror",
+        "tracedecay-domain",
+        "tracedecay-memory-provider-api",
+        "tracedecay-runtime-core"
+      ],
+      "reason": "The hygiene pipeline mints into the provider API's receipt vocabulary, takes over the canonical JSON encoding owned by tracedecay-domain, and reuses the single vendored credential-detector corpus exposed through tracedecay-runtime-core's public surface instead of re-deriving it; both TraceDecay-internal edges are explicit, narrow, and reviewed rather than a general internals import."
     }
   ],
   "rules": [
@@ -153,6 +223,22 @@
       "reason": "The same harness must run every provider without importing a concrete adapter or product surface."
     },
     {
+      "id": "evaluation-is-provider-neutral",
+      "from_packages": [
+        "tracedecay-memory-evaluation"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-*",
+        "ncm*",
+        "ocean*"
+      ],
+      "allowed_dependencies": [
+        "tracedecay-memory-conformance",
+        "tracedecay-memory-provider-api"
+      ],
+      "reason": "Metrics consume the provider-neutral baseline report and terminal vocabulary; they never import a concrete adapter, the root crate, storage, or code-index internals."
+    },
+    {
       "id": "composition-registry-is-narrow",
       "from_packages": [
         "tracedecay-memory-provider-registry"
@@ -168,6 +254,38 @@
         "tracedecay-memory-provider-native"
       ],
       "reason": "The composition registry may construct only the provider-neutral fabric and Native adapter, never stores, code indexes, hosts, transports, or the root crate."
+    },
+    {
+      "id": "observation-journal-is-isolated",
+      "from_packages": [
+        "tracedecay-memory-observation"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-*",
+        "ncm*",
+        "ocean*"
+      ],
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "reason": "The observation journal is a durable delivery-receipt ledger behind the provider-neutral boundary; it cannot import another provider, root composition, or upstream persistence internals."
+    },
+    {
+      "id": "hygiene-pipeline-reuses-domain-and-runtime-core-only",
+      "from_packages": [
+        "tracedecay-memory-hygiene"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-*",
+        "ncm*",
+        "ocean*"
+      ],
+      "allowed_dependencies": [
+        "tracedecay-domain",
+        "tracedecay-memory-provider-api",
+        "tracedecay-runtime-core"
+      ],
+      "reason": "The hygiene pipeline is a reviewed exception to the usual TraceDecay-internals ban: it may take over the canonical JSON encoding from tracedecay-domain and reuse the vendored credential detector corpus exposed by tracedecay-runtime-core's public surface, but no other TraceDecay-internal, NCM, or OCEAN package."
     },
     {
       "id": "public-transports-are-adapter-blind",

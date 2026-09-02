@@ -13,7 +13,7 @@ use tracedecay_memory_provider_registry::{
     CancellationToken, CanonicalPayload, CommittedEffectState, NATIVE_PROVIDER_ID,
     NativeMemoryApplicationPort, OperationControl, OwnedExactScope, OwnedProviderId,
     OwnedVersionedId, ProviderCall, ProviderCallParts, ProviderOperation, ProviderReply,
-    TerminalCode,
+    TerminalCode, parse_rfc3339_nanos,
 };
 use tracedecay_store::{
     FactReadControl, FactWriteControl, ProjectMemoryFactSearchKindV1, ProjectMemoryFactSearchQuery,
@@ -28,6 +28,11 @@ use crate::tracedecay::{TraceDecay, TraceDecayOpenOptions};
 
 const PROJECT_ID: &str = "project.native-provider-parity";
 const RECALL_CONTRACT_ID: &str = "tracedecay.memory.provider.recall.v1";
+
+/// Canonical tagged scope digest standing in for the authoritative
+/// project-open resolved scope in these parity fixtures.
+const SCOPE_DIGEST: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
 struct StoreFixture {
     _temporary: tempfile::TempDir,
@@ -177,10 +182,19 @@ async fn direct_search(fixture: &StoreFixture) -> FactStoreSearchResultV1 {
     public_search_page(&page).expect("public direct search projection")
 }
 
+/// The daemon profile the port under test is mounted for: the one profile
+/// every Native candidate attests, matching the profile the parity requests
+/// name so the host's `project_facts` rules bind.
+const PARITY_PROFILE: &str = "profile.native-provider-parity";
+
 fn native_port(fixture: &StoreFixture) -> ProjectNativeMemoryApplicationPort {
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&fixture.graph)));
-    ProjectNativeMemoryApplicationPort::new(graph_cell, fixture.project_root.clone())
-        .expect("construct project Native application port")
+    ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        fixture.project_root.clone(),
+        tracedecay_domain::UserProfileId::new(PARITY_PROFILE).expect("profile id"),
+    )
+    .expect("construct project Native application port")
 }
 
 fn source_refs(source: &FactIdentitySourceResultV1) -> Vec<String> {
@@ -358,7 +372,7 @@ fn recall_scope(project_id: &str) -> Value {
         "worktree_identity": "worktree.native-provider-parity",
         "branch_identity": "branch.native-provider-parity",
         "agent_session_id": "agent.native-provider-parity",
-        "scope_revision": 1,
+        "resolved_scope_digest": SCOPE_DIGEST,
     })
 }
 
@@ -423,7 +437,7 @@ fn recall_call(project_id: &str, request: Value) -> ProviderCall {
             "worktree.native-provider-parity",
             "branch.native-provider-parity",
             "agent.native-provider-parity",
-            1,
+            SCOPE_DIGEST,
         )
         .expect("recall exact scope"),
         request_id: "request.native-provider-parity".to_owned(),
@@ -458,11 +472,16 @@ fn recall_body(reply: &ProviderReply) -> Value {
 
 fn assert_provider_validity_is_current(candidate: &Value) {
     let validity = &candidate["validity"];
+    // Validity instants travel as `utc_rfc3339_nanos` strings; they are
+    // parsed with the same parser the host admission authority uses so the
+    // projection is proven admissible, not merely present.
     let observed_at = validity["observed_at"]
-        .as_i64()
+        .as_str()
+        .and_then(parse_rfc3339_nanos)
         .expect("typed observed timestamp");
     let valid_from = validity["valid_from"]
-        .as_i64()
+        .as_str()
+        .and_then(parse_rfc3339_nanos)
         .expect("typed valid-from timestamp");
     assert!(observed_at >= valid_from);
     assert!(validity["valid_until"].is_null());
@@ -525,6 +544,21 @@ async fn native_recall_matches_direct_search_semantically_on_identical_stores() 
             ))
         );
         assert_provider_validity_is_current(candidate);
+        // Every real Native fact recalled through the adapter is attested as
+        // `project_facts` with the owner project and the mount profile.
+        assert_eq!(
+            candidate["exact_scope_identity"],
+            json!({
+                "scope_binding": "project_facts",
+                "profile_id": PARITY_PROFILE,
+                "project_id": call.exact_scope.project_id,
+                "repository_identity": "",
+                "worktree_identity": "",
+                "branch_identity": "",
+                "agent_session_id": "",
+                "resolved_scope_digest": "",
+            })
+        );
     }
 }
 

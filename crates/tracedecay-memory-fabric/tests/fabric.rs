@@ -6,8 +6,10 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use tracedecay_memory_fabric::{
-    FabricConfig, FabricError, MemoryFabric, ObserverReceipt, ProviderCapabilityAvailability,
-    ProviderMode, ProviderReadiness,
+    ActiveCallPlan, ActiveRoutingPolicy, FabricConfig, FabricError, FallbackDecision,
+    FallbackDeclinedReason, FallbackRule, MemoryFabric, ObserverReceipt,
+    ProviderCapabilityAvailability, ProviderMode, ProviderReadiness, ReadyRouteTarget, RouteTarget,
+    RoutedProviderIdentity, RoutingError,
 };
 use tracedecay_memory_provider_api::contract::{
     CommittedEffectState, FallbackEligibility, TerminalCode,
@@ -15,14 +17,17 @@ use tracedecay_memory_provider_api::contract::{
 use tracedecay_memory_provider_api::{
     ApiError, CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
     HandshakeRequest, HandshakeRequestParts, HandshakeResponse, MemoryProvider, OperationControl,
-    OwnedExactScope, OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId, PinnedFallbackPolicy,
+    OwnedExactScope, OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId,
+    PayloadSanitizationReceipt, PayloadSanitizationReceiptParts, PinnedFallbackPolicy,
     ProviderCall, ProviderCallParts, ProviderDescriptor, ProviderLimits, ProviderOperation,
-    ProviderReply, TerminalRecord,
+    ProviderReply, SanitizationDisposition, TerminalRecord,
 };
 
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SECOND_DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const PAYLOAD_DIGEST: &str = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+const RESOLVED_SCOPE_DIGEST: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
 fn provider_id(value: &str) -> Result<OwnedProviderId, ApiError> {
     OwnedProviderId::new(value)
@@ -40,7 +45,7 @@ fn scope() -> Result<OwnedExactScope, ApiError> {
         "worktree-1",
         "refs/heads/main",
         "session-1",
-        9,
+        RESOLVED_SCOPE_DIGEST,
     )
 }
 
@@ -433,6 +438,26 @@ fn call(
         required_capabilities: capabilities,
         extensions: Vec::new(),
     })
+    .and_then(admitted)
+}
+
+/// Sanitizer revision these tests stand in for. The real revision is derived by
+/// `tracedecay-memory-hygiene` from the canonical policy document; the fabric
+/// only cares that a self-consistent receipt binds the dispatched payload.
+const TEST_SANITIZER_REVISION: &str = "tracedecay.memory.observation.hygiene.v1+fabric-test";
+
+/// Attaches the receipt the admitted hygiene pipeline mints for a payload it
+/// read and left byte-identical. Observation dispatch fails closed without one.
+fn admitted(call: ProviderCall) -> Result<ProviderCall, ApiError> {
+    if call.operation != ProviderOperation::Observe {
+        return Ok(call);
+    }
+    let receipt =
+        PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts::accepted_unmodified(
+            TEST_SANITIZER_REVISION,
+            call.payload.sha256.clone(),
+        ))?;
+    Ok(call.with_sanitization(receipt))
 }
 
 #[test]
@@ -1920,5 +1945,460 @@ fn status_reflects_retained_handshake_limits_receipt_and_readiness() -> Result<(
     let status = &fabric.statuses()?[0];
     assert_eq!(status.readiness, ProviderReadiness::NotReady);
     assert_eq!(status.effective_limits, None);
+    Ok(())
+}
+
+#[test]
+fn observation_delivery_fails_closed_without_a_bound_sanitization_receipt()
+-> Result<(), Box<dyn Error>> {
+    let fabric = MemoryFabric::new(FabricConfig::new(4, 1)?)?;
+    let provider = Arc::new(TestProvider::new("provider.hygiene", &[])?);
+    fabric.register(
+        provider_id("provider.hygiene")?,
+        1,
+        ProviderMode::Observer,
+        provider.clone(),
+    )?;
+    fabric.handshake(&handshake_request("provider.hygiene")?)?;
+
+    let admitted_call = call(
+        "provider.hygiene",
+        ProviderOperation::Observe,
+        Some(DIGEST),
+        &["observation.accept.v1"],
+        OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+    )?;
+    let receipt = admitted_call
+        .sanitization()
+        .ok_or_else(|| std::io::Error::other("the test helper must admit every observation"))?
+        .clone();
+    assert_eq!(receipt.disposition(), SanitizationDisposition::Accepted);
+
+    // Strip the receipt by rebuilding the same envelope without one.
+    let unsanitized = ProviderCall::new(ProviderCallParts {
+        operation: admitted_call.operation,
+        provider_id: admitted_call.provider_id.clone(),
+        registration_revision: admitted_call.registration_revision,
+        ready_receipt_sha256: admitted_call.ready_receipt_sha256.clone(),
+        exact_scope: admitted_call.exact_scope.clone(),
+        request_id: admitted_call.request_id.clone(),
+        operation_id: admitted_call.operation_id.clone(),
+        expected_state_generation: admitted_call.expected_state_generation,
+        idempotency_key: admitted_call.idempotency_key.clone(),
+        control: OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+        payload: admitted_call.payload.clone(),
+        required_capabilities: admitted_call
+            .required_capabilities
+            .iter()
+            .cloned()
+            .collect(),
+        extensions: admitted_call.extensions.clone(),
+    })?;
+    assert!(unsanitized.sanitization().is_none());
+    assert!(matches!(
+        fabric.deliver_observation(&unsanitized),
+        Err(FabricError::Api(ApiError::UnsanitizedObservation))
+    ));
+    assert_eq!(
+        provider.invocation_count(),
+        0,
+        "an unsanitized observation must never reach the provider"
+    );
+
+    // A well-formed receipt that describes different bytes is refused too.
+    let unbound = unsanitized
+        .clone()
+        .with_sanitization(PayloadSanitizationReceipt::new(
+            PayloadSanitizationReceiptParts::accepted_unmodified(
+                TEST_SANITIZER_REVISION,
+                SECOND_DIGEST,
+            ),
+        )?);
+    assert!(matches!(
+        fabric.deliver_observation(&unbound),
+        Err(FabricError::Api(ApiError::SanitizationReceiptUnbound))
+    ));
+    assert_eq!(provider.invocation_count(), 0);
+
+    // The gate runs before the concurrency permit is taken, so the single
+    // permit this fabric owns is still available to a legitimate delivery.
+    fabric.deliver_observation(&admitted_call)?;
+    assert_eq!(provider.invocation_count(), 1);
+    Ok(())
+}
+
+// --- Explicit routing and fallback policy -----------------------------------
+
+/// Host plan standing in for the composition root: it builds the readiness
+/// handshake and the recall call for whichever target the router names, so a
+/// fallback target receives its own fresh handshake and a call bound to that
+/// target's identity, receipt, and state generation.
+struct RecallRoutePlan;
+
+impl ActiveCallPlan for RecallRoutePlan {
+    type Error = ApiError;
+
+    fn handshake_request(&self, target: &RouteTarget) -> Result<HandshakeRequest, ApiError> {
+        HandshakeRequest::new(HandshakeRequestParts {
+            provider_id: target.provider_id.clone(),
+            registration_revision: target.registration_revision,
+            exact_scope: scope()?,
+            request_id: "handshake-route".to_owned(),
+            required_capabilities: vec![capability("recall.query.v1")?],
+            host_limits: limits(),
+            control: OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+            challenge_nonce: [5; 32],
+        })
+    }
+
+    fn provider_call(&self, target: &ReadyRouteTarget) -> Result<ProviderCall, ApiError> {
+        ProviderCall::new(ProviderCallParts {
+            operation: ProviderOperation::Recall,
+            provider_id: target.provider_id.clone(),
+            registration_revision: target.registration_revision,
+            ready_receipt_sha256: target.ready_receipt_sha256.clone(),
+            exact_scope: scope()?,
+            request_id: "request-recall.query.v1".to_owned(),
+            operation_id: "operation-recall.query.v1".to_owned(),
+            expected_state_generation: target.descriptor.state_generation,
+            idempotency_key: None,
+            control: OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+            payload: payload()?,
+            required_capabilities: vec![capability("recall.query.v1")?],
+            extensions: Vec::new(),
+        })
+    }
+}
+
+fn routing_policy(
+    provider: &str,
+    revision: u64,
+    fallback: FallbackRule,
+) -> Result<ActiveRoutingPolicy, Box<dyn Error>> {
+    Ok(ActiveRoutingPolicy::new(
+        provider_id(provider)?,
+        revision,
+        fallback,
+    )?)
+}
+
+fn unavailable_recall_reply(
+    provider: &str,
+    fallback: FallbackDirective,
+) -> Result<ProviderReply, ApiError> {
+    Ok(ProviderReply {
+        terminal: terminal(
+            ProviderOperation::Recall,
+            provider,
+            TerminalCode::ProviderUnavailable,
+            CommittedEffectEvidence::none(Some(0)),
+            fallback,
+            "operation-recall.query.v1",
+            &scope()?.exact_scope_sha256(),
+            Some("diagnostic.provider-unavailable"),
+        )?,
+        payload: None,
+        warnings: Vec::new(),
+        extensions: Vec::new(),
+        state_generation: 0,
+    })
+}
+
+#[test]
+fn routing_policy_rejects_zero_revision_and_self_targeting_fallback() -> Result<(), Box<dyn Error>>
+{
+    assert!(matches!(
+        ActiveRoutingPolicy::new(provider_id("provider.a")?, 0, FallbackRule::Forbidden),
+        Err(tracedecay_memory_fabric::RoutingPolicyError::RegistrationRevisionZero)
+    ));
+    let self_target = PinnedFallbackPolicy::new("policy.loop", 1, provider_id("provider.a")?)?;
+    assert!(matches!(
+        ActiveRoutingPolicy::new(
+            provider_id("provider.a")?,
+            1,
+            FallbackRule::ExplicitPinned(self_target)
+        ),
+        Err(tracedecay_memory_fabric::RoutingPolicyError::FallbackTargetMatchesActiveProvider)
+    ));
+    Ok(())
+}
+
+#[test]
+fn routing_refuses_non_active_or_mismatched_registrations_before_any_contact()
+-> Result<(), Box<dyn Error>> {
+    let fabric = MemoryFabric::new(FabricConfig::new(4, 2)?)?;
+    let observer = Arc::new(TestProvider::new("provider.observer", &[])?);
+    fabric.register(
+        provider_id("provider.observer")?,
+        1,
+        ProviderMode::Observer,
+        observer.clone(),
+    )?;
+    let disabled = Arc::new(TestProvider::new("provider.disabled", &[])?);
+    fabric.register(
+        provider_id("provider.disabled")?,
+        1,
+        ProviderMode::Disabled,
+        disabled.clone(),
+    )?;
+    let active = Arc::new(TestProvider::new("provider.active", &[])?);
+    fabric.register(
+        provider_id("provider.active")?,
+        2,
+        ProviderMode::Active,
+        active.clone(),
+    )?;
+
+    // An observer registration is never selectable for product output, and
+    // the refusal happens before any handshake or call reaches it.
+    let Err(RoutingError::ProviderNotActive { provider_id, mode }) = fabric.route_active(
+        &routing_policy("provider.observer", 1, FallbackRule::Forbidden)?,
+        "recall.query.v1",
+        &RecallRoutePlan,
+    ) else {
+        return Err("observer must be refused before contact".into());
+    };
+    assert_eq!(provider_id.as_str(), "provider.observer");
+    assert_eq!(mode, ProviderMode::Observer);
+    let Err(RoutingError::ProviderNotActive { mode, .. }) = fabric.route_active(
+        &routing_policy("provider.disabled", 1, FallbackRule::Forbidden)?,
+        "recall.query.v1",
+        &RecallRoutePlan,
+    ) else {
+        return Err("disabled must be refused before contact".into());
+    };
+    assert_eq!(mode, ProviderMode::Disabled);
+    assert!(matches!(
+        fabric.route_active(
+            &routing_policy("provider.missing", 1, FallbackRule::Forbidden)?,
+            "recall.query.v1",
+            &RecallRoutePlan,
+        ),
+        Err(RoutingError::ProviderNotRegistered { .. })
+    ));
+    let Err(RoutingError::RegistrationRevisionMismatch {
+        configured,
+        registered,
+        ..
+    }) = fabric.route_active(
+        &routing_policy("provider.active", 1, FallbackRule::Forbidden)?,
+        "recall.query.v1",
+        &RecallRoutePlan,
+    )
+    else {
+        return Err("stale pinned revision must be refused".into());
+    };
+    assert_eq!((configured, registered), (1, 2));
+    let Err(RoutingError::CapabilityUndeclared { capability, .. }) = fabric.route_active(
+        &routing_policy("provider.active", 2, FallbackRule::Forbidden)?,
+        "recall.missing.v1",
+        &RecallRoutePlan,
+    ) else {
+        return Err("undeclared capability must be refused".into());
+    };
+    assert_eq!(capability, "recall.missing.v1");
+    for provider in [&observer, &disabled, &active] {
+        assert_eq!(provider.handshake_count(), 0);
+        assert_eq!(provider.invocation_count(), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn routed_replies_name_their_provider_and_keep_zero_results_distinct_from_unavailable()
+-> Result<(), Box<dyn Error>> {
+    let fabric = MemoryFabric::new(FabricConfig::new(4, 2)?)?;
+    let active = Arc::new(TestProvider::new("provider.active", &[])?);
+    fabric.register(
+        provider_id("provider.active")?,
+        1,
+        ProviderMode::Active,
+        active.clone(),
+    )?;
+    let down = Arc::new(TestProvider::scripted(
+        "provider.down",
+        unavailable_recall_reply("provider.down", FallbackDirective::forbidden())?,
+    )?);
+    fabric.register(
+        provider_id("provider.down")?,
+        1,
+        ProviderMode::Active,
+        down.clone(),
+    )?;
+
+    let zero = fabric.route_active(
+        &routing_policy("provider.active", 1, FallbackRule::Forbidden)?,
+        "recall.query.v1",
+        &RecallRoutePlan,
+    )?;
+    assert_eq!(zero.terminal_code(), TerminalCode::SuccessZeroResults);
+    assert_eq!(
+        zero.identity,
+        RoutedProviderIdentity {
+            provider_id: provider_id("provider.active")?,
+            registration_revision: 1,
+            provider_instance_id: "test.provider.instance-1".to_owned(),
+        }
+    );
+    assert_eq!(zero.call.provider_id.as_str(), "provider.active");
+    assert_eq!(zero.call.ready_receipt_sha256, DIGEST);
+    assert_eq!(zero.fallback, FallbackDecision::NotApplicable);
+    assert_eq!(active.handshake_count(), 1);
+    assert_eq!(active.invocation_count(), 1);
+
+    let unavailable = fabric.route_active(
+        &routing_policy("provider.down", 1, FallbackRule::Forbidden)?,
+        "recall.query.v1",
+        &RecallRoutePlan,
+    )?;
+    assert_eq!(
+        unavailable.terminal_code(),
+        TerminalCode::ProviderUnavailable
+    );
+    assert_eq!(unavailable.identity.provider_id.as_str(), "provider.down");
+    assert!(unavailable.reply.payload.is_none());
+    assert_eq!(
+        unavailable.fallback,
+        FallbackDecision::Declined(FallbackDeclinedReason::DirectiveForbidden)
+    );
+    // The unavailable route never touched the healthy provider.
+    assert_eq!(active.handshake_count(), 1);
+    assert_eq!(active.invocation_count(), 1);
+    Ok(())
+}
+
+#[test]
+fn fallback_dispatches_only_under_the_matching_pinned_rule_with_a_fresh_target_handshake()
+-> Result<(), Box<dyn Error>> {
+    let fabric = MemoryFabric::new(FabricConfig::new(4, 2)?)?;
+    let target = Arc::new(TestProvider::new("provider.fallback-target", &[])?);
+    fabric.register(
+        provider_id("provider.fallback-target")?,
+        1,
+        ProviderMode::Active,
+        target.clone(),
+    )?;
+    let policy = PinnedFallbackPolicy::new(
+        "policy.memory-failover",
+        7,
+        provider_id("provider.fallback-target")?,
+    )?;
+    let explicit_id = provider_id("provider.explicit")?;
+    let explicit = Arc::new(TestProvider::scripted(
+        "provider.explicit",
+        unavailable_recall_reply(
+            "provider.explicit",
+            FallbackDirective::explicit_policy_only(
+                &explicit_id,
+                policy.clone(),
+                "operator-approved provider outage policy",
+            )?,
+        )?,
+    )?);
+    fabric.register(explicit_id, 1, ProviderMode::Active, explicit.clone())?;
+
+    // Default host rule: the provider's directive alone authorises nothing.
+    let declined = fabric.route_active(
+        &routing_policy("provider.explicit", 1, FallbackRule::Forbidden)?,
+        "recall.query.v1",
+        &RecallRoutePlan,
+    )?;
+    assert_eq!(declined.terminal_code(), TerminalCode::ProviderUnavailable);
+    assert_eq!(declined.identity.provider_id.as_str(), "provider.explicit");
+    assert_eq!(
+        declined.fallback,
+        FallbackDecision::Declined(FallbackDeclinedReason::HostRuleForbidden)
+    );
+    assert_eq!(explicit.invocation_count(), 1);
+    assert_eq!(target.handshake_count(), 0);
+    assert_eq!(target.invocation_count(), 0);
+
+    // A pinned rule at another revision is a mismatch, not a near-enough.
+    let stale_rule = PinnedFallbackPolicy::new(
+        "policy.memory-failover",
+        8,
+        provider_id("provider.fallback-target")?,
+    )?;
+    let mismatched = fabric.route_active(
+        &routing_policy(
+            "provider.explicit",
+            1,
+            FallbackRule::ExplicitPinned(stale_rule.clone()),
+        )?,
+        "recall.query.v1",
+        &RecallRoutePlan,
+    )?;
+    assert_eq!(
+        mismatched.identity.provider_id.as_str(),
+        "provider.explicit"
+    );
+    assert_eq!(
+        mismatched.fallback,
+        FallbackDecision::Declined(FallbackDeclinedReason::PolicyMismatch {
+            directive: policy.clone(),
+            configured: stale_rule,
+        })
+    );
+    assert_eq!(explicit.invocation_count(), 2);
+    assert_eq!(target.handshake_count(), 0);
+    assert_eq!(target.invocation_count(), 0);
+
+    // The identical pin dispatches exactly one fresh handshake and one call
+    // against the target, and the reply is attributed to the target.
+    let dispatched = fabric.route_active(
+        &routing_policy(
+            "provider.explicit",
+            1,
+            FallbackRule::ExplicitPinned(policy.clone()),
+        )?,
+        "recall.query.v1",
+        &RecallRoutePlan,
+    )?;
+    assert_eq!(dispatched.terminal_code(), TerminalCode::SuccessZeroResults);
+    assert_eq!(
+        dispatched.identity.provider_id.as_str(),
+        "provider.fallback-target"
+    );
+    assert_eq!(
+        dispatched.call.provider_id.as_str(),
+        "provider.fallback-target"
+    );
+    assert_eq!(
+        dispatched.fallback,
+        FallbackDecision::Dispatched {
+            from: RoutedProviderIdentity {
+                provider_id: provider_id("provider.explicit")?,
+                registration_revision: 1,
+                provider_instance_id: "test.provider.instance-1".to_owned(),
+            },
+            from_terminal_code: TerminalCode::ProviderUnavailable,
+            policy: policy.clone(),
+        }
+    );
+    assert_eq!(explicit.invocation_count(), 3);
+    assert_eq!(target.handshake_count(), 1);
+    assert_eq!(target.invocation_count(), 1);
+
+    // A target demoted to observer is declined even under the matching pin.
+    fabric.set_mode(
+        &provider_id("provider.fallback-target")?,
+        1,
+        ProviderMode::Observer,
+    )?;
+    let demoted = fabric.route_active(
+        &routing_policy("provider.explicit", 1, FallbackRule::ExplicitPinned(policy))?,
+        "recall.query.v1",
+        &RecallRoutePlan,
+    )?;
+    assert_eq!(demoted.identity.provider_id.as_str(), "provider.explicit");
+    assert_eq!(
+        demoted.fallback,
+        FallbackDecision::Declined(FallbackDeclinedReason::TargetNotActive {
+            target: provider_id("provider.fallback-target")?,
+            mode: ProviderMode::Observer,
+        })
+    );
+    assert_eq!(target.handshake_count(), 1);
+    assert_eq!(target.invocation_count(), 1);
     Ok(())
 }
