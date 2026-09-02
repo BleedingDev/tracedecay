@@ -1356,5 +1356,125 @@ fn provider_without_optional_capabilities_gets_host_preflight_not_a_call()
         "{}",
         verified.evidence
     );
+
+    // A deletion the host refused before dispatch deleted nothing, so it
+    // cannot evidence that deletion addressed the exact source. This check
+    // previously returned Pass for any terminal but InvalidRequest, handing
+    // 2000 basis points to a lane for a deletion that never happened.
+    let exact_source = privacy
+        .adjudication
+        .checks
+        .iter()
+        .find(|check| check.check_id == "exact_source_target")
+        .ok_or("exact_source_target")?;
+    assert_eq!(
+        exact_source.verdict,
+        CheckVerdict::Indeterminate,
+        "{}",
+        exact_source.evidence
+    );
+    assert!(
+        exact_source.evidence.contains("was not performed"),
+        "{}",
+        exact_source.evidence
+    );
+    Ok(())
+}
+
+/// A batch whose every item the provider refused has nothing on the committed
+/// side of the boundary, so `effect_boundary` cannot score. `commit_item` used
+/// to record every item as committed regardless of its terminal, which made a
+/// lane that committed nothing look like a lane that committed everything.
+#[test]
+fn refused_batch_items_are_not_recorded_as_committed() -> Result<(), Box<dyn Error>> {
+    // Declares observation acceptance so the descriptor stays valid and the
+    // host dispatches, then refuses every observation with a non-committing
+    // terminal — the shape a provider takes when it accepts the capability but
+    // stores nothing for the kinds this corpus emits.
+    struct RefusingObservationProvider(InMemoryTestProvider);
+    impl MemoryProvider for RefusingObservationProvider {
+        fn descriptor(&self) -> ProviderDescriptor {
+            self.0.descriptor()
+        }
+        fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+            self.0.handshake(request)
+        }
+        fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+            if call.operation != ProviderOperation::Observe {
+                return self.0.invoke(call);
+            }
+            let generation = self.0.lock().generation;
+            self.0.reply(
+                call,
+                TerminalCode::CapabilityUnsupported,
+                CommittedEffectEvidence::none(Some(generation)),
+                None,
+                generation,
+                Some("test.observation_refused".to_owned()),
+            )
+        }
+    }
+    let corpus = load_corpus()?;
+    let provider = RefusingObservationProvider(InMemoryTestProvider::new()?);
+    let scratch = ScratchRoot::create("refused-batch")?;
+    let runner = BaselineRunner::new(&corpus, scratch.config())?;
+    let lane = BaselineLane::Provider(ProviderLane::new(&provider, REGISTRATION_REVISION)?);
+    let report = runner.run(&lane)?.report;
+
+    let mut boundaries_seen = 0_usize;
+    for scenario in &report.scenarios {
+        for check in &scenario.adjudication.checks {
+            if check.check_id != "effect_boundary" {
+                continue;
+            }
+            boundaries_seen += 1;
+            assert_eq!(
+                check.verdict,
+                CheckVerdict::Indeterminate,
+                "{} effect_boundary scored without a committed item: {}",
+                scenario.scenario_id,
+                check.evidence
+            );
+            assert!(
+                check.evidence.contains("no item committed"),
+                "{} {}",
+                scenario.scenario_id,
+                check.evidence
+            );
+        }
+    }
+    assert!(
+        boundaries_seen > 0,
+        "no scenario exercised the batch effect boundary"
+    );
+
+    // The contrast that proves the check still discriminates: the same corpus
+    // against a provider that does commit must still score the boundary Pass
+    // with items on the committed side. Without this, the fix above could have
+    // turned every effect_boundary Indeterminate and no test would have noticed.
+    let healthy = InMemoryTestProvider::new()?;
+    let healthy_scratch = ScratchRoot::create("committed-batch")?;
+    let healthy_runner = BaselineRunner::new(&corpus, healthy_scratch.config())?;
+    let healthy_lane =
+        BaselineLane::Provider(ProviderLane::new(&healthy, REGISTRATION_REVISION)?);
+    let healthy_report = healthy_runner.run(&healthy_lane)?.report;
+    let mut passing_boundaries = 0_usize;
+    for scenario in &healthy_report.scenarios {
+        for check in &scenario.adjudication.checks {
+            if check.check_id == "effect_boundary" && check.verdict == CheckVerdict::Pass {
+                passing_boundaries += 1;
+                assert!(
+                    check.evidence.contains("committed"),
+                    "{} {}",
+                    scenario.scenario_id,
+                    check.evidence
+                );
+            }
+        }
+    }
+    assert!(
+        passing_boundaries > 0,
+        "a committing provider scored no passing effect boundary; the check no longer discriminates"
+    );
     Ok(())
 }

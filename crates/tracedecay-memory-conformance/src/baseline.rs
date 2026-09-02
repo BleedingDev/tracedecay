@@ -660,6 +660,26 @@ pub struct BatchBoundary {
     pub item_count: u64,
 }
 
+/// Whether a step outcome represents an effect the provider actually
+/// committed.
+///
+/// `duplicate` counts: the effect is present because an earlier identical
+/// dispatch committed it. Every other state — `none`, `partial`, `unknown` —
+/// and every non-terminal outcome does not, so the item stays on the
+/// uncommitted side of the batch boundary.
+fn committing_effect_state(outcome: &StepOutcome) -> bool {
+    match outcome {
+        StepOutcome::Terminal {
+            committed_effect_state,
+            ..
+        } => matches!(
+            CommittedEffectState::from_wire(committed_effect_state),
+            Some(CommittedEffectState::Committed | CommittedEffectState::Duplicate)
+        ),
+        _ => false,
+    }
+}
+
 /// Typed outcome of one step.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -2165,8 +2185,15 @@ impl<'run, 'corpus, 'provider> ScenarioExecution<'run, 'corpus, 'provider> {
         let observation = self.batch_item_observation(&batch_id, item_id, index, step)?;
         let operation_id = format!("{}.{batch_id}.{item_id}", self.scenario.id);
         let outcome = self.observe(&observation, &operation_id, step, false, calls, timings)?;
-        if let Some(batch) = self.batch.as_mut() {
-            batch.committed.push((item_id.to_owned(), operation_id));
+        // Only an item the provider actually committed belongs on the
+        // committed side of the batch boundary. Pushing unconditionally
+        // reported items as committed that the provider explicitly refused —
+        // a lane whose every observe returns `capability_unsupported` with
+        // effect state `none` looked like a lane that committed everything.
+        if committing_effect_state(&outcome) {
+            if let Some(batch) = self.batch.as_mut() {
+                batch.committed.push((item_id.to_owned(), operation_id));
+            }
         }
         Ok(outcome)
     }
@@ -2978,6 +3005,20 @@ impl<'run, 'corpus, 'provider> ScenarioExecution<'run, 'corpus, 'provider> {
                 ),
             },
             "effect_boundary" => match &evidence.batch {
+                // A boundary with nothing on the committed side is arithmetic,
+                // not evidence: it cannot show that the provider drew the
+                // boundary in the right place, only that it committed nothing.
+                // A lane whose every observe is refused would otherwise score
+                // full marks for a boundary it never had to draw.
+                Some(boundary) if boundary.committed_item_ids.is_empty() => (
+                    CheckVerdict::Indeterminate,
+                    "batch_boundary_items",
+                    format!(
+                        "no item committed; {} uncommitted of {}",
+                        boundary.uncommitted_item_ids.len(),
+                        boundary.item_count
+                    ),
+                ),
                 Some(boundary)
                     if boundary.committed_item_ids.len() + boundary.uncommitted_item_ids.len()
                         == usize::try_from(boundary.item_count).unwrap_or(usize::MAX) =>
@@ -3202,6 +3243,32 @@ impl<'run, 'corpus, 'provider> ScenarioExecution<'run, 'corpus, 'provider> {
                 ),
             },
             "exact_source_target" => match &evidence.delete {
+                // A deletion the provider never actually performed cannot
+                // demonstrate that deletion addressed the exact source. These
+                // terminals mean the request was refused, abandoned, or never
+                // dispatched — the host's own capability preflight produces
+                // CapabilityUnsupported without contacting the provider at
+                // all. Scoring them Pass credited a lane for deleting nothing.
+                // verified_absence and restart_persistence already treat a
+                // non-answer as Indeterminate; this check now matches them.
+                Some((key, code))
+                    if matches!(
+                        code,
+                        TerminalCode::CapabilityUnsupported
+                            | TerminalCode::Cancelled
+                            | TerminalCode::DeadlineExceeded
+                            | TerminalCode::ProviderUnavailable
+                    ) =>
+                {
+                    (
+                        CheckVerdict::Indeterminate,
+                        "delete_source_key",
+                        format!(
+                            "deletion of {key} was not performed (terminal {})",
+                            code.as_wire()
+                        ),
+                    )
+                }
                 Some((key, code)) if code != &TerminalCode::InvalidRequest => (
                     CheckVerdict::Pass,
                     "delete_source_key",
