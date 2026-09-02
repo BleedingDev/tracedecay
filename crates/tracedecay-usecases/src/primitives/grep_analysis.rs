@@ -15,25 +15,24 @@ use tracedecay_application::retrieval::grep_analysis::{
     PrimitiveFutureV1, PrimitiveOutcomeV1, PrimitivePageV1, PrimitivePortContextV1,
 };
 
-use crate::graph::health::{dependency_depth, depth_score};
-use crate::graph::queries::GraphQueryManager;
-use crate::tracedecay::SourceReadRuntime;
 use tracedecay_code_index::ast_grep_search::search_tree_scoped_with_cancel;
 use tracedecay_code_index::graph_projection::{
     CodeGraphInteractiveReader, CodeGraphSymbolSummaryV1,
 };
 use tracedecay_graph_db::GraphCancellation;
-use tracedecay_runtime_core::redundancy::round4;
+use tracedecay_graph_query::SourceReadRuntime;
+use tracedecay_graph_query::health::{dependency_depth, depth_score};
+use tracedecay_graph_query::queries::GraphQueryManager;
 
 pub struct TraceDecayAstGrepAuthorityV1 {
     source_runtime: Arc<SourceReadRuntime>,
-    code_graph: Arc<dyn crate::graph::CodeGraphProjectionReadPort>,
+    code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
 }
 
 impl TraceDecayAstGrepAuthorityV1 {
     pub fn new(
         source_runtime: Arc<SourceReadRuntime>,
-        code_graph: Arc<dyn crate::graph::CodeGraphProjectionReadPort>,
+        code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
     ) -> Self {
         Self {
             source_runtime,
@@ -104,10 +103,11 @@ impl AstGrepAuthorityV1 for TraceDecayAstGrepAuthorityV1 {
                     return PrimitiveOutcomeV1::Cancelled;
                 }
 
-                let graph_cancellation = crate::graph::request_graph_cancellation(context.request);
+                let graph_cancellation =
+                    tracedecay_graph_query::request_graph_cancellation(context.request);
                 let verified = match self
                     .code_graph
-                    .open(crate::graph::CodeGraphReadRequest::new(
+                    .open(tracedecay_graph_query::CodeGraphReadRequest::new(
                         context.request,
                         context.observed_at,
                         Arc::clone(&graph_cancellation),
@@ -198,11 +198,11 @@ impl AstGrepAuthorityV1 for TraceDecayAstGrepAuthorityV1 {
 }
 
 pub struct TraceDecayComplexityAuthorityV1 {
-    code_graph: Arc<dyn crate::graph::CodeGraphProjectionReadPort>,
+    code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
 }
 
 impl TraceDecayComplexityAuthorityV1 {
-    pub fn new(code_graph: Arc<dyn crate::graph::CodeGraphProjectionReadPort>) -> Self {
+    pub fn new(code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>) -> Self {
         Self { code_graph }
     }
 }
@@ -235,11 +235,11 @@ impl ComplexityAuthorityV1 for TraceDecayComplexityAuthorityV1 {
 }
 
 pub struct TraceDecayDependencyDepthAuthorityV1 {
-    code_graph: Arc<dyn crate::graph::CodeGraphProjectionReadPort>,
+    code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
 }
 
 impl TraceDecayDependencyDepthAuthorityV1 {
-    pub fn new(code_graph: Arc<dyn crate::graph::CodeGraphProjectionReadPort>) -> Self {
+    pub fn new(code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>) -> Self {
         Self { code_graph }
     }
 }
@@ -260,10 +260,11 @@ impl DependencyDepthAuthorityV1 for TraceDecayDependencyDepthAuthorityV1 {
                         Ok(path) => path,
                         Err(problem) => return PrimitiveOutcomeV1::Failed(problem),
                     };
-                let cancellation = crate::graph::request_graph_cancellation(context.request);
+                let cancellation =
+                    tracedecay_graph_query::request_graph_cancellation(context.request);
                 let verified = match self
                     .code_graph
-                    .open(crate::graph::CodeGraphReadRequest::new(
+                    .open(tracedecay_graph_query::CodeGraphReadRequest::new(
                         context.request,
                         context.observed_at,
                         Arc::clone(&cancellation),
@@ -408,4 +409,8 @@ fn unsupported_compatibility_cursor<T>() -> PrimitiveOutcomeV1<T> {
 
 fn count(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn round4(value: f64) -> f64 {
+    (value * 10000.0).round() / 10000.0
 }

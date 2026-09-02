@@ -1,13 +1,15 @@
 use tracedecay_domain::VectorGenerationIdV1;
-use tracedecay_semantic::{
-    SemanticModelLifecycleStateV1, SemanticModelLifecycleStatusV1,
+#[cfg(test)]
+use tracedecay_semantic_contracts::SemanticModelRemediationV1;
+use tracedecay_semantic_contracts::{
+    SemanticFallbackReasonV1, SemanticModelLifecycleStateV1, SemanticModelLifecycleStatusV1,
     SemanticRuntimeScheduleFailureV1, SemanticRuntimeScheduleStatusV1,
     SemanticRuntimeStatusProjectionV1,
 };
 
 use super::super::ports::{
-    SemanticActivationReceiptV1, SemanticConfigurationPinV1, SemanticFallbackReasonV1,
-    SemanticRuntimeStateV1, SemanticRuntimeStatusV1,
+    SemanticActivationReceiptV1, SemanticConfigurationPinV1, SemanticRuntimeStateV1,
+    SemanticRuntimeStatusV1,
 };
 
 /// Map daemon schedule projection into the application/Doctor status shape.
@@ -53,7 +55,8 @@ pub fn application_status_from_projection(
                     .clone()
                     .or_else(|| projection.prior_generation.clone()),
                 reason: match reason {
-                    SemanticRuntimeScheduleFailureV1::Artifact => {
+                    SemanticRuntimeScheduleFailureV1::Artifact
+                    | SemanticRuntimeScheduleFailureV1::ArtifactDetail(_) => {
                         SemanticFallbackReasonV1::ArtifactUnavailable
                     }
                     SemanticRuntimeScheduleFailureV1::Cancelled
@@ -106,7 +109,10 @@ fn ready_or_typed_missing_receipt(
 ///
 /// This is the sole lifecycle→runtime mapping. Callers must not invent a
 /// second translation of acquisition or failure states.
-pub fn lifecycle_to_runtime_state(state: &SemanticModelLifecycleStateV1) -> SemanticRuntimeStateV1 {
+pub fn lifecycle_to_runtime_state(
+    state: &SemanticModelLifecycleStateV1,
+    configuration: Option<&SemanticConfigurationPinV1>,
+) -> SemanticRuntimeStateV1 {
     match state {
         SemanticModelLifecycleStateV1::SelectedNotDownloaded {
             model_id,
@@ -151,15 +157,7 @@ pub fn lifecycle_to_runtime_state(state: &SemanticModelLifecycleStateV1) -> Sema
             model_id: model_id.clone(),
             artifact_digest: artifact_digest.clone(),
         },
-        // Vector-generation Indexing requires a configuration pin +
-        // generation id. Acquisition-phase indexing is reported as Loading
-        // until the semantic owner publishes an activation receipt.
         SemanticModelLifecycleStateV1::Loading {
-            model_id,
-            artifact_digest,
-            ..
-        }
-        | SemanticModelLifecycleStateV1::Indexing {
             model_id,
             artifact_digest,
             ..
@@ -167,6 +165,28 @@ pub fn lifecycle_to_runtime_state(state: &SemanticModelLifecycleStateV1) -> Sema
             model_id: model_id.clone(),
             artifact_digest: artifact_digest.clone(),
         },
+        // Runtime Indexing progress requires a configuration pin and a
+        // published non-zero total to validate; until both exist the typed
+        // Loading state (which keeps the model identity) remains the truth.
+        SemanticModelLifecycleStateV1::Indexing {
+            model_id,
+            artifact_digest,
+            completed_units,
+            total_units,
+            ..
+        } => {
+            if configuration.is_some() && *total_units > 0 && completed_units <= total_units {
+                SemanticRuntimeStateV1::Indexing {
+                    completed_units: *completed_units,
+                    total_units: *total_units,
+                }
+            } else {
+                SemanticRuntimeStateV1::Loading {
+                    model_id: model_id.clone(),
+                    artifact_digest: artifact_digest.clone(),
+                }
+            }
+        }
         SemanticModelLifecycleStateV1::Failed {
             model_id,
             artifact_digest,
@@ -222,7 +242,8 @@ pub fn prefer_lifecycle_over_generic_unavailable(
     }
     match lifecycle.state.as_ref() {
         Some(state) => {
-            SemanticRuntimeStatusV1::new(scheduler.configuration, lifecycle_to_runtime_state(state))
+            let runtime_state = lifecycle_to_runtime_state(state, scheduler.configuration.as_ref());
+            SemanticRuntimeStatusV1::new(scheduler.configuration, runtime_state)
         }
         None if is_deliberate_disablement(lifecycle) => SemanticRuntimeStatusV1::new(
             scheduler.configuration,
@@ -240,7 +261,8 @@ fn status_from_lifecycle(
 ) -> SemanticRuntimeStatusV1 {
     match lifecycle.state.as_ref() {
         Some(state) => {
-            SemanticRuntimeStatusV1::new(configuration, lifecycle_to_runtime_state(state))
+            let runtime_state = lifecycle_to_runtime_state(state, configuration.as_ref());
+            SemanticRuntimeStatusV1::new(configuration, runtime_state)
         }
         None => SemanticRuntimeStatusV1::new(
             configuration,
@@ -268,13 +290,13 @@ fn is_deliberate_disablement(lifecycle: &SemanticModelLifecycleStatusV1) -> bool
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     use tracedecay_domain::configuration::{ConfigurationRevisionId, ConfigurationSnapshotV1};
-    use tracedecay_semantic::SemanticModelRemediationV1;
 
     use super::*;
-    use crate::configuration::ConfigurationCurrentStateV1;
     use crate::semantic_runtime::SemanticRuntimeRouteV1;
+    use tracedecay_configuration::ConfigurationCurrentStateV1;
 
     fn pin() -> SemanticConfigurationPinV1 {
         SemanticConfigurationPinV1::from_current(&ConfigurationCurrentStateV1 {
@@ -336,6 +358,63 @@ mod tests {
             artifact_digest: digest(),
             detail: "connection refused to unroutable endpoint".to_owned(),
             retryable: true,
+        }
+    }
+
+    fn indexing(completed_units: u64, total_units: u64) -> SemanticModelLifecycleStateV1 {
+        SemanticModelLifecycleStateV1::Indexing {
+            model_id: "JinaEmbeddingsV2BaseCode".to_owned(),
+            revision: "rev".to_owned(),
+            artifact_digest: digest(),
+            install_path: PathBuf::from("/models/jina"),
+            completed_units,
+            total_units,
+        }
+    }
+
+    #[test]
+    fn lifecycle_indexing_surfaces_real_progress_with_a_configuration_pin() {
+        let status = resolve_semantic_application_status(
+            None,
+            Some(&lifecycle_status(
+                Some("JinaEmbeddingsV2BaseCode"),
+                Some(indexing(3, 10)),
+            )),
+            Some(pin()),
+        );
+
+        assert_eq!(status.validate(), Ok(()));
+        match &status.state {
+            SemanticRuntimeStateV1::Indexing {
+                completed_units,
+                total_units,
+            } => {
+                assert_eq!(*completed_units, 3);
+                assert_eq!(*total_units, 10);
+            }
+            other => panic!("expected indexing progress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifecycle_indexing_without_a_pin_or_totals_stays_typed_loading() {
+        for (configuration, state) in [(None, indexing(3, 10)), (Some(pin()), indexing(0, 0))] {
+            let status = resolve_semantic_application_status(
+                None,
+                Some(&lifecycle_status(
+                    Some("JinaEmbeddingsV2BaseCode"),
+                    Some(state),
+                )),
+                configuration,
+            );
+
+            assert_eq!(status.validate(), Ok(()));
+            match &status.state {
+                SemanticRuntimeStateV1::Loading { model_id, .. } => {
+                    assert_eq!(model_id, "JinaEmbeddingsV2BaseCode");
+                }
+                other => panic!("expected loading fallback, got {other:?}"),
+            }
         }
     }
 

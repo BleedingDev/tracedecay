@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracedecay_usecases::provider_usage::{ProviderUsageCostSummaryV1, ProviderUsageCoverageV1};
+use tracedecay_session_memory::provider_usage::{
+    ProviderUsageCostSummaryV1, ProviderUsageCoverageV1,
+};
 
 #[hotpath::measure(label = "cli.cost.read", future = true)]
 pub(crate) async fn handle_cost(
@@ -8,7 +10,7 @@ pub(crate) async fn handle_cost(
     by_model: bool,
     by_task: bool,
     export: Option<String>,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     let payload = call_cost_admin(&range).await?;
     if payload.get("summary").is_none_or(Value::is_null) {
         println!("Provider usage accounting is unavailable.");
@@ -41,7 +43,7 @@ fn print_cost_summary(
     by_task: bool,
     export: Option<&str>,
     summary: &CostSummaryPayload,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     if let Some(fmt) = export {
         print_cost_export(fmt, range, by_model, by_task, summary)?;
     } else if by_model {
@@ -60,7 +62,7 @@ fn print_cost_export(
     by_model: bool,
     by_task: bool,
     summary: &CostSummaryPayload,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     let usage = &summary.provider_usage;
     match fmt {
         "json" => {
@@ -141,7 +143,7 @@ fn print_model_table(summary: &CostSummaryPayload) {
             .unwrap_or_else(|| "n/a".to_owned());
         let token_count = model
             .total_tokens
-            .map(tracedecay::display::format_token_count)
+            .map(tracedecay_runtime_core::text::format_token_count)
             .unwrap_or_else(|| "unknown".to_owned());
         let cost = model
             .cost_usd
@@ -184,7 +186,7 @@ fn print_default_summary(
     );
 
     if summary.tokens_saved > 0 {
-        let saved = tracedecay::display::format_token_count(summary.tokens_saved);
+        let saved = tracedecay_runtime_core::text::format_token_count(summary.tokens_saved);
         println!();
         match summary.efficiency_ratio {
             Some(ratio) => {
@@ -211,7 +213,7 @@ struct TodayCostPayload {
 }
 
 #[hotpath::measure(label = "cli.cost.request", future = true)]
-async fn call_cost_admin(range: &str) -> tracedecay_runtime_core::errors::Result<Value> {
+async fn call_cost_admin(range: &str) -> tracedecay_domain::errors::Result<Value> {
     let cwd = std::env::current_dir()?;
     let project_root = tracedecay::config::discover_project_root(&cwd);
     let handshake =
@@ -237,10 +239,10 @@ fn print_cost_row(
         (denominator > 0).then_some((cache_read as f64 / denominator as f64) * 100.0)
     });
     let input = input
-        .map(tracedecay::display::format_token_count)
+        .map(tracedecay_runtime_core::text::format_token_count)
         .unwrap_or_else(|| "unknown".to_owned());
     let output = output
-        .map(tracedecay::display::format_token_count)
+        .map(tracedecay_runtime_core::text::format_token_count)
         .unwrap_or_else(|| "unknown".to_owned());
     let cost = cost
         .map(|cost| format!("${cost:.2}"))

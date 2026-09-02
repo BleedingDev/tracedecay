@@ -1,28 +1,40 @@
-use serde_json::Value;
-use tracedecay_application::{
-    ApplicationProblem, ApplicationProblemEnvelope, ResultContractRef, SafeDiagnostic,
-};
-use tracedecay_tool_catalog::BindingSurface;
+use std::collections::HashMap;
 
-use crate::application_surface::{ApplicationSurfaceOperation, resolve_catalog_tool_binding};
+use serde_json::{Value, json};
+use tracedecay_application::{ApplicationProblem, ResultContractRef};
+use tracedecay_code_extraction::LanguageRegistry;
+use tracedecay_code_index::intake::content_digest;
+use tracedecay_graph_query::VerifiedGraphQueryRequest;
+use tracedecay_runtime_core::privacy::{CodeSourceShapeV1, sanitize_code_source_bytes};
+use tracedecay_tool_catalog::{ApplicationSurfaceOperation, BindingSurface};
+
+use crate::application_surface::resolve_catalog_tool_binding;
 use crate::tracedecay::TraceDecay;
 use tracedecay_daemon_protocol::InvocationCancellationPolicy;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 
-use super::super::ToolResult;
+use tracedecay_mcp::ToolResult;
+use tracedecay_mcp::handlers::analysis as portable_analysis;
+use tracedecay_mcp::handlers::ast_grep as portable_ast_grep;
+use tracedecay_mcp::handlers::graph as portable_graph;
+use tracedecay_mcp::handlers::grep as portable_grep;
+use tracedecay_mcp::handlers::info as portable_info;
 
 use super::ToolCallRegistryOptions;
+use super::support::{effective_path, generic_tool_result, unique_file_paths};
 use super::tool_call_support::handle_retrieve;
 use super::unknown_tool_error;
 use super::{
-    admin_cli, admin_project, analysis, application_surface, ast_grep_search, automation_runs,
-    dashboard, dispatch_controls, edit, git, graph, grep, hook_runtime, info, skills, workflow,
+    admin_cli, admin_project, analysis, application_surface, automation_runs, dashboard,
+    dispatch_controls, edit, git, graph, hook_runtime, info, skills, workflow,
 };
 
 mod health_dispatch;
-mod retained_response;
 pub(super) use health_dispatch::dispatch_health_tools;
+use tracedecay_mcp::{
+    retained_problem_envelope, retained_safe_diagnostic, validated_retained_response,
+};
 
 fn graph_read_unavailable(detail: &str) -> TraceDecayError {
     TraceDecayError::ProjectRoute {
@@ -32,47 +44,286 @@ fn graph_read_unavailable(detail: &str) -> TraceDecayError {
     }
 }
 
-fn retained_contract_error(
-    context: &'static str,
-    error: tracedecay_application::ApplicationContractError,
-) -> TraceDecayError {
-    TraceDecayError::Config {
-        message: format!("{context}: {error}"),
+const DOC_COVERAGE_SYMBOL_BUDGET: usize = 500_000;
+
+#[hotpath::measure]
+fn doc_coverage_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function"
+            | "method"
+            | "class"
+            | "interface"
+            | "trait"
+            | "struct"
+            | "enum"
+            | "module"
+            | "field"
+            | "enum_variant"
+            | "const"
+            | "static"
+            | "type_alias"
+            | "property"
+            | "csharp_property"
+            | "record"
+            | "data_class"
+            | "sealed_class"
+            | "object"
+            | "case_class"
+            | "kotlin_object"
+            | "inner_class"
+            | "abstract_method"
+            | "constructor"
+            | "struct_method"
+            | "val"
+            | "var"
+            | "mixin"
+            | "extension"
+            | "union"
+            | "typedef"
+    )
+}
+
+#[hotpath::measure]
+fn doc_coverage_unavailable(detail: impl Into<String>) -> TraceDecayError {
+    TraceDecayError::project_route("verified-doc-coverage-unavailable", false, detail.into())
+}
+
+#[hotpath::measure]
+fn extract_doc_nodes(
+    project_root: &std::path::Path,
+    path: &str,
+    registry: &LanguageRegistry,
+) -> Result<(Vec<u8>, Vec<tracedecay_domain::code_intelligence::Node>)> {
+    let raw = std::fs::read(project_root.join(path)).map_err(|error| {
+        doc_coverage_unavailable(format!(
+            "verified documentation source `{path}` could not be read: {error}"
+        ))
+    })?;
+    let shape = match path.rsplit('.').next() {
+        Some("json" | "toml" | "yaml" | "yml") => CodeSourceShapeV1::StructuredData,
+        _ => CodeSourceShapeV1::CodeOrProse,
+    };
+    let sanitized = sanitize_code_source_bytes(&raw, shape).map_err(|error| {
+        doc_coverage_unavailable(format!(
+            "verified documentation source `{path}` could not be admitted through the code sanitizer: {error}"
+        ))
+    })?;
+    let (bytes, _receipt) = sanitized.into_parts();
+    let source = std::str::from_utf8(&bytes).map_err(|error| {
+        doc_coverage_unavailable(format!(
+            "verified documentation source `{path}` sanitized to non-UTF-8: {error}"
+        ))
+    })?;
+    let extractor = registry.extractor_for_file(path).ok_or_else(|| {
+        doc_coverage_unavailable(format!(
+            "the admitted graph contains `{path}` but its documentation grammar is unavailable"
+        ))
+    })?;
+    let nodes = extractor.extract(path, source).nodes;
+    Ok((bytes, nodes))
+}
+
+#[hotpath::measure(future = true, label = "mcp.analysis.doc_coverage.total")]
+async fn handle_verified_doc_coverage(
+    cg: &TraceDecay,
+    graph: &tracedecay_graph_query::VerifiedGraphQuery,
+    args: Value,
+    scope_prefix: Option<&str>,
+) -> Result<ToolResult> {
+    let path_prefix = effective_path(&args, scope_prefix);
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(50, |value| value.min(500) as usize);
+    let page = graph.symbols_page(None, DOC_COVERAGE_SYMBOL_BUDGET)?;
+    if page.has_more {
+        return Err(doc_coverage_unavailable(
+            "verified documentation census exceeded its declared symbol budget",
+        ));
     }
-}
+    let mut candidates = Vec::new();
+    for symbol in page.symbols {
+        let metadata = symbol.metadata.as_ref().ok_or_else(|| {
+            doc_coverage_unavailable(format!(
+                "symbol {} has no admitted documentation metadata",
+                symbol.occurrence.as_str()
+            ))
+        })?;
+        let path = symbol
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.logical_path.as_deref())
+            .ok_or_else(|| {
+                doc_coverage_unavailable(format!(
+                    "symbol {} has no admitted logical file binding",
+                    symbol.occurrence.as_str()
+                ))
+            })?;
+        if metadata.visibility == "public"
+            && doc_coverage_kind(&metadata.kind)
+            && tracedecay_runtime_core::path_scope::path_matches_scope(path, path_prefix)
+        {
+            candidates.push(symbol);
+        }
+    }
+    candidates.sort_by(|left, right| {
+        let left_path = left
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.logical_path.as_deref());
+        let right_path = right
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.logical_path.as_deref());
+        left_path
+            .cmp(&right_path)
+            .then_with(|| {
+                left.metadata
+                    .as_ref()
+                    .map(|metadata| metadata.start_line)
+                    .cmp(&right.metadata.as_ref().map(|metadata| metadata.start_line))
+            })
+            .then_with(|| left.occurrence.cmp(&right.occurrence))
+    });
 
-fn retained_safe_diagnostic(code: &'static str, message: &'static str) -> Result<SafeDiagnostic> {
-    SafeDiagnostic::new(code, message)
-        .map_err(|error| retained_contract_error("invalid retained application diagnostic", error))
-}
+    let registry = LanguageRegistry::new();
+    let mut extracted_path = None::<String>;
+    let mut extracted_bytes = Vec::new();
+    let mut extracted_nodes = Vec::new();
+    let mut undocumented = Vec::new();
+    for symbol in candidates {
+        if undocumented.len() == limit {
+            break;
+        }
+        let metadata = symbol.metadata.as_ref().ok_or_else(|| {
+            doc_coverage_unavailable("documentation candidate metadata disappeared")
+        })?;
+        let path = symbol
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.logical_path.as_deref())
+            .ok_or_else(|| {
+                doc_coverage_unavailable("documentation candidate file binding disappeared")
+            })?;
+        if extracted_path.as_deref() != Some(path) {
+            (extracted_bytes, extracted_nodes) =
+                extract_doc_nodes(cg.project_root(), path, &registry)?;
+            extracted_path = Some(path.to_owned());
+        }
+        let source_span = symbol
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.source_span)
+            .ok_or_else(|| {
+                doc_coverage_unavailable(format!(
+                    "public symbol {} has no admitted source span",
+                    symbol.occurrence.as_str()
+                ))
+            })?;
+        let start = usize::try_from(source_span.start_byte).map_err(|error| {
+            doc_coverage_unavailable(format!(
+                "public symbol {} source start does not fit this host: {error}",
+                symbol.occurrence.as_str()
+            ))
+        })?;
+        let end = usize::try_from(source_span.end_byte).map_err(|error| {
+            doc_coverage_unavailable(format!(
+                "public symbol {} source end does not fit this host: {error}",
+                symbol.occurrence.as_str()
+            ))
+        })?;
+        let admitted_symbol_source = extracted_bytes.get(start..end).ok_or_else(|| {
+            doc_coverage_unavailable(format!(
+                "public symbol {} source span is outside `{path}`",
+                symbol.occurrence.as_str()
+            ))
+        })?;
+        if content_digest(admitted_symbol_source) != metadata.content_digest {
+            return Err(doc_coverage_unavailable(format!(
+                "documentation source for symbol {} no longer matches the admitted graph generation",
+                symbol.occurrence.as_str()
+            )));
+        }
+        let extracted = extracted_nodes
+            .iter()
+            .find(|node| {
+                node.qualified_name == metadata.qualified_name
+                    && node.kind.as_str() == metadata.kind
+                    && node.start_line == metadata.start_line
+            })
+            .ok_or_else(|| {
+                doc_coverage_unavailable(format!(
+                    "public symbol {} is absent from the re-admitted documentation source `{path}`",
+                    symbol.occurrence.as_str()
+                ))
+            })?;
+        if extracted
+            .docstring
+            .as_deref()
+            .is_none_or(|docstring| docstring.trim().is_empty())
+        {
+            undocumented.push((
+                path.to_owned(),
+                json!({
+                    "id": symbol.occurrence.as_str(),
+                    "name": metadata.simple_name,
+                    "kind": metadata.kind,
+                    "line": metadata.start_line,
+                    "signature": metadata.signature,
+                }),
+            ));
+        }
+    }
 
-fn retained_problem_envelope(
-    contract: ResultContractRef,
-    request_id: tracedecay_application::RequestId,
-    problem: ApplicationProblem,
-) -> Result<ApplicationProblemEnvelope> {
-    ApplicationProblemEnvelope::new(contract, request_id, problem).map_err(|error| {
-        retained_contract_error("invalid retained application problem envelope", error)
-    })
+    let touched_files = unique_file_paths(undocumented.iter().map(|(path, _symbol)| path.as_str()));
+    let mut by_file = HashMap::<String, Vec<Value>>::new();
+    for (path, symbol) in undocumented {
+        by_file.entry(path).or_default().push(symbol);
+    }
+    let mut files = by_file
+        .into_iter()
+        .map(|(file, symbols)| {
+            json!({
+                "file": file,
+                "count": symbols.len(),
+                "symbols": symbols,
+            })
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| {
+        right["count"]
+            .as_u64()
+            .cmp(&left["count"].as_u64())
+            .then_with(|| left["file"].as_str().cmp(&right["file"].as_str()))
+    });
+    let output = json!({
+        "path_filter": path_prefix,
+        "total_undocumented": files
+            .iter()
+            .filter_map(|file| file["count"].as_u64())
+            .sum::<u64>(),
+        "file_count": files.len(),
+        "files": files,
+    });
+    Ok(generic_tool_result(
+        Some(cg.project_root()),
+        &args,
+        &output,
+        touched_files,
+    ))
 }
 
 async fn admitted_graph_query(
-    cg: &TraceDecay,
+    _cg: &TraceDecay,
     options: &ToolCallRegistryOptions<'_>,
     operation_name: &str,
-) -> Result<crate::tracedecay::queries::graph::VerifiedGraphQuery> {
-    let projection = options
-        .code_graph_projection_read_port
-        .as_deref()
-        .ok_or_else(|| {
-            graph_read_unavailable("the exact project graph projection is not mounted")
-        })?;
-    let admission = options
-        .code_graph_read_admission_port
-        .as_deref()
-        .ok_or_else(|| {
-            graph_read_unavailable("the exact project graph admission is not mounted")
-        })?;
+) -> Result<tracedecay_graph_query::VerifiedGraphQuery> {
+    let Some(port) = options.verified_graph_query_port.as_deref() else {
+        return Err(graph_read_unavailable(
+            "the exact project verified graph query is not mounted",
+        ));
+    };
     let request_id = options
         .application_request_id
         .clone()
@@ -97,18 +348,33 @@ async fn admitted_graph_query(
     // graph-backed tool in the graph/info/analysis/git/health groups funnels
     // through this one open, so a slow span here is admission contention or a
     // stale generation, never handler work.
-    hotpath::future!(
-        cg.open_verified_graph_query(
-            projection,
-            admission,
+    let query = hotpath::future!(
+        port.open(VerifiedGraphQueryRequest::new(
             &operation,
             request_id,
             deadline,
             cancellation,
-        ),
+        )),
         label = "mcp.dispatch.graph_query_admission"
     )
-    .await
+    .await?;
+    if let tracedecay_graph_query::CodeGraphReadFreshnessV1::LastCompleteStale {
+        sealed_at,
+        rebuild_in_flight,
+    } = query.freshness()
+    {
+        // Every graph-backed tool funnels through this open, so this is the
+        // single point that reports serve-old-while-rebuilding back to the
+        // dispatch boundary for the typed response trailer.
+        let _ = options
+            .served_stale_graph_generation
+            .set(super::ServedStaleCodeGraphReadV1 {
+                generation: query.generation().as_str().to_owned(),
+                sealed_at,
+                rebuild_in_flight,
+            });
+    }
+    Ok(query)
 }
 
 /// The hard ceiling every MCP tool call is bounded by, regardless of dispatch
@@ -243,8 +509,10 @@ fn dispatch_graph_tools_inner<'a>(
                 .await
             }
             "tracedecay_grep" => {
-                grep::handle_grep(
-                    cg,
+                let graph = admitted_graph_query(cg, &options, "source_lines").await;
+                portable_grep::handle_grep(
+                    cg.project_root(),
+                    graph.as_ref(),
                     args,
                     selected_scope_prefix,
                     options.application_deadline.clone(),
@@ -253,8 +521,8 @@ fn dispatch_graph_tools_inner<'a>(
                 .await
             }
             "tracedecay_ast_grep_search" => {
-                ast_grep_search::handle_ast_grep_search(
-                    cg,
+                portable_ast_grep::handle_ast_grep_search(
+                    cg.project_root(),
                     args,
                     selected_scope_prefix,
                     options.application_deadline.clone(),
@@ -278,19 +546,19 @@ fn dispatch_graph_tools_inner<'a>(
             }
             "tracedecay_callers" => {
                 let graph_query = admitted_graph_query(cg, &options, "code_callers").await?;
-                graph::handle_callers(cg, &graph_query, args).await
+                portable_graph::handle_callers(&graph_query, args).await
             }
             "tracedecay_callees" => {
                 let graph_query = admitted_graph_query(cg, &options, "callees").await?;
-                graph::handle_callees(cg, &graph_query, args).await
+                portable_graph::handle_callees(&graph_query, args).await
             }
             "tracedecay_impact" => {
                 let graph_query = admitted_graph_query(cg, &options, "impact").await?;
-                graph::handle_impact(cg, &graph_query, args).await
+                portable_graph::handle_impact(&graph_query, args).await
             }
             "tracedecay_node" => {
                 let graph_query = admitted_graph_query(cg, &options, "node").await?;
-                graph::handle_node(cg, &graph_query, args).await
+                portable_graph::handle_node(&graph_query, args).await
             }
             "tracedecay_similar" => {
                 let graph_query = admitted_graph_query(cg, &options, "similar").await?;
@@ -312,11 +580,12 @@ fn dispatch_graph_tools_inner<'a>(
             "tracedecay_implementations" => {
                 let graph_query =
                     admitted_graph_query(cg, &options, "code_implementations").await?;
-                graph::handle_implementations(cg, &graph_query, args, selected_scope_prefix).await
+                portable_graph::handle_implementations(&graph_query, args, selected_scope_prefix)
+                    .await
             }
             "tracedecay_callers_for" => {
                 let graph_query = admitted_graph_query(cg, &options, "code_callers").await?;
-                graph::handle_callers_for(cg, &graph_query, args).await
+                portable_graph::handle_callers_for(&graph_query, args).await
             }
             "tracedecay_find_exact_symbol" => {
                 let graph_query = admitted_graph_query(cg, &options, "qualified_name").await?;
@@ -333,21 +602,21 @@ fn dispatch_graph_tools_inner<'a>(
             }
             "tracedecay_by_qualified_name" => {
                 let graph_query = admitted_graph_query(cg, &options, "qualified_name").await?;
-                graph::handle_by_qualified_name(cg, &graph_query, args).await
+                portable_graph::handle_by_qualified_name(&graph_query, args).await
             }
             "tracedecay_signature" => {
                 let graph_query =
                     admitted_graph_query(cg, &options, "code_signature_search").await?;
-                graph::handle_signature(cg, &graph_query, args).await
+                portable_graph::handle_signature(&graph_query, args).await
             }
             "tracedecay_impls" => {
                 let graph_query =
                     admitted_graph_query(cg, &options, "code_implementations").await?;
-                graph::handle_impls(cg, &graph_query, args).await
+                portable_graph::handle_impls(&graph_query, args).await
             }
             "tracedecay_derives" => {
                 let graph_query = admitted_graph_query(cg, &options, "code_type_hierarchy").await?;
-                graph::handle_derives(cg, &graph_query, args).await
+                portable_graph::handle_derives(&graph_query, args).await
             }
             _ => Err(unknown_tool_error(tool_name)),
         }
@@ -396,10 +665,10 @@ fn dispatch_info_tools_inner<'a>(
     // measured wrapper so every profiling feature can compute its layout.
     Box::pin(async move {
         match tool_name {
-            "tracedecay_remote_status" => info::handle_remote_status(
+            "tracedecay_remote_status" => portable_info::handle_remote_status(
                 cg.project_root(),
                 &args,
-                options.remote_operational_status.as_ref(),
+                options.remote_operational_status.as_deref(),
             ),
             "tracedecay_status" => {
                 info::handle_status(
@@ -420,41 +689,56 @@ fn dispatch_info_tools_inner<'a>(
                 scope_prefix,
             )),
             "tracedecay_project_list" => {
-                info::handle_project_list(cg, args, options.project_registry_reads).await
+                portable_info::handle_project_list(
+                    cg.project_root(),
+                    args,
+                    options.project_registry_reads,
+                )
+                .await
             }
             "tracedecay_project_search" => {
-                info::handle_project_search(cg, args, options.project_registry_reads).await
+                portable_info::handle_project_search(
+                    cg.project_root(),
+                    args,
+                    options.project_registry_reads,
+                )
+                .await
             }
             "tracedecay_project_context" => {
-                info::handle_project_context(cg, args, options.project_registry_reads).await
+                portable_info::handle_project_context(
+                    cg.project_root(),
+                    args,
+                    options.project_registry_reads,
+                )
+                .await
             }
             "tracedecay_files" => {
                 let graph = admitted_graph_query(cg, &options, "file_metadata").await?;
-                info::handle_files(cg, &graph, args, selected_scope_prefix).await
+                portable_info::handle_files(&graph, args, selected_scope_prefix).await
             }
             "tracedecay_admin_sync" => {
                 info::handle_admin_sync(cg, args, options.code_index_reconcile_sink.as_ref()).await
             }
             "tracedecay_port_status" => {
                 let graph = admitted_graph_query(cg, &options, "port_status").await?;
-                info::handle_port_status(cg, &graph, args).await
+                portable_info::handle_port_status(&graph, args).await
             }
             "tracedecay_port_order" => {
                 let graph = admitted_graph_query(cg, &options, "port_order").await?;
-                info::handle_port_order(cg, &graph, args).await
+                portable_info::handle_port_order(&graph, args).await
             }
-            "tracedecay_simplify_scan" => info::handle_simplify_scan(cg, args, scope_prefix).await,
+            "tracedecay_simplify_scan" => portable_info::handle_simplify_scan().await,
             "tracedecay_type_hierarchy" => {
                 let graph = admitted_graph_query(cg, &options, "code_type_hierarchy").await?;
-                info::handle_type_hierarchy(cg, &graph, args).await
+                portable_info::handle_type_hierarchy(&graph, args).await
             }
             "tracedecay_body" => {
                 let graph = admitted_graph_query(cg, &options, "source_body").await?;
-                info::handle_body(cg, &graph, args, selected_scope_prefix).await
+                portable_info::handle_body(&graph, args, selected_scope_prefix).await
             }
             "tracedecay_todos" => {
                 let graph = admitted_graph_query(cg, &options, "todos").await?;
-                info::handle_todos(cg, &graph, args, scope_prefix).await
+                portable_info::handle_todos(&graph, args, scope_prefix).await
             }
             "tracedecay_read" => {
                 let operation = match args.get("mode").and_then(Value::as_str).unwrap_or("full") {
@@ -463,16 +747,16 @@ fn dispatch_info_tools_inner<'a>(
                     _ => "source_lines",
                 };
                 let graph = admitted_graph_query(cg, &options, operation).await?;
-                info::handle_read(cg, &graph, args).await
+                portable_info::handle_read(&graph, args).await
             }
             "tracedecay_outline" => {
                 let graph = admitted_graph_query(cg, &options, "source_outline").await?;
-                info::handle_outline(cg, &graph, args).await
+                portable_info::handle_outline(&graph, args).await
             }
-            "tracedecay_config" => info::handle_config(cg, &args).await,
+            "tracedecay_config" => portable_info::handle_config(cg.project_root(), &args).await,
             "tracedecay_signature_search" => {
                 let graph = admitted_graph_query(cg, &options, "code_signature_search").await?;
-                info::handle_signature_search(cg, &graph, args, selected_scope_prefix).await
+                portable_info::handle_signature_search(&graph, args, selected_scope_prefix).await
             }
             _ => Err(unknown_tool_error(tool_name)),
         }
@@ -634,74 +918,87 @@ fn dispatch_analysis_tools_inner<'a>(
         match tool_name {
             "tracedecay_dead_code" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_dead_code(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_dead_code(&graph, args, scope_prefix).await
             }
             "tracedecay_circular" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_circular(cg, &graph, args).await
+                portable_analysis::handle_circular(&graph, args).await
             }
             "tracedecay_hotspots" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_hotspots(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_hotspots(&graph, args, scope_prefix).await
             }
             "tracedecay_unused_imports" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_unused_imports(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_unused_imports(
+                    cg.project_root(),
+                    &graph,
+                    args,
+                    scope_prefix,
+                )
+                .await
             }
             // The one analysis tool that opens no graph query: its whole finding is
             // that the graph and the compiler disagree, so taking the graph's file
             // set as input would answer the question with the very source that is
             // under suspicion.
             "tracedecay_unmounted_files" => {
-                analysis::handle_unmounted_files(cg, args, scope_prefix).await
+                portable_analysis::handle_unmounted_files(cg.project_root(), args, scope_prefix)
+                    .await
             }
             "tracedecay_rank" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_rank(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_rank(&graph, args, scope_prefix).await
             }
             "tracedecay_largest" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_largest(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_largest(&graph, args, scope_prefix).await
             }
             "tracedecay_coupling" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_coupling(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_coupling(&graph, args, scope_prefix).await
             }
             "tracedecay_inheritance_depth" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_inheritance_depth(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_inheritance_depth(&graph, args, scope_prefix).await
             }
             "tracedecay_distribution" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_distribution(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_distribution(&graph, args, scope_prefix).await
             }
             "tracedecay_recursion" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_recursion(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_recursion(&graph, args, scope_prefix).await
             }
             "tracedecay_complexity" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_complexity(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_complexity(&graph, args, scope_prefix).await
             }
             "tracedecay_doc_coverage" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_doc_coverage(cg, &graph, args, scope_prefix).await
+                handle_verified_doc_coverage(cg, &graph, args, scope_prefix).await
             }
             "tracedecay_god_class" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_god_class(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_god_class(&graph, args, scope_prefix).await
             }
             "tracedecay_unsafe_patterns" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_unsafe_patterns(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_unsafe_patterns(
+                    cg.project_root(),
+                    &graph,
+                    args,
+                    scope_prefix,
+                )
+                .await
             }
             "tracedecay_constructors" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_constructors(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_constructors(&graph, args, scope_prefix).await
             }
             "tracedecay_field_sites" => {
                 let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                analysis::handle_field_sites(cg, &graph, args, scope_prefix).await
+                portable_analysis::handle_field_sites(&graph, args, scope_prefix).await
             }
             "tracedecay_diagnostics" => {
                 let graph = admitted_graph_query(cg, &options, "diagnostics_read").await?;
@@ -759,8 +1056,12 @@ fn dispatch_git_tools_inner<'a>(
                     git::handle_diff_context(cg, &graph, args).await
                 }
                 "tracedecay_changelog" => {
-                    let graph = admitted_graph_query(cg, &options, "file_dependents").await?;
-                    git::handle_changelog(cg, &graph, args).await
+                    git::handle_changelog(
+                        cg,
+                        admitted_graph_query(cg, &options, "file_dependents"),
+                        args,
+                    )
+                    .await
                 }
                 "tracedecay_commit_context" => {
                     let graph = admitted_graph_query(cg, &options, "file_dependents").await?;
@@ -955,8 +1256,8 @@ fn dispatch_retained_application_tools_inner<'a>(
                 normalized.request,
             )
         )
-        .ok_or_else(|| TraceDecayError::Config {
-            message: format!("invalid retained application request for {tool_name}"),
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("invalid retained application request for {tool_name}: {error}"),
         })?;
         if request.operation() != retained_operation {
             return Err(TraceDecayError::Config {
@@ -1012,7 +1313,7 @@ fn dispatch_retained_application_tools_inner<'a>(
                                 == tracedecay_daemon_protocol::DAEMON_INVOCATION_REVISION
                             && response.request_id == request_id.as_str() =>
                     {
-                        retained_response::validated_retained_response(
+                        validated_retained_response(
                             response.outcome,
                             retained_operation,
                             &request_id,
@@ -1131,10 +1432,9 @@ fn dispatch_session_workflow_tools_inner<'a>(
                 .await
             }
             "tracedecay_run_affected_tests" => {
-                let graph = admitted_graph_query(cg, &options, "file_dependents").await?;
                 workflow::handle_run_affected_tests(
                     cg,
-                    &graph,
+                    admitted_graph_query(cg, &options, "file_dependents"),
                     args,
                     options.application_cancellation.clone(),
                     options.code_index_publication_identity.as_deref(),

@@ -9,10 +9,13 @@
 //!
 //! Only the composition root can fill them, and it must do so before any
 //! transcript ingest, host installer, hook, or branch lock runs. That is what
-//! [`register_runtime_ports`] is: the single, idempotent, root-owned wiring
-//! call. Both process entry paths invoke it — `src/main.rs` for every CLI and
-//! daemon invocation, and the daemon session-registry constructor for embedded
-//! and integration-test runtimes that never pass through `main`.
+//! [`register_runtime_ports`] is: the complete, idempotent, root-owned wiring
+//! call. The CLI first installs the non-catalog subset and then completes the
+//! registration for commands that can reach host integration. Composition-root
+//! registry wrappers (`join_standalone_session_registry`, session-runtime
+//! shutdown, host admission) invoke the complete form for embedded and
+//! integration-test runtimes that never pass through `main`. The extracted
+//! store-runtime crate never calls this.
 //!
 //! Every underlying `register` is `OnceLock::set`, so repeated calls are safe
 //! and the first registration wins.
@@ -23,7 +26,7 @@ use std::pin::Pin;
 
 use serde_json::Value;
 
-use tracedecay_runtime_core::errors::Result;
+use tracedecay_domain::errors::Result;
 
 /// Installs every root-owned runtime port. Idempotent; first call wins.
 ///
@@ -32,14 +35,23 @@ use tracedecay_runtime_core::errors::Result;
 /// which fail quietly (or fail closed) when the root never registered.
 #[hotpath::measure(label = "runtime_ports.register")]
 pub fn register_runtime_ports() -> Result<()> {
+    register_runtime_ports_without_mcp_tool_catalog();
+    crate::agents::register_mcp_tool_catalog_ports()
+}
+
+/// Installs the runtime ports needed by ordinary command execution without
+/// assembling the agent-host MCP schema catalog.
+///
+/// `tracedecay tool` resolves its selected operation itself, while daemon and
+/// host lifecycle entrypoints still call [`register_runtime_ports`] and retain
+/// the eager catalog failure check before serving or changing integrations.
+#[hotpath::measure(label = "runtime_ports.register_without_mcp_catalog")]
+pub fn register_runtime_ports_without_mcp_tool_catalog() {
     register_session_ports();
     register_agent_host_ports();
-    crate::agents::register_mcp_tool_catalog_ports()?;
-    crate::dashboard::register_runtime_ports();
     tracedecay_code_index_runtime::install_application_catalog_snapshot(
         compose_application_catalog_snapshot,
     );
-    Ok(())
 }
 
 fn compose_application_catalog_snapshot() -> std::result::Result<
@@ -189,7 +201,7 @@ fn resolve_hook_scope(
     project_root: &Path,
     project_id: &tracedecay_domain::ProjectId,
 ) -> std::result::Result<tracedecay_application::ResolvedScope, String> {
-    crate::daemon::project_open_owners::resolved_scope_for_project(project_root, project_id)
+    tracedecay_code_index_runtime::resolved_scope_for_project(project_root, project_id)
         .map_err(|error| error.to_string())
 }
 
@@ -213,7 +225,8 @@ fn hook_timings_enabled(project_root: &Path) -> Option<bool> {
 
 fn resolve_hook_store_layout(
     project_root: &Path,
-) -> Pin<Box<dyn Future<Output = Result<crate::storage::StoreLayout>> + Send + '_>> {
+) -> Pin<Box<dyn Future<Output = Result<tracedecay_runtime_core::storage::StoreLayout>> + Send + '_>>
+{
     Box::pin(hotpath::future!(
         crate::tracedecay::TraceDecay::resolve_store_layout_for_identity(project_root),
         label = "runtime_ports.resolve_store_layout"

@@ -197,6 +197,7 @@ impl MaintenanceCheckpointRequest {
         }
     }
 
+    #[hotpath::skip]
     pub const fn mode(&self) -> MaintenanceCheckpointMode {
         self.mode
     }
@@ -215,6 +216,7 @@ pub struct CheckpointTicket {
 }
 
 impl CheckpointTicket {
+    #[hotpath::skip]
     pub async fn wait(self) -> Result<CheckpointOutcome, CheckpointControlError> {
         let result = self
             .response
@@ -697,6 +699,7 @@ impl PersistentWriter {
         }
     }
 
+    #[hotpath::skip]
     pub async fn submit(
         &self,
         request: RuntimeSubmitRequestV1,
@@ -795,6 +798,7 @@ impl PersistentWriter {
         Ok(outcome)
     }
 
+    #[hotpath::skip]
     pub async fn bounded_incremental_vacuum(
         &self,
         max_pages: u32,
@@ -836,6 +840,7 @@ impl PersistentWriter {
         response.await.map_err(|_| WriterActorError::ReplyDropped)?
     }
 
+    #[hotpath::skip]
     pub async fn snapshot_to(
         &self,
         destination: PathBuf,
@@ -845,6 +850,7 @@ impl PersistentWriter {
             .await
     }
 
+    #[hotpath::skip]
     pub async fn snapshot_to_interruptible(
         &self,
         destination: PathBuf,
@@ -855,6 +861,7 @@ impl PersistentWriter {
             .await
     }
 
+    #[hotpath::skip]
     async fn enqueue_online_backup(
         &self,
         destination: PathBuf,

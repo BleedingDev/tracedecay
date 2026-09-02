@@ -238,6 +238,7 @@ impl<'a, L> CalibratedSemanticQueryService<'a, L>
 where
     L: SemanticLaneRetriever,
 {
+    #[hotpath::skip]
     pub const fn new(lane: &'a L) -> Self {
         Self { lane }
     }

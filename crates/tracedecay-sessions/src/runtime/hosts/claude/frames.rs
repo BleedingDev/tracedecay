@@ -106,6 +106,7 @@ impl ClaudeSourceFrame {
         }
     }
 
+    #[hotpath::skip]
     pub(super) const fn scope_value(&self) -> &Value {
         &self.scope_record
     }

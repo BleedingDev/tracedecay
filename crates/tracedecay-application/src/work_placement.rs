@@ -148,6 +148,7 @@ impl<S> WorkPlacementService<S>
 where
     S: WorkPlacementStoragePort,
 {
+    #[hotpath::skip]
     pub const fn new(storage: S) -> Self {
         Self { storage }
     }

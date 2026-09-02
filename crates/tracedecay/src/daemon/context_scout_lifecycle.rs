@@ -46,6 +46,7 @@ pub(crate) enum AuthorityRejectionV1 {
 }
 
 impl AuthorityRejectionV1 {
+    #[hotpath::skip]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::ZeroHookProjectId => "zero_hook_project_id",
@@ -347,6 +348,7 @@ pub(crate) enum ContextScoutLifecycleLookupFailureV1 {
 }
 
 impl ContextScoutLifecycleLookupFailureV1 {
+    #[hotpath::skip]
     const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidProfileId => "invalid_profile_id",
@@ -386,6 +388,7 @@ impl ContextScoutLifecycleLookupV1 {
         }
     }
 
+    #[hotpath::skip]
     const fn is_resolved(&self) -> bool {
         matches!(self, Self::Resolved(_))
     }

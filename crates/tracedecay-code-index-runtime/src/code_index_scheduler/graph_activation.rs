@@ -9,7 +9,8 @@ use tracedecay_graph_db::{GraphCancellation, SealedGraphStateDigest};
 use super::{
     CodeGraphProjectionError, CodeGraphServingAuthorityV1, CodeIndexProductionErrorV1,
     CodeIndexPublicationStoreErrorV1, CodeIndexSchedulerErrorV1, CodeIndexWorktreeSchedulerV1,
-    DaemonCodeIndexPublicationStoreV1, DurablePublicationPointerV1, LatestCompleteCodeIndexV1,
+    DaemonCodeIndexPublicationStoreV1, DurablePublicationPointerV1, LatestCodeTextGenerationV1,
+    LatestCompleteCodeIndexV1,
 };
 use crate::code_graph_seat::{
     CodeGraphReplayBindingV1, CodeGraphSeatLeaseV1, CodeGraphSeatRuntimePortV1,
@@ -36,6 +37,14 @@ fn injected_resident_memory_refusals()
     static REFUSALS: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
         std::sync::OnceLock::new();
     REFUSALS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn injected_terminal_activation_failures()
+-> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -114,19 +123,33 @@ pub fn set_injected_resident_memory_refusal(worktree_id: &WorktreeId, refused: b
     }
 }
 
+#[cfg(test)]
+pub fn set_injected_terminal_activation_failure(worktree_id: &WorktreeId, failed: bool) {
+    let mut failures = injected_terminal_activation_failures()
+        .lock()
+        .expect("injected terminal activation failure gate must not be poisoned");
+    if failed {
+        failures.insert(worktree_id.as_str().to_owned());
+    } else {
+        failures.remove(worktree_id.as_str());
+    }
+}
+
 #[cfg(any(test, feature = "test-helpers"))]
+#[allow(clippy::expect_used)] // fixture gate: a poisoned injection mutex is a test-harness bug
 fn has_injected_resident_memory_refusal(worktree_id: &WorktreeId) -> bool {
     injected_resident_memory_refusals()
         .lock()
-        .expect("injected resident-memory refusal gate must not be poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .contains(worktree_id.as_str())
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
+#[allow(clippy::expect_used)] // fixture gate: a poisoned injection mutex is a test-harness bug
 fn take_injected_activation_failure(worktree_id: &WorktreeId) -> bool {
     let mut injected = injected_activation_failures()
         .lock()
-        .expect("injected activation failure gate must not be poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match injected.get_mut(worktree_id.as_str()) {
         Some(remaining) if *remaining > 0 => {
             *remaining = remaining.saturating_sub(1);
@@ -137,12 +160,21 @@ fn take_injected_activation_failure(worktree_id: &WorktreeId) -> bool {
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
+fn take_injected_terminal_activation_failure(worktree_id: &WorktreeId) -> bool {
+    injected_terminal_activation_failures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(worktree_id.as_str())
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+#[allow(clippy::expect_used)] // fixture gate: a poisoned injection mutex is a test-harness bug
 fn take_injected_activation_gate(
     worktree_id: &WorktreeId,
 ) -> Option<Arc<InjectedActivationGateStateV1>> {
     injected_activation_gates()
         .lock()
-        .expect("injected activation gate map must not be poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(worktree_id.as_str())
 }
 
@@ -164,6 +196,7 @@ pub enum CodeGraphActivationPolicyV1 {
 }
 
 impl CodeGraphActivationPolicyV1 {
+    #[hotpath::skip]
     pub const fn from_enabled(enabled: bool) -> Self {
         if enabled {
             Self::Enabled
@@ -172,6 +205,7 @@ impl CodeGraphActivationPolicyV1 {
         }
     }
 
+    #[hotpath::skip]
     pub const fn is_enabled(self) -> bool {
         matches!(self, Self::Enabled)
     }
@@ -193,6 +227,76 @@ impl CodeGraphActivationAuthorityV1 {
 
     pub fn policy(&self) -> CodeGraphActivationPolicyV1 {
         CodeGraphActivationPolicyV1::from_enabled(self.policy_cell().load(Ordering::Acquire))
+    }
+
+    /// Validate and seat an already-published revision-7 graph directly from
+    /// its durable verified head. `Ok(false)` is an explicit abstention for
+    /// non-persistent or disabled authorities; every persistent mismatch is a
+    /// typed error so the scheduler can retain pending coverage and replay.
+    #[hotpath::measure(future = true, label = "code_graph.activation.recover_verified_head")]
+    pub async fn recover_verified_head(
+        &self,
+        project_id: &ProjectId,
+        repository_id: &RepositoryId,
+        worktree_id: &WorktreeId,
+        latest: LatestCodeTextGenerationV1,
+        replay_binding: CodeGraphReplayBindingV1,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<bool, CodeIndexSchedulerErrorV1> {
+        if self.policy() == CodeGraphActivationPolicyV1::RefusedByConfiguration {
+            return Ok(false);
+        }
+        match self {
+            Self::Persistent {
+                runtime,
+                project_database,
+                ..
+            } => {
+                let generation_id = latest.metadata().manifest().generation_id.clone();
+                let retained = hotpath::future!(
+                    runtime.retain_code_graph_runtime(
+                        project_id.clone(),
+                        repository_id.clone(),
+                        worktree_id.clone(),
+                        latest.metadata().snapshot().reference.clone(),
+                        generation_id,
+                        Arc::clone(project_database),
+                        replay_binding,
+                        None,
+                    ),
+                    label = "code_graph.activation.recover_head.retain_runtime"
+                )
+                .await
+                .map_err(|error| CodeIndexSchedulerErrorV1::GraphActivation(error.to_string()))?;
+                retained
+                    .sweep_aborted_read_bundle_temporaries()
+                    .map_err(|error| {
+                        CodeIndexSchedulerErrorV1::GraphActivation(error.to_string())
+                    })?;
+                let pending_catalog_warm = tokio::task::spawn_blocking(move || {
+                    latest.activate_persistent_graph_head(retained, cancellation)
+                })
+                .await
+                .map_err(|error| {
+                    CodeIndexSchedulerErrorV1::GraphActivation(format!(
+                        "verified graph head activation task failed: {error}"
+                    ))
+                })??;
+                if let Some(pending_catalog_warm) = pending_catalog_warm {
+                    drop(tokio::task::spawn_blocking(move || {
+                        if let Err(error) = pending_catalog_warm.run() {
+                            tracing::warn!(
+                                error = %error,
+                                "background recovered code graph catalog warm failed"
+                            );
+                        }
+                    }));
+                }
+                Ok(true)
+            }
+            #[cfg(any(test, feature = "test-helpers"))]
+            Self::Memory { .. } => Ok(false),
+        }
     }
 
     #[hotpath::measure(future = true, label = "code_graph.activation.total")]
@@ -223,8 +327,8 @@ impl CodeGraphActivationAuthorityV1 {
                 ..
             } => {
                 let generation_id = latest.generation().manifest().generation_id.clone();
-                let retained = runtime
-                    .retain_code_graph_runtime(
+                let retained = hotpath::future!(
+                    runtime.retain_code_graph_runtime(
                         project_id.clone(),
                         repository_id.clone(),
                         worktree_id.clone(),
@@ -233,11 +337,11 @@ impl CodeGraphActivationAuthorityV1 {
                         Arc::clone(project_database),
                         replay_binding,
                         Some(latest.generation_handle()),
-                    )
-                    .await
-                    .map_err(|error| {
-                        CodeIndexSchedulerErrorV1::GraphActivation(error.to_string())
-                    })?;
+                    ),
+                    label = "code_graph.activation.retain_runtime"
+                )
+                .await
+                .map_err(|error| CodeIndexSchedulerErrorV1::GraphActivation(error.to_string()))?;
                 retained
                     .sweep_aborted_read_bundle_temporaries()
                     .map_err(|error| {
@@ -269,6 +373,11 @@ impl CodeGraphActivationAuthorityV1 {
                 if let Some(gate) = take_injected_activation_gate(worktree_id) {
                     gate.started.notify_one();
                     gate.release.notified().await;
+                }
+                if take_injected_terminal_activation_failure(worktree_id) {
+                    return Err(CodeIndexSchedulerErrorV1::Identity(
+                        "injected terminal graph activation failure".to_owned(),
+                    ));
                 }
                 if has_injected_resident_memory_refusal(worktree_id) {
                     latest.refuse_graph_activation(
@@ -350,19 +459,128 @@ impl GraphCancellation for SchedulerGraphCancellation {
 }
 
 struct PendingInteractiveCatalogWarmV1 {
+    retained: Box<dyn CodeGraphSeatLeaseV1 + Send>,
+    generation_id: tracedecay_domain::CodeGenerationId,
     store: Arc<CodeGraphProjectionStore>,
+    request_cancelled: Arc<AtomicBool>,
     cancellation: Arc<dyn GraphCancellation>,
 }
 
 impl PendingInteractiveCatalogWarmV1 {
     #[hotpath::measure(label = "code_graph.catalog.background_warm")]
     fn run(self) -> Result<(), CodeGraphProjectionError> {
+        let catalog_loaded = match self
+            .retained
+            .load_sealed_read_bundle_catalog(&self.request_cancelled)
+        {
+            Ok(tracedecay_graph_db::SealedReadBundleArtifactStateV1::Loaded {
+                artifact,
+                bytes,
+            }) => match self
+                .store
+                .install_interactive_catalog_artifact(&bytes, Arc::clone(&self.cancellation))
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        generation = %self.generation_id,
+                        bytes = artifact.bytes,
+                        "code graph interactive catalog loaded from sealed read bundle"
+                    );
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        generation = %self.generation_id,
+                        "sealed read bundle catalog failed to install; re-deriving the catalog from the projection"
+                    );
+                    false
+                }
+            },
+            Ok(tracedecay_graph_db::SealedReadBundleArtifactStateV1::Absent { reason }) => {
+                tracing::info!(
+                    generation = %self.generation_id,
+                    reason = %reason,
+                    "no sealed read bundle catalog; re-deriving the catalog from the projection"
+                );
+                false
+            }
+            Ok(tracedecay_graph_db::SealedReadBundleArtifactStateV1::Stale { detail }) => {
+                tracing::warn!(
+                    generation = %self.generation_id,
+                    detail = %detail,
+                    "sealed read bundle catalog is stale; re-deriving the catalog from the projection"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    generation = %self.generation_id,
+                    "sealed read bundle load failed; re-deriving the catalog from the projection"
+                );
+                false
+            }
+        };
+        if catalog_loaded {
+            return Ok(());
+        }
         self.store
             .warm_interactive_catalog_with_cancellation(self.cancellation)
     }
 }
 
+impl LatestCodeTextGenerationV1 {
+    #[hotpath::measure(label = "code_graph.activation.persistent_head")]
+    fn activate_persistent_graph_head(
+        &self,
+        retained: Box<dyn CodeGraphSeatLeaseV1 + Send>,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Option<PendingInteractiveCatalogWarmV1>, CodeIndexSchedulerErrorV1> {
+        let generation_id = self.metadata().manifest().generation_id.clone();
+        let snapshot = hotpath::measure_block!(
+            "code_graph.activation.validate_verified_head",
+            retained
+                .recover_verified_snapshot_from_head(Arc::clone(&cancellation))
+                .map_err(CodeGraphProjectionError::from)
+        )?;
+        let store = Arc::new(CodeGraphProjectionStore::from_verified_snapshot(
+            snapshot,
+            generation_id.clone(),
+        )?);
+        let graph_cancellation: Arc<dyn GraphCancellation> =
+            Arc::new(SchedulerGraphCancellation(Arc::clone(&cancellation)));
+        store.mark_interactive_catalog_warming()?;
+        let reader = hotpath::measure_block!("code_graph.activation.head_evidence_reader", {
+            store.evidence_reader_with_cancellation(
+                &generation_id,
+                Some(self.metadata().snapshot().repository.clone()),
+                self.source_freshness().map_err(|error| {
+                    CodeIndexSchedulerErrorV1::GraphActivation(error.to_string())
+                })?,
+                Arc::clone(&graph_cancellation),
+            )
+        })?;
+        self.install_graph_serving(
+            reader,
+            Some(Arc::clone(&store)),
+            CodeGraphServingAuthorityV1::Persistent {
+                _lease: retained.authority(),
+            },
+        )
+        .map_err(|error| CodeIndexSchedulerErrorV1::GraphActivation(error.to_string()))?;
+        Ok(Some(PendingInteractiveCatalogWarmV1 {
+            retained,
+            generation_id,
+            store,
+            request_cancelled: cancellation,
+            cancellation: graph_cancellation,
+        }))
+    }
+}
+
 impl LatestCompleteCodeIndexV1 {
+    #[hotpath::measure(label = "code_graph.activation.persistent")]
     fn activate_persistent_graph(
         &self,
         retained: Box<dyn CodeGraphSeatLeaseV1 + Send>,
@@ -385,67 +603,10 @@ impl LatestCompleteCodeIndexV1 {
         )?);
         let graph_cancellation: Arc<dyn GraphCancellation> =
             Arc::new(SchedulerGraphCancellation(Arc::clone(&cancellation)));
-        // A bundled generation loads its interactive catalog from the sealed
-        // read bundle and never runs the projection warm scan. Absent and
-        // stale bundles are typed states: the fallback to the background
-        // re-derivation is explicit and logged, so generations sealed before
-        // bundles existed keep serving exactly as before.
-        let catalog_loaded = match retained.load_sealed_read_bundle_catalog(&cancellation) {
-            Ok(tracedecay_graph_db::SealedReadBundleArtifactStateV1::Loaded {
-                artifact,
-                bytes,
-            }) => match store
-                .install_interactive_catalog_artifact(&bytes, Arc::clone(&graph_cancellation))
-            {
-                Ok(()) => {
-                    tracing::info!(
-                        generation = %generation_id,
-                        bytes = artifact.bytes,
-                        "code graph interactive catalog loaded from sealed read bundle"
-                    );
-                    true
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        generation = %generation_id,
-                        "sealed read bundle catalog failed to install; re-deriving the catalog from the projection"
-                    );
-                    false
-                }
-            },
-            Ok(tracedecay_graph_db::SealedReadBundleArtifactStateV1::Absent { reason }) => {
-                tracing::info!(
-                    generation = %generation_id,
-                    reason = %reason,
-                    "no sealed read bundle catalog; re-deriving the catalog from the projection"
-                );
-                false
-            }
-            Ok(tracedecay_graph_db::SealedReadBundleArtifactStateV1::Stale { detail }) => {
-                tracing::warn!(
-                    generation = %generation_id,
-                    detail = %detail,
-                    "sealed read bundle catalog is stale; re-deriving the catalog from the projection"
-                );
-                false
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    generation = %generation_id,
-                    "sealed read bundle load failed; re-deriving the catalog from the projection"
-                );
-                false
-            }
-        };
-        if !catalog_loaded {
-            // Install occurrence-seeded graph serving before the derived
-            // catalog scan. Marking first prevents a request from racing the
-            // background worker and performing the whole scan on its own
-            // thread.
-            store.mark_interactive_catalog_warming()?;
-        }
+        // Bundle IO and catalog materialization are optional accelerators. The
+        // immutable occurrence graph is already verified, so publish it first
+        // and keep only catalog-dependent lookups in the typed warming state.
+        store.mark_interactive_catalog_warming()?;
         let reader = hotpath::measure_block!("code_graph.activation.evidence_reader", {
             store.evidence_reader_with_cancellation(
                 &generation_id,
@@ -464,13 +625,11 @@ impl LatestCompleteCodeIndexV1 {
         .map_err(|error| CodeIndexSchedulerErrorV1::GraphActivation(error.to_string()))?;
         let _ = self.generation.test_attribution_authority();
         let _ = self.record_index();
-        if catalog_loaded {
-            // A bundled generation skips the warm entirely: the catalog is
-            // already ready, so there is no background scan to run.
-            return Ok(None);
-        }
         Ok(Some(PendingInteractiveCatalogWarmV1 {
+            retained,
+            generation_id,
             store,
+            request_cancelled: cancellation,
             cancellation: graph_cancellation,
         }))
     }

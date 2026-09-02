@@ -10,6 +10,7 @@ impl McpServer {
     /// project root; both are revalidated here so admit-time membership is never
     /// reused. Everything that differs between the branch plans is carried by
     /// `policy` rather than by branching on the plan again.
+    #[hotpath::skip]
     async fn apply_branch_effect(
         &self,
         effect_root: &Path,
@@ -36,12 +37,12 @@ impl McpServer {
         }
     }
 
+    #[hotpath::skip]
     pub(crate) async fn update_hook_workspace_route(
         &self,
         event: &hook_events::HookEvent,
         route_cache: &mut HookProjectRouteCache,
-    ) -> tracedecay_runtime_core::errors::Result<crate::mcp::project_route::ResolvedProjectRoute>
-    {
+    ) -> tracedecay_domain::errors::Result<crate::mcp::project_route::ResolvedProjectRoute> {
         let route = match HookProjectRouteCache::route_cwd(event) {
             Some(cwd) => {
                 crate::mcp::server::routing::resolve_private_project_route(
@@ -71,7 +72,7 @@ impl McpServer {
         route_cache.observe_workspace_route(event, route);
         self.hook_project_routes.store(route_cache)?;
         resolved.ok_or_else(|| {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "project_route_unavailable",
                 true,
                 "hook route was not retained under its structural identity",
@@ -79,6 +80,7 @@ impl McpServer {
         })
     }
 
+    #[hotpath::skip]
     pub(crate) async fn run_hook_event_plan(
         &self,
         cg: Arc<TraceDecay>,
@@ -174,6 +176,7 @@ impl McpServer {
         }
     }
 
+    #[hotpath::skip]
     pub(crate) async fn run_hook_incremental_sync(
         &self,
         cg: Arc<TraceDecay>,
@@ -185,6 +188,7 @@ impl McpServer {
         }
     }
 
+    #[hotpath::skip]
     async fn accept_debounced_code_index_reconcile(
         &self,
         cg: &TraceDecay,

@@ -1,9 +1,19 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use tracedecay::profile_registry_maintenance::{remove_store_directory, verify_store_path_absent};
 
 use crate::global;
 
 use super::daemon::daemon_tool_json;
+
+/// Bounds the wait for the profile lifecycle lease after the managed daemon
+/// service is stopped. The stop itself is separately bounded by the service
+/// supervisor (the generated unit's `TimeoutStopSec` SIGKILLs a hung daemon),
+/// so this only covers lease release after process exit plus short-lived
+/// shared holders such as hooks and doctor runs.
+const PROFILE_OFFLINE_LEASE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const PROFILE_SQLITE_DATABASES: [&str; 3] = ["global.db", "user-sessions.db", "user-memory.db"];
 const PROFILE_DATABASE_PATHS: [&str; 8] = [
@@ -27,8 +37,8 @@ fn wipe_io(
     operation: &str,
     path: &Path,
     error: &std::io::Error,
-) -> tracedecay_runtime_core::errors::TraceDecayError {
-    tracedecay_runtime_core::errors::TraceDecayError::Config {
+) -> tracedecay_domain::errors::TraceDecayError {
+    tracedecay_domain::errors::TraceDecayError::Config {
         message: format!("failed to {operation} '{}': {error}", path.display()),
     }
 }
@@ -36,9 +46,9 @@ fn wipe_io(
 fn validate_complete_wipe_profile_root(
     profile_root: &Path,
     user_home: Option<&Path>,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     if !profile_root.is_absolute() {
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: format!(
                 "complete profile wipe requires an absolute profile root, got '{}'",
                 profile_root.display()
@@ -48,7 +58,7 @@ fn validate_complete_wipe_profile_root(
     let metadata = std::fs::symlink_metadata(profile_root)
         .map_err(|error| wipe_io("inspect complete-wipe profile root", profile_root, &error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: format!(
                 "complete profile wipe root '{}' must be a regular directory, not a symlink",
                 profile_root.display()
@@ -63,7 +73,7 @@ fn validate_complete_wipe_profile_root(
         )
     })?;
     if canonical != profile_root || canonical.parent().is_none() {
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: format!(
                 "complete profile wipe root '{}' must be an exact canonical non-filesystem-root directory",
                 profile_root.display()
@@ -75,7 +85,7 @@ fn validate_complete_wipe_profile_root(
             .canonicalize()
             .map_err(|error| wipe_io("canonicalize user home", user_home, &error))?;
         if canonical_home.starts_with(&canonical) {
-            return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!(
                     "complete profile wipe root '{}' must not be the user home or one of its ancestors",
                     profile_root.display()
@@ -89,12 +99,15 @@ fn validate_complete_wipe_profile_root(
 fn remove_fixed_profile_path(
     profile_root: &Path,
     name: &str,
-) -> tracedecay_runtime_core::errors::Result<bool> {
+) -> tracedecay_domain::errors::Result<bool> {
     use tracedecay_private_fs::framed_log::{DirectorySyncPolicy, sync_directory};
 
     let path = profile_root.join(name);
-    tracedecay::storage::reject_symlink_components(&path, "profile database wipe target")
-        .map_err(|error| wipe_io("validate wipe target", &path, &error))?;
+    tracedecay_runtime_core::storage::reject_symlink_components(
+        &path,
+        "profile database wipe target",
+    )
+    .map_err(|error| wipe_io("validate wipe target", &path, &error))?;
     let removed = match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_dir() => {
             // `remove_dir_all` does not follow directory symlinks. The exact
@@ -106,11 +119,11 @@ fn remove_fixed_profile_path(
             true
         }
         Ok(metadata) if metadata.is_file() => {
-            tracedecay::storage::PrivateStoreIo::remove_file_durable(&path)
+            tracedecay_runtime_core::storage::PrivateStoreIo::remove_file_durable(&path)
                 .map_err(|error| wipe_io("remove profile database file", &path, &error))?
         }
         Ok(_) => {
-            return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!(
                     "profile database wipe target '{}' is not a regular file or directory",
                     path.display()
@@ -125,52 +138,103 @@ fn remove_fixed_profile_path(
     Ok(removed)
 }
 
-fn verify_wipe_path_absent(path: &Path) -> tracedecay_runtime_core::errors::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
-            message: format!(
-                "wipe did not remove expected namespace entry '{}'",
-                path.display()
-            ),
-        }),
-        Err(error) => Err(wipe_io("verify wipe path namespace absence", path, &error)),
+/// The exclusive maintenance window a destructive profile command runs in.
+///
+/// The fast path is an uncontended lease. When the lease is busy — most often
+/// because the managed daemon retains a shared lease for its whole lifetime —
+/// the profile is taken offline by quiescing the installed service (bounded
+/// by the supervisor's stop timeout, which SIGKILLs a hung or wedged daemon),
+/// and [`Self::finish`] restores the captured service state afterward.
+pub(crate) enum ProfileOfflineAuthority {
+    /// The lease was free; no daemon coordination was needed.
+    Lease(tracedecay_runtime_core::lifecycle_lease::LifecycleLease),
+    /// The managed daemon service was quiesced; dropping or finishing this
+    /// restores its prior state.
+    QuiescedDaemon(tracedecay_daemon_control::QuiescedDaemonLifecycle),
+}
+
+impl ProfileOfflineAuthority {
+    pub(crate) fn lease(
+        &self,
+    ) -> tracedecay_domain::errors::Result<&tracedecay_runtime_core::lifecycle_lease::LifecycleLease>
+    {
+        match self {
+            Self::Lease(lease) => Ok(lease),
+            Self::QuiescedDaemon(guard) => guard.lifecycle_lease(),
+        }
+    }
+
+    /// Releases the maintenance window, restarting the managed daemon when it
+    /// was running before. The destructive outcome is already decided when
+    /// this runs; a restore failure is reported on its own.
+    pub(crate) fn finish(self) -> tracedecay_domain::errors::Result<()> {
+        match self {
+            Self::Lease(lease) => {
+                drop(lease);
+                Ok(())
+            }
+            Self::QuiescedDaemon(guard) => guard.finish(),
+        }
     }
 }
 
-fn remove_local_wipe_directory(path: &Path) -> tracedecay_runtime_core::errors::Result<bool> {
-    use tracedecay_private_fs::framed_log::{DirectorySyncPolicy, sync_directory};
+/// Takes the whole profile offline for a destructive maintenance command,
+/// within a bound, or refuses typed — never "retry after it finishes".
+///
+/// The managed daemon holds a shared lifecycle lease for its entire lifetime,
+/// and a daemon wedged in a terminal retry loop (issue #765's unseatable
+/// sealed generation) never exits, so a bare lease attempt refuses forever —
+/// exactly when the operator most needs the escape hatch. On contention this
+/// stops the installed service (the supervisor bounds the stop and SIGKILLs a
+/// hung daemon), waits a bounded interval for the lease, and restores the
+/// captured service state when the caller finishes.
+#[hotpath::measure(label = "cli.profile.offline_acquire")]
+pub(crate) fn take_profile_offline(
+    profile_root: &Path,
+    operation: &'static str,
+) -> tracedecay_domain::errors::Result<ProfileOfflineAuthority> {
+    use tracedecay_runtime_core::lifecycle_lease::ExclusiveLeaseAttempt;
 
-    tracedecay::storage::reject_symlink_components(path, "local wipe target")
-        .map_err(|error| wipe_io("validate local wipe target", path, &error))?;
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => {
-            std::fs::remove_dir_all(path)
-                .map_err(|error| wipe_io("remove local wipe directory", path, &error))?;
-            let parent = path.parent().ok_or_else(|| {
-                tracedecay_runtime_core::errors::TraceDecayError::Config {
-                    message: format!("local wipe target '{}' has no parent", path.display()),
+    match tracedecay_runtime_core::lifecycle_lease::try_acquire_exclusive_for_profile(
+        profile_root,
+        operation,
+    )? {
+        ExclusiveLeaseAttempt::Acquired(lease) => Ok(ProfileOfflineAuthority::Lease(lease)),
+        ExclusiveLeaseAttempt::Busy { owner_operation } => {
+            let holder = owner_operation
+                .as_deref()
+                .map_or_else(String::new, |owner| format!(" (held by {owner})"));
+            eprintln!(
+                "The profile lifecycle lease is busy{holder}; stopping the managed TraceDecay \
+                 daemon service to take the profile offline. The previous service state is \
+                 restored when {operation} finishes."
+            );
+            match tracedecay_daemon_control::QuiescedDaemonLifecycle::acquire_with_timeout(
+                operation,
+                PROFILE_OFFLINE_LEASE_TIMEOUT,
+                crate::product_runtime::PRODUCT_BUILD_VERSION,
+            ) {
+                Ok(guard) => {
+                    eprintln!("Profile is offline for {operation}.");
+                    Ok(ProfileOfflineAuthority::QuiescedDaemon(guard))
                 }
-            })?;
-            sync_directory(parent, DirectorySyncPolicy::Strict)
-                .map_err(|error| wipe_io("sync local wipe parent", parent, &error))?;
-            verify_wipe_path_absent(path)?;
-            Ok(true)
+                Err(error) => Err(tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!(
+                        "{operation} could not take the profile offline within its \
+                         {}s lease bound: {error}. The previous daemon service state was \
+                         restored. If an unmanaged daemon or another maintenance command \
+                         holds the profile, stop it and re-run.",
+                        PROFILE_OFFLINE_LEASE_TIMEOUT.as_secs()
+                    ),
+                }),
+            }
         }
-        Ok(_) => Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
-            message: format!(
-                "local wipe target '{}' is not a regular directory",
-                path.display()
-            ),
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(wipe_io("inspect local wipe target", path, &error)),
     }
 }
 
 fn wipe_complete_profile_database_state(
     profile_root: &Path,
-) -> tracedecay_runtime_core::errors::Result<usize> {
+) -> tracedecay_domain::errors::Result<usize> {
     let mut removed = 0usize;
     for name in PROFILE_DATABASE_PATHS {
         removed += usize::from(remove_fixed_profile_path(profile_root, name)?);
@@ -180,19 +244,20 @@ fn wipe_complete_profile_database_state(
         for suffix in ["-wal", "-shm", "-journal", ""] {
             let member = sqlite_family_member(&database, suffix);
             removed += usize::from(
-                tracedecay::storage::PrivateStoreIo::remove_file_durable(&member).map_err(
-                    |error| wipe_io("remove profile SQLite family member", &member, &error),
-                )?,
+                tracedecay_runtime_core::storage::PrivateStoreIo::remove_file_durable(&member)
+                    .map_err(|error| {
+                        wipe_io("remove profile SQLite family member", &member, &error)
+                    })?,
             );
         }
     }
     for name in PROFILE_DATABASE_PATHS {
-        verify_wipe_path_absent(&profile_root.join(name))?;
+        verify_store_path_absent(&profile_root.join(name))?;
     }
     for database in PROFILE_SQLITE_DATABASES {
         let database = profile_root.join(database);
         for suffix in ["-wal", "-shm", "-journal", ""] {
-            verify_wipe_path_absent(&sqlite_family_member(&database, suffix))?;
+            verify_store_path_absent(&sqlite_family_member(&database, suffix))?;
         }
     }
     Ok(removed)
@@ -263,7 +328,7 @@ mod wipe_safety_tests {
 
         assert!(validate_complete_wipe_profile_root(&profile_link, None).is_err());
         assert!(
-            verify_wipe_path_absent(&dangling).is_err(),
+            verify_store_path_absent(&dangling).is_err(),
             "a dangling symlink remains a namespace entry"
         );
     }
@@ -279,7 +344,7 @@ mod wipe_safety_tests {
 pub(crate) async fn handle_wipe(
     all: bool,
     assume_yes: bool,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     handle_wipe_inner(all, assume_yes).await
 }
 
@@ -287,16 +352,12 @@ fn handle_wipe_inner(
     all: bool,
     assume_yes: bool,
 ) -> std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = tracedecay_runtime_core::errors::Result<()>>
-            + Send
-            + 'static,
-    >,
+    Box<dyn std::future::Future<Output = tracedecay_domain::errors::Result<()>> + Send + 'static>,
 > {
     // Erase the deeply nested wipe future before it reaches the measured
     // wrapper so every profiling feature can compute its layout.
     Box::pin(async move {
-        let profile_root = tracedecay::storage::default_profile_root()?;
+        let profile_root = tracedecay_runtime_core::storage::default_profile_root()?;
         let home_tracedecay = Some(profile_root.clone());
         if all {
             validate_complete_wipe_profile_root(
@@ -304,20 +365,70 @@ fn handle_wipe_inner(
                 tracedecay::agents::home_dir().as_deref(),
             )?;
         }
-        let lifecycle_lease =
-            tracedecay_runtime_core::lifecycle_lease::acquire_exclusive_for_profile(
-                &profile_root,
-                "wipe",
-            )?;
-        let _database_scope = tracedecay_runtime_core::db::enter_maintenance_database_scope(
-            &lifecycle_lease,
+        // A wedged daemon never exits on its own, so the lease is acquired
+        // through the bounded profile-offline sequence instead of a bare
+        // fail-fast attempt whose only advice was to wait for it.
+        let profile_offline = take_profile_offline(&profile_root, "wipe")?;
+        let outcome = wipe_under_profile_offline(
+            all,
+            assume_yes,
             &profile_root,
+            &home_tracedecay,
+            &profile_offline,
+        )
+        .await;
+        let restore = profile_offline.finish();
+        join_outcome_and_restore("wipe", outcome, restore)
+    })
+}
+
+/// Combines a destructive command's outcome with the daemon-restore outcome
+/// so neither failure can shadow the other.
+pub(crate) fn join_outcome_and_restore(
+    operation: &str,
+    outcome: tracedecay_domain::errors::Result<()>,
+    restore: tracedecay_domain::errors::Result<()>,
+) -> tracedecay_domain::errors::Result<()> {
+    match (outcome, restore) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(restore_error)) => Err(tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!(
+                "{operation} completed, but the managed daemon service state could not be \
+                 restored: {restore_error}"
+            ),
+        }),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(restore_error)) => {
+            Err(tracedecay_domain::errors::TraceDecayError::Config {
+                message: format!(
+                    "{error}; additionally the managed daemon service state could not be \
+                     restored: {restore_error}"
+                ),
+            })
+        }
+    }
+}
+
+/// The destructive wipe body, run inside the profile-offline window. The
+/// maintenance scope and registry handles drop before the caller restores the
+/// daemon service.
+async fn wipe_under_profile_offline(
+    all: bool,
+    assume_yes: bool,
+    profile_root: &Path,
+    home_tracedecay: &Option<PathBuf>,
+    profile_offline: &ProfileOfflineAuthority,
+) -> tracedecay_domain::errors::Result<()> {
+    {
+        let _database_scope = tracedecay_runtime_core::db::enter_maintenance_database_scope(
+            profile_offline.lease()?,
+            profile_root,
             "wipe",
         )?;
         let registry = if all {
             None
         } else {
-            tracedecay::profile_registry_maintenance::ProfileRegistryMaintenanceRuntime::try_open_existing(&profile_root)
+            tracedecay::profile_registry_maintenance::ProfileRegistryMaintenanceRuntime::try_open_existing(profile_root)
             .await?
         };
 
@@ -328,7 +439,7 @@ fn handle_wipe_inner(
         let project_paths = if all {
             Vec::new()
         } else {
-            global::gather_target_projects(false, &home_tracedecay).await?
+            global::gather_target_projects(false, home_tracedecay).await?
         };
         let mut targets = Vec::new();
         for path in &project_paths {
@@ -361,7 +472,7 @@ fn handle_wipe_inner(
             io::stderr().flush().ok();
             let mut answer = String::new();
             io::stdin().lock().read_line(&mut answer).map_err(|e| {
-                tracedecay_runtime_core::errors::TraceDecayError::Config {
+                tracedecay_domain::errors::TraceDecayError::Config {
                     message: format!("failed to read stdin: {e}"),
                 }
             })?;
@@ -375,7 +486,7 @@ fn handle_wipe_inner(
         }
 
         if all {
-            let removed = wipe_complete_profile_database_state(&profile_root)?;
+            let removed = wipe_complete_profile_database_state(profile_root)?;
             eprintln!();
             eprintln!(
                 "\x1b[32mWiped complete profile database state ({removed} filesystem entries).\x1b[0m"
@@ -389,7 +500,7 @@ fn handle_wipe_inner(
         let mut marker_cleanup = Vec::new();
 
         for location in &targets {
-            match remove_local_wipe_directory(&location.data_root) {
+            match remove_store_directory(&location.data_root) {
                 Ok(_) => {
                     wiped_paths.push(location.project_root.clone());
                     marker_cleanup.push(location);
@@ -415,7 +526,7 @@ fn handle_wipe_inner(
 
         for location in marker_cleanup {
             if let Some(marker_root) = &location.marker_root
-                && let Err(error) = remove_local_wipe_directory(marker_root)
+                && let Err(error) = remove_store_directory(marker_root)
             {
                 eprintln!("  \x1b[31m✗\x1b[0m {} ({error})", marker_root.display());
                 failures.push(format!("{} ({error})", marker_root.display()));
@@ -429,7 +540,7 @@ fn handle_wipe_inner(
         }
 
         if !failures.is_empty() {
-            return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!(
                     "local wipe failed for {} selected target(s): {}",
                     failures.len(),
@@ -441,28 +552,24 @@ fn handle_wipe_inner(
         eprintln!();
         eprintln!("\x1b[32mWiped {removed} project(s).\x1b[0m");
         Ok(())
-    })
+    }
 }
 
 /// Handles the `list` and `list --all` commands.
 #[hotpath::measure(label = "cli.list.run", future = true)]
-pub(crate) async fn handle_list(all: bool) -> tracedecay_runtime_core::errors::Result<()> {
+pub(crate) async fn handle_list(all: bool) -> tracedecay_domain::errors::Result<()> {
     handle_list_inner(all).await
 }
 
 fn handle_list_inner(
     all: bool,
 ) -> std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = tracedecay_runtime_core::errors::Result<()>>
-            + Send
-            + 'static,
-    >,
+    Box<dyn std::future::Future<Output = tracedecay_domain::errors::Result<()>> + Send + 'static>,
 > {
     // Erase the deeply nested list future before it reaches the measured
     // wrapper so every profiling feature can compute its layout.
     Box::pin(async move {
-        use tracedecay::display::format_token_count;
+        use tracedecay_runtime_core::text::format_token_count;
 
         let home_tracedecay = tracedecay::config::user_data_dir();
         let project_paths = global::gather_target_projects(all, &home_tracedecay).await?;
@@ -587,7 +694,7 @@ fn handle_list_inner(
             let path_str = format!("{} [{}]", r.path.display(), r.status_label);
             let pad = path_w.saturating_sub(path_str.chars().count());
             let size_str = if r.has_data {
-                tracedecay::display::format_bytes(r.size)
+                tracedecay_runtime_core::text::format_bytes(r.size)
             } else {
                 "—".to_string()
             };
@@ -617,7 +724,7 @@ fn handle_list_inner(
         };
         println!(
             "Total: {} on disk · {} tokens saved{}",
-            tracedecay::display::format_bytes(total_size),
+            tracedecay_runtime_core::text::format_bytes(total_size),
             total_tokens_str,
             total_suffix
         );

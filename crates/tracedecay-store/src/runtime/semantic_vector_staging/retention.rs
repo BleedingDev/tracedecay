@@ -31,6 +31,7 @@ impl SemanticVectorStageCensusRevision {
         Ok(Self(value))
     }
 
+    #[hotpath::skip]
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -436,6 +437,7 @@ impl SemanticVectorRetirementCleanupCursor {
         Ok(Self(value))
     }
 
+    #[hotpath::skip]
     pub const fn get(self) -> u64 {
         self.0
     }

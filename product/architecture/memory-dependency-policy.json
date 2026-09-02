@@ -196,20 +196,25 @@
     {
       "package": "tracedecay-application",
       "allowed_direct_dependencies": [
+        "getrandom",
         "gix",
+        "hex",
         "hotpath",
         "schemars",
         "serde",
         "serde_json",
+        "sha2",
         "thiserror",
         "tracedecay-domain",
         "tracedecay-policy",
         "tracedecay-tool-catalog"
       ],
       "allowed_dev_dependencies": [
+        "tempfile",
         "tokio"
       ],
       "allowed_dependency_features": {
+        "getrandom": [],
         "gix": [
           "revision",
           "blob-diff",
@@ -218,6 +223,7 @@
           "sha256",
           "status"
         ],
+        "hex": [],
         "hotpath": [
           "threads"
         ],
@@ -226,12 +232,13 @@
           "derive"
         ],
         "serde_json": [],
+        "sha2": [],
         "thiserror": [],
         "tracedecay-domain": [],
         "tracedecay-policy": [],
         "tracedecay-tool-catalog": []
       },
-      "reason": "This crate is under contract only because the composition registry is allowed one edge to it. Its dependency closure is therefore default-deny by exact name, external crates included, so a concrete store, code index, host, transport, or HTTP stack cannot be added here and become reachable from the registry. The closure is stated honestly: gix is a real capability, mounted behind the optional native-git feature for the CLI, MCP, usecases, and root consumers that need the historical-blob reader. That is exactly why the registry's protection is the source-import contract rather than a feature pin on its own edge -- Cargo unifies native-git across the production root graph. Adding any further capability here requires an ADR-bound exception, and the registry's source contract must still refuse to name whatever it exports."
+      "reason": "This crate is under contract only because the composition registry is allowed one edge to it. Its dependency closure is therefore default-deny by exact name, external crates included, so a concrete store, code index, host, transport, or HTTP stack cannot be added here and become reachable from the registry. The closure is stated honestly: gix is a real capability, mounted behind the optional native-git feature for the CLI, MCP, usecases, and root consumers that need the historical-blob reader. That is exactly why the registry's protection is the source-import contract rather than a feature pin on its own edge -- Cargo unifies native-git across the production root graph. Adding any further capability here requires an ADR-bound exception, and the registry's source contract must still refuse to name whatever it exports. Upstream floor 5749e4fc added getrandom, hex, and sha2 to this upstream-owned crate for request-identity nonce generation and digesting in src/request_identity.rs, and tempfile as a dev-dependency for unit tests in src/branch_snapshots.rs. They are admitted by exact name because each is a pure computation or test-scaffolding primitive: none is a store, code index, host, transport, or HTTP stack, so none widens what the composition registry can reach through its one contract-crate edge. Product crates adapt to upstream APIs, so the closure follows upstream's own dependency rather than the reverse."
     },
     {
       "package": "tracedecay-memory-observation",
@@ -469,20 +476,24 @@
         "*"
       ],
       "allowed_dependencies": [
+        "getrandom",
         "gix",
+        "hex",
         "hotpath",
         "schemars",
         "serde",
         "serde_json",
+        "sha2",
         "thiserror",
         "tracedecay-domain",
         "tracedecay-policy",
         "tracedecay-tool-catalog"
       ],
       "allowed_dev_dependencies": [
+        "tempfile",
         "tokio"
       ],
-      "reason": "The composition registry is allowed exactly one contract-crate edge, so this crate's whole dependency closure is default-deny -- every package, external crates included, not merely the tracedecay-*, ncm*, and ocean* prefixes. A store such as rusqlite, an HTTP stack, a code index, a host, a transport, or the root crate added here would widen what the registry can reach and is refused by name. The closure is not a claim that this crate is capability-free: gix is present behind the optional native-git feature, which the production root enables, and that is precisely why the registry is additionally bound by an exact source-import allowlist rather than by feature pins on its own edge."
+      "reason": "The composition registry is allowed exactly one contract-crate edge, so this crate's whole dependency closure is default-deny -- every package, external crates included, not merely the tracedecay-*, ncm*, and ocean* prefixes. A store such as rusqlite, an HTTP stack, a code index, a host, a transport, or the root crate added here would widen what the registry can reach and is refused by name. The closure is not a claim that this crate is capability-free: gix is present behind the optional native-git feature, which the production root enables, and that is precisely why the registry is additionally bound by an exact source-import allowlist rather than by feature pins on its own edge. Upstream floor 5749e4fc added getrandom, hex, and sha2 to this upstream-owned crate for request-identity nonce generation and digesting in src/request_identity.rs, and tempfile as a dev-dependency for unit tests in src/branch_snapshots.rs. They are admitted by exact name because each is a pure computation or test-scaffolding primitive: none is a store, code index, host, transport, or HTTP stack, so none widens what the composition registry can reach through its one contract-crate edge. Product crates adapt to upstream APIs, so the closure follows upstream's own dependency rather than the reverse."
     },
     {
       "id": "observation-journal-is-isolated",

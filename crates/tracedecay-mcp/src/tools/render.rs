@@ -6,7 +6,6 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::context_headings::CONTEXT_PRIORITY_HEADINGS;
-use crate::output_format::{RequestedOutputFormat, requested_output_format};
 use crate::path_tree::format_compact_path_list;
 use crate::response_handles::{
     RESPONSE_HANDLE_TTL_SECS, RESPONSE_RETRIEVE_TOOL, ResponseHandleRecord,
@@ -14,30 +13,11 @@ use crate::response_handles::{
     store_response_handle,
 };
 use crate::tools::MAX_RESPONSE_CHARS;
+use tracedecay_daemon_protocol::{RequestedOutputFormat, requested_output_format};
 use tracedecay_runtime_core::text::utf8_prefix_at_or_before;
 use tracedecay_runtime_core::tracedecay::current_timestamp;
 
-/// Formats a UNIX timestamp as a human-readable relative time (e.g. "2m ago").
-/// Returns "never" when the timestamp is 0.
-pub fn format_relative_time(timestamp: u64) -> String {
-    if timestamp == 0 {
-        return "never".to_string();
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let delta = now.saturating_sub(timestamp);
-    if delta < 60 {
-        format!("{delta}s ago")
-    } else if delta < 3600 {
-        format!("{}m ago", delta / 60)
-    } else if delta < 86400 {
-        format!("{}h ago", delta / 3600)
-    } else {
-        format!("{}d ago", delta / 86400)
-    }
-}
+pub use tracedecay_runtime_core::text::format_relative_time;
 
 const MARKDOWN_TRUNCATION_RESERVED_CHARS: usize = 2_048;
 

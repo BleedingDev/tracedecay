@@ -91,6 +91,7 @@ impl StoreRuntimeKey {
         &self.shard_id
     }
 
+    #[hotpath::skip]
     pub const fn incarnation(&self) -> StoreIncarnationV1 {
         self.incarnation
     }
@@ -915,6 +916,7 @@ impl StoreRuntimeClientLease {
         Ok(counts)
     }
 
+    #[hotpath::skip]
     pub async fn run_bounded_incremental_compaction(
         &self,
         max_pages: u64,
@@ -949,6 +951,7 @@ impl StoreRuntimeClientLease {
         Ok(())
     }
 
+    #[hotpath::skip]
     pub async fn run_checkpoint(
         &self,
         request: tracedecay_rusqlite_runtime::CheckpointRequest,
@@ -970,6 +973,7 @@ impl StoreRuntimeClientLease {
         Ok(outcome)
     }
 
+    #[hotpath::skip]
     pub async fn snapshot_to(
         &self,
         destination: PathBuf,
@@ -991,6 +995,7 @@ impl StoreRuntimeClientLease {
         Ok(receipt)
     }
 
+    #[hotpath::skip]
     pub async fn snapshot_to_interruptible(
         &self,
         destination: PathBuf,
@@ -1106,6 +1111,7 @@ impl StoreRuntimeClientLease {
             })
     }
 
+    #[hotpath::skip]
     pub async fn dispatch_submit_authorized(
         &self,
         request: tracedecay_store::RuntimeSubmitRequestV1,

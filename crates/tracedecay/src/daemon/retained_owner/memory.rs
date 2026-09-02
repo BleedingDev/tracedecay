@@ -1,42 +1,43 @@
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::Serialize;
 use tracedecay_application::retained_surfaces::{
-    FactFeedbackRequestV1, FactStoreAddRequestV1, FactStoreContradictRequestV1,
-    FactStoreGetRequestV1, FactStoreListRequestV1, FactStoreProbeRequestV1,
-    FactStoreReasonRequestV1, FactStoreRelatedRequestV1, FactStoreRemoveRequestV1,
-    FactStoreSearchRequestV1, FactStoreUpdateRequestV1, MemoryScopeV1, MemoryStatusRequestV1,
-    RetainedProjectSelectorV1, RetainedSurfaceOperation, RetainedSurfaceResultV1,
+    FactFeedbackRequestV1, FactRetrievalTelemetryV1, FactStoreAddRequestV1,
+    FactStoreContradictRequestV1, FactStoreGetRequestV1, FactStoreListRequestV1,
+    FactStoreProbeRequestV1, FactStoreReasonRequestV1, FactStoreRelatedRequestV1,
+    FactStoreRemoveRequestV1, FactStoreSearchRequestV1, FactStoreUpdateRequestV1, MemoryScopeV1,
+    MemoryStatusRequestV1, RetainedProjectSelectorV1, RetainedSurfaceOperation,
+    RetainedSurfaceResultV1,
 };
 use tracedecay_application::{
-    ApplicationOutcome, RequestAdmission, RetainedMemoryExecutionPortV1, RetainedMemoryRequestV1,
+    ApplicationOutcome, RetainedMemoryExecutionPortV1, RetainedMemoryRequestV1,
     RetainedSurfaceExecutionContextV1, RetainedSurfaceExecutionErrorV1,
     RetainedSurfaceExecutionFutureV1, now_micros,
 };
 use tracedecay_domain::{FactOwnerV1, ManifestDigest};
+use tracedecay_session_memory::memory::{
+    MemoryApplication, MemoryOperationContext, ProjectMemoryFactAddRequestOutcome,
+};
 use tracedecay_store::{
-    FactReadControl, FactWriteControl, ProjectMemoryFactContradictionQueryV1,
+    FactReadControl, ProjectMemoryFactContradictionQueryV1,
     ProjectMemoryFactFeedbackHistoryQueryV1, ProjectMemoryFactIdV1, ProjectMemoryFactListQueryV1,
     ProjectMemoryFactSearchKindV1,
-};
-use tracedecay_usecases::memory::{
-    MemoryApplication, MemoryOperationContext, ProjectMemoryFactAddRequestOutcome,
 };
 
 use super::map_execution_error;
 use super::memory_mapping;
-use super::memory_mutation::{fresh_one_shot_commit_gate, validate_memory_mutation};
+use super::memory_mutation::{
+    bounded_memory_operation, fact_write_control, validate_memory_mutation,
+};
 use super::memory_tracking::{TrackedExplicitSearch, track_explicit_search};
 use super::receipts::{
     effective_memory_deadline, evidence_outcome, memory_expiry_partial, prepare_retained_effect,
 };
-use crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1;
-use crate::store::DatabaseFactStore;
 use crate::tracedecay::TraceDecay;
 use tracedecay_runtime_core::db::Database;
+use tracedecay_runtime_core::store::memory::DatabaseFactStore;
+use tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1;
 
 macro_rules! execute_scoped_memory {
     (
@@ -78,9 +79,7 @@ macro_rules! execute_scoped_memory {
                 memory_mapping::ensure_profile_request_scope($memory_scope, $selector)?;
                 let (database, _) = bounded_memory_operation($context, async {
                     hotpath::future!(
-                        crate::daemon::store_runtime::session_registry::open_user_memory_db(
-                            registry
-                        ),
+                        tracedecay_store_runtime::open_user_memory_db(registry),
                         label = "daemon.retained.memory.open_profile"
                     )
                     .await
@@ -166,6 +165,7 @@ impl<'a> DirectRetainedMemoryPortV1<'a> {
         }
     }
 
+    #[hotpath::skip]
     async fn execute_add(
         &self,
         context: &RetainedSurfaceExecutionContextV1<'_>,
@@ -181,6 +181,7 @@ impl<'a> DirectRetainedMemoryPortV1<'a> {
         )
     }
 
+    #[hotpath::skip]
     async fn execute_read(
         &self,
         context: &RetainedSurfaceExecutionContextV1<'_>,
@@ -197,6 +198,7 @@ impl<'a> DirectRetainedMemoryPortV1<'a> {
         )
     }
 
+    #[hotpath::skip]
     async fn execute_status(
         &self,
         context: &RetainedSurfaceExecutionContextV1<'_>,
@@ -212,6 +214,7 @@ impl<'a> DirectRetainedMemoryPortV1<'a> {
         )
     }
 
+    #[hotpath::skip]
     async fn execute_update(
         &self,
         context: &RetainedSurfaceExecutionContextV1<'_>,
@@ -227,6 +230,7 @@ impl<'a> DirectRetainedMemoryPortV1<'a> {
         )
     }
 
+    #[hotpath::skip]
     async fn execute_remove(
         &self,
         context: &RetainedSurfaceExecutionContextV1<'_>,
@@ -242,6 +246,7 @@ impl<'a> DirectRetainedMemoryPortV1<'a> {
         )
     }
 
+    #[hotpath::skip]
     async fn execute_feedback(
         &self,
         context: &RetainedSurfaceExecutionContextV1<'_>,
@@ -613,25 +618,54 @@ async fn search_on_db(
             operation_context.operation_id().as_str(),
         )?)
     };
-    let tracked = if database.is_writable() {
-        track_explicit_search(
+    // Retrieval telemetry is recall bookkeeping for the returned hits, not
+    // part of the evidence itself. When only its write lane is unavailable,
+    // the search degrades to delivering the evidence with a typed telemetry
+    // state instead of refusing a read the store already served.
+    let (tracked, retrieval_telemetry) = if page.hits().is_empty() {
+        (
+            TrackedExplicitSearch::default(),
+            FactRetrievalTelemetryV1::NotApplicable,
+        )
+    } else if database.is_writable() {
+        match track_explicit_search(
             context,
             &memory,
             &owner,
             operation_context.operation_id().clone(),
             &page,
         )
-        .await?
+        .await
+        {
+            Ok(tracked) => {
+                let fact_count = page.hits().len();
+                (tracked, FactRetrievalTelemetryV1::Recorded { fact_count })
+            }
+            Err(error) => match memory_mapping::retrieval_telemetry_degradation(&error) {
+                Some(reason) => (
+                    TrackedExplicitSearch::default(),
+                    FactRetrievalTelemetryV1::Degraded { reason },
+                ),
+                None => return Err(error),
+            },
+        }
     } else {
-        TrackedExplicitSearch::default()
+        (
+            TrackedExplicitSearch::default(),
+            FactRetrievalTelemetryV1::ReadOnly,
+        )
     };
     if tracked.authority_result_invalid {
-        let committed_state = tracked
-            .committed_state()
-            .ok_or(RetainedSurfaceExecutionErrorV1::Unavailable)?;
-        let prepared = prepared
-            .as_ref()
-            .ok_or(RetainedSurfaceExecutionErrorV1::Unavailable)?;
+        let committed_state = tracked.committed_state().ok_or_else(|| {
+            RetainedSurfaceExecutionErrorV1::unavailable(
+                "the tracked retrieval telemetry carried no committed state",
+            )
+        })?;
+        let prepared = prepared.as_ref().ok_or_else(|| {
+            RetainedSurfaceExecutionErrorV1::unavailable(
+                "the retained memory effect was not prepared before settlement",
+            )
+        })?;
         return prepared.partial_with_digest(
             committed_state,
             "application.retained.memory-search-authority-result-invalid",
@@ -644,9 +678,11 @@ async fn search_on_db(
             let Some(committed_state) = tracked.committed_state() else {
                 return Err(error);
             };
-            let prepared = prepared
-                .as_ref()
-                .ok_or(RetainedSurfaceExecutionErrorV1::Unavailable)?;
+            let prepared = prepared.as_ref().ok_or_else(|| {
+                RetainedSurfaceExecutionErrorV1::unavailable(
+                    "the retained memory effect was not prepared before settlement",
+                )
+            })?;
             return prepared.partial_with_digest(
                 committed_state,
                 "application.retained.memory-search-projection-failed",
@@ -658,11 +694,15 @@ async fn search_on_db(
         && memory_mapping::refresh_search_hits(&mut mapped, &tracked.projections).is_err()
     {
         let Some(committed_state) = tracked.committed_state() else {
-            return Err(RetainedSurfaceExecutionErrorV1::Unavailable);
+            return Err(RetainedSurfaceExecutionErrorV1::unavailable(
+                "the refreshed search hits could not be projected and no telemetry state committed",
+            ));
         };
-        let prepared = prepared
-            .as_ref()
-            .ok_or(RetainedSurfaceExecutionErrorV1::Unavailable)?;
+        let prepared = prepared.as_ref().ok_or_else(|| {
+            RetainedSurfaceExecutionErrorV1::unavailable(
+                "the retained memory effect was not prepared before settlement",
+            )
+        })?;
         return prepared.partial_with_digest(
             committed_state,
             "application.retained.memory-search-telemetry-projection-failed",
@@ -675,16 +715,18 @@ async fn search_on_db(
                 tracedecay_application::CancellationStage::DuringRead,
             ));
         };
-        let prepared = prepared
-            .as_ref()
-            .ok_or(RetainedSurfaceExecutionErrorV1::Unavailable)?;
+        let prepared = prepared.as_ref().ok_or_else(|| {
+            RetainedSurfaceExecutionErrorV1::unavailable(
+                "the retained memory effect was not prepared before settlement",
+            )
+        })?;
         return prepared.partial_with_digest(
             committed_state,
             "application.retained.memory-search-admission-expiry-after-telemetry-commit",
             "Retrieval telemetry committed after the request or capability grant expired.",
         );
     }
-    let result = memory_mapping::exact_search_result(mapped);
+    let result = memory_mapping::exact_search_result(mapped, retrieval_telemetry);
     match evidence_outcome(context, RetainedSurfaceOperation::FactStoreSearch, result) {
         Ok(outcome) => Ok(outcome),
         Err(RetainedSurfaceExecutionErrorV1::TimedOut(
@@ -695,18 +737,22 @@ async fn search_on_db(
                     tracedecay_application::CancellationStage::DuringRead,
                 ));
             };
-            let prepared = prepared
-                .as_ref()
-                .ok_or(RetainedSurfaceExecutionErrorV1::Unavailable)?;
+            let prepared = prepared.as_ref().ok_or_else(|| {
+                RetainedSurfaceExecutionErrorV1::unavailable(
+                    "the retained memory effect was not prepared before settlement",
+                )
+            })?;
             prepared.memory_expiry_failed(committed_state)
         }
         Err(error) => {
             let Some(committed_state) = tracked.committed_state() else {
                 return Err(error);
             };
-            let prepared = prepared
-                .as_ref()
-                .ok_or(RetainedSurfaceExecutionErrorV1::Unavailable)?;
+            let prepared = prepared.as_ref().ok_or_else(|| {
+                RetainedSurfaceExecutionErrorV1::unavailable(
+                    "the retained memory effect was not prepared before settlement",
+                )
+            })?;
             prepared.partial_with_digest(
                 committed_state,
                 "application.retained.memory-search-delivery-failed",
@@ -925,105 +971,10 @@ fn fact_read_control(context: &RetainedSurfaceExecutionContextV1<'_>) -> FactRea
     }))
 }
 
-pub(super) fn fact_write_control(
-    context: &RetainedSurfaceExecutionContextV1<'_>,
-) -> FactWriteControl {
-    let interrupted_signal = context.cancellation_signal.clone();
-    let commit_signal = context.cancellation_signal.clone();
-    let expires_at = effective_expiry(context);
-    let commit_expires_at = expires_at;
-    FactWriteControl::new(
-        Arc::new(move || interrupted_signal.is_cancelled() || expires_at <= now_micros()),
-        fresh_one_shot_commit_gate(Arc::new(move || {
-            commit_signal.is_cancelled()
-                || commit_expires_at <= now_micros()
-                || !commit_signal.try_begin_commit()
-        })),
-    )
-}
-
 fn effective_expiry(
     context: &RetainedSurfaceExecutionContextV1<'_>,
 ) -> tracedecay_domain::UtcMicros {
     effective_memory_deadline(context).expires_at
-}
-
-#[hotpath::measure(label = "daemon.retained.memory.bounded_operation", future = true)]
-pub(super) async fn bounded_memory_operation<T, F>(
-    context: &RetainedSurfaceExecutionContextV1<'_>,
-    future: F,
-) -> Result<(T, bool), RetainedSurfaceExecutionErrorV1>
-where
-    F: Future<Output = Result<T, RetainedSurfaceExecutionErrorV1>>,
-{
-    let now = now_micros();
-    match context.request_context.admission_at(now) {
-        RequestAdmission::Admitted if !context.cancellation_signal.is_cancelled() => {}
-        RequestAdmission::Admitted | RequestAdmission::Cancelled => {
-            return Err(RetainedSurfaceExecutionErrorV1::Cancelled(
-                tracedecay_application::CancellationStage::BeforeEffect,
-            ));
-        }
-        RequestAdmission::TimedOut => {
-            return Err(RetainedSurfaceExecutionErrorV1::TimedOut(
-                tracedecay_application::CancellationStage::BeforeEffect,
-            ));
-        }
-    }
-    let remaining = effective_expiry(context).0.saturating_sub(now.0);
-    let remaining = u64::try_from(remaining)
-        .ok()
-        .map(Duration::from_micros)
-        .ok_or(RetainedSurfaceExecutionErrorV1::TimedOut(
-            tracedecay_application::CancellationStage::BeforeEffect,
-        ))?;
-    tokio::pin!(future);
-    tokio::select! {
-        biased;
-        outcome = &mut future => classify_memory_settlement(context, outcome),
-        () = context.cancellation_signal.cancelled() => {
-            if context.cancellation_signal.commit_started() {
-                classify_memory_settlement(context, future.await)
-            } else {
-                Err(RetainedSurfaceExecutionErrorV1::Cancelled(tracedecay_application::CancellationStage::BeforeEffect))
-            }
-        }
-        () = tokio::time::sleep(remaining) => {
-            if context.cancellation_signal.commit_started() {
-                classify_memory_settlement(context, future.await)
-            } else {
-                Err(RetainedSurfaceExecutionErrorV1::TimedOut(tracedecay_application::CancellationStage::BeforeEffect))
-            }
-        }
-    }
-}
-
-fn classify_memory_settlement<T>(
-    context: &RetainedSurfaceExecutionContextV1<'_>,
-    outcome: Result<T, RetainedSurfaceExecutionErrorV1>,
-) -> Result<(T, bool), RetainedSurfaceExecutionErrorV1> {
-    let commit_started = context.cancellation_signal.commit_started();
-    let cancelled = context.cancellation_signal.is_cancelled();
-    let timed_out = effective_expiry(context) <= now_micros();
-    match outcome {
-        Ok(value) if commit_started => Ok((value, timed_out)),
-        Ok(_) if cancelled => Err(RetainedSurfaceExecutionErrorV1::Cancelled(
-            tracedecay_application::CancellationStage::BeforeEffect,
-        )),
-        Ok(_) if timed_out => Err(RetainedSurfaceExecutionErrorV1::TimedOut(
-            tracedecay_application::CancellationStage::BeforeEffect,
-        )),
-        Ok(value) => Ok((value, false)),
-        Err(_) if cancelled && !commit_started => Err(RetainedSurfaceExecutionErrorV1::Cancelled(
-            tracedecay_application::CancellationStage::BeforeEffect,
-        )),
-        Err(RetainedSurfaceExecutionErrorV1::Cancelled(_)) if timed_out => {
-            Err(RetainedSurfaceExecutionErrorV1::TimedOut(
-                tracedecay_application::CancellationStage::BeforeEffect,
-            ))
-        }
-        Err(error) => Err(error),
-    }
 }
 
 fn memory_operation_context<T: Serialize>(

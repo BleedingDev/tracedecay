@@ -22,11 +22,12 @@ use tracedecay_hooks::{
 use tracedecay_lsp::DaemonLspProviderBundle;
 
 use crate::feedback::concrete::{ConcreteFeedbackOwner, ProjectFeedbackStore};
-use crate::feedback::observations::{
-    FeedbackDeliveryRouteV1, FeedbackHookScoutPhaseV1, FeedbackObservationEmitterV1,
-    FeedbackOperationV1, FeedbackOutcomeV1, FeedbackSourceEventV1,
-};
+use crate::feedback::observations::FeedbackObservationEmitterV1;
 use crate::lsp_runtime::DaemonLspSessionFactory;
+use tracedecay_application::feedback::observations::{
+    FeedbackDeliveryRouteV1, FeedbackHookScoutPhaseV1, FeedbackOperationV1, FeedbackOutcomeV1,
+    FeedbackSourceEventV1,
+};
 use tracedecay_host_integration::{
     HostCapabilityStateV1, HostCapabilityUnavailableReasonV1, HostCapabilityV1, HostKindV1,
     HostRegistrationRouteV1, stock_host_capabilities, stock_host_registration_evidence,
@@ -365,7 +366,7 @@ where
     CS: super::CiReadOnlyProviderArchiveV1 + Sync,
     CE: super::CiExactEvidenceAuthorityV1<CS::Record> + Sync,
     PE: super::CanonicalProximityEvidenceAuthorityV1 + Sync,
-    PC: crate::configuration::ConfigurationControlStore + Clone + Send + 'static,
+    PC: tracedecay_configuration::ConfigurationControlStore + Clone + Send + 'static,
 {
     pub fn runtime(&self) -> &super::AdvisoryRuntime<GR, GA, CS, CE, PE, PC> {
         &self.advisory.advisory
@@ -672,7 +673,7 @@ where
     CS: super::CiReadOnlyProviderArchiveV1 + Sync,
     CE: super::CiExactEvidenceAuthorityV1<CS::Record> + Sync,
     PE: super::CanonicalProximityEvidenceAuthorityV1 + Sync,
-    PC: crate::configuration::ConfigurationControlStore + Clone + Send + 'static,
+    PC: tracedecay_configuration::ConfigurationControlStore + Clone + Send + 'static,
 {
     let scope = input.resolved_scope.clone();
     let advisory = open_advisory_daemon_registration(input, providers)?;

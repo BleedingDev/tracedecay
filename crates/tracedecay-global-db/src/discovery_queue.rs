@@ -240,6 +240,7 @@ impl RegisteredGlobalDb {
         Ok(entries)
     }
 
+    #[hotpath::skip]
     pub async fn host_discovery_path(
         &self,
         provider: &str,

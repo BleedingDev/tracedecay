@@ -46,6 +46,7 @@ impl WorkflowProviderRegistration {
         &self.route
     }
 
+    #[hotpath::skip]
     pub const fn backend(&self) -> WorkProviderBackendV1 {
         self.backend
     }
@@ -54,6 +55,7 @@ impl WorkflowProviderRegistration {
         &self.model
     }
 
+    #[hotpath::skip]
     pub const fn priority(&self) -> u32 {
         self.priority
     }
@@ -149,6 +151,7 @@ pub struct WorkflowProviderPlacementService {
 }
 
 impl WorkflowProviderPlacementService {
+    #[hotpath::skip]
     pub const fn new(registry: WorkflowProviderRegistry) -> Self {
         Self { registry }
     }

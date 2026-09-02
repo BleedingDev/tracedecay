@@ -29,7 +29,7 @@ use tracedecay_domain::{
     SymbolOccurrenceId, UtcMicros, WorktreeId,
 };
 use tracedecay_graph_db::NeverCancelled;
-use tracedecay_usecases::graph::{
+use tracedecay_graph_query::{
     CodeGraphProjectionReadPort, CodeGraphReadError, CodeGraphReadFuture, CodeGraphReadRequest,
     VerifiedCodeGraphRead,
 };
@@ -106,7 +106,11 @@ impl CodeGraphProjectionReadPort for FixtureCodeGraphReadPort {
                 .as_ref()
                 .map(Arc::clone)
                 .ok_or(CodeGraphReadError::MissingRegistry)?;
-            VerifiedCodeGraphRead::new(self.scope.clone(), store)
+            VerifiedCodeGraphRead::new(
+                self.scope.clone(),
+                store,
+                tracedecay_graph_query::CodeGraphReadFreshnessV1::Current,
+            )
         })
     }
 }
@@ -164,7 +168,7 @@ pub(super) fn fixture_symbol_code_graph(
     }];
     let symbols = GenerationSymbolIndexV1::new(
         generation.clone(),
-        vec![LineageSymbolRecordV1 {
+        vec![Arc::new(LineageSymbolRecordV1 {
             occurrence: occurrence.clone(),
             identity: fixture_digest::<SymbolIdentityDigest>("source-edit-symbol", qualified_name),
             qualified_name: qualified_name.to_owned(),
@@ -186,10 +190,10 @@ pub(super) fn fixture_symbol_code_graph(
                 "source-edit-symbol-content",
                 symbol_source,
             ),
-        }],
+        })],
     )
     .unwrap();
-    let chunks = vec![CodeSearchChunkV1 {
+    let chunks = vec![Arc::new(CodeSearchChunkV1 {
         id: tracedecay_domain::CodeSearchChunkId::new("chunk:source-edit:moved").unwrap(),
         anchor: CodeSearchChunkAnchorV1 {
             generation_id: generation.clone(),
@@ -212,7 +216,7 @@ pub(super) fn fixture_symbol_code_graph(
         exact_terms: Vec::new(),
         subtokens: Vec::new(),
         sanitized_text: BoundedSanitizedText::new(symbol_source).unwrap(),
-    }];
+    })];
     let cancellation = CancellationSignal::active("cancel.source-edit-graph-fixture").unwrap();
     let hermetic = HermeticCodeGraphProjectionStore::memory(&cancellation).unwrap();
     hermetic
@@ -240,21 +244,18 @@ pub(super) async fn fixture_graph(
         profile_root: Some(profile_root.clone()),
         global_db_path: Some(profile_root.join("global.db")),
     };
-    let identity = crate::daemon::profile_identity::load_or_create(&profile_root).unwrap();
+    let identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root).unwrap();
     let database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         identity.profile_root(),
         1,
         "source-edit-owner-test-runtime",
     )
     .unwrap();
-    let runtime_registry = Arc::new(
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity,
-        )
+    let runtime_registry = crate::project_store_runtime::open_project_store_runtime(identity)
         .await
-        .unwrap(),
-    );
-    let profile_database = runtime_registry.profile_database().await.unwrap();
+        .unwrap();
+    let profile_database = runtime_registry.port().profile_database().await.unwrap();
     let store_layout = TraceDecay::resolve_first_touch_configuration_layout(
         project_root,
         &open_options,
@@ -270,11 +271,16 @@ pub(super) async fn fixture_graph(
             .expect("fixture layout has a project identity"),
     )
     .unwrap();
-    crate::storage::pin_fixture_repository_identity(project_root, project_id.as_str()).unwrap();
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+        project_root,
+        project_id.as_str(),
+    )
+    .unwrap();
     let configuration_database = runtime_registry
+        .port()
         .project_sessions(
             project_id,
-            [
+            vec![
                 project_root.to_path_buf(),
                 store_layout.project_root.clone(),
             ],

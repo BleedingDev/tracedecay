@@ -10,9 +10,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use crate::config::TraceDecayConfig;
-use crate::storage::{self, StoreLayout};
+use tracedecay_application::context_scout::ContextScoutAddressV1;
+use tracedecay_domain::errors::Result;
 use tracedecay_runtime_core::db::{Database, DatabaseStorageTelemetryHandle};
-use tracedecay_runtime_core::errors::Result;
+use tracedecay_runtime_core::storage::{self, StoreLayout};
 
 #[cfg(test)]
 mod concrete_runtime_tests;
@@ -35,10 +36,9 @@ pub(crate) use lifecycle::git_remote_url;
 pub struct TraceDecay {
     db: Database,
     profile_database: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
-    store_runtime_registry:
-        Arc<crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1>,
+    pub(crate) store_runtime_registry: crate::project_store_runtime::ProjectStoreRuntimeHandle,
     config: TraceDecayConfig,
-    configuration_runtime: Arc<tracedecay_usecases::configuration::ProjectConfigurationRuntime>,
+    configuration_runtime: Arc<tracedecay_configuration::ProjectConfigurationRuntime>,
     project_root: PathBuf,
     store_layout: StoreLayout,
     open_options: TraceDecayOpenOptions,
@@ -72,7 +72,7 @@ struct MountedContextScoutClaimAuthorityV1 {
     pin: crate::agents::context_scout_ports::ContextScoutAuthorityPinV1,
     context: tracedecay_application::RequestContext,
     lifecycle: crate::agents::context_scout_ports::ContextScoutLifecycleAddressV1,
-    address: crate::agents::context_scout_v2::ContextScoutAddressV1,
+    address: ContextScoutAddressV1,
     input_watermark: [u8; 32],
 }
 
@@ -81,20 +81,21 @@ impl TraceDecay {
         self.db.storage_telemetry_handle()
     }
 
+    #[hotpath::skip]
     pub(crate) async fn storage_page_counts(&self) -> Result<(u64, u64, u64)> {
         self.db.storage_page_counts().await
     }
 
     pub(crate) fn configuration_runtime(
         &self,
-    ) -> &Arc<tracedecay_usecases::configuration::ProjectConfigurationRuntime> {
+    ) -> &Arc<tracedecay_configuration::ProjectConfigurationRuntime> {
         &self.configuration_runtime
     }
 
-    pub(crate) fn store_runtime_registry(
+    pub(crate) fn project_store_runtime(
         &self,
-    ) -> &Arc<crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1> {
-        &self.store_runtime_registry
+    ) -> &dyn tracedecay_usecases::tracedecay::ProjectStoreRuntimeV1 {
+        self.store_runtime_registry.port()
     }
 
     pub(crate) fn profile_database(&self) -> &tracedecay_global_db::RegisteredGlobalDbLeaseV1 {
@@ -125,6 +126,7 @@ impl TraceDecay {
     /// authority becomes claimable; a stale pin or a foreign address never
     /// mounts.
     #[allow(clippy::too_many_arguments)]
+    #[hotpath::skip]
     pub(crate) async fn mount_current_context_scout_claim_authority(
         &self,
         registry: Arc<crate::agents::context_scout_ports::ProjectContextScoutAddressRegistryV1>,
@@ -132,7 +134,7 @@ impl TraceDecay {
         pin: crate::agents::context_scout_ports::ContextScoutAuthorityPinV1,
         context: tracedecay_application::RequestContext,
         lifecycle: crate::agents::context_scout_ports::ContextScoutLifecycleAddressV1,
-        address: crate::agents::context_scout_v2::ContextScoutAddressV1,
+        address: ContextScoutAddressV1,
         input_watermark: [u8; 32],
         observed_at: tracedecay_domain::UtcMicros,
     ) -> bool {
@@ -174,15 +176,13 @@ impl TraceDecay {
     /// `None` when nothing was mounted, the Plan 20 configuration moved past
     /// the mounted pin, or the durable address registry no longer resolves
     /// the mounted address for this hook.
+    #[hotpath::skip]
     pub(crate) async fn resolve_current_context_scout_claim_authority(
         &self,
         hook: &crate::agents::context_scout_ports::AdmittedContextScoutHookV1,
         lifecycle: &crate::agents::context_scout_ports::ContextScoutLifecycleAddressV1,
         observed_at: tracedecay_domain::UtcMicros,
-    ) -> Option<(
-        crate::agents::context_scout_v2::ContextScoutAddressV1,
-        [u8; 32],
-    )> {
+    ) -> Option<(ContextScoutAddressV1, [u8; 32])> {
         let mounted = self
             .context_scout_claim_authorities
             .read()
@@ -218,6 +218,7 @@ impl TraceDecay {
         }
     }
 
+    #[hotpath::skip]
     async fn context_scout_configuration_is_current(
         &self,
         pin: &crate::agents::context_scout_ports::ContextScoutAuthorityPinV1,
@@ -228,7 +229,7 @@ impl TraceDecay {
             .await
             .ok()
             .map(
-                |pinned| tracedecay_usecases::configuration::ConfigurationCurrentStateV1 {
+                |pinned| tracedecay_configuration::ConfigurationCurrentStateV1 {
                     revision_id: pinned.revision_id,
                     snapshot: pinned.snapshot,
                 },

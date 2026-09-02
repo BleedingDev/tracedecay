@@ -160,6 +160,7 @@ pub(super) enum GitHistoryScanMode {
 }
 
 impl GitHistoryScanMode {
+    #[hotpath::skip]
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::ReflogCapture => "reflog_capture",
@@ -190,6 +191,7 @@ pub(super) enum GitHistoryCursorHeadState {
 }
 
 impl GitHistoryCursorHeadState {
+    #[hotpath::skip]
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::LocalBranch => "local_branch",

@@ -104,6 +104,34 @@ pub fn resident_memory_watermark_bytes_v1(limit_bytes: NonZeroU64, permille: u64
     u64::try_from(scaled).unwrap_or(u64::MAX)
 }
 
+/// Sample this process's resident set size directly from the kernel.
+///
+/// The one `/proc/self/status` `VmRSS` parser in the workspace: the daemon
+/// retention tick publishes its samples into
+/// [`process_resident_memory_pressure_v1`], and load-scoped watchdogs (the
+/// semantic session pool's cold-load resident bound) sample it directly.
+/// Returns `None` where the kernel surface is unavailable (non-Linux hosts),
+/// which callers must treat as unobserved, never as zero.
+#[must_use]
+pub fn sampled_process_resident_bytes_v1() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let kib = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()?;
+        kib.checked_mul(1_024)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// What the last measured RSS sample says about this process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidentMemoryPressureStateV1 {
@@ -130,12 +158,14 @@ pub enum ResidentMemoryPressureStateV1 {
 
 impl ResidentMemoryPressureStateV1 {
     #[must_use]
+    #[hotpath::skip]
     pub const fn is_over_budget(self) -> bool {
         matches!(self, Self::OverBudget { .. })
     }
 
     /// The last measured RSS, or `None` when nothing has been sampled.
     #[must_use]
+    #[hotpath::skip]
     pub const fn observed_bytes(self) -> Option<u64> {
         match self {
             Self::Unobserved => None,
@@ -227,16 +257,19 @@ impl ResidentMemoryPressureV1 {
     }
 
     #[must_use]
+    #[hotpath::skip]
     pub const fn limit_bytes(&self) -> u64 {
         self.limit_bytes.get()
     }
 
     #[must_use]
+    #[hotpath::skip]
     pub const fn high_watermark_bytes(&self) -> u64 {
         self.high_watermark_bytes
     }
 
     #[must_use]
+    #[hotpath::skip]
     pub const fn low_watermark_bytes(&self) -> u64 {
         self.low_watermark_bytes
     }
@@ -408,6 +441,7 @@ impl ResidentMemoryComponentIdV1 {
         Ok(Self(value))
     }
 
+    #[hotpath::skip]
     pub const fn as_str(self) -> &'static str {
         self.0
     }
@@ -459,6 +493,7 @@ pub enum ResidentMemoryAdmissionFailureV1 {
 
 impl ResidentMemoryAdmissionFailureV1 {
     #[must_use]
+    #[hotpath::skip]
     pub const fn requested_bytes(&self) -> u64 {
         match self {
             Self::ReservationCeiling {
@@ -471,6 +506,7 @@ impl ResidentMemoryAdmissionFailureV1 {
     }
 
     #[must_use]
+    #[hotpath::skip]
     pub const fn limit_bytes(&self) -> u64 {
         match self {
             Self::ReservationCeiling { limit_bytes, .. }
@@ -482,6 +518,7 @@ impl ResidentMemoryAdmissionFailureV1 {
     /// ceiling. Over-budget refusals clear as pressure falls, so callers retry
     /// them instead of treating the input as permanently unservable.
     #[must_use]
+    #[hotpath::skip]
     pub const fn is_observed_over_budget(&self) -> bool {
         matches!(self, Self::ObservedOverBudget { .. })
     }
@@ -932,6 +969,7 @@ impl ResidentMemoryReservationV1 {
         &self.key
     }
 
+    #[hotpath::skip]
     pub const fn reserved_bytes(&self) -> u64 {
         self.reserved_bytes
     }
@@ -960,6 +998,7 @@ pub struct ProcessSharedMemoryReservationV1 {
 }
 
 impl ProcessSharedMemoryReservationV1 {
+    #[hotpath::skip]
     pub const fn reserved_bytes(&self) -> u64 {
         self.reserved_bytes
     }

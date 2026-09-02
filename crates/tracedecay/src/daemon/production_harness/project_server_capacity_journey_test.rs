@@ -17,7 +17,7 @@ async fn open_project_composition(
             message: "production harness is shut down".to_owned(),
         })?;
     let handshake = DaemonHandshake {
-        client_version: binary_version().to_owned(),
+        client_version: binary_version()?.to_owned(),
         client_instance_id: instance.to_owned(),
         client_identity: DaemonClientIdentity {
             profile_root: harness.profile_root.clone(),
@@ -70,17 +70,26 @@ async fn open_project(
     let code_search_scope = {
         let graph = composition.server.cg().await;
         let target = graph.configuration_runtime().configuration_target();
-        project_open_owners::resolved_scope_for_project(graph.project_root(), &target.project_id)
-            .map_err(|error| TraceDecayError::Config {
-                message: format!("capacity-journey code-index scope is invalid: {error:?}"),
-            })?
+        tracedecay_code_index_runtime::resolved_scope_for_project(
+            graph.project_root(),
+            &target.project_id,
+        )
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("capacity-journey code-index scope is invalid: {error:?}"),
+        })?
     };
     let latest = super::wait_for_production_composition_code_index(
         &resources.invocation,
         &composition.canonical_project_path,
         &code_search_scope,
     )
-    .await?;
+    .await?
+    .ok_or_else(|| TraceDecayError::Config {
+        message: format!(
+            "capacity-journey project '{}' has extractable sources but published no generation",
+            composition.canonical_project_path.display()
+        ),
+    })?;
     Ok((composition, latest))
 }
 
@@ -89,16 +98,21 @@ async fn seed_project_sessions_pending_convergence(
     project_root: &Path,
     project_id: &tracedecay_domain::ProjectId,
 ) {
-    let identity = crate::daemon::profile_identity::load_or_create(profile_root)
+    let identity = tracedecay_daemon_identity::profile_identity::load_or_create(profile_root)
         .expect("durable harness profile identity");
-    crate::storage::pin_fixture_repository_identity(project_root, project_id.as_str())
-        .expect("target project enrollment");
-    let sessions_path =
-        crate::storage::profile_sharded_data_root(profile_root, project_id.as_str())
-            .join(crate::storage::SESSIONS_DB_FILENAME);
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+        project_root,
+        project_id.as_str(),
+    )
+    .expect("target project enrollment");
+    let sessions_path = tracedecay_runtime_core::storage::profile_sharded_data_root(
+        profile_root,
+        project_id.as_str(),
+    )
+    .join(tracedecay_runtime_core::storage::SESSIONS_DB_FILENAME);
     std::fs::create_dir_all(sessions_path.parent().expect("session database parent"))
         .expect("session database directory");
-    crate::daemon::store_runtime::register_registered_schema_installer();
+    tracedecay_store_runtime::register_registered_schema_installer();
     let authority = tracedecay_runtime_core::db::DatabaseAuthority::acquire_test(
         &sessions_path,
         "seed production project-open convergence fixture",

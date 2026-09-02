@@ -9,17 +9,16 @@ use tracedecay_application::{ApplicationOutcome, ResolvedSetting};
 use tracedecay_domain::configuration::{
     ConfigurationValueV1, SettingKey, USER_UPLOAD_ENABLED_SETTING_KEY,
 };
-use tracedecay_tool_catalog::BindingSurface;
+use tracedecay_tool_catalog::{ApplicationSurfaceOperation, BindingSurface};
 
 use crate::agents::{self, DoctorCounters, HealthcheckContext};
 use crate::application_surface::{
-    ApplicationSurfaceOperation, ApplicationSurfaceRequest, execute_application_surface,
-    resolve_application_surface_dispatch,
+    ApplicationSurfaceRequest, execute_application_surface, resolve_application_surface_dispatch,
 };
-use crate::display::format_token_count;
+use tracedecay_application::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_application::{ConfigurationGetRequestV1, ConfigurationWireRequestV1};
 use tracedecay_daemon_protocol::RequestedOutputFormat;
-use tracedecay_usecases::request_identity::{GlobalRequestSurface, mint_global_request_id};
+use tracedecay_runtime_core::text::format_token_count;
 
 // Consumed by the unix-only daemon git-watch maintenance path; on other
 // targets only the module's tests reference it.
@@ -32,12 +31,13 @@ pub(crate) mod registry_drift;
 #[cfg(test)]
 pub(crate) struct DoctorTestRuntime {
     database: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
-    _registry: crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1,
+    _registry: tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1,
     _scope: tracedecay_runtime_core::db::DaemonDatabaseScope,
 }
 
 #[cfg(test)]
 impl DoctorTestRuntime {
+    #[hotpath::skip]
     pub(crate) async fn open(profile_root: &Path, label: &str) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,16 +51,13 @@ impl DoctorTestRuntime {
             std::fs::set_permissions(profile_root, std::fs::Permissions::from_mode(0o700))
                 .expect("secure Doctor test profile root");
         }
-        let identity = crate::daemon::profile_identity::load_or_create(profile_root)
+        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(profile_root)
             .expect("load Doctor test profile identity");
         let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
         let scope =
             tracedecay_runtime_core::db::enter_daemon_database_scope(profile_root, nonce, label)
                 .expect("enter Doctor test database scope");
-        let registry =
-            crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-                identity,
-            )
+        let registry = tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity)
             .await
             .expect("open Doctor test runtime registry");
         // Mount the profile SESSIONS store: every production caller of
@@ -85,7 +82,7 @@ impl DoctorTestRuntime {
 
 /// Runs a comprehensive health check of the tracedecay installation.
 #[hotpath::measure(label = "doctor.run", future = true)]
-pub async fn run_doctor() -> tracedecay_runtime_core::errors::Result<()> {
+pub async fn run_doctor() -> tracedecay_domain::errors::Result<()> {
     let _lifecycle_lease =
         match tracedecay_runtime_core::lifecycle_lease::acquire_shared_or_inherited("doctor") {
             Ok(lease) => lease,
@@ -94,18 +91,12 @@ pub async fn run_doctor() -> tracedecay_runtime_core::errors::Result<()> {
                 return Err(error);
             }
         };
-    debug_assert!(
-        !crate::version::build_version().is_empty(),
-        "the reported build version must not be empty"
-    );
+    let build_version = crate::version::build_version()?;
     let mut dc = DoctorCounters::new();
 
-    eprintln!(
-        "\n\x1b[1mtracedecay doctor v{}\x1b[0m\n",
-        crate::version::build_version()
-    );
+    eprintln!("\n\x1b[1mtracedecay doctor v{build_version}\x1b[0m\n");
 
-    check_binary(&mut dc);
+    check_binary(&mut dc, build_version);
     check_daemon_service(&mut dc);
 
     eprintln!("\n\x1b[1mCurrent project\x1b[0m");
@@ -219,8 +210,7 @@ fn render_doctor_finding(
 
 fn canonical_daemon_doctor_report(
     status: &serde_json::Value,
-) -> tracedecay_runtime_core::errors::Result<Option<tracedecay_application::doctor::DoctorReportV1>>
-{
+) -> tracedecay_domain::errors::Result<Option<tracedecay_application::doctor::DoctorReportV1>> {
     let Some(doctor_report) = status.get("doctor_report") else {
         return Ok(None);
     };
@@ -231,23 +221,23 @@ fn canonical_daemon_doctor_report(
         Some("observed") => {}
         Some("unknown" | "unsupported") => return Ok(None),
         Some(kind) => {
-            return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!("daemon canonical Doctor report has unknown typed state: {kind}"),
             });
         }
         None => {
-            return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: "daemon canonical Doctor report omitted its typed state".to_string(),
             });
         }
     }
     let report = doctor_report.get("report").cloned().ok_or_else(|| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: "observed daemon Doctor response omitted its report".to_string(),
         }
     })?;
     serde_json::from_value(report).map(Some).map_err(|error| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: format!("daemon canonical Doctor report violated its wire contract: {error}"),
         }
     })
@@ -311,15 +301,15 @@ fn database_health_from_storage_runtime_findings<'a>(
 fn doctor_result(
     dc: &DoctorCounters,
     storage_health: &DatabaseHealth,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     match storage_health {
         DatabaseHealth::Failed { reason } => {
-            Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!("doctor storage health check failed [{reason}]"),
             })
         }
         DatabaseHealth::Healthy | DatabaseHealth::Unknown { .. } if dc.issues > 0 => {
-            Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!("doctor found {} issue(s)", dc.issues),
             })
         }
@@ -330,7 +320,7 @@ fn doctor_result(
 #[hotpath::measure(label = "doctor.daemon_status", future = true)]
 async fn daemon_project_status(
     project_path: &Path,
-) -> tracedecay_runtime_core::errors::Result<serde_json::Value> {
+) -> tracedecay_domain::errors::Result<serde_json::Value> {
     let handshake = crate::daemon::handshake_for_current_client(
         Some(project_path.to_path_buf()),
         None,
@@ -374,15 +364,15 @@ const RUNTIME_TELEMETRY_PENDING: &str = "daemon runtime response omitted databas
 
 fn daemon_runtime_status(
     result: &serde_json::Value,
-) -> tracedecay_runtime_core::errors::Result<serde_json::Value> {
+) -> tracedecay_domain::errors::Result<serde_json::Value> {
     let runtime = crate::daemon::tool_json_payload(result, "tracedecay_runtime")?;
     let mut storage = runtime.get("database").cloned().ok_or_else(|| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: RUNTIME_TELEMETRY_PENDING.to_string(),
         }
     })?;
     let storage = storage.as_object_mut().ok_or_else(|| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: "daemon runtime database telemetry was not an object".to_string(),
         }
     })?;
@@ -438,7 +428,7 @@ impl DatabaseHealth {
 fn report_daemon_diagnostics_unavailable(
     dc: &mut DoctorCounters,
     db_path: Option<&Path>,
-    error: &tracedecay_runtime_core::errors::TraceDecayError,
+    error: &tracedecay_domain::errors::TraceDecayError,
 ) {
     dc.warn(&format!(
         "Canonical Doctor report unavailable from the sole daemon owner: {error}. Health remains unknown; Doctor did not open SQLite."
@@ -452,7 +442,7 @@ fn report_daemon_diagnostics_unavailable(
 
 fn fallback_database_path(project_path: &Path) -> Option<PathBuf> {
     if let Ok(Some(layout)) =
-        crate::storage::resolve_enrolled_layout_for_current_profile(project_path)
+        tracedecay_runtime_core::storage::resolve_enrolled_layout_for_current_profile(project_path)
     {
         return Some(layout.graph_db_path);
     }
@@ -469,7 +459,7 @@ fn database_recovery_guidance(db_path: &Path) -> String {
     graph_dirty.push(".dirty");
     let graph_dirty = PathBuf::from(graph_dirty);
     let legacy_dirty = data_root.join("dirty");
-    let sessions_path = data_root.join(crate::storage::SESSIONS_DB_FILENAME);
+    let sessions_path = data_root.join(tracedecay_runtime_core::storage::SESSIONS_DB_FILENAME);
 
     format!(
         "First stop all TraceDecay daemon and MCP processes. No files were changed.\n\
@@ -504,7 +494,7 @@ fn print_database_recovery_guidance(dc: &DoctorCounters, db_path: &Path) {
 /// "run install-service and ensure the service is running" text used to hide.
 fn check_daemon_service(dc: &mut DoctorCounters) {
     eprintln!("\n\x1b[1mDaemon service\x1b[0m");
-    match crate::daemon::installed_service_state() {
+    match tracedecay_daemon_control::installed_service_state() {
         Ok(state) => {
             let message = state.lifecycle_operator_advice();
             match daemon_service_doctor_verdict(state) {
@@ -525,27 +515,31 @@ enum DaemonServiceDoctorVerdict {
 }
 
 fn daemon_service_doctor_verdict(
-    state: crate::daemon::DaemonServiceState,
+    state: tracedecay_daemon_control::DaemonServiceState,
 ) -> DaemonServiceDoctorVerdict {
     match state {
-        crate::daemon::DaemonServiceState::RunningEnabled => DaemonServiceDoctorVerdict::Pass,
-        crate::daemon::DaemonServiceState::Missing
-        | crate::daemon::DaemonServiceState::RunningDisabled => DaemonServiceDoctorVerdict::Warn,
-        crate::daemon::DaemonServiceState::StoppedEnabled
-        | crate::daemon::DaemonServiceState::StoppedDisabled
-        | crate::daemon::DaemonServiceState::Masked => DaemonServiceDoctorVerdict::Fail,
+        tracedecay_daemon_control::DaemonServiceState::RunningEnabled => {
+            DaemonServiceDoctorVerdict::Pass
+        }
+        tracedecay_daemon_control::DaemonServiceState::Missing
+        | tracedecay_daemon_control::DaemonServiceState::RunningDisabled => {
+            DaemonServiceDoctorVerdict::Warn
+        }
+        tracedecay_daemon_control::DaemonServiceState::StoppedEnabled
+        | tracedecay_daemon_control::DaemonServiceState::StoppedDisabled
+        | tracedecay_daemon_control::DaemonServiceState::Masked => DaemonServiceDoctorVerdict::Fail,
     }
 }
 
 /// Check binary location and version.
-fn check_binary(dc: &mut DoctorCounters) {
+fn check_binary(dc: &mut DoctorCounters, build_version: &str) {
     eprintln!("\x1b[1mBinary\x1b[0m");
     if let Ok(exe) = std::env::current_exe() {
         dc.pass(&format!("Binary: {}", exe.display()));
     } else {
         dc.fail("Could not determine binary path");
     }
-    dc.pass(&format!("Version: {}", crate::version::build_version()));
+    dc.pass(&format!("Version: {build_version}"));
 }
 
 /// Reports git-metadata watcher health (design D3/D5).
@@ -560,7 +554,7 @@ fn check_binary(dc: &mut DoctorCounters) {
 fn check_watcher(dc: &mut DoctorCounters) {
     eprintln!("\n\x1b[1mWatcher\x1b[0m");
 
-    if !crate::daemon::daemon_reachable() {
+    if !tracedecay_daemon_control::daemon_reachable() {
         dc.info("Daemon not running — watcher inactive; sync happens on hook/read events");
         return;
     }
@@ -637,18 +631,16 @@ fn check_inert_project_config(dc: &mut DoctorCounters, project_path: &Path) {
 }
 
 #[hotpath::measure(label = "doctor.config.upload", future = true)]
-async fn configured_upload_enabled(
-    project_path: &Path,
-) -> tracedecay_runtime_core::errors::Result<bool> {
+async fn configured_upload_enabled(project_path: &Path) -> tracedecay_domain::errors::Result<bool> {
     let operation = ApplicationSurfaceOperation::ConfigurationGet;
     let key = SettingKey::new(USER_UPLOAD_ENABLED_SETTING_KEY).map_err(|error| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: error.to_string(),
         }
     })?;
     let request_id =
         mint_global_request_id(GlobalRequestSurface::DaemonDoctor).map_err(|error| {
-            tracedecay_runtime_core::errors::TraceDecayError::Config {
+            tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!("could not create Doctor configuration request: {error}"),
             }
         })?;
@@ -658,7 +650,7 @@ async fn configured_upload_enabled(
         false,
         false,
     )?;
-    let client = crate::daemon::invocation_client_for_current(handshake)?;
+    let client = tracedecay_daemon_identity::invocation_client_for_current(handshake)?;
     let dispatched = resolve_application_surface_dispatch(
         BindingSurface::Cli,
         operation,
@@ -668,46 +660,41 @@ async fn configured_upload_enabled(
         )),
         RequestedOutputFormat::Json,
     )
-    .map_err(
-        |error| tracedecay_runtime_core::errors::TraceDecayError::Config {
-            message: error.to_string(),
-        },
-    )?;
+    .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+        message: error.to_string(),
+    })?;
     let result = execute_application_surface(operation, dispatched, Some(&client))
         .await
-        .map_err(
-            |error| tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: error.to_string(),
+        .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+            message: error.to_string(),
+        })?;
+    let envelope =
+        result.result.map_err(
+            |problem| tracedecay_domain::errors::TraceDecayError::Config {
+                message: format!("{}: {}", problem.problem.code, problem.problem.message),
             },
         )?;
-    let envelope = result.result.map_err(|problem| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
-            message: format!("{}: {}", problem.problem.code, problem.problem.message),
-        }
-    })?;
     let ApplicationOutcome::Evidence(evidence) = envelope.outcome else {
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: "configuration get returned a non-evidence outcome".to_owned(),
         });
     };
     let setting: ResolvedSetting = serde_json::from_value(evidence.payload.ok_or_else(|| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: "configuration get omitted its payload".to_owned(),
         }
     })?)
-    .map_err(
-        |error| tracedecay_runtime_core::errors::TraceDecayError::Config {
-            message: format!("configuration get returned an invalid setting: {error}"),
-        },
-    )?;
+    .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+        message: format!("configuration get returned an invalid setting: {error}"),
+    })?;
     if setting.key != key {
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: "configuration get returned the wrong setting".to_owned(),
         });
     }
     match setting.effective_value {
         ConfigurationValueV1::Boolean(enabled) => Ok(enabled),
-        _ => Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        _ => Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: "worldwide counter upload setting is not boolean".to_owned(),
         }),
     }
@@ -716,7 +703,7 @@ async fn configured_upload_enabled(
 /// Check canonical user configuration and pending upload state.
 fn check_user_config(
     dc: &mut DoctorCounters,
-    upload_enabled: Result<&bool, &tracedecay_runtime_core::errors::TraceDecayError>,
+    upload_enabled: Result<&bool, &tracedecay_domain::errors::TraceDecayError>,
 ) {
     eprintln!("\n\x1b[1mUser config\x1b[0m");
     match upload_enabled {
@@ -726,10 +713,10 @@ fn check_user_config(
             "Worldwide counter upload setting unavailable from canonical configuration: {error}"
         )),
     }
-    if let Some(config_path) = tracedecay_usecases::user_config::config_path()
+    if let Some(config_path) = tracedecay_session_memory::user_config::config_path()
         && config_path.exists()
     {
-        let config = tracedecay_usecases::user_config::UserConfig::load();
+        let config = tracedecay_session_memory::user_config::UserConfig::load();
         if config.pending_upload > 0 {
             dc.info(&format!("Pending upload: {} tokens", config.pending_upload));
         }
@@ -740,7 +727,7 @@ fn check_user_config(
 #[hotpath::measure(label = "doctor.check.external_tools")]
 fn check_external_tools(dc: &mut DoctorCounters) {
     eprintln!("\n\x1b[1mExternal tools\x1b[0m");
-    let diagnostics = crate::mcp::tools::ast_grep_diagnostics_json();
+    let diagnostics = tracedecay_mcp::ast_grep_diagnostics_json();
     let installed = json_bool(&diagnostics, "installed");
     let rewrite_available = json_bool(&diagnostics, "rewrite_available");
     let outline_available = json_bool(&diagnostics, "outline_available");
@@ -786,7 +773,7 @@ fn json_bool(value: &serde_json::Value, key: &str) -> bool {
 #[hotpath::measure(label = "doctor.check.network")]
 fn check_network(
     dc: &mut DoctorCounters,
-    upload_enabled: Result<&bool, &tracedecay_runtime_core::errors::TraceDecayError>,
+    upload_enabled: Result<&bool, &tracedecay_domain::errors::TraceDecayError>,
 ) {
     eprintln!("\n\x1b[1mNetwork\x1b[0m");
     match upload_enabled {

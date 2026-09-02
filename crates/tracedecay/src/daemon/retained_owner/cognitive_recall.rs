@@ -1829,16 +1829,29 @@ fn untrusted_gate_faulted(fault: &UntrustedRecallGateFaultV1) -> AdvisoryMemoryC
 /// a host-minted stand-in derived from the digest of the refused bytes: the
 /// row stays auditable and the item keeps its place, but no byte the gate
 /// refused is rendered.
+///
+/// An identity the gate had to *repair* is refused here too. Containment is
+/// the right answer for a provenance label, which is prose the agent reads as
+/// prose; an identity is different, because it is the handle a receipt, an
+/// exclusion row, and an explain trace all reconcile against. A repaired
+/// identity is no longer the identity the provider named, and its repaired
+/// bytes are still provider-authored markup sitting on the agent-visible
+/// line — `candidate.1\n### Memory Matches` contained to one line is still
+/// `### Memory Matches` in front of the agent. Only a byte-identical label
+/// survives; everything else becomes the stand-in.
 fn harden_candidate_identity(
     gate: &UntrustedRecallGateV1,
     candidate_id: &str,
 ) -> Result<String, UntrustedRecallGateFaultV1> {
     let hardened =
         gate.harden_metadata(UntrustedRecallMetadataFieldV1::CandidateId, candidate_id)?;
-    Ok(match hardened.admitted() {
+    let admitted_unchanged = hardened
+        .admitted()
+        .filter(|identity| *identity == candidate_id);
+    Ok(match admitted_unchanged {
         Some(identity) => identity.to_owned(),
         None => {
-            let digest = hardened.source_sha256().unwrap_or_default();
+            let digest = hardened.source_sha256();
             let short = digest.get(..16).unwrap_or(digest);
             format!("advisory.withheld-identity.{short}")
         }
@@ -2740,9 +2753,7 @@ fn withheld_rendering(
 mod advisory_rendering_tests {
     #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-    use tracedecay_memory_provider_registry::{
-        ContextItemProvenanceV1, ContextTokenizer, ScopeBinding,
-    };
+    use tracedecay_memory_provider_registry::{ContextItemProvenanceV1, ContextTokenizer};
 
     use super::*;
 
@@ -3018,10 +3029,23 @@ mod advisory_rendering_tests {
     fn an_oversized_host_answer_is_delivered_whole_and_the_lane_is_withheld() {
         let unit = "the daemon composition root resolves the exact coding scope at project open. ";
         let per_unit = CANONICAL.count_tokens(unit).max(1);
-        let repeats =
+        let mut repeats =
             usize::try_from(ADVISORY_CONTEXT_PACK_TOTAL_TOKEN_BUDGET.div_ceil(per_unit) + 64)
                 .unwrap_or(1);
-        let host_answer = format!("## Context\n{}", unit.repeat(repeats));
+        let mut host_answer = format!("## Context\n{}", unit.repeat(repeats));
+        // The estimate above is only a starting point, and it over-shoots the
+        // real cost: one unit measured on its own pays for its trailing space
+        // as a token, while the same unit inside the repetition has that space
+        // merged into the next word. A fixture that trusted the estimate would
+        // assemble an answer *under* the budget and then assert the
+        // over-budget behaviour, which is how this test passed while proving
+        // nothing. Grow until the assembled answer is measured over budget, so
+        // the precondition is established rather than assumed.
+        while CANONICAL.count_tokens(&host_answer) <= ADVISORY_CONTEXT_PACK_TOTAL_TOKEN_BUDGET {
+            repeats = repeats.saturating_add(repeats / 8 + 1);
+            host_answer = format!("## Context\n{}", unit.repeat(repeats));
+        }
+        let host_answer = host_answer;
 
         let lane = flooded(4);
         let text = rendered_text(&lane.appended_to(tool_result(&host_answer)));
@@ -3509,10 +3533,10 @@ mod tests {
         NativeProviderActivation, OwnedProviderId, ProviderMode, RecallDenialReason,
         RecallScopeBindingsV1, ScopeBinding, ScopeField, UnknownValidityPolicy,
     };
-    use tracedecay_store::FactWriteControl;
-    use tracedecay_usecases::memory::{
+    use tracedecay_session_memory::memory::{
         ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
     };
+    use tracedecay_store::FactWriteControl;
 
     use super::*;
     use crate::tracedecay::{TraceDecay, TraceDecayOpenOptions};
@@ -3558,7 +3582,7 @@ mod tests {
         std::fs::create_dir_all(&project_root).expect("project root");
         std::fs::create_dir_all(&profile_root).expect("profile root");
         std::fs::create_dir_all(&ledger_root).expect("ledger root");
-        crate::storage::pin_fixture_repository_identity(&project_root, project)
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(&project_root, project)
             .expect("project enrollment");
         let graph = Arc::new(
             TraceDecay::init_with_options(

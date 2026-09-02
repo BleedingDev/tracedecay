@@ -18,8 +18,8 @@ pub(crate) use tracedecay::tracedecay::TraceDecay;
 pub(crate) use tracedecay_domain::{
     ActorId, Confidence, FactCategoryV1, FactEventId, FactId, ProjectId,
 };
+pub(crate) use tracedecay_lcm::{LcmSourceRef, LcmSummaryNodeDraft};
 pub(crate) use tracedecay_sessions::admission::HostAdmissionScope;
-pub(crate) use tracedecay_sessions::runtime::lcm::{LcmSourceRef, LcmSummaryNodeDraft};
 pub(crate) use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
 
 pub(crate) fn test_fact_write_control() -> tracedecay_store::FactWriteControl {
@@ -168,7 +168,8 @@ fn spawn_dashboard_server_with_runner(
                 project_graphs,
                 "127.0.0.1",
                 port,
-                dashboard::spa_router(),
+                tracedecay::product_runtime::register_fixture_product_runtime().build_version(),
+                dashboard::spa_router(tracedecay::product_runtime::FIXTURE_DASHBOARD_ASSETS),
                 async move {
                     let _ = shutdown_rx.await;
                 },
@@ -202,19 +203,20 @@ pub(crate) async fn setup_project(
         &project_root.join("src/lib.rs"),
         "pub fn seed_fixture() -> &'static str { \"dashboard\" }\n",
     );
-    let project_id = tracedecay::storage::read_repository_identity_marker(project_root)
-        .unwrap_or_else(|error| panic!("read dashboard fixture identity: {error}"))
-        .and_then(|marker| ProjectId::new(marker.project_id).ok())
-        .unwrap_or_else(|| {
-            let suffix = project_root
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .unwrap_or("project")
-                .replace(|character: char| !character.is_ascii_alphanumeric(), "_");
-            ProjectId::new(format!("dashboard_fixture_{suffix}"))
-                .unwrap_or_else(|error| panic!("mint dashboard fixture identity: {error}"))
-        });
-    let profile_root = tracedecay::storage::default_profile_root()
+    let project_id =
+        tracedecay_runtime_core::storage::read_repository_identity_marker(project_root)
+            .unwrap_or_else(|error| panic!("read dashboard fixture identity: {error}"))
+            .and_then(|marker| ProjectId::new(marker.project_id).ok())
+            .unwrap_or_else(|| {
+                let suffix = project_root
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or("project")
+                    .replace(|character: char| !character.is_ascii_alphanumeric(), "_");
+                ProjectId::new(format!("dashboard_fixture_{suffix}"))
+                    .unwrap_or_else(|error| panic!("mint dashboard fixture identity: {error}"))
+            });
+    let profile_root = tracedecay_runtime_core::storage::default_profile_root()
         .unwrap_or_else(|error| panic!("resolve dashboard fixture profile root: {error}"));
     let open_options = tracedecay::tracedecay::TraceDecayOpenOptions {
         profile_root: Some(profile_root.clone()),
@@ -243,7 +245,7 @@ pub(crate) async fn open_dashboard_host_runtime(cg: &TraceDecay) -> Arc<Dashboar
     let project_id_text = project_id.as_str().to_owned();
     let runtime = Arc::new(
         DashboardTestRuntimeV1::project(
-            tracedecay::storage::default_profile_root()
+            tracedecay_runtime_core::storage::default_profile_root()
                 .unwrap_or_else(|error| panic!("resolve dashboard test profile root: {error}")),
             cg.project_root(),
             project_id,
@@ -282,17 +284,17 @@ pub(crate) async fn record_dashboard_automatic_fact(
     run_id: &str,
     content: &str,
 ) -> DashboardAutomaticFactReceipt {
-    use tracedecay::store::memory::DatabaseFactStore;
     use tracedecay_automation_runtime::automation::AutomationRunControl;
     use tracedecay_automation_runtime::automation::automatic_facts::{
         AutomaticFactState, record_session_automatic_facts,
     };
-    use tracedecay_usecases::memory::MemoryApplication;
+    use tracedecay_runtime_core::store::memory::DatabaseFactStore;
+    use tracedecay_session_memory::memory::MemoryApplication;
 
     let owner = dashboard_fixture_project_owner(cg);
     let memory = MemoryApplication::new(owner, DatabaseFactStore::new(cg.db()))
         .unwrap_or_else(|error| panic!("initialize outcome memory application: {error}"));
-    let request = tracedecay_usecases::memory::ProjectMemoryFactAddRequest {
+    let request = tracedecay_session_memory::memory::ProjectMemoryFactAddRequest {
         content: content.to_string(),
         category: FactCategoryV1::Project,
         source_label: Some("dashboard-outcome-test".to_string()),
@@ -340,8 +342,8 @@ pub(crate) async fn delete_dashboard_automatic_fact(
     cg: &TraceDecay,
     receipt: &DashboardAutomaticFactReceipt,
 ) {
-    use tracedecay::store::memory::DatabaseFactStore;
-    use tracedecay_usecases::memory::{MemoryApplication, MemoryOperationContext};
+    use tracedecay_runtime_core::store::memory::DatabaseFactStore;
+    use tracedecay_session_memory::memory::{MemoryApplication, MemoryOperationContext};
 
     let owner = dashboard_fixture_project_owner(cg);
     let memory = MemoryApplication::new(owner.clone(), DatabaseFactStore::new(cg.db()))
@@ -377,11 +379,11 @@ pub(crate) async fn seed_dashboard_fact(
     tags: &[&str],
     entities: &[&str],
 ) -> FactId {
-    use tracedecay::store::memory::DatabaseFactStore;
-    use tracedecay_store::ProjectMemoryFactProjectionV1;
-    use tracedecay_usecases::memory::{
+    use tracedecay_runtime_core::store::memory::DatabaseFactStore;
+    use tracedecay_session_memory::memory::{
         MemoryApplication, ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
     };
+    use tracedecay_store::ProjectMemoryFactProjectionV1;
 
     let owner = dashboard_fixture_project_owner(cg);
     let memory = MemoryApplication::new(owner.clone(), DatabaseFactStore::new(cg.db()))
@@ -459,9 +461,9 @@ pub(crate) async fn seed_memory_fixture(cg: &TraceDecay) -> DashboardMemoryFixtu
             None,
         ),
     ] {
-        use tracedecay::store::memory::DatabaseFactStore;
+        use tracedecay_runtime_core::store::memory::DatabaseFactStore;
+        use tracedecay_session_memory::memory::{MemoryApplication, MemoryOperationContext};
         use tracedecay_store::{ProjectMemoryFactFeedbackCommandV1, ProjectMemoryFactIdV1};
-        use tracedecay_usecases::memory::{MemoryApplication, MemoryOperationContext};
 
         let owner = dashboard_fixture_project_owner(cg);
         let memory = MemoryApplication::new(owner.clone(), DatabaseFactStore::new(cg.db()))
@@ -494,9 +496,9 @@ pub(crate) async fn seed_memory_fixture(cg: &TraceDecay) -> DashboardMemoryFixtu
             .await
             .unwrap_or_else(|error| panic!("seed dashboard feedback: {error:?}"));
     }
-    use tracedecay::store::memory::DatabaseFactStore;
+    use tracedecay_runtime_core::store::memory::DatabaseFactStore;
+    use tracedecay_session_memory::memory::MemoryApplication;
     use tracedecay_store::{FactReadControl, ProjectMemoryFactIdV1, ProjectMemoryFactProjectionV1};
-    use tracedecay_usecases::memory::MemoryApplication;
     let near_duplicate_fact_id = fact_ids[1].clone();
     let owner = dashboard_fixture_project_owner(cg);
     let memory = MemoryApplication::new(owner.clone(), DatabaseFactStore::new(cg.db()))
@@ -859,7 +861,7 @@ async fn start_dashboard_fixture_with_options(
     let userprofile_guard = EnvVarGuard::set("USERPROFILE", &home);
     std::fs::create_dir_all(&project_root)
         .unwrap_or_else(|err| panic!("failed to create fixture project root: {err}"));
-    if let Err(err) = tracedecay::storage::pin_fixture_repository_identity(
+    if let Err(err) = tracedecay_runtime_core::storage::pin_fixture_repository_identity(
         &project_root,
         "dashboard_fixture_project",
     ) {

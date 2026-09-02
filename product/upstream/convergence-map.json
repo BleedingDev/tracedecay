@@ -3,7 +3,7 @@
   "schema_version": 2,
   "bead_id": "tdmem-0308",
   "policy_revision": "patch-footprint.v2",
-  "upstream_floor_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+  "upstream_floor_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
   "owners": {
     "product": {
       "id": "BleedingDev",
@@ -52,7 +52,7 @@
         "cargo test -p tracedecay-memory-provider-api --locked",
         "python3 tests/product_memory_provider_contract_set_test.py"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The provider-neutral contract can be proposed independently without carrying any concrete provider implementation."
@@ -84,7 +84,7 @@
       "tests": [
         "cargo test -p tracedecay-memory-fabric --locked"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The provider-neutral fabric is separable from product adapters and can converge through its public contracts."
@@ -132,7 +132,7 @@
         "cargo test -p tracedecay-memory-provider-registry --test recall_port --locked",
         "cargo test -p tracedecay-memory-provider-registry --test recall_selection --locked"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "product_only",
         "rationale": "Product selection and construction policy stays removable behind the narrow host composition mount."
@@ -181,7 +181,7 @@
         "python3 tests/product_memory_composition_feature_test.py",
         "cargo test --locked -p tracedecay --features memory-provider-host native_baseline"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "product_only",
         "rationale": "The adapter remains product-owned while Native storage and application authority stay unchanged upstream."
@@ -217,7 +217,7 @@
         "cargo test -p tracedecay-memory-provider-ncm --features local-process --test ncm_local_process --locked",
         "cargo test -p tracedecay-memory-provider-ncm --features local-process --test ncm_conformance --locked"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "product_only",
         "rationale": "The licensed external-provider adapter and its evidence remain isolated from the upstream host architecture."
@@ -257,7 +257,7 @@
         "python3 tests/product_dummy_provider_conformance_test.py",
         "cargo test -p tracedecay-memory-conformance --test baseline --locked"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Provider-neutral conformance behavior can be upstreamed independently from product provider implementations."
@@ -289,7 +289,7 @@
         "cargo test -p tracedecay-memory-evaluation --locked",
         "python3 tests/product_tdmem_0904_metric_catalog_test.py"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Provider-neutral metric definitions and their evaluator can be upstreamed with the conformance harness independently from product provider implementations."
@@ -323,7 +323,7 @@
         "cargo test -p tracedecay-memory-observation --locked",
         "python3 tests/product_upstream_ownership_registry_test.py"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The provider-neutral observation journal carries no provider implementation and can be proposed on its own once its delivery contract settles."
@@ -354,7 +354,7 @@
         "cargo test -p tracedecay-memory-hygiene --locked",
         "python3 tests/product_upstream_ownership_registry_test.py"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "product_only",
         "rationale": "The crate-local hygiene boundary takes over the canonical JSON encoding from tracedecay-domain and reuses the vendored detector corpus exposed by tracedecay-runtime-core's public surface, so it cannot be lifted out as an independently extractable upstream candidate without also carrying those upstream-owned internals into a separate ownership area."
@@ -400,7 +400,7 @@
         "cargo test --locked -p tracedecay --features memory-provider-host remount_sweeps_rows_that_expired_while_the_journey_was_down",
         "cargo test -p tracedecay-memory-observation --test retention_sweep_cadence --locked"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "product_only",
         "rationale": "The journey composes product-owned journal and hygiene crates against the upstream store and Native application port; it is removable with the host feature and has no upstream counterpart to converge with."
@@ -438,7 +438,7 @@
         "cargo test --locked -p tracedecay-memory-provider-registry --test recall_port",
         "python3 tests/product_upstream_ownership_registry_test.py"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "product_only",
         "rationale": "The mount composes the product-owned registry recall port and a product-owned admission ledger against the daemon's resolved scope; it is removable with the host feature and has no upstream counterpart to converge with."
@@ -471,7 +471,7 @@
         "python3 tests/product_observation_hygiene_policy_test.py",
         "python3 tests/product_upstream_ownership_registry_test.py"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "product_only",
         "rationale": "The policy documents describe TraceDecay's own observation governance and have no upstream counterpart to converge with."
@@ -503,7 +503,7 @@
         "python3 tests/product_tdmem_0901_scenario_corpus_test.py",
         "python3 tests/product_upstream_ownership_registry_test.py"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "product_only",
         "rationale": "The scenario corpus evaluates TraceDecay product behavior and has no upstream runtime surface to converge."
@@ -532,7 +532,7 @@
       "tests": [
         "python3 tests/product_upstream_ownership_registry_test.py"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The reserved provider-neutral compiler can converge only after its substantive behavior and tests exist."
@@ -574,7 +574,7 @@
         "python3 tests/product_upstream_ownership_registry_test.py",
         "python3 tests/product_patch_footprint_policy_test.py"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "product_only",
         "rationale": "Product planning and convergence enforcement remain downstream-owned while preserving upstream identity explicitly."
@@ -608,9 +608,9 @@
       ],
       "tests": [
         "cargo test -p tracedecay-application --locked",
-        "cargo test -p tracedecay --features test-helpers --test application_production_reachability --locked"
+        "cargo test -p tracedecay --features test-helpers --test runtime_acceptance_suite application_production_reachability --locked"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The application port is provider-neutral and can converge independently from every product-owned adapter and context compiler."
@@ -648,7 +648,7 @@
         "cargo test -p tracedecay-memory-provider-api --locked",
         "cargo test -p tracedecay-memory-conformance --locked"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "generated_resolution",
         "rationale": "Workspace membership can be removed directly and the lockfile is regenerated from the remaining manifests."
@@ -703,7 +703,7 @@
         "python3 tests/product_memory_composition_feature_test.py",
         "python3 tests/product_memory_fabric_disabled_mode_test.py"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "minimal_mount",
         "rationale": "These five exact files form the smallest current host patch and can be removed with the optional feature."
@@ -720,8 +720,8 @@
         "crates/tracedecay/src/daemon/engine/shutdown.rs",
         "crates/tracedecay/src/daemon/invocation_state.rs",
         "crates/tracedecay/src/daemon/production_harness.rs",
-        "crates/tracedecay/src/daemon/service/invocation/lsp.rs",
-        "crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs"
+        "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
+        "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs"
       ],
       "touch_points": [
         "daemon_shutdown_deadline",
@@ -731,7 +731,7 @@
         "tdmem-0404",
         "tdmem-1204"
       ],
-      "rationale": "Constrain the six existing daemon shutdown and production-harness layers that must share one caller deadline and expose incomplete blocking drain truthfully.",
+      "rationale": "Constrain the six existing daemon shutdown and production-harness layers that must share one caller deadline and expose incomplete blocking drain truthfully. Two of those layers moved into the new tracedecay-daemon-service crate at floor 5749e4fc; the area follows them rather than widening its footprint.",
       "semantic_invariants": [
         "Upstream behavior: daemon shutdown preserves lifecycle ordering and always completes terminal teardown after reporting the observed outcome.",
         "Product behavior: one caller-supplied absolute deadline bounds every nested shutdown and blocking-drain step without refresh."
@@ -740,7 +740,7 @@
         "cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification",
         "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The absolute-deadline shutdown correction is provider-neutral and can converge independently as an upstream lifecycle fix."
@@ -754,7 +754,8 @@
       "feature": "integration-test-harness",
       "path_patterns": [
         "crates/tracedecay/tests/common/mod.rs",
-        "crates/tracedecay/tests/memory_suite/memory_eval_test.rs"
+        "crates/tracedecay/tests/memory_suite/memory_eval_test.rs",
+        "crates/tracedecay-daemon-control/src/service/tests.rs"
       ],
       "touch_points": [
         "integration_test_runtime_isolation"
@@ -763,15 +764,17 @@
         "tdmem-0404",
         "tdmem-1204"
       ],
-      "rationale": "Constrain the two existing integration-test harness paths that select the checkout CLI and isolate daemon routing for memory-suite execution.",
+      "rationale": "Constrain the two existing integration-test harness paths that select the checkout CLI and isolate daemon routing for memory-suite execution, plus the one upstream lib-test module whose platform gate has to be removed for the workspace to compile its tests on macOS.",
       "semantic_invariants": [
         "Upstream behavior: integration tests use one bounded production-equivalent daemon socket and never inherit an installed daemon or global profile.",
-        "Product behavior: the memory suite executes a CLI built from the same checkout or fails closed before mixing revisions."
+        "Product behavior: the memory suite executes a CLI built from the same checkout or fails closed before mixing revisions.",
+        "Upstream test modules are touched only to make them compile on every supported host; no test body, assertion, or production path changes."
       ],
       "tests": [
-        "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1"
+        "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1",
+        "cargo test --locked -p tracedecay-daemon-control --lib"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Deterministic same-checkout integration-test isolation is provider-neutral and can be proposed upstream without product runtime changes."
@@ -789,7 +792,8 @@
         "crates/tracedecay/src/config.rs",
         "crates/tracedecay/src/config/tests.rs",
         "crates/tracedecay-global-db/src/configuration/registry.rs",
-        "crates/tracedecay-global-db/src/configuration/store.rs"
+        "crates/tracedecay-global-db/src/configuration/store.rs",
+        "crates/tracedecay-configuration/src/config/mod.rs"
       ],
       "touch_points": [
         "configuration_registry_mount",
@@ -805,11 +809,12 @@
         "No other upstream configuration key, default, or resolver behavior changes."
       ],
       "tests": [
+        "cargo test --locked -p tracedecay-configuration config::memory_provider_snapshot_tests",
         "cargo test --locked -p tracedecay --features memory-provider-host config::tests::memory_provider_recall_routing_defaults_to_no_active_provider_and_validates",
         "cargo test --locked -p tracedecay --features memory-provider-host config::tests::memory_provider_native_enabled_round_trips_and_defaults_off",
         "cargo test --locked -p tracedecay-global-db configuration"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Two additive typed settings with closed defaults are the smallest configuration patch and can be proposed upstream independently of any provider implementation."
@@ -822,11 +827,11 @@
       "ownership_class": "upstream_owned",
       "feature": "memory-provider-host",
       "path_patterns": [
-        "crates/tracedecay/src/daemon/session_sync.rs",
-        "crates/tracedecay/src/daemon/session_sync/git_topology.rs",
-        "crates/tracedecay/src/daemon/session_sync/project_lifecycle.rs",
-        "crates/tracedecay/src/daemon/session_sync/project_lifecycle_tests.rs",
-        "crates/tracedecay/src/daemon/session_sync_tests.rs"
+        "crates/tracedecay-session-runtime/src/session_sync.rs",
+        "crates/tracedecay-session-runtime/src/session_sync/git_topology.rs",
+        "crates/tracedecay-session-runtime/src/session_sync/project_lifecycle.rs",
+        "crates/tracedecay/src/daemon/session_runtime_tests/project_lifecycle_tests.rs",
+        "crates/tracedecay/src/daemon/session_runtime_tests/session_sync_tests.rs"
       ],
       "touch_points": [
         "daemon_composition_mount"
@@ -835,18 +840,17 @@
         "tdmem-0603",
         "tdmem-0502"
       ],
-      "rationale": "Thread the exact project-open ResolvedScope into DaemonSessionSyncConfig and SessionSyncProjectContext so session-sync git-topology resolution reuses the one authoritative scope the daemon already bound at project open instead of re-deriving repository, worktree, and reference identity from project_root a second time.",
+      "rationale": "Thread the exact project-open ResolvedScope into DaemonSessionSyncConfig and SessionSyncProjectContext so session-sync git-topology resolution reuses the one authoritative scope the daemon already bound at project open instead of re-deriving repository, worktree, and reference identity from project_root a second time. Upstream relocated session-sync into the new tracedecay-session-runtime crate and its fixtures into crates/tracedecay/src/daemon/session_runtime_tests/ at floor 5749e4fc; the area tracks the same five files at their new locations.",
       "semantic_invariants": [
         "Session-sync git-topology resolution never re-derives scope from project_root; it consumes the identical ResolvedScope value the daemon composition root bound at project-open.",
         "A project-open scope-resolution failure is never silently retried or substituted inside session-sync; the scope is carried through configuration and context, not recomputed.",
         "Existing session-sync outcomes, cursors, and lease behavior are unchanged for callers that already supplied a resolvable scope."
       ],
       "tests": [
-        "cargo test --locked -p tracedecay daemon::session_sync",
-        "cargo test --locked -p tracedecay daemon::session_sync::git_topology",
-        "cargo test --locked -p tracedecay daemon::session_sync::project_lifecycle"
+        "cargo test --locked -p tracedecay daemon::session_runtime_tests::session_sync_tests",
+        "cargo test --locked -p tracedecay daemon::session_runtime_tests::project_lifecycle_tests"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Removing a redundant identity re-derivation in favor of the already-bound scope is a provider-neutral correctness fix upstream can take independently of any provider work."
@@ -882,7 +886,7 @@
         "cargo test --locked -p tracedecay-usecases primitives::production",
         "cargo test --locked -p tracedecay-usecases primitives::runtime"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The ledger-uninitialized-versus-fault distinction is a general diagnostics-evidence correctness fix, independent of any concrete memory provider, and upstream can adopt it directly."
@@ -915,7 +919,7 @@
         "python3 tests/product_memory_composition_feature_test.py",
         "python3 tests/product_upstream_ownership_registry_test.py"
       ],
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "product_only",
         "rationale": "The lane exists only to deliver the optional product-owned provider host's advisory output and is removed with the memory-provider-host feature."
@@ -956,7 +960,7 @@
       "line_budget": 180,
       "rebase_or_removal_plan": "Regenerate Cargo.lock after removing product workspace members and retain every unrelated upstream resolution.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "generated_resolution",
         "rationale": "The lockfile delta is reproduced from pinned manifests and disappears when their path packages are removed."
@@ -999,7 +1003,7 @@
       "line_budget": 80,
       "rebase_or_removal_plan": "Remove only the additive product workspace member lines while preserving every upstream workspace setting.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The additive member list can be proposed upstream independently or removed without changing host behavior."
@@ -1029,7 +1033,7 @@
       "line_budget": 4,
       "rebase_or_removal_plan": "Remove the recall module declaration and re-export together if the upstream application boundary adopts a different equivalent port.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The two additive module lines are the narrow public mount for a provider-neutral application contract."
@@ -1062,7 +1066,7 @@
       "line_budget": 560,
       "rebase_or_removal_plan": "Decompose the oversized module below the hard per-file cap, then remove the local contract if upstream adopts an equivalent typed recall port.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The contract is provider-neutral application vocabulary and can be proposed independently from product-owned implementations."
@@ -1093,7 +1097,7 @@
       "line_budget": 300,
       "rebase_or_removal_plan": "Keep these contract tests with any upstreamed recall port and remove them only with the corresponding application vocabulary.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The tests exercise only provider-neutral application semantics and can accompany the port upstream."
@@ -1105,7 +1109,7 @@
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "cognitive_recall_contract",
-      "rationale": "Keep the application production-reachability suite compile-clean after the retained application boundary no longer consumes the daemon handshake import.",
+      "rationale": "Keep the application production-reachability suite compile-clean after the retained application boundary no longer consumes the daemon handshake import. Retired at floor 5749e4fc: upstream moved the suite to crates/tracedecay/tests/runtime_acceptance_suite/application_production_reachability.rs and independently removed the same stale handshake import, so the merged file is byte-identical to upstream and the product delta at this path is zero.",
       "semantic_invariants": [
         "The production reachability journeys and assertions remain byte-for-byte unchanged.",
         "Removing the stale import changes no runtime or test behavior."
@@ -1114,15 +1118,15 @@
         "git diff --check"
       ],
       "tests": [
-        "cargo test -p tracedecay --features test-helpers --test application_production_reachability --locked"
+        "cargo test -p tracedecay --features test-helpers --test runtime_acceptance_suite application_production_reachability --locked"
       ],
       "bead_ids": [
         "tdmem-1208"
       ],
       "line_budget": 2,
-      "rebase_or_removal_plan": "Drop this entry when upstream removes the same stale import or the floor advances past that cleanup.",
-      "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "rebase_or_removal_plan": "Retired because upstream performed the identical cleanup; delete this row once the retired-row history is no longer needed for the convergence audit. No product code has to be re-applied.",
+      "status": "retired",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The one-line stale-import cleanup is behavior-neutral and appropriate for direct upstream convergence."
@@ -1158,7 +1162,7 @@
       "line_budget": 40,
       "rebase_or_removal_plan": "Remove the three optional dependencies, the memory-provider-host feature, its feature-list membership, and the conformance dev-dependency together.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "minimal_mount",
         "rationale": "The optional dependency is the single package-level bridge and can be upstreamed or deleted independently."
@@ -1208,7 +1212,7 @@
       "line_budget": 560,
       "rebase_or_removal_plan": "Remove the typed mount helper, disabled activation, and two construction-context injections as one bounded patch.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "minimal_mount",
         "rationale": "The project composition seam is explicit, default-off, and independent from provider implementation details."
@@ -1238,7 +1242,7 @@
       "line_budget": 60,
       "rebase_or_removal_plan": "Remove only the feature-gated mount identity, inertness, and release assertions with the host mount.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The ownership proof documents the host lifecycle contract and can accompany the minimal mount upstream."
@@ -1271,7 +1275,7 @@
       "line_budget": 68,
       "rebase_or_removal_plan": "Remove the feature-gated retained field, constructor transfer, and test accessor without changing MCP routes.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "minimal_mount",
         "rationale": "One opaque retained field is the smallest server-lifetime ownership bridge for the composition object."
@@ -1302,7 +1306,7 @@
       "line_budget": 74,
       "rebase_or_removal_plan": "Remove the feature-gated type alias, optional construction field, defaults, and builder method together.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "minimal_mount",
         "rationale": "The optional construction field is a bounded transport for project ownership and can be removed atomically."
@@ -1335,7 +1339,7 @@
       "line_budget": 12,
       "rebase_or_removal_plan": "Remove the feature-gated journey shutdown block and restore the unused deadline binding; the remaining shutdown sequence is upstream-owned and unchanged.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "minimal_mount",
         "rationale": "One feature-gated await on the existing deadline-bearing shutdown path; removable atomically with the optional host feature."
@@ -1350,7 +1354,7 @@
       "rationale": "Gate the retained Native application authority and its direct parity module at the daemon composition boundary so provider behavior is opt-in and removable.",
       "semantic_invariants": [
         "Upstream behavior: retained project and profile operations continue to resolve through the owner-bound Native memory authority when the provider host feature is absent.",
-        "Enabled product behavior: memory-provider-host gates only the Native adapter module and parity fixture; provider calls remain behind registry composition and cannot replace canonical Native ownership.",
+        "Enabled product behavior: memory-provider-host gates exactly four declarations in this file and nothing else \u2014 the cognitive_recall module, the native_provider adapter module, the observation_journey module, and the cfg(all(test, feature)) native_provider_parity_tests fixture; every unconditional module and re-export stays upstream's, provider calls remain behind registry composition, and none of them can replace canonical Native ownership.",
         "The retained owner keeps exact project scope, request admission, cancellation, deadlines, receipts, and terminal mappings independent of provider availability.",
         "Enabled product behavior: the observation_journey module declaration is the only retained-owner seam for the durable observation journal; the journal is delivery-status authority only and never a second authority for Native facts."
       ],
@@ -1375,9 +1379,9 @@
         "tdmem-0502"
       ],
       "line_budget": 12,
-      "rebase_or_removal_plan": "Remove the two feature-gated module declarations and parity module path while leaving all existing retained project/profile authorities and their disabled behavior unchanged.",
+      "rebase_or_removal_plan": "Remove the four feature-gated declarations (cognitive_recall, native_provider, observation_journey, and the native_provider_parity_tests path module) while leaving all existing retained project/profile authorities and their disabled behavior unchanged.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "minimal_mount",
         "rationale": "The module declarations are the narrow host seam that makes Native provider behavior available only through the optional composition feature."
@@ -1414,7 +1418,7 @@
       "line_budget": 12,
       "rebase_or_removal_plan": "Revert only the constructor visibility change after the Native bridge no longer needs the retained owner's existing MemoryApplication authority; preserve every retained operation and its canonical write path.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Reusing the existing owner-bound application constructor is a small, provider-neutral composition seam that preserves Native authority."
@@ -1445,7 +1449,7 @@
       "line_budget": 84,
       "rebase_or_removal_plan": "Drop the deadline argument only if upstream daemon shutdown already exposes and propagates an equivalent absolute-deadline contract.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The bootstrap handoff is a provider-neutral correctness fix that can be upstreamed with the shutdown deadline chain."
@@ -1476,7 +1480,7 @@
       "line_budget": 8,
       "rebase_or_removal_plan": "Remove the engine forwarding delta when upstream engine shutdown accepts the same caller-owned absolute deadline.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The engine signature and forwarding change are the narrow upstream bridge for deadline conservation."
@@ -1507,7 +1511,7 @@
       "line_budget": 16,
       "rebase_or_removal_plan": "Remove the invocation-state forwarding patch after upstream accepts an equivalent shared-deadline shutdown signature.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The invocation-state bridge preserves upstream authority while closing the nested deadline-refresh gap."
@@ -1519,7 +1523,7 @@
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "production_harness_shutdown",
-      "rationale": "Use the production absolute-deadline shutdown API in the test-transport harness instead of the cfg(test)-only convenience method.",
+      "rationale": "Use the production absolute-deadline shutdown API in the test-transport harness instead of the cfg(test)-only convenience method. The patch is exactly the shared shutdown deadline inside shutdown_production_project_harness; the harness keeps upstream's imports, mount helper signatures, production_project_server call, and open flow.",
       "semantic_invariants": [
         "Upstream behavior: the production-composition harness retains its established teardown order and waits for invocation shutdown before detached project servers.",
         "Product behavior: test-transport builds consume the same bounded daemon shutdown deadline and compile without a cfg(test)-only method."
@@ -1536,22 +1540,22 @@
         "tdmem-0404",
         "tdmem-1204"
       ],
-      "line_budget": 62,
+      "line_budget": 16,
       "rebase_or_removal_plan": "Drop this caller adaptation when upstream exposes the same bounded production-harness shutdown path or removes the cfg(test)-only convenience method.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Calling the production deadline-aware API from test transport is a provider-neutral lifecycle correctness fix."
       }
     },
     {
-      "path": "crates/tracedecay/src/daemon/service/invocation/lsp.rs",
+      "path": "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
       "area_id": "shutdown_deadline",
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "daemon_shutdown_deadline",
-      "rationale": "Bound LSP shutdown by the remaining caller budget so process teardown cannot silently outlive the daemon's absolute deadline.",
+      "rationale": "Bound LSP shutdown by the remaining caller budget so process teardown cannot silently outlive the daemon's absolute deadline. Upstream moved this seam out of crates/tracedecay/src/daemon/service/invocation/lsp.rs into the new tracedecay-daemon-service crate at floor 5749e4fc; the bounded-deadline split was re-applied minimally at the new path and the deadline constant now resolves through tracedecay_runtime_core.",
       "semantic_invariants": [
         "Upstream behavior: LSP teardown retains its existing process ownership and reports the real shutdown outcome.",
         "Product behavior: LSP shutdown consumes only the remaining shared deadline and never creates a fresh timeout."
@@ -1568,21 +1572,21 @@
         "tdmem-1204"
       ],
       "line_budget": 16,
-      "rebase_or_removal_plan": "Delete the local LSP deadline adaptation when upstream LSP shutdown consumes the caller's absolute deadline directly.",
+      "rebase_or_removal_plan": "Delete the local LSP deadline adaptation when upstream LSP shutdown consumes the caller's absolute deadline directly. The seam moved with upstream's crate split at floor 5749e4fc; re-locate it again if upstream moves the file once more.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Bounded LSP teardown is an upstream daemon-lifecycle correction independent of memory-provider behavior."
       }
     },
     {
-      "path": "crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs",
+      "path": "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
       "area_id": "shutdown_deadline",
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "daemon_shutdown_deadline",
-      "rationale": "Bound blocking project-runtime drain by the shared deadline, expose incomplete drain as Failed, and still perform terminal teardown.",
+      "rationale": "Bound blocking project-runtime drain by the shared deadline, expose incomplete drain as Failed, and still perform terminal teardown. Upstream moved this seam out of crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs into the new tracedecay-daemon-service crate at floor 5749e4fc; the deadline-consuming finish_drained_runtimes and its regression tests were re-applied at the new path with DAEMON_TASK_ABORT_DEADLINE and DAEMON_SHUTDOWN_DEADLINE resolved through tracedecay_runtime_core.",
       "semantic_invariants": [
         "Upstream behavior: project-runtime shutdown reaches terminal teardown and truthfully reports an incomplete blocking drain as Failed.",
         "Product behavior: blocking drain is bounded by the caller deadline and cannot extend shutdown through an internal replacement budget."
@@ -1601,9 +1605,9 @@
         "tdmem-1204"
       ],
       "line_budget": 180,
-      "rebase_or_removal_plan": "Remove the bounded-drain implementation when upstream project-runtime shutdown provides the same deadline conservation and truthful terminal outcome.",
+      "rebase_or_removal_plan": "Remove the bounded-drain implementation when upstream project-runtime shutdown provides the same deadline conservation and truthful terminal outcome. The seam moved with upstream's crate split at floor 5749e4fc; re-locate it again if upstream moves the file once more.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Bounded blocking drain and truthful failure reporting are provider-neutral upstream lifecycle fixes."
@@ -1634,7 +1638,7 @@
       "line_budget": 69,
       "rebase_or_removal_plan": "Remove the local harness resolver and isolation helpers when upstream provides equivalent fail-closed same-checkout command construction.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Same-checkout integration-test execution and daemon isolation are broadly useful upstream test-harness corrections."
@@ -1665,7 +1669,7 @@
       "line_budget": 149,
       "rebase_or_removal_plan": "Drop the memory-suite-specific wiring when upstream memory evaluation uses the common isolated command and socket contract directly.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "The memory-suite harness reuse is a deterministic integration-test correction suitable for upstream convergence."
@@ -1710,7 +1714,7 @@
       "line_budget": 62,
       "rebase_or_removal_plan": "Re-apply two additive registrations onto the upstream settings vector; remove them entirely if upstream gains a settings-extension seam a product crate can use.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Two additive settings with closed defaults; upstream could adopt them or offer an extension seam that removes the exception."
@@ -1754,7 +1758,7 @@
       "line_budget": 20,
       "rebase_or_removal_plan": "Re-apply two entries to the additive-key list, or delete them with the registrations.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Mechanical additive-list extension that upstream would carry with the settings themselves."
@@ -1783,7 +1787,7 @@
       "line_budget": 90,
       "rebase_or_removal_plan": "Remove the two key constants and the routing document type as one additive patch if upstream adopts equivalent settings.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Additive typed setting with a closed default."
@@ -1795,7 +1799,7 @@
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "configuration_registry_mount",
-      "rationale": "Read the two memory-provider settings from the resolved snapshot into the use-case runtime configuration the daemon composition consumes.",
+      "rationale": "Read the two memory-provider settings from the resolved snapshot into the use-case runtime configuration the daemon composition consumes. Retired at floor 5749e4fc: upstream emptied this module into the new tracedecay-configuration crate, so the product delta at this path is now zero and the semantic lives at crates/tracedecay-configuration/src/config/mod.rs.",
       "semantic_invariants": [
         "Both fields are required from the snapshot and the routing document is validated before the configuration is pinned; a malformed document fails project open as a typed configuration error."
       ],
@@ -1809,9 +1813,37 @@
         "tdmem-0607"
       ],
       "line_budget": 60,
-      "rebase_or_removal_plan": "Delete the two fields and the routing reader together with the composition-root consumer.",
+      "rebase_or_removal_plan": "Retired. The two memory-provider configuration fields moved with upstream's crate split to crates/tracedecay-configuration/src/config/mod.rs, which carries the live entry; delete this row once the retired-row history is no longer needed for the convergence audit.",
+      "status": "retired",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Additive typed setting with a closed default."
+      }
+    },
+    {
+      "path": "crates/tracedecay-configuration/src/config/mod.rs",
+      "area_id": "memory_provider_configuration_gate",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "configuration_registry_mount",
+      "rationale": "Read the two memory-provider settings from the resolved snapshot into the use-case runtime configuration the daemon composition consumes. Upstream moved TraceDecayConfig out of crates/tracedecay-usecases/src/config/mod.rs into the new tracedecay-configuration crate at floor 5749e4fc; the two additive fields, their closed defaults, the two snapshot reads, and the validating routing reader were re-applied minimally at the new path. runtime_config_from_snapshot and memory_provider_recall_routing_from_snapshot are crate-private, so the assertions that prove this entry's invariant live in the crate-local module memory_provider_snapshot_tests in this same file; the line budget covers the reader plus those tests.",
+      "semantic_invariants": [
+        "Both fields are required from the snapshot and the routing document is validated before the configuration is pinned; a malformed document fails project open as a typed configuration error."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-configuration config::memory_provider_snapshot_tests"
+      ],
+      "bead_ids": [
+        "tdmem-0607"
+      ],
+      "line_budget": 250,
+      "rebase_or_removal_plan": "Delete the two fields and the routing reader together with the composition-root consumer. Follow the config module if upstream relocates it again; the previous location is kept as a retired row.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Additive typed setting with a closed default."
@@ -1840,7 +1872,7 @@
       "line_budget": 60,
       "rebase_or_removal_plan": "Delete the two fields and the routing reader as one additive patch.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Additive typed setting with a closed default."
@@ -1868,19 +1900,19 @@
       "line_budget": 175,
       "rebase_or_removal_plan": "Delete the two tests with the fields.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Additive typed setting with a closed default."
       }
     },
     {
-      "path": "crates/tracedecay/src/daemon/session_sync.rs",
+      "path": "crates/tracedecay-session-runtime/src/session_sync.rs",
       "area_id": "session_sync_scope_mount",
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "daemon_composition_mount",
-      "rationale": "Add the project-open ResolvedScope field to DaemonSessionSyncConfig so the composition root can hand session-sync the exact scope it already resolved once, instead of session-sync deriving its own.",
+      "rationale": "Add the project-open ResolvedScope field to DaemonSessionSyncConfig so the composition root can hand session-sync the exact scope it already resolved once, instead of session-sync deriving its own. Upstream moved session-sync out of crates/tracedecay/src/daemon/session_sync.rs into the new tracedecay-session-runtime crate at floor 5749e4fc; the scope field was carried to the new path unchanged.",
       "semantic_invariants": [
         "The scope field carries the authoritative project-open ResolvedScope verbatim; no other configuration field changes shape."
       ],
@@ -1888,28 +1920,29 @@
         "git diff --check"
       ],
       "tests": [
-        "cargo test --locked -p tracedecay daemon::session_sync"
+        "cargo test --locked -p tracedecay daemon::session_runtime_tests::session_sync_tests",
+        "cargo test --locked -p tracedecay daemon::session_runtime_tests::project_lifecycle_tests"
       ],
       "bead_ids": [
         "tdmem-0603",
         "tdmem-0502"
       ],
       "line_budget": 5,
-      "rebase_or_removal_plan": "Remove the scope field and its doc comment.",
+      "rebase_or_removal_plan": "Remove the scope field and its doc comment. The seam moved with upstream's crate split at floor 5749e4fc; re-locate it again if upstream moves the file once more.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "A configuration field carrying an already-resolved value is a narrow, provider-neutral plumbing change."
       }
     },
     {
-      "path": "crates/tracedecay/src/daemon/session_sync/git_topology.rs",
+      "path": "crates/tracedecay-session-runtime/src/session_sync/git_topology.rs",
       "area_id": "session_sync_scope_mount",
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "daemon_composition_mount",
-      "rationale": "Replace the re-derivation of ResolvedScope from project_root with the scope carried on SessionSyncProjectContext, removing a duplicate identity-resolution path and its distinct failure mode.",
+      "rationale": "Replace the re-derivation of ResolvedScope from project_root with the scope carried on SessionSyncProjectContext, removing a duplicate identity-resolution path and its distinct failure mode. Upstream moved this file out of crates/tracedecay/src/daemon/session_sync/git_topology.rs into the new tracedecay-session-runtime crate at floor 5749e4fc; the self.scope.clone() reuse was carried to the new path unchanged.",
       "semantic_invariants": [
         "Git-topology sync never calls resolved_scope_for_project itself; it clones the context's already-bound scope.",
         "The prior Unavailable failure path for a scope-resolution error at sync time is removed because that resolution no longer happens here."
@@ -1918,28 +1951,28 @@
         "git diff --check"
       ],
       "tests": [
-        "cargo test --locked -p tracedecay daemon::session_sync::git_topology"
+        "cargo test --locked -p tracedecay daemon::session_runtime_tests::session_sync_tests"
       ],
       "bead_ids": [
         "tdmem-0603",
         "tdmem-0502"
       ],
       "line_budget": 10,
-      "rebase_or_removal_plan": "Restore the resolved_scope_for_project(...) call in place of self.scope.clone().",
+      "rebase_or_removal_plan": "Restore the resolved_scope_for_project(...) call in place of self.scope.clone(). The seam moved with upstream's crate split at floor 5749e4fc; re-locate it again if upstream moves the file once more.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Removing a redundant identity re-derivation is a general correctness fix upstream can take independently."
       }
     },
     {
-      "path": "crates/tracedecay/src/daemon/session_sync/project_lifecycle.rs",
+      "path": "crates/tracedecay-session-runtime/src/session_sync/project_lifecycle.rs",
       "area_id": "session_sync_scope_mount",
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "daemon_composition_mount",
-      "rationale": "Add the scope field to SessionSyncProjectContext and wire it from DaemonSessionSyncConfig at registration, so the context carries the same authoritative scope its config was given.",
+      "rationale": "Add the scope field to SessionSyncProjectContext and wire it from DaemonSessionSyncConfig at registration, so the context carries the same authoritative scope its config was given. Upstream moved this file out of crates/tracedecay/src/daemon/session_sync/project_lifecycle.rs into the new tracedecay-session-runtime crate at floor 5749e4fc; the project-open scope binding was carried to the new path unchanged.",
       "semantic_invariants": [
         "SessionSyncProjectContext.scope is populated only from config.scope at register_project time; it is never independently resolved."
       ],
@@ -1947,28 +1980,28 @@
         "git diff --check"
       ],
       "tests": [
-        "cargo test --locked -p tracedecay daemon::session_sync::project_lifecycle"
+        "cargo test --locked -p tracedecay daemon::session_runtime_tests::project_lifecycle_tests"
       ],
       "bead_ids": [
         "tdmem-0603",
         "tdmem-0502"
       ],
       "line_budget": 4,
-      "rebase_or_removal_plan": "Remove the scope field and its assignment in register_project.",
+      "rebase_or_removal_plan": "Remove the scope field and its assignment in register_project. The seam moved with upstream's crate split at floor 5749e4fc; re-locate it again if upstream moves the file once more.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "A one-field plumbing change to carry an already-resolved value."
       }
     },
     {
-      "path": "crates/tracedecay/src/daemon/session_sync/project_lifecycle_tests.rs",
+      "path": "crates/tracedecay/src/daemon/session_runtime_tests/project_lifecycle_tests.rs",
       "area_id": "session_sync_scope_mount",
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "daemon_composition_mount",
-      "rationale": "Update the project-lifecycle test fixtures to resolve and pass the new required scope field on DaemonSessionSyncConfig so existing registration and recovery tests keep constructing a valid config.",
+      "rationale": "Update the project-lifecycle test fixtures to resolve and pass the new required scope field on DaemonSessionSyncConfig so existing registration and recovery tests keep constructing a valid config. Upstream moved this fixture out of crates/tracedecay/src/daemon/session_sync/project_lifecycle_tests.rs into crates/tracedecay/src/daemon/session_runtime_tests/ at floor 5749e4fc; the fixture now resolves scope through tracedecay_code_index_runtime::resolved_scope_for_project and also supplies it to upstream's newly added recovery test, because the scope field is mandatory on DaemonSessionSyncConfig.",
       "semantic_invariants": [
         "Each fixture resolves scope through the same resolved_scope_for_project used by production callers before construction, so tests exercise the real production shape."
       ],
@@ -1976,28 +2009,28 @@
         "git diff --check"
       ],
       "tests": [
-        "cargo test --locked -p tracedecay daemon::session_sync::project_lifecycle"
+        "cargo test --locked -p tracedecay daemon::session_runtime_tests::project_lifecycle_tests"
       ],
       "bead_ids": [
         "tdmem-0603",
         "tdmem-0502"
       ],
-      "line_budget": 12,
-      "rebase_or_removal_plan": "Drop the resolved scope local bindings and the scope field from each fixture's config construction.",
+      "line_budget": 18,
+      "rebase_or_removal_plan": "Drop the resolved scope local bindings and the scope field from each fixture's config construction. The seam moved with upstream's crate split at floor 5749e4fc; re-locate it again if upstream moves the file once more.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Test-fixture updates that mirror a narrow production field addition."
       }
     },
     {
-      "path": "crates/tracedecay/src/daemon/session_sync_tests.rs",
+      "path": "crates/tracedecay/src/daemon/session_runtime_tests/session_sync_tests.rs",
       "area_id": "session_sync_scope_mount",
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "daemon_composition_mount",
-      "rationale": "Update the session-sync test fixture to resolve and pass the new required scope field on DaemonSessionSyncConfig so the existing cancel/alias-activation regression test keeps constructing a valid config.",
+      "rationale": "Update the session-sync test fixture to resolve and pass the new required scope field on DaemonSessionSyncConfig so the existing cancel/alias-activation regression test keeps constructing a valid config. Upstream moved this fixture out of crates/tracedecay/src/daemon/session_sync_tests.rs into crates/tracedecay/src/daemon/session_runtime_tests/ at floor 5749e4fc; the fixture resolves scope through tracedecay_code_index_runtime::resolved_scope_for_project, the same resolver production callers use.",
       "semantic_invariants": [
         "The fixture resolves scope through the same resolved_scope_for_project used by production callers before construction."
       ],
@@ -2005,16 +2038,16 @@
         "git diff --check"
       ],
       "tests": [
-        "cargo test --locked -p tracedecay daemon::session_sync"
+        "cargo test --locked -p tracedecay daemon::session_runtime_tests::session_sync_tests"
       ],
       "bead_ids": [
         "tdmem-0603",
         "tdmem-0502"
       ],
       "line_budget": 4,
-      "rebase_or_removal_plan": "Drop the resolved scope local binding and the scope field from the fixture's config construction.",
+      "rebase_or_removal_plan": "Drop the resolved scope local binding and the scope field from the fixture's config construction. The seam moved with upstream's crate split at floor 5749e4fc; re-locate it again if upstream moves the file once more.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Test-fixture update mirroring a narrow production field addition."
@@ -2043,7 +2076,7 @@
       "line_budget": 115,
       "rebase_or_removal_plan": "Remove the PublicationLedgerUninitialized variant and revert current_generation() to report every read failure as StoreUnavailable.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "A general diagnostics-evidence correctness fix independent of any concrete memory provider."
@@ -2072,7 +2105,7 @@
       "line_budget": 36,
       "rebase_or_removal_plan": "Remove publication_ledger_initialized() and the GENERATION_PUBLICATIONS_TABLE constant.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "A narrow read-only existence probe supporting the same general diagnostics-evidence fix."
@@ -2101,7 +2134,7 @@
       "line_budget": 84,
       "rebase_or_removal_plan": "Remove current_diagnostic_generation() and restore the inline current.generation/coverage match at its call site.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "A typed mapping helper supporting the same general diagnostics-evidence fix."
@@ -2129,7 +2162,7 @@
       "line_budget": 53,
       "rebase_or_removal_plan": "Restore the prior doc wording and the two-reason (Stale-only-retryable) test assertions.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "A doc/test-only clarification of retry semantics supporting the same general diagnostics-evidence fix."
@@ -2163,10 +2196,41 @@
       "line_budget": 90,
       "rebase_or_removal_plan": "Remove the advisory admission before dispatch and the advisory compile after dispatch.",
       "status": "active",
-      "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "product_only",
         "rationale": "The lane exists only to carry the optional product-owned provider host's advisory output and disappears with the memory-provider-host feature."
+      }
+    },
+    {
+      "path": "crates/tracedecay-daemon-control/src/service/tests.rs",
+      "area_id": "integration_test_harness",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "integration_test_runtime_isolation",
+      "rationale": "Un-gate the ServiceRunner import in the daemon-control service test module so the crate's lib tests compile on non-Linux hosts. Upstream gates the import with #[cfg(target_os = \"linux\")] while its own released_windows_replacement_lease_is_reacquired_shared_before_restore test names ServiceRunner::WindowsTask unconditionally, so cargo check --workspace --all-targets cannot compile on macOS at floor 5749e4fc. The file is otherwise byte-identical to upstream.",
+      "semantic_invariants": [
+        "No test body, assertion, fixture, or production path in tracedecay-daemon-control changes; only the import's platform gate is removed.",
+        "The import becomes unconditional, which is correct on every platform because the test that consumes ServiceRunner is itself unconditional.",
+        "Removing the gate cannot change runtime behavior: the symbol is used only inside #[cfg(test)] code."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo check --workspace --all-targets --locked"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-daemon-control --lib"
+      ],
+      "bead_ids": [
+        "tdmem-1208"
+      ],
+      "line_budget": 4,
+      "rebase_or_removal_plan": "Delete this entry and restore upstream's file verbatim as soon as upstream either gates the consuming test to Linux as well or drops the cfg from the import itself; the change is a single deleted attribute line and carries no product semantics.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A cross-platform test-compilation fix in an upstream-only test module belongs upstream verbatim and has no product-specific content."
       }
     }
   ],

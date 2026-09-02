@@ -1,14 +1,14 @@
-use crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1;
-use crate::mcp::tools::ToolResult;
 use crate::tracedecay::TraceDecay;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
 use tracedecay_automation_runtime::automation::config_error;
+use tracedecay_domain::errors::Result;
 use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_host_admission::SharedHostAdmissionBroker;
-use tracedecay_runtime_core::errors::Result;
+use tracedecay_mcp::ToolResult;
 use tracedecay_sessions::admission::HostAdmissionOutcome;
+use tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1;
 
 use super::SessionAuthorities;
 use super::support::tool_json;
@@ -16,7 +16,6 @@ use super::support::tool_json;
 mod admission;
 mod context_scout;
 mod envelope;
-mod errors;
 mod hermes;
 mod ingest;
 mod terminal;
@@ -30,7 +29,6 @@ pub(crate) use admission::{
     HookV2AdmissionOutcomeV1, admit_hook_v2_envelope, hook_v2_pending_work_envelopes,
 };
 pub(crate) use envelope::daemon_mint_hook_v2_file_id;
-pub(crate) use errors::structured_hook_error_data;
 pub(crate) use hermes::replay_projectless_hermes_host_admission;
 
 use admission::{hook_v2_admit, hook_v2_profile_admit};
@@ -38,12 +36,12 @@ use context_scout::{
     ContextScoutReadSurfaceV1, hook_v2_cancel, hook_v2_delivery_receipt, hook_v2_feedback,
     hook_v2_feedback_notice_delivery, hook_v2_scout_prepare, hook_v2_scout_read, hook_v2_status,
 };
-use errors::map_host_admission_outcome;
 use hermes::{hermes_receipt, user_review};
 use ingest::{
     accounting_receipt, claude_compact, codex_compact, cursor_compact, ingest_transcript,
 };
 use terminal::retain_codex_stop;
+use tracedecay_mcp::map_host_admission_outcome;
 
 fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args.get(key)
@@ -90,14 +88,17 @@ pub async fn handle_hook_runtime(
                     "user transcript ingest requires projectless daemon routing",
                 ));
             }
-            ingest_transcript(
+            // Boxed: transcript ingest composes the deepest session-runtime
+            // future in the handler tree; inlining it into the dispatch frame
+            // overflows the perf-profile worker stack.
+            Box::pin(ingest_transcript(
                 Some(cg),
                 &args,
                 None,
                 global_db,
                 accounting_db,
                 session_authorities,
-            )
+            ))
             .await?
         }
         "codex_stop" | "user_review" | "hermes_receipt" => {
@@ -130,9 +131,9 @@ async fn opencode_lsp_updated(
         .map_err(|error| config_error(format!("invalid OpenCode LSP event: {error}")))?;
     tracedecay_hooks::decode_opencode_lsp_event(&payload)
         .map_err(|error| config_error(format!("invalid OpenCode LSP event: {error}")))?;
-    tracedecay_usecases::event_lane::publish(
+    tracedecay_session_memory::event_lane::publish(
         project_sessions,
-        tracedecay_usecases::event_lane::ActivityFamilyV1::Hook,
+        tracedecay_session_memory::event_lane::ActivityFamilyV1::Hook,
         cg.project_root(),
         None,
         1,
@@ -198,9 +199,14 @@ pub(crate) async fn handle_projectless_hook_runtime(
             &args,
             action,
             profile_root,
-            session_authorities.profile_identity.ok_or_else(|| {
-                config_error("authenticated profile identity is unavailable for Hook V2 admission")
-            })?,
+            session_authorities
+                .profile_identity
+                .as_deref()
+                .ok_or_else(|| {
+                    config_error(
+                        "authenticated profile identity is unavailable for Hook V2 admission",
+                    )
+                })?,
         )?,
         "claude_compact" => claude_compact(&args, session_authorities).await?,
         _ => unreachable!("projectless hook action validated above"),

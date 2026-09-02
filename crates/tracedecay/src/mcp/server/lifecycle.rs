@@ -111,6 +111,7 @@ pub(crate) enum StartupCatchUpStateV1 {
 }
 
 impl StartupCatchUpStateV1 {
+    #[hotpath::skip]
     const fn settled(&self) -> bool {
         !matches!(self, Self::Syncing { .. })
     }
@@ -255,6 +256,9 @@ impl StartupCatchUpMachineV1 {
 pub(crate) struct VersionCheckState {
     pub(crate) latest: Option<String>,
     pub(crate) checked_at: Option<Instant>,
+    /// Single-flights the background refresh so an expired cache cannot fan
+    /// concurrent completions into parallel GitHub fetches.
+    pub(crate) refreshing: bool,
 }
 
 /// Owns response admission, revocation, and forced cancellation for one
@@ -262,16 +266,16 @@ pub(crate) struct VersionCheckState {
 #[derive(Clone)]
 pub(crate) struct ProjectServerResponseLifecycle {
     response_gate: Arc<tokio::sync::RwLock<()>>,
-    response_revoked: tracedecay_usecases::context::CancellationToken,
-    request_abort: tracedecay_usecases::context::CancellationToken,
+    response_revoked: tracedecay_session_memory::context::CancellationToken,
+    request_abort: tracedecay_session_memory::context::CancellationToken,
 }
 
 impl Default for ProjectServerResponseLifecycle {
     fn default() -> Self {
         Self {
             response_gate: Arc::new(tokio::sync::RwLock::new(())),
-            response_revoked: tracedecay_usecases::context::CancellationToken::new(),
-            request_abort: tracedecay_usecases::context::CancellationToken::new(),
+            response_revoked: tracedecay_session_memory::context::CancellationToken::new(),
+            request_abort: tracedecay_session_memory::context::CancellationToken::new(),
         }
     }
 }
@@ -302,7 +306,9 @@ impl ProjectServerResponseLifecycle {
         &self.response_gate
     }
 
-    pub(crate) fn response_revoked(&self) -> &tracedecay_usecases::context::CancellationToken {
+    pub(crate) fn response_revoked(
+        &self,
+    ) -> &tracedecay_session_memory::context::CancellationToken {
         &self.response_revoked
     }
 }
@@ -351,12 +357,14 @@ impl McpServer {
         self.project_server_lifecycle.revoke();
     }
 
+    #[hotpath::skip]
     pub(crate) async fn revoke_project_server_responses_after_drain(&self) {
         self.project_server_lifecycle
             .revoke_after_request_drain()
             .await;
     }
 
+    #[hotpath::skip]
     pub(crate) async fn wait_for_project_server_request_drain(&self) {
         self.project_server_lifecycle.wait_for_request_drain().await;
     }
@@ -403,6 +411,7 @@ impl McpServer {
     /// If reopening fails the previous instance is kept — the effect-time
     /// branch identity check in the hook writer and
     /// [`Self::maybe_sync_if_stale`] still protect writes.
+    #[hotpath::skip]
     pub(crate) async fn reopen_if_branch_drifted(&self) -> Arc<TraceDecay> {
         self.reopen_if_branch_drifted_memoized().await.0
     }
@@ -411,9 +420,10 @@ impl McpServer {
     /// hands back this request's single branch resolution, so the rest of the
     /// request reads the live branch from the memo instead of re-opening the
     /// repository. The memo is request-scoped and never retained.
+    #[hotpath::skip]
     pub(crate) async fn reopen_if_branch_drifted_memoized(
         &self,
-    ) -> (Arc<TraceDecay>, crate::branch::BranchMemo) {
+    ) -> (Arc<TraceDecay>, tracedecay_runtime_core::branch::BranchMemo) {
         let current = self.cg_snapshot().await;
         // One resolution serves the fast-path check and every later
         // live-branch read in this request.
@@ -490,6 +500,7 @@ impl McpServer {
     /// Reopens do not block requests, so tests (and any caller that genuinely
     /// needs the post-swap state rather than an answer) observe completion here.
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn wait_for_branch_reopen(&self, after: u64, timeout: std::time::Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while self.branch_reopen_completions.load(Ordering::Acquire) <= after {
@@ -556,6 +567,7 @@ impl McpServer {
     }
 
     /// Polls until startup reconciliation admission settles or `timeout` elapses.
+    #[hotpath::skip]
     pub async fn wait_for_startup_catch_up(&self, timeout: std::time::Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while !self.startup_catch_up_done() {
@@ -653,7 +665,7 @@ impl McpServer {
     pub(crate) fn maybe_spawn_read_refresh(
         &self,
         cg: &Arc<TraceDecay>,
-        live_branch: &crate::branch::BranchMemo,
+        live_branch: &tracedecay_runtime_core::branch::BranchMemo,
     ) {
         if !self.sync_config.read_refresh {
             return;
@@ -729,51 +741,75 @@ impl McpServer {
         });
     }
 
-    /// Returns a version-update warning if a newer release is available.
-    /// Results are cached for `VERSION_CHECK_INTERVAL` (15 minutes).
-    pub(crate) async fn check_version_update(&self) -> Option<String> {
-        let current = env!("CARGO_PKG_VERSION");
+    /// Returns a version-update warning if a newer release is known to be
+    /// available. Results are cached for `VERSION_CHECK_INTERVAL` (15
+    /// minutes); an expired cache answers with the previous result and
+    /// refreshes in the background, so a tool-call completion never awaits
+    /// the GitHub fetch (best-effort with a 1 s timeout, but a fixed
+    /// per-interval stall on the response path either way).
+    pub(crate) fn check_version_update(&self) -> Option<String> {
+        let (warning, claim_refresh) = {
+            let mut cache = self.version_cache.lock().ok()?;
+            cached_version_warning(&mut cache, env!("CARGO_PKG_VERSION"))
+        };
+        if claim_refresh {
+            self.spawn_version_refresh();
+        }
+        warning
+    }
 
-        // Fast path: serve from cache if still fresh.
-        {
-            let cache = self.version_cache.lock().ok()?;
-            if let Some(checked_at) = cache.checked_at
-                && checked_at.elapsed() < VERSION_CHECK_INTERVAL
-            {
-                let latest = cache.latest.as_deref()?;
-                return if crate::cloud::is_newer_minor_version(current, latest) {
-                    Some(format!(
-                        "⚠️ tracedecay v{current} is installed, but v{latest} is available. \
-                             Run `tracedecay upgrade` to update."
-                    ))
-                } else {
-                    None
+    /// Refreshes the version cache off the request path. The claimed
+    /// `refreshing` flag is always released: on a completed fetch (success or
+    /// failure both stamp `checked_at`, preserving the no-immediate-retry
+    /// contract) and on a refused spawn during shutdown.
+    fn spawn_version_refresh(&self) {
+        let server = self.dispatch_authority.server();
+        let spawned = self.spawn_background_task(hotpath::future!(
+            async move {
+                let latest = tokio::task::spawn_blocking(crate::cloud::fetch_latest_version)
+                    .await
+                    .ok()
+                    .flatten();
+                let Some(server) = server.upgrade() else {
+                    return;
                 };
-            }
-        }
-
-        // Cache miss or expired – fetch from GitHub (best-effort, 1 s timeout).
-        let latest = tokio::task::spawn_blocking(crate::cloud::fetch_latest_version)
-            .await
-            .ok()
-            .flatten();
-
-        // Update cache regardless of fetch outcome so we don't retry immediately.
-        if let Ok(mut cache) = self.version_cache.lock() {
-            cache.latest.clone_from(&latest);
-            cache.checked_at = Some(Instant::now());
-        }
-
-        let latest = latest?;
-        if crate::cloud::is_newer_minor_version(current, &latest) {
-            Some(format!(
-                "⚠️ tracedecay v{current} is installed, but v{latest} is available. \
-                 Run `tracedecay upgrade` to update."
-            ))
-        } else {
-            None
+                if let Ok(mut cache) = server.version_cache.lock() {
+                    cache.latest.clone_from(&latest);
+                    cache.checked_at = Some(Instant::now());
+                    cache.refreshing = false;
+                }
+            },
+            label = "mcp.server.version_refresh"
+        ));
+        if !spawned && let Ok(mut cache) = self.version_cache.lock() {
+            cache.refreshing = false;
         }
     }
+}
+
+/// Answers the version-update question from the cache alone and reports
+/// whether this caller claimed the (single-flighted) background refresh. The
+/// warning always reflects the last completed check; an expired cache serves
+/// that stale answer rather than making the caller wait for a fetch.
+fn cached_version_warning(cache: &mut VersionCheckState, current: &str) -> (Option<String>, bool) {
+    let fresh = cache
+        .checked_at
+        .is_some_and(|checked_at| checked_at.elapsed() < VERSION_CHECK_INTERVAL);
+    let claim_refresh = !fresh && !cache.refreshing;
+    if claim_refresh {
+        cache.refreshing = true;
+    }
+    let warning = cache
+        .latest
+        .as_deref()
+        .filter(|latest| crate::cloud::is_newer_minor_version(current, latest))
+        .map(|latest| {
+            format!(
+                "⚠️ tracedecay v{current} is installed, but v{latest} is available. \
+                 Run `tracedecay upgrade` to update."
+            )
+        });
+    (warning, claim_refresh)
 }
 
 #[cfg(test)]
@@ -829,5 +865,72 @@ mod background_task_owner_tests {
         assert!(owner.shutdown().await.is_empty());
         assert!(dropped.load(Ordering::Acquire));
         assert!(!owner.spawn(async {}));
+    }
+}
+
+#[cfg(test)]
+mod version_check_tests {
+    use super::*;
+
+    fn state(
+        latest: Option<&str>,
+        checked_at: Option<Instant>,
+        refreshing: bool,
+    ) -> VersionCheckState {
+        VersionCheckState {
+            latest: latest.map(str::to_owned),
+            checked_at,
+            refreshing,
+        }
+    }
+
+    #[test]
+    fn fresh_cache_answers_without_claiming_a_refresh() {
+        let mut newer = state(Some("99.0.0"), Some(Instant::now()), false);
+        let (warning, claimed) = cached_version_warning(&mut newer, "0.1.0");
+        assert!(warning.expect("newer release warns").contains("99.0.0"));
+        assert!(!claimed, "a fresh cache must not refetch");
+        assert!(!newer.refreshing);
+
+        let mut same = state(Some("0.1.0"), Some(Instant::now()), false);
+        let (warning, claimed) = cached_version_warning(&mut same, "0.1.0");
+        assert_eq!(warning, None);
+        assert!(!claimed);
+    }
+
+    #[test]
+    fn expired_cache_serves_the_stale_answer_and_claims_one_refresh() {
+        let expired = Instant::now()
+            .checked_sub(VERSION_CHECK_INTERVAL * 2)
+            .expect("expired instant");
+        let mut cache = state(Some("99.0.0"), Some(expired), false);
+
+        let (warning, claimed) = cached_version_warning(&mut cache, "0.1.0");
+        assert!(
+            warning
+                .expect("stale answer still serves")
+                .contains("99.0.0"),
+            "an expired cache must answer from the last completed check instead of blocking"
+        );
+        assert!(claimed, "the first caller past expiry claims the refresh");
+        assert!(cache.refreshing);
+
+        let (warning, claimed) = cached_version_warning(&mut cache, "0.1.0");
+        assert!(
+            warning.is_some(),
+            "in-flight refresh still serves the cache"
+        );
+        assert!(
+            !claimed,
+            "a refresh already in flight must not be claimed again"
+        );
+    }
+
+    #[test]
+    fn cold_cache_answers_nothing_but_still_claims_the_refresh() {
+        let mut cache = state(None, None, false);
+        let (warning, claimed) = cached_version_warning(&mut cache, "0.1.0");
+        assert_eq!(warning, None, "no completed check yet, nothing to report");
+        assert!(claimed);
     }
 }

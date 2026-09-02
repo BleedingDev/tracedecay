@@ -6,13 +6,14 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_daemon_identity::authority;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 use super::super::remote_deletion::{
     RemoteDeletionExecutionError, RemoteDeletionFailureCode, RemoteDeletionPhase,
     RemoteDeletionReceipt, RemoteDeletionReceiptTarget,
 };
-use super::{StoreAdministration, authority, destructive_reservation_error};
+use super::{StoreAdministration, destructive_reservation_error};
 
 struct RemoteDeletionCleanupError {
     code: RemoteDeletionFailureCode,
@@ -48,7 +49,7 @@ fn cleanup_error(
 }
 
 fn validate_project_id(project_id: &str) -> std::result::Result<(), &'static str> {
-    crate::storage::validate_project_id(project_id)
+    tracedecay_runtime_core::storage::validate_project_id(project_id)
 }
 
 impl StoreAdministration {
@@ -385,6 +386,7 @@ impl StoreAdministration {
                     };
                     receipt.tombstone_id = Some(tombstone.tombstone_id.clone());
                     receipt.tombstone_recorded = true;
+                    self.settle_remote_account_deletion_tombstone_persist(&tombstone);
                     let open_tasks =
                         super::super::project_open_tasks(owners.project_open_gates.as_ref()).await;
                     if !open_tasks
@@ -578,6 +580,7 @@ impl StoreAdministration {
         .await
     }
 
+    #[hotpath::skip]
     async fn remote_deletion_project_ids(
         &self,
         database: &tracedecay_global_db::RegisteredGlobalDbLeaseV1,
@@ -645,6 +648,7 @@ impl StoreAdministration {
         Ok(project_ids)
     }
 
+    #[hotpath::skip]
     async fn remove_remote_deleted_project(
         &self,
         owners: &super::super::remote_deletion::RemoteDeletionRuntimeOwners,
@@ -673,8 +677,10 @@ impl StoreAdministration {
                     },
                 )
             })?;
-        let data_root = crate::storage::profile_sharded_data_root(profile_root, project_id);
-        let project_sessions_path = data_root.join(crate::storage::SESSIONS_DB_FILENAME);
+        let data_root =
+            tracedecay_runtime_core::storage::profile_sharded_data_root(profile_root, project_id);
+        let project_sessions_path =
+            data_root.join(tracedecay_runtime_core::storage::SESSIONS_DB_FILENAME);
         let identity = self.profile_identity().map_err(|error| {
             cleanup_error(
                 RemoteDeletionFailureCode::RuntimeRetirementIncomplete,

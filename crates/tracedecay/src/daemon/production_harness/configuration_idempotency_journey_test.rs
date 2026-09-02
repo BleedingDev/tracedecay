@@ -16,11 +16,13 @@ use tracedecay_domain::configuration::{
 use tracedecay_sdk::client::{Client, ClientError, ConnectionMode};
 use tracedecay_sdk::operations::{ApplicationConfigurationSet, TypedOperation};
 use tracedecay_tool_catalog::{
-    EffectClass, IdempotencyContract, ReceiptContract, ReconciliationContract, TerminalState,
+    ApplicationSurfaceOperation, EffectClass, IdempotencyContract, ReceiptContract,
+    ReconciliationContract, TerminalState,
 };
 
 use super::journey_test_support::tool_payload;
 use super::*;
+use tracedecay_daemon_service::daemon_operation_event_authority;
 
 const HTTP_AUTH_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -59,9 +61,11 @@ async fn cli_configuration_set(
 ) -> ApplicationResult<Value> {
     let graph = harness.server(project).expect("project server").cg().await;
     let target = graph.configuration_runtime().configuration_target().clone();
-    let scope =
-        project_open_owners::resolved_scope_for_project(graph.project_root(), &target.project_id)
-            .expect("project application scope");
+    let scope = tracedecay_code_index_runtime::resolved_scope_for_project(
+        graph.project_root(),
+        &target.project_id,
+    )
+    .expect("project application scope");
     let project_root = graph.project_root().to_path_buf();
     drop(graph);
     let resources = harness
@@ -74,7 +78,7 @@ async fn cli_configuration_set(
         project_root,
         scope,
     );
-    let operation = crate::application_surface::ApplicationSurfaceOperation::ConfigurationSet;
+    let operation = ApplicationSurfaceOperation::ConfigurationSet;
     let application_operation =
         tracedecay_application::configuration_surface_operation(operation.as_str())
             .expect("configuration operation contract")
@@ -95,8 +99,8 @@ async fn cli_configuration_set(
         observed_at.0 + i64::try_from(maximum_millis).expect("deadline fits") * 1_000,
     ))
     .expect("configuration deadline");
-    let request_id = tracedecay_usecases::request_identity::mint_global_request_id(
-        tracedecay_usecases::request_identity::GlobalRequestSurface::Cli,
+    let request_id = tracedecay_application::request_identity::mint_global_request_id(
+        tracedecay_application::request_identity::GlobalRequestSurface::Cli,
     )
     .expect("CLI request id");
     let cancellation =
@@ -147,9 +151,11 @@ async fn configuration_batch_via_surface(
 ) -> ApplicationResult<Value> {
     let graph = harness.server(project).expect("project server").cg().await;
     let target = graph.configuration_runtime().configuration_target().clone();
-    let scope =
-        project_open_owners::resolved_scope_for_project(graph.project_root(), &target.project_id)
-            .expect("project application scope");
+    let scope = tracedecay_code_index_runtime::resolved_scope_for_project(
+        graph.project_root(),
+        &target.project_id,
+    )
+    .expect("project application scope");
     let project_root = graph.project_root().to_path_buf();
     drop(graph);
     let resources = harness
@@ -162,7 +168,7 @@ async fn configuration_batch_via_surface(
         project_root,
         scope,
     );
-    let operation = crate::application_surface::ApplicationSurfaceOperation::ConfigurationBatch;
+    let operation = ApplicationSurfaceOperation::ConfigurationBatch;
     let application_operation =
         tracedecay_application::configuration_surface_operation(operation.as_str())
             .expect("configuration operation contract")
@@ -185,15 +191,16 @@ async fn configuration_batch_via_surface(
     .expect("configuration deadline");
     let request_surface = match surface {
         tracedecay_tool_catalog::BindingSurface::Cli => {
-            tracedecay_usecases::request_identity::GlobalRequestSurface::Cli
+            tracedecay_application::request_identity::GlobalRequestSurface::Cli
         }
         tracedecay_tool_catalog::BindingSurface::Dashboard => {
-            tracedecay_usecases::request_identity::GlobalRequestSurface::DashboardSettings
+            tracedecay_application::request_identity::GlobalRequestSurface::DashboardSettings
         }
         other => panic!("unsupported configuration batch test surface: {other:?}"),
     };
-    let request_id = tracedecay_usecases::request_identity::mint_global_request_id(request_surface)
-        .expect("surface request id");
+    let request_id =
+        tracedecay_application::request_identity::mint_global_request_id(request_surface)
+            .expect("surface request id");
     if surface == tracedecay_tool_catalog::BindingSurface::Dashboard {
         return crate::application_surface::resolve_dashboard_application_surface(
             operation,
@@ -240,9 +247,11 @@ async fn configuration_http_sdk(
 ) {
     let graph = harness.server(project).expect("project server").cg().await;
     let target = graph.configuration_runtime().configuration_target().clone();
-    let scope =
-        project_open_owners::resolved_scope_for_project(graph.project_root(), &target.project_id)
-            .expect("project application scope");
+    let scope = tracedecay_code_index_runtime::resolved_scope_for_project(
+        graph.project_root(),
+        &target.project_id,
+    )
+    .expect("project application scope");
     let project_root = graph.project_root().to_path_buf();
     drop(graph);
     let resources = harness

@@ -22,12 +22,12 @@ use tracedecay_domain::configuration::{
 };
 
 use super::DashboardState;
-use crate::application::configuration::DirectConfigurationMutation;
 use crate::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_automation_runtime::automation::backend;
 use tracedecay_automation_runtime::automation::config::{
     AutomationConfig, AutomationConfigPatch, effective_config, from_configuration_snapshot,
 };
+use tracedecay_configuration::DirectConfigurationMutation;
 
 use crate::application_surface::configuration_apply_error;
 
@@ -150,7 +150,7 @@ pub async fn patch_config(
 /// pair a status result with an unrelated configuration revision.
 pub(crate) fn effective_automation_config(
     state: &DashboardState,
-) -> tracedecay_runtime_core::errors::Result<(ConfigurationRevisionId, AutomationConfig)> {
+) -> tracedecay_domain::errors::Result<(ConfigurationRevisionId, AutomationConfig)> {
     let pinned = crate::config::cached_runtime_configuration(&state.project_root)?;
     let config = from_configuration_snapshot(&pinned.snapshot)?;
     Ok((pinned.revision_id, config))

@@ -459,13 +459,36 @@ where
                 break;
             }
 
-            let decision = self.adapter.decide(record, self.control).map_err(|cause| {
-                ObservationRuntimeError::Admission {
-                    source_event_id: record.source_event_id.clone(),
-                    source_sequence: sequence,
-                    cause: AdapterFailureV1::new(cause),
+            let decision = match self.adapter.decide(record, self.control) {
+                Ok(decision) => decision,
+                Err(cause) => {
+                    // The caller's bound is spent *inside* `decide`: hygiene,
+                    // digest derivation, and a readiness handshake all run
+                    // there, each of them narrowed to the caller's own
+                    // remaining budget. So the ordinary way a bounded caller
+                    // learns it is out of time is that one of those
+                    // sub-operations gives up and reports a refusal — and
+                    // reporting that refusal as an adapter failure would turn
+                    // "this pass ran out of time" into "this canonical record
+                    // cannot be admitted", which is a claim about the record
+                    // that nothing established. The bound is checked first,
+                    // and when it has elapsed the batch stops on the caller's
+                    // own typed reason. Nothing was appended on this path
+                    // either way, so the watermark holds and the canonical
+                    // source still owns the record for the next pass, which
+                    // runs on a fresh budget and surfaces any real refusal
+                    // then.
+                    if let Some(stop) = self.caller_stop(record) {
+                        report.stopped_on = Some(stop);
+                        break;
+                    }
+                    return Err(ObservationRuntimeError::Admission {
+                        source_event_id: record.source_event_id.clone(),
+                        source_sequence: sequence,
+                        cause: AdapterFailureV1::new(cause),
+                    });
                 }
-            })?;
+            };
 
             match decision {
                 AdmissionDecisionV1::Admit(admitted) => {

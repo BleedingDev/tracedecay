@@ -539,27 +539,39 @@ class MemoryCompositionFeatureTest(unittest.TestCase):
                 any("concrete Native adapter" in error for error in errors)
             )
 
-    def test_pinned_selector_variant_must_stay_test_gated(self) -> None:
+    def test_mount_without_a_pinned_selector_variant_passes(self) -> None:
+        """The gate must not demand the removed pinned-activation seam.
+
+        `ProjectMemoryProviderActivationSelector::Pinned`, its resolve arm and
+        its only construction (`open_with_native_provider_for_test`) were
+        removed: `production_harness.rs` is upstream-owned and its
+        convergence-map entry authorizes only the shared shutdown deadline, so
+        the seam was unauthorized. A composition whose selector carries exactly
+        one variant is therefore the *correct* shape, and the gate must accept
+        it. The pinned spellings stay forbidden -- see
+        `test_production_entry_cannot_pin_an_activation` and
+        `test_pinned_selector_outside_gated_harness_fails`.
+        """
         directory, repo = self.fixture()
         with directory:
             mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT.replace(
-                    '    #[cfg(any(test, feature = "test-transport"))]\n'
-                    "    Pinned(ProjectMemoryProviderActivation),",
-                    "    Pinned(ProjectMemoryProviderActivation),",
-                    1,
-                ),
-                encoding="utf-8",
+            seamless = VALID_MOUNT.replace(
+                "    /// Pin one activation explicitly. Test and transport builds only.\n"
+                '    #[cfg(any(test, feature = "test-transport"))]\n'
+                "    Pinned(ProjectMemoryProviderActivation),\n",
+                "",
+                1,
+            ).replace(
+                '            #[cfg(any(test, feature = "test-transport"))]\n'
+                "            Self::Pinned(activation) => Ok(activation),\n",
+                "",
+                1,
             )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "missing exact gating fragment" in error
-                    and "Pinned(ProjectMemoryProviderActivation)," in error
-                    for error in errors
-                )
-            )
+            # `PinnedRuntimeConfiguration` is an unrelated identifier and stays.
+            self.assertNotIn("Pinned(ProjectMemoryProviderActivation)", seamless)
+            self.assertNotIn("Self::Pinned", seamless)
+            mount.write_text(seamless, encoding="utf-8")
+            self.assertEqual(CHECKER.check_repository(repo), [])
 
     def test_production_entry_cannot_pin_an_activation(self) -> None:
         directory, repo = self.fixture()

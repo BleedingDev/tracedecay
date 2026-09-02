@@ -7,12 +7,19 @@ use tracedecay_application::{
     ApplicationOperation, ApplicationProblem, ApplicationProblemKind, AuthorityReceipt,
     CallableCodeAuthorizationAdmission, CallableCodeAuthorizationFuture,
     CallableCodeAuthorizationPort, RequestAdmission, RequestContext, ResolvedScope, RetryDirective,
+    SafeDiagnostic,
 };
+use tracedecay_daemon_service::callable_code_request_context;
 use tracedecay_domain::{ComponentVersion, UtcMicros};
 
-use tracedecay_usecases::ProjectSourceAccessSnapshot;
-use tracedecay_usecases::configuration::{ConfigurationControlStore, ProjectConfigurationRuntime};
-use tracedecay_usecases::graph::CodeGraphReadError;
+use tracedecay_configuration::{
+    ConfigurationControlStore, ConfigurationError, ProjectConfigurationRuntime,
+};
+use tracedecay_graph_query::CodeGraphReadError;
+use tracedecay_usecases::{
+    CallableCodeAuthorizationSourcePort, CurrentCallableCodeAccessFuture,
+    ProjectSourceAccessSnapshot,
+};
 
 type CurrentAccessFuture<'a> = Pin<
     Box<dyn Future<Output = Result<ProjectSourceAccessSnapshot, ApplicationProblem>> + Send + 'a>,
@@ -36,8 +43,8 @@ impl CurrentCallableCodeAccessPort for ProductionCallableCodeAccessPort {
                 .configuration_store()
                 .current()
                 .await
-                .map_err(|_| concealed())?;
-            let configuration = tracedecay_usecases::config::PinnedRuntimeConfiguration::new(
+                .map_err(configuration_current_problem)?;
+            let configuration = tracedecay_configuration::config::PinnedRuntimeConfiguration::new(
                 self.configuration.configuration_target().clone(),
                 current.revision_id,
                 current.snapshot,
@@ -74,6 +81,7 @@ impl DaemonCallableCodeAuthorizationSource {
         }
     }
 
+    #[hotpath::skip]
     pub(super) async fn current(
         &self,
         observed_at: UtcMicros,
@@ -89,6 +97,22 @@ impl DaemonCallableCodeAuthorizationSource {
             source: self.clone(),
             admitted_access,
         }
+    }
+}
+
+impl CallableCodeAuthorizationSourcePort for DaemonCallableCodeAuthorizationSource {
+    fn current(&self, observed_at: UtcMicros) -> CurrentCallableCodeAccessFuture<'_> {
+        Box::pin(async move { self.access.current_access(observed_at).await })
+    }
+
+    fn authorize(
+        &self,
+        admitted_access: ProjectSourceAccessSnapshot,
+    ) -> Arc<dyn CallableCodeAuthorizationPort> {
+        Arc::new(DaemonCallableCodeAuthorizationSource::authorize(
+            self,
+            admitted_access,
+        ))
     }
 }
 
@@ -117,9 +141,10 @@ impl DaemonCodeGraphReadAdmission {
         }
     }
 
+    #[hotpath::skip]
     async fn admit_graph_read(
         &self,
-        request: tracedecay_usecases::graph::CodeGraphReadAdmissionRequest<'_>,
+        request: tracedecay_graph_query::CodeGraphReadAdmissionRequest<'_>,
     ) -> Result<RequestContext, CodeGraphReadError> {
         let access = self
             .authorization
@@ -129,7 +154,7 @@ impl DaemonCodeGraphReadAdmission {
         if access.scope != self.scope {
             return Err(CodeGraphReadError::Denied);
         }
-        let context = crate::daemon::service::invocation::callable_code_request_context(
+        let context = callable_code_request_context(
             &self.scope,
             &access,
             request.request_id.as_str(),
@@ -148,11 +173,11 @@ impl DaemonCodeGraphReadAdmission {
     }
 }
 
-impl tracedecay_usecases::graph::CodeGraphReadAdmissionPort for DaemonCodeGraphReadAdmission {
+impl tracedecay_graph_query::CodeGraphReadAdmissionPort for DaemonCodeGraphReadAdmission {
     fn admit<'a>(
         &'a self,
-        request: tracedecay_usecases::graph::CodeGraphReadAdmissionRequest<'a>,
-    ) -> tracedecay_usecases::graph::CodeGraphReadAdmissionFuture<'a> {
+        request: tracedecay_graph_query::CodeGraphReadAdmissionRequest<'a>,
+    ) -> tracedecay_graph_query::CodeGraphReadAdmissionFuture<'a> {
         Box::pin(async move {
             let admission = hotpath::measure_block!(
                 "daemon.authority.callable_code.admit",
@@ -237,6 +262,7 @@ pub(super) struct DaemonCallableCodeAuthorization {
 }
 
 impl DaemonCallableCodeAuthorization {
+    #[hotpath::skip]
     async fn route_receipt(
         &self,
         context: &RequestContext,
@@ -329,6 +355,7 @@ impl CallableCodeAuthorizationPort for DaemonCallableCodeAuthorization {
 }
 
 impl DaemonCallableCodeAuthorization {
+    #[hotpath::skip]
     async fn recheck_route(
         &self,
         context: &RequestContext,
@@ -368,6 +395,32 @@ fn same_authority(
 
 fn concealed() -> ApplicationProblem {
     ApplicationProblem::not_found_or_not_authorized(RetryDirective::Never)
+}
+
+/// Availability of the configuration authority is not an authorization
+/// outcome. During cold open the store can be transiently unavailable
+/// (reader saturation, publication still pending) and concealing that window
+/// would mint a permanent denial against the daemon's own project; it must
+/// surface as a retryable unavailable state instead. Every other failure
+/// shape stays concealed so a probing caller learns nothing about identity.
+fn configuration_current_problem(error: ConfigurationError) -> ApplicationProblem {
+    match error {
+        ConfigurationError::Unavailable => ApplicationProblem::unavailable(SafeDiagnostic {
+            code: "configuration_authority_unavailable".to_owned(),
+            message: "The project configuration authority is temporarily unavailable.".to_owned(),
+        }),
+        ConfigurationError::TargetUnavailable
+        | ConfigurationError::AuthorizedTargetAmbiguous
+        | ConfigurationError::RevisionConflict
+        | ConfigurationError::PlanExpired
+        | ConfigurationError::PlanStale
+        | ConfigurationError::PolicyWideningForbidden
+        | ConfigurationError::ProjectlessProfileRequired
+        | ConfigurationError::IdempotencyConflict
+        | ConfigurationError::MutationAuthorityRejected
+        | ConfigurationError::Validation(_)
+        | ConfigurationError::ResetRequired { .. } => concealed(),
+    }
 }
 
 #[cfg(test)]
@@ -534,9 +587,9 @@ mod tests {
         let cancellation =
             CancellationSignal::active("cancel.graph-read-admission").expect("cancellation");
 
-        let context = tracedecay_usecases::graph::CodeGraphReadAdmissionPort::admit(
+        let context = tracedecay_graph_query::CodeGraphReadAdmissionPort::admit(
             &admission,
-            tracedecay_usecases::graph::CodeGraphReadAdmissionRequest::new(
+            tracedecay_graph_query::CodeGraphReadAdmissionRequest::new(
                 &operation,
                 request_id.clone(),
                 Deadline::new(mounted.grant_expires_at).expect("deadline"),
@@ -551,5 +604,51 @@ mod tests {
         assert_eq!(context.request_id(), &request_id);
         assert_eq!(context.cancellation(), &cancellation.context());
         assert!(context.allows(operation.capability_id(), operation.use_case_id()));
+    }
+
+    #[test]
+    fn transient_configuration_unavailability_stays_retryable_not_denied() {
+        let problem = configuration_current_problem(ConfigurationError::Unavailable);
+        assert_eq!(problem.kind(), ApplicationProblemKind::Unavailable);
+
+        let read_error = map_graph_admission_problem(problem);
+        assert!(
+            matches!(read_error, CodeGraphReadError::Unavailable { .. }),
+            "a warming configuration authority must not read as a denial: {read_error:?}"
+        );
+
+        let routed = tracedecay_graph_query::map_code_graph_read_runtime_error(read_error);
+        let tracedecay_domain::errors::TraceDecayError::ProjectRoute {
+            reason_code,
+            retryable,
+            ..
+        } = routed
+        else {
+            panic!("graph-read unavailability must stay a project-route refusal: {routed:?}");
+        };
+        assert_eq!(reason_code, "code-graph-unavailable");
+        assert!(
+            retryable,
+            "the cold-open configuration window must stay retryable"
+        );
+    }
+
+    #[test]
+    fn authorization_shaped_configuration_failures_stay_concealed() {
+        for error in [
+            ConfigurationError::TargetUnavailable,
+            ConfigurationError::MutationAuthorityRejected,
+            ConfigurationError::Validation("tampered".to_owned()),
+        ] {
+            let problem = configuration_current_problem(error);
+            assert_eq!(
+                problem.kind(),
+                ApplicationProblemKind::NotFoundOrNotAuthorized
+            );
+            assert!(matches!(
+                map_graph_admission_problem(problem),
+                CodeGraphReadError::Denied
+            ));
+        }
     }
 }

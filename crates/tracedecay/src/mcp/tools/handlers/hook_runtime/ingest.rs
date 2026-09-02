@@ -3,26 +3,26 @@ use serde_json::{Value, json};
 use std::path::Path;
 use std::time::Duration;
 use tracedecay_automation_runtime::automation::config_error;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{ObservationScopeV1, ProjectId};
 use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_host_admission::{HostAdmissionAuthorities, HostAdmissionFacade};
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_session_memory::session::lcm::{
+    LcmAuthorityOutcome, LcmAuthorityPayload, LcmAuthorityRequest, LcmAuthorityUnavailableReason,
+    LcmCompactionCommand, LcmCompressionEvidence, LcmHostProtocol,
+};
 use tracedecay_sessions::admission::{
     HostAdmissionOutcome, HostAdmissionScope, HostAdmissionStatus,
 };
 use tracedecay_sessions::runtime::source::TranscriptSource;
 use tracedecay_usecases::observation::ObservationCancellation;
-use tracedecay_usecases::session::lcm::{
-    LcmAuthorityOutcome, LcmAuthorityPayload, LcmAuthorityRequest, LcmAuthorityUnavailableReason,
-    LcmCompactionCommand, LcmCompressionEvidence, LcmHostProtocol,
-};
 
 use super::super::SessionAuthorities;
 
-use super::errors::{
+use super::required_str;
+use tracedecay_mcp::{
     hook_admission_error, map_claude_observation_ingest_error, map_transcript_ingest_error,
 };
-use super::required_str;
 
 mod kernels;
 
@@ -287,7 +287,7 @@ async fn admit_codex_rollouts_for_compaction(
         if attempt > 0 {
             tokio::time::sleep(COMPACTION_INGEST_RETRY_DELAY).await;
         }
-        match admit_codex_rollouts_once(cg, session_authorities).await {
+        match admit_codex_rollouts_once(cg, session_authorities.clone()).await {
             Ok(messages_upserted) => return Ok(messages_upserted),
             Err(error) => {
                 let converging =
@@ -416,7 +416,7 @@ fn compaction_authority_unavailable(action: &str) -> Value {
 
 fn compaction_response_json(
     action: &str,
-    response: &tracedecay_usecases::session::lcm::LcmAuthorityResponse,
+    response: &tracedecay_session_memory::session::lcm::LcmAuthorityResponse,
 ) -> Value {
     if let (LcmAuthorityOutcome::Ready, Some(LcmAuthorityPayload::Compaction(compression))) =
         (&response.outcome, &response.payload)
@@ -497,7 +497,7 @@ fn pressure_only_command(
     protocol: LcmHostProtocol,
 ) -> LcmAuthorityRequest {
     LcmAuthorityRequest::Compact(LcmCompactionCommand {
-        preflight: tracedecay_sessions::runtime::lcm::LcmPreflightRequest {
+        preflight: tracedecay_lcm::LcmPreflightRequest {
             provider: provider.to_owned(),
             session_id: session_id.to_string(),
             messages: Vec::new(),
@@ -528,17 +528,17 @@ pub(super) async fn accounting_receipt(
     let scope = ObservationScopeV1::Project {
         project_id: project_observation_id(cg)?,
     };
-    let usage = tracedecay_usecases::provider_usage::provider_usage_aggregate(
+    let usage = tracedecay_session_memory::provider_usage::provider_usage_aggregate(
         provider_usage_db,
         &scope,
         None,
         None,
     )
     .await;
-    let prices = tracedecay_usecases::provider_pricing::load_table();
-    let priced = tracedecay_usecases::provider_usage::price_provider_usage(&usage, prices, 0);
-    let complete =
-        priced.coverage == tracedecay_usecases::provider_usage::ProviderUsageCoverageV1::Complete;
+    let prices = tracedecay_session_memory::provider_pricing::load_table();
+    let priced = tracedecay_session_memory::provider_usage::price_provider_usage(&usage, prices, 0);
+    let complete = priced.coverage
+        == tracedecay_session_memory::provider_usage::ProviderUsageCoverageV1::Complete;
     let tokens_consumed = complete
         .then(|| {
             priced
@@ -611,7 +611,7 @@ pub(crate) async fn ingest_transcript_with_cancellation(
     } else {
         HostAdmissionScope::Project
     };
-    let facade = host_admission_facade(cg, admission_scope, session_authorities)?;
+    let facade = host_admission_facade(cg, admission_scope, session_authorities.clone())?;
     let admission = facade.accept_replay(provider, admission_scope);
     if let Some(rejection) = reject_unadmitted(
         admission,
@@ -638,7 +638,7 @@ pub(crate) async fn ingest_transcript_with_cancellation(
             user_scope,
             profile_root,
             global_db,
-            session_authorities,
+            session_authorities: session_authorities.clone(),
             facade: &facade,
             max_new_bytes,
             cancellation
@@ -704,10 +704,10 @@ pub(crate) async fn ingest_transcript_with_cancellation(
         && !user_scope
     {
         let settlement = hotpath::future!(
-            crate::hint_outcomes::settle_project_hint_outcomes(
+            tracedecay_agent_hosts::hooks::hint_outcomes::settlement::settle_project_hint_outcomes(
                 accounting_db,
                 session_authorities.project.map(std::convert::AsRef::as_ref),
-                crate::analytics_bridge::hook_import_sources(Some(cg.project_root())),
+                tracedecay_usecases::analytics_bridge::hook_import_sources(Some(cg.project_root())),
                 cg.project_root(),
                 crate::tracedecay::current_timestamp()
             ),

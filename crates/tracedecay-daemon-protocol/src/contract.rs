@@ -4,15 +4,16 @@
 //! the daemon's closed post-handshake invocation protocol. They are data: no
 //! socket, no admission decision, no runtime registry, no database.
 //!
-//! The contract lives outside `crate::daemon` on purpose. Its callers are the
-//! application surface and the invocation client, which have no business
-//! reaching into the daemon's service internals just to name a payload. Keeping
-//! the shapes here means a caller depends on the protocol, not on the server
-//! that happens to implement it.
+//! The contract lives here in `tracedecay-daemon-protocol`, outside the
+//! daemon's service crate, on purpose. Its callers are the application surface
+//! and the invocation client, which have no business reaching into the
+//! daemon's service internals just to name a payload. Keeping the shapes here
+//! means a caller depends on the protocol, not on the server that happens to
+//! implement it.
 //!
 //! Behavior stays with the daemon. Anything that interprets a request —
 //! authority minting, scope resolution, dispatch — remains in
-//! `crate::daemon::service::invocation`; only construction, validation, and the
+//! `tracedecay-daemon-service`; only construction, validation, and the
 //! application-DTO conversions travel with the types they belong to.
 
 mod git_surface;
@@ -59,18 +60,20 @@ use tracedecay_domain::{
     ScopeSetId, UtcMicros, WorkAttemptV1, WorkDuplicateAdjudicationCommandV1,
     WorkPlacementPreflightV1, WorkPlacementV1, WorkRunControlV1,
 };
-use tracedecay_lsp::{
+use tracedecay_tool_catalog::{ApplicationSurfaceOperation, EffectClass, UseCaseId};
+
+use crate::lsp_wire::{
     LspSessionAccess, LspSessionCredential, LspSessionId, MAX_LSP_FRAME_BYTES,
     MAX_LSP_WORKSPACE_ROOTS,
 };
-use tracedecay_tool_catalog::{EffectClass, UseCaseId};
-
 use crate::surface::{ContextScoutSurfaceRequest, GitReadSurfaceRequest};
 use tracedecay_application::ConfigurationWireRequestV1;
+use tracedecay_application::feedback::observations::{
+    FeedbackDeliveryRouteV1, FeedbackSourceEventV1,
+};
 use tracedecay_application::git::GitHubStackSignalExpandSurfaceRequest;
 use tracedecay_application::git::{GitApplySurfaceRequest, GitPreviewSurfaceRequest};
-use tracedecay_usecases::feedback::observations::{FeedbackDeliveryRouteV1, FeedbackSourceEventV1};
-use tracedecay_usecases::primitives::PrimitiveRequest;
+use tracedecay_application::retrieval::PrimitiveRequest;
 
 /// Request-field character rules. The contract accepts opaque handles and ids
 /// only in a shape it can echo back safely, so validation travels with the
@@ -99,6 +102,9 @@ fn valid_lsp_control(deadline: &Deadline, cancellation: &CancellationContext) ->
 pub const DAEMON_INVOCATION_PROTOCOL: &str = "tracedecay.daemon.invocation";
 /// Initial revision of the daemon-owned invocation wire shape.
 pub const DAEMON_INVOCATION_REVISION: u16 = 1;
+/// Request method a control client sends over the closed protocol to ask the
+/// daemon to shut down.
+pub const DAEMON_SHUTDOWN_METHOD: &str = "tracedecay/daemon/shutdown";
 const DAEMON_INVOCATION_CANCEL_OPERATION: &str = "invocation_cancel";
 const DAEMON_INVOCATION_DELIVERY_ACK_OPERATION: &str = "invocation_delivery_ack";
 
@@ -426,6 +432,7 @@ pub enum DaemonInvocationOperation {
     WorkflowApplication,
     HandoffApplication,
     SemanticEvaluateAndPublish,
+    SemanticActivate,
     SemanticQualify,
     LspOpen,
     LspFrame,
@@ -436,6 +443,7 @@ pub enum DaemonInvocationOperation {
 }
 
 impl DaemonInvocationOperation {
+    #[hotpath::skip]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::GitStatus => "git_status",
@@ -489,6 +497,7 @@ impl DaemonInvocationOperation {
             Self::WorkflowApplication => "workflow_application",
             Self::HandoffApplication => "handoff_application",
             Self::SemanticEvaluateAndPublish => "semantic_evaluate_and_publish",
+            Self::SemanticActivate => "semantic_activate",
             Self::SemanticQualify => "semantic_qualify",
             Self::LspOpen => "lsp_open",
             Self::LspFrame => "lsp_frame",
@@ -579,6 +588,7 @@ pub enum WorkApplicationInvocationV1 {
 }
 
 impl WorkApplicationInvocationV1 {
+    #[hotpath::skip]
     pub const fn operation_key(&self) -> &'static str {
         match self {
             Self::GenerateProposal(_) => "generate_proposal",
@@ -639,6 +649,7 @@ pub enum WorkflowApplicationInvocation {
 }
 
 impl WorkflowApplicationInvocation {
+    #[hotpath::skip]
     pub const fn operation_key(&self) -> &'static str {
         match self {
             Self::RegisterDefinition(_) => "register_definition",
@@ -671,6 +682,7 @@ pub enum HandoffApplicationInvocationV1 {
 }
 
 impl HandoffApplicationInvocationV1 {
+    #[hotpath::skip]
     pub const fn operation_key(&self) -> &'static str {
         match self {
             Self::IssueTaskHandoff(_) => "issue_task_handoff",
@@ -698,7 +710,7 @@ pub struct DaemonInvocationRequest {
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum DaemonInvocationPayload {
     GitRead {
-        surface_operation: crate::surface::ApplicationSurfaceOperation,
+        surface_operation: ApplicationSurfaceOperation,
         request: GitReadSurfaceRequest,
         observed_at: UtcMicros,
         deadline: Deadline,
@@ -723,7 +735,7 @@ pub enum DaemonInvocationPayload {
         cancellation: CancellationContext,
     },
     NativeIntegration {
-        surface_operation: crate::surface::ApplicationSurfaceOperation,
+        surface_operation: ApplicationSurfaceOperation,
         request: tracedecay_application::NativeIntegrationSurfaceRequest,
         observed_at: UtcMicros,
         deadline: Deadline,
@@ -797,14 +809,14 @@ pub enum DaemonInvocationPayload {
         cancellation: CancellationContext,
     },
     PrimitiveRead {
-        surface_operation: crate::surface::ApplicationSurfaceOperation,
+        surface_operation: ApplicationSurfaceOperation,
         request: PrimitiveRequest,
         observed_at: UtcMicros,
         deadline: Deadline,
         cancellation: CancellationContext,
     },
     PrimitiveCode {
-        surface_operation: crate::surface::ApplicationSurfaceOperation,
+        surface_operation: ApplicationSurfaceOperation,
         request: tracedecay_application::PrimitiveCodeSurfaceRequest,
         page: PageRequest,
         observed_at: UtcMicros,
@@ -812,7 +824,7 @@ pub enum DaemonInvocationPayload {
         cancellation: CancellationContext,
     },
     CallableCode {
-        surface_operation: crate::surface::ApplicationSurfaceOperation,
+        surface_operation: ApplicationSurfaceOperation,
         request: tracedecay_application::CallableCodeSurfaceRequest,
         page: PageRequest,
         observed_at: UtcMicros,
@@ -820,7 +832,7 @@ pub enum DaemonInvocationPayload {
         cancellation: CancellationContext,
     },
     Configuration {
-        surface_operation: crate::surface::ApplicationSurfaceOperation,
+        surface_operation: ApplicationSurfaceOperation,
         request: ConfigurationWireRequestV1,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resolved_scope: Option<ResolvedScope>,
@@ -829,7 +841,7 @@ pub enum DaemonInvocationPayload {
         cancellation: CancellationContext,
     },
     ContextScout {
-        surface_operation: crate::surface::ApplicationSurfaceOperation,
+        surface_operation: ApplicationSurfaceOperation,
         request: ContextScoutSurfaceRequest,
         observed_at: UtcMicros,
         deadline: Deadline,
@@ -891,6 +903,20 @@ pub enum DaemonInvocationPayload {
         deadline: Deadline,
         cancellation: CancellationContext,
     },
+    /// One operator journey: evaluate the named profile natively, publish the
+    /// accepted evaluation, and compare-and-swap it into `active_profile` of
+    /// the project's semantic runtime configuration. The daemon composes the
+    /// installed-model material and the configuration revision itself; the
+    /// caller authors only the profile selection.
+    SemanticActivate {
+        evaluated_profile_id: String,
+        /// Record the previously active profile as `rollback_profile` when
+        /// one exists and differs from the newly activated selection.
+        set_rollback: bool,
+        observed_at: UtcMicros,
+        deadline: Deadline,
+        cancellation: CancellationContext,
+    },
     SemanticQualify {
         evaluated_profile_id: String,
         observed_at: UtcMicros,
@@ -939,7 +965,7 @@ impl DaemonInvocationRequest {
     /// logic and no fallback mutation path.
     pub fn native_integration(
         request_id: impl Into<String>,
-        surface_operation: crate::surface::ApplicationSurfaceOperation,
+        surface_operation: ApplicationSurfaceOperation,
         request: tracedecay_application::NativeIntegrationSurfaceRequest,
         observed_at: UtcMicros,
         deadline: Deadline,
@@ -962,14 +988,14 @@ impl DaemonInvocationRequest {
 
     pub fn feedback(
         request_id: impl Into<String>,
-        operation: crate::surface::ApplicationSurfaceOperation,
+        operation: ApplicationSurfaceOperation,
         request_handle: String,
         observed_at: UtcMicros,
         deadline: Deadline,
         cancellation: CancellationContext,
     ) -> Self {
         let payload = match operation {
-            crate::surface::ApplicationSurfaceOperation::FeedbackDiagnostics => {
+            ApplicationSurfaceOperation::FeedbackDiagnostics => {
                 DaemonInvocationPayload::FeedbackDiagnostics {
                     request_handle,
                     observed_at,
@@ -977,16 +1003,14 @@ impl DaemonInvocationRequest {
                     cancellation,
                 }
             }
-            crate::surface::ApplicationSurfaceOperation::FeedbackGet => {
-                DaemonInvocationPayload::FeedbackGet {
-                    request_handle,
-                    resolved_scope: None,
-                    observed_at,
-                    deadline,
-                    cancellation,
-                }
-            }
-            crate::surface::ApplicationSurfaceOperation::FeedbackExpand => {
+            ApplicationSurfaceOperation::FeedbackGet => DaemonInvocationPayload::FeedbackGet {
+                request_handle,
+                resolved_scope: None,
+                observed_at,
+                deadline,
+                cancellation,
+            },
+            ApplicationSurfaceOperation::FeedbackExpand => {
                 DaemonInvocationPayload::FeedbackExpand {
                     request_handle,
                     observed_at,
@@ -994,15 +1018,13 @@ impl DaemonInvocationRequest {
                     cancellation,
                 }
             }
-            crate::surface::ApplicationSurfaceOperation::FeedbackList => {
-                DaemonInvocationPayload::FeedbackList {
-                    request_handle,
-                    observed_at,
-                    deadline,
-                    cancellation,
-                }
-            }
-            crate::surface::ApplicationSurfaceOperation::FeedbackImpact => {
+            ApplicationSurfaceOperation::FeedbackList => DaemonInvocationPayload::FeedbackList {
+                request_handle,
+                observed_at,
+                deadline,
+                cancellation,
+            },
+            ApplicationSurfaceOperation::FeedbackImpact => {
                 DaemonInvocationPayload::FeedbackImpact {
                     request_handle,
                     observed_at,
@@ -1010,99 +1032,97 @@ impl DaemonInvocationRequest {
                     cancellation,
                 }
             }
-            crate::surface::ApplicationSurfaceOperation::AffectedTests => {
-                DaemonInvocationPayload::AffectedTests {
-                    request_handle,
-                    observed_at,
-                    deadline,
-                    cancellation,
-                }
-            }
-            crate::surface::ApplicationSurfaceOperation::TestResults
-            | crate::surface::ApplicationSurfaceOperation::ObservatoryRead
-            | crate::surface::ApplicationSurfaceOperation::FeedbackAdvisoryCycle
-            | crate::surface::ApplicationSurfaceOperation::SessionLookup
-            | crate::surface::ApplicationSurfaceOperation::QualifiedName
-            | crate::surface::ApplicationSurfaceOperation::CallChain
-            | crate::surface::ApplicationSurfaceOperation::FileDependents
-            | crate::surface::ApplicationSurfaceOperation::SourceLines
-            | crate::surface::ApplicationSurfaceOperation::SourceBody
-            | crate::surface::ApplicationSurfaceOperation::SourceOutline
-            | crate::surface::ApplicationSurfaceOperation::ModuleApi
-            | crate::surface::ApplicationSurfaceOperation::FileMetadata
-            | crate::surface::ApplicationSurfaceOperation::HealthRead
-            | crate::surface::ApplicationSurfaceOperation::HealthDelta
-            | crate::surface::ApplicationSurfaceOperation::StorageStatus
-            | crate::surface::ApplicationSurfaceOperation::DiagnosticsRead
-            | crate::surface::ApplicationSurfaceOperation::CodeSymbolSearch
-            | crate::surface::ApplicationSurfaceOperation::CodeSignatureSearch
-            | crate::surface::ApplicationSurfaceOperation::CodeImplementations
-            | crate::surface::ApplicationSurfaceOperation::CodeTypeHierarchy
-            | crate::surface::ApplicationSurfaceOperation::CodeCallers => {
+            ApplicationSurfaceOperation::AffectedTests => DaemonInvocationPayload::AffectedTests {
+                request_handle,
+                observed_at,
+                deadline,
+                cancellation,
+            },
+            ApplicationSurfaceOperation::TestResults
+            | ApplicationSurfaceOperation::ObservatoryRead
+            | ApplicationSurfaceOperation::FeedbackAdvisoryCycle
+            | ApplicationSurfaceOperation::SessionLookup
+            | ApplicationSurfaceOperation::QualifiedName
+            | ApplicationSurfaceOperation::CallChain
+            | ApplicationSurfaceOperation::FileDependents
+            | ApplicationSurfaceOperation::SourceLines
+            | ApplicationSurfaceOperation::SourceBody
+            | ApplicationSurfaceOperation::SourceOutline
+            | ApplicationSurfaceOperation::ModuleApi
+            | ApplicationSurfaceOperation::FileMetadata
+            | ApplicationSurfaceOperation::HealthRead
+            | ApplicationSurfaceOperation::HealthDelta
+            | ApplicationSurfaceOperation::StorageStatus
+            | ApplicationSurfaceOperation::DiagnosticsRead
+            | ApplicationSurfaceOperation::CodeSymbolSearch
+            | ApplicationSurfaceOperation::CodeSignatureSearch
+            | ApplicationSurfaceOperation::CodeImplementations
+            | ApplicationSurfaceOperation::CodeTypeHierarchy
+            | ApplicationSurfaceOperation::CodeCallers => {
                 unreachable!("primitive operations use their typed constructor")
             }
-            crate::surface::ApplicationSurfaceOperation::CodeExactOccurrence
-            | crate::surface::ApplicationSurfaceOperation::CodePhraseSearch
-            | crate::surface::ApplicationSurfaceOperation::CodeCallees
-            | crate::surface::ApplicationSurfaceOperation::CodeFacets
-            | crate::surface::ApplicationSurfaceOperation::CodeTimeline
-            | crate::surface::ApplicationSurfaceOperation::CodeDeclaration
-            | crate::surface::ApplicationSurfaceOperation::CodeDefinition
-            | crate::surface::ApplicationSurfaceOperation::CodeTypeDefinition
-            | crate::surface::ApplicationSurfaceOperation::CodeReferences => {
+            ApplicationSurfaceOperation::CodeExactOccurrence
+            | ApplicationSurfaceOperation::CodePhraseSearch
+            | ApplicationSurfaceOperation::CodeCallees
+            | ApplicationSurfaceOperation::CodeFacets
+            | ApplicationSurfaceOperation::CodeTimeline
+            | ApplicationSurfaceOperation::CodeDeclaration
+            | ApplicationSurfaceOperation::CodeDefinition
+            | ApplicationSurfaceOperation::CodeTypeDefinition
+            | ApplicationSurfaceOperation::CodeReferences => {
                 unreachable!("callable code operations use their typed constructor")
             }
-            crate::surface::ApplicationSurfaceOperation::GitStatus
-            | crate::surface::ApplicationSurfaceOperation::GitDiff
-            | crate::surface::ApplicationSurfaceOperation::GitHistory
-            | crate::surface::ApplicationSurfaceOperation::GitBlame
-            | crate::surface::ApplicationSurfaceOperation::GitHunks
-            | crate::surface::ApplicationSurfaceOperation::GitPreview
-            | crate::surface::ApplicationSurfaceOperation::GitApply
-            | crate::surface::ApplicationSurfaceOperation::GitHubStackSignalExpand => {
+            ApplicationSurfaceOperation::GitStatus
+            | ApplicationSurfaceOperation::GitDiff
+            | ApplicationSurfaceOperation::GitHistory
+            | ApplicationSurfaceOperation::GitBlame
+            | ApplicationSurfaceOperation::GitHunks
+            | ApplicationSurfaceOperation::GitPreview
+            | ApplicationSurfaceOperation::GitApply
+            | ApplicationSurfaceOperation::GitHubStackSignalExpand => {
                 unreachable!("Git operations use their typed constructors")
             }
-            crate::surface::ApplicationSurfaceOperation::NativeIntegrationStackSnapshot
-            | crate::surface::ApplicationSurfaceOperation::NativeIntegrationPreflight
-            | crate::surface::ApplicationSurfaceOperation::NativeIntegrationApprove
-            | crate::surface::ApplicationSurfaceOperation::NativeIntegrationApply
-            | crate::surface::ApplicationSurfaceOperation::NativeIntegrationStatus
-            | crate::surface::ApplicationSurfaceOperation::NativeIntegrationCancel => {
+            ApplicationSurfaceOperation::NativeIntegrationStackSnapshot
+            | ApplicationSurfaceOperation::NativeIntegrationPreflight
+            | ApplicationSurfaceOperation::NativeIntegrationApprove
+            | ApplicationSurfaceOperation::NativeIntegrationApply
+            | ApplicationSurfaceOperation::NativeIntegrationStatus
+            | ApplicationSurfaceOperation::NativeIntegrationCancel => {
                 unreachable!("native-integration operations use their typed constructor")
             }
-            crate::surface::ApplicationSurfaceOperation::NativeIntegrationWorktreeInventory
-            | crate::surface::ApplicationSurfaceOperation::NativeIntegrationWorktreeInspect
-            | crate::surface::ApplicationSurfaceOperation::NativeIntegrationWorktreeConfirm
-            | crate::surface::ApplicationSurfaceOperation::NativeIntegrationWorktreeRemove
-            | crate::surface::ApplicationSurfaceOperation::NativeIntegrationWorktreeReconcile => {
+            ApplicationSurfaceOperation::NativeIntegrationWorktreeInventory
+            | ApplicationSurfaceOperation::NativeIntegrationWorktreeInspect
+            | ApplicationSurfaceOperation::NativeIntegrationWorktreeConfirm
+            | ApplicationSurfaceOperation::NativeIntegrationWorktreeRemove
+            | ApplicationSurfaceOperation::NativeIntegrationWorktreeReconcile => {
                 unreachable!("native worktree operations use their typed constructor")
             }
-            crate::surface::ApplicationSurfaceOperation::ConfigurationList
-            | crate::surface::ApplicationSurfaceOperation::ConfigurationExplain
-            | crate::surface::ApplicationSurfaceOperation::ConfigurationGet
-            | crate::surface::ApplicationSurfaceOperation::ConfigurationSet
-            | crate::surface::ApplicationSurfaceOperation::ConfigurationUnset
-            | crate::surface::ApplicationSurfaceOperation::ConfigurationBatch
-            | crate::surface::ApplicationSurfaceOperation::ConfigurationWriteCredential
-            | crate::surface::ApplicationSurfaceOperation::ConfigurationObservedState
-            | crate::surface::ApplicationSurfaceOperation::ConfigurationProtectedPreview
-            | crate::surface::ApplicationSurfaceOperation::ConfigurationProtectedApply
-            | crate::surface::ApplicationSurfaceOperation::ConfigurationRollbackPreview
-            | crate::surface::ApplicationSurfaceOperation::ConfigurationRollbackApply
-            | crate::surface::ApplicationSurfaceOperation::ConfigurationAudit => {
+            ApplicationSurfaceOperation::ConfigurationList
+            | ApplicationSurfaceOperation::ConfigurationExplain
+            | ApplicationSurfaceOperation::ConfigurationGet
+            | ApplicationSurfaceOperation::ConfigurationSet
+            | ApplicationSurfaceOperation::ConfigurationUnset
+            | ApplicationSurfaceOperation::ConfigurationBatch
+            | ApplicationSurfaceOperation::ConfigurationWriteCredential
+            | ApplicationSurfaceOperation::ConfigurationObservedState
+            | ApplicationSurfaceOperation::ConfigurationProtectedPreview
+            | ApplicationSurfaceOperation::ConfigurationProtectedApply
+            | ApplicationSurfaceOperation::ConfigurationRollbackPreview
+            | ApplicationSurfaceOperation::ConfigurationRollbackApply
+            | ApplicationSurfaceOperation::ConfigurationAudit => {
                 unreachable!("configuration operations use their typed constructor")
             }
-            crate::surface::ApplicationSurfaceOperation::ContextScoutStatus
-            | crate::surface::ApplicationSurfaceOperation::ContextScoutRecent
-            | crate::surface::ApplicationSurfaceOperation::ContextScoutExplain
-            | crate::surface::ApplicationSurfaceOperation::ContextScoutCapability
-            | crate::surface::ApplicationSurfaceOperation::ContextScoutBudget
-            | crate::surface::ApplicationSurfaceOperation::ContextScoutPause
-            | crate::surface::ApplicationSurfaceOperation::ContextScoutResume
-            | crate::surface::ApplicationSurfaceOperation::ContextScoutCancel
-            | crate::surface::ApplicationSurfaceOperation::ContextScoutClaim
-            | crate::surface::ApplicationSurfaceOperation::ContextScoutDelivery
-            | crate::surface::ApplicationSurfaceOperation::ContextScoutFeedback => {
+            ApplicationSurfaceOperation::ContextScoutStatus
+            | ApplicationSurfaceOperation::ContextScoutRecent
+            | ApplicationSurfaceOperation::ContextScoutExplain
+            | ApplicationSurfaceOperation::ContextScoutCapability
+            | ApplicationSurfaceOperation::ContextScoutBudget
+            | ApplicationSurfaceOperation::ContextScoutPause
+            | ApplicationSurfaceOperation::ContextScoutResume
+            | ApplicationSurfaceOperation::ContextScoutCancel
+            | ApplicationSurfaceOperation::ContextScoutClaim
+            | ApplicationSurfaceOperation::ContextScoutDelivery
+            | ApplicationSurfaceOperation::ContextScoutFeedback => {
                 unreachable!("Context Scout operations use their typed constructor")
             }
         };
@@ -1157,24 +1177,23 @@ impl DaemonInvocationRequest {
 
     pub fn primitive(
         request_id: impl Into<String>,
-        operation: crate::surface::ApplicationSurfaceOperation,
+        operation: ApplicationSurfaceOperation,
         request: PrimitiveRequest,
         observed_at: UtcMicros,
         deadline: Deadline,
         cancellation: CancellationContext,
     ) -> Self {
         let payload = match (operation, request) {
+            (ApplicationSurfaceOperation::FeedbackImpact, PrimitiveRequest::Impact(request)) => {
+                DaemonInvocationPayload::PrimitiveImpact {
+                    request,
+                    observed_at,
+                    deadline,
+                    cancellation,
+                }
+            }
             (
-                crate::surface::ApplicationSurfaceOperation::FeedbackImpact,
-                PrimitiveRequest::Impact(request),
-            ) => DaemonInvocationPayload::PrimitiveImpact {
-                request,
-                observed_at,
-                deadline,
-                cancellation,
-            },
-            (
-                crate::surface::ApplicationSurfaceOperation::AffectedTests,
+                ApplicationSurfaceOperation::AffectedTests,
                 PrimitiveRequest::AffectedFileTests(request),
             ) => DaemonInvocationPayload::PrimitiveAffectedTests {
                 request,
@@ -1183,7 +1202,7 @@ impl DaemonInvocationRequest {
                 cancellation,
             },
             (
-                crate::surface::ApplicationSurfaceOperation::TestResults,
+                ApplicationSurfaceOperation::TestResults,
                 PrimitiveRequest::RecentTestResults(page),
             ) => DaemonInvocationPayload::PrimitiveTestResults {
                 page,
@@ -1192,55 +1211,55 @@ impl DaemonInvocationRequest {
                 cancellation,
             },
             (
-                surface_operation @ crate::surface::ApplicationSurfaceOperation::SessionLookup,
+                surface_operation @ ApplicationSurfaceOperation::SessionLookup,
                 request @ PrimitiveRequest::SessionLookup(_),
             )
             | (
-                surface_operation @ crate::surface::ApplicationSurfaceOperation::QualifiedName,
+                surface_operation @ ApplicationSurfaceOperation::QualifiedName,
                 request @ PrimitiveRequest::QualifiedName(_),
             )
             | (
-                surface_operation @ crate::surface::ApplicationSurfaceOperation::CallChain,
+                surface_operation @ ApplicationSurfaceOperation::CallChain,
                 request @ PrimitiveRequest::CallChain(_),
             )
             | (
-                surface_operation @ crate::surface::ApplicationSurfaceOperation::FileDependents,
+                surface_operation @ ApplicationSurfaceOperation::FileDependents,
                 request @ PrimitiveRequest::FileDependents(_),
             )
             | (
-                surface_operation @ crate::surface::ApplicationSurfaceOperation::SourceLines,
+                surface_operation @ ApplicationSurfaceOperation::SourceLines,
                 request @ PrimitiveRequest::SourceLines(_),
             )
             | (
-                surface_operation @ crate::surface::ApplicationSurfaceOperation::SourceBody,
+                surface_operation @ ApplicationSurfaceOperation::SourceBody,
                 request @ PrimitiveRequest::SourceBody(_),
             )
             | (
-                surface_operation @ crate::surface::ApplicationSurfaceOperation::SourceOutline,
+                surface_operation @ ApplicationSurfaceOperation::SourceOutline,
                 request @ PrimitiveRequest::SourceOutline(_),
             )
             | (
-                surface_operation @ crate::surface::ApplicationSurfaceOperation::ModuleApi,
+                surface_operation @ ApplicationSurfaceOperation::ModuleApi,
                 request @ PrimitiveRequest::ModuleApi(_),
             )
             | (
-                surface_operation @ crate::surface::ApplicationSurfaceOperation::FileMetadata,
+                surface_operation @ ApplicationSurfaceOperation::FileMetadata,
                 request @ PrimitiveRequest::FileMetadata(_),
             )
             | (
-                surface_operation @ crate::surface::ApplicationSurfaceOperation::HealthRead,
+                surface_operation @ ApplicationSurfaceOperation::HealthRead,
                 request @ PrimitiveRequest::HealthRead(_),
             )
             | (
-                surface_operation @ crate::surface::ApplicationSurfaceOperation::HealthDelta,
+                surface_operation @ ApplicationSurfaceOperation::HealthDelta,
                 request @ PrimitiveRequest::HealthDelta(_),
             )
             | (
-                surface_operation @ crate::surface::ApplicationSurfaceOperation::StorageStatus,
+                surface_operation @ ApplicationSurfaceOperation::StorageStatus,
                 request @ PrimitiveRequest::StorageStatus(_),
             )
             | (
-                surface_operation @ crate::surface::ApplicationSurfaceOperation::DiagnosticsRead,
+                surface_operation @ ApplicationSurfaceOperation::DiagnosticsRead,
                 request @ PrimitiveRequest::DiagnosticsRead(_),
             ) => DaemonInvocationPayload::PrimitiveRead {
                 surface_operation,
@@ -1262,7 +1281,7 @@ impl DaemonInvocationRequest {
 
     pub fn configuration(
         request_id: impl Into<String>,
-        surface_operation: crate::surface::ApplicationSurfaceOperation,
+        surface_operation: ApplicationSurfaceOperation,
         request: ConfigurationWireRequestV1,
         observed_at: UtcMicros,
         deadline: Deadline,
@@ -1286,7 +1305,7 @@ impl DaemonInvocationRequest {
 
     pub fn context_scout(
         request_id: impl Into<String>,
-        surface_operation: crate::surface::ApplicationSurfaceOperation,
+        surface_operation: ApplicationSurfaceOperation,
         request: ContextScoutSurfaceRequest,
         observed_at: UtcMicros,
         deadline: Deadline,
@@ -1497,6 +1516,29 @@ impl DaemonInvocationRequest {
         }
     }
 
+    pub fn semantic_activate(
+        request_id: impl Into<String>,
+        evaluated_profile_id: String,
+        set_rollback: bool,
+        observed_at: UtcMicros,
+        deadline: Deadline,
+        cancellation: CancellationContext,
+    ) -> Self {
+        Self {
+            protocol: DAEMON_INVOCATION_PROTOCOL.to_owned(),
+            revision: DAEMON_INVOCATION_REVISION,
+            request_id: request_id.into(),
+            delivery_route: None,
+            payload: DaemonInvocationPayload::SemanticActivate {
+                evaluated_profile_id,
+                set_rollback,
+                observed_at,
+                deadline,
+                cancellation,
+            },
+        }
+    }
+
     pub fn semantic_qualify(
         request_id: impl Into<String>,
         evaluated_profile_id: String,
@@ -1520,7 +1562,7 @@ impl DaemonInvocationRequest {
 
     pub fn callable_code(
         request_id: impl Into<String>,
-        surface_operation: crate::surface::ApplicationSurfaceOperation,
+        surface_operation: ApplicationSurfaceOperation,
         request: tracedecay_application::CallableCodeSurfaceRequest,
         page: PageRequest,
         observed_at: UtcMicros,
@@ -1531,31 +1573,31 @@ impl DaemonInvocationRequest {
             (&request, surface_operation),
             (
                 tracedecay_application::CallableCodeSurfaceRequest::ExactOccurrence(_),
-                crate::surface::ApplicationSurfaceOperation::CodeExactOccurrence,
+                ApplicationSurfaceOperation::CodeExactOccurrence,
             ) | (
                 tracedecay_application::CallableCodeSurfaceRequest::PhraseSearch(_),
-                crate::surface::ApplicationSurfaceOperation::CodePhraseSearch,
+                ApplicationSurfaceOperation::CodePhraseSearch,
             ) | (
                 tracedecay_application::CallableCodeSurfaceRequest::Callees(_),
-                crate::surface::ApplicationSurfaceOperation::CodeCallees,
+                ApplicationSurfaceOperation::CodeCallees,
             ) | (
                 tracedecay_application::CallableCodeSurfaceRequest::Facets(_),
-                crate::surface::ApplicationSurfaceOperation::CodeFacets,
+                ApplicationSurfaceOperation::CodeFacets,
             ) | (
                 tracedecay_application::CallableCodeSurfaceRequest::Timeline(_),
-                crate::surface::ApplicationSurfaceOperation::CodeTimeline,
+                ApplicationSurfaceOperation::CodeTimeline,
             ) | (
                 tracedecay_application::CallableCodeSurfaceRequest::Declaration(_),
-                crate::surface::ApplicationSurfaceOperation::CodeDeclaration,
+                ApplicationSurfaceOperation::CodeDeclaration,
             ) | (
                 tracedecay_application::CallableCodeSurfaceRequest::Definition(_),
-                crate::surface::ApplicationSurfaceOperation::CodeDefinition,
+                ApplicationSurfaceOperation::CodeDefinition,
             ) | (
                 tracedecay_application::CallableCodeSurfaceRequest::TypeDefinition(_),
-                crate::surface::ApplicationSurfaceOperation::CodeTypeDefinition,
+                ApplicationSurfaceOperation::CodeTypeDefinition,
             ) | (
                 tracedecay_application::CallableCodeSurfaceRequest::References(_),
-                crate::surface::ApplicationSurfaceOperation::CodeReferences,
+                ApplicationSurfaceOperation::CodeReferences,
             )
         ));
         Self {
@@ -1576,7 +1618,7 @@ impl DaemonInvocationRequest {
 
     pub fn primitive_code(
         request_id: impl Into<String>,
-        surface_operation: crate::surface::ApplicationSurfaceOperation,
+        surface_operation: ApplicationSurfaceOperation,
         request: tracedecay_application::PrimitiveCodeSurfaceRequest,
         page: PageRequest,
         observed_at: UtcMicros,
@@ -1719,11 +1761,13 @@ impl DaemonInvocationRequest {
         }
     }
 
+    #[must_use]
     pub fn with_delivery_route(mut self, route: FeedbackDeliveryRouteV1) -> Self {
         self.delivery_route = Some(route);
         self
     }
 
+    #[must_use]
     pub fn with_resolved_scope(mut self, scope: Option<ResolvedScope>) -> Self {
         match &mut self.payload {
             DaemonInvocationPayload::FeedbackGet { resolved_scope, .. }
@@ -1761,21 +1805,11 @@ impl DaemonInvocationRequest {
             DaemonInvocationPayload::GitRead {
                 surface_operation, ..
             } => match surface_operation {
-                crate::surface::ApplicationSurfaceOperation::GitStatus => {
-                    DaemonInvocationOperation::GitStatus
-                }
-                crate::surface::ApplicationSurfaceOperation::GitDiff => {
-                    DaemonInvocationOperation::GitDiff
-                }
-                crate::surface::ApplicationSurfaceOperation::GitHistory => {
-                    DaemonInvocationOperation::GitHistory
-                }
-                crate::surface::ApplicationSurfaceOperation::GitBlame => {
-                    DaemonInvocationOperation::GitBlame
-                }
-                crate::surface::ApplicationSurfaceOperation::GitHunks => {
-                    DaemonInvocationOperation::GitHunks
-                }
+                ApplicationSurfaceOperation::GitStatus => DaemonInvocationOperation::GitStatus,
+                ApplicationSurfaceOperation::GitDiff => DaemonInvocationOperation::GitDiff,
+                ApplicationSurfaceOperation::GitHistory => DaemonInvocationOperation::GitHistory,
+                ApplicationSurfaceOperation::GitBlame => DaemonInvocationOperation::GitBlame,
+                ApplicationSurfaceOperation::GitHunks => DaemonInvocationOperation::GitHunks,
                 _ => unreachable!("Git read payloads use a Git read surface operation"),
             },
             DaemonInvocationPayload::GitPreview { .. } => DaemonInvocationOperation::GitPreview,
@@ -1786,37 +1820,37 @@ impl DaemonInvocationRequest {
             DaemonInvocationPayload::NativeIntegration {
                 surface_operation, ..
             } => match surface_operation {
-                crate::surface::ApplicationSurfaceOperation::NativeIntegrationStackSnapshot => {
+                ApplicationSurfaceOperation::NativeIntegrationStackSnapshot => {
                     DaemonInvocationOperation::NativeIntegrationStackSnapshot
                 }
-                crate::surface::ApplicationSurfaceOperation::NativeIntegrationPreflight => {
+                ApplicationSurfaceOperation::NativeIntegrationPreflight => {
                     DaemonInvocationOperation::NativeIntegrationPreflight
                 }
-                crate::surface::ApplicationSurfaceOperation::NativeIntegrationApprove => {
+                ApplicationSurfaceOperation::NativeIntegrationApprove => {
                     DaemonInvocationOperation::NativeIntegrationApprove
                 }
-                crate::surface::ApplicationSurfaceOperation::NativeIntegrationApply => {
+                ApplicationSurfaceOperation::NativeIntegrationApply => {
                     DaemonInvocationOperation::NativeIntegrationApply
                 }
-                crate::surface::ApplicationSurfaceOperation::NativeIntegrationStatus => {
+                ApplicationSurfaceOperation::NativeIntegrationStatus => {
                     DaemonInvocationOperation::NativeIntegrationStatus
                 }
-                crate::surface::ApplicationSurfaceOperation::NativeIntegrationCancel => {
+                ApplicationSurfaceOperation::NativeIntegrationCancel => {
                     DaemonInvocationOperation::NativeIntegrationCancel
                 }
-                crate::surface::ApplicationSurfaceOperation::NativeIntegrationWorktreeInventory => {
+                ApplicationSurfaceOperation::NativeIntegrationWorktreeInventory => {
                     DaemonInvocationOperation::NativeIntegrationWorktreeInventory
                 }
-                crate::surface::ApplicationSurfaceOperation::NativeIntegrationWorktreeInspect => {
+                ApplicationSurfaceOperation::NativeIntegrationWorktreeInspect => {
                     DaemonInvocationOperation::NativeIntegrationWorktreeInspect
                 }
-                crate::surface::ApplicationSurfaceOperation::NativeIntegrationWorktreeConfirm => {
+                ApplicationSurfaceOperation::NativeIntegrationWorktreeConfirm => {
                     DaemonInvocationOperation::NativeIntegrationWorktreeConfirm
                 }
-                crate::surface::ApplicationSurfaceOperation::NativeIntegrationWorktreeRemove => {
+                ApplicationSurfaceOperation::NativeIntegrationWorktreeRemove => {
                     DaemonInvocationOperation::NativeIntegrationWorktreeRemove
                 }
-                crate::surface::ApplicationSurfaceOperation::NativeIntegrationWorktreeReconcile => {
+                ApplicationSurfaceOperation::NativeIntegrationWorktreeReconcile => {
                     DaemonInvocationOperation::NativeIntegrationWorktreeReconcile
                 }
                 _ => unreachable!(
@@ -1925,6 +1959,9 @@ impl DaemonInvocationRequest {
             DaemonInvocationPayload::SemanticEvaluateAndPublish { .. } => {
                 DaemonInvocationOperation::SemanticEvaluateAndPublish
             }
+            DaemonInvocationPayload::SemanticActivate { .. } => {
+                DaemonInvocationOperation::SemanticActivate
+            }
             DaemonInvocationPayload::SemanticQualify { .. } => {
                 DaemonInvocationOperation::SemanticQualify
             }
@@ -1993,6 +2030,7 @@ impl DaemonInvocationRequest {
                 | DaemonInvocationOperation::WorkflowApplication
                 | DaemonInvocationOperation::HandoffApplication
                 | DaemonInvocationOperation::SemanticEvaluateAndPublish
+                | DaemonInvocationOperation::SemanticActivate
                 | DaemonInvocationOperation::SemanticQualify
                 | DaemonInvocationOperation::LspOpen
         )
@@ -2193,19 +2231,19 @@ impl DaemonInvocationRequest {
                 let matches = matches!(
                     (surface_operation, request),
                     (
-                        crate::surface::ApplicationSurfaceOperation::CodeSymbolSearch,
+                        ApplicationSurfaceOperation::CodeSymbolSearch,
                         tracedecay_application::PrimitiveCodeSurfaceRequest::SymbolSearch(_),
                     ) | (
-                        crate::surface::ApplicationSurfaceOperation::CodeSignatureSearch,
+                        ApplicationSurfaceOperation::CodeSignatureSearch,
                         tracedecay_application::PrimitiveCodeSurfaceRequest::SignatureSearch(_),
                     ) | (
-                        crate::surface::ApplicationSurfaceOperation::CodeImplementations,
+                        ApplicationSurfaceOperation::CodeImplementations,
                         tracedecay_application::PrimitiveCodeSurfaceRequest::Implementations(_),
                     ) | (
-                        crate::surface::ApplicationSurfaceOperation::CodeTypeHierarchy,
+                        ApplicationSurfaceOperation::CodeTypeHierarchy,
                         tracedecay_application::PrimitiveCodeSurfaceRequest::TypeHierarchy(_),
                     ) | (
-                        crate::surface::ApplicationSurfaceOperation::CodeCallers,
+                        ApplicationSurfaceOperation::CodeCallers,
                         tracedecay_application::PrimitiveCodeSurfaceRequest::Callers(_),
                     )
                 );
@@ -2218,6 +2256,13 @@ impl DaemonInvocationRequest {
                 observed_at,
                 deadline,
                 cancellation,
+            }
+            | DaemonInvocationPayload::SemanticActivate {
+                evaluated_profile_id,
+                observed_at,
+                deadline,
+                cancellation,
+                ..
             } => {
                 if evaluated_profile_id.trim() != evaluated_profile_id
                     || evaluated_profile_id.is_empty()
@@ -2263,31 +2308,31 @@ impl DaemonInvocationRequest {
                 let matches = matches!(
                     (surface_operation, request),
                     (
-                        crate::surface::ApplicationSurfaceOperation::CodeExactOccurrence,
+                        ApplicationSurfaceOperation::CodeExactOccurrence,
                         tracedecay_application::CallableCodeSurfaceRequest::ExactOccurrence(_),
                     ) | (
-                        crate::surface::ApplicationSurfaceOperation::CodePhraseSearch,
+                        ApplicationSurfaceOperation::CodePhraseSearch,
                         tracedecay_application::CallableCodeSurfaceRequest::PhraseSearch(_),
                     ) | (
-                        crate::surface::ApplicationSurfaceOperation::CodeCallees,
+                        ApplicationSurfaceOperation::CodeCallees,
                         tracedecay_application::CallableCodeSurfaceRequest::Callees(_),
                     ) | (
-                        crate::surface::ApplicationSurfaceOperation::CodeFacets,
+                        ApplicationSurfaceOperation::CodeFacets,
                         tracedecay_application::CallableCodeSurfaceRequest::Facets(_),
                     ) | (
-                        crate::surface::ApplicationSurfaceOperation::CodeTimeline,
+                        ApplicationSurfaceOperation::CodeTimeline,
                         tracedecay_application::CallableCodeSurfaceRequest::Timeline(_),
                     ) | (
-                        crate::surface::ApplicationSurfaceOperation::CodeDeclaration,
+                        ApplicationSurfaceOperation::CodeDeclaration,
                         tracedecay_application::CallableCodeSurfaceRequest::Declaration(_),
                     ) | (
-                        crate::surface::ApplicationSurfaceOperation::CodeDefinition,
+                        ApplicationSurfaceOperation::CodeDefinition,
                         tracedecay_application::CallableCodeSurfaceRequest::Definition(_),
                     ) | (
-                        crate::surface::ApplicationSurfaceOperation::CodeTypeDefinition,
+                        ApplicationSurfaceOperation::CodeTypeDefinition,
                         tracedecay_application::CallableCodeSurfaceRequest::TypeDefinition(_),
                     ) | (
-                        crate::surface::ApplicationSurfaceOperation::CodeReferences,
+                        ApplicationSurfaceOperation::CodeReferences,
                         tracedecay_application::CallableCodeSurfaceRequest::References(_),
                     )
                 );
@@ -2482,8 +2527,20 @@ pub fn parse_daemon_invocation_request(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    // A frame that names this protocol but no longer deserializes is either
+    // a foreign revision (explicitly, or as same-revision wire drift between
+    // build versions) or a malformed request. Answer the former as the typed
+    // revision refusal so a skewed client never has to guess from
+    // `invalid_request` whether its own request was wrong.
+    let envelope_revision = value.get("revision").and_then(serde_json::Value::as_u64);
     Some(serde_json::from_value(value).map_err(|_| {
-        DaemonInvocationResponse::problem(request_id, DaemonInvocationProblem::InvalidRequest)
+        let problem = match envelope_revision {
+            Some(revision) if revision != u64::from(DAEMON_INVOCATION_REVISION) => {
+                DaemonInvocationProblem::UnsupportedRevision
+            }
+            _ => DaemonInvocationProblem::InvalidRequest,
+        };
+        DaemonInvocationResponse::problem(request_id, problem)
     }))
 }
 
@@ -2539,6 +2596,55 @@ mod semantic_qualification_tests {
             wire.get("candidate").is_none(),
             "caller-authored candidate material must not cross the publishing wire"
         );
+    }
+
+    #[test]
+    fn semantic_activation_wire_carries_only_the_profile_selection_and_rollback_intent() {
+        let request = DaemonInvocationRequest::semantic_activate(
+            "request.semantic-activation.default-profile",
+            "hybrid-conservative".to_owned(),
+            true,
+            UtcMicros(1_000),
+            Deadline::new(UtcMicros(2_000)).expect("deadline"),
+            CancellationContext::active("cancellation.semantic-activation.default-profile")
+                .expect("cancellation"),
+        );
+
+        assert_eq!(
+            request.operation(),
+            DaemonInvocationOperation::SemanticActivate
+        );
+        assert_eq!(request.operation().as_str(), "semantic_activate");
+        assert!(request.requires_project());
+        assert_eq!(request.validate(), Ok(()));
+        let wire = serde_json::to_value(request).expect("semantic activation wire");
+        assert_eq!(wire["operation"], "semantic_activate");
+        assert_eq!(wire["evaluated_profile_id"], "hybrid-conservative");
+        assert_eq!(wire["set_rollback"], true);
+        assert!(
+            wire.get("candidate").is_none() && wire.get("artifact_path").is_none(),
+            "caller-authored artifact material must not cross the activation wire"
+        );
+    }
+
+    #[test]
+    fn semantic_activation_rejects_blank_or_padded_profile_ids() {
+        for profile in ["", " hybrid-conservative", &"p".repeat(257)] {
+            let request = DaemonInvocationRequest::semantic_activate(
+                "request.semantic-activation.invalid-profile",
+                profile.to_owned(),
+                false,
+                UtcMicros(1_000),
+                Deadline::new(UtcMicros(2_000)).expect("deadline"),
+                CancellationContext::active("cancellation.semantic-activation.invalid-profile")
+                    .expect("cancellation"),
+            );
+            assert_eq!(
+                request.validate(),
+                Err(DaemonInvocationProblem::InvalidRequest),
+                "profile {profile:?} must be rejected before dispatch"
+            );
+        }
     }
 
     #[test]
@@ -2623,6 +2729,47 @@ pub enum DaemonInvocationProblem {
 }
 
 #[cfg(test)]
+mod invocation_wire_revision_tests {
+    use super::{
+        DAEMON_INVOCATION_PROTOCOL, DaemonInvocationOutcome, DaemonInvocationProblem,
+        parse_daemon_invocation_request,
+    };
+
+    fn parse_problem(line: &str) -> DaemonInvocationProblem {
+        let response = parse_daemon_invocation_request(line)
+            .expect("frames naming the invocation protocol must be answered")
+            .expect_err("undecodable frames must produce a typed response");
+        match response.outcome {
+            DaemonInvocationOutcome::Problem { problem } => problem,
+            outcome => panic!("expected a typed problem response, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn foreign_revision_frames_refuse_as_unsupported_revision() {
+        let line = format!(
+            r#"{{"protocol":"{DAEMON_INVOCATION_PROTOCOL}","revision":2,"request_id":"request.future","operation":"semantic_activate_v3"}}"#
+        );
+        assert_eq!(
+            parse_problem(&line),
+            DaemonInvocationProblem::UnsupportedRevision,
+            "a frame from a different wire revision is a revision refusal, not a caller mistake"
+        );
+    }
+
+    #[test]
+    fn same_revision_malformed_frames_stay_invalid_request() {
+        let line = format!(
+            r#"{{"protocol":"{DAEMON_INVOCATION_PROTOCOL}","revision":1,"request_id":"request.same","operation":"no_such_operation"}}"#
+        );
+        assert_eq!(
+            parse_problem(&line),
+            DaemonInvocationProblem::InvalidRequest,
+        );
+    }
+}
+
+#[cfg(test)]
 mod invocation_problem_tests {
     use super::{DaemonInvocationProblem, DaemonInvocationResponse};
 
@@ -2677,6 +2824,7 @@ impl DaemonGitEffectClass {
         }
     }
 
+    #[hotpath::skip]
     const fn into_application(self) -> EffectClass {
         match self {
             Self::IndexStage => EffectClass::GitIndexStage,
@@ -2698,6 +2846,7 @@ pub struct DaemonGitPreviewResult {
 }
 
 impl DaemonGitPreviewResult {
+    #[hotpath::skip]
     pub const fn execution(&self) -> &OperationReceipt {
         &self.execution
     }
@@ -2816,6 +2965,7 @@ pub struct DaemonGitEffectResult {
 }
 
 impl DaemonGitEffectResult {
+    #[hotpath::skip]
     pub const fn execution(&self) -> &OperationReceipt {
         &self.execution
     }
@@ -2875,10 +3025,12 @@ pub struct DaemonFeedbackResult {
 impl DaemonFeedbackResult {
     /// Read-only views for the daemon's operation accounting. The fields stay
     /// private so the envelope can only be built from an application packet.
+    #[hotpath::skip]
     pub const fn execution(&self) -> &OperationReceipt {
         &self.execution
     }
 
+    #[hotpath::skip]
     pub const fn page(&self) -> &PageState {
         &self.page
     }
@@ -3084,9 +3236,26 @@ pub enum DaemonInvocationOutcome {
         scope: ResolvedScope,
         profile_digest: ManifestDigest,
         report_digest: ManifestDigest,
-        report: tracedecay_search_eval::DirectEvaluationReportV1,
+        report: serde_json::Value,
         source_generation: tracedecay_domain::CodeGenerationId,
         snapshot_digest: ManifestDigest,
+    },
+    /// Terminal receipt of the composed evaluate → publish → activate journey.
+    ///
+    /// `configuration_revision` is the revision produced by the activation
+    /// compare-and-swap; `runtime_state` is the serialized
+    /// `SemanticRuntimeStateV1` observed immediately after that revision
+    /// applied (the daemon serializes the typed state; like the evaluation
+    /// `report` above, it crosses this wire as JSON), so a caller can
+    /// distinguish "activation recorded, runtime converging" from "ready".
+    SemanticProfileActivated {
+        scope: ResolvedScope,
+        profile_digest: ManifestDigest,
+        report_digest: ManifestDigest,
+        configuration_revision: tracedecay_domain::configuration::ConfigurationRevisionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rollback_profile_id: Option<String>,
+        runtime_state: serde_json::Value,
     },
     SemanticEvaluatedProfileQualified {
         qualification: CanonicalQualificationBlob,

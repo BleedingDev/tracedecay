@@ -14,12 +14,12 @@ use tracedecay_domain::{
     ProviderUsageCountersV1, ProviderUsageModelV1, ProviderUsageScopeV1,
 };
 use tracedecay_global_db::ParseOffset;
+use tracedecay_lcm::{LcmCompressionRequest, LcmSummarizerMode};
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::runtime::hermes::{
     ProjectIngestDestination, ingest_for_project as ingest_for_project_with_id,
     ingest_homes as ingest_homes_with_id, ingest_homes_for_projects, ingest_user_homes,
 };
-use tracedecay_sessions::runtime::lcm::{LcmCompressionRequest, LcmSummarizerMode};
 use tracedecay_sessions::runtime::source::TranscriptIngestStats;
 use tracedecay_sessions::runtime::{SessionProvider, SessionRecord};
 
@@ -40,7 +40,9 @@ async fn ingest_for_project(
     project_root: &Path,
 ) -> TranscriptIngestStats {
     let admission = runtime.runtime().facade();
-    ingest_for_project_with_id(&admission, project_root, runtime.project_id().clone()).await
+    ingest_for_project_with_id(&admission, project_root, runtime.project_id().clone())
+        .await
+        .expect("hermes home")
 }
 
 async fn ingest_homes(
@@ -1487,11 +1489,15 @@ async fn hermes_conflicting_identity_does_not_overwrite_committed_observation() 
             .await
             .is_empty()
     );
-    // Collision fails closed before advancing past the conflicting row.
-    assert_eq!(
-        observation_source_cursor(&db, "hermes", SESSION_ID, &project).await,
-        Some(prefix_cursor)
-    );
+    // The collision is a deterministic, non-retryable admission refusal:
+    // the committed observation is preserved and the conflicting row is
+    // covered (`admission_refused`), so the frontier advances exactly one
+    // row within the same generation instead of wedging on the conflict.
+    let after_conflict = observation_source_cursor(&db, "hermes", SESSION_ID, &project)
+        .await
+        .expect("committed Hermes observation cursor");
+    assert_eq!(after_conflict.generation(), prefix_cursor.generation());
+    assert_eq!(after_conflict.position(), prefix_cursor.position() + 1);
 }
 
 #[tokio::test]

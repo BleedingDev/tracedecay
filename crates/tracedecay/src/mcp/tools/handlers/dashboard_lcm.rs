@@ -6,26 +6,26 @@ use tracedecay_application::{
     CancellationSignal, CapabilityGrantId, CapabilityGrantSnapshot, DisclosureClass, RequestContext,
 };
 use tracedecay_domain::{ActorId, RetrievalGrainV1, SessionId, TemporalModeV1, canonical_sha256};
+use tracedecay_session_memory::session::{SessionRetrievalScope, SessionTemporalQuery};
 use tracedecay_temporal_query::context::ContextBudget;
 use tracedecay_temporal_query::ranking::DiversityLimits;
 use tracedecay_tool_catalog::{CapabilityId, UseCaseId};
-use tracedecay_usecases::session::{SessionRetrievalScope, SessionTemporalQuery};
 
-use crate::dashboard::{
+use tracedecay_dashboard_api::{
     DashboardHttpRequestControlV1, DashboardLcmCanonicalMatchesV1, DashboardLcmCanonicalMessageV1,
     DashboardLcmCanonicalPageV1, DashboardLcmCanonicalStatsV1, DashboardLcmCanonicalSummaryV1,
     DashboardLcmReadFutureV1, DashboardLcmReadOutcomeV1, DashboardLcmReadPortV1,
     DashboardLcmReadRequestV1, DashboardLcmReadStateV1,
 };
+use tracedecay_lcm::{LcmDescribeResponse, LcmDescribeTarget};
 use tracedecay_sessions::runtime::SessionSearchTimeRange;
-use tracedecay_sessions::runtime::lcm::{LcmDescribeResponse, LcmDescribeTarget};
 
-use crate::daemon::session_retrieval::{
+use tracedecay_session_memory::context::ResolvedSessionIdentity;
+use tracedecay_session_runtime::session_retrieval::{
     LcmDescribeServiceCommand, LcmDescribeServiceOutcome, SessionApplicationRetrievalPortV1,
     SessionRetrievalPageView, SessionRetrievalServiceOutcome, SessionRetrievalStoreScope,
     admitted_execution_limits,
 };
-use tracedecay_usecases::context::ResolvedSessionIdentity;
 
 const SUMMARY_DESCRIBE_CONCURRENCY: usize = 8;
 const DASHBOARD_AGGREGATE_PAGE_LIMIT: usize = 16;
@@ -39,6 +39,7 @@ enum DashboardLcmRequestAdmissionErrorV1 {
 }
 
 impl DashboardLcmRequestAdmissionErrorV1 {
+    #[hotpath::skip]
     const fn read_state_and_reason(self) -> (DashboardLcmReadStateV1, &'static str) {
         match self {
             Self::DeadlineElapsed => (
@@ -516,6 +517,7 @@ impl DashboardLcmReadAdapter {
         ))
     }
 
+    #[hotpath::skip]
     async fn describe(
         &self,
         context: &RequestContext,
@@ -680,9 +682,9 @@ fn cursor_manifest_not_ready(
 }
 
 const fn session_budget_reason(
-    stage: tracedecay_usecases::session::SessionRetrievalBudgetStageV1,
+    stage: tracedecay_session_memory::session::SessionRetrievalBudgetStageV1,
 ) -> &'static str {
-    use tracedecay_usecases::session::SessionRetrievalBudgetStageV1;
+    use tracedecay_session_memory::session::SessionRetrievalBudgetStageV1;
 
     match stage {
         SessionRetrievalBudgetStageV1::RequestResultLimit => {
@@ -904,27 +906,28 @@ mod tests {
             &'a self,
             _context: &'a RequestContext,
             _query: SessionTemporalQuery,
-        ) -> crate::daemon::session_retrieval::SessionApplicationRetrievalFutureV1<'a> {
+        ) -> tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalFutureV1<'a>
+        {
             panic!("expired dashboard admission must not invoke retrieval")
         }
     }
 
     fn dashboard_lcm_test_identity() -> ResolvedSessionIdentity {
         ResolvedSessionIdentity::for_project(
-            tracedecay_usecases::context::ProfileId::new("profile.dashboard-lcm-test")
+            tracedecay_session_memory::context::ProfileId::new("profile.dashboard-lcm-test")
                 .expect("profile identity"),
             tracedecay_domain::ProjectId::new("project.dashboard-lcm-test")
                 .expect("project identity"),
-            tracedecay_usecases::context::SessionStoreId::new("store.dashboard-lcm-test")
+            tracedecay_session_memory::context::SessionStoreId::new("store.dashboard-lcm-test")
                 .expect("store identity"),
-            tracedecay_usecases::context::SessionRootId::new("root.dashboard-lcm-test")
+            tracedecay_session_memory::context::SessionRootId::new("root.dashboard-lcm-test")
                 .expect("root identity"),
-            tracedecay_usecases::context::ResolvedGitRoute::new(
+            tracedecay_session_memory::context::ResolvedGitRoute::new(
                 tracedecay_domain::RepositoryId::new("repository.dashboard-lcm-test")
                     .expect("repository identity"),
                 tracedecay_domain::WorktreeId::new("worktree.dashboard-lcm-test")
                     .expect("worktree identity"),
-                tracedecay_usecases::context::BranchId::new("branch.dashboard-lcm-test")
+                tracedecay_session_memory::context::BranchId::new("branch.dashboard-lcm-test")
                     .expect("branch identity"),
             ),
         )
@@ -1004,13 +1007,13 @@ mod tests {
     fn dashboard_budget_refusal_preserves_stage_in_reason() {
         assert_eq!(
             session_budget_reason(
-                tracedecay_usecases::session::SessionRetrievalBudgetStageV1::ContextTokens
+                tracedecay_session_memory::session::SessionRetrievalBudgetStageV1::ContextTokens
             ),
             "lcm_temporal_budget_context_tokens"
         );
         assert_eq!(
             session_budget_reason(
-                tracedecay_usecases::session::SessionRetrievalBudgetStageV1::ExecutionWorkExhausted
+                tracedecay_session_memory::session::SessionRetrievalBudgetStageV1::ExecutionWorkExhausted
             ),
             "lcm_temporal_budget_execution_work_exhausted"
         );
@@ -1039,7 +1042,7 @@ mod tests {
     #[test]
     fn dashboard_aggregate_pages_use_the_canonical_cursor_and_authorized_root() {
         let request = DashboardLcmReadRequestV1::Timeline {
-            bucket: crate::dashboard::DashboardLcmTimelineBucketV1::Day,
+            bucket: tracedecay_dashboard_api::DashboardLcmTimelineBucketV1::Day,
             session_id: None,
             limit: 400,
         };

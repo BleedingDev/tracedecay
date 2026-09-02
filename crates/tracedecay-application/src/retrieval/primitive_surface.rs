@@ -20,6 +20,7 @@ pub enum PrimitiveSemanticModeV1 {
 }
 
 impl PrimitiveSemanticModeV1 {
+    #[hotpath::skip]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::FallbackAllowed => "fallback_allowed",
@@ -36,6 +37,7 @@ pub enum ContextModeV1 {
 }
 
 impl ContextModeV1 {
+    #[hotpath::skip]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Explore => "explore",

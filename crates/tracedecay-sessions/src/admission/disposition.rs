@@ -32,6 +32,7 @@ impl HostAdmissionStatus {
     /// (the runtime kernel's hook-runtime error context) and be reconstituted
     /// with [`Self::from_wire`] without anyone re-deriving it from a reason
     /// code.
+    #[hotpath::skip]
     pub const fn as_wire(self) -> &'static str {
         match self {
             Self::Supported => "supported",
@@ -238,6 +239,7 @@ fn bounded_reason_code(value: &str) -> String {
 }
 
 impl HostAdmissionStatus {
+    #[hotpath::skip]
     pub const fn is_replay_progress(self) -> bool {
         matches!(
             self,

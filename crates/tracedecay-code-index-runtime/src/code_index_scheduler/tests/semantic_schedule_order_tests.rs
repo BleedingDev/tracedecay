@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{Receiver, Sender, channel},
 };
 use std::time::Duration;
@@ -33,19 +33,55 @@ async fn published_generation_for_root(
     .expect("matching project generation publication")
 }
 
+/// Ordered log of the generation ids a semantic hook was offered.
+///
+/// Semantic delivery is at-least-once per serving generation: no-op
+/// verification passes and remount wakes re-offer the already-serving
+/// generation so a lost enqueue is retried, and the production hook dedupes
+/// downstream. Tests therefore assert on which generations a hook observed,
+/// never on exact call counts.
+type SemanticDeliveryLogV1 = Arc<Mutex<Vec<CodeGenerationId>>>;
+
+fn recording_semantic_hook(
+    deliveries: &SemanticDeliveryLogV1,
+) -> SavedCodeGenerationScheduleHookV1 {
+    let deliveries = Arc::clone(deliveries);
+    Arc::new(move |generation: Arc<CodeIndexPublishedGenerationV1>| {
+        deliveries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(generation.manifest().generation_id.clone());
+        true
+    })
+}
+
+fn delivered_generations(deliveries: &SemanticDeliveryLogV1) -> Vec<CodeGenerationId> {
+    deliveries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+async fn wait_for_semantic_delivery(
+    deliveries: &SemanticDeliveryLogV1,
+    generation: &CodeGenerationId,
+) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !delivered_generations(deliveries).contains(generation) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("semantic hook received the generation");
+}
+
 #[tokio::test]
 async fn remount_replaces_semantic_hook_and_replays_latest_generation() {
     let fixture = GitFixture::new(&[("src/lib.rs", "pub fn alpha() -> u32 { 1 }\n")]);
     let store = TempDir::new().expect("store root");
     let registry = CodeIndexSchedulerRegistryV1::new(1);
-    let first_calls = Arc::new(AtomicUsize::new(0));
-    let first_hook = {
-        let calls = Arc::clone(&first_calls);
-        Arc::new(move |_: Arc<CodeIndexPublishedGenerationV1>| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            true
-        }) as SavedCodeGenerationScheduleHookV1
-    };
+    let first_deliveries: SemanticDeliveryLogV1 = Arc::new(Mutex::new(Vec::new()));
+    let first_hook = recording_semantic_hook(&first_deliveries);
     assert!(
         registry
             .mount_worktree(
@@ -58,22 +94,10 @@ async fn remount_replaces_semantic_hook_and_replays_latest_generation() {
             .expect("mount scheduler")
     );
     let first_generation = wait_for_initial_generation(&registry, fixture.path()).await;
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while first_calls.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("initial semantic schedule");
+    wait_for_semantic_delivery(&first_deliveries, &first_generation).await;
 
-    let second_calls = Arc::new(AtomicUsize::new(0));
-    let second_hook = {
-        let calls = Arc::clone(&second_calls);
-        Arc::new(move |_: Arc<CodeIndexPublishedGenerationV1>| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            true
-        }) as SavedCodeGenerationScheduleHookV1
-    };
+    let second_deliveries: SemanticDeliveryLogV1 = Arc::new(Mutex::new(Vec::new()));
+    let second_hook = recording_semantic_hook(&second_deliveries);
     assert!(
         !registry
             .mount_worktree(
@@ -85,12 +109,18 @@ async fn remount_replaces_semantic_hook_and_replays_latest_generation() {
             .await
             .expect("remount scheduler")
     );
-    assert_eq!(
-        second_calls.load(Ordering::SeqCst),
-        1,
-        "remount must replay the already-published generation"
+    // Remount replays the already-published generation to the replacement
+    // hook without requiring a new edit.
+    wait_for_semantic_delivery(&second_deliveries, &first_generation).await;
+    // The hook swap happens under the scheduler mutex, so once remount
+    // returns no offer to the retired hook can still be in flight.
+    let retired_deliveries = delivered_generations(&first_deliveries);
+    assert!(
+        retired_deliveries
+            .iter()
+            .all(|generation| generation == &first_generation),
+        "retired hook saw only the generation published during its tenure"
     );
-    let retired_calls = first_calls.load(Ordering::SeqCst);
 
     fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 2 }\n");
     assert!(
@@ -100,19 +130,12 @@ async fn remount_replaces_semantic_hook_and_replays_latest_generation() {
     );
     let second_generation =
         wait_for_generation_change(&registry, fixture.path(), &first_generation).await;
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while second_calls.load(Ordering::SeqCst) < 2 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("replacement hook scheduled edited generation");
+    wait_for_semantic_delivery(&second_deliveries, &second_generation).await;
     assert_eq!(
-        first_calls.load(Ordering::SeqCst),
-        retired_calls,
+        delivered_generations(&first_deliveries),
+        retired_deliveries,
         "retired hook must not receive later generations"
     );
-    let disabled_calls = second_calls.load(Ordering::SeqCst);
     assert!(
         !registry
             .mount_worktree(
@@ -124,17 +147,25 @@ async fn remount_replaces_semantic_hook_and_replays_latest_generation() {
             .await
             .expect("remount without semantics")
     );
+    // Snapshot after the clearing remount returns: at-least-once re-offers of
+    // `second_generation` may land up to the hook swap, but never after it.
+    let disabled_deliveries = delivered_generations(&second_deliveries);
     fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 3 }\n");
     assert!(
         registry
             .notify_path(fixture.path(), fixture.path().join("src/lib.rs"))
             .await
     );
-    let _ = wait_for_generation_change(&registry, fixture.path(), &second_generation).await;
+    let third_generation =
+        wait_for_generation_change(&registry, fixture.path(), &second_generation).await;
     assert_eq!(
-        second_calls.load(Ordering::SeqCst),
-        disabled_calls,
+        delivered_generations(&second_deliveries),
+        disabled_deliveries,
         "remount without a semantic runtime must clear the stale hook"
+    );
+    assert!(
+        !disabled_deliveries.contains(&third_generation),
+        "no hook may observe a generation published after semantics were cleared"
     );
     registry.shutdown().await;
 }
@@ -187,6 +218,79 @@ async fn semantic_schedule_reuses_the_serving_generation_handle() {
         Arc::ptr_eq(&scheduled_generation, &serving_generation),
         "semantic scheduling must share the immutable serving generation instead of deep-cloning it"
     );
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn semantic_schedule_can_retry_the_serving_generation_after_lifecycle_selection() {
+    let fixture = GitFixture::new(&[("src/lib.rs", "pub fn alpha() -> u32 { 1 }\n")]);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    let lifecycle_ready = Arc::new(AtomicBool::new(false));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let scheduled_generation = Arc::new(Mutex::new(None));
+    let semantic_hook = {
+        let lifecycle_ready = Arc::clone(&lifecycle_ready);
+        let attempts = Arc::clone(&attempts);
+        let scheduled_generation = Arc::clone(&scheduled_generation);
+        Arc::new(move |generation: Arc<CodeIndexPublishedGenerationV1>| {
+            attempts.fetch_add(1, Ordering::AcqRel);
+            if !lifecycle_ready.load(Ordering::Acquire) {
+                return false;
+            }
+            *scheduled_generation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(generation);
+            true
+        }) as SavedCodeGenerationScheduleHookV1
+    };
+    assert!(
+        registry
+            .mount_worktree(
+                test_project_id(),
+                fixture.path(),
+                store.path().to_path_buf(),
+                Some(semantic_hook),
+            )
+            .await
+            .expect("mount scheduler")
+    );
+    wait_for_live_complete_generation(&registry, fixture.path()).await;
+    let attempts_before_selection = attempts.load(Ordering::Acquire);
+    assert!(
+        attempts_before_selection > 0,
+        "the serving generation must have reached the not-yet-selected lifecycle"
+    );
+
+    lifecycle_ready.store(true, Ordering::Release);
+    assert!(
+        registry
+            .reschedule_semantic_generation(fixture.path())
+            .await,
+        "selection completion must re-offer the already-serving generation"
+    );
+
+    let scheduler = registry
+        .scheduler_handle(fixture.path())
+        .await
+        .expect("scheduler handle");
+    let serving_generation = scheduler
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .latest_complete()
+        .expect("serving generation")
+        .generation_handle();
+    let scheduled_generation = scheduled_generation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("lifecycle-ready schedule");
+    assert_eq!(
+        attempts.load(Ordering::Acquire),
+        attempts_before_selection + 1,
+        "selection completion must trigger exactly one bounded retry"
+    );
+    assert!(Arc::ptr_eq(&scheduled_generation, &serving_generation));
     registry.shutdown().await;
 }
 
@@ -330,14 +434,8 @@ async fn panicking_semantic_hook_does_not_retire_later_reconciliation() {
     let first_publication = published_generation_for_root(&mut publications, &project_root).await;
     assert_eq!(first_publication, first_generation);
 
-    let replacement_calls = Arc::new(AtomicUsize::new(0));
-    let replacement_hook = {
-        let calls = Arc::clone(&replacement_calls);
-        Arc::new(move |_: Arc<CodeIndexPublishedGenerationV1>| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            true
-        }) as SavedCodeGenerationScheduleHookV1
-    };
+    let replacement_deliveries: SemanticDeliveryLogV1 = Arc::new(Mutex::new(Vec::new()));
+    let replacement_hook = recording_semantic_hook(&replacement_deliveries);
     assert!(
         !registry
             .mount_worktree(
@@ -349,11 +447,8 @@ async fn panicking_semantic_hook_does_not_retire_later_reconciliation() {
             .await
             .expect("replace panicking hook")
     );
-    assert_eq!(
-        replacement_calls.load(Ordering::SeqCst),
-        1,
-        "replacement hook replays the already-serving generation"
-    );
+    // Remount replays the already-serving generation to the replacement hook.
+    wait_for_semantic_delivery(&replacement_deliveries, &first_generation).await;
 
     fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 2 }\n");
     assert!(
@@ -377,13 +472,7 @@ async fn panicking_semantic_hook_does_not_retire_later_reconciliation() {
     .expect("edited generation published");
     let second_generation =
         wait_for_generation_change(&registry, fixture.path(), &first_generation).await;
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while replacement_calls.load(Ordering::SeqCst) < 2 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("replacement hook received the edited generation");
+    wait_for_semantic_delivery(&replacement_deliveries, &second_generation).await;
     registry.shutdown().await;
 
     assert_ne!(first_generation, second_generation);

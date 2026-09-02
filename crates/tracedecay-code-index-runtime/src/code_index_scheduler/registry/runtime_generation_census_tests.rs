@@ -7,19 +7,20 @@ use std::process::Command;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use crate::daemon::project_open_owners::{
-    project_code_index_generation_census_reader, resolved_scope_for_project,
-};
+use crate::daemon::project_open_owners::project_code_index_generation_census_reader;
 use crate::mcp::tools::handlers::{
     ToolCallRegistryOptions, handle_tool_call_with_registry_options,
 };
-use crate::runtime_telemetry::{GenerationCensusSnapshot, GenerationCensusUnavailableReason};
 use crate::tracedecay::TraceDecay;
 use tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1;
+use tracedecay_code_index_runtime::resolved_scope_for_project;
 use tracedecay_runtime_core::config::PinnedUserDataDir;
+use tracedecay_session_memory::runtime_telemetry::{
+    GenerationCensusSnapshot, GenerationCensusUnavailableReason,
+};
 
 #[tokio::test]
-async fn runtime_mcp_reports_exact_counts_from_the_mounted_sealed_generation() {
+async fn runtime_mcp_refuses_counts_until_the_mounted_graph_can_serve_queries() {
     let _profile = PinnedUserDataDir::new();
     let dir = TempDir::new().expect("fixture root");
     let project = dir.path().join("runtime-generation-census-observed");
@@ -84,12 +85,10 @@ async fn runtime_mcp_reports_exact_counts_from_the_mounted_sealed_generation() {
     assert_eq!(
         payload["database"]["generation_census"],
         json!({
-            "state": "observed",
-            "source_total_bytes": 37,
-            "symbol_count": 2,
-            "edge_count": 1,
+            "state": "unavailable",
+            "reason": "exact_scope_generation_not_ready",
         }),
-        "the runtime census must describe the sealed generation, not a removed relational graph"
+        "a decoded seat without an interactive graph store must not claim query readiness"
     );
 
     let wrong_project_id =

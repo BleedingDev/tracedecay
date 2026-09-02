@@ -1,21 +1,28 @@
 //! Semantic code runtime: artifact store, model lifecycle, embedding
 //! projection, session pooling, and the daemon-callable scheduling handle.
 //!
-//! The crate owns the semantic implementation outright. Configuration
-//! ownership and application status projection stay with the root binary; the
-//! few contracts both sides need (resource ceilings, the fallback reason, the
-//! rerank compatibility pins, and the default catalog model id) are defined
-//! here and re-exported by the root's configuration modules.
+//! The crate owns the semantic implementation outright, including user-data-dir
+//! lifecycle-root discovery via `tracedecay_runtime_core::config::user_data_dir`.
+//! Application/Doctor status projection stays in `tracedecay-usecases`. Shared
+//! configuration, artifact, lifecycle, and runtime-status contracts are
+//! owned by `tracedecay-semantic-contracts`.
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 
-use serde::{Deserialize, Serialize};
 use tracedecay_domain::{
-    CodeGenerationId, CodeSearchChunkV1, ComponentRevision, ManifestDigest,
-    ProjectionBatchRequestV1, ProjectionKeyV1, VectorGenerationIdV1,
+    CodeGenerationId, CodeSearchChunkV1, ProjectionBatchRequestV1, ProjectionKeyV1,
+    VectorGenerationIdV1,
+};
+use tracedecay_semantic_contracts::configuration::{
+    SemanticFallbackReasonV1, SemanticResourceCeilings,
+};
+use tracedecay_semantic_contracts::lifecycle::SemanticModelLifecycleStateV1;
+use tracedecay_semantic_contracts::runtime_status::{
+    SemanticGenerationPointerV1, SemanticRuntimeScheduleFailureV1, SemanticRuntimeScheduleStatusV1,
+    SemanticRuntimeStatusProjectionV1,
 };
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -49,7 +56,6 @@ mod hotpath_observe;
 pub use generation_resume::SemanticProjectionResumeOutcomeV1;
 use generation_resume::SemanticProjectionResumeV1;
 use generation_resume::{completed_batch_offset, install_candidate_on_success};
-mod manifest;
 mod model_catalog;
 mod model_lifecycle;
 pub mod projector;
@@ -67,18 +73,15 @@ pub use model_catalog::{CatalogedFastEmbedModelV1, FastEmbedModelCatalogV1};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use model_lifecycle::ModelMemberSourceV1;
 pub use model_lifecycle::{
-    ModelLifecycleErrorV1, SemanticLifecycleVerifiedReadyEventV1,
-    SemanticModelLifecycleEvaluationPublicationLeaseV1, SemanticModelLifecycleOwnerV1,
-    SemanticModelLifecyclePublicationIdentityV1, SemanticModelLifecycleStateV1,
-    SemanticModelLifecycleStatusV1, SemanticModelRemediationV1, apply_config_selection,
+    ModelLifecycleErrorV1, SemanticModelLifecycleEvaluationPublicationLeaseV1,
+    SemanticModelLifecycleOwnerV1, SemanticModelLifecyclePublicationIdentityV1,
+    apply_config_selection, apply_default_config_selection, default_shared_lifecycle_owner,
     open_local_semantic_evaluation_lifecycle, shared_lifecycle_owner,
 };
 
 pub use runtime_service::{
-    PreparedSemanticRuntimeCommitV1, SemanticGenerationPointerV1,
-    SemanticRuntimeScheduleCancellationV1, SemanticRuntimeScheduleFailureV1,
-    SemanticRuntimeScheduleStatusV1, SemanticRuntimeSchedulingHandleV1,
-    SemanticRuntimeShutdownReceiptV1, SemanticRuntimeWorkV1,
+    PreparedSemanticRuntimeCommitV1, SemanticRuntimeScheduleCancellationV1,
+    SemanticRuntimeSchedulingHandleV1, SemanticRuntimeShutdownReceiptV1, SemanticRuntimeWorkV1,
 };
 pub use semantic_evaluation::{
     PreparedSemanticEvaluationProjectionV1, SemanticEvaluationCancellationV1,
@@ -88,95 +91,15 @@ pub use semantic_evaluation::{
     measure_semantic_evaluation_projection_cancellation, prepare_semantic_evaluation_projection,
 };
 
-/// Default `FastEmbed` catalog model selected on install (offline-safe).
-///
-/// Root configuration re-exports this so settings validation and the model
-/// acquisition lifecycle can never disagree about the default selection.
-pub const DEFAULT_FASTEMBED_MODEL_ID: &str = "JinaEmbeddingsV2BaseCode";
-
 /// Resolve the lifecycle store root beneath a caller-supplied user data
-/// directory. The crate never discovers the data directory itself; the root
-/// binary owns that decision and passes the resolved path in.
+/// directory.
 pub fn default_lifecycle_root_in(user_data_dir: &Path) -> PathBuf {
     user_data_dir.join("semantic-models")
 }
 
-/// Process ceilings applied before an installed semantic profile is admitted.
-///
-/// The selected artifact manifest may impose tighter limits. These local
-/// ceilings never authorize a profile to exceed its own declared bounds.
-/// Range validation stays with the root configuration owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SemanticResourceCeilings {
-    pub max_model_bytes: u64,
-    pub max_tokenizer_bytes: u64,
-    pub max_resident_bytes: u64,
-    pub max_threads: u32,
-    pub max_concurrent_sessions: u32,
-    pub max_batch_size: u32,
-    pub max_sequence_length: u32,
-    pub load_deadline_ms: u64,
-}
-
-impl Default for SemanticResourceCeilings {
-    fn default() -> Self {
-        Self {
-            max_model_bytes: 700 * 1024 * 1024,
-            max_tokenizer_bytes: 64 * 1024 * 1024,
-            max_resident_bytes: 2 * 1024 * 1024 * 1024,
-            // The artifact admits this maximum. The installed background CPU
-            // authority narrows the native runtime on smaller hosts.
-            max_threads: embedding_parallelism::default_max_intra_threads(),
-            // Concurrent sessions are pure sizing: each one is an independent
-            // invocation of the same graph over the same tensor shape. Default
-            // to what the serving reservation leaves room for instead of
-            // embedding single-file on every host.
-            max_concurrent_sessions: embedding_parallelism::default_max_concurrent_sessions(),
-            max_batch_size: 32,
-            max_sequence_length: 512,
-            load_deadline_ms: 30_000,
-        }
-    }
-}
-
-/// Exact artifact and runtime pins for the optional bounded reranker.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RerankCompatibilityPinsV1 {
-    pub implementation_revision: ComponentRevision,
-    pub artifact_manifest_digest: ManifestDigest,
-    pub runtime_compatibility_digest: ManifestDigest,
-}
-
-/// Why the semantic lane is unavailable or degraded for one observation.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SemanticFallbackReasonV1 {
-    ConfigurationUnavailable,
-    RuntimeUnavailable,
-    ArtifactUnavailable,
-    IncompatibleRuntime,
-    ResourceCeilingExceeded,
-    CorruptArtifact,
-    Indexing,
-    RuntimeFailure,
-    RollbackInProgress,
-    InvalidRuntimeStatus,
-    /// Selected catalog model has not been downloaded yet.
-    SelectedNotDownloaded,
-    /// Daemon-owned model acquisition is in progress.
-    Downloading,
-    /// Downloaded bytes are being verified against catalog pins.
-    Verifying,
-    /// Model is installed but not yet loaded into the runtime.
-    Loading,
-    /// Model acquisition or load failed; exact/lexical/graph remain available.
-    ModelFailed,
-    /// A complete prior activation exists but does not match the newest source.
-    Stale,
-    /// The semantic store schema must be explicitly reset before semantics run.
-    ResetRequired,
+/// Resolve the lifecycle store root under the process user data directory.
+pub fn default_lifecycle_root() -> Option<PathBuf> {
+    tracedecay_runtime_core::config::user_data_dir().map(|root| default_lifecycle_root_in(&root))
 }
 
 type SemanticProjectionStageFutureV1 = Pin<
@@ -249,7 +172,7 @@ impl LoadedSemanticArtifactV1 {
             manifest.privacy_key_epoch,
             resources,
         )
-        .map_err(|_| SemanticRuntimeScheduleFailureV1::Artifact)?;
+        .map_err(SemanticRuntimeScheduleFailureV1::artifact)?;
         Ok(Self(Arc::new(authority)))
     }
 
@@ -276,15 +199,17 @@ impl LoadedSemanticArtifactV1 {
         let key = projection.embedding_key();
         let authority = AdmittedProjectionArtifactV1::from_lifecycle_install(
             model,
-            install_path,
+            install_path.as_path(),
             key.chunker_revision.clone(),
             key.privacy_domain.clone(),
             key.privacy_key_epoch,
             resources,
         )
-        .map_err(|_| SemanticRuntimeScheduleFailureV1::Artifact)?;
+        .map_err(SemanticRuntimeScheduleFailureV1::artifact)?;
         if authority.projection() != projection {
-            return Err(SemanticRuntimeScheduleFailureV1::Artifact);
+            return Err(SemanticRuntimeScheduleFailureV1::artifact(
+                "loaded lifecycle artifact does not match the requested projection",
+            ));
         }
         Ok(Self(Arc::new(authority)))
     }
@@ -319,7 +244,7 @@ impl LoadedSemanticArtifactV1 {
             manifest.privacy_key_epoch,
             resources,
         )
-        .map_err(|_| SemanticRuntimeScheduleFailureV1::Artifact)
+        .map_err(SemanticRuntimeScheduleFailureV1::artifact)
     }
 
     pub fn projection(&self) -> &tracedecay_domain::AdmittedEmbeddingProjectionKeyV1 {
@@ -335,7 +260,7 @@ impl LoadedSemanticArtifactV1 {
 pub struct FastEmbedSemanticGenerationRequestV1 {
     target_generation: CodeGenerationId,
     projection_request: ProjectionBatchRequestV1,
-    canonical_chunks: Vec<CodeSearchChunkV1>,
+    canonical_chunks: Vec<Arc<CodeSearchChunkV1>>,
     max_embeds_per_batch: usize,
     load_artifact: FastEmbedArtifactLoaderV1,
     resume_projection: SemanticProjectionResumeV1,
@@ -359,7 +284,7 @@ impl FastEmbedSemanticGenerationRequestV1 {
     >(
         target_generation: CodeGenerationId,
         projection_request: ProjectionBatchRequestV1,
-        canonical_chunks: Vec<CodeSearchChunkV1>,
+        canonical_chunks: Vec<Arc<CodeSearchChunkV1>>,
         max_embeds_per_batch: usize,
         load_artifact: LoadArtifact,
         resume_projection: ResumeProjection,
@@ -404,13 +329,6 @@ impl FastEmbedSemanticGenerationRequestV1 {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct SemanticRuntimeStatusProjectionV1 {
-    pub status: SemanticRuntimeScheduleStatusV1,
-    pub degraded_reason: Option<SemanticFallbackReasonV1>,
-    pub prior_generation: Option<VectorGenerationIdV1>,
-}
-
 /// Map a pre-install warm failure onto the scheduler's typed failure set.
 ///
 /// Cancellation and deadline expiry keep their identities: a cancelled or
@@ -431,6 +349,7 @@ fn warm_failure(error: SessionAcquireError) -> SemanticRuntimeScheduleFailureV1 
         SessionAcquireError::Exhausted { .. }
         | SessionAcquireError::QueueFull { .. }
         | SessionAcquireError::MemoryCeilingExceeded { .. }
+        | SessionAcquireError::ResidentCeilingExceeded { .. }
         | SessionAcquireError::Open(_)
         | SessionAcquireError::Closed => SemanticRuntimeScheduleFailureV1::Runtime,
     }
@@ -963,7 +882,8 @@ impl DaemonSemanticRuntimeHandleV1 {
                 prior_generation,
             } => (
                 Some(match reason {
-                    SemanticRuntimeScheduleFailureV1::Artifact => {
+                    SemanticRuntimeScheduleFailureV1::Artifact
+                    | SemanticRuntimeScheduleFailureV1::ArtifactDetail(_) => {
                         SemanticFallbackReasonV1::ArtifactUnavailable
                     }
                     SemanticRuntimeScheduleFailureV1::Runtime
@@ -1154,7 +1074,9 @@ where
         if vectors.len() != 1 {
             return Err("semantic projector returned a non-unit vector batch".to_owned());
         }
-        Ok(vectors.pop().unwrap_or_else(|| panic!("unit vector batch")))
+        vectors
+            .pop()
+            .ok_or_else(|| "semantic projector returned a non-unit vector batch".to_owned())
     }
 
     #[hotpath::measure(label = "semantic.embed.encode")]
@@ -1877,6 +1799,23 @@ mod scheduling_tests {
         assert_ne!(
             handle.current().map(|pointer| pointer.generation),
             Some(old)
+        );
+    }
+
+    #[test]
+    fn artifact_schedule_failure_carries_source_error_text() {
+        let failure = SemanticRuntimeScheduleFailureV1::artifact(
+            "cataloged lifecycle install is missing a required member",
+        );
+        assert_eq!(
+            failure,
+            SemanticRuntimeScheduleFailureV1::ArtifactDetail(
+                "cataloged lifecycle install is missing a required member".to_owned()
+            )
+        );
+        assert_eq!(
+            failure.to_string(),
+            "Artifact: cataloged lifecycle install is missing a required member"
         );
     }
 }

@@ -96,14 +96,14 @@ fn registration_with_cancellation(
 
 #[test]
 #[cfg(feature = "test-helpers")]
-fn semantic_stage_persists_vectors_without_ephemeral_hnsw_maintenance() {
+fn semantic_stage_maintains_generation_hnsw_index_across_reopen() {
     let fixture = ContractFixture::new();
     let mut authority = fixture.authority();
-    let plan = fixture.plan("deferred-hnsw", "semantic-deferred-hnsw", None);
+    let plan = fixture.plan("staged-hnsw", "semantic-staged-hnsw", None);
     let (batch, receipt) = fixture.batch_and_receipt(&plan, 1.5);
-    fixture.begin_and_append(&mut authority, &plan, &receipt, "deferred-hnsw");
+    fixture.begin_and_append(&mut authority, &plan, &receipt, "staged-hnsw");
     fixture
-        .apply(&mut authority, &receipt, batch, "deferred-hnsw.native")
+        .apply(&mut authority, &receipt, batch, "staged-hnsw.native")
         .unwrap();
 
     let namespace = GraphNamespace::new(plan.key.projection.namespace.as_str()).unwrap();
@@ -112,10 +112,21 @@ fn semantic_stage_persists_vectors_without_ephemeral_hnsw_maintenance() {
     let physical_namespace = GraphNamespace::new(format!(
         "generation:{}",
         hex::encode(Sha256::digest(
-            serde_json::to_vec(&(namespace, &projection, generation)).unwrap()
+            serde_json::to_vec(&(&namespace, &projection, generation)).unwrap()
         ))
     ))
     .unwrap();
+    let vector_property =
+        semantic_vector_native::vector_property(plan.semantic_generation_id.as_digest().as_str())
+            .unwrap();
+    let index_request = |namespace: GraphNamespace| GraphVectorIndexRequest {
+        namespace,
+        projection: projection.clone(),
+        property: vector_property.clone(),
+        dimension: usize::from(plan.recipe.embedding_dimension),
+        metric: VectorMetric::Cosine,
+        cancellation: Arc::new(TestCancellation),
+    };
     let database = fixture
         .graph
         .registry
@@ -124,21 +135,61 @@ fn semantic_stage_persists_vectors_without_ephemeral_hnsw_maintenance() {
 
     assert_eq!(
         database
-            .vector_index_status(GraphVectorIndexRequest {
-                namespace: physical_namespace,
-                projection,
-                property: semantic_vector_native::vector_property(
-                    plan.semantic_generation_id.as_digest().as_str(),
-                )
-                .unwrap(),
-                dimension: usize::from(plan.recipe.embedding_dimension),
-                metric: VectorMetric::Cosine,
-                cancellation: Arc::new(TestCancellation),
-            })
+            .vector_index_status(index_request(physical_namespace))
             .unwrap(),
-        GraphVectorIndexStatus::Missing,
-        "staging persists vector scalars, but its non-durable HNSW would be discarded on reopen"
+        GraphVectorIndexStatus::Available { vectors: 1 },
+        "staging maintains the generation's HNSW index alongside its vector scalars"
     );
+    drop(database);
+
+    fixture.settle_batch(&mut authority, &receipt, "staged-hnsw.settle");
+    fixture.ready(&mut authority, &plan, "staged-hnsw.ready");
+    let committed = fixture.publish(&mut authority, &plan, "staged-hnsw.publish");
+    settle_publication(&mut authority, &plan, &committed, "staged-hnsw.publication");
+    drop(committed);
+    drop(authority);
+
+    // The index the serving generation searches must be the persisted one:
+    // close the store, reopen it, and answer status and search through the
+    // recovered verified snapshot without any rebuild.
+    assert!(fixture.graph.close().unwrap());
+    fixture.graph.mount().unwrap();
+    let mut restarted_authority = fixture.authority();
+    let snapshot = with_context("staged-hnsw.recovered", |context| {
+        fixture.graph.registry.verified_generation_snapshot(
+            fixture.registration(),
+            &mut restarted_authority,
+            context,
+            &plan.publication_key,
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        snapshot
+            .vector_index_status(index_request(namespace.clone()))
+            .unwrap(),
+        GraphVectorIndexStatus::Available { vectors: 1 },
+        "reopen must restore the persisted generation index, not rebuild or lose it"
+    );
+    let matches = snapshot
+        .vector_search(tracedecay_graph_db::VectorSearchRequest {
+            namespace,
+            projection,
+            property: vector_property,
+            query: vec![1.5; usize::from(plan.recipe.embedding_dimension)],
+            dimension: usize::from(plan.recipe.embedding_dimension),
+            metric: VectorMetric::Cosine,
+            limit: 4,
+            cancellation: Arc::new(TestCancellation),
+        })
+        .unwrap()
+        .matches;
+    assert_eq!(
+        matches.len(),
+        1,
+        "the restored index must answer search over the staged vector"
+    );
+    assert!(matches[0].distance.is_finite());
 }
 
 fn finalize_retention_step(
@@ -192,9 +243,11 @@ fn native_batch_admission_rejects_every_chunk_binding_mismatch() {
         let plan = fixture.plan(name, name, None);
         let (batch, receipt) = fixture.batch_and_receipt_with_mismatch(&plan, 1.0, Some(mismatch));
         fixture.begin_and_append(&mut authority, &plan, &receipt, name);
-        assert_eq!(
-            fixture.apply(&mut authority, &receipt, batch, name),
-            Err(GraphDbError::Conflict),
+        assert!(
+            matches!(
+                fixture.apply(&mut authority, &receipt, batch, name),
+                Err(GraphDbError::Conflict { .. })
+            ),
             "{name} must fail closed"
         );
         // The projection admits one pending stage at a time; release the
@@ -504,15 +557,15 @@ fn receipt_then_cancel_fences_a_delayed_native_apply() {
         SemanticVectorStageCancelOutcome::Cancelled(ref record)
             if record.state == SemanticVectorStageState::Cancelled
     ));
-    assert_eq!(
+    assert!(matches!(
         fixture.apply(
             &mut authority,
             &receipt,
             batch,
             "receipt-cancel.delayed-apply"
         ),
-        Err(GraphDbError::Conflict)
-    );
+        Err(GraphDbError::Conflict { .. })
+    ));
 }
 
 #[test]
@@ -550,7 +603,7 @@ fn native_apply_then_cancel_removes_before_settlement() {
             &receipt.receipt_digest,
         )
     });
-    assert_eq!(settlement, Err(GraphDbError::Conflict));
+    assert!(matches!(settlement, Err(GraphDbError::Conflict { .. })));
     with_context("apply-cancel.resume", |context| {
         assert!(matches!(
             fixture
@@ -691,15 +744,15 @@ fn cancelled_response_loss_retry_reconciles_native_cleanup() {
             SemanticVectorStageCancelOutcome::ExactReplay(_)
         ));
     });
-    assert_eq!(
+    assert!(matches!(
         fixture.apply(
             &mut authority,
             &receipt,
             batch,
             "cancel-retry.delayed-apply"
         ),
-        Err(GraphDbError::Conflict)
-    );
+        Err(GraphDbError::Conflict { .. })
+    ));
 }
 
 #[test]
@@ -781,10 +834,10 @@ fn retention_cleanup_failure_keeps_cancel_fence_until_retry() {
         assert_eq!(failure, Err(GraphDbError::Cancelled));
 
         pause.release();
-        assert_eq!(
+        assert!(matches!(
             delayed_apply.join().expect("delayed apply thread"),
-            Err(GraphDbError::Conflict)
-        );
+            Err(GraphDbError::Conflict { .. })
+        ));
         assert_eq!(
             pause.calls.load(Ordering::SeqCst),
             2,

@@ -11,10 +11,10 @@ use tracedecay_domain::{
     ContentDigest, EdgeAuthorityV1, ManifestDigest, RelationEdgeKindV1, SnapshotFileDispositionV1,
     SourceSpan, SymbolOccurrenceId, canonical_sha256,
 };
-use tracedecay_usecases::graph::{map_code_graph_read_runtime_error, map_projection_error};
+use tracedecay_graph_query::{map_code_graph_read_runtime_error, map_projection_error};
 use tracedecay_usecases::tracedecay::SourceEditGraphReadV1;
 
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 const MAX_RENAME_SYMBOLS: usize = 10_000;
 const MAX_RENAME_FILES: usize = 100_000;
@@ -235,7 +235,7 @@ pub(super) fn relation_kind(edge: RelationEdgeKindV1, line: &str, path: &str) ->
 pub(super) fn ensure_active(graph: &SourceEditGraphReadV1) -> Result<()> {
     if graph.cancellation().is_cancelled() {
         return Err(map_code_graph_read_runtime_error(
-            tracedecay_usecases::graph::CodeGraphReadError::Cancelled,
+            tracedecay_graph_query::CodeGraphReadError::Cancelled,
         ));
     }
     Ok(())

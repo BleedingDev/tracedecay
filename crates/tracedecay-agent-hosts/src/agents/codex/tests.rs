@@ -520,6 +520,55 @@ fn sync_codex_hook_trust_rejects_tampered_installed_command() {
 }
 
 #[test]
+fn sync_codex_hook_trust_all_skipped_is_ok_without_hollow_state() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let plugin_dir = install_codex_personal_bootstrap(home.path(), TEST_BIN).unwrap();
+    let hooks_path = plugin_dir.join("hooks/hooks.json");
+    let mut hooks = load_json_file_strict(&hooks_path).unwrap();
+    // Tamper every managed command so the safety valve skips the full set.
+    let events = hooks["hooks"].as_object_mut().unwrap();
+    for groups in events.values_mut() {
+        let Some(groups) = groups.as_array_mut() else {
+            continue;
+        };
+        for group in groups {
+            let Some(handlers) = group
+                .get_mut("hooks")
+                .and_then(|value| value.as_array_mut())
+            else {
+                continue;
+            };
+            for handler in handlers {
+                let Some(command) = handler.get("command").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                handler["command"] = json!(format!("{command} && /tmp/untrusted-payload"));
+            }
+        }
+    }
+    safe_write_json_file(&hooks_path, &hooks, None).unwrap();
+    let config_path = codex_config_path(home.path());
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config_path,
+        "model = \"o4-mini\"\n\n[plugins.\"tracedecay@personal\"]\nenabled = true\n",
+    )
+    .unwrap();
+
+    let outcome = sync_codex_hook_trust(home.path(), TEST_BIN).unwrap();
+
+    assert_eq!(outcome.trusted, 0);
+    assert_eq!(outcome.skipped.len(), CODEX_MANAGED_HOOKS.len());
+    let config_text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !config_text.contains("[hooks"),
+        "all-skip must not leave hollow [hooks]/[hooks.state] tables: {config_text}"
+    );
+    assert!(config_text.contains("model = \"o4-mini\""));
+    assert!(config_text.contains("[plugins.\"tracedecay@personal\"]"));
+}
+
+#[test]
 fn codex_hook_command_invokes_tracedecay_is_a_safety_valve() {
     // A hook that actually invokes the tracedecay binary is trustable. Build
     // the command through the same hook_command helper the generator uses so
@@ -663,11 +712,12 @@ fn skill_tree_files(root: &Path) -> Vec<String> {
 }
 
 /// The composed Codex deploy set (sourced from the shared `plugin/` tree
-/// via `codex_files`) must cover every shared model-invocable skill and the
-/// 13 canonical `tracedecay-*` workflow dispatchers, plus Codex's manifest,
-/// `.mcp.json`, hooks, and README. Codex has no slash-command or
-/// `disable-model-invocation` surface, so it ships all skills in their
-/// canonical (model-invocable) form.
+/// via `codex_files`) must cover every file under `plugin/skills/` plus
+/// Codex's manifest, `.mcp.json`, hooks, and README. Codex has no
+/// slash-command or `disable-model-invocation` surface, so it ships all
+/// skills in their canonical (model-invocable) form. Workflow dispatch lives
+/// in native slash commands on other hosts; Codex does not ship those
+/// commands or retired `tracedecay-*` dispatcher skills.
 #[test]
 fn codex_embedded_file_list_covers_the_whole_source_bundle() {
     let deploy: std::collections::BTreeSet<String> = codex_embedded_plugin_files()
@@ -1227,4 +1277,44 @@ fn codex_update_plugin_refreshes_bundle_and_records_hook_trust() {
         CodexHookTrustState::Trusted
     );
     assert_eq!(codex_hook_trust_followup(home.path()), None);
+}
+
+#[test]
+fn deactivation_fails_on_corrupt_plugins_table() {
+    let home = tempfile::tempdir().unwrap();
+    install_codex_marketplace_entry(
+        &codex_personal_marketplace_path(home.path()),
+        "personal",
+        "Personal",
+        CODEX_GLOBAL_PLUGIN_SOURCE_PATH,
+    )
+    .unwrap();
+    let config_path = codex_config_path(home.path());
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, "plugins = \"corrupt\"\n").unwrap();
+
+    let error = CodexIntegration
+        .deactivate_deployed_host_registration(&install_ctx(home.path()))
+        .expect_err("a corrupt plugins table must fail deactivate");
+    assert!(
+        error
+            .to_string()
+            .contains("could not read Codex native plugin activation state"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        "plugins = \"corrupt\"\n"
+    );
+}
+
+#[test]
+fn detected_host_surface_reports_codex_home() {
+    let home = tempfile::tempdir().unwrap();
+    assert_eq!(CodexIntegration.detected_host_surface(home.path()), None);
+    std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+    assert_eq!(
+        CodexIntegration.detected_host_surface(home.path()),
+        Some(home.path().join(".codex"))
+    );
 }

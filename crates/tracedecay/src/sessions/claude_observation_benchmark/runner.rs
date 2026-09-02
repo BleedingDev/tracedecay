@@ -30,43 +30,13 @@ use tracedecay_usecases::observation::ObservationCancellation;
 /// They drive the real observation pipeline, and host admission refuses every
 /// capture with `background_cpu_unavailable` when no authority is installed.
 /// Production installs it during daemon bootstrap, which a benchmark never
-/// runs, and `tracedecay-global-db`'s equivalent harness helper is
-/// `#[cfg(test)] pub(crate)`, so it cannot be reused from here.
+/// runs. The shared JSONL preparation authority is process-wide and single
+/// (a second install with a different memory handle fails closed), so this
+/// delegates to the same helper `HostAdmissionTestRuntimeV1` uses instead of
+/// racing it with a benchmark-private handle.
 fn ensure_background_cpu_authority() {
-    use std::num::NonZeroUsize;
-    use tracedecay_private_fs::background_cpu::{
-        install_process_background_cpu, process_background_cpu,
-    };
-
-    use std::sync::{Arc, OnceLock};
-    use tracedecay_runtime_core::resident_memory::{
-        DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1, ProcessResidentMemoryV1,
-    };
-
-    static BENCHMARK_RESIDENT_MEMORY: OnceLock<Arc<ProcessResidentMemoryV1>> = OnceLock::new();
-
-    if process_background_cpu().is_none() {
-        // A sibling benchmark can win the process-wide installation race at a
-        // different canonical width; reuse that authority rather than making
-        // success depend on execution order.
-        if install_process_background_cpu(NonZeroUsize::MIN).is_err() {
-            assert!(
-                process_background_cpu().is_some(),
-                "background CPU authority is neither installable nor already installed"
-            );
-        }
-    }
-
-    // The Codex provider path additionally refuses with
-    // `BackgroundResourceUnavailable { resource: "process resident-memory
-    // authority" }` until preparation resources are configured.
-    let memory = Arc::clone(BENCHMARK_RESIDENT_MEMORY.get_or_init(|| {
-        Arc::new(ProcessResidentMemoryV1::new(
-            DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1,
-        ))
-    }));
-    let _ = tracedecay_sessions::runtime::codex::CodexDiscoveryHub::default()
-        .configure_preparation_resources(memory);
+    crate::host_admission::ensure_process_background_cpu_authority()
+        .expect("install process capture authorities for the benchmark");
 }
 
 use super::artifact::{
@@ -113,6 +83,7 @@ pub(super) struct Fixture {
 }
 
 impl Fixture {
+    #[hotpath::skip]
     pub(super) async fn new(repetition: usize) -> Self {
         let temp = benchmark_tempdir("pipeline-");
         let home = temp.path().join("home");
@@ -147,6 +118,7 @@ impl Fixture {
         ClaudeSource::with_home(&self.home).for_user_scope(Some(session_id.to_string()), Vec::new())
     }
 
+    #[hotpath::skip]
     pub(super) async fn ingest(&self, source: &ClaudeSource) -> ClaudeObservationIngestStats {
         let admission = self.runtime.facade();
         ingest_source_with_observations_with_admission(
@@ -161,6 +133,7 @@ impl Fixture {
         .expect("run production observation pipeline")
     }
 
+    #[hotpath::skip]
     pub(super) async fn replay(&self) -> Vec<StoredObservation> {
         self.replay_after(0, RECORDS_PER_REPETITION + 1).await
     }
@@ -171,6 +144,7 @@ impl Fixture {
             .expect("measure registered profile database storage")
     }
 
+    #[hotpath::skip]
     async fn replay_after(&self, after_sequence: u64, limit: usize) -> Vec<StoredObservation> {
         self.runtime
             .replay_observations(
@@ -182,6 +156,7 @@ impl Fixture {
             .expect("replay committed benchmark observations")
     }
 
+    #[hotpath::skip]
     pub(super) async fn verify_committed_state(&self, observations: &[StoredObservation]) {
         assert_eq!(observations.len(), RECORDS_PER_REPETITION);
         let expected_session_id = self
@@ -229,6 +204,7 @@ impl Fixture {
         self.verify_projector_only_current_writes().await;
     }
 
+    #[hotpath::skip]
     async fn verify_projector_only_current_writes(&self) {
         let snapshot = self
             .runtime
@@ -431,6 +407,7 @@ struct ProviderFixture {
 }
 
 impl ProviderFixture {
+    #[hotpath::skip]
     async fn new(kind: ProviderKind, repetition: usize) -> Self {
         let temp = benchmark_tempdir("provider-");
         let home = temp.path().join("home");
@@ -489,6 +466,7 @@ impl ProviderFixture {
             .expect("measure registered provider database storage")
     }
 
+    #[hotpath::skip]
     async fn parse_native_fixture(&self) -> usize {
         match self.kind {
             ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Cursor => {
@@ -530,6 +508,7 @@ impl ProviderFixture {
         }
     }
 
+    #[hotpath::skip]
     async fn ingest(&self) -> u64 {
         let scope = self.scope();
         let cancellation = ObservationCancellation::default();
@@ -640,10 +619,12 @@ impl ProviderFixture {
         adapter_work + projection.projected
     }
 
+    #[hotpath::skip]
     async fn replay(&self) -> Vec<StoredObservation> {
         self.replay_after(0, PROVIDER_REPLAY_LIMIT).await
     }
 
+    #[hotpath::skip]
     async fn replay_after(&self, sequence: u64, limit: usize) -> Vec<StoredObservation> {
         self.runtime
             .replay_observations(
@@ -740,6 +721,7 @@ impl ProviderSamples {
         }
     }
 
+    #[hotpath::skip]
     async fn measure_turn(&mut self, repetition: usize, fixture_id: usize) {
         let fixture = ProviderFixture::new(self.kind, fixture_id).await;
         let parse = PhaseSnapshot::start(fixture.database_storage_bytes());

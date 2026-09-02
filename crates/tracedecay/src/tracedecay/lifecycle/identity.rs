@@ -3,9 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::storage::{self, StoreLayout};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDb;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_runtime_core::storage::{self, StoreLayout};
 use tracedecay_store::ProjectId;
 
 use super::{MovedStoreAdoption, TraceDecay, TraceDecayOpenOptions};
@@ -53,6 +53,7 @@ impl TraceDecay {
     /// This differs from [`Self::resolve_registered_configuration_layout`] only
     /// in that a project with no enrollment marker or registry match falls
     /// through to a default identity instead of failing closed.
+    #[hotpath::skip]
     pub(crate) async fn resolve_first_touch_configuration_layout(
         project_root: &Path,
         open_options: &TraceDecayOpenOptions,
@@ -295,9 +296,11 @@ impl TraceDecay {
     ) -> bool {
         let option_resolved_store_exists = open_options
             .resolved_profile_root()
-            .and_then(|profile_root| crate::storage::resolve_layout(project_root, &profile_root))
+            .and_then(|profile_root| {
+                tracedecay_runtime_core::storage::resolve_layout(project_root, &profile_root)
+            })
             .is_ok_and(|layout| {
-                layout.storage_mode == crate::storage::StorageMode::ProfileSharded
+                layout.storage_mode == tracedecay_runtime_core::storage::StorageMode::ProfileSharded
                     && layout.graph_db_path.exists()
             });
         if open_options.profile_root.is_some() || open_options.global_db_path.is_some() {
@@ -305,14 +308,16 @@ impl TraceDecay {
         }
         option_resolved_store_exists
             || crate::config::has_project_database(project_root)
-            || crate::storage::has_repository_identity_marker(project_root)
+            || tracedecay_runtime_core::storage::has_repository_identity_marker(project_root)
     }
 
+    #[hotpath::skip]
     pub async fn has_initialized_store(project_root: &Path) -> bool {
         Self::has_initialized_store_with_options(project_root, &TraceDecayOpenOptions::default())
             .await
     }
 
+    #[hotpath::skip]
     pub async fn has_initialized_store_with_options(
         project_root: &Path,
         open_options: &TraceDecayOpenOptions,
@@ -325,6 +330,7 @@ impl TraceDecay {
     /// Resolves the store layout for a project using the same registry/alias
     /// aware path as [`Self::has_initialized_store`], returning it only when
     /// the resolved store's graph database actually exists.
+    #[hotpath::skip]
     pub async fn initialized_store_layout_with_options(
         project_root: &Path,
         open_options: &TraceDecayOpenOptions,
@@ -350,6 +356,7 @@ impl TraceDecay {
 
     /// Resolves the profile store layout for a local path using enrollment
     /// markers first, then the global registry aliases for the git identity.
+    #[hotpath::skip]
     pub async fn resolve_store_layout_for_identity(project_root: &Path) -> Result<StoreLayout> {
         Self::resolve_store_layout_for_identity_with_options(
             project_root,
@@ -358,6 +365,7 @@ impl TraceDecay {
         .await
     }
 
+    #[hotpath::skip]
     pub async fn resolve_store_layout_for_identity_with_options(
         project_root: &Path,
         open_options: &TraceDecayOpenOptions,
@@ -365,6 +373,7 @@ impl TraceDecay {
         Self::resolve_store_layout_for_local_identity(project_root, open_options).await
     }
 
+    #[hotpath::skip]
     async fn resolve_store_layout_for_local_identity(
         project_root: &Path,
         open_options: &TraceDecayOpenOptions,
@@ -388,8 +397,14 @@ impl TraceDecay {
     ) -> Result<()> {
         let profile_root = open_options.resolved_profile_root()?;
         let selected_id = selected.identity.project_id.as_deref();
-        let (candidates, _, _) =
+        let (candidates, _, candidates_match_exact_root) =
             storage::matching_legacy_profile_layouts(project_root, &profile_root, selected_id)?;
+        // Sibling worktree manifests share a git common dir but name a
+        // different checkout path. They are not a second identity for this
+        // exact root and must not fail a registered exact-root resolution.
+        if !candidates_match_exact_root {
+            return Ok(());
+        }
         let Some(legacy) = candidates
             .into_iter()
             .find(|layout| layout.graph_db_path.is_file())

@@ -3,7 +3,8 @@ use std::process::Command;
 
 use super::*;
 #[cfg(unix)]
-use tracedecay_lsp::{FramePoll, FrameSend};
+use tracedecay_daemon_protocol::{FramePoll, FrameSend};
+use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
 #[cfg(unix)]
 fn future_lsp_deadline(after: std::time::Duration) -> tracedecay_application::Deadline {
@@ -50,12 +51,7 @@ fn lsp_test_invocation(
         moved_store_adoption: crate::tracedecay::MovedStoreAdoption::Never,
     };
     tracedecay_daemon_protocol::DaemonInvocationClient::new(
-        super::super::DaemonConnection {
-            endpoint,
-            auth_token: None,
-            authority_record: None,
-        }
-        .into_protocol(),
+        tracedecay_daemon_protocol::DaemonConnection::new(endpoint, None),
         handshake,
     )
 }
@@ -70,13 +66,13 @@ async fn project_owner_wait_stops_when_the_client_disconnects() {
         }
     }
 
-    let (mut transport, input, _output) = crate::mcp::transport::ChannelTransport::new();
+    let (mut transport, input, _output) = tracedecay_mcp::transport::ChannelTransport::new();
     drop(input);
     let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let probe = DropProbe(Arc::clone(&dropped));
     let open = async move {
         let _probe = probe;
-        std::future::pending::<tracedecay_runtime_core::errors::Result<()>>().await
+        std::future::pending::<tracedecay_domain::errors::Result<()>>().await
     };
 
     let error = tokio::time::timeout(
@@ -96,11 +92,11 @@ async fn project_owner_wait_stops_when_the_client_disconnects() {
 
 #[tokio::test]
 async fn project_owner_half_close_can_still_receive_a_bounded_result() {
-    let (mut transport, input, _output) = crate::mcp::transport::ChannelTransport::new();
+    let (mut transport, input, _output) = tracedecay_mcp::transport::ChannelTransport::new();
     drop(input);
     let result = super::super::await_project_owner_or_disconnect(&mut transport, async {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        Ok::<_, tracedecay_runtime_core::errors::TraceDecayError>(17)
+        Ok::<_, tracedecay_domain::errors::TraceDecayError>(17)
     })
     .await
     .expect("half-closed owner lookup");
@@ -126,7 +122,7 @@ fn closed_feedback_list_request(
     );
     super::super::DaemonInvocationRequest::feedback(
         request_id,
-        crate::application_surface::ApplicationSurfaceOperation::FeedbackList,
+        ApplicationSurfaceOperation::FeedbackList,
         request_handle.to_owned(),
         observed_at,
         tracedecay_application::Deadline::new(tracedecay_domain::UtcMicros(
@@ -567,12 +563,7 @@ async fn stdio_bridge_session_reconnects_on_a_fresh_socket_and_resumes_frames() 
         moved_store_adoption: crate::tracedecay::MovedStoreAdoption::Never,
     };
     let invocation = tracedecay_daemon_protocol::DaemonInvocationClient::new(
-        super::super::DaemonConnection {
-            endpoint,
-            auth_token: None,
-            authority_record: None,
-        }
-        .into_protocol(),
+        tracedecay_daemon_protocol::DaemonConnection::new(endpoint, None),
         handshake,
     );
     let (deadline, cancellation) = active_lsp_control("cancel.lsp.reconnect-open");
@@ -668,7 +659,7 @@ async fn socket_client_requires_user_storage_scope_without_project() {
         enter_test_daemon_database_scope(&client_identity.profile_root, "projectless-socket-test");
 
     let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let server_task = tokio::spawn(super::super::serve_socket_client(server, engine));
+    let server_task = tokio::spawn(Box::pin(super::super::serve_socket_client(server, engine)));
 
     let (reader, mut writer) = client.into_split();
     let handshake = DaemonHandshake {
@@ -734,7 +725,7 @@ async fn user_session_read_bypasses_unregistered_project_route() {
     let endpoint = tracedecay_daemon_protocol::DaemonEndpoint::Unix(
         client_identity.profile_root.join("daemon.sock"),
     );
-    let daemon_authority = super::super::authority::DaemonAuthority::acquire(
+    let daemon_authority = tracedecay_daemon_identity::authority::DaemonAuthority::acquire(
         &client_identity.profile_root,
         &endpoint,
         "user-session-read-test",
@@ -751,7 +742,7 @@ async fn user_session_read_bypasses_unregistered_project_route() {
     std::fs::create_dir_all(&unregistered_project).expect("unregistered project directory");
 
     let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let server_task = tokio::spawn(super::super::serve_socket_client(server, engine));
+    let server_task = tokio::spawn(Box::pin(super::super::serve_socket_client(server, engine)));
 
     let (reader, mut writer) = client.into_split();
     let handshake = DaemonHandshake {
@@ -825,7 +816,7 @@ async fn socket_client_routes_multiple_closed_invocations_without_falling_back_t
         "closed-invocation-socket-test",
     );
     let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let server_task = tokio::spawn(super::super::serve_socket_client(server, engine));
+    let server_task = tokio::spawn(Box::pin(super::super::serve_socket_client(server, engine)));
 
     let (reader, mut writer) = client.into_split();
     let handshake = DaemonHandshake {
@@ -959,7 +950,7 @@ async fn socket_git_preview_apply_replay_and_pre_admission_problems_are_canonica
 
     let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
     let engine_for_test = engine.clone();
-    let server_task = tokio::spawn(super::super::serve_socket_client(server, engine));
+    let server_task = tokio::spawn(Box::pin(super::super::serve_socket_client(server, engine)));
     let (reader, mut writer) = client.into_split();
     writer
         .write_all(handshake.to_line().expect("handshake").as_bytes())
@@ -1226,7 +1217,7 @@ async fn portable_broker_routes_multiple_closed_invocations_without_falling_back
     let server = tokio::spawn(async move {
         let stream = listener.accept().await.expect("accept client");
         let lifecycle = DaemonLifecycle::default();
-        super::super::serve_windows_broker_client(
+        Box::pin(super::super::serve_windows_broker_client(
             stream,
             TOKEN,
             &lifecycle,
@@ -1235,7 +1226,7 @@ async fn portable_broker_routes_multiple_closed_invocations_without_falling_back
                 super::super::ProjectOpenGates::default(),
             )),
             None,
-        )
+        ))
         .await
     });
 
@@ -1341,7 +1332,7 @@ async fn daemon_linked_worktree_route_repairs_primary_identity_and_keeps_alias()
     )
     .expect("daemon database scope");
     let engine = test_daemon_engine_for_profile(&profile_root);
-    let project_id = crate::storage::read_repository_identity_marker(&primary)
+    let project_id = tracedecay_runtime_core::storage::read_repository_identity_marker(&primary)
         .expect("read primary repository identity")
         .expect("primary repository identity")
         .project_id;

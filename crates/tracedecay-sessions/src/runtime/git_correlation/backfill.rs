@@ -261,6 +261,7 @@ impl BackfillStats {
         }
     }
 
+    #[hotpath::skip]
     pub const fn skipped_total(&self) -> usize {
         self.skipped_no_window + self.skipped_not_worktree + self.skipped_git_error
     }

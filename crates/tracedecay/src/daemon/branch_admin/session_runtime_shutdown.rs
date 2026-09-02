@@ -1,12 +1,13 @@
 use std::sync::{Arc, atomic::Ordering};
 
-use super::{SessionRuntimeRegistryEntryV1, StoreAdministration, authority};
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use super::{SessionRuntimeRegistryEntryV1, StoreAdministration};
+use tracedecay_daemon_identity::authority;
+use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_store_runtime::RemoteRecoveryProjectLifecycle;
 
 #[derive(Clone)]
 pub(in crate::daemon) struct SessionRuntimeMemoryGraphReconciliationShutdownV1 {
-    registries:
-        Vec<Arc<crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1>>,
+    registries: Vec<Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>>,
 }
 
 impl SessionRuntimeMemoryGraphReconciliationShutdownV1 {
@@ -39,13 +40,15 @@ impl SessionRuntimeMemoryGraphReconciliationShutdownV1 {
 
 impl StoreAdministration {
     #[cfg(test)]
+    #[hotpath::skip]
     pub(in crate::daemon) async fn install_long_lived_session_runtime_registry_for_test(
         &self,
     ) -> Result<()> {
         let identity = self.profile_identity()?.clone();
         let profile_root = authority::canonical_identity_path(identity.profile_root())?;
+        crate::register_runtime_ports()?;
         let registry = Arc::new(
-            crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open_with_session_maintenance(
+            tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open_with_session_maintenance(
                 identity.clone(),
                 true,
             )
@@ -68,10 +71,10 @@ impl StoreAdministration {
         })
     }
 
+    #[hotpath::skip]
     pub(in crate::daemon) async fn session_runtime_registry(
         &self,
-    ) -> Result<Arc<crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1>>
-    {
+    ) -> Result<Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>> {
         if self
             .session_runtime_registry_admission_closed
             .load(Ordering::Acquire)
@@ -100,27 +103,30 @@ impl StoreAdministration {
         };
         let registry = registry
             .get_or_try_init(|| async move {
-                crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-                    identity,
-                )
-                .await
-                .map(Arc::new)
+                crate::register_runtime_ports()?;
+                // Boxed: the registry-open composition is a mega future whose
+                // inline layout overflows 2MB runtime stacks.
+                Box::pin(tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity))
+                    .await
+                    .map(Arc::new)
             })
             .await
             .map(Arc::clone)?;
         registry.install_session_sync_service(&self.session_sync_service)?;
         if let Some(lifecycle) = self.remote_recovery_project_lifecycle()? {
-            registry.install_remote_recovery_project_lifecycle(&lifecycle)?;
+            registry.install_remote_recovery_project_lifecycle(
+                Arc::clone(&lifecycle) as Arc<dyn RemoteRecoveryProjectLifecycle>
+            )?;
         }
         Ok(registry)
     }
 
+    #[hotpath::skip]
     pub(in crate::daemon) async fn registered_runtime_registry(
         &self,
-    ) -> Result<Arc<crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1>>
-    {
-        self.ensure_account_active().await?;
-        self.session_runtime_registry().await
+    ) -> Result<Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>> {
+        Box::pin(self.ensure_account_active()).await?;
+        Box::pin(self.session_runtime_registry()).await
     }
 
     /// Shutdown-only: drains the retained graph owners out of every session
@@ -151,6 +157,7 @@ impl StoreAdministration {
         }
     }
 
+    #[hotpath::skip]
     pub(in crate::daemon) async fn prepare_memory_graph_reconciliation_shutdown(
         &self,
     ) -> Result<SessionRuntimeMemoryGraphReconciliationShutdownV1> {
@@ -169,11 +176,10 @@ impl StoreAdministration {
             let initialized = entry
                 .registry
                 .get_or_try_init(|| async move {
-                    crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-                        identity,
-                    )
-                    .await
-                    .map(Arc::new)
+                    crate::register_runtime_ports()?;
+                    tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity)
+                        .await
+                        .map(Arc::new)
                 })
                 .await?;
             registries.push(Arc::clone(initialized));

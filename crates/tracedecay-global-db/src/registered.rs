@@ -1,8 +1,8 @@
 use std::future::Future;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_runtime_core::{
     db::{
         Database, DatabaseAuthority, DatabaseEngineReadConnection, DatabaseEngineReadSnapshot,
@@ -11,7 +11,6 @@ use tracedecay_runtime_core::{
         DatabaseRuntimeClientV1, DatabaseStorageTelemetryHandle, DatabaseWriteTransaction,
         engine::{Executor, IntoParams, QueryExecutor, Rows},
     },
-    errors::TraceDecayError,
     store_runtime::{VerifiedGraphRuntimePortV1, VerifiedGraphRuntimeWeakProxyV1},
 };
 use tracedecay_store::{StoreRuntimeBindingV1, StoreShardScopeV1, VerifiedStoreLocatorV1};
@@ -68,7 +67,7 @@ impl RegisteredGlobalDbOwnerV1 {
     #[hotpath::measure(future = true, label = "global_db.registered.admit")]
     pub async fn admit_and_attach(
         database: DatabaseOwnerV1,
-    ) -> tracedecay_runtime_core::errors::Result<Self> {
+    ) -> tracedecay_domain::errors::Result<Self> {
         let temporary = database.issue_lease().map_err(registered_owner_error)?;
         let registered = RegisteredGlobalDb::from_database(temporary);
         super::schema_stages::ensure_attached_registered_schema(&registered.database).await?;
@@ -86,10 +85,8 @@ impl RegisteredGlobalDbOwnerV1 {
     #[hotpath::measure(future = true, label = "global_db.registered.admit_daemon")]
     pub async fn admit_and_attach_for_daemon(
         database: DatabaseOwnerV1,
-    ) -> tracedecay_runtime_core::errors::Result<(
-        Self,
-        super::schema_stages::RegisteredSchemaConvergence,
-    )> {
+    ) -> tracedecay_domain::errors::Result<(Self, super::schema_stages::RegisteredSchemaConvergence)>
+    {
         let temporary = database.issue_lease().map_err(registered_owner_error)?;
         let registered = RegisteredGlobalDb::from_database(temporary);
         let convergence =
@@ -239,318 +236,21 @@ pub struct RegisteredGlobalDb {
     )>,
 }
 
-#[derive(Clone)]
-pub struct RegisteredWorkTopologyV1 {
-    source: tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    runtime: VerifiedGraphRuntimeWeakProxyV1,
-}
-
-impl RegisteredWorkTopologyV1 {
-    pub fn verified_snapshot(
-        &self,
-        authority: &tracedecay_domain::WorkAuthority,
-        cancelled: Arc<AtomicBool>,
-    ) -> Result<
-        tracedecay_runtime_core::work_topology::WorkTopologyStore,
-        tracedecay_runtime_core::work_topology::WorkTopologyError,
-    > {
-        let events = self
-            .source
-            .load_authority_events(authority)
-            .map_err(|error| {
-                tracedecay_runtime_core::work_topology::WorkTopologyError::Unavailable(
-                    error.to_string(),
-                )
-            })?;
-        let check = || {
-            if cancelled.load(Ordering::Acquire) {
-                Err(tracedecay_graph_db::GraphDbError::Cancelled)
-            } else {
-                Ok(())
-            }
-        };
-        tracedecay_runtime_core::work_topology::WorkTopologyStore::publish_from_events(
-            &events,
-            &check,
-            |manifest, key| {
-                self.runtime
-                    .publish_verified_manifest(manifest, key, Arc::clone(&cancelled))
-            },
-        )
-    }
-}
-
-#[derive(Clone)]
-pub struct RegisteredWorkflowTopologyV1 {
-    source: tracedecay_rusqlite_runtime::workflow::WorkflowSqliteAuthority,
-    runtime: VerifiedGraphRuntimeWeakProxyV1,
-}
-
-impl RegisteredWorkflowTopologyV1 {
-    pub fn verified_snapshot(
-        &self,
-        definition_id: &tracedecay_domain::WorkflowDefinitionId,
-        definition_version: u64,
-        cancelled: Arc<AtomicBool>,
-    ) -> Result<
-        tracedecay_runtime_core::workflow_topology::WorkflowTopologyStore,
-        tracedecay_runtime_core::workflow_topology::WorkflowTopologyError,
-    > {
-        let definition = self
-            .source
-            .load_definition_source(definition_id, definition_version)
-            .map_err(|error| {
-                tracedecay_runtime_core::workflow_topology::WorkflowTopologyError::Unavailable(
-                    format!("{error:?}"),
-                )
-            })?
-            .ok_or_else(|| {
-                tracedecay_runtime_core::workflow_topology::WorkflowTopologyError::Unavailable(
-                    "workflow definition source is missing".to_owned(),
-                )
-            })?;
-        let check = || {
-            if cancelled.load(Ordering::Acquire) {
-                Err(tracedecay_graph_db::GraphDbError::Cancelled)
-            } else {
-                Ok(())
-            }
-        };
-        tracedecay_runtime_core::workflow_topology::WorkflowTopologyStore::publish_from_definition(
-            &definition,
-            &check,
-            |manifest, key| {
-                self.runtime
-                    .publish_verified_manifest(manifest, key, Arc::clone(&cancelled))
-            },
-        )
-    }
-}
-
-/// Core Work command and projection services over the registered exact-SQL
-/// channel.
-pub struct RegisteredWorkApplicationServicesV1 {
-    commands:
-        tracedecay_application::WorkService<tracedecay_rusqlite_runtime::work::WorkSqliteStorage>,
-    projections: tracedecay_application::WorkProjectionReadService<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    >,
-    topology: RegisteredWorkTopologyV1,
-    attempts: tracedecay_application::WorkAttemptService<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    >,
-    run_control: tracedecay_application::WorkRunControlService<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    >,
-    placement: tracedecay_application::WorkPlacementService<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    >,
-    artifact_hydration: tracedecay_application::WorkArtifactHydrationService<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    >,
-    duplicate_adjudications: tracedecay_application::WorkDuplicateAdjudicationServiceV1<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    >,
-}
-
-/// The Work product graph authority: its verified reads and its journaled
-/// mutations, both over the same registered store.
-///
-/// This is a second Work authority, not a view of the first. The task services
-/// above are scoped by `WorkAuthority`; this one is scoped by the registered
-/// profile owner, which is also where its owner identity comes from — the
-/// store's own binding, never a value a request supplied.
-pub struct RegisteredWorkProductServicesV1 {
-    reads: tracedecay_application::WorkProductReadServiceV1<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    >,
-    mutations: tracedecay_application::WorkProductMutationServiceV1<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    >,
-    attempts: tracedecay_application::WorkProductAttemptServiceV1<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    >,
-    synthesis: tracedecay_application::WorkProductSynthesisAttemptServiceV1<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    >,
-    retry: tracedecay_application::WorkProductRetryServiceV1<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-        tracedecay_application::RuntimeWorkRetryEvidenceV1,
-    >,
-}
-
-impl RegisteredWorkProductServicesV1 {
-    pub const fn reads(
-        &self,
-    ) -> &tracedecay_application::WorkProductReadServiceV1<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    > {
-        &self.reads
-    }
-
-    pub const fn mutations(
-        &self,
-    ) -> &tracedecay_application::WorkProductMutationServiceV1<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    > {
-        &self.mutations
-    }
-
-    pub const fn attempts(
-        &self,
-    ) -> &tracedecay_application::WorkProductAttemptServiceV1<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    > {
-        &self.attempts
-    }
-
-    pub const fn synthesis(
-        &self,
-    ) -> &tracedecay_application::WorkProductSynthesisAttemptServiceV1<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    > {
-        &self.synthesis
-    }
-
-    pub const fn retry(
-        &self,
-    ) -> &tracedecay_application::WorkProductRetryServiceV1<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-        tracedecay_application::RuntimeWorkRetryEvidenceV1,
-    > {
-        &self.retry
-    }
-}
-
-impl RegisteredWorkApplicationServicesV1 {
-    pub fn commands(
-        &self,
-    ) -> &tracedecay_application::WorkService<tracedecay_rusqlite_runtime::work::WorkSqliteStorage>
-    {
-        &self.commands
-    }
-
-    pub fn projections(
-        &self,
-    ) -> &tracedecay_application::WorkProjectionReadService<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    > {
-        &self.projections
-    }
-
-    pub fn topology(&self) -> &RegisteredWorkTopologyV1 {
-        &self.topology
-    }
-
-    pub fn attempts(
-        &self,
-    ) -> &tracedecay_application::WorkAttemptService<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    > {
-        &self.attempts
-    }
-
-    /// The run-level pause/resume authority.
-    ///
-    /// It is a separate service from [`Self::attempts`] because the aggregate
-    /// it owns is separate: an attempt lease fences one attempt, while the run
-    /// control fences every future reservation of the run.
-    pub const fn run_control(
-        &self,
-    ) -> &tracedecay_application::WorkRunControlService<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    > {
-        &self.run_control
-    }
-
-    /// The placement preflight/admit/status/release authority.
-    pub const fn placement(
-        &self,
-    ) -> &tracedecay_application::WorkPlacementService<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    > {
-        &self.placement
-    }
-
-    /// The artifact and evidence hydration read authority.
-    pub const fn artifact_hydration(
-        &self,
-    ) -> &tracedecay_application::WorkArtifactHydrationService<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    > {
-        &self.artifact_hydration
-    }
-
-    /// Explicit revisioned duplicate-effort adjudication authority.
-    pub const fn duplicate_adjudications(
-        &self,
-    ) -> &tracedecay_application::WorkDuplicateAdjudicationServiceV1<
-        tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-    > {
-        &self.duplicate_adjudications
-    }
-}
-
-/// Workflow definition reads and journaled mutation authority over the
-/// registered exact-SQL channel.
-///
-/// [`WorkflowSqliteAuthority`]: tracedecay_rusqlite_runtime::workflow::WorkflowSqliteAuthority
-pub struct RegisteredWorkflowApplicationServicesV1 {
-    definitions: tracedecay_application::WorkflowDefinitionService<
-        tracedecay_rusqlite_runtime::workflow::WorkflowSqliteAuthority,
-    >,
-    effects: tracedecay_rusqlite_runtime::workflow::WorkflowSqliteAuthority,
-    topology: RegisteredWorkflowTopologyV1,
-}
-
-impl RegisteredWorkflowApplicationServicesV1 {
-    pub fn definitions(
-        &self,
-    ) -> &tracedecay_application::WorkflowDefinitionService<
-        tracedecay_rusqlite_runtime::workflow::WorkflowSqliteAuthority,
-    > {
-        &self.definitions
-    }
-
-    pub fn effects(&self) -> &tracedecay_rusqlite_runtime::workflow::WorkflowSqliteAuthority {
-        &self.effects
-    }
-
-    pub fn has_pending_effects(
-        &self,
-        worktree_id: &tracedecay_domain::WorktreeId,
-    ) -> Result<bool, tracedecay_application::WorkflowEffectAuthorityErrorV1> {
-        tracedecay_application::WorkflowEffectAuthorityPortV1::has_pending_effects(
-            &self.effects,
-            worktree_id,
-        )
-    }
-
-    pub fn topology(&self) -> &RegisteredWorkflowTopologyV1 {
-        &self.topology
-    }
-}
-
 impl RegisteredGlobalDb {
     #[hotpath::measure(future = true, label = "global_db.registered.schema")]
     pub async fn converge_schema(
         &self,
         convergence: super::schema_stages::RegisteredSchemaConvergence,
-    ) -> tracedecay_runtime_core::errors::Result<()> {
+    ) -> tracedecay_domain::errors::Result<()> {
         super::schema_stages::converge_registered_schema(&self.database, convergence).await
     }
 
-    pub async fn release_connection_memory(&self) -> tracedecay_runtime_core::errors::Result<()> {
+    pub async fn release_connection_memory(&self) -> tracedecay_domain::errors::Result<()> {
         self.database.release_connection_memory().await
     }
 
-    pub(crate) async fn checkpoint_database(&self) -> tracedecay_runtime_core::errors::Result<()> {
+    #[hotpath::skip]
+    pub(crate) async fn checkpoint_database(&self) -> tracedecay_domain::errors::Result<()> {
         self.database.checkpoint().await
     }
 
@@ -559,16 +259,14 @@ impl RegisteredGlobalDb {
     /// exclusive maintenance role.
     pub(crate) fn write_authority_role(
         &self,
-    ) -> tracedecay_runtime_core::errors::Result<tracedecay_runtime_core::db::DatabaseAuthorityRole>
-    {
+    ) -> tracedecay_domain::errors::Result<tracedecay_runtime_core::db::DatabaseAuthorityRole> {
         Ok(self.database.write_authority()?.role())
     }
 
     /// Truncates the drained WAL file through the runtime's exclusive
     /// maintenance facade.
-    pub(crate) async fn truncate_database_wal(
-        &self,
-    ) -> tracedecay_runtime_core::errors::Result<()> {
+    #[hotpath::skip]
+    pub(crate) async fn truncate_database_wal(&self) -> tracedecay_domain::errors::Result<()> {
         self.database.truncate_wal_for_offline_maintenance().await
     }
 
@@ -669,17 +367,14 @@ impl RegisteredGlobalDb {
     #[hotpath::measure(future = true, label = "global_db.registered.txn.snapshot")]
     pub async fn read_snapshot(
         &self,
-    ) -> tracedecay_runtime_core::errors::Result<DatabaseEngineReadSnapshot> {
+    ) -> tracedecay_domain::errors::Result<DatabaseEngineReadSnapshot> {
         self.database
             .begin_engine_read_snapshot("open registered database read snapshot")
             .await
     }
 
     #[hotpath::measure(future = true, label = "global_db.registered.snapshot_to")]
-    pub async fn snapshot_to(
-        &self,
-        destination: &Path,
-    ) -> tracedecay_runtime_core::errors::Result<()> {
+    pub async fn snapshot_to(&self, destination: &Path) -> tracedecay_domain::errors::Result<()> {
         self.prepare_snapshot_destination(destination)?;
         self.database.snapshot_to(destination).await
     }
@@ -695,8 +390,7 @@ impl RegisteredGlobalDb {
         &self,
         destination: &Path,
         probe: Arc<dyn tracedecay_store::RuntimeRequestProbeV1>,
-    ) -> tracedecay_runtime_core::errors::Result<tracedecay_rusqlite_runtime::OnlineBackupReceipt>
-    {
+    ) -> tracedecay_domain::errors::Result<tracedecay_rusqlite_runtime::OnlineBackupReceipt> {
         self.prepare_snapshot_destination(destination)?;
         self.database
             .snapshot_to_interruptible(destination, probe)
@@ -706,7 +400,7 @@ impl RegisteredGlobalDb {
     fn prepare_snapshot_destination(
         &self,
         destination: &Path,
-    ) -> tracedecay_runtime_core::errors::Result<()> {
+    ) -> tracedecay_domain::errors::Result<()> {
         if destination == self.database.canonical_database_path() {
             return Err(registered_error(
                 "snapshot registered global database",
@@ -745,7 +439,8 @@ impl RegisteredGlobalDb {
         Ok(())
     }
 
-    async fn rearm_queued_projection_retries(&self) -> tracedecay_runtime_core::errors::Result<()> {
+    #[hotpath::skip]
+    async fn rearm_queued_projection_retries(&self) -> tracedecay_domain::errors::Result<()> {
         let transaction = self
             .database
             .begin_write_transaction("rearm queued projection retries")
@@ -760,6 +455,7 @@ impl RegisteredGlobalDb {
 
     /// Rebuilds the registered observation projection through this client's
     /// guarded database capability.
+    #[hotpath::skip]
     pub async fn rebuild_observation_projection(
         &self,
         frontier_sequence: u64,
@@ -768,9 +464,10 @@ impl RegisteredGlobalDb {
     }
 
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn validate_registry_schema_contract_for_test(
         &self,
-    ) -> tracedecay_runtime_core::errors::Result<()> {
+    ) -> tracedecay_domain::errors::Result<()> {
         let snapshot = self
             .read_snapshot()
             .await
@@ -780,7 +477,7 @@ impl RegisteredGlobalDb {
 
     pub fn writer_connection(
         &self,
-    ) -> tracedecay_runtime_core::errors::Result<RegisteredGlobalDbWriterConnection<'_>> {
+    ) -> tracedecay_domain::errors::Result<RegisteredGlobalDbWriterConnection<'_>> {
         if !self.database.is_writable() {
             return Err(registered_error(
                 "acquire registered global database writer",
@@ -798,7 +495,7 @@ impl RegisteredGlobalDb {
     #[hotpath::measure(future = true, label = "global_db.registered.txn.begin")]
     pub async fn begin_write_transaction(
         &self,
-    ) -> tracedecay_runtime_core::errors::Result<RegisteredGlobalDbWriteTransaction<'_>> {
+    ) -> tracedecay_domain::errors::Result<RegisteredGlobalDbWriteTransaction<'_>> {
         let authority = self.database.write_authority()?;
         authority.require_active_write_scope("begin registered global database transaction")?;
         let transaction = self
@@ -822,138 +519,32 @@ impl RegisteredGlobalDb {
 
     pub fn work_storage(
         &self,
-    ) -> tracedecay_runtime_core::errors::Result<tracedecay_rusqlite_runtime::work::WorkSqliteStorage>
+    ) -> tracedecay_domain::errors::Result<tracedecay_rusqlite_runtime::work::WorkSqliteStorage>
     {
         self.database.work_storage()
     }
 
     pub fn authorized_scope_set_storage(
         &self,
-    ) -> tracedecay_runtime_core::errors::Result<
+    ) -> tracedecay_domain::errors::Result<
         tracedecay_rusqlite_runtime::repository::AuthorizedScopeSetSqliteStorage,
     > {
         self.database.authorized_scope_set_storage()
-    }
-
-    pub fn work_application_services(
-        &self,
-    ) -> tracedecay_runtime_core::errors::Result<RegisteredWorkApplicationServicesV1> {
-        let storage = self.work_storage()?;
-        let runtime = self.project_graph_runtime().cloned().ok_or_else(|| {
-            registered_error(
-                "attach registered Work topology",
-                "project graph runtime is not bound",
-            )
-        })?;
-        Ok(RegisteredWorkApplicationServicesV1 {
-            commands: tracedecay_application::WorkService::new(storage.clone()),
-            projections: tracedecay_application::WorkProjectionReadService::new(storage.clone()),
-            attempts: tracedecay_application::WorkAttemptService::new(storage.clone()),
-            run_control: tracedecay_application::WorkRunControlService::new(storage.clone()),
-            placement: tracedecay_application::WorkPlacementService::new(storage.clone()),
-            artifact_hydration: tracedecay_application::WorkArtifactHydrationService::new(
-                storage.clone(),
-            ),
-            duplicate_adjudications:
-                tracedecay_application::WorkDuplicateAdjudicationServiceV1::new(storage.clone()),
-            topology: RegisteredWorkTopologyV1 {
-                source: storage,
-                runtime,
-            },
-        })
-    }
-
-    /// Attaches the Work product graph authority over the registered exact-SQL
-    /// handle.
-    ///
-    /// The catalog binding is supplied by the caller rather than minted here,
-    /// because a service composed against a capability the catalog does not
-    /// advertise could never authorize a request: it would look wired and
-    /// answer nothing. Whichever adapter mounts a Work product operation
-    /// passes that operation's own capability and use-case ids.
-    ///
-    /// The owner identity is NOT a parameter. It is resolved from the store's
-    /// own registered binding, so no caller can ask for another profile's Work
-    /// product by naming it.
-    pub fn work_product_services(
-        &self,
-        binding: tracedecay_application::WorkProductBindingV1,
-    ) -> tracedecay_runtime_core::errors::Result<RegisteredWorkProductServicesV1> {
-        let storage = self.work_storage()?;
-        Ok(RegisteredWorkProductServicesV1 {
-            reads: tracedecay_application::WorkProductReadServiceV1::new(
-                storage.clone(),
-                storage.clone(),
-                binding,
-            ),
-            mutations: tracedecay_application::WorkProductMutationServiceV1::new(
-                storage.clone(),
-                storage.clone(),
-                storage.clone(),
-            ),
-            attempts: tracedecay_application::WorkProductAttemptServiceV1::new(storage.clone()),
-            synthesis: tracedecay_application::WorkProductSynthesisAttemptServiceV1::new(
-                storage.clone(),
-            ),
-            retry: tracedecay_application::WorkProductRetryServiceV1::new(
-                storage,
-                tracedecay_application::RuntimeWorkRetryEvidenceV1,
-            ),
-        })
-    }
-
-    /// Attaches product intelligence to the canonical verified Work graph and
-    /// rooted-evidence authorities owned by this registered exact-SQL store.
-    pub fn work_intelligence_service(
-        &self,
-        binding: tracedecay_application::WorkProductBindingV1,
-    ) -> tracedecay_runtime_core::errors::Result<
-        tracedecay_application::WorkIntelligenceServiceV1<
-            tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-            tracedecay_rusqlite_runtime::work::WorkSqliteStorage,
-        >,
-    > {
-        let storage = self.work_storage()?;
-        Ok(tracedecay_application::WorkIntelligenceServiceV1::new(
-            storage.clone(),
-            storage,
-            binding,
-        ))
     }
 
     /// Attaches the workflow source and journal authority over the registered
     /// exact-SQL handle.
     pub fn workflow_storage(
         &self,
-    ) -> tracedecay_runtime_core::errors::Result<
+    ) -> tracedecay_domain::errors::Result<
         tracedecay_rusqlite_runtime::workflow::WorkflowSqliteAuthority,
     > {
         self.database.workflow_storage()
     }
 
-    pub fn workflow_application_services(
-        &self,
-    ) -> tracedecay_runtime_core::errors::Result<RegisteredWorkflowApplicationServicesV1> {
-        let authority = self.workflow_storage()?;
-        let runtime = self.project_graph_runtime().cloned().ok_or_else(|| {
-            registered_error(
-                "attach registered workflow topology",
-                "project graph runtime is not bound",
-            )
-        })?;
-        Ok(RegisteredWorkflowApplicationServicesV1 {
-            definitions: tracedecay_application::WorkflowDefinitionService::new(authority.clone()),
-            effects: authority.clone(),
-            topology: RegisteredWorkflowTopologyV1 {
-                source: authority,
-                runtime,
-            },
-        })
-    }
-
     pub fn handoff_open_storage(
         &self,
-    ) -> tracedecay_runtime_core::errors::Result<
+    ) -> tracedecay_domain::errors::Result<
         tracedecay_rusqlite_runtime::handoff::HandoffOpenSqliteAuthority,
     > {
         self.database.handoff_open_storage()
@@ -961,13 +552,12 @@ impl RegisteredGlobalDb {
 
     pub fn storage_telemetry_handle(
         &self,
-    ) -> tracedecay_runtime_core::errors::Result<DatabaseStorageTelemetryHandle> {
+    ) -> tracedecay_domain::errors::Result<DatabaseStorageTelemetryHandle> {
         self.database.storage_telemetry_handle()
     }
 
-    pub async fn storage_page_counts(
-        &self,
-    ) -> tracedecay_runtime_core::errors::Result<(u64, u64, u64)> {
+    #[hotpath::skip]
+    pub async fn storage_page_counts(&self) -> tracedecay_domain::errors::Result<(u64, u64, u64)> {
         self.database.storage_page_counts().await
     }
 
@@ -975,7 +565,7 @@ impl RegisteredGlobalDb {
     pub async fn run_bounded_incremental_compaction(
         &self,
         max_pages: u64,
-    ) -> tracedecay_runtime_core::errors::Result<()> {
+    ) -> tracedecay_domain::errors::Result<()> {
         self.database.run_incremental_vacuum(max_pages).await
     }
 
@@ -984,19 +574,17 @@ impl RegisteredGlobalDb {
         &self,
         provider: &str,
         session_id: Option<&str>,
-        config: &tracedecay_sessions::runtime::lcm::retention::LcmRetentionConfig,
-        mode: tracedecay_sessions::runtime::lcm::retention::RetentionMode,
+        config: &tracedecay_lcm::retention::LcmRetentionConfig,
+        mode: tracedecay_lcm::retention::RetentionMode,
         now: i64,
-    ) -> tracedecay_runtime_core::errors::Result<
-        tracedecay_sessions::runtime::lcm::retention::LcmRetentionReport,
-    > {
+    ) -> tracedecay_domain::errors::Result<tracedecay_lcm::retention::LcmRetentionReport> {
         let storage_root = self.db_path().parent().ok_or_else(|| {
             registered_error(
                 "run registered session retention",
                 "registered sessions database has no storage root",
             )
         })?;
-        tracedecay_sessions::runtime::lcm::retention::run_session_retention(
+        tracedecay_lcm::retention::run_session_retention(
             &self.database,
             storage_root,
             provider,
@@ -1016,9 +604,8 @@ impl RegisteredGlobalDb {
         config: &super::observation::retention::ObservationRetentionConfig,
         mode: super::observation::retention::RetentionMode,
         now: i64,
-    ) -> tracedecay_runtime_core::errors::Result<
-        super::observation::retention::ObservationRetentionReport,
-    > {
+    ) -> tracedecay_domain::errors::Result<super::observation::retention::ObservationRetentionReport>
+    {
         if matches!(mode, super::observation::retention::RetentionMode::Apply) {
             self.database
                 .write_authority()?
@@ -1050,6 +637,7 @@ pub struct RegisteredGlobalDbWriterConnection<'a> {
 }
 
 impl RegisteredGlobalDbWriterConnection<'_> {
+    #[hotpath::skip]
     pub async fn execute<P>(
         &self,
         sql: &str,
@@ -1064,6 +652,7 @@ impl RegisteredGlobalDbWriterConnection<'_> {
             .map_err(engine_error)
     }
 
+    #[hotpath::skip]
     pub async fn query<P>(
         &self,
         sql: &str,
@@ -1075,6 +664,7 @@ impl RegisteredGlobalDbWriterConnection<'_> {
         self.database.read_connection().query(sql, params).await
     }
 
+    #[hotpath::skip]
     pub async fn execute_batch(
         &self,
         sql: &str,
@@ -1092,6 +682,7 @@ pub struct RegisteredGlobalDbWriteTransaction<'a> {
 }
 
 impl QueryExecutor for RegisteredGlobalDbWriteTransaction<'_> {
+    #[hotpath::skip]
     async fn query<P>(
         &self,
         sql: &str,
@@ -1105,6 +696,7 @@ impl QueryExecutor for RegisteredGlobalDbWriteTransaction<'_> {
 }
 
 impl Executor for RegisteredGlobalDbWriteTransaction<'_> {
+    #[hotpath::skip]
     async fn execute<P>(
         &self,
         sql: &str,
@@ -1116,6 +708,7 @@ impl Executor for RegisteredGlobalDbWriteTransaction<'_> {
         RegisteredGlobalDbWriteTransaction::execute(self, sql, params).await
     }
 
+    #[hotpath::skip]
     async fn execute_batch(&self, sql: &str) -> tracedecay_runtime_core::db::engine::Result<()> {
         RegisteredGlobalDbWriteTransaction::execute_batch(self, sql).await
     }
@@ -1182,6 +775,7 @@ impl tracedecay_runtime_core::db::engine::DatabaseAttachmentExecutor
 }
 
 impl RegisteredGlobalDbWriteTransaction<'_> {
+    #[hotpath::skip]
     pub async fn execute<P>(
         &self,
         sql: &str,
@@ -1193,6 +787,7 @@ impl RegisteredGlobalDbWriteTransaction<'_> {
         self.transaction.execute(sql, params).await
     }
 
+    #[hotpath::skip]
     pub async fn query<P>(
         &self,
         sql: &str,
@@ -1204,6 +799,7 @@ impl RegisteredGlobalDbWriteTransaction<'_> {
         self.transaction.query(sql, params).await
     }
 
+    #[hotpath::skip]
     pub async fn execute_batch(
         &self,
         sql: &str,

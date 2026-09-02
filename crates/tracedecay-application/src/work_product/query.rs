@@ -78,6 +78,7 @@ impl WorkEvidenceExpansionV1 {
         })
     }
 
+    #[hotpath::skip]
     pub const fn link(&self) -> &TaskEvidenceLinkV1 {
         &self.link
     }
@@ -86,10 +87,12 @@ impl WorkEvidenceExpansionV1 {
         &self.content_handle
     }
 
+    #[hotpath::skip]
     pub const fn is_redacted(&self) -> bool {
         self.redacted
     }
 
+    #[hotpath::skip]
     pub const fn observed_at(&self) -> UtcMicros {
         self.observed_at
     }
@@ -154,6 +157,7 @@ where
     E: WorkEvidenceReadPortV1,
     A: WorkProductOwnerAuthorizationPortV1,
 {
+    #[hotpath::skip]
     pub const fn new(evidence: E, owner_authority: A) -> Self {
         Self {
             evidence,
@@ -309,6 +313,7 @@ where
     H: WorkHistoryReadPortV1,
     A: WorkProductOwnerAuthorizationPortV1,
 {
+    #[hotpath::skip]
     pub const fn new(history: H, owner_authority: A) -> Self {
         Self {
             history,

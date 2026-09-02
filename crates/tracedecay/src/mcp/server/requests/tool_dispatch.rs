@@ -6,6 +6,7 @@ use crate::mcp::tools::{ToolCallRegistryOptions, handle_tool_call_with_registry_
 use super::super::read_coalescing::{ReadFlightClaim, tool_allows_identical_read_coalescing};
 
 impl McpServer {
+    #[hotpath::skip]
     pub(super) async fn route_tool_arguments(
         &self,
         id: &Value,
@@ -35,6 +36,7 @@ impl McpServer {
         let routed_project = match private_route {
             Some(_)
                 if crate::mcp::project_route::arguments_have_project_selector(
+                    tool_name,
                     &handler_arguments,
                 ) =>
             {
@@ -95,6 +97,7 @@ impl McpServer {
 
     #[cfg(feature = "test-transport")]
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn call_tool_for_test(
         &self,
         tool_name: &str,
@@ -130,9 +133,20 @@ impl McpServer {
                 None,
                 application_invocation_executor,
                 application_invocation_target,
-                None,
-                None,
-                None,
+                Some(
+                    tracedecay_application::RequestId::new("request.mcp.test-transport")
+                        .expect("static test-transport request identity"),
+                ),
+                Some(
+                    tracedecay_application::Deadline::new(tracedecay_domain::UtcMicros(i64::MAX))
+                        .expect("static test-transport deadline"),
+                ),
+                Some(
+                    tracedecay_application::CancellationSignal::active(
+                        "cancellation.mcp.test-transport",
+                    )
+                    .expect("static test-transport cancellation"),
+                ),
             )
             .await
     }
@@ -211,6 +225,7 @@ impl McpServer {
 
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(not(feature = "memory-provider-host"), allow(clippy::let_and_return))]
+    #[hotpath::skip]
     pub(super) async fn execute_tool_dispatch(
         &self,
         cg: &TraceDecay,
@@ -309,17 +324,19 @@ impl McpServer {
                 code_index_search_authority: self.code_index_search_authority.clone(),
                 code_graph_projection_read_port: self.code_graph_projection_read_port.clone(),
                 code_graph_read_admission_port: self.code_graph_read_admission_port.clone(),
+                verified_graph_query_port: self.verified_graph_query_port.clone(),
                 code_index_ignored_dependency_admission: self
                     .code_index_ignored_dependency_admission
                     .clone(),
                 generation_census_reader: self.generation_census_reader(),
                 retained_project_server_resolver: self.retained_project_server_resolver.clone(),
                 session_sync_service: session_sync_service.as_deref(),
+                served_stale_graph_generation: std::sync::Arc::new(std::sync::OnceLock::new()),
                 session_authorities: crate::mcp::tools::SessionAuthorities::new(
                     self.session_db.as_ref(),
                     self.user_session_db.as_ref(),
                 )
-                .with_profile_identity(self.profile_identity.as_ref())
+                .with_profile_identity(self.profile_identity.clone())
                 .with_profile_retained_authority(self.profile_retained_authority.as_ref())
                 .with_registered_databases(
                     self.registered_session_db.as_ref(),

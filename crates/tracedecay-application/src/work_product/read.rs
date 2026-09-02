@@ -44,6 +44,7 @@ pub struct WorkGraphReadRequestV1 {
 }
 
 impl WorkGraphReadRequestV1 {
+    #[hotpath::skip]
     pub const fn current(selection: WorkProductSelectionScopeV1, observed_at: UtcMicros) -> Self {
         Self {
             selection,
@@ -188,30 +189,37 @@ impl WorkGraphVersionEntryV1 {
         })
     }
 
+    #[hotpath::skip]
     pub const fn valid_at(&self) -> UtcMicros {
         self.valid_at
     }
 
+    #[hotpath::skip]
     pub const fn observed_at(&self) -> UtcMicros {
         self.observed_at
     }
 
+    #[hotpath::skip]
     pub const fn projected_at(&self) -> UtcMicros {
         self.projected_at
     }
 
+    #[hotpath::skip]
     pub const fn verified_version(&self) -> &VerifiedWorkGraphVersionV1 {
         &self.verified_version
     }
 
+    #[hotpath::skip]
     pub const fn graph(&self) -> &WorkProductGraphV1 {
         &self.graph
     }
 
+    #[hotpath::skip]
     pub const fn runtime(&self) -> &WorkRuntimeProjectionV1 {
         &self.runtime
     }
 
+    #[hotpath::skip]
     pub const fn projections(&self) -> &WorkProductProjectionBundleV1 {
         &self.projections
     }
@@ -266,10 +274,12 @@ pub enum WorkGraphSelectionCoverageV1 {
 }
 
 impl WorkGraphSelectionCoverageV1 {
+    #[hotpath::skip]
     pub const fn is_partial(&self) -> bool {
         matches!(self, Self::Partial { .. })
     }
 
+    #[hotpath::skip]
     pub const fn covered_events(&self) -> u32 {
         match self {
             Self::Complete { covered_events } | Self::Partial { covered_events, .. } => {
@@ -279,6 +289,7 @@ impl WorkGraphSelectionCoverageV1 {
     }
 
     /// The first journal sequence outside the selection, when one exists.
+    #[hotpath::skip]
     pub const fn first_excluded_sequence(&self) -> Option<WorkProductEventSequenceV1> {
         match self {
             Self::Complete { .. } => None,
@@ -367,10 +378,12 @@ impl WorkGraphTimelineV1 {
         &self.entries
     }
 
+    #[hotpath::skip]
     pub const fn coverage(&self) -> &WorkGraphTimelineCoverageV1 {
         &self.coverage
     }
 
+    #[hotpath::skip]
     pub const fn continuation(&self) -> Option<&OpaqueCursor> {
         match &self.coverage {
             WorkGraphTimelineCoverageV1::Complete { .. } => None,
@@ -429,6 +442,7 @@ pub enum WorkGraphReadV1 {
 }
 
 impl WorkGraphReadV1 {
+    #[hotpath::skip]
     pub const fn authorized_scope(&self) -> &AuthorizedWorkProductScopeV1 {
         match self {
             Self::Current {
@@ -449,6 +463,7 @@ impl WorkGraphReadV1 {
     /// How much of the owner's journal this selection covered. `Partial` means
     /// the entries below are the covered slice and scoped events exist outside
     /// it — never that the graph is broken.
+    #[hotpath::skip]
     pub const fn selection_coverage(&self) -> &WorkGraphSelectionCoverageV1 {
         match self {
             Self::Current {
@@ -536,6 +551,7 @@ where
     G: WorkGraphReadPortV1,
     A: WorkProductOwnerAuthorizationPortV1,
 {
+    #[hotpath::skip]
     pub const fn new(graph: G, owner_authority: A, binding: WorkProductBindingV1) -> Self {
         Self {
             graph,

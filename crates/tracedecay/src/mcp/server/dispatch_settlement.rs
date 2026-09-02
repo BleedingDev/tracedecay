@@ -3,7 +3,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
 const SETTLEMENT_NOT_STARTED: u8 = 0;
 const SETTLEMENT_SETTLING: u8 = 1;
@@ -57,6 +58,7 @@ impl DispatchSettlement {
     /// client's cancellation or deadline is the whole truth. Once the worker is
     /// settling or has joined without handing back its canonical result, the
     /// effect state is unknown and no client-side terminal may claim otherwise.
+    #[hotpath::skip]
     const fn effect_may_have_committed(self) -> bool {
         match self {
             Self::NotStarted => false,
@@ -236,6 +238,7 @@ impl RetainedDispatchRegistry {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     async fn active_count_for_test(&self) -> usize {
         self.state.lock().await.active.len()
     }
@@ -257,6 +260,7 @@ impl RetainedDispatchRegistry {
         }
     }
 
+    #[hotpath::skip]
     pub(super) async fn shutdown(&self) {
         let mut state = self.state.lock().await;
         self.accepting.store(false, Ordering::Release);
@@ -330,6 +334,7 @@ impl RetainedDispatchAuthority {
         self.server.clone()
     }
 
+    #[hotpath::skip]
     pub(super) async fn shutdown(&self) {
         let requested_at = tracedecay_application::clock::now_micros();
         for cancellation in super::requests::recover_lock(&self.cancellations).values() {
@@ -417,8 +422,7 @@ impl super::McpServer {
             self.dispatch_authority.cancellations(),
             registered_request_id,
         );
-        let application_surface =
-            crate::application_surface::ApplicationSurfaceOperation::from_tool_name(tool_name);
+        let application_surface = ApplicationSurfaceOperation::from_tool_name(tool_name);
         let source_edit = super::requests::is_source_edit_tool(tool_name);
         let controlled_read = super::requests::is_controlled_read_tool(tool_name);
         let ceiling = crate::mcp::tools::binding::canonical_tool_dispatch_ceiling(tool_name)
@@ -523,7 +527,15 @@ impl DispatchControl {
         T: Send + 'static,
         F: Future<Output = Result<T>> + Send + 'static,
     {
-        if self.cancellation.is_cancelled() {
+        // A pre-cancelled cooperative dispatch is still admitted: its
+        // invocation authority observes the already-cancelled signal itself —
+        // that is the cooperative contract — so the settlement it records is
+        // the authoritative one, and a cancellation that raced request
+        // registration still reaches the application executor. Only a tool
+        // with no live cancellation observer keeps the pre-admission refusal,
+        // because nothing downstream would ever consult the signal.
+        let cancelled_before_admission = self.cancellation.is_cancelled();
+        if cancelled_before_admission && !self.live_cancellable {
             return RetainedDispatchOutcome::failed(dispatch_cancelled_error(
                 &self.tool_name,
                 DispatchSettlement::NotStarted,
@@ -557,7 +569,17 @@ impl DispatchControl {
             () = &mut cancellation, if self.live_cancellable => {
                 Err(DispatchFailure::new(dispatch_cancelled_error(
                     &self.tool_name,
-                    settlement.snapshot(),
+                    // A signal cancelled before this worker was admitted has
+                    // already won the commit compare-and-swap: the effect's
+                    // commit point is unreachable no matter how far the
+                    // admitted worker has raced, so the plain pre-admission
+                    // terminal stays truthful and effect-unknown is reserved
+                    // for cancellations that arrived after admission.
+                    if cancelled_before_admission {
+                        DispatchSettlement::NotStarted
+                    } else {
+                        settlement.snapshot()
+                    },
                 )))
             }
             () = &mut deadline => {
@@ -652,7 +674,10 @@ fn tool_carries_effect(tool_name: &str) -> bool {
         .is_ok_and(|contract| !contract.read_only())
 }
 
-fn dispatch_cancelled_error(tool_name: &str, settlement: DispatchSettlement) -> TraceDecayError {
+pub(super) fn dispatch_cancelled_error(
+    tool_name: &str,
+    settlement: DispatchSettlement,
+) -> TraceDecayError {
     if settlement.effect_may_have_committed() && tool_carries_effect(tool_name) {
         return effect_unknown_error(tool_name, settlement, "cancellation");
     }
@@ -726,7 +751,7 @@ mod tests {
                 .run_retained(&runner_registry, async move {
                     started.notify_one();
                     release.notified().await;
-                    Ok::<_, tracedecay_runtime_core::errors::TraceDecayError>("not committed")
+                    Ok::<_, tracedecay_domain::errors::TraceDecayError>("not committed")
                 })
                 .await
         });
@@ -773,7 +798,7 @@ mod tests {
                 .run_retained(&runner_registry, async move {
                     started.notify_one();
                     release.notified().await;
-                    Ok::<_, tracedecay_runtime_core::errors::TraceDecayError>("committed")
+                    Ok::<_, tracedecay_domain::errors::TraceDecayError>("committed")
                 })
                 .await
         });
@@ -792,6 +817,123 @@ mod tests {
         );
         assert_eq!(committed.settlement(), DispatchSettlement::Joined);
         registry.shutdown().await;
+    }
+
+    /// A cooperative dispatch cancelled before admission is still admitted so
+    /// its invocation authority observes the signal and records the
+    /// authoritative settlement — a cancellation that raced request
+    /// registration must still reach the application executor — while the
+    /// caller reads the plain pre-admission cancelled terminal.
+    #[tokio::test]
+    async fn pre_cancelled_cooperative_dispatch_still_reaches_its_worker() {
+        let registry = Arc::new(RetainedDispatchRegistry::new());
+        let cancellation =
+            tracedecay_application::CancellationSignal::active("cancel.pre-admission-cooperative")
+                .expect("cancellation");
+        assert!(cancellation.cancel(tracedecay_application::clock::now_micros()));
+        let control = DispatchControl::new(
+            "tracedecay_search",
+            deadline_after(std::time::Duration::from_mins(1)),
+            cancellation,
+        )
+        .expect("control");
+        let worker_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_flag = Arc::clone(&worker_ran);
+        let outcome = control
+            .run_retained(&registry, async move {
+                worker_flag.store(true, std::sync::atomic::Ordering::Release);
+                Ok::<_, tracedecay_domain::errors::TraceDecayError>("authority settled")
+            })
+            .await;
+        let failure = outcome
+            .result
+            .expect_err("a pre-cancelled dispatch reports its typed cancelled terminal");
+        assert_eq!(
+            failure.project_route_context().map(|context| context.0),
+            Some("tool_dispatch_cancelled"),
+            "pre-admission cancellation keeps the plain cancelled terminal"
+        );
+        assert_eq!(
+            failure.project_route_context().map(|context| context.1),
+            Some(true),
+            "nothing committed, so the pre-admission terminal stays retryable"
+        );
+        registry.shutdown().await;
+        assert!(
+            worker_ran.load(std::sync::atomic::Ordering::Acquire),
+            "the admitted worker must run so the invocation authority settles it"
+        );
+    }
+
+    /// A pre-cancelled effect dispatch cannot degrade to effect-unknown: the
+    /// cancellation won the commit compare-and-swap before admission, so the
+    /// commit point is unreachable however far the admitted worker raced.
+    #[tokio::test]
+    async fn pre_cancelled_cooperative_effect_reports_cancelled_not_effect_unknown() {
+        let registry = Arc::new(RetainedDispatchRegistry::new());
+        let cancellation =
+            tracedecay_application::CancellationSignal::active("cancel.pre-admission-effect")
+                .expect("cancellation");
+        assert!(cancellation.cancel(tracedecay_application::clock::now_micros()));
+        let control = DispatchControl::new(
+            "tracedecay_str_replace",
+            deadline_after(std::time::Duration::from_mins(1)),
+            cancellation,
+        )
+        .expect("control");
+        let outcome = control
+            .run_retained(&registry, async move {
+                Ok::<_, tracedecay_domain::errors::TraceDecayError>("commit unreachable")
+            })
+            .await;
+        let failure = outcome
+            .result
+            .expect_err("a pre-cancelled effect dispatch cannot report success");
+        assert_eq!(
+            failure.project_route_context().map(|context| context.0),
+            Some("tool_dispatch_cancelled"),
+            "the commit CAS was already lost, so effect-unknown would be untruthful"
+        );
+        registry.shutdown().await;
+    }
+
+    /// A tool with no live cancellation observer keeps the pre-admission
+    /// refusal: nothing downstream would ever consult the signal, so admitting
+    /// the worker would only run work whose answer is already decided.
+    #[tokio::test]
+    async fn pre_cancelled_non_cooperative_dispatch_is_refused_before_admission() {
+        let registry = Arc::new(RetainedDispatchRegistry::new());
+        let cancellation =
+            tracedecay_application::CancellationSignal::active("cancel.pre-admission-refused")
+                .expect("cancellation");
+        assert!(cancellation.cancel(tracedecay_application::clock::now_micros()));
+        let control = DispatchControl::new(
+            "tracedecay_configuration_set",
+            deadline_after(std::time::Duration::from_mins(1)),
+            cancellation,
+        )
+        .expect("control");
+        let worker_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_flag = Arc::clone(&worker_ran);
+        let outcome = control
+            .run_retained(&registry, async move {
+                worker_flag.store(true, std::sync::atomic::Ordering::Release);
+                Ok::<_, tracedecay_domain::errors::TraceDecayError>("never admitted")
+            })
+            .await;
+        assert_eq!(outcome.settlement(), DispatchSettlement::NotStarted);
+        let failure = outcome
+            .result
+            .expect_err("a pre-cancelled non-cooperative dispatch is refused");
+        assert_eq!(
+            failure.project_route_context().map(|context| context.0),
+            Some("tool_dispatch_cancelled")
+        );
+        registry.shutdown().await;
+        assert!(
+            !worker_ran.load(std::sync::atomic::Ordering::Acquire),
+            "no settlement authority exists, so the worker must never be admitted"
+        );
     }
 
     /// A live-cancellable effect tool whose worker was already admitted cannot
@@ -819,7 +961,7 @@ mod tests {
                 .run_retained(&runner_registry, async move {
                     started.notify_one();
                     release.notified().await;
-                    Ok::<_, tracedecay_runtime_core::errors::TraceDecayError>(
+                    Ok::<_, tracedecay_domain::errors::TraceDecayError>(
                         "effect state is the daemon's to say",
                     )
                 })

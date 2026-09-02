@@ -18,17 +18,19 @@ use std::process::Command;
 use std::sync::Arc;
 #[cfg(feature = "test-transport")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "test-transport")]
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::{Mutex, MutexGuard};
 #[cfg(feature = "test-transport")]
 use tracedecay::daemon::ProductionProjectCompositionHarnessV1;
 #[cfg(feature = "test-transport")]
 use tracedecay::host_admission::{HostAdmissionTestRuntimeV1, ProjectScopedTestRuntimeV1};
-use tracedecay::mcp::ToolResult;
 #[cfg(feature = "test-transport")]
-use tracedecay::mcp::{McpServer, McpTransport};
-use tracedecay::storage::PrivateStoreIo;
+use tracedecay::mcp::McpServer;
 use tracedecay::tracedecay::TraceDecay;
+#[cfg(feature = "test-transport")]
+use tracedecay_domain::errors::TraceDecayError;
 #[cfg(feature = "test-transport")]
 use tracedecay_domain::{
     CanonicalMessageRoleV1, CanonicalObservationEnvelopeV1, CanonicalObservationEvidenceV1,
@@ -43,7 +45,9 @@ use tracedecay_domain::{
     SessionId, SessionProjectionGenerationV1, UtcMicros, derive_exact_observation_anchor_id,
 };
 #[cfg(feature = "test-transport")]
-use tracedecay_runtime_core::errors::TraceDecayError;
+use tracedecay_mcp::McpTransport;
+use tracedecay_mcp::ToolResult;
+use tracedecay_runtime_core::storage::PrivateStoreIo;
 #[cfg(feature = "test-transport")]
 use tracedecay_sessions::admission::HostAdmissionScope;
 #[cfg(feature = "test-transport")]
@@ -108,7 +112,67 @@ pub(crate) async fn handle_real_server_tool_call(
 ) -> Value {
     let response = handle_real_server_tool_call_raw(server, tool_name, arguments).await;
     assert!(response["error"].is_null(), "{response}");
-    response["result"].clone()
+    let mut result = response["result"].clone();
+    // The retained envelope wraps the owner's payload in authority and receipt
+    // metadata, which can push a modest payload over the response budget. The
+    // truncation wrapper carries a typed retrieve handle; recover the full
+    // original the same way a real agent does before unwrapping.
+    if let Some(text) = result["content"][0]["text"].as_str()
+        && let Some(handle) = truncated_response_handle(text)
+    {
+        let retrieved = handle_real_server_tool_call_raw(
+            server,
+            "tracedecay_retrieve",
+            json!({ "handle": handle }),
+        )
+        .await;
+        assert!(retrieved["error"].is_null(), "{retrieved}");
+        let record: Value = serde_json::from_str(
+            retrieved["result"]["content"][0]["text"]
+                .as_str()
+                .expect("retrieved response text"),
+        )
+        .expect("retrieved response JSON");
+        result["content"][0]["text"] = record["content"].clone();
+    }
+    // Retained tools answer with the versioned `schema.application.retained.*`
+    // envelope; these tests assert the owner's payload, so unwrap evidence and
+    // effect payloads in place. Problem envelopes stay intact for tests that
+    // assert typed refusals.
+    if let Some(text) = result["content"][0]["text"].as_str()
+        && let Some(payload) = retained_envelope_payload(text)
+    {
+        result["content"][0]["text"] = Value::String(payload.to_string());
+    }
+    result
+}
+
+/// The retrieve handle from a response-budget truncation wrapper, if `text`
+/// is one.
+#[cfg(feature = "test-transport")]
+pub(crate) fn truncated_response_handle(text: &str) -> Option<String> {
+    let wrapper: Value = serde_json::from_str(text).ok()?;
+    if wrapper["truncated"] != Value::Bool(true) {
+        return None;
+    }
+    wrapper["handle"].as_str().map(str::to_owned)
+}
+
+/// The owner payload from a retained evidence or effect envelope, if `text`
+/// is one. Problem envelopes and non-retained responses return `None`.
+#[cfg(feature = "test-transport")]
+pub(crate) fn retained_envelope_payload(text: &str) -> Option<Value> {
+    let envelope: Value = serde_json::from_str(text).ok()?;
+    envelope
+        .pointer("/contract/schema_id")
+        .and_then(Value::as_str)
+        .filter(|schema| schema.starts_with("schema.application.retained."))?;
+    matches!(
+        envelope.pointer("/outcome/outcome").and_then(Value::as_str),
+        Some("evidence" | "effect")
+    )
+    .then(|| envelope.pointer("/outcome/value/payload").cloned())
+    .flatten()
 }
 
 /// The whole JSON-RPC response, including a protocol-level `error`.
@@ -137,8 +201,10 @@ pub(crate) async fn handle_real_server_tool_call_raw(
         }
     });
     let mut transport = CaptureTransport::default();
-    server
-        .handle_and_write(&request.to_string(), &mut transport)
+    // Heap-allocate the server dispatch future so every awaiting test keeps a
+    // bounded resident frame (perf-profile layouts overflow the test stack
+    // when these mega-futures compose inline).
+    Box::pin(server.handle_and_write(&request.to_string(), &mut transport))
         .await
         .expect("real MCP server tool call");
     serde_json::from_str(transport.output.trim()).expect("JSON-RPC response")
@@ -151,23 +217,86 @@ pub(crate) fn extract_real_server_text(result: &Value) -> &str {
         .expect("MCP text result")
 }
 
-/// Polls the daemon-owned code-index search authority through its typed
-/// cold-activation state (`authority_unavailable`) until it answers; any
-/// other failure surfaces immediately through the caller's assertions.
+/// Polls the daemon-owned code-index search authority until an exact
+/// generation is bound and its native code graph is serving.
+///
+/// Search generation publication and native graph publication are distinct
+/// boundaries; graph-facing fixtures require both.
 #[cfg(feature = "test-transport")]
 pub(crate) async fn warm_code_index_search(server: &McpServer, query: &str) {
+    wait_for_code_index_generation(server, query).await;
+    wait_for_current_graph(server).await;
+}
+
+/// Poll `tracedecay_search` until it binds a `code_generation`. Authority
+/// activation (`warm_code_index_search`) can return on a warming lexical
+/// lane; ranked `search_matches` are not stable until a generation seats.
+#[cfg(feature = "test-transport")]
+pub(crate) async fn wait_for_code_index_generation(server: &McpServer, query: &str) {
+    let mut last = Value::Null;
     for _ in 0..60 {
         let result =
             handle_real_server_tool_call(server, "tracedecay_search", json!({ "query": query }))
                 .await;
-        let payload: Value =
+        last =
             serde_json::from_str(extract_real_server_text(&result)).expect("search payload JSON");
-        if payload["reason"].as_str() != Some("authority_unavailable") {
+        if last["reason"].as_str() == Some("authority_unavailable") {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        if last["code_generation"].as_str().is_some() {
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    panic!("code-index search authority did not activate within the polling budget");
+    panic!("code-index search did not bind a generation within the polling budget: {last}");
+}
+
+/// Poll `tracedecay_status` until the exact generation is current and its
+/// native code graph is serving.
+///
+/// `code_index_freshness.status = current` permits a graph that is still
+/// pending or unavailable, so graph-facing fixtures must also observe the
+/// canonical `code_graph_serving.state = ready` publication boundary.
+#[cfg(feature = "test-transport")]
+pub(crate) async fn wait_for_current_graph(server: &McpServer) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let status = handle_real_server_tool_call(
+                server,
+                "tracedecay_status",
+                json!({
+                    "include_branch_diagnostics": false,
+                    "include_storage_health": false,
+                    "include_session_ingest": false,
+                    "include_staleness": false,
+                }),
+            )
+            .await;
+            let status: Value = serde_json::from_str(extract_real_server_text(&status))
+                .expect("typed project status JSON");
+            let freshness = &status["code_index_freshness"];
+            let serving = &freshness["worktree"]["code_graph_serving"];
+            match (
+                freshness["status"].as_str(),
+                serving["state"].as_str(),
+                serving["reason"].as_str(),
+            ) {
+                (Some("current"), Some("ready"), _) => break,
+                (Some("warming"), _, _)
+                | (_, Some("pending"), _)
+                | (_, Some("unavailable"), Some("generation_unavailable")) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                (_, Some("refused"), _) | (_, _, Some("activation_disabled")) => {
+                    panic!("graph readiness was refused: {status}");
+                }
+                actual => panic!("graph readiness became {actual:?}: {status}"),
+            }
+        }
+    })
+    .await
+    .expect("graph did not become current within the publication budget");
 }
 
 #[cfg(feature = "test-transport")]
@@ -219,10 +348,12 @@ pub(crate) async fn production_composition_fixture_with_sources(
         .status()
         .expect("git commit");
     assert!(commit.success(), "git commit must succeed");
-    let harness =
-        ProductionProjectCompositionHarnessV1::open(isolation.path(), vec![project_root.clone()])
-            .await
-            .expect("production composition harness");
+    let harness = Box::pin(ProductionProjectCompositionHarnessV1::open(
+        isolation.path(),
+        vec![project_root.clone()],
+    ))
+    .await
+    .expect("production composition harness");
     ProductionCompositionFixture {
         harness,
         project_root,
@@ -271,10 +402,12 @@ pub(crate) async fn init_production_source_edit_project(
         .status()
         .expect("git commit source-edit fixture");
     assert!(commit.success(), "git commit must succeed");
-    let harness =
-        ProductionProjectCompositionHarnessV1::open(isolation_root, [project_root.to_path_buf()])
-            .await
-            .expect("production source-edit composition");
+    let harness = Box::pin(ProductionProjectCompositionHarnessV1::open(
+        isolation_root,
+        [project_root.to_path_buf()],
+    ))
+    .await
+    .expect("production source-edit composition");
     (
         ProductionSourceEditFixture {
             harness,
@@ -381,8 +514,8 @@ pub(crate) async fn handle_tool_call(
     mut args: serde_json::Value,
     server_stats: Option<serde_json::Value>,
     scope_prefix: Option<&str>,
-) -> tracedecay_runtime_core::errors::Result<ToolResult> {
-    let owns_format = tracedecay::mcp::tools::tool_defaults_to_markdown(tool_name);
+) -> tracedecay_domain::errors::Result<ToolResult> {
+    let owns_format = tracedecay_mcp::tool_defaults_to_markdown(tool_name);
     if !owns_format && let Some(obj) = args.as_object_mut() {
         obj.entry("format".to_string())
             .or_insert_with(|| serde_json::json!("json"));
@@ -395,55 +528,154 @@ pub(crate) async fn handle_tool_call(
     // in-process MCP harness and the for-test server constructor live behind
     // it); without the feature these tools take the generic path below.
     //
-    // Always mount the retained project session runtime for these tools. Falling
-    // through when `sessions.db` is not yet a regular file left
-    // `active_project_session_db` unset, so message-search and LCM reads failed
-    // closed even though the test graph still retained a registered session
-    // authority (production mounts that authority before dispatching the same
-    // tools).
+    // Every retained-surface tool (LCM, message search, fact store, session
+    // and workflow reads) executes through the daemon retained owner in
+    // production, so dispatch it through the registered test server — which
+    // mounts that owner in process — rather than the bare registry path whose
+    // missing executor truthfully reports the transport as unavailable.
     #[cfg(feature = "test-transport")]
-    if tool_name == "tracedecay_message_search" || tool_name.starts_with("tracedecay_lcm_") {
+    if tracedecay_application::RetainedSurfaceOperation::from_tool_name(tool_name).is_some() {
         let runtime = open_active_project_scoped_runtime(cg).await;
-        let server = McpServer::new_with_host_admission_test_runtime_for_test(
-            TraceDecay::open(cg.project_root()).await?,
-            None,
-            runtime,
-        )
+        // The daemon serves retained tools only for registered projects, so
+        // mirror `real_mcp_server` and register this graph's identity in the
+        // runtime registry; without it route resolution truthfully reports
+        // the retained operation authority as unavailable.
+        if let Some(project_id) = cg.store_layout().identity.project_id.clone() {
+            runtime
+                .upsert_code_project(&project_id, cg.project_root(), None, None, None)
+                .await?;
+        }
+        // Boxed graph-open and server-construction futures: these are the
+        // deep production compositions whose inline layouts overflow the
+        // perf-profile test stack.
+        let graph = Box::pin(TraceDecay::open(cg.project_root())).await?;
+        let server = Box::pin(McpServer::new_with_host_admission_test_runtime_for_test(
+            graph, None, runtime,
+        ))
         .await?;
         if !server.has_project_application_retrieval_for_test() {
             return Err(TraceDecayError::Config {
                 message: format!("{tool_name} project retrieval authority was not constructed"),
             });
         }
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": args,
-            },
-        })
-        .to_string();
-        let response = crate::mcp_server_test::run_server_with_messages(server, vec![request])
-            .await
-            .into_iter()
-            .next()
-            .ok_or_else(|| TraceDecayError::Config {
-                message: format!("{tool_name} returned no MCP response"),
+        // Each dispatch is one client connection against the shared live
+        // server (the daemon's per-socket entry point); the server must stay
+        // up across dispatches because a truncated response is recovered by a
+        // follow-up `tracedecay_retrieve` on the same server.
+        let dispatch = |name: String, arguments: Value| {
+            let server = std::sync::Arc::clone(&server);
+            async move {
+                let request = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                })
+                .to_string();
+                let response = crate::mcp_server_test::run_client_connection_with_messages(
+                    server,
+                    vec![request],
+                )
+                .await
+                .into_iter()
+                .next()
+                .ok_or_else(|| TraceDecayError::Config {
+                    message: format!("{name} returned no MCP response"),
+                })?;
+                let response: Value =
+                    serde_json::from_str(&response).map_err(|error| TraceDecayError::Config {
+                        message: format!("{name} returned invalid MCP JSON: {error}"),
+                    })?;
+                if let Some(error) = response.get("error") {
+                    return Err(TraceDecayError::Config {
+                        message: format!("{name} failed over MCP: {error}"),
+                    });
+                }
+                Ok(response["result"].clone())
+            }
+        };
+        let outcome = handle_retained_dispatch(tool_name, args, dispatch).await;
+        server.shutdown().await;
+        return outcome;
+    }
+    Box::pin(tracedecay::mcp::handle_tool_call(
+        cg,
+        tool_name,
+        args,
+        server_stats,
+        scope_prefix,
+    ))
+    .await
+}
+
+/// Dispatches `tool_name` through `dispatch`, recovers truncated responses
+/// through the typed retrieve handle, and unwraps the retained evidence or
+/// effect payload. A problem envelope is surfaced as an error carrying the
+/// full envelope, not an answer.
+#[cfg(feature = "test-transport")]
+async fn handle_retained_dispatch<D, F>(
+    tool_name: &str,
+    args: Value,
+    dispatch: D,
+) -> tracedecay_domain::errors::Result<ToolResult>
+where
+    D: Fn(String, Value) -> F,
+    F: std::future::Future<Output = tracedecay_domain::errors::Result<Value>>,
+{
+    let mut result = dispatch(tool_name.to_owned(), args).await?;
+    // The retained envelope wraps the owner's payload in authority and
+    // receipt metadata, which can push a modest payload over the response
+    // budget. Recover the full original through the typed retrieve handle
+    // the same way a real agent does.
+    if let Some(text) = result["content"][0]["text"].as_str()
+        && let Some(handle) = truncated_response_handle(text)
+    {
+        let retrieved = dispatch(
+            "tracedecay_retrieve".to_owned(),
+            json!({ "handle": handle, "format": "json" }),
+        )
+        .await?;
+        let record: Value =
+            serde_json::from_str(retrieved["content"][0]["text"].as_str().ok_or_else(|| {
+                TraceDecayError::Config {
+                    message: format!("{tool_name} retrieve returned no text: {retrieved}"),
+                }
+            })?)
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("{tool_name} retrieve returned invalid JSON: {error}"),
             })?;
-        let response: Value =
-            serde_json::from_str(&response).map_err(|error| TraceDecayError::Config {
-                message: format!("{tool_name} returned invalid MCP JSON: {error}"),
-            })?;
-        if let Some(error) = response.get("error") {
+        result["content"][0]["text"] = record["content"].clone();
+    }
+    // The retained MCP contract is the versioned
+    // `schema.application.retained.*` envelope. These handler tests assert
+    // the owner's payload, so unwrap evidence and effect payloads here and
+    // surface refusals as errors; a problem envelope is a refusal, not an
+    // answer.
+    let text = result["content"][0]["text"]
+        .as_str()
+        .ok_or_else(|| TraceDecayError::Config {
+            message: format!("{tool_name} returned no text content: {result}"),
+        })?;
+    let payload = match retained_envelope_payload(text) {
+        Some(payload) => payload,
+        None => {
+            let envelope: Value =
+                serde_json::from_str(text).map_err(|error| TraceDecayError::Config {
+                    message: format!("{tool_name} returned no retained envelope: {error}"),
+                })?;
             return Err(TraceDecayError::Config {
-                message: format!("{tool_name} failed over MCP: {error}"),
+                message: format!("{tool_name} answered with a retained refusal: {envelope}"),
             });
         }
-        return Ok(ToolResult::new(response["result"].clone(), Vec::new()));
-    }
-    tracedecay::mcp::handle_tool_call(cg, tool_name, args, server_stats, scope_prefix).await
+    };
+    let mut unwrapped = result;
+    unwrapped["content"] = serde_json::json!([
+        { "type": "text", "text": payload.to_string() }
+    ]);
+    Ok(ToolResult::new(unwrapped, Vec::new()))
 }
 
 #[cfg(feature = "test-transport")]
@@ -454,15 +686,13 @@ pub(crate) async fn handle_tool_call_with_runtime(
     mut args: serde_json::Value,
     server_stats: Option<serde_json::Value>,
     scope_prefix: Option<&str>,
-) -> tracedecay_runtime_core::errors::Result<ToolResult> {
-    let owns_format = tracedecay::mcp::tools::tool_defaults_to_markdown(tool_name);
+) -> tracedecay_domain::errors::Result<ToolResult> {
+    let owns_format = tracedecay_mcp::tool_defaults_to_markdown(tool_name);
     if !owns_format && let Some(obj) = args.as_object_mut() {
         obj.entry("format".to_string())
             .or_insert_with(|| serde_json::json!("json"));
     }
-    runtime
-        .call_mcp_tool_for_test(cg, tool_name, args, server_stats, scope_prefix)
-        .await
+    Box::pin(runtime.call_mcp_tool_for_test(cg, tool_name, args, server_stats, scope_prefix)).await
 }
 
 #[cfg(feature = "test-transport")]
@@ -470,10 +700,14 @@ async fn handle_project_open_source_edit_tool_call(
     cg: &TraceDecay,
     tool_name: &str,
     mut args: Value,
-) -> tracedecay_runtime_core::errors::Result<ToolResult> {
-    let graph = TraceDecay::open(cg.project_root()).await?;
-    let server = McpServer::new(graph, None).await;
-    server
+) -> tracedecay_domain::errors::Result<ToolResult> {
+    let graph = Box::pin(TraceDecay::open(cg.project_root())).await?;
+    let server = Box::pin(McpServer::new(graph, None)).await;
+    // `false` means this direct server has no production code-graph
+    // projection port, so the source-edit authority cannot mount; the
+    // dispatch boundary below is still the production path, and an actual
+    // edit reports its typed executor-unavailable refusal.
+    let _authority_mounted = server
         .install_project_open_source_edit_authority_for_test()
         .await?;
 
@@ -530,8 +764,8 @@ pub(crate) async fn handle_production_source_edit_tool_call(
     mut args: Value,
     _server_stats: Option<Value>,
     _scope_prefix: Option<&str>,
-) -> tracedecay_runtime_core::errors::Result<ToolResult> {
-    let owns_format = tracedecay::mcp::tools::tool_defaults_to_markdown(tool_name);
+) -> tracedecay_domain::errors::Result<ToolResult> {
+    let owns_format = tracedecay_mcp::tool_defaults_to_markdown(tool_name);
     if !owns_format && let Some(object) = args.as_object_mut() {
         object
             .entry("format".to_owned())
@@ -628,30 +862,8 @@ async fn call_project_open_source_edit_server(
     server: &McpServer,
     tool_name: &str,
     arguments: Value,
-) -> tracedecay_runtime_core::errors::Result<ToolResult> {
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": tool_name,
-            "arguments": arguments,
-        }
-    });
-    let mut transport = CaptureTransport::default();
-    server
-        .handle_and_write(&request.to_string(), &mut transport)
-        .await?;
-    let response: Value =
-        serde_json::from_str(transport.output.trim()).map_err(|error| TraceDecayError::Config {
-            message: format!("source edit MCP response was invalid JSON: {error}"),
-        })?;
-    if !response["error"].is_null() {
-        return Err(TraceDecayError::Config {
-            message: format!("source edit MCP call failed: {}", response["error"]),
-        });
-    }
-    Ok(ToolResult::new(response["result"].clone(), Vec::new()))
+) -> tracedecay_domain::errors::Result<ToolResult> {
+    server.call_tool_for_test(tool_name, arguments).await
 }
 
 pub(crate) struct GlobalDbEnvGuard {
@@ -865,9 +1077,13 @@ pub(crate) async fn real_mcp_server(cg: TestTraceDecay) -> Arc<McpServer> {
         .upsert_code_project(&project_id, &project_root, None, None, None)
         .await
         .expect("register test project");
-    McpServer::new_with_host_admission_test_runtime_for_test(cg.into_inner(), None, runtime)
-        .await
-        .expect("registered test server")
+    Box::pin(McpServer::new_with_host_admission_test_runtime_for_test(
+        cg.into_inner(),
+        None,
+        runtime,
+    ))
+    .await
+    .expect("registered test server")
 }
 
 pub(crate) async fn close_test_graph(cg: TestTraceDecay) {
@@ -960,7 +1176,7 @@ pub(crate) fn extract_first_json_content(value: &Value) -> Value {
         .unwrap_or_else(|| panic!("missing JSON content item in {value}"))
 }
 
-pub(crate) fn expect_tool_error<T>(result: tracedecay_runtime_core::errors::Result<T>) -> String {
+pub(crate) fn expect_tool_error<T>(result: tracedecay_domain::errors::Result<T>) -> String {
     match result {
         Ok(_) => panic!("expected tool call to fail"),
         Err(err) => format!("{err}"),
@@ -1050,7 +1266,7 @@ pub(crate) async fn seed_project_registry(
 }
 
 pub(crate) fn tool_properties<'a>(
-    tools: &'a [tracedecay::mcp::ToolDefinition],
+    tools: &'a [tracedecay_mcp::ToolDefinition],
     name: &str,
 ) -> &'a serde_json::Map<String, Value> {
     tools

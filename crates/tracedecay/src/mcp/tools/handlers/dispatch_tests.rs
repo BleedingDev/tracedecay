@@ -59,10 +59,10 @@ impl tracedecay_daemon_protocol::DaemonInvocationExecutor for RecordingMultiRoot
         &self,
         _subject_digest: tracedecay_domain::ManifestDigest,
         _observed_at: tracedecay_domain::UtcMicros,
-        _event: tracedecay_usecases::feedback::observations::FeedbackSourceEventV1,
+        _event: tracedecay_application::feedback::observations::FeedbackSourceEventV1,
     ) -> tracedecay_daemon_protocol::DaemonInvocationExecutorFuture<
         '_,
-        tracedecay_runtime_core::errors::Result<()>,
+        tracedecay_domain::errors::Result<()>,
     > {
         Box::pin(async { Ok(()) })
     }
@@ -163,6 +163,62 @@ fn diagnostics_without_an_executor_reaches_the_analysis_handler() {
             "the reviewed request shape has no in-process handler to fall back to",
         );
     }
+}
+
+#[tokio::test]
+async fn unmounted_files_root_dispatch_reports_a_real_orphaned_rust_source() {
+    let _env_lock = lock_user_data_dir_test_env();
+    let dir = TempDir::new().unwrap();
+    let _env = SelectorEnv::new(dir.path());
+    let project = dir.path().join("unmounted-files-root-dispatch");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"unmounted-files-root-dispatch\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn mounted() {}\n").unwrap();
+    fs::write(
+        project.join("src/orphan.rs"),
+        "pub fn reachable_only_if_declared() {}\n",
+    )
+    .unwrap();
+    let (cg, _runtime) = TraceDecay::init_test_fixture_with_registered_runtime(
+        &project,
+        "project.mcp-unmounted-files-root-dispatch",
+    )
+    .await
+    .unwrap();
+
+    let result = handle_tool_call(
+        &cg,
+        "tracedecay_unmounted_files",
+        json!({"ecosystem": "rust", "format": "json"}),
+        None,
+        None,
+    )
+    .await
+    .expect("the production root dispatch reaches the portable unmounted-files handler");
+    let payload: Value = serde_json::from_str(
+        result.value["content"][0]["text"]
+            .as_str()
+            .expect("unmounted-files JSON text"),
+    )
+    .expect("unmounted-files JSON payload");
+
+    assert_eq!(payload["unmounted_file_count"], 1);
+    assert_eq!(payload["returned_count"], 1);
+    assert_eq!(payload["unmounted"][0]["file"], "src/orphan.rs");
+    assert_eq!(
+        payload["unmounted"][0]["package"],
+        "unmounted-files-root-dispatch"
+    );
+    assert_eq!(
+        payload["unmounted"][0]["suggested_declaration"],
+        "mod orphan;"
+    );
+
+    cg.close();
 }
 
 #[test]
@@ -567,6 +623,215 @@ async fn status_and_runtime_share_cursor_session_ingest_authority() {
     cg.close();
 }
 
+/// Status must report the serving truth the retrieval lanes enforce. On a
+/// fresh daemon the census answers before any generation seals; claiming
+/// `serving_branch` there contradicted every lane's truthful
+/// `generation_rebuilding` refusal. Once a sealed complete generation exists,
+/// the branch claim returns together with the typed `retrieval_serving`
+/// state.
+#[tokio::test]
+async fn status_serving_branch_reports_the_lane_serving_truth() {
+    let _env_lock = lock_user_data_dir_test_env();
+    let dir = TempDir::new().unwrap();
+    let _env = SelectorEnv::new(dir.path());
+    let project = dir.path().join("status-serving-truth");
+    fs::create_dir_all(project.join("src")).unwrap();
+    run_git_in(&project, &["init", "-b", "main"]);
+    fs::write(project.join("src/lib.rs"), "pub fn probe() {}\n").unwrap();
+    run_git_in(&project, &["add", "."]);
+    run_git_in(&project, &["commit", "-m", "initial"]);
+    let (cg, runtime) = TraceDecay::init_test_fixture_with_registered_runtime(
+        &project,
+        "project.mcp-status-serving-truth",
+    )
+    .await
+    .unwrap();
+    // Publish store branch metadata and reopen, so `serving_branch` is a
+    // claim the store would actually make — the exact claim the gate must
+    // withhold while nothing serves.
+    cg.checkpoint().await.unwrap();
+    let layout = cg.store_layout().clone();
+    cg.close();
+    let meta = tracedecay_runtime_core::branch_meta::BranchMeta::new("main");
+    tracedecay_runtime_core::branch_meta::save_branch_meta(&layout.data_root, &meta).unwrap();
+    let cg = runtime
+        .open_project_graph_for_test(
+            &project,
+            crate::tracedecay::TraceDecayOpenOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cg.serving_branch(),
+        Some("main"),
+        "the store must publish a branch claim for this test to be falsifiable",
+    );
+
+    let freshness_reader = |latest_generation_id: Option<&str>,
+                            staleness_state: Option<&str>,
+                            rebuild_in_flight: bool| {
+        let latest_generation_id = latest_generation_id.map(str::to_owned);
+        let staleness_state = staleness_state.map(str::to_owned);
+        let reader: tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader =
+            std::sync::Arc::new(move |worktree_root: std::path::PathBuf| {
+                let freshness = tracedecay_dashboard_api::code_index_freshness_api::CodeIndexWorktreeFreshnessV1 {
+                    worktree_root: worktree_root.display().to_string(),
+                    latest_generation_id: latest_generation_id.clone(),
+                    staleness_state: staleness_state.clone(),
+                    rebuild_in_flight,
+                    ..Default::default()
+                };
+                Box::pin(async move { Some(freshness) })
+            });
+        reader
+    };
+    let status_output = |result: ToolResult| {
+        serde_json::from_str::<Value>(
+            result.value["content"][0]["text"]
+                .as_str()
+                .expect("status JSON text"),
+        )
+        .expect("parse status JSON")
+    };
+
+    // Fresh daemon: the census answers, nothing has sealed yet.
+    let rebuilding = handle_tool_call_with_registry_options(
+        &cg,
+        "tracedecay_status",
+        json!({"format": "json"}),
+        None,
+        None,
+        ToolCallRegistryOptions {
+            code_index_freshness_reader: Some(freshness_reader(None, Some("indexing"), true)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("status answers while nothing serves");
+    let rebuilding = status_output(rebuilding);
+    assert_eq!(
+        rebuilding["retrieval_serving"],
+        json!({"status": "unavailable", "reason": "generation_rebuilding"}),
+        "status must carry the same typed refusal the lanes enforce",
+    );
+    assert!(
+        rebuilding.get("serving_branch").is_none(),
+        "no branch is served before the first sealed generation: {rebuilding}",
+    );
+
+    // A sealed complete generation exists: the branch claim is truthful again.
+    let serving = handle_tool_call_with_registry_options(
+        &cg,
+        "tracedecay_status",
+        json!({"format": "json"}),
+        None,
+        None,
+        ToolCallRegistryOptions {
+            code_index_freshness_reader: Some(freshness_reader(
+                Some("generation.status-serving-truth.1"),
+                Some("fresh"),
+                false,
+            )),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("status answers while serving");
+    let serving = status_output(serving);
+    assert_eq!(
+        serving["retrieval_serving"],
+        json!({"status": "serving", "freshness": "current"})
+    );
+    assert_eq!(
+        serving["serving_branch"],
+        json!("main"),
+        "a serving census restores the branch claim: {serving}",
+    );
+
+    let rebuilding = handle_tool_call_with_registry_options(
+        &cg,
+        "tracedecay_status",
+        json!({"format": "json"}),
+        None,
+        None,
+        ToolCallRegistryOptions {
+            code_index_freshness_reader: Some(freshness_reader(
+                Some("generation.status-serving-truth.1"),
+                Some("stale"),
+                true,
+            )),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("status answers while a stale seat is rebuilding");
+    let rebuilding = status_output(rebuilding);
+    assert_eq!(
+        rebuilding["retrieval_serving"]["freshness"],
+        json!("last_complete_stale")
+    );
+    assert_eq!(
+        rebuilding["retrieval_serving"]["condition"],
+        json!("rebuilding"),
+        "scheduler liveness must distinguish a routine rebuild: {rebuilding}",
+    );
+
+    // A seat sealed long ago surfaces its age inside the serving claim, so a
+    // wedged daemon serving days-old answers is visibly wedged rather than a
+    // bare "serving".
+    let sealed_at_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
+        - 3 * 86_400 * 1_000_000;
+    let aged_reader: tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader =
+        std::sync::Arc::new(move |worktree_root: std::path::PathBuf| {
+            let freshness =
+                tracedecay_dashboard_api::code_index_freshness_api::CodeIndexWorktreeFreshnessV1 {
+                    worktree_root: worktree_root.display().to_string(),
+                    latest_generation_id: Some("generation.status-serving-truth.1".to_owned()),
+                    sealed_at_micros: Some(sealed_at_micros),
+                    staleness_state: Some("stale".to_owned()),
+                    ..Default::default()
+                };
+            Box::pin(async move { Some(freshness) })
+        });
+    let aged = handle_tool_call_with_registry_options(
+        &cg,
+        "tracedecay_status",
+        json!({"format": "json"}),
+        None,
+        None,
+        ToolCallRegistryOptions {
+            code_index_freshness_reader: Some(aged_reader),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("status answers for an aged seat");
+    let aged = status_output(aged);
+    assert_eq!(aged["retrieval_serving"]["status"], json!("serving"));
+    assert_eq!(
+        aged["retrieval_serving"]["freshness"],
+        json!("last_complete_stale")
+    );
+    assert_eq!(
+        aged["retrieval_serving"]["condition"],
+        json!("stalled"),
+        "a stale seat with no scheduler remedy must be typed stalled: {aged}",
+    );
+    let age_seconds = aged["retrieval_serving"]["seated_generation_age_seconds"]
+        .as_i64()
+        .expect("an aged seat reports its age in the serving claim");
+    assert!(
+        age_seconds >= 3 * 86_400 - 60,
+        "the serving claim must expose the seat age: {aged}",
+    );
+
+    cg.checkpoint().await.unwrap();
+    cg.close();
+}
+
 #[tokio::test]
 async fn unsupported_selector_tool_rejects_explicit_project_selector() {
     let _env_lock = lock_user_data_dir_test_env();
@@ -715,7 +980,7 @@ async fn selected_project_retrieve_finds_selected_project_response_handle() {
     .expect("active routed server");
 
     let result = server
-        .handle_request(&crate::mcp::transport::JsonRpcRequest {
+        .handle_request(&tracedecay_mcp::transport::JsonRpcRequest {
             jsonrpc: "2.0".to_owned(),
             id: Some(json!(1)),
             method: "tools/call".to_owned(),
@@ -758,7 +1023,7 @@ async fn selected_project_retrieve_finds_selected_project_response_handle() {
     );
 
     let retrieved = server
-        .handle_request(&crate::mcp::transport::JsonRpcRequest {
+        .handle_request(&tracedecay_mcp::transport::JsonRpcRequest {
             jsonrpc: "2.0".to_owned(),
             id: Some(json!(2)),
             method: "tools/call".to_owned(),
@@ -814,7 +1079,7 @@ async fn selected_project_retrieve_finds_selected_project_response_handle() {
         ),
     ] {
         let missing = server
-            .handle_request(&crate::mcp::transport::JsonRpcRequest {
+            .handle_request(&tracedecay_mcp::transport::JsonRpcRequest {
                 jsonrpc: "2.0".to_owned(),
                 id: Some(json!(id)),
                 method: "tools/call".to_owned(),
@@ -1039,13 +1304,13 @@ async fn pr_context_returns_git_evidence_while_verified_graph_is_unavailable() {
     let merge_base = git_stdout_in(&project, &["merge-base", "main", "HEAD"]);
     for (error, expected_reason) in [
         (
-            tracedecay_usecases::graph::CodeGraphReadError::Unavailable {
+            tracedecay_graph_query::CodeGraphReadError::Unavailable {
                 detail: "the exact generation is still warming".to_owned(),
             },
             "code-graph-unavailable",
         ),
         (
-            tracedecay_usecases::graph::CodeGraphReadError::Stale {
+            tracedecay_graph_query::CodeGraphReadError::Stale {
                 detail: "the exact generation advanced".to_owned(),
             },
             "code-graph-stale",
@@ -1118,24 +1383,24 @@ async fn pr_context_propagates_terminal_graph_failures_without_a_cursor() {
     .await
     .unwrap();
     let terminal_errors = [
-        tracedecay_usecases::graph::map_code_graph_read_runtime_error(
-            tracedecay_usecases::graph::CodeGraphReadError::Cancelled,
+        tracedecay_graph_query::map_code_graph_read_runtime_error(
+            tracedecay_graph_query::CodeGraphReadError::Cancelled,
         ),
-        tracedecay_usecases::graph::map_code_graph_read_runtime_error(
-            tracedecay_usecases::graph::CodeGraphReadError::Denied,
+        tracedecay_graph_query::map_code_graph_read_runtime_error(
+            tracedecay_graph_query::CodeGraphReadError::Denied,
         ),
-        tracedecay_usecases::graph::map_code_graph_read_runtime_error(
-            tracedecay_usecases::graph::CodeGraphReadError::Corrupt {
+        tracedecay_graph_query::map_code_graph_read_runtime_error(
+            tracedecay_graph_query::CodeGraphReadError::Corrupt {
                 detail: "corrupt projection".to_owned(),
             },
         ),
-        tracedecay_usecases::graph::map_code_graph_read_runtime_error(
-            tracedecay_usecases::graph::CodeGraphReadError::ResetRequired {
+        tracedecay_graph_query::map_code_graph_read_runtime_error(
+            tracedecay_graph_query::CodeGraphReadError::ResetRequired {
                 detail: "generation reset required".to_owned(),
             },
         ),
-        tracedecay_usecases::graph::map_code_graph_read_runtime_error(
-            tracedecay_usecases::graph::CodeGraphReadError::InvalidRequest {
+        tracedecay_graph_query::map_code_graph_read_runtime_error(
+            tracedecay_graph_query::CodeGraphReadError::InvalidRequest {
                 detail: "invalid graph request".to_owned(),
             },
         ),
@@ -1148,7 +1413,7 @@ async fn pr_context_propagates_terminal_graph_failures_without_a_cursor() {
         let detail = error.to_string();
         let result = git::handle_pr_context(
             &cg,
-            async move { Err::<crate::tracedecay::queries::graph::VerifiedGraphQuery, _>(error) },
+            async move { Err::<tracedecay_graph_query::VerifiedGraphQuery, _>(error) },
             json!({"base_ref": "main", "head_ref": "HEAD", "format": "json"}),
             None,
             None,
@@ -1431,6 +1696,88 @@ async fn a_warm_call_is_unaffected_by_the_ceiling() {
     cg.close();
 }
 
+/// Serve-old-while-rebuilding is typed on the wire: when the one verified-
+/// graph open funnel answered from the last complete seated generation, the
+/// dispatch boundary appends the `code_graph_freshness` trailer naming the
+/// serving generation; a proven-current open leaves the response untouched.
+#[tokio::test]
+async fn a_stale_served_graph_read_carries_the_typed_freshness_trailer() {
+    let _env_lock = lock_user_data_dir_test_env();
+    let dir = TempDir::new().unwrap();
+    let _env = SelectorEnv::new(dir.path());
+    let project = dir.path().join("stale-graph-trailer");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn probe() {}\n").unwrap();
+    let (cg, _runtime) = TraceDecay::init_test_fixture_with_registered_runtime(
+        &project,
+        "project.mcp-stale-graph-trailer",
+    )
+    .await
+    .unwrap();
+
+    let stale = handle_tool_call_with_registry_options(
+        &cg,
+        "tracedecay_files",
+        json!({}),
+        None,
+        None,
+        verified_graph_stale_options(&cg, ToolCallRegistryOptions::default()),
+    )
+    .await
+    .expect("a stale-served graph read still answers");
+    let rendered = serde_json::to_string(&stale.value).unwrap();
+    assert!(
+        rendered.contains("code_graph_freshness: stale"),
+        "a stale-served response must carry the typed freshness trailer: {rendered}",
+    );
+    assert!(
+        rendered.contains("generation.mcp-verified-graph-fixture.1"),
+        "the trailer must name the serving generation: {rendered}",
+    );
+    assert!(
+        rendered.contains("(sealed 1m ago) while the code index rebuilds"),
+        "a rebuild-in-flight serve must state the seat age and the rebuild: {rendered}",
+    );
+
+    let wedged = handle_tool_call_with_registry_options(
+        &cg,
+        "tracedecay_files",
+        json!({}),
+        None,
+        None,
+        verified_graph_wedged_options(&cg, ToolCallRegistryOptions::default()),
+    )
+    .await
+    .expect("a wedged stale serve still answers");
+    let rendered = serde_json::to_string(&wedged.value).unwrap();
+    assert!(
+        rendered.contains("no rebuild pass in flight"),
+        "a wedged route must not claim a rebuild is in flight: {rendered}",
+    );
+    assert!(
+        !rendered.contains("while the code index rebuilds"),
+        "a wedged route must not present itself as a routine rebuild: {rendered}",
+    );
+
+    let current = handle_tool_call_with_registry_options(
+        &cg,
+        "tracedecay_files",
+        json!({}),
+        None,
+        None,
+        verified_graph_options(&cg, ToolCallRegistryOptions::default()),
+    )
+    .await
+    .expect("a proven-current graph read answers");
+    let rendered = serde_json::to_string(&current.value).unwrap();
+    assert!(
+        !rendered.contains("code_graph_freshness"),
+        "a proven-current response must not carry a freshness trailer: {rendered}",
+    );
+
+    cg.close();
+}
+
 #[test]
 fn unavailable_effect_contract_fails_before_handler_dispatch() {
     assert!(super::ensure_mcp_dispatch_available("tracedecay_lcm_doctor").is_ok());
@@ -1455,6 +1802,27 @@ async fn user_lcm_doctor_reports_a_missing_store_without_opening_it() {
     .unwrap();
     let profile_root = dir.path().join("unavailable-user-lcm-profile");
     let sessions_db = tracedecay_sessions::runtime::user_sessions_db_path(&profile_root);
+    let profile_identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+            .expect("missing-store profile identity");
+    let profile_id = profile_identity.profile_id().as_str();
+    let suffix = profile_id
+        .strip_prefix("profile.")
+        .expect("canonical profile identity prefix");
+    let session_identity = tracedecay_session_memory::context::ResolvedSessionIdentity::for_profile(
+        tracedecay_session_memory::context::ProfileId::new(profile_id.to_owned())
+            .expect("profile session identity"),
+        tracedecay_session_memory::context::SessionStoreId::new(format!("store.profile.{suffix}"))
+            .expect("profile store identity"),
+        tracedecay_session_memory::context::SessionRootId::new(format!("root.profile.{suffix}"))
+            .expect("profile root identity"),
+    );
+    let profile_retained_authority =
+        crate::daemon::retained_owner::profile_retained_connection_authority(
+            &profile_identity,
+            &session_identity,
+        )
+        .expect("canonical profile retained authority");
 
     let result = handle_tool_call_with_registry_options(
         &cg,
@@ -1464,6 +1832,8 @@ async fn user_lcm_doctor_reports_a_missing_store_without_opening_it() {
         None,
         ToolCallRegistryOptions {
             profile_root: Some(&profile_root),
+            session_authorities: SessionAuthorities::default()
+                .with_profile_retained_authority(Some(&profile_retained_authority)),
             ..Default::default()
         },
     )
@@ -1476,7 +1846,10 @@ async fn user_lcm_doctor_reports_a_missing_store_without_opening_it() {
             .expect("LCM Doctor text response"),
     )
     .expect("LCM Doctor unavailable payload");
-    assert_eq!(payload["status"], "unavailable");
+    assert_eq!(
+        payload["problem"]["kind"], "unavailable",
+        "missing-store LCM Doctor renders the application problem kind, got {payload}"
+    );
     assert!(
         !sessions_db.exists(),
         "read-only LCM Doctor must not open a missing profile store"
@@ -1519,7 +1892,13 @@ async fn unavailable_user_lcm_effect_is_rejected_before_profile_store_open() {
     .await
     .unwrap_err();
 
-    assert!(error.to_string().contains("unknown"));
+    let message = error.to_string();
+    assert!(
+        message.contains(
+            "storage_scope=user is unavailable for non-retained tool `tracedecay_lcm_compress`"
+        ),
+        "a known-but-unavailable LCM effect must report its typed reason, got {message}"
+    );
     assert!(
         !sessions_db.exists(),
         "unavailable LCM must not open its profile store"

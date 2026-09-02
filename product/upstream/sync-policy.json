@@ -31,7 +31,7 @@
   "floor": {
     "metadata": "product/upstream/tracedecay-v2-pr707.json",
     "pull_request": 707,
-    "sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
+    "sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
     "advancement_authority": "tdmem-1208",
     "immutable_until_approved_train": true,
     "pins": [

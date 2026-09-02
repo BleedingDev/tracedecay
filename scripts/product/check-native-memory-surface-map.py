@@ -99,7 +99,7 @@ EXPECTED_DERIVED_SURFACES = {
 }
 
 SOURCE_MARKERS = {
-    "crates/tracedecay-usecases/src/memory/mod.rs": [
+    "crates/tracedecay-session-memory/src/memory/mod.rs": [
         "memory_application_for_db",
         "pub struct MemoryApplication",
     ],
@@ -140,7 +140,7 @@ SOURCE_MARKERS = {
         "HostAdmissionFacade",
         "transcript_capture_kernel",
     ],
-    "crates/tracedecay/src/daemon/session_retrieval/admitted.rs": [
+    "crates/tracedecay-session-runtime/src/session_retrieval/admitted.rs": [
         "SessionApplicationRetrievalPortV1",
         "retrieve_admitted_with_cancellation",
     ],

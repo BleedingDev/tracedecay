@@ -2,21 +2,21 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::mcp::response_handles::{
-    ResponseHandleLookup, public_retrieve_error, retrieve_response_handle,
-};
 use crate::tracedecay::TraceDecay;
 use crate::tracedecay::current_timestamp;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDb;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
-
-use super::super::ToolResult;
-use super::super::binding::{
-    tool_accepts_registered_project_selector, tool_is_selector_bound_effect,
+use tracedecay_mcp::response_handles::{
+    ResponseHandleLookup, public_retrieve_error, retrieve_response_handle,
 };
-use super::super::render;
+
+use super::super::binding::{
+    tool_accepts_registered_project_selector, tool_dispatches_registered_project_reader,
+};
 use super::support;
 use super::support::registered_project_context;
+use tracedecay_mcp::ToolResult;
+use tracedecay_mcp::tools::render;
 
 pub(in crate::mcp::tools) fn text_tool_result(text: &str) -> ToolResult {
     support::text_tool_result(text, Vec::new())
@@ -54,15 +54,14 @@ pub(crate) async fn resolve_registered_project_route_for_tool(
     global_db: Option<&RegisteredGlobalDb>,
     resolver: Option<crate::mcp::server::RetainedProjectServerResolver>,
 ) -> Result<Option<crate::mcp::project_route::ResolvedProjectRoute>> {
-    if !tool_accepts_registered_project_selector(&tool_name)
-        || tool_is_selector_bound_effect(&tool_name)
-    {
+    let semantic_top_level_fields =
+        crate::mcp::project_route::semantic_route_argument_fields(&tool_name);
+    if tool_accepts_registered_project_selector(&tool_name) {
+        support::validate_registered_project_selector_aliases(&args, semantic_top_level_fields)?;
+    }
+    if !tool_dispatches_registered_project_reader(&tool_name) {
         return Ok(None);
     }
-    let semantic_top_level_fields = match tool_name.as_str() {
-        "tracedecay_message_search" => &["project_path"][..],
-        _ => &[][..],
-    };
     let context = boxed_send(registered_project_context(
         &args,
         semantic_top_level_fields,

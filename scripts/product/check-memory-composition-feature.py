@@ -34,9 +34,11 @@ The invariants this gate enforces:
   its registry refusal, before any journal, ledger, replay or worker.
 * **Explicit activation.**  The production entry can pass only
   ``FromRuntimeConfiguration``; the resolved activation is bound exactly once
-  and never rebound, shadowed or overwritten; the resolver keeps its explicit
-  four-way table; and the ``Pinned`` selector, its resolve arm and its single
-  construction stay ``#[cfg(any(test, feature = "test-transport"))]`` gated.
+  and never rebound, shadowed or overwritten; and the resolver keeps its
+  explicit four-way table.  There is no pinned-activation seam at all: the
+  selector carries exactly one variant, so no build -- test, transport or
+  production -- can express an activation the runtime configuration did not
+  decide.  The pinned spellings stay forbidden everywhere below.
 * **Narrow registry ownership.**  Only ``project_composition.rs`` composes,
   and the enabled Native activation is constructed exactly once *inside* the
   resolved ``Some(mode)`` arm of ``mount_project_memory_provider_host``.
@@ -264,16 +266,23 @@ MATCH_KEYWORD = re.compile(r"\bmatch\b")
 MATCHES_MACRO = re.compile(r"\bmatches!\s*\(")
 STATEMENT_BOUNDARY = ";{}"
 
-# Exact composition fragments that prove the *gating* of the test-only
-# activation seam.  These are checked against the whole file, because their
-# whole point is the `#[cfg(...)]` attribute that removes them from a
-# production build.
+# Exact composition fragments that prove the *gating* of the host mount.
+# These are checked against the whole file, because their whole point is the
+# `#[cfg(...)]` attribute that removes them from a production build.
+#
+# The two `Pinned` fragments this tuple used to carry are gone on purpose.
+# The `ProjectMemoryProviderActivationSelector::Pinned` variant, its resolve
+# arm and its only construction (the `open_with_native_provider_for_test`
+# harness seam) no longer exist: `production_harness.rs` is upstream-owned and
+# its convergence-map entry (`shutdown_deadline` /
+# `production_harness_shutdown`) authorizes only the shared shutdown deadline,
+# so the seam was unauthorized and was removed. A gating requirement can only
+# be stated about a construct that exists; requiring these fragments would
+# force the unauthorized seam back into an upstream file. The pinned spellings
+# stay *forbidden* below (see `check_composition_mount` and the root-source
+# scan), which is the stronger invariant the removal leaves behind.
 COMPOSITION_GATING_FRAGMENTS = (
     f'#[cfg(feature = "{FEATURE}")]\nfn mount_project_memory_provider_host(',
-    '#[cfg(any(test, feature = "test-transport"))]\n'
-    "    Pinned(ProjectMemoryProviderActivation),",
-    '#[cfg(any(test, feature = "test-transport"))]\n'
-    "            Self::Pinned(activation) => Ok(activation),",
 )
 # The four-way resolution table, checked inside the resolver body: disabled
 # stays disabled, a routing gate while disabled is a hard error, host-on alone

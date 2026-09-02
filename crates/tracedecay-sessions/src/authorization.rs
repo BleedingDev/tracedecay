@@ -37,6 +37,7 @@ pub enum SessionAccess {
 }
 
 impl SessionAccess {
+    #[hotpath::skip]
     pub const fn matches_requested_access(self, requested: Self) -> bool {
         matches!(
             (self, requested),
@@ -54,6 +55,7 @@ pub enum SessionRetrievalScope {
 }
 
 impl SessionRetrievalScope {
+    #[hotpath::skip]
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Session(_) => "session",
@@ -80,6 +82,7 @@ impl SessionRetrievalScope {
         matches!(self, Self::Session(granted) if granted == requested)
     }
 
+    #[hotpath::skip]
     pub const fn matches_authorized_root_target(&self) -> bool {
         matches!(self, Self::AllSessionsInAuthorizedRoot)
     }

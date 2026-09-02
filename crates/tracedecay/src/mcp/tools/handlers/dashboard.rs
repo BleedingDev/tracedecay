@@ -17,21 +17,22 @@ use serde_json::{Value, json};
 use tracedecay_application::{
     ApplicationProblem, ApplicationProblemEnvelope, RequestId, SafeDiagnostic,
 };
+use tracedecay_configuration::DirectConfigurationMutation;
 use tracedecay_domain::ProjectId;
 use tracedecay_domain::configuration::{
     CodeIndexWorkerSelectionV1, ConfigurationIdempotencyKey, ConfigurationRevisionId, UserProfileId,
 };
-use tracedecay_usecases::configuration::DirectConfigurationMutation;
+use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
 use crate::tracedecay::TraceDecay;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 
-use super::super::ToolResult;
 use super::dashboard_lcm::DashboardLcmReadAdapter;
 use super::support::generic_tool_result;
+use tracedecay_mcp::ToolResult;
 
-use crate::dashboard::{
+use tracedecay_dashboard_api::{
     AutomationSchedulerReconciler, DEFAULT_PORT, DashboardApplicationRouters,
     DashboardApplicationRuntime, DashboardAutomationWriter,
     DashboardCodeIndexWorkerConfigurationV1, DashboardCodeIndexWorkerSettingsCommitFuture,
@@ -48,7 +49,7 @@ struct DashboardProfileCodeIndexWorkerSettingsAdapter {
     database: RegisteredGlobalDbLeaseV1,
     profile_id: UserProfileId,
     project_root: PathBuf,
-    registrar: crate::daemon::DaemonConfigurationRuntimeRegistrar,
+    registrar: tracedecay_daemon_service::DaemonConfigurationRuntimeRegistrar,
 }
 
 impl DashboardProfileCodeIndexWorkerSettingsAdapter {
@@ -56,13 +57,13 @@ impl DashboardProfileCodeIndexWorkerSettingsAdapter {
         database: RegisteredGlobalDbLeaseV1,
         profile_id: UserProfileId,
         project_root: PathBuf,
-        service: &crate::daemon::DaemonInvocationService,
+        service: &tracedecay_daemon_service::DaemonInvocationService,
     ) -> Self {
         Self {
             database,
             profile_id,
             project_root,
-            registrar: crate::daemon::DaemonConfigurationRuntimeRegistrar::new(service),
+            registrar: tracedecay_daemon_service::DaemonConfigurationRuntimeRegistrar::new(service),
         }
     }
 }
@@ -71,7 +72,7 @@ pub(crate) fn compose_dashboard_profile_code_index_worker_settings(
     database: RegisteredGlobalDbLeaseV1,
     profile_id: UserProfileId,
     project_root: PathBuf,
-    service: &crate::daemon::DaemonInvocationService,
+    service: &tracedecay_daemon_service::DaemonInvocationService,
 ) -> Arc<dyn DashboardProfileCodeIndexWorkerSettingsPort> {
     Arc::new(DashboardProfileCodeIndexWorkerSettingsAdapter::new(
         database,
@@ -109,8 +110,8 @@ impl DashboardProfileCodeIndexWorkerSettingsPort
         let project_root = self.project_root.clone();
         let registrar = self.registrar.clone();
         Box::pin(async move {
-            let request_id = tracedecay_usecases::request_identity::mint_global_request_id(
-                tracedecay_usecases::request_identity::GlobalRequestSurface::DashboardSettings,
+            let request_id = tracedecay_application::request_identity::mint_global_request_id(
+                tracedecay_application::request_identity::GlobalRequestSurface::DashboardSettings,
             )
             .map_err(|_| DashboardCodeIndexWorkerSettingsErrorV1::Unavailable)?;
             let committed = registrar
@@ -207,7 +208,7 @@ impl DashboardApplicationRuntime for DashboardInvocationExecutorAdapter {
         )
         .map_err(|error| error.to_string())?;
         let executor: Arc<dyn tracedecay_daemon_protocol::DaemonInvocationExecutor> = Arc::new(
-            crate::daemon::invocation_client_for_current(handshake)
+            tracedecay_daemon_identity::invocation_client_for_current(handshake)
                 .map_err(|error| error.to_string())?,
         );
         Self::new(executor, self.user_profile_id.clone())
@@ -263,7 +264,7 @@ impl DashboardApplicationRuntime for DashboardInvocationExecutorAdapter {
         Box::pin(async move {
             let error_request_id = request_id.clone();
             match crate::application_surface::resolve_dashboard_application_surface(
-                crate::application_surface::ApplicationSurfaceOperation::ConfigurationBatch,
+                ApplicationSurfaceOperation::ConfigurationBatch,
                 request_id,
                 crate::application_surface::ApplicationSurfaceRequest::Configuration(
                     tracedecay_application::ConfigurationWireRequestV1::Batch(
@@ -362,7 +363,7 @@ impl DashboardApplicationRuntime for DashboardInvocationExecutorAdapter {
         &self,
         control: DashboardHttpRequestControlV1,
         transaction_id: tracedecay_domain::NativeIntegrationTransactionId,
-    ) -> crate::dashboard::DashboardNativeIntegrationStatusFuture<'_> {
+    ) -> tracedecay_dashboard_api::DashboardNativeIntegrationStatusFuture<'_> {
         let executor = Arc::clone(&self.executor);
         Box::pin(async move {
             dashboard_native_integration_status(executor.as_ref(), &control, transaction_id).await
@@ -376,17 +377,17 @@ impl DashboardApplicationRuntime for DashboardInvocationExecutorAdapter {
 #[hotpath::measure(future = true, label = "mcp.dashboard.native_integration.status")]
 pub(crate) async fn dashboard_native_integration_status(
     executor: &dyn tracedecay_daemon_protocol::DaemonInvocationExecutor,
-    control: &crate::dashboard::DashboardHttpRequestControlV1,
+    control: &tracedecay_dashboard_api::DashboardHttpRequestControlV1,
     transaction_id: tracedecay_domain::NativeIntegrationTransactionId,
 ) -> std::result::Result<
     tracedecay_application::NativeIntegrationSurfaceResultV1,
-    crate::dashboard::DashboardDaemonReadUnavailableV1,
+    tracedecay_dashboard_api::DashboardDaemonReadUnavailableV1,
 > {
-    use crate::dashboard::DashboardDaemonReadUnavailableV1;
+    use tracedecay_dashboard_api::DashboardDaemonReadUnavailableV1;
 
     let request = tracedecay_daemon_protocol::DaemonInvocationRequest::native_integration(
         control.request_id().as_str(),
-        crate::application_surface::ApplicationSurfaceOperation::NativeIntegrationStatus,
+        ApplicationSurfaceOperation::NativeIntegrationStatus,
         crate::application_surface::NativeIntegrationSurfaceRequest::Status(
             tracedecay_application::NativeIntegrationStatusSurfaceRequest { transaction_id },
         ),
@@ -606,7 +607,7 @@ pub(crate) async fn shutdown_dashboard_for_until(
 pub(crate) async fn shutdown_dashboard_for(project_root: &Path) -> Result<()> {
     shutdown_dashboard_for_until(
         project_root,
-        tokio::time::Instant::now() + crate::daemon::DAEMON_SHUTDOWN_DEADLINE,
+        tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE,
     )
     .await
 }
@@ -636,8 +637,10 @@ pub(crate) async fn shutdown_dashboard_until(deadline: tokio::time::Instant) -> 
 }
 
 pub(crate) async fn shutdown_dashboard() -> Result<()> {
-    shutdown_dashboard_until(tokio::time::Instant::now() + crate::daemon::DAEMON_SHUTDOWN_DEADLINE)
-        .await
+    shutdown_dashboard_until(
+        tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE,
+    )
+    .await
 }
 
 fn dashboard_tool_result(cg: &TraceDecay, args: &Value, payload: &Value) -> ToolResult {
@@ -656,21 +659,21 @@ pub(super) async fn handle_dashboard(
     daemon_user_profile_id: Option<UserProfileId>,
     daemon_profile_root: Option<PathBuf>,
     session_retrieval: Option<
-        Arc<dyn crate::daemon::session_retrieval::SessionApplicationRetrievalPortV1>,
+        Arc<dyn tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1>,
     >,
-    session_identity: Option<tracedecay_usecases::context::ResolvedSessionIdentity>,
+    session_identity: Option<tracedecay_session_memory::context::ResolvedSessionIdentity>,
     registered_savings_db: Option<RegisteredGlobalDbLeaseV1>,
     automation_scheduler_reconciler: Option<AutomationSchedulerReconciler>,
     automation_writer: DashboardAutomationWriter,
-    doctor_report_reader: Option<crate::dashboard::DoctorReportReader>,
+    doctor_report_reader: Option<tracedecay_dashboard_api::DoctorReportReader>,
     remote_operational_status: Option<
-        crate::daemon::remote_protocol::RemoteOperationalStatusProviderV1,
+        std::sync::Arc<dyn tracedecay_application::remote::status::RemoteOperationalStatusReadPort>,
     >,
     code_index_freshness_reader: Option<
-        crate::dashboard::code_index_freshness_api::CodeIndexFreshnessReader,
+        tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader,
     >,
-    explorer_semantic_reader: Option<crate::dashboard::ExplorerSemanticReader>,
-    feedback_status_reader: Option<crate::dashboard::feedback_api::FeedbackStatusReader>,
+    explorer_semantic_reader: Option<tracedecay_dashboard_api::ExplorerSemanticReader>,
+    feedback_status_reader: Option<tracedecay_dashboard_api::feedback_api::FeedbackStatusReader>,
     code_diagnostics_broker: Option<
         Arc<tokio::sync::Mutex<tracedecay_lsp::analyzer::broker::DiagnosticBroker>>,
     >,
@@ -680,7 +683,7 @@ pub(super) async fn handle_dashboard(
     delivery_settlement_authority: Option<
         Arc<tracedecay_usecases::observability::DeliverySettlementAuthorityV1>,
     >,
-    daemon_invocation_service: Option<crate::daemon::DaemonInvocationService>,
+    daemon_invocation_service: Option<tracedecay_daemon_service::DaemonInvocationService>,
 ) -> Result<ToolResult> {
     let action = args
         .get("action")
@@ -778,20 +781,21 @@ pub(super) async fn handle_dashboard(
             // Shared construction with the CLI path: resolved LCM/session store
             // selection included. No catch-up ingest spawn here — the host
             // MCP server already swept hookless transcripts at startup.
-            let retained_server = retained_project_server_resolver.as_ref().ok_or_else(|| {
-                TraceDecayError::Config {
+            let retained_server = retained_project_server_resolver
+                .as_ref()
+                .ok_or_else(|| TraceDecayError::Config {
                     message: "retained dashboard project server resolver is unavailable"
                         .to_string(),
-                }
-            })?(
-                crate::mcp::server::RetainedProjectGraphRequest::for_mounted_root(
-                    cg.project_root().to_path_buf(),
-                ),
-            )
-            .await?
-            .ok_or_else(|| TraceDecayError::Config {
-                message: "retained dashboard project server is unavailable".to_string(),
-            })?;
+                })?
+                .resolve(
+                    crate::mcp::server::RetainedProjectGraphRequest::for_mounted_root(
+                        cg.project_root().to_path_buf(),
+                    ),
+                )
+                .await?
+                .ok_or_else(|| TraceDecayError::Config {
+                    message: "retained dashboard project server is unavailable".to_string(),
+                })?;
             if let Some(expected_profile_id) = daemon_user_profile_id.as_ref()
                 && retained_server
                     .profile_identity()
@@ -820,7 +824,8 @@ pub(super) async fn handle_dashboard(
                     "retained dashboard project server resolved a different root",
                 ));
             }
-            let retained_cg: Arc<dyn crate::dashboard::DashboardProjectRuntime> = retained_graph;
+            let retained_cg: Arc<dyn tracedecay_dashboard_api::DashboardProjectRuntime> =
+                retained_graph;
             let dashboard_project_graph_resolver = retained_project_server_resolver
                 .clone()
                 .zip(daemon_user_profile_id.clone())
@@ -886,7 +891,7 @@ pub(super) async fn handle_dashboard(
                 .zip(session_identity)
                 .and_then(|(retrieval, identity)| DashboardLcmReadAdapter::new(retrieval, identity))
                 .map(|adapter| {
-                    Arc::new(adapter) as Arc<dyn crate::dashboard::DashboardLcmReadPortV1>
+                    Arc::new(adapter) as Arc<dyn tracedecay_dashboard_api::DashboardLcmReadPortV1>
                 });
             // Loom's git sources read the verified session-git-evidence
             // projection through the same registered store; a state composed
@@ -898,19 +903,23 @@ pub(super) async fn handle_dashboard(
                             database.clone(),
                         ),
                     )
-                        as Arc<dyn crate::dashboard::DashboardGitCorrelationReadPortV1>
+                        as Arc<dyn tracedecay_dashboard_api::DashboardGitCorrelationReadPortV1>
                 });
             let delivery_read_authority = daemon_invocation_service.map(|service| {
                 let adapter = super::dashboard_delivery::DashboardDeliveryReadAdapter::new(
                     service,
                     retained_cg.project_root().to_path_buf(),
                 );
-                Arc::new(adapter) as Arc<dyn crate::dashboard::DashboardDeliveryReadPortV1>
+                Arc::new(adapter) as Arc<dyn tracedecay_dashboard_api::DashboardDeliveryReadPortV1>
             });
             crate::hooks::install_dashboard_hook_readiness_projection()?;
+            // One fetch covers the served bundle and the advertised build
+            // version; both come from the registered product runtime.
+            let product_runtime = crate::product_runtime::product_runtime()?;
             let state = build_state_with_automation_reconciler(
                 retained_cg.clone(),
                 DashboardStateCompositionV1 {
+                    build_version: product_runtime.build_version(),
                     project_graph_resolver: dashboard_project_graph_resolver,
                     code_graph_read_admission,
                     code_graph_projection_read_port,
@@ -926,8 +935,8 @@ pub(super) async fn handle_dashboard(
                     automation_writer,
                     doctor_report_reader,
                     remote_operational_status_reader: remote_operational_status.map(|provider| {
-                        Arc::new(move || provider())
-                            as crate::dashboard::RemoteOperationalStatusReader
+                        Arc::new(move || provider.read())
+                            as tracedecay_dashboard_api::RemoteOperationalStatusReader
                     }),
                     code_index_freshness_reader,
                     explorer_semantic_reader,
@@ -939,9 +948,14 @@ pub(super) async fn handle_dashboard(
             )
             .await?;
 
-            let app = router(retained_cg.as_ref(), state, crate::dashboard::spa_router()).await?;
+            let app = router(
+                retained_cg.as_ref(),
+                state,
+                crate::dashboard::spa_router(product_runtime.dashboard()),
+            )
+            .await?;
             let (listener, addr) = bind_dashboard(&host, port).await?;
-            let app = crate::dashboard::with_dashboard_http_admission(app, addr);
+            let app = tracedecay_dashboard_api::with_dashboard_http_admission(app, addr);
             let url = format!("http://{addr}/");
 
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

@@ -17,7 +17,7 @@ REPO = Path(__file__).resolve().parents[1]
 MATRIX = REPO / "product/architecture/coding-memory-authority-matrix.json"
 CHECKER = REPO / "scripts/product/check-coding-memory-authority-matrix.py"
 CORE_CHECKER = REPO / "scripts/product/check-coding-memory-authority-matrix-core.py"
-RUNTIME_RS = Path("crates/tracedecay-usecases/src/configuration/runtime.rs")
+RUNTIME_RS = Path("crates/tracedecay-configuration/src/configuration/runtime.rs")
 
 
 def load_core_module():
@@ -326,7 +326,7 @@ impl ProjectConfigurationRuntime {
 class RuntimeConfigurationAuthorityAssertionTest(unittest.TestCase):
     """The single-writer configuration-authority assertion must stay whole.
 
-    `crates/tracedecay-usecases/src/configuration/runtime.rs` is the production
+    `crates/tracedecay-configuration/src/configuration/runtime.rs` is the production
     evidence that the retained transactional store is the ONLY runtime
     configuration authority. These tests pin the gate's source-evidence check
     so it cannot be reduced back to independent word fragments that a

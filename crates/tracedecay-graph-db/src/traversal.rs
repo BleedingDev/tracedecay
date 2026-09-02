@@ -34,6 +34,17 @@ pub enum GraphTraversalDirection {
     Both,
 }
 
+/// How a bulk fan-out behaves when the next relation would exceed `max_relations`.
+///
+/// Complete-adjacency tools must [`Self::Refuse`] so a truncated page cannot be
+/// mistaken for the full neighborhood. Page-shaped consumers (context related
+/// symbols) use [`Self::Truncate`]: they already keep a small prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelationFanoutOverflow {
+    Refuse,
+    Truncate,
+}
+
 #[derive(Clone)]
 pub struct TraversalRequest {
     pub namespace: GraphNamespace,
@@ -229,6 +240,32 @@ pub(crate) fn outgoing_relations(
         Direction::Outgoing,
         cancellation,
         ensure_projection_readable,
+        RelationFanoutOverflow::Refuse,
+    )
+}
+
+pub(crate) fn outgoing_relations_truncated(
+    database: &GrafeoDB,
+    namespace: &GraphNamespace,
+    starts: &[GraphEntityId],
+    relation_kinds: &BTreeSet<GraphRelationKind>,
+    max_relations: usize,
+    cancellation: &dyn GraphCancellation,
+    ensure_projection_readable: &dyn Fn(
+        &GraphNamespace,
+        &GraphProjectionId,
+    ) -> Result<(), GraphDbError>,
+) -> Result<Vec<Vec<GraphRelation>>, GraphDbError> {
+    directed_relations(
+        database,
+        namespace,
+        starts,
+        relation_kinds,
+        max_relations,
+        Direction::Outgoing,
+        cancellation,
+        ensure_projection_readable,
+        RelationFanoutOverflow::Truncate,
     )
 }
 
@@ -249,7 +286,6 @@ pub(crate) fn outgoing_relation_targets(
     let projected = relation_projection(Arc::clone(&store), relation_kinds);
     let mut admitted = 0_usize;
     let mut results = Vec::with_capacity(starts.len());
-    let mut entity_ids = HashMap::new();
     for start in starts {
         if cancellation.is_cancelled() {
             return Err(GraphDbError::Cancelled);
@@ -263,24 +299,22 @@ pub(crate) fn outgoing_relation_targets(
             if cancellation.is_cancelled() {
                 return Err(GraphDbError::Cancelled);
             }
-            let relation = relation_for_edge(
-                &projected,
-                edge,
-                namespace,
-                ensure_projection_readable,
-                &mut entity_ids,
-            )?;
             let target = store
                 .get_node(neighbor)
                 .ok_or_else(|| GraphDbError::Corrupt {
                     message: "outgoing relation target is missing".to_owned(),
                 })?;
             let target = decode_entity(&target)?;
-            if target.identity != relation.to {
-                return Err(GraphDbError::Corrupt {
-                    message: "outgoing relation target disagrees with native adjacency".to_owned(),
-                });
-            }
+            let relation = relation_for_edge(
+                &projected,
+                edge,
+                namespace,
+                ensure_projection_readable,
+                RelationEndpointCheck::Expected {
+                    from: start,
+                    to: &target.identity,
+                },
+            )?;
             targets.push(GraphRelationTarget { relation, target });
         }
         targets.sort_by(|left, right| left.relation.identity.cmp(&right.relation.identity));
@@ -294,6 +328,57 @@ pub(crate) fn outgoing_relation_targets(
         results.push(targets);
     }
     Ok(results)
+}
+
+pub(crate) fn visit_outgoing_relation_targets(
+    database: &GrafeoDB,
+    namespace: &GraphNamespace,
+    start: &GraphEntityId,
+    relation_kinds: &BTreeSet<GraphRelationKind>,
+    cancellation: &dyn GraphCancellation,
+    ensure_projection_readable: &dyn Fn(
+        &GraphNamespace,
+        &GraphProjectionId,
+    ) -> Result<(), GraphDbError>,
+    visitor: &mut dyn FnMut(GraphRelationTarget),
+) -> Result<usize, GraphDbError> {
+    if cancellation.is_cancelled() {
+        return Err(GraphDbError::Cancelled);
+    }
+    let store = database.graph_store();
+    let projected = relation_projection(Arc::clone(&store), relation_kinds);
+    let Some(node) = optional_node_for_entity(store.as_ref(), namespace, start)? else {
+        return Ok(0);
+    };
+    let mut visited = 0_usize;
+    for (neighbor, edge) in projected.edges_from(node, Direction::Outgoing) {
+        if cancellation.is_cancelled() {
+            return Err(GraphDbError::Cancelled);
+        }
+        let target = store
+            .get_node(neighbor)
+            .ok_or_else(|| GraphDbError::Corrupt {
+                message: "outgoing relation target is missing".to_owned(),
+            })?;
+        let target = decode_entity(&target)?;
+        let relation = relation_for_edge(
+            &projected,
+            edge,
+            namespace,
+            ensure_projection_readable,
+            RelationEndpointCheck::Expected {
+                from: start,
+                to: &target.identity,
+            },
+        )?;
+        visitor(GraphRelationTarget { relation, target });
+        visited = visited
+            .checked_add(1)
+            .ok_or_else(|| GraphDbError::Corrupt {
+                message: "outgoing relation target count overflowed".to_owned(),
+            })?;
+    }
+    Ok(visited)
 }
 
 /// Bulk kind-filtered incoming fan-out. See [`incoming_relation_ids`].
@@ -318,6 +403,32 @@ pub(crate) fn incoming_relations(
         Direction::Incoming,
         cancellation,
         ensure_projection_readable,
+        RelationFanoutOverflow::Refuse,
+    )
+}
+
+pub(crate) fn incoming_relations_truncated(
+    database: &GrafeoDB,
+    namespace: &GraphNamespace,
+    starts: &[GraphEntityId],
+    relation_kinds: &BTreeSet<GraphRelationKind>,
+    max_relations: usize,
+    cancellation: &dyn GraphCancellation,
+    ensure_projection_readable: &dyn Fn(
+        &GraphNamespace,
+        &GraphProjectionId,
+    ) -> Result<(), GraphDbError>,
+) -> Result<Vec<Vec<GraphRelation>>, GraphDbError> {
+    directed_relations(
+        database,
+        namespace,
+        starts,
+        relation_kinds,
+        max_relations,
+        Direction::Incoming,
+        cancellation,
+        ensure_projection_readable,
+        RelationFanoutOverflow::Truncate,
     )
 }
 
@@ -326,10 +437,12 @@ pub(crate) fn incoming_relations(
 /// A start with no projected entity yields an empty batch rather than an
 /// error, matching the existing outgoing contract. The `max_relations` budget
 /// is charged across the whole batch — not per start — so a caller cannot
-/// exceed it by widening `starts`, and an over-budget read fails with
-/// [`GraphDbError::BudgetExhausted`] rather than returning a truncated batch
-/// that could be mistaken for a complete fan-out.
+/// exceed it by widening `starts`. [`RelationFanoutOverflow::Refuse`] fails
+/// with [`GraphDbError::BudgetExhausted`] the moment the next row would
+/// exceed the budget (without walking the remaining edges).
+/// [`RelationFanoutOverflow::Truncate`] stops and returns the prefix.
 #[allow(clippy::too_many_arguments)]
+#[hotpath::measure(label = "graph_db.compact.directed_relations")]
 fn directed_relations(
     database: &GrafeoDB,
     namespace: &GraphNamespace,
@@ -342,6 +455,7 @@ fn directed_relations(
         &GraphNamespace,
         &GraphProjectionId,
     ) -> Result<(), GraphDbError>,
+    overflow: RelationFanoutOverflow,
 ) -> Result<Vec<Vec<GraphRelation>>, GraphDbError> {
     check_batch_request(starts, cancellation)?;
     let store = database.graph_store();
@@ -349,9 +463,14 @@ fn directed_relations(
     let mut admitted = 0_usize;
     let mut results = Vec::with_capacity(starts.len());
     let mut entity_ids = HashMap::new();
+    let mut truncated = false;
     for start in starts {
         if cancellation.is_cancelled() {
             return Err(GraphDbError::Cancelled);
+        }
+        if truncated {
+            results.push(Vec::new());
+            continue;
         }
         let Some(node) = optional_node_for_entity(store.as_ref(), namespace, start)? else {
             results.push(Vec::new());
@@ -362,12 +481,21 @@ fn directed_relations(
             if cancellation.is_cancelled() {
                 return Err(GraphDbError::Cancelled);
             }
+            if admitted.saturating_add(relations.len()).saturating_add(1) > max_relations {
+                match overflow {
+                    RelationFanoutOverflow::Refuse => return Err(read_budget(max_relations)),
+                    RelationFanoutOverflow::Truncate => {
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
             relations.push(relation_for_edge(
                 &projected,
                 edge,
                 namespace,
                 ensure_projection_readable,
-                &mut entity_ids,
+                RelationEndpointCheck::Cached(&mut entity_ids),
             )?);
         }
         relations.sort_by(|left, right| left.identity.cmp(&right.identity));
@@ -375,9 +503,6 @@ fn directed_relations(
         admitted = admitted
             .checked_add(relations.len())
             .ok_or_else(|| read_budget(max_relations))?;
-        if admitted > max_relations {
-            return Err(read_budget(max_relations));
-        }
         results.push(relations);
     }
     Ok(results)
@@ -472,6 +597,7 @@ fn projection_relation_projection(
     GraphProjection::new(store, spec)
 }
 
+#[hotpath::measure(label = "graph_db.compact.native_outgoing")]
 fn native_outgoing_traversal(
     store: &dyn GraphStore,
     start: NodeId,
@@ -675,6 +801,7 @@ enum NativeTraversalStop {
     Error(GraphDbError),
 }
 
+#[hotpath::measure(label = "graph_db.compact.directional")]
 fn directional_traversal(
     store: &dyn GraphStore,
     start: NodeId,
@@ -1013,6 +1140,14 @@ fn relation_identity(
     })
 }
 
+enum RelationEndpointCheck<'a> {
+    Cached(&'a mut HashMap<NodeId, GraphEntityId>),
+    Expected {
+        from: &'a GraphEntityId,
+        to: &'a GraphEntityId,
+    },
+}
+
 fn relation_for_edge(
     store: &dyn GraphStore,
     edge: EdgeId,
@@ -1021,7 +1156,7 @@ fn relation_for_edge(
         &GraphNamespace,
         &GraphProjectionId,
     ) -> Result<(), GraphDbError>,
-    entity_ids: &mut HashMap<NodeId, GraphEntityId>,
+    endpoint_check: RelationEndpointCheck<'_>,
 ) -> Result<GraphRelation, GraphDbError> {
     let stored = store.get_edge(edge).ok_or_else(|| GraphDbError::Corrupt {
         message: "outgoing relation references a missing native edge".to_owned(),
@@ -1071,9 +1206,17 @@ fn relation_for_edge(
         stored.get_property(RELATION_TO_PROPERTY),
         "outgoing relation target",
     )?;
-    if cached_entity_identity(store, stored.src, namespace, entity_ids)? != from
-        || cached_entity_identity(store, stored.dst, namespace, entity_ids)? != to
-    {
+    let endpoints_match = match endpoint_check {
+        RelationEndpointCheck::Cached(entity_ids) => {
+            cached_entity_identity(store, stored.src, namespace, entity_ids)? == from
+                && cached_entity_identity(store, stored.dst, namespace, entity_ids)? == to
+        }
+        RelationEndpointCheck::Expected {
+            from: expected_from,
+            to: expected_to,
+        } => expected_from == &from && expected_to == &to,
+    };
+    if !endpoints_match {
         return Err(GraphDbError::Corrupt {
             message: "outgoing relation endpoints disagree with native adjacency".to_owned(),
         });

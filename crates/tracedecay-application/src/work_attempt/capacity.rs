@@ -57,18 +57,22 @@ impl WorkAttemptCapacityV1 {
         }
     }
 
+    #[hotpath::skip]
     pub const fn global_active(&self) -> u64 {
         self.global_active
     }
 
+    #[hotpath::skip]
     pub const fn repository_active(&self) -> u64 {
         self.repository_active
     }
 
+    #[hotpath::skip]
     pub const fn task_active(&self) -> u64 {
         self.task_active
     }
 
+    #[hotpath::skip]
     pub const fn concurrency(&self) -> &TopologyConcurrencyPolicyV1 {
         &self.concurrency
     }

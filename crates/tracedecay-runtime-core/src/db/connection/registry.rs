@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::db::{DatabaseAuthority, engine::Connection};
-use crate::errors::TraceDecayError;
 use crate::profiled_lock::ProfiledMutex;
+use tracedecay_domain::errors::TraceDecayError;
 // The store-runtime registry moved into this kernel, so the facade retains the
 // concrete handle rather than an erased port.
 use super::memory_graph_reconciliation::{
@@ -83,6 +83,7 @@ impl DatabaseRuntimeClientV1 {
         self.guard.runtime().verified_locator()
     }
 
+    #[hotpath::skip]
     pub async fn dispatch_submit(
         &self,
         request: tracedecay_store::RuntimeSubmitRequestV1,
@@ -267,8 +268,16 @@ pub(super) struct DatabaseInner {
     /// The daemon map owns the graph runtime attachment. The database keeps
     /// only this weak binding so mounting a derived graph cannot contribute a
     /// counted Store/Graph client that blocks retirement of its own owner.
+    /// The cell is shared (`Arc`) so a deferred-activation graph proxy can
+    /// resolve it at use time without retaining this inner allocation.
     pub(super) memory_graph_runtime:
-        OnceLock<Weak<dyn crate::store_runtime::VerifiedGraphRuntimePortV1>>,
+        Arc<OnceLock<Weak<dyn crate::store_runtime::VerifiedGraphRuntimePortV1>>>,
+    /// Watermark of the projected memory-graph source, keyed by the exact
+    /// append-only lineage stamp it was computed under. See
+    /// [`super::graph_binding`] for the invariant that makes the stamp a
+    /// change token for the projected source.
+    pub(super) memory_graph_source_watermark:
+        std::sync::Mutex<Option<super::graph_binding::MemoryGraphSourceStampedWatermarkV1>>,
 }
 
 impl DatabaseInner {
@@ -278,7 +287,7 @@ impl DatabaseInner {
         runtime: StoreRuntimeClientLease,
         access: DatabaseAccessMode,
         authority: Option<DatabaseAuthority>,
-    ) -> crate::errors::Result<Self> {
+    ) -> tracedecay_domain::errors::Result<Self> {
         let runtime = runtime.into_database_attachment().map_err(|error| {
             database_registry_error("publish canonical database runtime", format!("{error:?}"))
         })?;
@@ -345,7 +354,8 @@ impl DatabaseInner {
                 ProjectMemoryReconciliationTelemetryV1::default(),
             ),
             _authority: authority,
-            memory_graph_runtime: OnceLock::new(),
+            memory_graph_runtime: Arc::new(OnceLock::new()),
+            memory_graph_source_watermark: std::sync::Mutex::new(None),
         })
     }
 

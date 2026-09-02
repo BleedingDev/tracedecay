@@ -37,6 +37,7 @@ pub struct DiversityLimits {
 }
 
 impl DiversityLimits {
+    #[hotpath::skip]
     pub const fn unbounded() -> Self {
         Self {
             per_logical_message: usize::MAX,

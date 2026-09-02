@@ -276,10 +276,10 @@ impl tracedecay_daemon_protocol::DaemonInvocationExecutor for FactStoreCurateSuc
         &self,
         _subject_digest: ManifestDigest,
         _observed_at: UtcMicros,
-        _event: tracedecay_usecases::feedback::observations::FeedbackSourceEventV1,
+        _event: tracedecay_application::feedback::observations::FeedbackSourceEventV1,
     ) -> tracedecay_daemon_protocol::DaemonInvocationExecutorFuture<
         '_,
-        tracedecay_runtime_core::errors::Result<()>,
+        tracedecay_domain::errors::Result<()>,
     > {
         Box::pin(async { Ok(()) })
     }
@@ -351,10 +351,10 @@ impl tracedecay_daemon_protocol::DaemonInvocationExecutor for ExpiredDeadlineExe
         &self,
         _subject_digest: ManifestDigest,
         _observed_at: UtcMicros,
-        _event: tracedecay_usecases::feedback::observations::FeedbackSourceEventV1,
+        _event: tracedecay_application::feedback::observations::FeedbackSourceEventV1,
     ) -> tracedecay_daemon_protocol::DaemonInvocationExecutorFuture<
         '_,
-        tracedecay_runtime_core::errors::Result<()>,
+        tracedecay_domain::errors::Result<()>,
     > {
         Box::pin(async { Ok(()) })
     }
@@ -548,10 +548,10 @@ impl tracedecay_daemon_protocol::DaemonInvocationExecutor for PostCommitPartialE
         &self,
         _subject_digest: ManifestDigest,
         _observed_at: UtcMicros,
-        _event: tracedecay_usecases::feedback::observations::FeedbackSourceEventV1,
+        _event: tracedecay_application::feedback::observations::FeedbackSourceEventV1,
     ) -> tracedecay_daemon_protocol::DaemonInvocationExecutorFuture<
         '_,
-        tracedecay_runtime_core::errors::Result<()>,
+        tracedecay_domain::errors::Result<()>,
     > {
         Box::pin(async { Ok(()) })
     }
@@ -622,10 +622,10 @@ impl tracedecay_daemon_protocol::DaemonInvocationExecutor for PreCommitInterrupt
         &self,
         _subject_digest: ManifestDigest,
         _observed_at: UtcMicros,
-        _event: tracedecay_usecases::feedback::observations::FeedbackSourceEventV1,
+        _event: tracedecay_application::feedback::observations::FeedbackSourceEventV1,
     ) -> tracedecay_daemon_protocol::DaemonInvocationExecutorFuture<
         '_,
-        tracedecay_runtime_core::errors::Result<()>,
+        tracedecay_domain::errors::Result<()>,
     > {
         Box::pin(async { Ok(()) })
     }

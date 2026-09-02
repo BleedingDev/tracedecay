@@ -5,6 +5,7 @@
 //! anchors through the active evaluated federated profile, reauthorizes Work on
 //! both sides of selection, and hydrates only the globally selected anchors.
 
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,10 +14,10 @@ use tracedecay_application::retrieval::SessionRetrievalStructuralRefusalV1;
 use tracedecay_application::{
     OpaqueCursor, RequestContext, ResolvedScope, WorkAnchorHydrationFuture,
     WorkAnchorHydrationPortV1, WorkAnchorHydrationRequestV1, WorkEvidenceCoverageStateV1,
-    WorkEvidenceFreshnessV1, WorkEvidenceHydrationErrorV1, WorkTaskSessionContinuationV1,
-    WorkTaskSessionCoverageV1, WorkTaskSessionEvidenceV1, WorkTaskSessionFuture,
-    WorkTaskSessionHydrationStateV1, WorkTaskSessionHydrationV1, WorkTaskSessionPortV1,
-    WorkTaskSessionRankContributionV1, WorkTaskSessionRankedAnchorV1,
+    WorkEvidenceFreshnessV1, WorkEvidenceHydrationErrorV1, WorkEvidenceRetrievalPortV1,
+    WorkTaskSessionContinuationV1, WorkTaskSessionCoverageV1, WorkTaskSessionEvidenceV1,
+    WorkTaskSessionFuture, WorkTaskSessionHydrationStateV1, WorkTaskSessionHydrationV1,
+    WorkTaskSessionPortV1, WorkTaskSessionRankContributionV1, WorkTaskSessionRankedAnchorV1,
     WorkTaskSessionReauthorizationErrorV1, WorkTaskSessionReauthorizationPortV1,
     WorkTaskSessionRequestV1,
 };
@@ -29,6 +30,10 @@ use tracedecay_query::retrieval::QueryAuthorityV1;
 use tracedecay_query::retrieval::evidence_lanes::{
     TaskSessionBindingV1, TaskSessionCandidateSelectionV1, TaskSessionLaneEvidenceV1,
 };
+use tracedecay_session_memory::session::{
+    SessionDataFreshness, SessionRetrievalScope, SessionTemporalQuery,
+    TaskSessionRetrievalOutcomeV1,
+};
 use tracedecay_session_temporal_store::execution::{
     TaskSessionExecutionOmissionReasonV1, TaskSessionRankSelectorV1,
     TaskSessionReauthorizationStageV1, TaskSessionSelectionCallbackErrorV1,
@@ -36,12 +41,8 @@ use tracedecay_session_temporal_store::execution::{
 use tracedecay_temporal_query::context::ContextBudget;
 use tracedecay_temporal_query::ports::ExecutionLimits;
 use tracedecay_temporal_query::ranking::DiversityLimits;
-use tracedecay_usecases::session::{
-    SessionDataFreshness, SessionRetrievalScope, SessionTemporalQuery,
-    TaskSessionRetrievalOutcomeV1,
-};
 
-use crate::daemon::session_retrieval::SessionApplicationRetrievalPortV1;
+use tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1;
 
 const WORK_EVIDENCE_CONTEXT_BYTES: u64 = 64 * 1024;
 const WORK_TASK_SESSION_SANITIZER_REVISION: &str = "sanitizer.work-task-session.v1";
@@ -137,6 +138,23 @@ impl DaemonWorkEvidenceRetrievalV1 {
                 ))
                 .with_execution_limits(execution_limits)
         })
+    }
+}
+
+impl WorkEvidenceRetrievalPortV1 for DaemonWorkEvidenceRetrievalV1 {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn same_retrieval_authority(&self, other: &dyn WorkEvidenceRetrievalPortV1) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<Self>()
+            .is_some_and(|other| self.same_authority(other))
+    }
+
+    fn clone_arc(&self) -> Arc<dyn WorkEvidenceRetrievalPortV1> {
+        Arc::new(self.clone())
     }
 }
 
@@ -536,7 +554,7 @@ const fn cursor_manifest_hydration_refusal(
 }
 
 const fn budget_hydration_refusal(
-    stage: tracedecay_usecases::session::SessionRetrievalBudgetStageV1,
+    stage: tracedecay_session_memory::session::SessionRetrievalBudgetStageV1,
 ) -> WorkEvidenceHydrationErrorV1 {
     WorkEvidenceHydrationErrorV1::StructuralRefusal(
         SessionRetrievalStructuralRefusalV1::BudgetExhausted { stage },
@@ -632,6 +650,7 @@ pub(crate) mod tests {
         WorkProductSourceWatermarkV1, WorktreeId,
     };
     use tracedecay_query::retrieval::fusion::RetrievalCursorKeyringV1;
+    use tracedecay_session_memory::context::{BranchId, ProfileId, SessionRootId, SessionStoreId};
     use tracedecay_tool_catalog::{CapabilityId, UseCaseId};
 
     use super::*;
@@ -654,12 +673,12 @@ pub(crate) mod tests {
         );
         assert_eq!(
             budget_hydration_refusal(
-                tracedecay_usecases::session::SessionRetrievalBudgetStageV1::ContextTokens
+                tracedecay_session_memory::session::SessionRetrievalBudgetStageV1::ContextTokens
             ),
             WorkEvidenceHydrationErrorV1::StructuralRefusal(
                 SessionRetrievalStructuralRefusalV1::BudgetExhausted {
                     stage:
-                        tracedecay_usecases::session::SessionRetrievalBudgetStageV1::ContextTokens,
+                        tracedecay_session_memory::session::SessionRetrievalBudgetStageV1::ContextTokens,
                 }
             )
         );
@@ -912,20 +931,29 @@ pub(crate) mod tests {
         .expect("materialize provider session temporal projection");
 
         let root =
-            crate::daemon::session_retrieval::DaemonSessionRetrievalRoot::project_identity_for_test(
+            tracedecay_session_runtime::session_retrieval::DaemonSessionRetrievalRoot::project_identity_for_test(
+                ProfileId::new(database.binding().shard_id.profile_id.as_str().to_owned())
+                    .expect("profile identity"),
+                SessionStoreId::new("store.project.work-task-session")
+                    .expect("session store identity"),
+                SessionRootId::new("root.project.work-task-session")
+                    .expect("session root identity"),
+                database.binding().shard_id.clone(),
                 project_id,
                 repository_id,
                 worktree_id,
+                BranchId::new("branch.work-task-session").expect("branch identity"),
                 project.display().to_string(),
             );
         let scope = root
             .identity()
             .session_request_scope()
             .expect("resolved Work scope");
-        let retrieval = crate::daemon::session_retrieval::DaemonSessionRetrievalService::new(
-            database, root, None,
-        )
-        .expect("mounted project retrieval service");
+        let retrieval =
+            tracedecay_session_runtime::session_retrieval::DaemonSessionRetrievalService::new(
+                database, root, None,
+            )
+            .expect("mounted project retrieval service");
         let privacy_domain = id::<PrivacyDomainId>("privacy.work-task-session");
         let adapter = DaemonWorkEvidenceRetrievalV1::new(Arc::new(retrieval))
             .with_federated_authority(Arc::new(StaticFederatedAuthority(Arc::new(

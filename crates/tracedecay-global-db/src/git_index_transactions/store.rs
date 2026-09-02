@@ -13,6 +13,10 @@ use tracedecay_store::{
 };
 
 use crate::RegisteredGlobalDb;
+use crate::sqlite_persist::{
+    ReplayPresence, commit_outcome, replay_if_equal, require_absent_or_equal,
+    require_inserted_or_active, require_single_cas_row,
+};
 use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, Row, params};
 
 use super::database::{GitMutationDatabase, GitMutationReadSnapshot, GitMutationWriteTransaction};
@@ -33,6 +37,7 @@ pub struct GitIndexPreviewInputGcResult {
 }
 
 impl<'db> GlobalDbGitIndexTransactionStore<'db> {
+    #[hotpath::skip]
     pub const fn new(db: &'db RegisteredGlobalDb) -> Self {
         Self {
             db: GitMutationDatabase::Registered(db),
@@ -51,9 +56,15 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
         }
         let transaction = self.begin_write().await?;
         let outcome = insert_preview_input_if_absent(&transaction, &input, &encoded).await;
-        commit_outcome(transaction, outcome).await
+        commit_outcome(
+            transaction,
+            outcome,
+            GitIndexTransactionStoreError::Unavailable,
+        )
+        .await
     }
 
+    #[hotpath::skip]
     pub async fn read_preview_input(
         &self,
         preview_id: &GitIndexPreviewId,
@@ -64,6 +75,7 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
         read_preview_input_from_transaction(&snapshot, preview_id, observed_at).await
     }
 
+    #[hotpath::skip]
     pub async fn purge_expired_preview_inputs(
         &self,
         observed_at: UtcMicros,
@@ -74,6 +86,7 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
             .map(|result| result.purged)
     }
 
+    #[hotpath::skip]
     pub async fn next_live_preview_input_expiry(
         &self,
     ) -> GitIndexTransactionStoreResult<Option<UtcMicros>> {
@@ -124,7 +137,12 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
             })
         }
         .await;
-        commit_outcome(transaction, outcome).await
+        commit_outcome(
+            transaction,
+            outcome,
+            GitIndexTransactionStoreError::Unavailable,
+        )
+        .await
     }
 
     #[hotpath::measure(future = true, label = "global_db.git_index.persist.preview")]
@@ -135,9 +153,15 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
         preview.validate().map_err(invalid_domain)?;
         let transaction = self.begin_write().await?;
         let outcome = insert_preview_if_absent(&transaction, &preview).await;
-        commit_outcome(transaction, outcome).await
+        commit_outcome(
+            transaction,
+            outcome,
+            GitIndexTransactionStoreError::Unavailable,
+        )
+        .await
     }
 
+    #[hotpath::skip]
     pub async fn read_preview(
         &self,
         preview_id: &GitIndexPreviewId,
@@ -151,6 +175,7 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
     /// key without opening a writer. This is the read-only projection of the
     /// same record `begin_or_replay` reconstructs before it decides to start,
     /// replay, or require recovery.
+    #[hotpath::skip]
     pub async fn read_record(
         &self,
         idempotency_key: &GitIndexIdempotencyKey,
@@ -227,7 +252,12 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
             Ok(GitIndexTransactionBeginResultV1::Started(Box::new(record)))
         }
         .await;
-        commit_outcome(transaction, outcome).await
+        commit_outcome(
+            transaction,
+            outcome,
+            GitIndexTransactionStoreError::Unavailable,
+        )
+        .await
     }
 
     #[hotpath::measure(future = true, label = "global_db.git_index.persist.cas")]
@@ -270,13 +300,16 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
                 )
                 .await
                 .map_err(unavailable)?;
-            if updated != 1 {
-                return Err(GitIndexTransactionStoreError::JournalConflict);
-            }
+            require_single_cas_row(updated, GitIndexTransactionStoreError::JournalConflict)?;
             Ok(replacement)
         }
         .await;
-        commit_outcome(transaction, outcome).await
+        commit_outcome(
+            transaction,
+            outcome,
+            GitIndexTransactionStoreError::Unavailable,
+        )
+        .await
     }
 
     /// Publishes the terminal journal transition and receipt in one immediate
@@ -295,11 +328,11 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
                 .await?
                 .ok_or(GitIndexTransactionStoreError::ReceiptConflict)?;
             if let Some(existing) = record.terminal_receipt {
-                return if existing == write.receipt {
-                    Ok(existing)
-                } else {
-                    Err(GitIndexTransactionStoreError::ReceiptConflict)
-                };
+                return replay_if_equal(
+                    existing,
+                    &write.receipt,
+                    GitIndexTransactionStoreError::ReceiptConflict,
+                );
             }
             if write.receipt.outcome == GitIndexReceiptOutcomeV1::NeedsInspection {
                 ensure_active_quarantine(&transaction, &write.journal).await?;
@@ -347,9 +380,7 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
                 )
                 .await
                 .map_err(unavailable)?;
-            if updated != 1 {
-                return Err(GitIndexTransactionStoreError::JournalConflict);
-            }
+            require_single_cas_row(updated, GitIndexTransactionStoreError::JournalConflict)?;
             transaction
                 .execute(
                     "INSERT INTO git_index_transaction_receipts
@@ -371,9 +402,15 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
             Ok(write.receipt)
         }
         .await;
-        commit_outcome(transaction, outcome).await
+        commit_outcome(
+            transaction,
+            outcome,
+            GitIndexTransactionStoreError::Unavailable,
+        )
+        .await
     }
 
+    #[hotpath::skip]
     pub async fn recovery_candidates(
         &self,
         repository_id: &RepositoryId,
@@ -392,6 +429,7 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
             .collect())
     }
 
+    #[hotpath::skip]
     pub async fn recovery_repositories(&self) -> GitIndexTransactionStoreResult<Vec<RepositoryId>> {
         let snapshot = self.read_snapshot().await?;
         let mut rows = snapshot
@@ -452,9 +490,15 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
                 ensure_active_quarantine(&transaction, &record.journal).await
             }
             .await;
-        commit_outcome(transaction, outcome).await
+        commit_outcome(
+            transaction,
+            outcome,
+            GitIndexTransactionStoreError::Unavailable,
+        )
+        .await
     }
 
+    #[hotpath::skip]
     pub async fn clear_repository_quarantine(
         &self,
         repository_id: &RepositoryId,
@@ -506,13 +550,20 @@ impl<'db> GlobalDbGitIndexTransactionStore<'db> {
             Ok(())
         }
         .await;
-        commit_outcome(transaction, outcome).await
+        commit_outcome(
+            transaction,
+            outcome,
+            GitIndexTransactionStoreError::Unavailable,
+        )
+        .await
     }
 
+    #[hotpath::skip]
     async fn begin_write(&self) -> GitIndexTransactionStoreResult<GitMutationWriteTransaction<'_>> {
         self.db.begin_write().await.map_err(unavailable)
     }
 
+    #[hotpath::skip]
     async fn read_snapshot(&self) -> GitIndexTransactionStoreResult<GitMutationReadSnapshot> {
         self.db.read_snapshot().await.map_err(unavailable)
     }
@@ -550,24 +601,6 @@ where
     Ok(expiry)
 }
 
-#[hotpath::measure(future = true, label = "global_db.git_index.txn.commit")]
-async fn commit_outcome<T>(
-    transaction: GitMutationWriteTransaction<'_>,
-    outcome: GitIndexTransactionStoreResult<T>,
-) -> GitIndexTransactionStoreResult<T> {
-    match outcome {
-        Ok(value) => transaction
-            .commit()
-            .await
-            .map(|()| value)
-            .map_err(unavailable),
-        Err(error) => match transaction.rollback().await {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(unavailable(rollback_error)),
-        },
-    }
-}
-
 async fn insert_preview_if_absent<E>(
     transaction: &E,
     preview: &GitIndexPreviewV1,
@@ -575,12 +608,14 @@ async fn insert_preview_if_absent<E>(
 where
     E: Executor,
 {
-    if let Some(existing) = read_preview_from_transaction(transaction, &preview.preview_id).await? {
-        return if existing == *preview {
-            Ok(())
-        } else {
-            Err(GitIndexTransactionStoreError::PreviewConflict)
-        };
+    let existing = read_preview_from_transaction(transaction, &preview.preview_id).await?;
+    match require_absent_or_equal(
+        existing,
+        preview,
+        GitIndexTransactionStoreError::PreviewConflict,
+    )? {
+        ReplayPresence::Equal => return Ok(()),
+        ReplayPresence::Absent => {}
     }
     transaction
         .execute(
@@ -1029,18 +1064,17 @@ where
         )
         .await
         .map_err(unavailable)?;
-    if inserted == 1
-        || transaction_has_active_quarantine(
-            transaction,
-            &journal.repository_id,
-            &journal.transaction_id,
-        )
-        .await?
-    {
-        Ok(())
-    } else {
-        Err(GitIndexTransactionStoreError::ReceiptConflict)
-    }
+    let already_active = transaction_has_active_quarantine(
+        transaction,
+        &journal.repository_id,
+        &journal.transaction_id,
+    )
+    .await?;
+    require_inserted_or_active(
+        inserted,
+        already_active,
+        GitIndexTransactionStoreError::ReceiptConflict,
+    )
 }
 
 /// Resolve a fence created after admission in the same atomic write that
@@ -1192,6 +1226,6 @@ fn invalid_domain(error: tracedecay_domain::DomainError) -> GitIndexTransactionS
     GitIndexTransactionStoreError::InvalidData(error.to_string())
 }
 
-fn unavailable<T>(_error: T) -> GitIndexTransactionStoreError {
-    GitIndexTransactionStoreError::Unavailable
+fn unavailable(error: impl std::fmt::Display) -> GitIndexTransactionStoreError {
+    GitIndexTransactionStoreError::unavailable(error)
 }

@@ -15,7 +15,7 @@ use tracedecay_global_db::RegisteredGlobalDb;
 /// wire contract or a second routing identity.
 pub(crate) struct SelectedProjectResponseLease {
     _guard: tokio::sync::OwnedRwLockReadGuard<()>,
-    revoked: tracedecay_usecases::context::CancellationToken,
+    revoked: tracedecay_session_memory::context::CancellationToken,
     _active: ResponseLeaseGaugeGuard,
 }
 
@@ -37,7 +37,7 @@ impl Drop for ResponseLeaseGaugeGuard {
 impl SelectedProjectResponseLease {
     pub(crate) fn new(
         guard: tokio::sync::OwnedRwLockReadGuard<()>,
-        revoked: tracedecay_usecases::context::CancellationToken,
+        revoked: tracedecay_session_memory::context::CancellationToken,
     ) -> Self {
         Self {
             _guard: guard,
@@ -46,7 +46,7 @@ impl SelectedProjectResponseLease {
         }
     }
 
-    pub(crate) fn revoked(&self) -> &tracedecay_usecases::context::CancellationToken {
+    pub(crate) fn revoked(&self) -> &tracedecay_session_memory::context::CancellationToken {
         &self.revoked
     }
 
@@ -83,6 +83,7 @@ impl ConnectionRouteState {
         }
     }
 
+    #[hotpath::skip]
     pub(crate) async fn observe_initialize(
         &mut self,
         params: Option<&Value>,
@@ -99,6 +100,22 @@ impl ConnectionRouteState {
 
     pub(crate) fn memory_request_scope(&self) -> &str {
         &self.memory_request_scope
+    }
+
+    /// Snapshot immutable connection routing for one independent read.
+    ///
+    /// Selected response/request leases are request-owned and therefore start
+    /// empty. Effectful requests and notifications continue to use the
+    /// canonical connection state so their route-cache mutations are visible
+    /// to every later read after the connection barrier.
+    pub(crate) fn fork_for_independent_read(&self) -> Self {
+        Self {
+            initialize_route: self.initialize_route.clone(),
+            memory_request_scope: self.memory_request_scope.clone(),
+            route_cache: self.route_cache.clone(),
+            selected_response_lease: None,
+            selected_request_server: None,
+        }
     }
 
     pub(crate) fn install_selected_response_lease(&mut self, lease: SelectedProjectResponseLease) {
@@ -411,8 +428,11 @@ mod tests {
             )
             .await
             .expect("register original project root");
-        crate::storage::write_repository_identity_marker(&old_root, "proj_renamed")
-            .expect("write repository identity");
+        tracedecay_runtime_core::storage::write_repository_identity_marker(
+            &old_root,
+            "proj_renamed",
+        )
+        .expect("write repository identity");
 
         fs::rename(&old_root, &new_root).expect("rename project root");
         symlink(&new_root, &old_root).expect("link old root to renamed root");
@@ -479,8 +499,11 @@ mod tests {
             )
             .await
             .expect("register primary checkout");
-        crate::storage::write_repository_identity_marker(&primary_root, "proj_primary")
-            .expect("write repository identity");
+        tracedecay_runtime_core::storage::write_repository_identity_marker(
+            &primary_root,
+            "proj_primary",
+        )
+        .expect("write repository identity");
 
         let params = initialize_params(&linked_root);
         let resolved = resolve_initialize_roots_project_path(Some(&params), Some(registry)).await;

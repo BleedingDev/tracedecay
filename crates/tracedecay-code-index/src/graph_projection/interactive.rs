@@ -26,7 +26,8 @@ use tracedecay_domain::{
 };
 use tracedecay_graph_db::{
     GraphCancellation, GraphEntity, GraphEntityId, GraphProjectionIdentity, GraphRelation,
-    GraphRelationKind, MAX_VERIFIED_GENERATION_RELATIONS, VerifiedGraphSnapshot,
+    GraphRelationKind, MAX_VERIFIED_GENERATION_RELATIONS, RelationFanoutOverflow,
+    VerifiedGraphSnapshot,
 };
 
 use super::{
@@ -225,6 +226,7 @@ impl CodeGraphProjectionStore {
 }
 
 impl CodeGraphInteractiveReader {
+    #[hotpath::skip]
     pub(super) fn assemble(
         generation: CodeGenerationId,
         projection: GraphProjectionIdentity,
@@ -243,6 +245,7 @@ impl CodeGraphInteractiveReader {
         }
     }
 
+    #[hotpath::skip]
     pub fn generation(&self) -> &CodeGenerationId {
         &self.generation
     }
@@ -434,6 +437,28 @@ impl CodeGraphInteractiveReader {
             AdjacencyDirection::Outgoing,
             max_relations,
             cancellation,
+            RelationFanoutOverflow::Refuse,
+        )
+    }
+
+    /// Page-shaped outgoing fan-out: stops at `max_relations` instead of
+    /// refusing the batch. Context assembly uses this so a popular symbol
+    /// cannot force a 50k-edge hydrate on every call.
+    pub fn callees_truncated(
+        &self,
+        seeds: &[SymbolOccurrenceId],
+        kinds: &[RelationEdgeKindV1],
+        max_relations: usize,
+        request_cancellation: Arc<dyn GraphCancellation>,
+    ) -> Result<Vec<Vec<CodeGraphSemanticEdgeV1>>, CodeGraphProjectionError> {
+        let cancellation = self.read_cancellation(request_cancellation)?;
+        self.semantic_neighbors(
+            seeds,
+            kinds,
+            AdjacencyDirection::Outgoing,
+            max_relations,
+            cancellation,
+            RelationFanoutOverflow::Truncate,
         )
     }
 
@@ -453,6 +478,27 @@ impl CodeGraphInteractiveReader {
             AdjacencyDirection::Incoming,
             max_relations,
             cancellation,
+            RelationFanoutOverflow::Refuse,
+        )
+    }
+
+    /// Page-shaped incoming fan-out: stops at `max_relations` instead of
+    /// refusing the batch.
+    pub fn callers_truncated(
+        &self,
+        seeds: &[SymbolOccurrenceId],
+        kinds: &[RelationEdgeKindV1],
+        max_relations: usize,
+        request_cancellation: Arc<dyn GraphCancellation>,
+    ) -> Result<Vec<Vec<CodeGraphSemanticEdgeV1>>, CodeGraphProjectionError> {
+        let cancellation = self.read_cancellation(request_cancellation)?;
+        self.semantic_neighbors(
+            seeds,
+            kinds,
+            AdjacencyDirection::Incoming,
+            max_relations,
+            cancellation,
+            RelationFanoutOverflow::Truncate,
         )
     }
 
@@ -470,6 +516,7 @@ impl CodeGraphInteractiveReader {
             AdjacencyDirection::Outgoing,
             MAX_VERIFIED_GENERATION_RELATIONS,
             Arc::clone(&cancellation),
+            RelationFanoutOverflow::Refuse,
         )?;
         let incoming = self.semantic_neighbors(
             seeds,
@@ -477,6 +524,7 @@ impl CodeGraphInteractiveReader {
             AdjacencyDirection::Incoming,
             MAX_VERIFIED_GENERATION_RELATIONS,
             cancellation,
+            RelationFanoutOverflow::Refuse,
         )?;
         let mut counts = CodeGraphEdgeKindCountsV1::default();
         for edge in outgoing.into_iter().flatten() {
@@ -643,6 +691,7 @@ impl CodeGraphInteractiveReader {
                 AdjacencyDirection::Outgoing,
                 max_relations,
                 Arc::clone(&cancellation),
+                RelationFanoutOverflow::Refuse,
             )?;
             edges.extend(
                 per_seed
@@ -685,6 +734,7 @@ impl CodeGraphInteractiveReader {
                 AdjacencyDirection::Incoming,
                 max_relations_per_hop,
                 Arc::clone(&cancellation),
+                RelationFanoutOverflow::Refuse,
             )?;
             let mut next = Vec::new();
             for edge in per_seed.into_iter().flatten() {
@@ -713,6 +763,7 @@ impl CodeGraphInteractiveReader {
                 AdjacencyDirection::Incoming,
                 max_relations_per_hop,
                 Arc::clone(&cancellation),
+                RelationFanoutOverflow::Refuse,
             )?;
             if remaining
                 .into_iter()
@@ -756,6 +807,7 @@ impl CodeGraphInteractiveReader {
                 AdjacencyDirection::Outgoing,
                 max_relations_per_hop,
                 Arc::clone(&cancellation),
+                RelationFanoutOverflow::Refuse,
             )?;
             for edge in per_seed.into_iter().flatten() {
                 let target = edge.edge.to_occurrence.clone();
@@ -778,6 +830,7 @@ impl CodeGraphInteractiveReader {
         })
     }
 
+    #[hotpath::skip]
     fn read_cancellation(
         &self,
         request: Arc<dyn GraphCancellation>,
@@ -792,6 +845,7 @@ impl CodeGraphInteractiveReader {
         Ok(cancellation)
     }
 
+    #[hotpath::skip]
     fn catalog(
         &self,
         cancellation: Arc<dyn GraphCancellation>,
@@ -943,22 +997,43 @@ impl CodeGraphInteractiveReader {
         direction: AdjacencyDirection,
         max_relations: usize,
         cancellation: Arc<dyn GraphCancellation>,
+        overflow: RelationFanoutOverflow,
     ) -> Result<Vec<Vec<CodeGraphSemanticEdgeV1>>, CodeGraphProjectionError> {
         let starts = entity_ids(seeds)?;
         let admitted: BTreeSet<RelationEdgeKindV1> = kinds.iter().copied().collect();
-        let per_seed_relations = match direction {
-            AdjacencyDirection::Outgoing => self.snapshot.outgoing_relations(
-                &starts,
-                &source_relation_kinds()?,
-                max_relations,
-                Arc::clone(&cancellation),
-            )?,
-            AdjacencyDirection::Incoming => self.snapshot.incoming_relations(
-                &starts,
-                &target_relation_kinds()?,
-                max_relations,
-                Arc::clone(&cancellation),
-            )?,
+        let per_seed_relations = match (direction, overflow) {
+            (AdjacencyDirection::Outgoing, RelationFanoutOverflow::Refuse) => {
+                self.snapshot.outgoing_relations(
+                    &starts,
+                    &source_relation_kinds()?,
+                    max_relations,
+                    Arc::clone(&cancellation),
+                )?
+            }
+            (AdjacencyDirection::Outgoing, RelationFanoutOverflow::Truncate) => {
+                self.snapshot.outgoing_relations_truncated(
+                    &starts,
+                    &source_relation_kinds()?,
+                    max_relations,
+                    Arc::clone(&cancellation),
+                )?
+            }
+            (AdjacencyDirection::Incoming, RelationFanoutOverflow::Refuse) => {
+                self.snapshot.incoming_relations(
+                    &starts,
+                    &target_relation_kinds()?,
+                    max_relations,
+                    Arc::clone(&cancellation),
+                )?
+            }
+            (AdjacencyDirection::Incoming, RelationFanoutOverflow::Truncate) => {
+                self.snapshot.incoming_relations_truncated(
+                    &starts,
+                    &target_relation_kinds()?,
+                    max_relations,
+                    Arc::clone(&cancellation),
+                )?
+            }
         };
         if per_seed_relations.len() != seeds.len() {
             return Err(CodeGraphProjectionError::Corrupt(

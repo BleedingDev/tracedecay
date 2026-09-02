@@ -3,8 +3,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 use tracedecay_domain::canonical_text::sha256_hex;
 
-use crate::mcp::hook_events::HookEvent;
 use tracedecay_global_db::{AnalyticsEventInsert, RegisteredGlobalDb};
+use tracedecay_mcp::hook_events::HookEvent;
 
 pub(super) struct McpToolAnalyticsEvent<'a> {
     pub(super) project_root: &'a std::path::Path,
@@ -109,7 +109,7 @@ fn hook_route_idempotency_key(project_root: &Path, admission_seq: u64) -> String
 }
 
 pub(super) fn mcp_tool_analytics_event(input: McpToolAnalyticsEvent<'_>) -> AnalyticsEventInsert {
-    let category = crate::accounting::classifier::classify(&[input.tool_name], &[]);
+    let category = tracedecay_agent_hosts::task_classifier::classify(&[input.tool_name], &[]);
     let mut metadata = json!({
         "request_id": input.request_id,
         "transport": "mcp",
@@ -268,8 +268,8 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::mcp::hook_events::{HookAgent, HookEvent, HookEventKind};
     use tracedecay_hooks::core_events::HookRouteMetadata;
+    use tracedecay_mcp::hook_events::{HookAgent, HookEvent, HookEventKind};
 
     use super::{
         FAILURE_REASON_MAX_CHARS, McpToolAnalyticsEvent, bounded_failure_reason,

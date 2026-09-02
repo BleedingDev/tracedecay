@@ -71,6 +71,7 @@ pub const PROVIDER: &str = "cursor";
 impl CursorComposerSource {
     /// Ingest composer sessions belonging to `project_root`, bounded to
     /// `envelope_cap` newly changed sessions.
+    #[hotpath::skip]
     pub async fn ingest(
         &self,
         admission: &dyn crate::admission::HostAdmission,
@@ -89,6 +90,7 @@ impl CursorComposerSource {
     }
 
     /// [`Self::ingest`] with an aggregate serialized-payload byte budget.
+    #[hotpath::skip]
     pub async fn ingest_capped(
         &self,
         admission: &dyn crate::admission::HostAdmission,
@@ -108,6 +110,7 @@ impl CursorComposerSource {
         .await
     }
 
+    #[hotpath::skip]
     pub async fn ingest_user(
         &self,
         admission: &dyn crate::admission::HostAdmission,
@@ -124,6 +127,7 @@ impl CursorComposerSource {
     }
 
     /// [`Self::ingest_user`] with an aggregate serialized-payload byte budget.
+    #[hotpath::skip]
     pub async fn ingest_user_capped(
         &self,
         admission: &dyn crate::admission::HostAdmission,

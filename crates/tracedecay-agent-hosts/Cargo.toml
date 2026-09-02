@@ -20,6 +20,8 @@ hotpath = [
     "tracedecay-application/hotpath",
     "tracedecay-automation/hotpath",
     "tracedecay-automation-runtime/hotpath",
+    "tracedecay-daemon-protocol/hotpath",
+    "tracedecay-framing/hotpath",
     "tracedecay-global-db/hotpath",
     "tracedecay-hooks/hotpath",
     "tracedecay-host-integration/hotpath",
@@ -28,10 +30,10 @@ hotpath = [
     "tracedecay-private-fs/hotpath",
     "tracedecay-runtime-core/hotpath",
     "tracedecay-rusqlite-runtime/hotpath",
-    "tracedecay-session-temporal-store/hotpath",
+    "tracedecay-lcm/hotpath",
+    "tracedecay-session-memory/hotpath",
     "tracedecay-sessions/hotpath",
     "tracedecay-store/hotpath",
-    "tracedecay-temporal-query/hotpath",
     "tracedecay-tool-catalog/hotpath",
     "tracedecay-usecases/hotpath",
 ]
@@ -42,6 +44,8 @@ hotpath-alloc = [
     "tracedecay-application/hotpath-alloc",
     "tracedecay-automation/hotpath-alloc",
     "tracedecay-automation-runtime/hotpath-alloc",
+    "tracedecay-daemon-protocol/hotpath-alloc",
+    "tracedecay-framing/hotpath-alloc",
     "tracedecay-global-db/hotpath-alloc",
     "tracedecay-hooks/hotpath-alloc",
     "tracedecay-host-integration/hotpath-alloc",
@@ -50,10 +54,10 @@ hotpath-alloc = [
     "tracedecay-private-fs/hotpath-alloc",
     "tracedecay-runtime-core/hotpath-alloc",
     "tracedecay-rusqlite-runtime/hotpath-alloc",
-    "tracedecay-session-temporal-store/hotpath-alloc",
+    "tracedecay-lcm/hotpath-alloc",
+    "tracedecay-session-memory/hotpath-alloc",
     "tracedecay-sessions/hotpath-alloc",
     "tracedecay-store/hotpath-alloc",
-    "tracedecay-temporal-query/hotpath-alloc",
     "tracedecay-tool-catalog/hotpath-alloc",
     "tracedecay-usecases/hotpath-alloc",
 ]
@@ -64,6 +68,8 @@ hotpath-cpu = [
     "tracedecay-application/hotpath-cpu",
     "tracedecay-automation/hotpath-cpu",
     "tracedecay-automation-runtime/hotpath-cpu",
+    "tracedecay-daemon-protocol/hotpath-cpu",
+    "tracedecay-framing/hotpath-cpu",
     "tracedecay-global-db/hotpath-cpu",
     "tracedecay-hooks/hotpath-cpu",
     "tracedecay-host-integration/hotpath-cpu",
@@ -72,10 +78,10 @@ hotpath-cpu = [
     "tracedecay-private-fs/hotpath-cpu",
     "tracedecay-runtime-core/hotpath-cpu",
     "tracedecay-rusqlite-runtime/hotpath-cpu",
-    "tracedecay-session-temporal-store/hotpath-cpu",
+    "tracedecay-lcm/hotpath-cpu",
+    "tracedecay-session-memory/hotpath-cpu",
     "tracedecay-sessions/hotpath-cpu",
     "tracedecay-store/hotpath-cpu",
-    "tracedecay-temporal-query/hotpath-cpu",
     "tracedecay-tool-catalog/hotpath-cpu",
     "tracedecay-usecases/hotpath-cpu",
 ]
@@ -117,6 +123,8 @@ yaml-edit = { version = "0.2.3", default-features = false }
 tracedecay-application = { path = "../tracedecay-application", version = "0.1.0" }
 tracedecay-automation = { path = "../tracedecay-automation", version = "0.1.0" }
 tracedecay-automation-runtime = { path = "../tracedecay-automation-runtime", version = "0.1.0" }
+tracedecay-daemon-protocol = { path = "../tracedecay-daemon-protocol", version = "0.1.0" }
+tracedecay-framing = { path = "../tracedecay-framing", version = "0.1.0" }
 tracedecay-domain = { path = "../tracedecay-domain", version = "0.1.0" }
 tracedecay-global-db = { path = "../tracedecay-global-db", version = "0.1.0" }
 tracedecay-hooks = { path = "../tracedecay-hooks", version = "0.1.0" }
@@ -126,10 +134,10 @@ tracedecay-policy = { path = "../tracedecay-policy", version = "0.1.0" }
 tracedecay-private-fs = { path = "../tracedecay-private-fs", version = "0.1.0" }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0" }
 tracedecay-rusqlite-runtime = { path = "../tracedecay-rusqlite-runtime", version = "0.1.0" }
-tracedecay-session-temporal-store = { path = "../tracedecay-session-temporal-store", version = "0.1.0" }
+tracedecay-lcm = { path = "../tracedecay-lcm", version = "0.1.0" }
+tracedecay-session-memory = { path = "../tracedecay-session-memory", version = "0.1.0" }
 tracedecay-sessions = { path = "../tracedecay-sessions", version = "0.1.0" }
 tracedecay-store = { path = "../tracedecay-store", version = "0.1.0" }
-tracedecay-temporal-query = { path = "../tracedecay-temporal-query", version = "0.1.0" }
 tracedecay-tool-catalog = { path = "../tracedecay-tool-catalog", version = "0.1.0" }
 tracedecay-usecases = { path = "../tracedecay-usecases", version = "0.1.0" }
 

@@ -21,7 +21,7 @@ async fn committed_query_routes_install_and_rollback_as_one_revision() {
 
     let project_id = ProjectId::new("project.query-semantic-activation").expect("project id");
     let scope =
-        crate::daemon::project_open_owners::resolved_scope_for_project(project.path(), &project_id)
+        tracedecay_code_index_runtime::resolved_scope_for_project(project.path(), &project_id)
             .expect("resolved scope");
     let store = TempDir::new().expect("store root");
     let registry =
@@ -32,18 +32,15 @@ async fn committed_query_routes_install_and_rollback_as_one_revision() {
         .expect("mount code index");
     let cursor_store = TempDir::new().expect("cursor store");
     let profile_root = cursor_store.path().join("profile");
-    let identity =
-        crate::daemon::profile_identity::load_or_create(&profile_root).expect("profile identity");
+    let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+        .expect("profile identity");
     let _cursor_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         &profile_root,
         2,
         "query-semantic-activation",
     )
     .expect("database scope");
-    let session_registry =
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity,
-        )
+    let session_registry = tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity)
         .await
         .expect("session registry");
     let session_db = session_registry
@@ -534,7 +531,7 @@ async fn deferred_committed_restore_keeps_core_query_lanes_mountable() {
 
     let project_id = ProjectId::new("project.query-deferred-core-restore").expect("project id");
     let scope =
-        crate::daemon::project_open_owners::resolved_scope_for_project(project.path(), &project_id)
+        tracedecay_code_index_runtime::resolved_scope_for_project(project.path(), &project_id)
             .expect("resolved scope");
     let store = TempDir::new().expect("store root");
     let registry =
@@ -545,18 +542,15 @@ async fn deferred_committed_restore_keeps_core_query_lanes_mountable() {
         .expect("mount code index");
     let cursor_store = TempDir::new().expect("cursor store");
     let profile_root = cursor_store.path().join("profile");
-    let identity =
-        crate::daemon::profile_identity::load_or_create(&profile_root).expect("profile identity");
+    let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+        .expect("profile identity");
     let _cursor_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         &profile_root,
         2,
         "query-deferred-core-restore",
     )
     .expect("database scope");
-    let session_registry =
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity,
-        )
+    let session_registry = tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity)
         .await
         .expect("session registry");
     let session_db = session_registry
@@ -785,13 +779,16 @@ fn empty_restart_lanes() -> Vec<tracedecay_query::retrieval::fusion::Composition
 async fn project_cursor_authority_resumes_prepared_and_fusion_after_reopen() {
     let directory = TempDir::new().expect("temporary profile");
     let profile_root = directory.path().join("profile");
-    let identity =
-        crate::daemon::profile_identity::load_or_create(&profile_root).expect("profile identity");
+    let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+        .expect("profile identity");
     let project_root = directory.path().join("project");
     std::fs::create_dir_all(&project_root).expect("project root");
     let project_id = ProjectId::new("project.query-restart").expect("project id");
-    crate::storage::pin_fixture_repository_identity(&project_root, project_id.as_str())
-        .expect("production project enrollment");
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+        &project_root,
+        project_id.as_str(),
+    )
+    .expect("production project enrollment");
     let profile_sessions_path =
         tracedecay_sessions::runtime::user_sessions_db_path(identity.profile_root());
     let _scope_guard = tracedecay_runtime_core::db::enter_daemon_database_scope(
@@ -801,11 +798,9 @@ async fn project_cursor_authority_resumes_prepared_and_fusion_after_reopen() {
     )
     .expect("daemon database scope");
     let session_registry =
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity.clone(),
-        )
-        .await
-        .expect("session registry");
+        tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity.clone())
+            .await
+            .expect("session registry");
     let database = session_registry
         .project_sessions(project_id.clone(), [project_root.clone()])
         .await
@@ -898,11 +893,9 @@ async fn project_cursor_authority_resumes_prepared_and_fusion_after_reopen() {
     drop(database);
     drop(session_registry);
     let reopened_registry =
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity,
-        )
-        .await
-        .expect("reopened session registry");
+        tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity)
+            .await
+            .expect("reopened session registry");
     let reopened = reopened_registry
         .project_sessions(project_id.clone(), [project_root])
         .await
@@ -962,8 +955,11 @@ async fn project_cursor_authority_resumes_prepared_and_fusion_after_reopen() {
     std::fs::create_dir_all(&foreign_root).expect("foreign project root");
     let foreign_project_id =
         ProjectId::new("project.query-restart-foreign").expect("foreign project id");
-    crate::storage::pin_fixture_repository_identity(&foreign_root, foreign_project_id.as_str())
-        .expect("foreign production project enrollment");
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+        &foreign_root,
+        foreign_project_id.as_str(),
+    )
+    .expect("foreign production project enrollment");
     let foreign_database = reopened_registry
         .project_sessions(foreign_project_id, [foreign_root])
         .await

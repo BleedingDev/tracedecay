@@ -427,6 +427,7 @@ where
     G: WorkGraphReadPortV1,
     A: WorkProductOwnerAuthorizationPortV1,
 {
+    #[hotpath::skip]
     pub const fn new(graph: G, owner_authority: A, binding: WorkProductBindingV1) -> Self {
         Self {
             graph,

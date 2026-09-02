@@ -29,6 +29,60 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+resolve_clean_source_head() {
+  local source_repo=$1
+  local expected_sha=${2:-}
+  local source_git_root
+  local source_git_sha
+  local source_drift
+  local first_drift
+
+  if ! source_git_root=$(git -C "$source_repo" rev-parse --show-toplevel 2>/dev/null); then
+    die "source repository is not a git worktree: $source_repo"
+  fi
+  source_git_root=$(cd -- "$source_git_root" && pwd -P)
+  [[ $source_git_root == "$source_repo" ]] ||
+    die "source repository must be its own git worktree: $source_repo (git reported $source_git_root)"
+  if ! source_git_sha=$(git -C "$source_repo" rev-parse --verify 'HEAD^{commit}' 2>/dev/null); then
+    die "source repository HEAD does not resolve to a commit: $source_repo"
+  fi
+  [[ ${#source_git_sha} -eq 40 && $source_git_sha != *[!0-9a-f]* ]] ||
+    die "source repository HEAD is not a full lowercase git sha: $source_git_sha"
+  if [[ -n $expected_sha && $source_git_sha != "$expected_sha" ]]; then
+    die "source repository HEAD moved during distribution acceptance: captured $expected_sha, now $source_git_sha"
+  fi
+  # Ignored build outputs and the workflow-owned auxiliary checkout are not
+  # release source. All other tracked, staged, and untracked drift cannot be
+  # stamped as the clean release-env commit.
+  if ! source_drift=$(git --no-optional-locks -C "$source_repo" status \
+    --porcelain=v1 \
+    --untracked-files=all \
+    -- . ':(exclude).release-automation' 2>/dev/null); then
+    die "failed to verify source repository cleanliness: $source_repo"
+  fi
+  if [[ -n $source_drift ]]; then
+    first_drift=${source_drift%%$'\n'*}
+    die "source repository has tracked or untracked drift ($first_drift); commit or remove it before distribution acceptance"
+  fi
+
+  printf '%s\n' "$source_git_sha"
+}
+
+assert_binary_source_sha() {
+  local binary=$1
+  local product_version=$2
+  local source_git_sha=$3
+  local build_kind=$4
+  local reported_version
+  local expected_version="tracedecay ${product_version}+${source_git_sha}"
+
+  if ! reported_version=$("$binary" --version); then
+    die "$build_kind tracedecay binary failed to report its version: $binary"
+  fi
+  [[ $reported_version == "$expected_version" ]] ||
+    die "$build_kind tracedecay binary reported $reported_version; expected $expected_version"
+}
+
 assert_fastembed_fixture() {
   local fixture_root=$1
   local validator=$2
@@ -122,6 +176,7 @@ PY
 
 assert_required_assets() {
   local root_package=$1
+  local cli_package=$2
   local required
   local -a root_assets=(
     "plugin/.lsp.json"
@@ -129,8 +184,10 @@ assert_required_assets() {
     "plugin/.codex-plugin/plugin.json"
     "plugin/.cursor-plugin/plugin.json"
     "plugin/.kimi-plugin/plugin.json"
+    "plugin/opencode/tracedecay.ts"
+    "plugin/opencode/tracedecay-mcp.ts"
+    "plugin/opencode/opencode.registration.json"
     "plugin/cursor-native-extension/embedded/extension.js"
-    "dashboard/app-dist/index.html"
     "tests/fixtures/packaged_host_events/claude.json"
     "tests/fixtures/packaged_host_events/claude/post_tool_use_write.json"
     "tests/fixtures/packaged_host_events/cline-family.json"
@@ -155,8 +212,13 @@ assert_required_assets() {
     [[ -f "$root_package/$required" ]] ||
       die "packaged tracedecay crate is missing $required"
   done
+  # The dashboard bundle ships in the CLI package (its build.rs embeds the
+  # package-local dashboard/app-dist); the root library package must not
+  # carry a second copy that could drift from the one the binary serves.
   python3 "$repo/scripts/check-dashboard-bundle.py" \
-    "$root_package/dashboard/app-dist"
+    "$cli_package/dashboard/app-dist"
+  [[ ! -e "$root_package/dashboard/app-dist" ]] ||
+    die "packaged tracedecay crate must not carry dashboard/app-dist; the CLI package owns the bundle"
 
   python3 - "$root_package/plugin/.lsp.json" <<'PY'
 import json
@@ -230,12 +292,14 @@ done
 require_command cargo
 require_command cmp
 require_command curl
+require_command git
 require_command python3
 require_command rustc
 require_command tar
 
 repo=$(cd -- "$repo" && pwd -P)
 [[ -f "$repo/Cargo.toml" ]] || die "Cargo.toml not found under $repo"
+source_git_sha=$(resolve_clean_source_head "$repo")
 for fixture in \
   claude.json \
   claude/post_tool_use_write.json \
@@ -320,19 +384,21 @@ cargo build \
   --bins
 
 echo "distribution acceptance: staging the product package tree"
-# `tracedecay` is `crates/tracedecay`, but the assets it ships — the dashboard
-# bundle, host plugins, vendored payloads, benchmark corpora, and the packaged
-# fixtures — are repository-root directories shared with the whole workspace.
-# Cargo packs only what lives inside the package directory, so packaging the
-# checkout as-is yields a `tracedecay` archive with none of them, and the
-# `include` whitelist in `crates/tracedecay/Cargo.toml` silently matches
-# nothing. Stage a copy of the workspace, place exactly those root assets
-# beside the product manifest, and pack from the staged tree. `build.rs`
-# already recognises this shape: a manifest directory with `dashboard` and
-# `plugin` beside it *is* the repository root, and it embeds the prebuilt
-# app-dist rather than rebuilding the frontend.
+# `tracedecay` is `crates/tracedecay`, but the assets it ships — host plugins,
+# vendored payloads, benchmark corpora, and the packaged fixtures — are
+# repository-root directories shared with the whole workspace. Cargo packs
+# only what lives inside the package directory, so packaging the checkout
+# as-is yields a `tracedecay` archive with none of them, and the `include`
+# whitelist in `crates/tracedecay/Cargo.toml` silently matches nothing. Stage
+# a copy of the workspace, place exactly those root assets beside the product
+# manifest, and pack from the staged tree. The dashboard bundle is different:
+# it ships in the CLI package (`crates/tracedecay-cli`, whose `include` names
+# `/dashboard/app-dist/**`), and its build.rs embeds a package-local
+# `dashboard/app-dist` when one exists, so the bundle is staged beside the
+# CLI manifest below rather than beside the library manifest.
 staged="$work/staged"
 mkdir -p -- "$staged"
+resolve_clean_source_head "$repo" "$source_git_sha" >/dev/null
 tar -C "$repo" \
   --exclude=./target \
   --exclude=./.git \
@@ -341,6 +407,7 @@ tar -C "$repo" \
   --exclude='./dashboard/node_modules' \
   --exclude='./node_modules' \
   -cf - . | tar -xf - -C "$staged"
+resolve_clean_source_head "$repo" "$source_git_sha" >/dev/null
 
 staged_product="$staged/crates/tracedecay"
 [[ -f "$staged_product/Cargo.toml" ]] ||
@@ -358,16 +425,31 @@ declare -a staged_root_assets=(
   "plugin"
   "vendor"
   "benchmark_data"
-  "dashboard/app-dist"
   "dashboard/hermes-wrapper"
   "tests/fixtures"
   "scripts/run-session-temporal-benchmark.sh"
 )
 for asset in "${staged_root_assets[@]}"; do
-  [[ -e "$repo/$asset" ]] ||
-    die "product package asset is missing from the source tree: $asset"
+  [[ -e "$staged/$asset" ]] ||
+    die "product package asset is missing from the staged source tree: $asset"
   mkdir -p -- "$staged_product/$(dirname -- "$asset")"
-  cp -a -- "$repo/$asset" "$staged_product/$(dirname -- "$asset")/"
+  cp -a -- "$staged/$asset" "$staged_product/$(dirname -- "$asset")/"
+done
+
+# The CLI package carries the prebuilt dashboard bundle; its `include`
+# whitelist names `/dashboard/app-dist/**` and its build.rs embeds the
+# package-local copy in packaged-crate mode.
+staged_cli_crate="$staged/crates/tracedecay-cli"
+[[ -f "$staged_cli_crate/Cargo.toml" ]] ||
+  die "staged workspace is missing the CLI manifest at crates/tracedecay-cli"
+declare -a staged_cli_assets=(
+  "dashboard/app-dist"
+)
+for asset in "${staged_cli_assets[@]}"; do
+  [[ -e "$staged/$asset" ]] ||
+    die "CLI package asset is missing from the staged source tree: $asset"
+  mkdir -p -- "$staged_cli_crate/$(dirname -- "$asset")"
+  cp -a -- "$staged/$asset" "$staged_cli_crate/$(dirname -- "$asset")/"
 done
 
 # The manifest reads its readme from the workspace root, which is outside the
@@ -390,14 +472,18 @@ if text.count(old) != 1:
 path.write_text(text.replace(old, new), encoding="utf-8")
 PY
 
-# Prove the staged assets are byte-identical to the source tree, so the archive
-# below ships what the repository actually holds.
-python3 - "$repo" "$staged_product" "${staged_root_assets[@]}" <<'PY'
+# Prove the package-local copies are byte-identical to the validated staged
+# snapshot, so no later live-checkout change can enter the archive.
+assert_staged_assets_identical() {
+  local source_dir=$1
+  local staged_dir=$2
+  shift 2
+  python3 - "$source_dir" "$staged_dir" "$@" <<'PY'
 import hashlib
 import pathlib
 import sys
 
-repo = pathlib.Path(sys.argv[1])
+source_root = pathlib.Path(sys.argv[1])
 staged = pathlib.Path(sys.argv[2])
 
 
@@ -412,15 +498,18 @@ def digest(root: pathlib.Path) -> str:
 
 
 for asset in sys.argv[3:]:
-    source, copied = repo / asset, staged / asset
+    source, copied = source_root / asset, staged / asset
     if not copied.exists():
         raise SystemExit(f"distribution acceptance: staged asset is missing: {asset}")
     if digest(source) != digest(copied):
         raise SystemExit(
-            f"distribution acceptance: staged asset differs from its source: {asset}"
+            f"distribution acceptance: staged asset differs from its snapshot: {asset}"
         )
-print(f"distribution acceptance: staged {len(sys.argv) - 3} product asset entries")
+print(f"distribution acceptance: staged {len(sys.argv) - 3} package asset entries")
 PY
+}
+assert_staged_assets_identical "$staged" "$staged_product" "${staged_root_assets[@]}"
+assert_staged_assets_identical "$staged" "$staged_cli_crate" "${staged_cli_assets[@]}"
 
 echo "distribution acceptance: packaging every workspace crate"
 # Every workspace member is publish = false: releases ship GitHub-release
@@ -532,12 +621,12 @@ while IFS=$'\t' read -r name version; do
     die "package archive did not contain $name-$version/Cargo.toml"
   package_dirs["$name"]=$directory
   # Extracted archives are named `<name>-<version>`, but in the workspace every
-  # crate sits at `crates/<name>`. Build scripts that reach a sibling crate by
-  # relative path — `tracedecay-agent-hosts/build.rs` shares
-  # `tracedecay/src/version/build_identity.rs` through `#[path]` — resolve
-  # against that unversioned shape. `cargo package` cannot carry a file from
-  # outside the package, so give the battery the same sibling layout the
-  # workspace has rather than a copy that could drift from it.
+  # crate sits at `crates/<name>`. Sources that reach a sibling crate by
+  # relative `#[path]` — e.g. `tracedecay/src/daemon.rs` includes scheduler
+  # test modules from `tracedecay-code-index-runtime` — resolve against that
+  # unversioned shape. `cargo package` cannot carry a file from outside the
+  # package, so give the battery the same sibling layout the workspace has
+  # rather than a copy that could drift from it.
   ln -sfn -- "$name-$version" "$packages/$name"
 done <"$package_table"
 
@@ -549,6 +638,7 @@ for required_package in \
   tracedecay-tool-catalog \
   tracedecay-lsp \
   tracedecay-code-index \
+  tracedecay-code-index-runtime \
   tracedecay-code-extraction \
   tracedecay-query \
   tracedecay-semantic; do
@@ -564,7 +654,9 @@ query_package=${package_dirs[tracedecay-query]}
 semantic_package=${package_dirs[tracedecay-semantic]}
 catalog_package=${package_dirs[tracedecay-tool-catalog]}
 
-assert_required_assets "$root_package"
+assert_required_assets "$root_package" "$cli_package"
+[[ ! -e "$package_root/.git" && ! -L "$package_root/.git" ]] ||
+  die "extracted package workspace unexpectedly contains .git metadata: $package_root/.git"
 
 patch_config="$work/packaged-crates.toml"
 python3 - "$metadata" "$packages" "$staged/Cargo.toml" >"$patch_config" <<'PY'
@@ -613,7 +705,7 @@ verify_feature_wiring \
   "$patch_config"
 
 echo "distribution acceptance: compiling packaged CLI with release facilities"
-cargo build \
+TRACEDECAY_RELEASE_GIT_SHA="$source_git_sha" cargo build \
   --manifest-path "$cli_package/Cargo.toml" \
   --release \
   "${release_cli_cargo_args[@]}" \
@@ -626,6 +718,11 @@ fi
 packaged_cli_bin="$target_directory/release/tracedecay${executable_suffix}"
 [[ -x $packaged_cli_bin ]] ||
   die "packaged tracedecay CLI build did not produce $packaged_cli_bin"
+assert_binary_source_sha \
+  "$packaged_cli_bin" \
+  "$product_version" \
+  "$source_git_sha" \
+  "extracted-package"
 
 echo "distribution acceptance: testing packaged patched Rust grammar"
 cargo nextest run \
@@ -736,7 +833,7 @@ TRACEDECAY_DISTRIBUTION_FASTEMBED_FIXTURE="$fastembed_fixture" \
 
 install_root="$work/install"
 echo "distribution acceptance: installing packaged CLI with release facilities"
-cargo install \
+TRACEDECAY_RELEASE_GIT_SHA="$source_git_sha" cargo install \
   --path "$cli_package" \
   --root "$install_root" \
   "${release_cli_cargo_args[@]}" \
@@ -931,7 +1028,11 @@ CARGO_NET_OFFLINE=true HF_HUB_OFFLINE=1 "$fastembed_binary" \
 binary=$(python3 "$repo/scripts/resolve-installed-binary.py" \
   "$install_root" \
   "${RUNNER_OS:-}")
-"$binary" --version
+assert_binary_source_sha \
+  "$binary" \
+  "$product_version" \
+  "$source_git_sha" \
+  "installed extracted-package"
 
 echo "distribution acceptance: exercising installed MCP behavior"
 if [[ ${RUNNER_OS:-} == Windows ]]; then

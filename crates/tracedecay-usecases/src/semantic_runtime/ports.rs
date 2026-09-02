@@ -9,13 +9,14 @@ use tracedecay_domain::{
     FusionProfileId, ManifestDigest, RetrievalAnchorId, UtcMicros, VectorGenerationIdV1,
     canonical_sha256,
 };
+use tracedecay_semantic_contracts::SemanticFallbackReasonV1;
 
 use crate::config::retrieval::{
     AcceptedRetrievalProfileV1, RetrievalProfileAuditEventV1, RetrievalProfileAuditOperationV1,
     RetrievalProfileCasV1, RetrievalProfileStateV1, RetrievalRuntimeCompatibilityV1,
     SemanticCompatibilityPinsV1, SemanticResourceRequirementV1,
 };
-use crate::configuration::{
+use tracedecay_configuration::{
     ConfigurationControlStore, ConfigurationCurrentStateV1, ConfigurationOperationFuture,
 };
 
@@ -432,10 +433,6 @@ impl SemanticRollbackReceiptV1 {
         )
     }
 }
-
-/// Why the semantic lane is unavailable or degraded. Defined by the semantic
-/// runtime crate, which produces the reasons this projection reports.
-pub use tracedecay_semantic::SemanticFallbackReasonV1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -1634,7 +1631,7 @@ mod validate_contract_tests {
     use tracedecay_domain::{ManifestDigest, VectorGenerationIdV1};
 
     use super::*;
-    use crate::configuration::ConfigurationCurrentStateV1;
+    use tracedecay_configuration::ConfigurationCurrentStateV1;
 
     fn pin() -> SemanticConfigurationPinV1 {
         SemanticConfigurationPinV1::from_current(&ConfigurationCurrentStateV1 {

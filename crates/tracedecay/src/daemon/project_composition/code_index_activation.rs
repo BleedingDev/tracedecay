@@ -5,6 +5,8 @@
 //! reachable from the published MCP servers.
 
 use super::*;
+use tracedecay_code_index_runtime::code_index_scheduler::query_runtime::QueryRuntimeMountErrorV1;
+use tracedecay_semantic_contracts::SemanticResourceCeilings;
 
 /// Inputs the deferred mount closure re-clones on every activation attempt.
 /// Bundled so the builder keeps one argument list instead of thirteen
@@ -14,15 +16,14 @@ pub(super) struct CodeIndexActivationMountInputs {
     pub(super) project_id: tracedecay_domain::ProjectId,
     pub(super) project_root: PathBuf,
     pub(super) store_root: PathBuf,
-    pub(super) semantic_runtime: crate::semantic_code::DaemonSemanticRuntimeHandleV1,
-    pub(super) semantic_lifecycle: Option<Arc<crate::semantic_code::SemanticModelLifecycleOwnerV1>>,
-    pub(super) semantic_resources: crate::config::SemanticResourceCeilings,
+    pub(super) semantic_runtime: tracedecay_semantic::DaemonSemanticRuntimeHandleV1,
+    pub(super) semantic_lifecycle: Option<Arc<tracedecay_semantic::SemanticModelLifecycleOwnerV1>>,
+    pub(super) semantic_resources: SemanticResourceCeilings,
     pub(super) native_graph_activation: bool,
     pub(super) scope: tracedecay_application::ResolvedScope,
     pub(super) route_registered: Arc<AtomicBool>,
     pub(super) cancellation: CancellationToken,
-    pub(super) graph_runtime:
-        Arc<crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1>,
+    pub(super) graph_runtime: Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>,
     pub(super) graph_publication_database: Arc<tracedecay_runtime_core::db::Database>,
     pub(super) profile_id: tracedecay_domain::configuration::UserProfileId,
 }
@@ -219,21 +220,73 @@ fn spawn_query_authority_when_generation_ready(inputs: QueryAuthorityWaitInputs)
             {
                 return;
             }
-            let mut fields = vec![
-                ("project", authority_project.display().to_string()),
-                ("phase", "code_index_query_authority".to_owned()),
-            ];
-            match outcome {
-                Ok(()) => fields.push(("outcome", "mounted".to_owned())),
-                Err(error) => {
-                    fields.push(("outcome", "degraded".to_owned()));
-                    fields.push(("error", error.to_string()));
-                }
-            }
-            log_daemon_event("project_open_phase", &fields);
+            log_query_authority_activation_outcome(&authority_project, outcome);
         },
         label = "daemon.project.activate.query_authority"
     ));
+}
+
+/// Classify and emit the post-wait query-authority mount result.
+///
+/// `GenerationUnavailable` is the expected pre-seat gap: the waiter already
+/// saw a generation id, but the mount still needs a current complete
+/// generation. That is typed status, not a WARN. A real mount refusal stays
+/// WARN so a broken profile or key cannot hide as warmup.
+fn log_query_authority_activation_outcome(
+    project: &Path,
+    outcome: std::result::Result<(), QueryRuntimeMountErrorV1>,
+) {
+    match outcome {
+        Ok(()) => {
+            log_daemon_event(
+                "project_open_phase",
+                &[
+                    ("project", project.display().to_string()),
+                    ("phase", "code_index_query_authority".to_owned()),
+                    ("outcome", "mounted".to_owned()),
+                ],
+            );
+        }
+        Err(QueryRuntimeMountErrorV1::GenerationUnavailable) => {
+            tracing::info!(
+                event = "project_open_phase",
+                project = %project.display(),
+                phase = "code_index_query_authority",
+                outcome = "awaiting_generation",
+                "query authority is unseated until a current generation exists"
+            );
+        }
+        Err(error) => {
+            log_daemon_event(
+                "project_open_phase",
+                &[
+                    ("project", project.display().to_string()),
+                    ("phase", "code_index_query_authority".to_owned()),
+                    ("outcome", "degraded".to_owned()),
+                    ("error", error.to_string()),
+                ],
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::daemon) enum QueryAuthorityActivationLogV1 {
+    Mounted,
+    AwaitingGeneration,
+    Degraded,
+}
+
+pub(in crate::daemon) fn classify_query_authority_activation_outcome(
+    outcome: &std::result::Result<(), QueryRuntimeMountErrorV1>,
+) -> QueryAuthorityActivationLogV1 {
+    match outcome {
+        Ok(()) => QueryAuthorityActivationLogV1::Mounted,
+        Err(QueryRuntimeMountErrorV1::GenerationUnavailable) => {
+            QueryAuthorityActivationLogV1::AwaitingGeneration
+        }
+        Err(_) => QueryAuthorityActivationLogV1::Degraded,
+    }
 }
 
 /// Hint sink handed to the activation owner: it coalesces after-edit hook paths
@@ -317,15 +370,39 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use tempfile::TempDir;
+    use tracedecay_code_index_runtime::code_index_scheduler::query_runtime::QueryRuntimeMountErrorV1;
 
     use super::*;
 
+    #[test]
+    fn pre_seat_generation_gap_is_typed_status_not_degraded() {
+        assert_eq!(
+            classify_query_authority_activation_outcome(&Ok(())),
+            QueryAuthorityActivationLogV1::Mounted
+        );
+        assert_eq!(
+            classify_query_authority_activation_outcome(&Err(
+                QueryRuntimeMountErrorV1::GenerationUnavailable
+            )),
+            QueryAuthorityActivationLogV1::AwaitingGeneration
+        );
+        assert_eq!(
+            classify_query_authority_activation_outcome(&Err(
+                QueryRuntimeMountErrorV1::KeyUnavailable
+            )),
+            QueryAuthorityActivationLogV1::Degraded
+        );
+    }
+
     fn git(root: &Path, arguments: &[&str]) {
-        let status = Command::new(tracedecay_runtime_core::git::git_program())
-            .current_dir(root)
-            .args(arguments)
-            .status()
-            .expect("run git");
+        let status = Command::new(
+            tracedecay_runtime_core::git::try_git_program()
+                .expect("absolute git executable should resolve"),
+        )
+        .current_dir(root)
+        .args(arguments)
+        .status()
+        .expect("run git");
         assert!(status.success(), "git {arguments:?}");
     }
 

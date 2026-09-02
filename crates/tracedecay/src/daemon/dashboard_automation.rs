@@ -21,6 +21,9 @@ use tracedecay_automation_runtime::automation::run_ledger::{
     AutomationRunLedgerRecord, AutomationTrigger,
 };
 use tracedecay_automation_runtime::automation::skill_writer::deploy_managed_skills_to_project;
+#[cfg(feature = "test-transport")]
+use tracedecay_daemon_identity::authority;
+use tracedecay_daemon_service::DaemonInvocationService;
 use tracedecay_dashboard_api::{
     DashboardAutomationAuthorityErrorV1, DashboardAutomationAuthorityV1,
     DashboardAutomationObservationRecorderV1, DashboardAutomationRunOutcomeV1,
@@ -32,7 +35,7 @@ use tracedecay_domain::configuration::UserProfileId;
 
 use crate::mcp::server::{RetainedProjectGraphRequest, RetainedProjectServerResolver};
 use crate::tracedecay::TraceDecay;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 mod retained_curator;
 pub(crate) use retained_curator::execute_retained_memory_curator;
@@ -80,7 +83,7 @@ impl DashboardAutomationRequestRuntime {
 }
 
 pub(crate) fn dashboard_automation_observation_port(
-    invocation_service: crate::daemon::service::invocation::DaemonInvocationService,
+    invocation_service: DaemonInvocationService,
 ) -> tracedecay_dashboard_api::DashboardAutomationObservationPortV1 {
     Arc::new(move |project_root| {
         let invocation_service = invocation_service.clone();
@@ -112,7 +115,7 @@ pub(crate) fn compose_dashboard_automation_authority(
     daemon_user_profile_id: UserProfileId,
     retained_project_server_resolver: RetainedProjectServerResolver,
     writer: DashboardAutomationWriter,
-    invocation_service: crate::daemon::service::invocation::DaemonInvocationService,
+    invocation_service: DaemonInvocationService,
 ) -> Result<DashboardAutomationAuthorityV1> {
     let project_resolver = dashboard_automation_project_resolver(
         daemon_user_profile_id,
@@ -130,7 +133,7 @@ fn compose_dashboard_automation_authority_with_resolver(
     profile_root: PathBuf,
     project_resolver: DashboardAutomationProjectResolver,
     writer: DashboardAutomationWriter,
-    invocation_service: crate::daemon::service::invocation::DaemonInvocationService,
+    invocation_service: DaemonInvocationService,
 ) -> Result<DashboardAutomationAuthorityV1> {
     let run_port = dashboard_automation_run_port(
         profile_root.clone(),
@@ -151,7 +154,7 @@ pub(crate) fn compose_dashboard_automation_authority_for_test(
     profile_root: PathBuf,
     retained: Arc<TraceDecay>,
     writer: DashboardAutomationWriter,
-    invocation_service: crate::daemon::service::invocation::DaemonInvocationService,
+    invocation_service: DaemonInvocationService,
 ) -> Result<DashboardAutomationAuthorityV1> {
     let retained_root = retained.project_root().to_path_buf();
     let project_resolver: DashboardAutomationProjectResolver =
@@ -159,18 +162,16 @@ pub(crate) fn compose_dashboard_automation_authority_for_test(
             let retained = Arc::clone(&retained);
             let retained_root = retained_root.clone();
             Box::pin(async move {
-                let requested = super::authority::canonical_identity_path(&requested_project_root)
+                let requested = authority::canonical_identity_path(&requested_project_root)
                     .map_err(|error| DashboardAutomationAuthorityErrorV1::Unavailable {
                         detail: format!("dashboard automation project is unavailable: {error}"),
                     })?;
-                let retained_identity = super::authority::canonical_identity_path(&retained_root)
-                    .map_err(|error| {
-                    DashboardAutomationAuthorityErrorV1::Unavailable {
+                let retained_identity = authority::canonical_identity_path(&retained_root)
+                    .map_err(|error| DashboardAutomationAuthorityErrorV1::Unavailable {
                         detail: format!(
                             "retained dashboard automation project is unavailable: {error}"
                         ),
-                    }
-                })?;
+                    })?;
                 if requested != retained_identity {
                     return Err(DashboardAutomationAuthorityErrorV1::Denied {
                         detail: "dashboard automation project authority resolved a different root"
@@ -191,7 +192,7 @@ pub(crate) fn compose_dashboard_automation_authority_for_test(
 fn dashboard_automation_run_port(
     profile_root: PathBuf,
     project_resolver: DashboardAutomationProjectResolver,
-    invocation_service: crate::daemon::service::invocation::DaemonInvocationService,
+    invocation_service: DaemonInvocationService,
 ) -> DashboardAutomationRunPortV1 {
     Arc::new(move |invocation| {
         let profile_root = profile_root.clone();
@@ -258,19 +259,22 @@ fn dashboard_automation_project_resolver(
         let daemon_user_profile_id = daemon_user_profile_id.clone();
         let retained_project_server_resolver = Arc::clone(&retained_project_server_resolver);
         Box::pin(async move {
-            let retained_server = retained_project_server_resolver(
-                RetainedProjectGraphRequest::for_mounted_root(requested_project_root.clone()),
-            )
-            .await
-            .map_err(|error| DashboardAutomationAuthorityErrorV1::Unavailable {
-                detail: format!("dashboard automation project authority is unavailable: {error}"),
-            })?
-            .ok_or_else(|| DashboardAutomationAuthorityErrorV1::Unavailable {
-                detail: format!(
-                    "dashboard automation project '{}' is not retained by the daemon",
-                    requested_project_root.display()
-                ),
-            })?;
+            let retained_server = retained_project_server_resolver
+                .resolve(RetainedProjectGraphRequest::for_mounted_root(
+                    requested_project_root.clone(),
+                ))
+                .await
+                .map_err(|error| DashboardAutomationAuthorityErrorV1::Unavailable {
+                    detail: format!(
+                        "dashboard automation project authority is unavailable: {error}"
+                    ),
+                })?
+                .ok_or_else(|| DashboardAutomationAuthorityErrorV1::Unavailable {
+                    detail: format!(
+                        "dashboard automation project '{}' is not retained by the daemon",
+                        requested_project_root.display()
+                    ),
+                })?;
             if retained_server
                 .profile_identity()
                 .is_none_or(|identity| identity.profile_id() != &daemon_user_profile_id)
@@ -357,7 +361,7 @@ async fn execute_dashboard_automation_run(
     request: DashboardAutomationRunRequestV1,
     request_control: DashboardHttpRequestControlV1,
     _run_control: &AutomationRunControl,
-    invocation_service: &crate::daemon::service::invocation::DaemonInvocationService,
+    invocation_service: &DaemonInvocationService,
 ) -> DashboardAutomationResult<DashboardAutomationRunOutcomeV1> {
     let producer = crate::daemon::project_automation_observation_producer(
         invocation_service,
@@ -406,8 +410,10 @@ async fn execute_dashboard_automation_run(
                 request_control.cancellation(),
                 request_control.observed_at(),
                 configuration_digest,
-                crate::daemon::automation_effect::user_job_run_request(&run_id, &job_id)
-                    .map_err(automation_failed)?,
+                tracedecay_automation_runtime::automation::effect_runtime::user_job_run_request(
+                    &run_id, &job_id,
+                )
+                .map_err(automation_failed)?,
             )
             .await
             .map_err(automation_failed)?;
@@ -606,7 +612,7 @@ fn automation_admission_conflict() -> DashboardAutomationAuthorityErrorV1 {
 }
 
 fn automation_terminal_run(
-    terminal: &crate::daemon::automation_effect::AutomationSettledTerminal,
+    terminal: &tracedecay_automation_runtime::automation::effect_runtime::AutomationSettledTerminal,
 ) -> DashboardAutomationResult<tracedecay_application::retained_surfaces::AutomationRunResultV1> {
     if let Some(run) = terminal.run_result() {
         return Ok(run.clone());
@@ -620,7 +626,9 @@ fn automation_terminal_run(
 }
 
 fn automation_problem(
-    problem: Box<crate::daemon::automation_effect::AutomationSettledProblem>,
+    problem: Box<
+        tracedecay_automation_runtime::automation::effect_runtime::AutomationSettledProblem,
+    >,
 ) -> DashboardAutomationAuthorityErrorV1 {
     DashboardAutomationAuthorityErrorV1::AutomationProblem(problem)
 }

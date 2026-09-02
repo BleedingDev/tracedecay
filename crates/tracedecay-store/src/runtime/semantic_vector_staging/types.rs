@@ -9,7 +9,6 @@ use super::super::{
     StoreRuntimeBindingV1, StoreShardIdV1, StoreShardScopeV1,
 };
 
-pub const MAX_SEMANTIC_VECTOR_STAGE_CHUNKS: u64 = 100_000;
 pub const MAX_SEMANTIC_VECTOR_STAGE_CHUNKS_PER_BATCH: usize = 512;
 pub const MAX_SEMANTIC_VECTOR_STAGE_PAGE_RECORDS: u16 = 64;
 pub const MAX_SEMANTIC_VECTOR_PENDING_EFFECT_PAGE_RECORDS: u16 = 64;
@@ -365,13 +364,6 @@ impl SemanticVectorStagePlan {
                 field: "semantic vector publication projection",
             });
         }
-        if self.expected_chunk_count > MAX_SEMANTIC_VECTOR_STAGE_CHUNKS {
-            return Err(StorageRuntimeContractErrorV1::InvalidRange {
-                field: "semantic vector expected chunk count",
-                min: 0,
-                max: MAX_SEMANTIC_VECTOR_STAGE_CHUNKS,
-            });
-        }
         if !matches!(
             &self.source_scope.scope,
             StoreShardScopeV1::Code { scope, .. }
@@ -503,6 +495,7 @@ pub enum SemanticVectorStageChunkOperation {
 }
 
 impl SemanticVectorStageChunkOperation {
+    #[hotpath::skip]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Embed => "embed",
@@ -726,6 +719,7 @@ impl SemanticVectorOutboxSequence {
         Ok(Self(value))
     }
 
+    #[hotpath::skip]
     pub const fn get(self) -> u64 {
         self.0
     }

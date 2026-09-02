@@ -420,6 +420,7 @@ impl CodexDiscoveryHub {
         hotpath::gauge!("codex_discovery_consumers").set(inner.consumers.len() as f64);
     }
 
+    #[hotpath::skip]
     pub(crate) async fn discover(
         &self,
         consumer: &str,
@@ -1772,6 +1773,7 @@ enum CodexDiscoverySweep {
 }
 
 impl CodexDiscoveryFrontier {
+    #[hotpath::skip]
     pub(crate) const fn initial() -> Self {
         Self {
             epoch: CodexCorpusEpoch::initial(),
@@ -1779,6 +1781,7 @@ impl CodexDiscoveryFrontier {
         }
     }
 
+    #[hotpath::skip]
     const fn in_progress(epoch: CodexCorpusEpoch) -> Self {
         Self {
             epoch,
@@ -1786,6 +1789,7 @@ impl CodexDiscoveryFrontier {
         }
     }
 
+    #[hotpath::skip]
     const fn complete(epoch: CodexCorpusEpoch) -> Self {
         Self {
             epoch,
@@ -1793,10 +1797,12 @@ impl CodexDiscoveryFrontier {
         }
     }
 
+    #[hotpath::skip]
     pub(crate) const fn is_complete(self) -> bool {
         matches!(self.state, CodexDiscoverySweep::Complete)
     }
 
+    #[hotpath::skip]
     pub(crate) const fn for_coverage(self, coverage_complete: bool) -> Self {
         if self.is_complete() && !coverage_complete {
             Self::in_progress(self.epoch)
@@ -1825,6 +1831,7 @@ impl CodexDiscoveryFrontier {
         Ok(decoded)
     }
 
+    #[hotpath::skip]
     pub(crate) const fn into_parse_offsets(self) -> (ParseOffset, ParseOffset) {
         if self.epoch.is_initial() && matches!(self.state, CodexDiscoverySweep::InProgress) {
             return (
@@ -1863,6 +1870,7 @@ pub(crate) struct CodexCorpusEpoch {
 }
 
 impl CodexCorpusEpoch {
+    #[hotpath::skip]
     const fn initial() -> Self {
         Self {
             high: 0,
@@ -1871,10 +1879,12 @@ impl CodexCorpusEpoch {
         }
     }
 
+    #[hotpath::skip]
     const fn is_initial(self) -> bool {
         self.high == 0 && self.low == 0 && self.files == 0
     }
 
+    #[hotpath::skip]
     const fn from_parse_offset(offset: ParseOffset) -> Self {
         Self {
             high: offset.byte_offset,
@@ -1883,6 +1893,7 @@ impl CodexCorpusEpoch {
         }
     }
 
+    #[hotpath::skip]
     const fn into_parse_offset(self) -> ParseOffset {
         ParseOffset {
             byte_offset: self.high,

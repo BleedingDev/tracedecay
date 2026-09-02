@@ -411,6 +411,104 @@ async fn project_server_cache_hit_skips_open_and_singleflights_first_miss() {
     eprintln!("[cache-test] phase=shutdown done");
 }
 
+/// A mounted route alias answers without re-running registry admission: the
+/// retirement/revocation lifecycle owns a mounted server's validity, and only
+/// a (re)mount re-enters `ensure_registered_project_route`. A tombstone
+/// recorded after the mount therefore refuses the *next mount*, not the
+/// already-retained route.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mounted_route_alias_serves_without_readmission_until_retirement() {
+    let temp = TempDir::new().expect("temp dir");
+    let project = temp.path().join("project");
+    let profile_root = temp.path().join("profile");
+    std::fs::create_dir_all(project.join("src")).expect("project dir");
+    std::fs::write(project.join("src/main.rs"), "fn main() {}\n").expect("project source");
+    let client_identity = test_client_identity_for(profile_root.clone());
+    initialize_test_project(&project, &client_identity).await;
+    let handshake = DaemonHandshake {
+        project_path: Some(project.clone()),
+        client_identity,
+        ..test_handshake_defaults()
+    };
+    let _database_scope =
+        enter_test_daemon_database_scope(&profile_root, "mounted-alias-readmission");
+    let engine = test_daemon_engine_for_profile(&profile_root);
+
+    let mounted = engine
+        .project_server(&handshake)
+        .await
+        .expect("mount project server");
+
+    // Recorded *after* the mount and before any retirement: per-request
+    // re-admission would refuse the very next call, while lifecycle-owned
+    // admission keeps serving the retained route.
+    let database = engine
+        .store_administration
+        .registered_profile_database()
+        .await
+        .expect("profile database");
+    let profile_id = engine
+        .store_administration
+        .profile_identity()
+        .expect("profile identity")
+        .profile_id()
+        .as_str()
+        .to_owned();
+    database
+        .record_remote_deletion_tombstone(tracedecay_global_db::RemoteDeletionTombstone {
+            target: tracedecay_global_db::RemoteDeletionTarget::Account,
+            profile_id,
+            project_id: None,
+            tombstone_id: "tombstone.mounted-alias".to_owned(),
+            recorded_at_micros: 1,
+            cleanup: tracedecay_global_db::RemoteDeletionCleanupState::Pending,
+        })
+        .await
+        .expect("persist account tombstone");
+
+    let served = engine
+        .project_server(&handshake)
+        .await
+        .expect("a mounted route alias must keep serving until retirement lands");
+    assert!(
+        std::sync::Arc::ptr_eq(&mounted, &served),
+        "the alias hit must return the already-mounted server"
+    );
+    drop(served);
+    drop(mounted);
+
+    // Retirement (owned by the deletion/retirement lifecycle suites) drops
+    // the owner entry and every route alias. Drive that transition directly
+    // so this test pins only the admission contract: an evicted route
+    // re-enters `ensure_registered_project_route`, where the tombstone
+    // refuses the re-mount.
+    let route = super::super::ProjectRouteKey::from_handshake(
+        &project.canonicalize().expect("canonical project"),
+        &handshake,
+    )
+    .expect("route key");
+    {
+        let mut servers = engine.store_administration.project_servers().lock().await;
+        let key = servers
+            .get_route(&route)
+            .map(|(key, _)| key.clone())
+            .expect("mounted owner bound to route");
+        servers
+            .remove(&key)
+            .expect("retire the mounted owner and its aliases");
+    }
+
+    let refused = match engine.project_server(&handshake).await {
+        Ok(_) => panic!("re-mount after retirement must re-enter admission and be refused"),
+        Err(error) => error,
+    };
+    assert!(
+        refused.to_string().contains("deleted"),
+        "refusal must carry the remote-deletion cause, got: {refused}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn interrupted_post_insert_activation_retains_maintenance_ownership() {
@@ -491,7 +589,7 @@ fn store_owner_key_collapses_profile_and_store_aliases() {
     std::os::unix::fs::symlink(&profile, &profile_alias).expect("profile alias");
     std::os::unix::fs::symlink(&store, &store_alias).expect("store alias");
 
-    let direct = StoreOwnerKey::from_paths(
+    let direct = store_owner_key_from_paths(
         &profile,
         &profile.join("global.db"),
         Some("project-id".to_string()),
@@ -499,7 +597,7 @@ fn store_owner_key_collapses_profile_and_store_aliases() {
         &store.join("graph.db"),
     )
     .expect("direct owner");
-    let aliased = StoreOwnerKey::from_paths(
+    let aliased = store_owner_key_from_paths(
         &profile_alias,
         &profile_alias.join("global.db"),
         Some("project-id".to_string()),
@@ -526,7 +624,7 @@ fn parallel_client_instances_share_one_engine_but_scope_and_profile_do_not() {
     std::fs::create_dir_all(&other_profile).expect("other profile dir");
     std::fs::create_dir_all(&store).expect("store dir");
 
-    let owner = StoreOwnerKey::from_paths(
+    let owner = store_owner_key_from_paths(
         &profile,
         &profile.join("global.db"),
         Some("project-id".to_string()),
@@ -578,7 +676,7 @@ fn parallel_client_instances_share_one_engine_but_scope_and_profile_do_not() {
     let (_, inserted) = registry.bind_or_insert_route(scoped_route, scoped_key, Arc::new(u8::MAX));
     assert!(inserted, "distinct scope must retain an isolated engine");
 
-    let other_owner = StoreOwnerKey::from_paths(
+    let other_owner = store_owner_key_from_paths(
         &other_profile,
         &other_profile.join("global.db"),
         Some("project-id".to_string()),
@@ -1398,7 +1496,7 @@ async fn automation_retirement_timeout_retains_owner_tombstone_until_join_finish
     );
     assert_eq!(
         reconcile,
-        Some(crate::dashboard::AutomationSchedulerReconcileOutcome::Retiring),
+        Some(tracedecay_dashboard_api::AutomationSchedulerReconcileOutcome::Retiring),
         "replacement must remain unavailable while the old JoinHandle is live"
     );
     assert_eq!(
@@ -1425,10 +1523,10 @@ async fn automation_retirement_timeout_retains_owner_tombstone_until_join_finish
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn released_automation_tombstone_allows_one_eventual_replacement() {
-    use crate::dashboard::AutomationSchedulerReconcileOutcome;
     use tracedecay_automation_runtime::automation::scheduler::{
         AutomationSchedulerControl, save_scheduler_control,
     };
+    use tracedecay_dashboard_api::AutomationSchedulerReconcileOutcome;
 
     let dir = TempDir::new().expect("temp dir");
     let project = dir.path().join("project");

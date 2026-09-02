@@ -314,6 +314,7 @@ pub enum ContextUseOutcomeV1 {
 }
 
 impl ContextUseOutcomeV1 {
+    #[hotpath::skip]
     pub const fn label(self) -> &'static str {
         match self {
             Self::Supplied => "context_supplied",

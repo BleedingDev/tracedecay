@@ -1,10 +1,32 @@
 //! `tracedecay_diagnostics` — compiler and LSP diagnostics mapped to enclosing symbols.
 
-use super::*;
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::Duration;
 
-fn diagnostics_scope_arg(args: &Value) -> Result<(&str, crate::diagnostics::Scope)> {
-    use crate::diagnostics::Scope;
+use serde_json::{Value, json};
+use tokio::sync::Mutex;
+use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_global_db::RegisteredGlobalDb;
+use tracedecay_graph_query::VerifiedGraphQuery;
+use tracedecay_lsp::analyzer::activity::{active_languages_for_files, documents_for_adapter};
+use tracedecay_lsp::analyzer::broker::{
+    CodeDiagnostic, DiagnosticBroker, DiagnosticSeverity as BrokerDiagnosticSeverity, NodeSpan,
+    enclosing_node_for_line,
+};
+use tracedecay_lsp::compile_diagnostics::{
+    Diagnostic, DiagnosticsCache, Scope, is_rust_diagnostics_cold, run_all,
+    rust_diagnostics_target_dir, spawn_rust_diagnostics_prewarm,
+};
+use tracedecay_mcp::ToolResult;
 
+use crate::tracedecay::TraceDecay;
+
+use super::super::support::{generic_tool_result, unique_file_paths};
+
+const ANALYSIS_SYMBOL_BUDGET: usize = 500_000;
+
+fn diagnostics_scope_arg(args: &Value) -> Result<(&str, Scope)> {
     let scope_str = args
         .get("scope")
         .and_then(|v| v.as_str())
@@ -38,7 +60,7 @@ fn required_diagnostics_scope_value(args: &Value, scope: &str, name: &str) -> Re
 }
 
 fn enclosing_diagnostic_node(
-    graph: &crate::tracedecay::queries::graph::VerifiedGraphQuery,
+    graph: &VerifiedGraphQuery,
     spans_by_file: &mut HashMap<String, Vec<NodeSpan>>,
     file: &str,
     line_start: u32,
@@ -85,8 +107,8 @@ fn diagnostics_prewarm_enabled(config_flag: bool) -> bool {
 
 /// Build the early-return `warming` payload for a cold prewarm. Factored out so
 /// the warming path is unit-testable without spawning cargo.
-fn diagnostics_warming_result(project_root: &std::path::Path, args: &Value) -> ToolResult {
-    let target_dir = crate::diagnostics::rust_diagnostics_target_dir(project_root);
+fn diagnostics_warming_result(project_root: &Path, args: &Value) -> ToolResult {
+    let target_dir = rust_diagnostics_target_dir(project_root);
     let payload = json!({
         "status": "warming",
         "message": format!(
@@ -104,11 +126,9 @@ fn diagnostics_warming_result(project_root: &std::path::Path, args: &Value) -> T
 ///
 /// Read-only and fail-open: an unavailable verified projection is reported as
 /// explicitly empty rather than omitted.
-async fn session_correlation_health_json(
-    session_db: Option<&tracedecay_global_db::RegisteredGlobalDb>,
-) -> Value {
+async fn session_correlation_health_json(session_db: Option<&RegisteredGlobalDb>) -> Value {
     let health = match session_db {
-        Some(db) => crate::store::GlobalDbGitCorrelationStore::new(db)
+        Some(db) => tracedecay_global_db::GlobalDbGitCorrelationStore::new(db)
             .correlation_index_health()
             .await
             .ok(),
@@ -148,14 +168,12 @@ async fn session_correlation_health_json(
 #[hotpath::measure(future = true, label = "mcp.analysis.diagnostics.total")]
 pub(crate) async fn handle_diagnostics(
     cg: &TraceDecay,
-    graph: &crate::tracedecay::queries::graph::VerifiedGraphQuery,
+    graph: &VerifiedGraphQuery,
     args: Value,
-    diagnostics_cache: Option<&crate::diagnostics::DiagnosticsCache>,
-    diagnostics_lsp: Option<&tokio::sync::Mutex<DiagnosticBroker>>,
-    session_db: Option<&tracedecay_global_db::RegisteredGlobalDb>,
+    diagnostics_cache: Option<&DiagnosticsCache>,
+    diagnostics_lsp: Option<&Mutex<DiagnosticBroker>>,
+    session_db: Option<&RegisteredGlobalDb>,
 ) -> Result<ToolResult> {
-    use crate::diagnostics::run_all;
-
     let (scope_str, scope) = diagnostics_scope_arg(&args)?;
     let project_root = cg.project_root().to_path_buf();
 
@@ -165,9 +183,9 @@ pub(crate) async fn handle_diagnostics(
     // keep working and re-call once it is warm. Default-off preserves the
     // original blocking behaviour for callers who want the answer inline.
     if diagnostics_prewarm_enabled(cg.get_config().diagnostics_prewarm)
-        && crate::diagnostics::is_rust_diagnostics_cold(&project_root)
+        && is_rust_diagnostics_cold(&project_root)
     {
-        crate::diagnostics::spawn_rust_diagnostics_prewarm(&project_root)?;
+        spawn_rust_diagnostics_prewarm(&project_root)?;
         return Ok(diagnostics_warming_result(&project_root, &args));
     }
 
@@ -188,7 +206,7 @@ pub(crate) async fn handle_diagnostics(
     )
     .await?;
 
-    if let crate::diagnostics::Scope::File { path } = &scope {
+    if let Scope::File { path } = &scope {
         diagnostics.retain(|d| d.file == *path);
     }
 
@@ -253,10 +271,10 @@ pub(crate) async fn handle_diagnostics(
 
 async fn lsp_file_diagnostics(
     cg: &TraceDecay,
-    scope: &crate::diagnostics::Scope,
-    diagnostics_lsp: Option<&tokio::sync::Mutex<DiagnosticBroker>>,
-) -> Result<Option<Vec<crate::diagnostics::Diagnostic>>> {
-    let crate::diagnostics::Scope::File { path } = scope else {
+    scope: &Scope,
+    diagnostics_lsp: Option<&Mutex<DiagnosticBroker>>,
+) -> Result<Option<Vec<Diagnostic>>> {
+    let Scope::File { path } = scope else {
         return Ok(None);
     };
     let Some(diagnostics_lsp) = diagnostics_lsp else {
@@ -312,10 +330,8 @@ async fn lsp_file_diagnostics(
     ))
 }
 
-fn lsp_diagnostic_to_compiler_diagnostic(
-    diagnostic: CodeDiagnostic,
-) -> crate::diagnostics::Diagnostic {
-    crate::diagnostics::Diagnostic {
+fn lsp_diagnostic_to_compiler_diagnostic(diagnostic: CodeDiagnostic) -> Diagnostic {
+    Diagnostic {
         file: diagnostic.file,
         line_start: diagnostic.line_start,
         line_end: diagnostic.line_end,

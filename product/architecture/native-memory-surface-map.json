@@ -23,7 +23,7 @@
       "write_owner": "MemoryApplication over DatabaseFactStore/ProjectMemoryFactStore selected by FactOwnerV1",
       "read_authority": "The same owner-bound Native store; reads never discover a different path per request.",
       "source_paths": [
-        "crates/tracedecay-usecases/src/memory/mod.rs",
+        "crates/tracedecay-session-memory/src/memory/mod.rs",
         "crates/tracedecay-runtime-core/src/store/memory/mod.rs",
         "crates/tracedecay/src/tracedecay/facts.rs",
         "crates/tracedecay/src/daemon/retained_owner/memory.rs"
@@ -46,7 +46,7 @@
       "write_owner": "Owner-bound MemoryApplication feedback command through DatabaseFactStore",
       "read_authority": "Native feedback history/status queries over the same store",
       "source_paths": [
-        "crates/tracedecay-usecases/src/memory/project_memory.rs",
+        "crates/tracedecay-session-memory/src/memory/project_memory.rs",
         "crates/tracedecay-runtime-core/src/store/memory/mod.rs",
         "crates/tracedecay/src/daemon/retained_owner/memory.rs"
       ],
@@ -89,8 +89,8 @@
       "read_authority": "Admitted session/LCM retrieval service",
       "source_paths": [
         "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
-        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
-        "crates/tracedecay/src/store/session_ingest_authority.rs"
+        "crates/tracedecay-session-runtime/src/session_retrieval/admitted.rs",
+        "crates/tracedecay-host-admission/src/session_ingest_authority.rs"
       ],
       "prohibited": [
         "calling session observations canonical explicit facts",
@@ -110,7 +110,7 @@
       "read_authority": "Generation-pinned relation graph readers",
       "source_paths": [
         "crates/tracedecay-runtime-core/src/store/memory/graph.rs",
-        "crates/tracedecay/src/daemon/store_runtime/session_registry/memory_graph_reconciliation_tasks.rs"
+        "crates/tracedecay-store-runtime/src/session_registry/memory_graph_reconciliation_tasks.rs"
       ],
       "rebuildable": true,
       "prohibited": [
@@ -486,7 +486,7 @@
       "source_paths": [
         "crates/tracedecay/src/daemon/retained_owner/memory.rs",
         "crates/tracedecay/src/daemon/retained_owner/memory_target.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory_mutation.rs"
+        "crates/tracedecay-session-memory/src/memory_mutation.rs"
       ],
       "write_owner": "native_explicit_fact_log or native_feedback_log",
       "read_authority": "owner-bound Native store",
@@ -515,7 +515,7 @@
       "entry": "fact_store_curate / Memory Curator automation",
       "source_paths": [
         "crates/tracedecay/src/daemon/dashboard_automation/retained_curator.rs",
-        "crates/tracedecay-usecases/src/memory/curation.rs",
+        "crates/tracedecay-session-memory/src/memory/curation.rs",
         "crates/tracedecay-automation-runtime/src/automation/runner.rs"
       ],
       "write_owner": "native_explicit_fact_log",
@@ -529,7 +529,7 @@
       "effect": "write",
       "entry": "session reflector / automatic fact add",
       "source_paths": [
-        "crates/tracedecay-usecases/src/memory/project_memory.rs",
+        "crates/tracedecay-session-memory/src/memory/project_memory.rs",
         "crates/tracedecay-runtime-core/src/store/memory/automatic_facts",
         "crates/tracedecay-automation-runtime/src/automation/automatic_facts.rs",
         "crates/tracedecay/tests/automation_runner_test/session_reflector.rs"
@@ -560,9 +560,10 @@
       "effect": "read",
       "entry": "SessionApplicationRetrievalPortV1",
       "source_paths": [
-        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
-        "crates/tracedecay/src/daemon/session_retrieval/contract.rs",
-        "crates/tracedecay-usecases/src/context"
+        "crates/tracedecay-session-runtime/src/session_retrieval/admitted.rs",
+        "crates/tracedecay-session-runtime/src/session_retrieval/contract.rs",
+        "crates/tracedecay-session-memory/src/context",
+        "crates/tracedecay-graph-query/src/context"
       ],
       "write_owner": "none",
       "read_authority": "session_observation_store",
@@ -575,9 +576,9 @@
       "effect": "mixed",
       "entry": "search/probe/related/reason plus retrieval tracking",
       "source_paths": [
-        "crates/tracedecay-usecases/src/memory/project_memory.rs",
+        "crates/tracedecay-session-memory/src/memory/project_memory.rs",
         "crates/tracedecay-runtime-core/src/store/memory/search.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory_tracking.rs"
+        "crates/tracedecay-session-memory/src/memory_tracking.rs"
       ],
       "write_owner": "native_feedback_log for access/retrieval telemetry only",
       "read_authority": "native_explicit_fact_log plus native_search_projection/native_relation_graph",
@@ -591,7 +592,7 @@
       "entry": "daemon-owned at-rest privacy rescan",
       "source_paths": [
         "crates/tracedecay/src/daemon/privacy_remediation.rs",
-        "crates/tracedecay-usecases/src/memory/privacy_remediation.rs",
+        "crates/tracedecay-session-memory/src/memory/privacy_remediation.rs",
         "crates/tracedecay-runtime-core/src/store/memory/privacy_purge.rs"
       ],
       "write_owner": "native_explicit_fact_log",
@@ -622,7 +623,7 @@
       "source_paths": [
         "crates/tracedecay-runtime-core/src/store/memory/mod.rs",
         "crates/tracedecay-runtime-core/src/store/memory/graph.rs",
-        "crates/tracedecay/src/daemon/store_runtime/session_registry/memory_graph_reconciliation_tasks.rs"
+        "crates/tracedecay-store-runtime/src/session_registry/memory_graph_reconciliation_tasks.rs"
       ],
       "write_owner": "native_relation_graph",
       "read_authority": "native_explicit_fact_log",
@@ -734,8 +735,9 @@
       "invasiveness": "low",
       "recommendation": "preferred_active_read_mount",
       "mount_paths": [
-        "crates/tracedecay-usecases/src/context",
-        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs"
+        "crates/tracedecay-session-memory/src/context",
+        "crates/tracedecay-graph-query/src/context",
+        "crates/tracedecay-session-runtime/src/session_retrieval/admitted.rs"
       ],
       "allowed_side_effects": [
         "return provenance-rich bounded advisory candidates",
@@ -754,8 +756,8 @@
       "invasiveness": "medium_low",
       "recommendation": "observer_feedback_mount",
       "mount_paths": [
-        "crates/tracedecay/src/daemon/retained_owner/memory_tracking.rs",
-        "crates/tracedecay/src/daemon/service/invocation/feedback.rs"
+        "crates/tracedecay-session-memory/src/memory_tracking.rs",
+        "crates/tracedecay-daemon-service/src/invocation/feedback.rs"
       ],
       "allowed_side_effects": [
         "send idempotent outcome/feedback observations after Native settlement",

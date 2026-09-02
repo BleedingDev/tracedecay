@@ -2,11 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use tracedecay_domain::canonical_sha256;
+use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_runtime_core::db::{
     DatabaseEngineReadSnapshot,
     engine::{Row, Value},
 };
-use tracedecay_runtime_core::errors::TraceDecayError;
 
 use super::{
     CodeProjectRecord, GraphScopeRecord, ProjectAliasRecord, ProjectRegistryContext,
@@ -31,20 +31,17 @@ fn profile_store_path_is_contained(
     {
         return false;
     }
-    let Ok(canonical_profile) = profile_root.canonicalize() else {
+    let Some(canonical_profile) =
+        tracedecay_runtime_core::path_safety::canonicalize_existing_prefix(profile_root)
+    else {
         return false;
     };
     let target_exists = data_root.exists();
-    let mut existing = data_root;
-    while !existing.exists() {
-        let Some(parent) = existing.parent() else {
-            return false;
-        };
-        existing = parent;
-    }
-    existing.canonicalize().is_ok_and(|path| {
-        path.starts_with(&canonical_profile) && (!target_exists || path != canonical_profile)
-    })
+    let Some(path) = tracedecay_runtime_core::path_safety::canonicalize_existing_prefix(data_root)
+    else {
+        return false;
+    };
+    path.starts_with(&canonical_profile) && (!target_exists || path != canonical_profile)
 }
 
 impl RegisteredGlobalDb {
@@ -139,6 +136,7 @@ impl RegisteredGlobalDb {
         Ok(projects)
     }
 
+    #[hotpath::skip]
     pub async fn code_project_exists(&self, project_id: &str) -> Result<bool> {
         let snapshot = self
             .dashboard_snapshot("check code project registration")
@@ -292,6 +290,7 @@ impl RegisteredGlobalDb {
         }))
     }
 
+    #[hotpath::skip]
     pub async fn project_registry_contexts_for_projects(
         &self,
         projects: &[CodeProjectRecord],
@@ -302,6 +301,7 @@ impl RegisteredGlobalDb {
         contexts_for_projects(&snapshot, projects).await
     }
 
+    #[hotpath::skip]
     pub async fn try_list_store_instances_for_project(
         &self,
         project_id: &str,
@@ -610,6 +610,7 @@ impl RegisteredGlobalDb {
         Ok(true)
     }
 
+    #[hotpath::skip]
     async fn dashboard_snapshot(
         &self,
         operation: &'static str,

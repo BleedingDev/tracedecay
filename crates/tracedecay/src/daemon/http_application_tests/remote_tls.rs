@@ -24,6 +24,7 @@ use crate::daemon::http_application::{
     DaemonHttpApplicationRegistry, DaemonHttpApplicationService,
     validate_remote_brain_tls_identity_at,
 };
+use tracedecay_daemon_service::DaemonInvocationService;
 
 const REMOTE_TLS_CERTIFICATE: &[u8] =
     include_bytes!("../../../../../tests/fixtures/remote_tls/localhost.crt.pem");
@@ -42,7 +43,7 @@ const REMOTE_TLS_ALTERNATE_ROOT_CERTIFICATE: &[u8] =
 
 fn remote_tls_fixture(
     temporary: &tempfile::TempDir,
-) -> (crate::daemon::RemoteBrainTlsConfig, PathBuf) {
+) -> (tracedecay_daemon_control::RemoteBrainTlsConfig, PathBuf) {
     let certificate = temporary.path().join("remote.crt.pem");
     let private_key = temporary.path().join("remote.key.pem");
     std::fs::write(&certificate, REMOTE_TLS_CERTIFICATE).expect("write TLS certificate fixture");
@@ -53,7 +54,7 @@ fn remote_tls_fixture(
         std::fs::set_permissions(&private_key, std::fs::Permissions::from_mode(0o600))
             .expect("restrict TLS key fixture");
     }
-    let config = crate::daemon::RemoteBrainTlsConfig::from_optional_parts(
+    let config = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
         Some("127.0.0.1:0".parse().expect("ephemeral TLS listener")),
         Some(certificate.clone()),
         Some(private_key),
@@ -65,13 +66,13 @@ fn remote_tls_fixture(
 
 fn unprovisioned_remote_registry(identity: &str) -> DaemonHttpApplicationRegistry {
     let credentials = Arc::new(
-        crate::daemon::remote_protocol::DaemonRemoteCredentialAuthorityV1::new(
+        tracedecay_store_runtime::DaemonRemoteCredentialAuthorityV1::new(
             BrainId::new(format!("brain.{identity}")).expect("brain identity"),
             UserProfileId::new(format!("profile.{identity}")).expect("profile identity"),
         ),
     );
     let transaction = Arc::new(
-        crate::daemon::remote_replay_transaction::DaemonRemoteReplayTransactionAuthorityV1::new(
+        tracedecay_store_runtime::DaemonRemoteReplayTransactionAuthorityV1::new(
             tokio::runtime::Handle::current(),
         )
         .expect("remote replay transaction authority"),
@@ -79,7 +80,7 @@ fn unprovisioned_remote_registry(identity: &str) -> DaemonHttpApplicationRegistr
     let router = crate::daemon::remote_protocol::build_daemon_remote_protocol_router(
         Arc::clone(&credentials),
         transaction,
-        crate::daemon::service::invocation::DaemonInvocationService::default(),
+        DaemonInvocationService::default(),
     )
     .expect("remote protocol router");
     let registry = DaemonHttpApplicationRegistry::default();
@@ -93,7 +94,7 @@ fn large_response_remote_registry(
     identity: &str,
 ) -> (DaemonHttpApplicationRegistry, Arc<tokio::sync::Barrier>) {
     let credentials = Arc::new(
-        crate::daemon::remote_protocol::DaemonRemoteCredentialAuthorityV1::new(
+        tracedecay_store_runtime::DaemonRemoteCredentialAuthorityV1::new(
             BrainId::new(format!("brain.{identity}")).expect("remote brain identity"),
             UserProfileId::new(format!("profile.{identity}")).expect("remote profile identity"),
         ),
@@ -125,7 +126,7 @@ fn delayed_response_remote_registry(
     identity: &str,
 ) -> (DaemonHttpApplicationRegistry, Arc<tokio::sync::Notify>) {
     let credentials = Arc::new(
-        crate::daemon::remote_protocol::DaemonRemoteCredentialAuthorityV1::new(
+        tracedecay_store_runtime::DaemonRemoteCredentialAuthorityV1::new(
             BrainId::new(format!("brain.{identity}")).expect("remote brain identity"),
             UserProfileId::new(format!("profile.{identity}")).expect("remote profile identity"),
         ),
@@ -154,7 +155,7 @@ fn stalled_response_remote_registry(
     identity: &str,
 ) -> (DaemonHttpApplicationRegistry, Arc<tokio::sync::Notify>) {
     let credentials = Arc::new(
-        crate::daemon::remote_protocol::DaemonRemoteCredentialAuthorityV1::new(
+        tracedecay_store_runtime::DaemonRemoteCredentialAuthorityV1::new(
             BrainId::new(format!("brain.{identity}")).expect("remote brain identity"),
             UserProfileId::new(format!("profile.{identity}")).expect("remote profile identity"),
         ),
@@ -427,7 +428,7 @@ async fn remote_tls_h2_only_handshake_is_rejected(
 fn remote_tls_configuration_rejects_partial_and_wildcard_admission() {
     let path = PathBuf::from("remote.pem");
     assert!(
-        crate::daemon::RemoteBrainTlsConfig::from_optional_parts(
+        tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
             Some("127.0.0.1:7443".parse().unwrap()),
             Some(path.clone()),
             None,
@@ -435,7 +436,7 @@ fn remote_tls_configuration_rejects_partial_and_wildcard_admission() {
         .is_err()
     );
     assert!(
-        crate::daemon::RemoteBrainTlsConfig::from_optional_parts(
+        tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
             Some("0.0.0.0:7443".parse().unwrap()),
             Some(path.clone()),
             Some(path),
@@ -457,7 +458,7 @@ async fn remote_tls_startup_rejects_invalid_identity_and_occupied_address() {
         std::fs::set_permissions(&invalid_key, std::fs::Permissions::from_mode(0o600))
             .expect("restrict invalid key fixture");
     }
-    let invalid = crate::daemon::RemoteBrainTlsConfig::from_optional_parts(
+    let invalid = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
         Some("127.0.0.1:0".parse().unwrap()),
         Some(invalid_certificate),
         Some(invalid_key),
@@ -478,7 +479,7 @@ async fn remote_tls_startup_rejects_invalid_identity_and_occupied_address() {
 
     let (valid, valid_certificate) = remote_tls_fixture(&temporary);
     let invalid_key = temporary.path().join("invalid.key.pem");
-    let invalid_key_config = crate::daemon::RemoteBrainTlsConfig::from_optional_parts(
+    let invalid_key_config = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
         Some("127.0.0.1:0".parse().unwrap()),
         Some(valid_certificate),
         Some(invalid_key),
@@ -500,7 +501,7 @@ async fn remote_tls_startup_rejects_invalid_identity_and_occupied_address() {
     let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("occupied address");
-    let occupied_config = crate::daemon::RemoteBrainTlsConfig::from_optional_parts(
+    let occupied_config = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
         Some(occupied.local_addr().expect("occupied address")),
         Some(valid.certificate_chain().to_path_buf()),
         Some(valid.private_key().to_path_buf()),
@@ -542,13 +543,14 @@ async fn remote_tls_startup_rejects_unusable_leaf_and_chain_constraints() {
         )
         .expect("restrict leaf-only TLS private key");
     }
-    let leaf_without_anchor_config = crate::daemon::RemoteBrainTlsConfig::from_optional_parts(
-        Some("127.0.0.1:0".parse().unwrap()),
-        Some(leaf_without_anchor),
-        Some(leaf_without_anchor_key),
-    )
-    .unwrap()
-    .unwrap();
+    let leaf_without_anchor_config =
+        tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
+            Some("127.0.0.1:0".parse().unwrap()),
+            Some(leaf_without_anchor),
+            Some(leaf_without_anchor_key),
+        )
+        .unwrap()
+        .unwrap();
     let leaf_without_anchor_error = match DaemonHttpApplicationService::bind_with_remote_tls(
         unprovisioned_remote_registry("remote-tls-leaf-without-anchor"),
         AUTH_TOKEN,
@@ -594,7 +596,7 @@ async fn remote_tls_startup_rejects_unusable_leaf_and_chain_constraints() {
             std::fs::set_permissions(&private_key_path, std::fs::Permissions::from_mode(0o600))
                 .expect("restrict TLS private key fixture");
         }
-        let config = crate::daemon::RemoteBrainTlsConfig::from_optional_parts(
+        let config = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
             Some("127.0.0.1:0".parse().unwrap()),
             Some(certificate_path),
             Some(private_key_path),
@@ -629,7 +631,7 @@ async fn remote_tls_startup_rejects_unusable_leaf_and_chain_constraints() {
         std::fs::set_permissions(&unrelated_key, std::fs::Permissions::from_mode(0o600))
             .expect("restrict TLS private key fixture");
     }
-    let unrelated = crate::daemon::RemoteBrainTlsConfig::from_optional_parts(
+    let unrelated = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
         Some("127.0.0.1:0".parse().unwrap()),
         Some(unrelated_chain),
         Some(unrelated_key),
@@ -712,7 +714,7 @@ async fn remote_tls_startup_rejects_non_private_or_non_regular_key_handles() {
     std::fs::write(&private_key, REMOTE_TLS_PRIVATE_KEY).expect("write TLS key fixture");
     std::fs::set_permissions(&private_key, std::fs::Permissions::from_mode(0o644))
         .expect("make TLS key fixture non-private");
-    let exposed = crate::daemon::RemoteBrainTlsConfig::from_optional_parts(
+    let exposed = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
         Some("127.0.0.1:0".parse().unwrap()),
         Some(certificate.clone()),
         Some(private_key.clone()),
@@ -735,7 +737,7 @@ async fn remote_tls_startup_rejects_non_private_or_non_regular_key_handles() {
         .expect("restore private TLS key fixture");
     let key_link = temporary.path().join("remote-link.key.pem");
     symlink(&private_key, &key_link).expect("symlink TLS key fixture");
-    let linked = crate::daemon::RemoteBrainTlsConfig::from_optional_parts(
+    let linked = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
         Some("127.0.0.1:0".parse().unwrap()),
         Some(certificate.clone()),
         Some(key_link),
@@ -758,7 +760,7 @@ async fn remote_tls_startup_rejects_non_private_or_non_regular_key_handles() {
     std::fs::create_dir(&directory).expect("TLS key directory fixture");
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o600))
         .expect("restrict TLS key directory fixture");
-    let directory_key = crate::daemon::RemoteBrainTlsConfig::from_optional_parts(
+    let directory_key = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
         Some("127.0.0.1:0".parse().unwrap()),
         Some(certificate),
         Some(directory),
@@ -787,9 +789,12 @@ async fn remote_tls_listener_serves_only_remote_routes_and_isolates_credential_a
         tracedecay_daemon_protocol::DaemonEndpoint::Unix(profile_root.join("remote-tls.sock"));
     #[cfg(not(unix))]
     let endpoint = tracedecay_daemon_protocol::default_loopback_endpoint();
-    let daemon_authority =
-        crate::daemon::authority::DaemonAuthority::acquire(&profile_root, &endpoint, "test")
-            .expect("daemon authority");
+    let daemon_authority = tracedecay_daemon_identity::authority::DaemonAuthority::acquire(
+        &profile_root,
+        &endpoint,
+        "test",
+    )
+    .expect("daemon authority");
     let _database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         &profile_root,
         daemon_authority.record().epoch,
@@ -798,11 +803,9 @@ async fn remote_tls_listener_serves_only_remote_routes_and_isolates_credential_a
     .expect("daemon database scope");
     let identity = daemon_authority.profile_identity().clone();
     let runtime = Arc::new(
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity.clone(),
-        )
-        .await
-        .expect("session runtime registry"),
+        tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity.clone())
+            .await
+            .expect("session runtime registry"),
     );
     let credential = *b"0123456789abcdef0123456789abcdef";
     let node_id = BrainNodeId::new("node.remote-tls").expect("node identity");
@@ -816,7 +819,7 @@ async fn remote_tls_listener_serves_only_remote_routes_and_isolates_credential_a
     let first_router = crate::daemon::remote_protocol::build_daemon_remote_protocol_router(
         Arc::clone(&first_credentials),
         runtime.remote_replay_transaction(),
-        crate::daemon::service::invocation::DaemonInvocationService::default(),
+        DaemonInvocationService::default(),
     )
     .expect("first remote protocol router");
     let first_registry = DaemonHttpApplicationRegistry::default();
@@ -910,9 +913,12 @@ async fn remote_tls_listener_bounds_connections_and_expires_incomplete_headers()
         tracedecay_daemon_protocol::DaemonEndpoint::Unix(profile_root.join("remote-tls.sock"));
     #[cfg(not(unix))]
     let daemon_endpoint = tracedecay_daemon_protocol::default_loopback_endpoint();
-    let daemon_authority =
-        crate::daemon::authority::DaemonAuthority::acquire(&profile_root, &daemon_endpoint, "test")
-            .expect("daemon authority");
+    let daemon_authority = tracedecay_daemon_identity::authority::DaemonAuthority::acquire(
+        &profile_root,
+        &daemon_endpoint,
+        "test",
+    )
+    .expect("daemon authority");
     let _database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         &profile_root,
         daemon_authority.record().epoch,
@@ -921,11 +927,9 @@ async fn remote_tls_listener_bounds_connections_and_expires_incomplete_headers()
     .expect("daemon database scope");
     let identity = daemon_authority.profile_identity().clone();
     let runtime = Arc::new(
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity.clone(),
-        )
-        .await
-        .expect("session runtime registry"),
+        tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity.clone())
+            .await
+            .expect("session runtime registry"),
     );
     let credential = *b"fedcba9876543210fedcba9876543210";
     let grant = live_remote_grant(
@@ -941,7 +945,7 @@ async fn remote_tls_listener_bounds_connections_and_expires_incomplete_headers()
     let router = crate::daemon::remote_protocol::build_daemon_remote_protocol_router(
         Arc::clone(&credentials),
         runtime.remote_replay_transaction(),
-        crate::daemon::service::invocation::DaemonInvocationService::default(),
+        DaemonInvocationService::default(),
     )
     .expect("remote protocol router");
     let registry = DaemonHttpApplicationRegistry::default();

@@ -14,6 +14,7 @@ impl<'a> Statement<'a> {
         })
     }
 
+    #[hotpath::skip]
     pub async fn execute<P>(&self, params: P) -> Result<u64>
     where
         P: IntoParams,

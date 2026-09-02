@@ -16,6 +16,10 @@ use tracedecay_mcp::{JsonRpcResponse, McpTransport};
 use super::BrokerStream;
 use super::*;
 use tracedecay_daemon_protocol::{BrokerReadHalf, BrokerWriteHalf};
+use tracedecay_framing::{
+    BoundedLineReader, MAX_MCP_JSONRPC_FRAME_BYTES, MCP_OVERSIZE_ID_INSPECT_BYTES,
+    is_wire_oversized_io_error, wire_oversized_io_error_with_prefix,
+};
 
 pub(super) struct BrokerStreamTransport {
     // Every daemon read of this transport races something else in a
@@ -23,11 +27,17 @@ pub(super) struct BrokerStreamTransport {
     // bounded reader owns the partial-frame accumulator so a read dropped by a
     // lost race resumes instead of restarting mid-frame and desynchronizing
     // JSON-RPC framing for the rest of the connection.
-    reader: tracedecay_sessions::admission::BoundedLineReader<tokio::io::BufReader<BrokerReadHalf>>,
+    reader: BoundedLineReader<tokio::io::BufReader<BrokerReadHalf>>,
     writer: Arc<tokio::sync::Mutex<Option<BrokerWriteHalf>>>,
     active_requests: Arc<
         std::sync::Mutex<HashMap<String, Option<tracedecay_domain::DeliverySettlementAttemptV1>>>,
     >,
+    /// Whether this connection ever accepted an identified request. After the
+    /// peer half-closes its request side, a connection that served requests
+    /// and has settled every one of them has nothing left to deliver, while a
+    /// connection that never carried a request keeps waiting for the peer's
+    /// full close.
+    accepted_any_request: Arc<std::sync::atomic::AtomicBool>,
     replay: VecDeque<String>,
     response_lifecycle: Option<crate::mcp::server::ProjectServerResponseLifecycle>,
     selected_project_responses: Option<RmcpSelectedProjectResponseAuthority>,
@@ -60,11 +70,10 @@ impl BrokerStreamTransport {
     pub(super) fn new(stream: BrokerStream) -> Self {
         let (reader, writer) = stream.into_owned_split();
         Self {
-            reader: tracedecay_sessions::admission::BoundedLineReader::new(
-                tokio::io::BufReader::new(reader),
-            ),
+            reader: BoundedLineReader::new(tokio::io::BufReader::new(reader)),
             writer: Arc::new(tokio::sync::Mutex::new(Some(writer))),
             active_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            accepted_any_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             replay: VecDeque::new(),
             response_lifecycle: None,
             selected_project_responses: None,
@@ -73,14 +82,9 @@ impl BrokerStreamTransport {
     }
 
     pub(super) fn push_replay(&mut self, line: String) -> std::io::Result<()> {
-        if line.len() > tracedecay_sessions::admission::MAX_MCP_JSONRPC_FRAME_BYTES {
-            let prefix = line.as_bytes()[..line
-                .len()
-                .min(tracedecay_sessions::admission::MCP_OVERSIZE_ID_INSPECT_BYTES)]
-                .to_vec();
-            return Err(
-                tracedecay_sessions::admission::wire_oversized_io_error_with_prefix(prefix),
-            );
+        if line.len() > MAX_MCP_JSONRPC_FRAME_BYTES {
+            let prefix = line.as_bytes()[..line.len().min(MCP_OVERSIZE_ID_INSPECT_BYTES)].to_vec();
+            return Err(wire_oversized_io_error_with_prefix(prefix));
         }
         self.replay.push_back(line);
         Ok(())
@@ -110,6 +114,7 @@ impl BrokerStreamTransport {
         self
     }
 
+    #[hotpath::skip]
     async fn write_all_and_flush(
         writer: Arc<tokio::sync::Mutex<Option<BrokerWriteHalf>>>,
         bytes: Vec<u8>,
@@ -192,6 +197,7 @@ impl BrokerStreamTransport {
         }
     }
 
+    #[hotpath::skip]
     async fn observe_incoming_message(&self, value: &serde_json::Value) {
         let Some(method) = value.get("method").and_then(serde_json::Value::as_str) else {
             return;
@@ -248,9 +254,42 @@ impl BrokerStreamTransport {
                 .as_ref()
                 .and_then(|settlement| settlement.attempt_for_request(value));
             active.insert(request_key, delivery_attempt);
+            self.accepted_any_request
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 
+    /// Resolves once this connection has accepted at least one request and
+    /// every accepted request has settled — delivered, suppressed, or answered
+    /// with its typed cancellation. After the peer half-closes its request
+    /// side, a connection in that state has nothing left it could ever
+    /// deliver, so waiting for the peer's full close would only strand clients
+    /// that hold their read half open awaiting the daemon's EOF (a cancelling
+    /// client does exactly that).
+    #[hotpath::measure(label = "daemon.broker.eof_settled_wait", future = true)]
+    async fn wait_for_accepted_requests_settled(
+        active_requests: Arc<
+            std::sync::Mutex<
+                HashMap<String, Option<tracedecay_domain::DeliverySettlementAttemptV1>>,
+            >,
+        >,
+        accepted_any_request: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        loop {
+            if accepted_any_request.load(std::sync::atomic::Ordering::Acquire)
+                && active_requests.lock().is_ok_and(|active| active.is_empty())
+            {
+                return;
+            }
+            // Settlement lands through independently spawned response and
+            // cancellation writers; poll on the same bounded interval the
+            // full-close monitor uses rather than threading a notifier
+            // through every removal site.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    #[hotpath::skip]
     async fn wait_for_peer_full_close(writer: Arc<tokio::sync::Mutex<Option<BrokerWriteHalf>>>) {
         loop {
             let full_close = {
@@ -285,6 +324,7 @@ impl BrokerStreamTransport {
 }
 
 impl tracedecay_mcp::McpTransport for BrokerStreamTransport {
+    #[hotpath::skip]
     async fn read_line(&mut self) -> std::io::Result<Option<String>> {
         if let Some(line) = self.replay.pop_front() {
             return Ok(Some(line));
@@ -292,6 +332,7 @@ impl tracedecay_mcp::McpTransport for BrokerStreamTransport {
         self.reader.read_mcp_line().await
     }
 
+    #[hotpath::skip]
     async fn write_line(&mut self, line: &str) -> std::io::Result<()> {
         let mut writer = self.writer.lock().await;
         let writer = writer.as_mut().ok_or_else(|| {
@@ -303,6 +344,7 @@ impl tracedecay_mcp::McpTransport for BrokerStreamTransport {
         writer.write_all(line.as_bytes()).await
     }
 
+    #[hotpath::skip]
     async fn flush(&mut self) -> std::io::Result<()> {
         let mut writer = self.writer.lock().await;
         let writer = writer.as_mut().ok_or_else(|| {
@@ -417,15 +459,29 @@ impl rmcp::transport::Transport<rmcp::RoleServer> for BrokerStreamTransport {
                     // still waiting for an in-flight response. Keep rmcp's
                     // receive loop alive until the native transport observes
                     // the peer's full close; otherwise rmcp tears down the
-                    // service and strands the request permit.
-                    self.peer_fully_closed_after_eof().await;
+                    // service and strands the request permit. Once every
+                    // accepted request has settled, though, the half-open
+                    // connection has nothing left to deliver, and a client
+                    // that reads until daemon EOF — a cancelling client does —
+                    // needs this side to close first.
+                    let settled = Self::wait_for_accepted_requests_settled(
+                        Arc::clone(&self.active_requests),
+                        Arc::clone(&self.accepted_any_request),
+                    );
+                    let peer_full_close = self.peer_fully_closed_after_eof();
+                    tokio::select! {
+                        () = peer_full_close => {
+                            hotpath::gauge!("daemon.broker.eof_peer_close_total").inc(1_u64);
+                        }
+                        () = settled => {
+                            hotpath::gauge!("daemon.broker.eof_settled_close_total").inc(1_u64);
+                        }
+                    }
                     return None;
                 }
-                Err(error)
-                    if tracedecay_sessions::admission::is_wire_oversized_io_error(&error) =>
-                {
-                    let _ =
-                        crate::mcp::transport::write_wire_oversized_rejection(self, &error).await;
+                Err(error) if is_wire_oversized_io_error(&error) => {
+                    let _ = tracedecay_mcp::transport::write_wire_oversized_rejection(self, &error)
+                        .await;
                     return None;
                 }
                 Err(error) => {
@@ -466,6 +522,7 @@ impl rmcp::transport::Transport<rmcp::RoleServer> for BrokerStreamTransport {
         }
     }
 
+    #[hotpath::skip]
     async fn close(&mut self) -> std::result::Result<(), Self::Error> {
         self.writer.lock().await.take();
         Ok(())
@@ -495,6 +552,9 @@ mod peer_close_tests {
         producer: Arc<BoundedObservabilityProducerV1>,
         db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
         project_id: ProjectId,
+        // The lease alone does not own daemon write authority. Keep the test
+        // runtime alive until every asynchronous settlement has drained.
+        _runtime: tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime,
     }
 
     async fn delivery_settlement_fixture() -> DeliverySettlementFixture {
@@ -536,6 +596,7 @@ mod peer_close_tests {
             producer,
             db,
             project_id,
+            _runtime: runtime,
         }
     }
 
@@ -638,6 +699,63 @@ mod peer_close_tests {
                 .expect("rmcp receive must finish after full peer close")
                 .is_none()
         );
+    }
+
+    /// A client that half-closes after every accepted request settled — the
+    /// cancelling client pattern: it keeps its read half open awaiting the
+    /// daemon's EOF — must observe this side close without a full peer close.
+    #[tokio::test]
+    async fn rmcp_receive_closes_after_half_close_once_accepted_requests_settle() {
+        let (server, client) = tokio::net::UnixStream::pair().expect("UnixStream pair");
+        let mut transport = BrokerStreamTransport::new(BrokerStream::Unix(server));
+        let (client_reader, mut client_writer) = client.into_split();
+
+        client_writer
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tracedecay_files","arguments":{}}}
+"#,
+            )
+            .await
+            .expect("request");
+        client_writer.flush().await.expect("flush request");
+        assert!(
+            <BrokerStreamTransport as rmcp::transport::Transport<rmcp::RoleServer>>::receive(
+                &mut transport
+            )
+            .await
+            .is_some(),
+            "the transport must accept the request"
+        );
+        let response = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "result": {"content": [{"type": "text", "text": "settled"}]}
+        }))
+        .expect("typed response");
+        <BrokerStreamTransport as rmcp::transport::Transport<rmcp::RoleServer>>::send(
+            &mut transport,
+            response,
+        )
+        .await
+        .expect("response write");
+
+        client_writer
+            .shutdown()
+            .await
+            .expect("half-close client request side");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                <BrokerStreamTransport as rmcp::transport::Transport<rmcp::RoleServer>>::receive(
+                    &mut transport,
+                ),
+            )
+            .await
+            .expect("settled connection must close after request half-close")
+            .is_none(),
+            "a settled half-closed connection carries no further messages"
+        );
+        drop(client_reader);
     }
 
     #[tokio::test]

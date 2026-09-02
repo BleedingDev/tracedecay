@@ -2,17 +2,17 @@ use std::path::Path;
 
 use crate::current_unix_timestamp;
 
-pub(crate) use tracedecay::storage::{ProjectStorageLocation, ProjectStorageStatus};
+pub(crate) use tracedecay_runtime_core::storage::{ProjectStorageLocation, ProjectStorageStatus};
 
 pub(crate) fn classify_project_storage(project_root: &Path) -> ProjectStorageLocation {
-    tracedecay::storage::classify_project_storage(project_root)
+    tracedecay_runtime_core::storage::classify_project_storage(project_root)
 }
 
 pub(crate) async fn classify_project_storage_with_registry(
     project_root: &Path,
     registry: Option<&tracedecay::profile_registry_maintenance::ProfileRegistryMaintenanceRuntime>,
     profile_root: Option<&Path>,
-) -> tracedecay_runtime_core::errors::Result<ProjectStorageLocation> {
+) -> tracedecay_domain::errors::Result<ProjectStorageLocation> {
     let location = classify_project_storage(project_root);
     let (Some(registry), Some(profile_root)) = (registry, profile_root) else {
         return Ok(location);
@@ -28,7 +28,7 @@ fn classify_registry_storage(
     profile_root: &Path,
     store: &tracedecay_global_db::StoreInstanceRecord,
 ) -> Option<ProjectStorageLocation> {
-    tracedecay::storage::classify_registry_storage(project_root, profile_root, store)
+    store.classify_storage(project_root, profile_root)
 }
 
 pub(crate) fn classify_registry_storage_value(
@@ -36,7 +36,11 @@ pub(crate) fn classify_registry_storage_value(
     profile_root: &Path,
     store: &serde_json::Value,
 ) -> Option<ProjectStorageLocation> {
-    tracedecay::storage::classify_registry_storage_value(project_root, profile_root, store)
+    tracedecay_runtime_core::storage::classify_registry_storage_value(
+        project_root,
+        profile_root,
+        store,
+    )
 }
 
 /// Returns how many seconds have elapsed since a persisted timestamp.
@@ -61,7 +65,7 @@ fn elapsed_since(now: i64, recorded_at: i64) -> i64 {
 /// `force` = true on status/sync commands (always attempt), false on others
 /// (only flush if stale > 30s).
 pub(crate) fn try_flush(
-    config: &mut tracedecay_usecases::user_config::UserConfig,
+    config: &mut tracedecay_session_memory::user_config::UserConfig,
     force: bool,
     upload_enabled: bool,
 ) {
@@ -96,7 +100,7 @@ pub(crate) fn try_flush(
 /// parallel). If `skip_suppression` is false, the warning is suppressed for 15
 /// minutes after it was last shown; if true it is always shown (used for status).
 pub(crate) fn check_for_update(
-    config: &mut tracedecay_usecases::user_config::UserConfig,
+    config: &mut tracedecay_session_memory::user_config::UserConfig,
     skip_cache: bool,
     skip_suppression: bool,
 ) {
@@ -179,7 +183,7 @@ pub(crate) fn tracedecay_dir_size(dir: &Path) -> u64 {
 pub(crate) async fn gather_target_projects(
     all: bool,
     home_tracedecay: &Option<std::path::PathBuf>,
-) -> tracedecay_runtime_core::errors::Result<Vec<std::path::PathBuf>> {
+) -> tracedecay_domain::errors::Result<Vec<std::path::PathBuf>> {
     if all {
         let payload = call_admin_cli(
             None,
@@ -198,15 +202,13 @@ pub(crate) async fn gather_target_projects(
 
 fn registry_project_roots(
     payload: &serde_json::Value,
-) -> tracedecay_runtime_core::errors::Result<Vec<std::path::PathBuf>> {
+) -> tracedecay_domain::errors::Result<Vec<std::path::PathBuf>> {
     let projects = payload
         .get("projects")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(
-            || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: "daemon registry list response omitted projects array".to_string(),
-            },
-        )?;
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: "daemon registry list response omitted projects array".to_string(),
+        })?;
 
     projects
         .iter()
@@ -216,7 +218,7 @@ fn registry_project_roots(
                 .get("project_root")
                 .and_then(serde_json::Value::as_str)
                 .map(std::path::PathBuf::from)
-                .ok_or_else(|| tracedecay_runtime_core::errors::TraceDecayError::Config {
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
                     message: format!(
                         "daemon registry list response has no project_root for project at index {index}"
                     ),
@@ -228,7 +230,7 @@ fn registry_project_roots(
 async fn call_admin_cli(
     project_root: Option<&Path>,
     arguments: serde_json::Value,
-) -> tracedecay_runtime_core::errors::Result<serde_json::Value> {
+) -> tracedecay_domain::errors::Result<serde_json::Value> {
     let handshake = tracedecay::daemon::handshake_for_current_client(
         project_root.map(Path::to_path_buf),
         None,
@@ -394,9 +396,9 @@ fn local_project_marker_exists(project_root: &Path, data_dir: &Path) -> bool {
     data_dir.file_name().is_some_and(|name| {
         name == tracedecay::config::TRACEDECAY_DIR
             && matches!(
-                tracedecay::storage::read_legacy_enrollment_marker(project_root),
+                tracedecay_runtime_core::storage::read_legacy_enrollment_marker(project_root),
                 Ok(Some(marker))
-                    if marker.storage_mode == tracedecay::storage::StorageMode::ProfileSharded
+                    if marker.storage_mode == tracedecay_runtime_core::storage::StorageMode::ProfileSharded
             )
     })
 }
@@ -483,7 +485,7 @@ mod gather_tests {
         let ts = root.join(".tracedecay");
         fs::create_dir_all(&ts).unwrap();
         fs::write(
-            ts.join(tracedecay::storage::ENROLLMENT_FILENAME),
+            ts.join(tracedecay_runtime_core::storage::ENROLLMENT_FILENAME),
             format!(
                 r#"{{
   "project_id": "{project_id}",
@@ -583,7 +585,7 @@ mod gather_tests {
         fs::create_dir_all(&project_root).unwrap();
         fs::create_dir_all(&data_root).unwrap();
         fs::write(
-            data_root.join(tracedecay::storage::STORE_MANIFEST_FILENAME),
+            data_root.join(tracedecay_runtime_core::storage::STORE_MANIFEST_FILENAME),
             b"{}",
         )
         .unwrap();
@@ -726,10 +728,10 @@ mod gather_tests {
 
     #[test]
     fn canonical_upload_denial_overrides_stale_legacy_metadata() {
-        let mut config = tracedecay_usecases::user_config::UserConfig {
+        let mut config = tracedecay_session_memory::user_config::UserConfig {
             upload_enabled: true,
             pending_upload: 42,
-            ..tracedecay_usecases::user_config::UserConfig::default()
+            ..tracedecay_session_memory::user_config::UserConfig::default()
         };
 
         try_flush(&mut config, true, false);

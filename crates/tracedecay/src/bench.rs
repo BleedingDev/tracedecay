@@ -10,7 +10,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::tracedecay::TraceDecay;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 #[derive(Debug, Serialize)]
 pub struct QueryResult {
@@ -92,7 +92,7 @@ pub async fn run_bench_with_toml(
 /// tier (green ≥80%, yellow ≥50%, red <50%). Matches the ANSI style used
 /// elsewhere in `tracedecay status`.
 pub fn format_report_console(report: &BenchReport) -> String {
-    use crate::display::{format_number, format_token_count};
+    use tracedecay_runtime_core::text::{format_number, format_token_count};
 
     // Column widths (display columns, not bytes). Tuned so the typical
     // terminal (≥100 cols) shows the table without wrapping.

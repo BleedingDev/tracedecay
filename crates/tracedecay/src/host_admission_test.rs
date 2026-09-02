@@ -27,11 +27,14 @@ use tracedecay_usecases::observation::{
 
 fn initialize_repository(path: &Path) {
     fs::create_dir_all(path).unwrap();
-    let output = Command::new(tracedecay_runtime_core::git::git_program())
-        .args(["init", "-q", "-b", "main"])
-        .current_dir(path)
-        .output()
-        .unwrap();
+    let output = Command::new(
+        tracedecay_runtime_core::git::try_git_program()
+            .expect("absolute git executable should resolve"),
+    )
+    .args(["init", "-q", "-b", "main"])
+    .current_dir(path)
+    .output()
+    .unwrap();
     assert!(
         output.status.success(),
         "git init failed: {}",
@@ -111,17 +114,15 @@ fn host_capture_request(scope: ObservationScopeV1, record_id: &str) -> CaptureOb
 async fn projectless_profile_capture_uses_the_daemon_profile_worker_plan() {
     let root = TempDir::new().unwrap();
     let profile_root = root.path().join("profile");
-    let identity = crate::daemon::profile_identity::load_or_create(&profile_root).unwrap();
+    let identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root).unwrap();
     let _daemon_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         identity.profile_root(),
         1,
         "projectless-host-admission-worker-plan-test",
     )
     .unwrap();
-    let registry =
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity.clone(),
-        )
+    let registry = tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity.clone())
         .await
         .unwrap();
     let profile_registered = registry.profile_sessions().await.unwrap();
@@ -164,17 +165,15 @@ async fn host_ingress_binds_provenance_to_authoritative_project_and_replays_stab
     initialize_repository(&repository_root);
     let project_id = ProjectId::new("project.host-provenance").unwrap();
     let identity =
-        crate::daemon::profile_identity::load_or_create(&root.path().join("profile")).unwrap();
+        tracedecay_daemon_identity::profile_identity::load_or_create(&root.path().join("profile"))
+            .unwrap();
     let _daemon_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         identity.profile_root(),
         1,
         "host-provenance-authority-test",
     )
     .unwrap();
-    let registry =
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity.clone(),
-        )
+    let registry = tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity.clone())
         .await
         .unwrap();
     enroll_project(&repository_root, &project_id);
@@ -247,16 +246,19 @@ async fn host_ingress_binds_provenance_to_authoritative_project_and_replays_stab
     assert_eq!(initial_provenance.capture().project_id(), Some(&project_id));
     assert_eq!(initial_provenance.generation_id(), &initial_generation);
 
-    let remote = Command::new(tracedecay_runtime_core::git::git_program())
-        .args([
-            "remote",
-            "add",
-            "origin",
-            "https://example.invalid/changed.git",
-        ])
-        .current_dir(&repository_root)
-        .output()
-        .unwrap();
+    let remote = Command::new(
+        tracedecay_runtime_core::git::try_git_program()
+            .expect("absolute git executable should resolve"),
+    )
+    .args([
+        "remote",
+        "add",
+        "origin",
+        "https://example.invalid/changed.git",
+    ])
+    .current_dir(&repository_root)
+    .output()
+    .unwrap();
     assert!(remote.status.success());
     let replay = facade
         .capture_observation(host_capture_request(
@@ -354,17 +356,15 @@ async fn host_ingress_binds_provenance_to_authoritative_project_and_replays_stab
 async fn registered_profile_runtime_is_required_and_mismatch_never_falls_back() {
     let temporary = TempDir::new().unwrap();
     let profile_root = temporary.path().join("profile");
-    let identity = crate::daemon::profile_identity::load_or_create(&profile_root).unwrap();
+    let identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root).unwrap();
     let daemon_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         identity.profile_root(),
         1,
         "host-admission-authority-test",
     )
     .unwrap();
-    let registry =
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity.clone(),
-        )
+    let registry = tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity.clone())
         .await
         .unwrap();
     let registered = registry.profile_sessions().await.unwrap();
@@ -472,17 +472,15 @@ async fn registered_project_runtime_is_exact_and_revocation_never_falls_back() {
     let profile_root = temporary.path().join("profile");
     let project_root = temporary.path().join("project");
     initialize_repository(&project_root);
-    let identity = crate::daemon::profile_identity::load_or_create(&profile_root).unwrap();
+    let identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root).unwrap();
     let daemon_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         identity.profile_root(),
         1,
         "host-admission-project-authority-test",
     )
     .unwrap();
-    let registry =
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity.clone(),
-        )
+    let registry = tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity.clone())
         .await
         .unwrap();
     let project_id = ProjectId::new("project.registered.exact").unwrap();

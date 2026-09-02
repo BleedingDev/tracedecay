@@ -83,4 +83,4 @@ gate_output_contains "invalid metadata" "must be a lowercase 40-character Git SH
 gate_run "$SCRIPT" --repo "$GATE_REPO_ROOT" --metadata "$REAL_METADATA"
 gate_expect_success "real product checkout"
 gate_output_contains "real product checkout" \
-  "\"pinned_floor_sha\": \"08fbe33a7c7f403191fd5d6e356c7b6681b96403\""
+  "\"pinned_floor_sha\": \"5749e4fcfe268e17bd19a0e6ef90c646f7b37289\""

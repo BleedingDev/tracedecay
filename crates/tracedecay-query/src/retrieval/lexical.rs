@@ -14,7 +14,8 @@ use tracedecay_domain::{
     CodeGenerationId, CompactCandidate, ComponentRevision, CursorPayloadDigest,
     EphemeralSanitizedQueryViewV1, FixedPointScore, RetrievalBudget, RetrievalError,
     RetrievalFailure, RetrievalRequest, Retriever, RetrieverBatch, RetrieverContinuation,
-    RetrieverCoverage, RetrieverKind, RetrieverOutcome, ScoreDomainId,
+    RetrieverCoverage, RetrieverKind, RetrieverOutcome, ScoreDomainId, split_subtokens,
+    technical_tokens,
 };
 
 use super::ports::{
@@ -33,8 +34,9 @@ pub use self::projection::{
     CodeLexicalArtifactBuildProgressV1, CodeLexicalArtifactBuilderV1, CodeLexicalArtifactErrorV1,
     CodeLexicalArtifactFinalizationPhaseV1, CodeLexicalArtifactFinalizationStepV1,
     CodeLexicalArtifactOccurrenceV1, CodeLexicalArtifactReaderV1,
-    CodeLexicalArtifactSectionDigestV1, CodeLexicalImportMembershipWitnessV1,
-    CodeLexicalProjectionAdapterV1, CodeLexicalProjectionBuildStepV1, CodeLexicalProjectionBuildV1,
+    CodeLexicalArtifactSectionDigestV1, CodeLexicalArtifactWriterRevisionV1,
+    CodeLexicalImportMembershipWitnessV1, CodeLexicalProjectionAdapterV1,
+    CodeLexicalProjectionBuildStepV1, CodeLexicalProjectionBuildV1,
     CodeLexicalProjectionMetadataV1, LEXICAL_PROJECTION_BUILD_DEADLINE_MICROS_V1,
     PreparedCodeLexicalArtifactBatchV1, PreparedCodeLexicalArtifactPageV1,
     VerifiedCodeLexicalArtifactV1, lexical_projection_build_deadline_micros,
@@ -65,6 +67,12 @@ pub struct LexicalQueryPartsV1 {
 
 /// Shared tokenizer for production retrieval and its direct evaluator.
 ///
+/// Whole terms are the same maximal technical tokens the code index extracts
+/// (`tracedecay_domain::technical_tokens`), so a term the indexer keeps whole
+/// (`foo-bar`, `a::b`, `p/q.rs`) is queried whole, and subtokens decompose
+/// through the same shared grammar. Single-token queries intentionally emit
+/// no subtokens so one technical term does not fan out to common subtokens.
+///
 /// Multi-token sanitized input is also retained as a phrase. This gives exact
 /// diagnostic/error text and natural-language queries a bounded lexical phrase
 /// signal; protected exact admission remains solely authority-controlled.
@@ -82,14 +90,15 @@ pub fn lexical_query_parts(query: &str) -> Result<LexicalQueryPartsV1, Retrieval
     let mut whole_terms = Vec::new();
     let mut subtokens = Vec::new();
     let split_identifiers = query.split_whitespace().nth(1).is_some();
-    for token in query.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
-        if token.is_empty() {
-            continue;
-        }
+    for (_, token) in technical_tokens(query) {
         whole_terms.push(token.to_owned());
         if split_identifiers {
             let lowercase = token.to_ascii_lowercase();
-            subtokens.extend(split_identifier_parts(token).filter(|part| part != &lowercase));
+            subtokens.extend(
+                split_subtokens(token)
+                    .into_iter()
+                    .filter(|part| part != &lowercase),
+            );
         }
     }
     whole_terms.sort();
@@ -117,27 +126,6 @@ pub fn lexical_query_parts(query: &str) -> Result<LexicalQueryPartsV1, Retrieval
         subtokens,
         phrases,
     })
-}
-
-fn split_identifier_parts(token: &str) -> impl Iterator<Item = String> + '_ {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    for character in token.chars() {
-        if character == '_' || (character.is_ascii_uppercase() && !current.is_empty()) {
-            if !current.is_empty() {
-                parts.push(std::mem::take(&mut current).to_ascii_lowercase());
-            }
-            if character != '_' {
-                current.push(character);
-            }
-        } else {
-            current.push(character);
-        }
-    }
-    if !current.is_empty() {
-        parts.push(current.to_ascii_lowercase());
-    }
-    parts.into_iter()
 }
 
 /// Whole exact terms and language-profiled subtokens are distinct fields.

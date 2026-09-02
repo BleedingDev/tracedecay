@@ -154,7 +154,7 @@ pub async fn registry_gc_report(
     db: &RegisteredGlobalDb,
     _profile_root: &Path,
     prefix: Option<String>,
-) -> tracedecay_runtime_core::errors::Result<RegistryGcReport> {
+) -> tracedecay_domain::errors::Result<RegistryGcReport> {
     let prefixes = prefix.iter().map(PathBuf::from).collect::<Vec<_>>();
     let projects = db.list_code_projects(usize::MAX).await?;
     let mut candidates = Vec::new();
@@ -220,12 +220,12 @@ pub async fn apply_registry_gc(
     db: &RegisteredGlobalDb,
     profile_root: &Path,
     prefix: Option<String>,
-) -> tracedecay_runtime_core::errors::Result<RegistryGcReport> {
+) -> tracedecay_domain::errors::Result<RegistryGcReport> {
     let transaction = db.begin_write_transaction().await?;
     let mut report = registry_gc_report(db, profile_root, prefix).await?;
     for project in &report.candidates {
         if Path::new(&project.canonical_root).exists() {
-            return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!(
                     "registry cleanup candidate '{}' became live while applying the plan",
                     project.project_id
@@ -235,7 +235,7 @@ pub async fn apply_registry_gc(
     }
     for project_path in &report.storage_project_candidates {
         if project_path.exists() {
-            return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!(
                     "registry cleanup candidate '{}' became live while applying the plan",
                     project_path.display()
@@ -264,7 +264,7 @@ pub(super) async fn delete_registry_gc_candidates_in_transaction(
     transaction: &RegisteredGlobalDbWriteTransaction<'_>,
     project_ids: &[String],
     project_paths: &[PathBuf],
-) -> tracedecay_runtime_core::errors::Result<(usize, usize)> {
+) -> tracedecay_domain::errors::Result<(usize, usize)> {
     const CHUNK: usize = 256;
     let mut code_projects = 0_usize;
     for chunk in project_ids.chunks(CHUNK) {
@@ -301,12 +301,47 @@ pub(super) async fn delete_registry_gc_candidates_in_transaction(
     Ok((code_projects, storage_projects))
 }
 
+/// Rows removed by one `projects forget` registry retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ForgetRegistryProjectRows {
+    /// Deleted `code_projects` identity rows; aliases, store instances, graph
+    /// scopes, and store artifacts cascade with them.
+    pub code_projects_deleted: usize,
+    /// Deleted path-keyed `projects` token-ledger rows.
+    pub path_ledger_rows_deleted: usize,
+}
+
+/// Retires one registered project identity in a single transaction: the
+/// `code_projects` row (its aliases, store instances, graph scopes, and store
+/// artifacts cascade away with it) plus the path-keyed `projects` ledger rows
+/// for every root and alias the identity records. Sibling identities are
+/// untouched — this is the row authority behind `tracedecay projects forget`.
+pub async fn forget_registry_project(
+    db: &RegisteredGlobalDb,
+    project_id: &str,
+    project_paths: &[PathBuf],
+) -> tracedecay_domain::errors::Result<ForgetRegistryProjectRows> {
+    let transaction = db.begin_write_transaction().await?;
+    let (code_projects_deleted, path_ledger_rows_deleted) =
+        delete_registry_gc_candidates_in_transaction(
+            &transaction,
+            &[project_id.to_string()],
+            project_paths,
+        )
+        .await?;
+    transaction.commit().await?;
+    Ok(ForgetRegistryProjectRows {
+        code_projects_deleted,
+        path_ledger_rows_deleted,
+    })
+}
+
 /// Retires exact registry rows for project roots already removed by an
 /// explicit operator action.
 pub async fn retire_registry_project_paths(
     db: &RegisteredGlobalDb,
     project_paths: &[PathBuf],
-) -> tracedecay_runtime_core::errors::Result<usize> {
+) -> tracedecay_domain::errors::Result<usize> {
     let transaction = db.begin_write_transaction().await?;
     let (_, retired) =
         delete_registry_gc_candidates_in_transaction(&transaction, &[], project_paths).await?;

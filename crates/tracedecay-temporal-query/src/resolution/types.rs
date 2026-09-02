@@ -22,6 +22,7 @@ impl ResolutionEvidence {
         }
     }
 
+    #[hotpath::skip]
     pub const fn is_authorized(&self) -> bool {
         self.authorized
     }
@@ -40,6 +41,7 @@ pub enum ValidatedAuthorization {
 }
 
 impl ValidatedAuthorization {
+    #[hotpath::skip]
     pub const fn is_authorized(self) -> bool {
         matches!(self, Self::Authorized)
     }
@@ -99,6 +101,7 @@ pub struct ResolvedOccurrence {
 }
 
 impl ResolvedOccurrence {
+    #[hotpath::skip]
     pub const fn certainty(&self) -> ResolutionCertainty {
         if self.uncertain {
             ResolutionCertainty::AuthorizedUnknown

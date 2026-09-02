@@ -275,6 +275,7 @@ where
         + WorkProductOwnerAuthorizationPortV1
         + WorkProductAttemptAdmissionPortV1,
 {
+    #[hotpath::skip]
     pub const fn new(storage: S) -> Self {
         Self { storage }
     }

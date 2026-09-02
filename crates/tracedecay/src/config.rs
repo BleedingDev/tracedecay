@@ -23,23 +23,23 @@ use tracedecay_domain::configuration::{
     SYNC_MAX_CONCURRENT_SYNCS_SETTING_KEY, SYNC_ORPHAN_DB_GC_DAYS_SETTING_KEY,
     SYNC_READ_COOLDOWN_SECS_SETTING_KEY, SYNC_READ_REFRESH_SETTING_KEY,
     SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY, SYNC_SESSION_START_SYNC_SETTING_KEY,
-    SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY, SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY,
-    SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, SettingKey, TELEMETRY_TIMINGS_SETTING_KEY, UserProfileId,
+    SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY, SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
+    SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY, SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, SettingKey,
+    TELEMETRY_TIMINGS_SETTING_KEY, UserProfileId,
 };
 
+use tracedecay_configuration::ConfigurationControlStore;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::configuration::{
-    GlobalDbConfigurationControlStore, ProfileCodeIndexWorkerCommitV1,
-    ProfileCodeIndexWorkerConfigurationStore, ProfileCodeIndexWorkerConfigurationV1,
+    GlobalDbConfigurationControlStore, ProfileCodeIndexWorkerConfigurationStore,
+    ProfileCodeIndexWorkerConfigurationV1,
 };
 use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
 use tracedecay_maintenance::retention::branch_compaction::CompactionThresholdConfig;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
-use tracedecay_usecases::configuration::ConfigurationControlStore;
+use tracedecay_semantic_contracts::SemanticConfig;
 
 pub use tracedecay_global_db::configuration::{registry, resolver};
 pub use tracedecay_usecases::config::retrieval;
-pub mod topology;
-pub(crate) mod work_executable_binding;
 
 /// Name of the legacy configuration migration input stored inside the data
 /// directory. It is not a runtime authority and production code must never
@@ -72,14 +72,6 @@ pub use tracedecay_domain::configuration::SEMANTIC_RUNTIME_SETTING_KEY;
 /// versioned unit the daemon backstop reads, mirroring the semantic key. Absent
 /// or unset resolves to [`RetentionConfig::default`]'s bounded safe policy.
 pub const SYNC_RETENTION_SETTING_KEY: &str = "sync.retention.v1";
-
-/// Canonical pinned semantic runtime configuration.
-///
-/// Re-exported from the global configuration authority so historical
-/// `crate::config::<item>` paths retain nominal type identity.
-pub use tracedecay_global_db::configuration::semantic::{
-    DEFAULT_FASTEMBED_MODEL_ID, SemanticConfig, SemanticProfileSelection, SemanticResourceCeilings,
-};
 
 /// The shared generated/vendored segment list and its membership test moved
 /// into `tracedecay_runtime_core::config`: the extracted migration inventory
@@ -212,6 +204,9 @@ fn default_native_graph_activation() -> bool {
 fn default_sync_auto_watch() -> bool {
     false
 }
+fn default_sync_watch_linked_worktrees() -> bool {
+    false
+}
 fn default_sync_watch_debounce_ms() -> u64 {
     2000
 }
@@ -282,7 +277,7 @@ fn default_compaction_threshold() -> Option<CompactionThresholdConfig> {
 pub struct RetentionConfig {
     /// Session-store (LCM raw/projected) retention windows.
     #[serde(default)]
-    pub session_lcm: tracedecay_sessions::runtime::lcm::LcmRetentionConfig,
+    pub session_lcm: tracedecay_lcm::LcmRetentionConfig,
     /// Observation-evidence generation-scoped retention windows.
     #[serde(default)]
     pub observation: tracedecay_global_db::observation::retention::ObservationRetentionConfig,
@@ -309,7 +304,7 @@ pub struct RetentionConfig {
 impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
-            session_lcm: tracedecay_sessions::runtime::lcm::LcmRetentionConfig::default(),
+            session_lcm: tracedecay_lcm::LcmRetentionConfig::default(),
             observation:
                 tracedecay_global_db::observation::retention::ObservationRetentionConfig::default(),
             orphan_store_gc_days: default_orphan_store_gc_days(),
@@ -416,6 +411,10 @@ pub struct SyncConfig {
     /// Enable the daemon git-metadata watcher.
     #[serde(default = "default_sync_auto_watch")]
     pub auto_watch: bool,
+    /// Admit linked worktrees into the daemon watcher without an explicit
+    /// branch-indexing request.
+    #[serde(default = "default_sync_watch_linked_worktrees")]
+    pub watch_linked_worktrees: bool,
     /// Per-project quiet-period debounce before a watcher-triggered sync (ms).
     #[serde(default = "default_sync_watch_debounce_ms")]
     pub watch_debounce_ms: u64,
@@ -483,6 +482,7 @@ impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             auto_watch: default_sync_auto_watch(),
+            watch_linked_worktrees: default_sync_watch_linked_worktrees(),
             watch_debounce_ms: default_sync_watch_debounce_ms(),
             watch_max_delay_ms: default_sync_watch_max_delay_ms(),
             watch_max_projects: default_sync_watch_max_projects(),
@@ -537,6 +537,9 @@ impl SyncConfig {
     pub fn with_env_overrides(mut self) -> Self {
         if let Some(value) = env_bool("SYNC_AUTO_WATCH") {
             self.auto_watch = value;
+        }
+        if let Some(value) = env_bool("SYNC_WATCH_LINKED_WORKTREES") {
+            self.watch_linked_worktrees = value;
         }
         if let Some(value) = env_parse("SYNC_WATCH_DEBOUNCE_MS") {
             self.watch_debounce_ms = value;
@@ -611,7 +614,7 @@ impl Default for TraceDecayConfig {
 
 /// Typed project route for the configuration daemon boundary. The path is
 /// display/routing context only; [`ProjectId`] remains the authority key.
-pub use tracedecay_usecases::config::RuntimeConfigurationTarget;
+pub use tracedecay_configuration::config::RuntimeConfigurationTarget;
 
 /// A complete resolved configuration pinned to one revision before a runtime
 /// component starts. No caller may re-read mutable legacy input after holding
@@ -769,7 +772,7 @@ pub fn install_pinned_runtime_configuration(
 /// never replaced by a path-derived identity.
 pub fn runtime_configuration_target_for_layout(
     project_root: &Path,
-    layout: &crate::storage::StoreLayout,
+    layout: &tracedecay_runtime_core::storage::StoreLayout,
 ) -> Result<RuntimeConfigurationTarget> {
     let project_id = layout.identity.project_id.as_deref().ok_or_else(|| {
         config_error("configuration authority unavailable: store layout has no project id")
@@ -799,7 +802,7 @@ pub fn runtime_configuration_target_for_project_id(
 /// [`open_runtime_configuration_for_registered_database`] instead.
 pub fn runtime_configuration_for_layout(
     project_root: &Path,
-    layout: &crate::storage::StoreLayout,
+    layout: &tracedecay_runtime_core::storage::StoreLayout,
 ) -> Result<PinnedRuntimeConfiguration> {
     let target = runtime_configuration_target_for_layout(project_root, layout)?;
     let configuration = runtime_configuration_cache()
@@ -825,7 +828,7 @@ pub fn runtime_configuration_for_layout(
 /// than a fabricated default authority.
 pub(crate) async fn resolve_runtime_configuration_for_registered_database(
     project_root: &Path,
-    layout: &crate::storage::StoreLayout,
+    layout: &tracedecay_runtime_core::storage::StoreLayout,
     database: RegisteredGlobalDbLeaseV1,
 ) -> Result<PinnedRuntimeConfiguration> {
     let target = runtime_configuration_target_for_layout(project_root, layout)?;
@@ -863,8 +866,8 @@ pub(crate) struct OpenedRuntimeConfiguration {
 
 fn usecase_runtime_configuration(
     configuration: PinnedRuntimeConfiguration,
-) -> Result<tracedecay_usecases::config::PinnedRuntimeConfiguration> {
-    tracedecay_usecases::config::PinnedRuntimeConfiguration::new(
+) -> Result<tracedecay_configuration::config::PinnedRuntimeConfiguration> {
+    tracedecay_configuration::config::PinnedRuntimeConfiguration::new(
         configuration.target,
         configuration.revision_id,
         configuration.snapshot,
@@ -873,9 +876,9 @@ fn usecase_runtime_configuration(
 
 fn usecase_opened_runtime_configuration(
     opened: OpenedRuntimeConfiguration,
-) -> Result<tracedecay_usecases::config::OpenedRuntimeConfiguration> {
+) -> Result<tracedecay_configuration::config::OpenedRuntimeConfiguration> {
     Ok(
-        tracedecay_usecases::config::OpenedRuntimeConfiguration::new(
+        tracedecay_configuration::config::OpenedRuntimeConfiguration::new(
             usecase_runtime_configuration(opened.configuration)?,
             opened.registered_database,
         ),
@@ -883,7 +886,7 @@ fn usecase_opened_runtime_configuration(
 }
 
 pub(crate) fn root_runtime_configuration(
-    configuration: &tracedecay_usecases::config::PinnedRuntimeConfiguration,
+    configuration: &tracedecay_configuration::config::PinnedRuntimeConfiguration,
 ) -> Result<PinnedRuntimeConfiguration> {
     PinnedRuntimeConfiguration::new(
         configuration.target.clone(),
@@ -893,24 +896,44 @@ pub(crate) fn root_runtime_configuration(
 }
 
 pub(crate) fn materialize_root_runtime_configuration(
-    configuration: &tracedecay_usecases::config::PinnedRuntimeConfiguration,
+    configuration: &tracedecay_configuration::config::PinnedRuntimeConfiguration,
 ) -> Result<TraceDecayConfig> {
     Ok(root_runtime_configuration(configuration)?.config)
 }
 
+struct RootPinnedRuntimeConfigurationCache;
+
+impl tracedecay_configuration::config::PinnedRuntimeConfigurationCachePort
+    for RootPinnedRuntimeConfigurationCache
+{
+    fn publish(
+        &self,
+        configuration: tracedecay_configuration::config::PinnedRuntimeConfiguration,
+    ) -> Result<()> {
+        install_pinned_runtime_configuration(root_runtime_configuration(&configuration)?)
+    }
+
+    fn cached_for_root(
+        &self,
+        project_root: &Path,
+    ) -> Result<tracedecay_configuration::config::PinnedRuntimeConfiguration> {
+        usecase_runtime_configuration(cached_runtime_configuration(project_root)?)
+    }
+}
+
 struct RootRuntimeConfigurationAuthority;
 
-impl tracedecay_usecases::config::RuntimeConfigurationAuthorityPort
+impl tracedecay_configuration::config::RuntimeConfigurationAuthorityPort
     for RootRuntimeConfigurationAuthority
 {
     fn open<'a>(
         &'a self,
         project_root: &'a Path,
-        layout: &'a crate::storage::StoreLayout,
+        layout: &'a tracedecay_runtime_core::storage::StoreLayout,
         database: RegisteredGlobalDbLeaseV1,
-    ) -> tracedecay_usecases::config::RuntimeConfigurationFuture<
+    ) -> tracedecay_configuration::config::RuntimeConfigurationFuture<
         'a,
-        tracedecay_usecases::config::OpenedRuntimeConfiguration,
+        tracedecay_configuration::config::OpenedRuntimeConfiguration,
     > {
         Box::pin(async move {
             usecase_opened_runtime_configuration(
@@ -923,11 +946,11 @@ impl tracedecay_usecases::config::RuntimeConfigurationAuthorityPort
     fn open_read_only<'a>(
         &'a self,
         project_root: &'a Path,
-        layout: &'a crate::storage::StoreLayout,
+        layout: &'a tracedecay_runtime_core::storage::StoreLayout,
         database: RegisteredGlobalDbLeaseV1,
-    ) -> tracedecay_usecases::config::RuntimeConfigurationFuture<
+    ) -> tracedecay_configuration::config::RuntimeConfigurationFuture<
         'a,
-        tracedecay_usecases::config::OpenedRuntimeConfiguration,
+        tracedecay_configuration::config::OpenedRuntimeConfiguration,
     > {
         Box::pin(async move {
             usecase_opened_runtime_configuration(
@@ -944,11 +967,11 @@ impl tracedecay_usecases::config::RuntimeConfigurationAuthorityPort
     fn resolve<'a>(
         &'a self,
         project_root: &'a Path,
-        layout: &'a crate::storage::StoreLayout,
+        layout: &'a tracedecay_runtime_core::storage::StoreLayout,
         database: RegisteredGlobalDbLeaseV1,
-    ) -> tracedecay_usecases::config::RuntimeConfigurationFuture<
+    ) -> tracedecay_configuration::config::RuntimeConfigurationFuture<
         'a,
-        tracedecay_usecases::config::PinnedRuntimeConfiguration,
+        tracedecay_configuration::config::PinnedRuntimeConfiguration,
     > {
         Box::pin(async move {
             usecase_runtime_configuration(
@@ -965,11 +988,11 @@ impl tracedecay_usecases::config::RuntimeConfigurationAuthorityPort
     fn load_read_only<'a>(
         &'a self,
         project_root: &'a Path,
-        layout: &'a crate::storage::StoreLayout,
+        layout: &'a tracedecay_runtime_core::storage::StoreLayout,
         database: RegisteredGlobalDbLeaseV1,
-    ) -> tracedecay_usecases::config::RuntimeConfigurationFuture<
+    ) -> tracedecay_configuration::config::RuntimeConfigurationFuture<
         'a,
-        tracedecay_usecases::config::PinnedRuntimeConfiguration,
+        tracedecay_configuration::config::PinnedRuntimeConfiguration,
     > {
         Box::pin(async move {
             usecase_runtime_configuration(
@@ -986,8 +1009,12 @@ impl tracedecay_usecases::config::RuntimeConfigurationAuthorityPort
 
 pub(crate) fn install_usecase_runtime_configuration_authority() -> Result<()> {
     static INSTALLATION: LazyLock<std::result::Result<(), String>> = LazyLock::new(|| {
-        tracedecay_usecases::config::install_runtime_configuration_authority(Arc::new(
+        tracedecay_configuration::config::install_runtime_configuration_authority(Arc::new(
             RootRuntimeConfigurationAuthority,
+        ))
+        .map_err(|error| error.to_string())?;
+        tracedecay_configuration::config::install_pinned_runtime_configuration_cache(Arc::new(
+            RootPinnedRuntimeConfigurationCache,
         ))
         .map_err(|error| error.to_string())?;
         install_dashboard_configuration_read_port().map_err(|error| error.to_string())
@@ -1007,7 +1034,7 @@ pub(crate) fn install_usecase_runtime_configuration_authority() -> Result<()> {
 #[hotpath::measure(label = "daemon.config.open", future = true)]
 pub(crate) async fn open_runtime_configuration_for_registered_database(
     project_root: &Path,
-    layout: &crate::storage::StoreLayout,
+    layout: &tracedecay_runtime_core::storage::StoreLayout,
     database: RegisteredGlobalDbLeaseV1,
 ) -> Result<OpenedRuntimeConfiguration> {
     let target = runtime_configuration_target_for_layout(project_root, layout)?;
@@ -1046,33 +1073,6 @@ pub(crate) async fn read_or_initialize_profile_code_index_worker_configuration(
         .map_err(map_configuration_error)
 }
 
-pub(crate) fn profile_code_index_worker_mutation(
-    database: &RegisteredGlobalDb,
-    profile_id: &UserProfileId,
-    selection: CodeIndexWorkerSelectionV1,
-) -> Result<tracedecay_usecases::configuration::DirectConfigurationMutation> {
-    ProfileCodeIndexWorkerConfigurationStore::new_registered(database, profile_id)
-        .and_then(|store| store.mutation(selection))
-        .map_err(map_configuration_error)
-}
-
-#[hotpath::measure(label = "daemon.config.profile_workers.commit", future = true)]
-pub(crate) async fn commit_profile_code_index_worker_selection(
-    database: RegisteredGlobalDbLeaseV1,
-    profile_id: &UserProfileId,
-    authority: &tracedecay_usecases::configuration::ConfigurationMutationAuthority,
-    selection: CodeIndexWorkerSelectionV1,
-    expected_revision: &ConfigurationRevisionId,
-) -> Result<ProfileCodeIndexWorkerCommitV1> {
-    let store =
-        ProfileCodeIndexWorkerConfigurationStore::new_registered(database.as_ref(), profile_id)
-            .map_err(map_configuration_error)?;
-    store
-        .commit_selection(authority, selection, expected_revision)
-        .await
-        .map_err(map_configuration_error)
-}
-
 async fn open_runtime_configuration_from_store(
     target: RuntimeConfigurationTarget,
     store: &GlobalDbConfigurationControlStore<'_>,
@@ -1096,7 +1096,7 @@ async fn open_runtime_configuration_from_store(
                 |error| config_error(format!("invalid initial configuration revision: {error}")),
             )?;
         let daemon_binding =
-            tracedecay_usecases::config::scope_control::daemon_owned_project_source_binding(
+            tracedecay_configuration::config::scope_control::daemon_owned_project_source_binding(
                 &target.project_id,
                 &target.project_root,
             )
@@ -1131,7 +1131,7 @@ async fn open_runtime_configuration_from_store(
             .map_err(map_configuration_error)?;
     }
     let daemon_binding =
-        tracedecay_usecases::config::scope_control::daemon_owned_project_source_binding(
+        tracedecay_configuration::config::scope_control::daemon_owned_project_source_binding(
             &target.project_id,
             &target.project_root,
         )
@@ -1146,7 +1146,7 @@ async fn open_runtime_configuration_from_store(
         .await
     {
         Ok(state) => state,
-        Err(tracedecay_usecases::configuration::ConfigurationError::RevisionConflict) => {
+        Err(tracedecay_configuration::ConfigurationError::RevisionConflict) => {
             store.current().await.map_err(map_configuration_error)?
         }
         Err(error) => return Err(map_configuration_error(error)),
@@ -1210,9 +1210,9 @@ async fn open_runtime_configuration_from_store(
                     Ok(state) => state,
                     // A concurrent open won the swap; adopt what it
                     // published and re-verify it exactly.
-                    Err(
-                        tracedecay_usecases::configuration::ConfigurationError::RevisionConflict,
-                    ) => store.current().await.map_err(map_configuration_error)?,
+                    Err(tracedecay_configuration::ConfigurationError::RevisionConflict) => {
+                        store.current().await.map_err(map_configuration_error)?
+                    }
                     Err(error) => return Err(map_configuration_error(error)),
                 };
             }
@@ -1237,7 +1237,7 @@ async fn open_runtime_configuration_from_store(
 #[cfg(test)]
 pub(crate) async fn ensure_runtime_configuration_for_registered_database(
     project_root: &Path,
-    layout: &crate::storage::StoreLayout,
+    layout: &tracedecay_runtime_core::storage::StoreLayout,
     database: RegisteredGlobalDbLeaseV1,
 ) -> Result<PinnedRuntimeConfiguration> {
     Ok(
@@ -1252,7 +1252,7 @@ pub(crate) async fn ensure_runtime_configuration_for_registered_database(
 #[hotpath::measure(label = "daemon.config.open.read_only", future = true)]
 pub(crate) async fn open_runtime_configuration_for_registered_database_read_only(
     project_root: &Path,
-    layout: &crate::storage::StoreLayout,
+    layout: &tracedecay_runtime_core::storage::StoreLayout,
     database: RegisteredGlobalDbLeaseV1,
 ) -> Result<OpenedRuntimeConfiguration> {
     let target = runtime_configuration_target_for_layout(project_root, layout)?;
@@ -1304,7 +1304,7 @@ fn validate_registered_configuration_database(
 
 pub(crate) async fn load_runtime_configuration_for_registered_database_read_only(
     project_root: &Path,
-    layout: &crate::storage::StoreLayout,
+    layout: &tracedecay_runtime_core::storage::StoreLayout,
     database: RegisteredGlobalDbLeaseV1,
 ) -> Result<PinnedRuntimeConfiguration> {
     Ok(
@@ -1321,7 +1321,7 @@ pub(crate) async fn load_runtime_configuration_for_registered_database_read_only
 #[cfg(not(test))]
 pub async fn ensure_runtime_configuration_for_layout(
     _project_root: &Path,
-    _layout: &crate::storage::StoreLayout,
+    _layout: &tracedecay_runtime_core::storage::StoreLayout,
 ) -> Result<PinnedRuntimeConfiguration> {
     Err(registered_configuration_database_required())
 }
@@ -1329,7 +1329,7 @@ pub async fn ensure_runtime_configuration_for_layout(
 #[cfg(not(test))]
 pub async fn resolve_runtime_configuration_for_layout(
     _project_root: &Path,
-    _layout: &crate::storage::StoreLayout,
+    _layout: &tracedecay_runtime_core::storage::StoreLayout,
 ) -> Result<PinnedRuntimeConfiguration> {
     Err(registered_configuration_database_required())
 }
@@ -1337,7 +1337,7 @@ pub async fn resolve_runtime_configuration_for_layout(
 #[cfg(not(test))]
 pub async fn load_runtime_configuration_for_layout_read_only(
     _project_root: &Path,
-    _layout: &crate::storage::StoreLayout,
+    _layout: &tracedecay_runtime_core::storage::StoreLayout,
 ) -> Result<PinnedRuntimeConfiguration> {
     Err(registered_configuration_database_required())
 }
@@ -1349,11 +1349,9 @@ fn registered_configuration_database_required() -> TraceDecayError {
     )
 }
 
-fn map_configuration_error(
-    error: tracedecay_usecases::configuration::ConfigurationError,
-) -> TraceDecayError {
+fn map_configuration_error(error: tracedecay_configuration::ConfigurationError) -> TraceDecayError {
     match error {
-        tracedecay_usecases::configuration::ConfigurationError::ResetRequired { reason } => {
+        tracedecay_configuration::ConfigurationError::ResetRequired { reason } => {
             TraceDecayError::reset_required("configuration", reason)
         }
         error => config_error(format!("configuration authority unavailable: {error}")),
@@ -1394,7 +1392,7 @@ pub fn cached_telemetry_config(project_root: &Path) -> Result<TelemetryConfig> {
 #[hotpath::measure(label = "daemon.config.bootstrap")]
 pub fn bootstrap_runtime_configuration(
     project_root: &Path,
-    layout: &crate::storage::StoreLayout,
+    layout: &tracedecay_runtime_core::storage::StoreLayout,
 ) -> Result<PinnedRuntimeConfiguration> {
     let target = runtime_configuration_target_for_layout(project_root, layout)?;
     if let Ok(existing) = runtime_configuration_cache().for_project(&target.project_id) {
@@ -1458,6 +1456,10 @@ pub fn runtime_config_from_snapshot(
         semantic: semantic_config_from_snapshot(snapshot)?,
         sync: SyncConfig {
             auto_watch: required_bool(snapshot, SYNC_AUTO_WATCH_SETTING_KEY)?,
+            watch_linked_worktrees: required_bool(
+                snapshot,
+                SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
+            )?,
             watch_debounce_ms: required_unsigned(snapshot, SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY)?,
             watch_max_delay_ms: required_unsigned(snapshot, SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY)?,
             watch_max_projects: required_usize(snapshot, SYNC_WATCH_MAX_PROJECTS_SETTING_KEY)?,
@@ -1640,7 +1642,9 @@ pub fn brand_env(suffix: &str) -> Option<String> {
 /// Returns the path to the configuration file (`config.json`) within the
 /// resolved data directory.
 pub fn get_config_path(project_root: &Path) -> PathBuf {
-    if let Ok(layout) = crate::storage::resolve_layout_for_current_profile(project_root) {
+    if let Ok(layout) =
+        tracedecay_runtime_core::storage::resolve_layout_for_current_profile(project_root)
+    {
         return layout.config_path;
     }
     get_tracedecay_dir(project_root).join(CONFIG_FILENAME)
@@ -1716,7 +1720,7 @@ pub fn save_config_to_path(config_path: &Path, config: &TraceDecayConfig) -> Res
                 config_path.display()
             ),
         })?;
-    crate::storage::PrivateStoreIo::create_dir_all(data_dir).map_err(|e| {
+    tracedecay_runtime_core::storage::PrivateStoreIo::create_dir_all(data_dir).map_err(|e| {
         TraceDecayError::Config {
             message: format!(
                 "failed to create tracedecay directory '{}': {}",
@@ -1773,7 +1777,10 @@ fn is_ignored_by_git(project_path: &Path, git_config_global: Option<&Path>) -> O
             .and_then(|path| is_ignored_by_explicit_global_excludes(project_path, path))
     };
     let dir_name = active_data_dir_name(project_path);
-    let mut command = Command::new(tracedecay_runtime_core::git::git_program());
+    let Ok(git) = tracedecay_runtime_core::git::try_git_program() else {
+        return fallback_global_excludes();
+    };
+    let mut command = Command::new(git);
     command
         .arg("-C")
         .arg(project_path)
@@ -1974,10 +1981,10 @@ fn any_pattern_matches(patterns: &[String], candidates: &[&str]) -> bool {
 /// Single source of truth: [`tracedecay_runtime_core::config`] owns the lock,
 /// [`lock_user_data_dir_test_env`], and `PinnedUserDataDir`; this module only
 /// re-exports them so every historical `crate::config::…` call site keeps
-/// resolving. The lock and its accessor are unconditional there (not gated
-/// behind `cfg(test)` / `feature = "test-helpers"`) because non-test code —
-/// `src/session_temporal_benchmark.rs`, which is always compiled and
-/// backs `cargo bench` — takes this lock outside a test build.
+/// resolving. The re-export follows the same gate as its only non-test
+/// consumer, `session_temporal_benchmark`, so a production build carries
+/// neither the harness nor its accessor.
+#[cfg(any(test, feature = "test-helpers"))]
 pub(crate) use tracedecay_runtime_core::config::lock_user_data_dir_test_env;
 
 /// Pins [`USER_DATA_DIR_ENV`] and agent home discovery to an isolated temp

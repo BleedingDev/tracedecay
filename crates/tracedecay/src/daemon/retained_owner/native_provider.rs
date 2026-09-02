@@ -2033,7 +2033,7 @@ fn map_retained_error(error: RetainedSurfaceExecutionErrorV1) -> NativeReadFailu
         | RetainedSurfaceExecutionErrorV1::Stale
         | RetainedSurfaceExecutionErrorV1::Unsupported
         | RetainedSurfaceExecutionErrorV1::Saturated
-        | RetainedSurfaceExecutionErrorV1::Unavailable
+        | RetainedSurfaceExecutionErrorV1::Unavailable { .. }
         | RetainedSurfaceExecutionErrorV1::ProfileResetRequired
         | RetainedSurfaceExecutionErrorV1::ProjectResetRequired => {
             NativeReadFailure::ProviderUnavailable

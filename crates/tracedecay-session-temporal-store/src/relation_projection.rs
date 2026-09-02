@@ -45,6 +45,7 @@ struct CanonicalOccurrence {
 }
 
 impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
+    #[hotpath::skip]
     pub async fn active_session_summary_relations(
         &self,
         session_id: &SessionId,
@@ -249,6 +250,7 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         Ok(pending.len())
     }
 
+    #[hotpath::skip]
     async fn active_relation_generation(
         &self,
         session_id: &SessionId,

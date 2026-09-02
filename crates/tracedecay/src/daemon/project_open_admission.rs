@@ -10,21 +10,13 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use tracedecay_daemon_identity::authority;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct ProjectServerKey {
     pub(super) owner: StoreOwnerKey,
     pub(super) project_root: PathBuf,
     pub(super) scope_prefix: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct StoreOwnerKey {
-    pub(super) profile_root: PathBuf,
-    pub(super) global_db_path: PathBuf,
-    pub(super) project_id: Option<String>,
-    pub(super) store_root: PathBuf,
-    pub(super) graph_db_path: PathBuf,
 }
 
 /// A client route known before any project database is opened. This is the
@@ -199,9 +191,12 @@ fn refused_store_file_identity(path: &Path) -> Option<RefusedStoreFileIdentityV1
 /// resolves no persisted store, in which case a recorded refusal keeps its
 /// plain time-based backoff.
 fn refused_store_fingerprint(route: &ProjectRouteKey) -> Option<RefusedStoreFingerprintV1> {
-    let layout = crate::storage::resolve_persisted_layout(&route.project_path, &route.profile_root)
-        .ok()
-        .flatten()?;
+    let layout = tracedecay_runtime_core::storage::resolve_persisted_layout(
+        &route.project_path,
+        &route.profile_root,
+    )
+    .ok()
+    .flatten()?;
     let mut graph_dbs = BTreeMap::new();
     if let Some(identity) = refused_store_file_identity(&layout.graph_db_path) {
         graph_dbs.insert(layout.graph_db_path.clone(), identity);
@@ -260,11 +255,14 @@ fn project_route_matches_identity(
 ) -> bool {
     route.profile_root == profile_root
         && (project_roots.contains(&route.project_path)
-            || crate::storage::resolve_persisted_layout(&route.project_path, profile_root)
-                .ok()
-                .flatten()
-                .and_then(|layout| layout.identity.project_id)
-                .as_deref()
+            || tracedecay_runtime_core::storage::resolve_persisted_layout(
+                &route.project_path,
+                profile_root,
+            )
+            .ok()
+            .flatten()
+            .and_then(|layout| layout.identity.project_id)
+            .as_deref()
                 == Some(project_id))
 }
 
@@ -560,6 +558,7 @@ impl ProjectOpenTasks {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn start<OpenFuture>(
         &self,
         route: ProjectRouteKey,
@@ -571,6 +570,7 @@ impl ProjectOpenTasks {
         self.start_cancellable(route, |_| open).await
     }
 
+    #[hotpath::skip]
     pub(super) async fn start_cancellable<OpenOperation, OpenFuture>(
         &self,
         route: ProjectRouteKey,
@@ -678,6 +678,7 @@ impl ProjectOpenTasks {
         ProjectOpenTaskClaim::InFlight(state)
     }
 
+    #[hotpath::skip]
     pub(super) async fn cached_failure(
         &self,
         route: &ProjectRouteKey,
@@ -766,6 +767,7 @@ impl ProjectOpenTasks {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn wait_for_completion(
         mut state: tokio::sync::watch::Receiver<ProjectOpenTaskState>,
     ) -> Result<()> {
@@ -783,11 +785,13 @@ impl ProjectOpenTasks {
         }
     }
 
+    #[hotpath::skip]
     pub(super) async fn shutdown(&self) -> bool {
         self.shutdown_with_deadline(DAEMON_TASK_ABORT_DEADLINE, DAEMON_TASK_ABORT_DEADLINE)
             .await
     }
 
+    #[hotpath::skip]
     pub(super) async fn shutdown_project_identity(
         &self,
         profile_root: &Path,
@@ -929,6 +933,7 @@ impl ProjectOpenTasks {
             .await
     }
 
+    #[hotpath::skip]
     async fn drain_retiring_routes(&self, routes: Vec<ProjectRouteKey>, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         let completions = {
@@ -958,6 +963,7 @@ impl ProjectOpenTasks {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn tracked_task_count(&self) -> usize {
         let mut registry = self.lock_registry();
         registry.prune(Instant::now());
@@ -975,6 +981,7 @@ impl ProjectOpenTasks {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn tracked_route_count(&self) -> usize {
         let mut registry = self.lock_registry();
         registry.prune(Instant::now());
@@ -1024,22 +1031,22 @@ impl ProjectServerPublication {
     }
 }
 
-impl StoreOwnerKey {
-    pub(super) fn from_paths(
-        profile_root: &Path,
-        global_db_path: &Path,
-        project_id: Option<String>,
-        store_root: &Path,
-        graph_db_path: &Path,
-    ) -> Result<Self> {
-        Ok(Self {
-            profile_root: authority::canonical_identity_path(profile_root)?,
-            global_db_path: authority::canonical_identity_path(global_db_path)?,
-            project_id,
-            store_root: authority::canonical_identity_path(store_root)?,
-            graph_db_path: authority::canonical_identity_path(graph_db_path)?,
-        })
-    }
+/// Builds a [`StoreOwnerKey`] from raw paths, canonicalizing each identity
+/// path so filesystem aliases converge on one owner.
+pub(super) fn store_owner_key_from_paths(
+    profile_root: &Path,
+    global_db_path: &Path,
+    project_id: Option<String>,
+    store_root: &Path,
+    graph_db_path: &Path,
+) -> Result<StoreOwnerKey> {
+    Ok(StoreOwnerKey {
+        profile_root: authority::canonical_identity_path(profile_root)?,
+        global_db_path: authority::canonical_identity_path(global_db_path)?,
+        project_id,
+        store_root: authority::canonical_identity_path(store_root)?,
+        graph_db_path: authority::canonical_identity_path(graph_db_path)?,
+    })
 }
 
 impl ProjectRouteKey {
@@ -1064,7 +1071,7 @@ impl ProjectServerKey {
     ) -> Result<Self> {
         let layout = cg.store_layout();
         Ok(Self {
-            owner: StoreOwnerKey::from_paths(
+            owner: store_owner_key_from_paths(
                 &handshake.client_identity.profile_root,
                 &handshake.client_identity.global_db_path,
                 layout.identity.project_id.clone(),
@@ -1111,8 +1118,8 @@ mod refused_store_invalidation_tests {
     }
 
     fn store_data_root(profile_root: &Path, project_root: &Path) -> PathBuf {
-        let project_id = crate::storage::default_profile_project_id(project_root);
-        crate::storage::profile_sharded_data_root(profile_root, &project_id)
+        let project_id = tracedecay_runtime_core::storage::default_profile_project_id(project_root);
+        tracedecay_runtime_core::storage::profile_sharded_data_root(profile_root, &project_id)
     }
 
     fn seed_refused_store(profile_root: &Path, project_root: &Path) -> PathBuf {

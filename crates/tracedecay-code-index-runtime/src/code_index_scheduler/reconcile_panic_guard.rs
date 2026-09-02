@@ -24,12 +24,12 @@ use tokio::time::Instant;
 /// pass. The floor keeps a transient panic from hot-looping the pool; the
 /// ceiling keeps a persistently panicking input from being retried more than a
 /// few times an hour.
-pub const RECONCILE_PANIC_BACKOFF_FLOOR: Duration = if cfg!(test) {
+pub const RECONCILE_PANIC_BACKOFF_FLOOR: Duration = if cfg!(any(test, feature = "test-helpers")) {
     Duration::from_millis(50)
 } else {
     Duration::from_secs(30)
 };
-pub const RECONCILE_PANIC_BACKOFF_CEILING: Duration = if cfg!(test) {
+pub const RECONCILE_PANIC_BACKOFF_CEILING: Duration = if cfg!(any(test, feature = "test-helpers")) {
     Duration::from_millis(400)
 } else {
     Duration::from_mins(10)
@@ -69,6 +69,7 @@ impl Default for ReconcilePanicGuardV1 {
 }
 
 impl ReconcilePanicGuardV1 {
+    #[hotpath::skip]
     pub const fn new() -> Self {
         Self {
             consecutive_panics: 0,
@@ -112,6 +113,7 @@ impl ReconcilePanicGuardV1 {
     /// Consecutive panics observed since the last progressing pass. Reported
     /// on the warn path so an operator sees a bounded counter rather than an
     /// undifferentiated repeating line.
+    #[hotpath::skip]
     pub const fn consecutive_panics(&self) -> u32 {
         self.consecutive_panics
     }
@@ -269,12 +271,13 @@ mod tests {
 /// — capacity another holder will release — earns a re-arm, and even that is
 /// capped so a genuinely undersized budget degrades to stale instead of
 /// spinning.
-pub const RECONCILE_CAPACITY_RETRY_FLOOR: Duration = if cfg!(test) {
+pub const RECONCILE_CAPACITY_RETRY_FLOOR: Duration = if cfg!(any(test, feature = "test-helpers")) {
     Duration::from_millis(40)
 } else {
     Duration::from_secs(2)
 };
-pub const RECONCILE_CAPACITY_RETRY_CEILING: Duration = if cfg!(test) {
+pub const RECONCILE_CAPACITY_RETRY_CEILING: Duration = if cfg!(any(test, feature = "test-helpers"))
+{
     Duration::from_millis(320)
 } else {
     Duration::from_mins(1)
@@ -299,6 +302,7 @@ impl Default for ReconcileCapacityRetryV1 {
 }
 
 impl ReconcileCapacityRetryV1 {
+    #[hotpath::skip]
     pub const fn new() -> Self {
         Self {
             consecutive: 0,
@@ -330,6 +334,7 @@ impl ReconcileCapacityRetryV1 {
     }
 
     /// Consecutive capacity refusals since the last non-capacity pass.
+    #[hotpath::skip]
     pub const fn consecutive(&self) -> u32 {
         self.consecutive
     }

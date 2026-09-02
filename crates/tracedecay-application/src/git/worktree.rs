@@ -254,6 +254,7 @@ pub enum NativeWorktreeSurfaceRequest {
 }
 
 impl NativeWorktreeSurfaceRequest {
+    #[hotpath::skip]
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::Inventory(_) => NATIVE_INTEGRATION_WORKTREE_INVENTORY_OPERATION,
@@ -541,6 +542,7 @@ where
     S: AuthorizedScopeSetPort,
     P: NativeWorktreePort,
 {
+    #[hotpath::skip]
     pub const fn new(scope_sets: S, port: P) -> Self {
         Self { scope_sets, port }
     }

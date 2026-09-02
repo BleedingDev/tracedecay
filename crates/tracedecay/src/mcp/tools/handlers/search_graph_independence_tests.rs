@@ -14,13 +14,13 @@ use super::dispatch_test_support::{SelectorEnv, verified_graph_options};
 use super::*;
 use crate::config::lock_user_data_dir_test_env;
 
-struct PendingCodeGraphAdmission;
+struct PendingVerifiedGraphQueryPort;
 
-impl tracedecay_usecases::graph::CodeGraphReadAdmissionPort for PendingCodeGraphAdmission {
-    fn admit<'a>(
+impl tracedecay_graph_query::VerifiedGraphQueryPort for PendingVerifiedGraphQueryPort {
+    fn open<'a>(
         &'a self,
-        _request: tracedecay_usecases::graph::CodeGraphReadAdmissionRequest<'a>,
-    ) -> tracedecay_usecases::graph::CodeGraphReadAdmissionFuture<'a> {
+        _request: tracedecay_graph_query::VerifiedGraphQueryRequest<'a>,
+    ) -> tracedecay_graph_query::VerifiedGraphQueryFuture<'a> {
         Box::pin(std::future::pending())
     }
 }
@@ -119,7 +119,7 @@ async fn tracedecay_search_preserves_lexical_results_when_graph_admission_is_mis
     .expect("registered search fixture");
 
     let mut options = lexical_search_options(&cg);
-    options.code_graph_read_admission_port = None;
+    options.verified_graph_query_port = None;
 
     let result = handle_tool_call_with_registry_options(
         &cg,
@@ -158,7 +158,7 @@ async fn tracedecay_search_preserves_lexical_results_when_graph_admission_is_mis
             "status": "unavailable",
             "reason_code": "verified-code-graph-read-unavailable",
             "retryable": false,
-            "detail": "the exact project graph admission is not mounted",
+            "detail": "the exact project verified graph query is not mounted",
         })
     );
     assert_eq!(
@@ -237,7 +237,7 @@ async fn tracedecay_search_does_not_wait_for_slow_graph_admission() {
     .expect("registered slow graph fixture");
 
     let mut options = lexical_search_options(&cg);
-    options.code_graph_read_admission_port = Some(Arc::new(PendingCodeGraphAdmission));
+    options.verified_graph_query_port = Some(Arc::new(PendingVerifiedGraphQueryPort));
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         handle_tool_call_with_registry_options(
@@ -283,7 +283,7 @@ async fn tracedecay_search_does_not_wait_for_slow_graph_admission() {
     assert!(payload["external_import_hint"].is_null());
 
     let mut markdown_options = lexical_search_options(&cg);
-    markdown_options.code_graph_read_admission_port = Some(Arc::new(PendingCodeGraphAdmission));
+    markdown_options.verified_graph_query_port = Some(Arc::new(PendingVerifiedGraphQueryPort));
     let markdown = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         handle_tool_call_with_registry_options(
@@ -328,7 +328,7 @@ async fn tracedecay_context_preserves_fallback_results_while_semantic_and_graph_
     .expect("registered context fixture");
 
     let mut options = lexical_search_options(&cg);
-    options.code_graph_read_admission_port = None;
+    options.verified_graph_query_port = None;
     let result = handle_tool_call_with_registry_options(
         &cg,
         "tracedecay_context",
@@ -374,7 +374,7 @@ async fn tracedecay_context_preserves_fallback_results_while_semantic_and_graph_
     assert_eq!(payload["memory_matches"].as_array().map(Vec::len), Some(0));
 
     let mut markdown_options = lexical_search_options(&cg);
-    markdown_options.code_graph_read_admission_port = None;
+    markdown_options.verified_graph_query_port = None;
     let markdown = handle_tool_call_with_registry_options(
         &cg,
         "tracedecay_context",
@@ -428,7 +428,7 @@ async fn tracedecay_context_returns_typed_pending_coverage_when_every_code_lane_
     });
     let options = ToolCallRegistryOptions {
         code_index_search_executor: Some(executor),
-        code_graph_read_admission_port: None,
+        verified_graph_query_port: None,
         ..lexical_search_options(&cg)
     };
     let result = handle_tool_call_with_registry_options(
@@ -460,5 +460,79 @@ async fn tracedecay_context_returns_typed_pending_coverage_when_every_code_lane_
         assert_eq!(payload["coverage"][lane]["reason"], "generation_rebuilding");
     }
     assert_eq!(payload["memory_matches"].as_array().map(Vec::len), Some(0));
+    cg.close();
+}
+
+fn stale_lexical_search() -> crate::mcp::server::CodeIndexSearchOutcomeV1 {
+    match completed_lexical_search() {
+        crate::mcp::server::CodeIndexSearchOutcomeV1::Complete(mut complete) => {
+            complete.coverage = crate::mcp::server::CodeIndexSearchCoverageV1::fused_stale(
+                &complete.code_generation,
+                &complete.semantic,
+            );
+            crate::mcp::server::CodeIndexSearchOutcomeV1::Complete(complete)
+        }
+        other => other,
+    }
+}
+
+#[tokio::test]
+async fn tracedecay_context_preserves_stale_lane_coverage_markers() {
+    let _env_lock = lock_user_data_dir_test_env();
+    let dir = TempDir::new().expect("stale context isolation");
+    let _env = SelectorEnv::new(dir.path());
+    let project = dir.path().join("stale-context-coverage");
+    fs::create_dir_all(project.join("src")).expect("create stale context sources");
+    fs::write(project.join("src/lib.rs"), "pub fn LexicalWidget() {}\n")
+        .expect("write stale context fixture");
+    let (cg, _runtime) = TraceDecay::init_test_fixture_with_registered_runtime(
+        &project,
+        "project.stale-context-coverage",
+    )
+    .await
+    .expect("registered stale context fixture");
+
+    let executor: crate::mcp::server::CodeIndexSearchExecutor =
+        Arc::new(|_| Box::pin(async { stale_lexical_search() }));
+    let mut options = lexical_search_options(&cg);
+    options.code_index_search_executor = Some(executor);
+    options.verified_graph_query_port = None;
+    let result = handle_tool_call_with_registry_options(
+        &cg,
+        "tracedecay_context",
+        json!({
+            "task": "explain LexicalWidget",
+            "include_memory": false,
+            "format": "json",
+        }),
+        None,
+        None,
+        options,
+    )
+    .await
+    .expect("serve-stale context must still answer");
+    let payload: Value = serde_json::from_str(
+        result.value["content"][0]["text"]
+            .as_str()
+            .expect("stale context JSON text"),
+    )
+    .expect("stale context JSON payload");
+
+    assert_eq!(
+        payload["code_generation"],
+        "generation.search-degradation.1"
+    );
+    assert_eq!(payload["search_matches"].as_array().map(Vec::len), Some(1));
+    assert_eq!(payload["coverage"]["recall"], "partial");
+    for lane in ["exact", "lexical", "graph"] {
+        assert_eq!(
+            payload["coverage"][lane]["status"], "stale",
+            "context must keep serve-stale markers on {lane}: {payload}"
+        );
+        assert_eq!(
+            payload["coverage"][lane]["generation"], "generation.search-degradation.1",
+            "stale {lane} must name the served generation: {payload}"
+        );
+    }
     cg.close();
 }

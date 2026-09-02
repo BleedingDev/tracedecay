@@ -133,6 +133,7 @@ impl TemporalHydratedResult {
         Self::unavailable(rank, stable_id.into(), anchor_id, state)
     }
 
+    #[hotpath::skip]
     pub const fn rank(&self) -> u32 {
         self.rank
     }
@@ -145,6 +146,7 @@ impl TemporalHydratedResult {
         &self.anchor_id
     }
 
+    #[hotpath::skip]
     pub const fn state(&self) -> HydrationStateV1 {
         self.state
     }
@@ -259,6 +261,7 @@ impl TemporalCandidateExport {
         self.next_cursor.as_deref()
     }
 
+    #[hotpath::skip]
     pub const fn coverage(&self) -> RetrieverCoverage {
         self.coverage
     }
@@ -849,6 +852,7 @@ enum SummaryRejectionClass {
 }
 
 impl SummaryRejectionClass {
+    #[hotpath::skip]
     const fn coverage(self) -> CoverageClass {
         match self {
             Self::Unauthorized | Self::SessionMismatch => CoverageClass::Hidden,
@@ -857,6 +861,7 @@ impl SummaryRejectionClass {
         }
     }
 
+    #[hotpath::skip]
     const fn hides_details(self) -> bool {
         match self {
             Self::Unauthorized | Self::SessionMismatch => true,

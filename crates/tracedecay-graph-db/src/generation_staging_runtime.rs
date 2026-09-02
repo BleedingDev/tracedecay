@@ -47,7 +47,9 @@ impl GraphDb {
             native_contract::validate_semantic_native_batch(plan, receipt, &batch)
         })?;
         if receipt.key.stage != plan.key {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "generation_staging_runtime.apply_staged_generation_batch",
+            ));
         }
         let locator = generation_locator(plan)?;
         let physical_namespace = locator.physical_namespace()?;
@@ -55,7 +57,9 @@ impl GraphDb {
             || batch.projection.as_str() != plan.key.projection.projection.as_str()
             || batch.source_generation.as_str() != plan.source_generation.as_str()
         {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "generation_staging_runtime.apply_staged_generation_batch",
+            ));
         }
         require_staged_batch_mutation_count(batch.mutations.len())?;
         let logical_output_digest = batch.semantic_vector_output_digest()?;
@@ -88,7 +92,9 @@ impl GraphDb {
             {
                 return Ok(existing.commit);
             }
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "generation_staging_runtime.apply_staged_generation_batch",
+            ));
         }
         hotpath::measure_block!("graph_db.generation.stage.batch.capacity", {
             let (entity_count, relation_count) =
@@ -152,9 +158,15 @@ impl GraphDb {
         }
         check()?;
         let mut state = self.state_write_guard()?;
+        // Staged semantic vectors maintain their per-generation HNSW index
+        // inline: the pinned grafeo persists index topology at checkpoint and
+        // restores it on open, so the index built here is the one the serving
+        // generation searches after any number of reopens. `apply_locked`
+        // creates the index on the first vector-carrying batch of the fresh
+        // physical namespace and refreshes it for every committed vector row.
         let commit = hotpath::measure_block!(
             "graph_db.generation.stage.batch.apply_locked",
-            self.apply_locked_without_vector_index_maintenance(
+            self.apply_locked(
                 database,
                 &mut state,
                 batch,
@@ -185,7 +197,9 @@ impl GraphDb {
             .validate()
             .map_err(|error| GraphDbError::invalid(error.to_string()))?;
         if receipt.key.stage != plan.key {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "generation_staging_runtime.staged_generation_batch_publication_digest",
+            ));
         }
         let physical_namespace = generation_locator(plan)?.physical_namespace()?;
         let idempotency_key = batch_idempotency_key(&receipt.key)?;
@@ -198,7 +212,9 @@ impl GraphDb {
         if publication.commit.digest != publication.digest
             || publication.commit.source_generation.as_str() != plan.source_generation.as_str()
         {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "generation_staging_runtime.staged_generation_batch_publication_digest",
+            ));
         }
         staged_publication_digest(
             &publication.digest,
@@ -238,7 +254,9 @@ impl GraphDb {
                     })?
                     .commit;
                 if current.source_generation.as_str() != plan.source_generation.as_str() {
-                    return Err(GraphDbError::Conflict);
+                    return Err(GraphDbError::conflict(
+                        "generation_staging_runtime.prepare_publication_from_staged_native",
+                    ));
                 }
                 let manifest = GraphGenerationManifest::new_checked(
                     locator.projection.clone(),
@@ -266,7 +284,9 @@ impl GraphDb {
                     if existing.input_digest != existing_input_digest.as_str()
                         || existing.digest != digest
                     {
-                        return Err(GraphDbError::Conflict);
+                        return Err(GraphDbError::conflict(
+                            "generation_staging_runtime.prepare_publication_from_staged_native",
+                        ));
                     }
                     return Ok(GraphBatchPlan::Settled(
                         existing.commit,
@@ -302,7 +322,9 @@ impl GraphDb {
                     || finalized.watermark != manifest.watermark
                     || finalized.generation_dependency_digest.as_ref() != Some(&dependency_digest)
                 {
-                    return Err(GraphDbError::Conflict);
+                    return Err(GraphDbError::conflict(
+                        "generation_staging_runtime.prepare_publication_from_staged_native",
+                    ));
                 }
                 let recovered = GraphRecoveredGenerationDigestV1::new(format!(
                     "sha256:{}",
@@ -340,7 +362,9 @@ impl GraphDb {
             return Ok(());
         }
         if state.retains(&locator) {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "generation_staging_runtime.reserve_staged_generation_retirement",
+            ));
         }
         state.retiring.insert(locator);
         Ok(())
@@ -373,7 +397,9 @@ impl GraphDb {
             GraphDbError::unavailable("verified graph generation state lock is poisoned")
         })?;
         if state.retiring.contains(locator) || state.collected.contains(locator) {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict(
+                "generation_staging_runtime.require_staged_generation_writable",
+            ));
         }
         Ok(())
     }
@@ -441,7 +467,9 @@ fn staged_publication_digest(
     receipt_digest: &tracedecay_store::SemanticVectorBatchReceiptDigest,
 ) -> Result<SemanticVectorGraphBatchDigest, GraphDbError> {
     if native_input_digest != receipt_digest.as_str() {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict(
+            "generation_staging_runtime.staged_publication_digest",
+        ));
     }
     let digest = tracedecay_domain::canonical_sha256(&(
         "tracedecay.semantic-vector-physical-batch-publication.v1",
@@ -468,18 +496,24 @@ pub(crate) fn validate_stage_publication_replay(
         || replay.expected_prior_head != plan.expected_prior_verified_head
         || replay.input_digest != finalization_input_digest(plan, checkpoint)?
     {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict(
+            "generation_staging_runtime.validate_stage_publication_replay",
+        ));
     }
     let source = checked_decode_replay_source(&replay.canonical_replay_source, check)?;
     let GraphGenerationReplaySource::SemanticVectorGeneration(source) = source else {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict(
+            "generation_staging_runtime.validate_stage_publication_replay",
+        ));
     };
     if source.semantic_generation_id != plan.semantic_generation_id
         || source.base_generation != plan.base_generation
         || source.metadata.source_generation.as_str() != plan.source_generation.as_str()
         || source.metadata.dependencies != vec![stage_dependency(plan)?]
     {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict(
+            "generation_staging_runtime.validate_stage_publication_replay",
+        ));
     }
     let manifest = GraphGenerationManifest::new_checked(
         source.metadata.projection,
@@ -520,7 +554,9 @@ fn require_receipt_output_digest(
     recorded: &SemanticVectorBatchOutputDigest,
 ) -> Result<(), GraphDbError> {
     if actual != recorded {
-        return Err(GraphDbError::Conflict);
+        return Err(GraphDbError::conflict(
+            "generation_staging_runtime.require_receipt_output_digest",
+        ));
     }
     Ok(())
 }
@@ -630,10 +666,10 @@ mod tests {
         let foreign =
             SemanticVectorBatchOutputDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             require_receipt_output_digest(&actual, &foreign),
-            Err(GraphDbError::Conflict)
-        );
+            Err(GraphDbError::Conflict { .. })
+        ));
         assert_eq!(require_receipt_output_digest(&actual, &actual), Ok(()));
     }
 
@@ -675,13 +711,13 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(settled.as_str(), expected.as_str());
-        assert_eq!(
+        assert!(matches!(
             staged_publication_digest(
                 &"b".repeat(64),
                 &format!("sha256:{}", "c".repeat(64)),
                 &receipt
             ),
-            Err(GraphDbError::Conflict)
-        );
+            Err(GraphDbError::Conflict { .. })
+        ));
     }
 }

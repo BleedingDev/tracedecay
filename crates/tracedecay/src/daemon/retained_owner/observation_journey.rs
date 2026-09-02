@@ -612,9 +612,14 @@ impl UntrustedRecallGateV1 {
         value: &str,
     ) -> Result<UntrustedRecallMetadataV1, HygieneError> {
         Ok(match self.hardener.harden_metadata(field, value)? {
-            AdvisoryMetadataAdmissionV1::Admitted { value, .. } => {
-                UntrustedRecallMetadataV1::Admitted(value)
-            }
+            AdvisoryMetadataAdmissionV1::Admitted {
+                value,
+                source_sha256,
+                ..
+            } => UntrustedRecallMetadataV1::Admitted {
+                value,
+                source_sha256,
+            },
             AdvisoryMetadataAdmissionV1::Withheld {
                 reason,
                 source_sha256,
@@ -719,7 +724,12 @@ impl UntrustedRecallItemV1 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum UntrustedRecallMetadataV1 {
     /// The label may be rendered, in this contained form.
-    Admitted(String),
+    Admitted {
+        /// The contained label, as the gate would render it.
+        value: String,
+        /// Digest of the provider's original label.
+        source_sha256: String,
+    },
     /// The label must not be rendered. The caller substitutes a host-minted
     /// stand-in rather than a repaired copy of the provider's bytes.
     Withheld {
@@ -734,7 +744,7 @@ impl UntrustedRecallMetadataV1 {
     /// The contained label, when the gate admitted one.
     pub(super) fn admitted(&self) -> Option<&str> {
         match self {
-            Self::Admitted(value) => Some(value),
+            Self::Admitted { value, .. } => Some(value),
             Self::Withheld { .. } => None,
         }
     }
@@ -742,16 +752,21 @@ impl UntrustedRecallMetadataV1 {
     /// The typed refusal, when the gate refused the label.
     pub(super) const fn withheld_reason(&self) -> Option<AdvisoryTextWithheldReasonV1> {
         match self {
-            Self::Admitted(_) => None,
+            Self::Admitted { .. } => None,
             Self::Withheld { reason, .. } => Some(*reason),
         }
     }
 
     /// Digest of the provider's original label, admitted or not.
-    pub(super) fn source_sha256(&self) -> Option<&str> {
+    ///
+    /// Both arms carry it, so a caller that substitutes a host-minted stand-in
+    /// for a label it will not render can derive that stand-in from the
+    /// provider's own bytes without keeping a copy of them.
+    pub(super) fn source_sha256(&self) -> &str {
         match self {
-            Self::Admitted(_) => None,
-            Self::Withheld { source_sha256, .. } => Some(source_sha256),
+            Self::Admitted { source_sha256, .. } | Self::Withheld { source_sha256, .. } => {
+                source_sha256
+            }
         }
     }
 }
@@ -3269,7 +3284,7 @@ mod tests {
 
     use super::*;
     use crate::host_admission::HostAdmissionTestRuntimeV1;
-    use crate::store::GlobalDbObservationStore;
+    use tracedecay_global_db::GlobalDbObservationStore;
 
     const READY_RECEIPT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const PROVIDER_RECEIPT: &str =
@@ -4328,7 +4343,12 @@ mod tests {
 
         let deliveries = wait_for_deliveries(journey.journal_path(), 2).await;
         for (_, state, attempts) in &deliveries {
-            assert_eq!((state.as_str(), *attempts), ("rejected", 1));
+            assert_eq!(
+                (state.as_str(), *attempts),
+                ("rejected", 1),
+                "{}",
+                journal_snapshot(journey.journal_path())
+            );
         }
         assert_eq!(first_port.observe_calls.load(Ordering::Relaxed), 0);
         {
@@ -4690,10 +4710,21 @@ mod tests {
             }
         });
 
+        // The caller's bound sits past the lane's foreground budget on
+        // purpose: the admission below runs until that bound, so the sample it
+        // leaves behind is a genuine budget breach rather than an in-budget
+        // deadline hit.
+        let budget = fixture
+            .journey
+            .backpressure
+            .policy()
+            .foreground_budget_micros;
         let cancellation = HostCancellationToken::new();
         let bounds = ReplayBoundsV1 {
             cancellation: &cancellation,
-            deadline: tokio::time::Instant::now() + Duration::from_millis(150),
+            deadline: tokio::time::Instant::now()
+                + Duration::from_micros(u64::try_from(budget).expect("budget is positive"))
+                + Duration::from_millis(100),
         };
         let started = std::time::Instant::now();
         let error = fixture
@@ -4734,11 +4765,6 @@ mod tests {
         // A sample taken only on success would leave the lane blind to exactly
         // the admissions that hurt, and the breach run is what sheds optional
         // traffic before the next record pays the same cost.
-        let budget = fixture
-            .journey
-            .backpressure
-            .policy()
-            .foreground_budget_micros;
         let sample = fixture
             .journey
             .backpressure

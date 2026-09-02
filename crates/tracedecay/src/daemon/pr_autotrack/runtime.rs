@@ -28,6 +28,7 @@ pub struct PrAutotrackTask {
 }
 
 impl PrAutotrackTask {
+    #[hotpath::skip]
     pub async fn shutdown(self) {
         self.cancellation.cancel();
         if let Err(error) = self.task.await {

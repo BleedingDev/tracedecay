@@ -25,6 +25,7 @@ impl HydrationDenial {
         Ok(Self { state })
     }
 
+    #[hotpath::skip]
     pub const fn state(&self) -> HydrationStateV1 {
         self.state
     }
@@ -45,18 +46,22 @@ pub struct HydrationGrant<'a> {
 }
 
 impl<'a> HydrationGrant<'a> {
+    #[hotpath::skip]
     pub const fn snapshot(&self) -> &'a TemporalExecutionSnapshot {
         self.snapshot
     }
 
+    #[hotpath::skip]
     pub const fn anchor_id(&self) -> &'a RetrievalAnchorId {
         self.anchor_id
     }
 
+    #[hotpath::skip]
     pub const fn max_bytes(&self) -> usize {
         self.max_bytes
     }
 
+    #[hotpath::skip]
     pub const fn max_chunk_bytes(&self) -> usize {
         self.max_chunk_bytes
     }
@@ -201,6 +206,7 @@ impl UnavailableHydration {
         &self.anchor_id
     }
 
+    #[hotpath::skip]
     pub const fn state(&self) -> HydrationStateV1 {
         self.state
     }

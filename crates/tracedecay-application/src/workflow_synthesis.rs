@@ -46,6 +46,7 @@ pub enum WorkflowSynthesisRefusal {
 }
 
 impl WorkflowSynthesisRefusal {
+    #[hotpath::skip]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::StepWithoutFanOut => "step_without_fan_out",

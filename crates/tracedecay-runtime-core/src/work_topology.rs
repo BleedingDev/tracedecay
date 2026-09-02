@@ -149,7 +149,7 @@ impl From<GraphDbError> for WorkTopologyError {
             | GraphDbError::DurabilityUncertain { message }
             | GraphDbError::ProjectionMismatch { message, .. }
             | GraphDbError::GenerationMismatch { message, .. } => Self::Corrupt(message),
-            GraphDbError::Conflict => {
+            GraphDbError::Conflict { .. } => {
                 Self::Unavailable("Work topology publication conflict".to_owned())
             }
             GraphDbError::Unavailable { message }
@@ -315,6 +315,7 @@ impl WorkTopologyStore {
     /// The verified graph generation this topology snapshot is published
     /// under. Reads bound to this generation become stale when a newer
     /// generation is published.
+    #[hotpath::skip]
     pub const fn generation(&self) -> &GraphGenerationId {
         &self.generation
     }

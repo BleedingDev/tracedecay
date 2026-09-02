@@ -346,6 +346,7 @@ impl AuthorizedScopeSet {
         &self.scope_set_id
     }
 
+    #[hotpath::skip]
     pub const fn revision(&self) -> ScopeSetRevision {
         self.revision
     }
@@ -604,6 +605,7 @@ impl MultiRootContinuationV1 {
         &self.root_generations
     }
 
+    #[hotpath::skip]
     pub const fn next_page(&self) -> u64 {
         self.next_page
     }

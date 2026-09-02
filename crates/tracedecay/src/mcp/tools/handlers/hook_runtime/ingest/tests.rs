@@ -1,5 +1,6 @@
 use super::super::*;
 use crate::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_mcp::structured_hook_error_data;
 
 use super::*;
 
@@ -14,7 +15,7 @@ fn cursor_compaction_response_matches_hook_contract() {
     assert!(outcome.summary_node_ids.is_empty());
     assert_eq!(
         outcome.relation_projection_status,
-        tracedecay_sessions::runtime::lcm::LcmRelationProjectionStatus::NotApplicable
+        tracedecay_lcm::LcmRelationProjectionStatus::NotApplicable
     );
 }
 

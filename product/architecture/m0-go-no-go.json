@@ -116,7 +116,7 @@
       "upstream_mount_paths": [
         "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
         "crates/tracedecay/src/mcp/server/hook_writes.rs",
-        "crates/tracedecay/src/daemon/service/invocation/observability_producer.rs"
+        "crates/tracedecay-daemon-service/src/invocation/observability_producer.rs"
       ],
       "symbols": [
         "post-admission normalized observation",
@@ -133,10 +133,10 @@
         "crates/tracedecay-memory-context/**"
       ],
       "upstream_mount_paths": [
-        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
-        "crates/tracedecay/src/daemon/session_retrieval/contract.rs",
-        "crates/tracedecay-usecases/src/context/mod.rs",
-        "crates/tracedecay-usecases/src/context/read_modes.rs"
+        "crates/tracedecay-session-runtime/src/session_retrieval/admitted.rs",
+        "crates/tracedecay-session-runtime/src/session_retrieval/contract.rs",
+        "crates/tracedecay-session-memory/src/context/mod.rs",
+        "crates/tracedecay-graph-query/src/context/read_modes.rs"
       ],
       "symbols": [
         "admitted session retrieval",
@@ -153,8 +153,8 @@
         "crates/tracedecay-memory-observation/**"
       ],
       "upstream_mount_paths": [
-        "crates/tracedecay/src/daemon/service/invocation/feedback.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory_tracking.rs",
+        "crates/tracedecay-daemon-service/src/invocation/feedback.rs",
+        "crates/tracedecay-session-memory/src/memory_tracking.rs",
         "crates/tracedecay/src/daemon/scheduler/automation_observation.rs"
       ],
       "symbols": [

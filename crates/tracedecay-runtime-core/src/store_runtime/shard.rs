@@ -51,6 +51,7 @@ pub enum ShardRuntimeLeaseKind {
 }
 
 impl ShardRuntimeLeaseKind {
+    #[hotpath::skip]
     const fn resource(self) -> ShardRuntimeResource {
         match self {
             Self::GeneralReader => ShardRuntimeResource::GeneralReader,
@@ -62,6 +63,7 @@ impl ShardRuntimeLeaseKind {
         }
     }
 
+    #[hotpath::skip]
     const fn counter_name(self) -> &'static str {
         match self {
             Self::GeneralReader => "general reader leases",

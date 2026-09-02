@@ -30,9 +30,9 @@ use tempfile::TempDir;
 use tokio::sync::OnceCell;
 use tracedecay::config::USER_DATA_DIR_ENV;
 use tracedecay::host_admission::HostAdmissionTestRuntimeV1;
-use tracedecay::storage::PrivateStoreIo;
-use tracedecay::types::{Node, NodeKind, Visibility};
+use tracedecay_domain::code_intelligence::{Node, NodeKind, Visibility};
 use tracedecay_runtime_core::db::{Database, DatabaseAuthority, TestDatabaseRuntimeMode};
+use tracedecay_runtime_core::storage::PrivateStoreIo;
 use tracedecay_sessions::admission::{HostAdmissionOutcome, HostAdmissionScope};
 use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
 
@@ -76,7 +76,7 @@ pub fn register_test_schema_installer() {
 
 pub async fn initialize_test_database(
     path: &Path,
-) -> tracedecay_runtime_core::errors::Result<(Database, bool)> {
+) -> tracedecay_domain::errors::Result<(Database, bool)> {
     register_test_schema_installer();
     let authority = DatabaseAuthority::acquire_test(path, "integration test initialize")?;
     Database::publish_test_runtime(path, &authority, TestDatabaseRuntimeMode::Initialize).await
@@ -84,7 +84,7 @@ pub async fn initialize_test_database(
 
 pub async fn open_test_database(
     path: &Path,
-) -> tracedecay_runtime_core::errors::Result<(Database, bool)> {
+) -> tracedecay_domain::errors::Result<(Database, bool)> {
     register_test_schema_installer();
     let authority = DatabaseAuthority::acquire_test(path, "integration test open")?;
     Database::publish_test_runtime(path, &authority, TestDatabaseRuntimeMode::Existing).await
@@ -92,7 +92,7 @@ pub async fn open_test_database(
 
 pub async fn open_test_database_read_only(
     path: &Path,
-) -> tracedecay_runtime_core::errors::Result<(Database, bool)> {
+) -> tracedecay_domain::errors::Result<(Database, bool)> {
     register_test_schema_installer();
     let authority = DatabaseAuthority::acquire_test(path, "integration test read-only open")?;
     Database::publish_test_runtime(path, &authority, TestDatabaseRuntimeMode::ReadOnly).await
@@ -715,6 +715,37 @@ pub fn apply_tracedecay_home_env(command: &mut Command, home: &Path) {
     detach_from_test_process_group(command);
 }
 
+/// Resolve a `tracedecay-search-eval` package binary that used to live under
+/// the root crate's `src/bin/`.
+///
+/// Those targets now belong to `-p tracedecay-search-eval`, so root
+/// integration tests cannot use `CARGO_BIN_EXE_*`. Prefer an explicit
+/// override, then the sibling artifact beside the current test profile.
+pub fn search_eval_bin(name: &str) -> PathBuf {
+    let override_env = match name {
+        "tracedecay-search-eval" => "TRACEDECAY_SEARCH_EVAL_TEST_BIN",
+        "tracedecay-search-eval-direct" => "TRACEDECAY_SEARCH_EVAL_DIRECT_TEST_BIN",
+        _ => "TRACEDECAY_SEARCH_EVAL_TEST_BIN",
+    };
+    let binary = std::env::var_os(override_env)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let test_executable =
+                std::env::current_exe().expect("test executable path should resolve");
+            let profile_dir = test_executable
+                .parent()
+                .and_then(Path::parent)
+                .expect("integration test should run from a Cargo profile directory");
+            profile_dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+        });
+    assert!(
+        binary.is_file(),
+        "search-eval binary `{name}` is missing at {}; build it with `cargo build -p tracedecay-search-eval --bin {name}` or set {override_env}",
+        binary.display()
+    );
+    binary
+}
+
 pub(crate) fn select_tracedecay_bin(
     explicit: Option<OsString>,
     cargo_provided: Option<OsString>,
@@ -764,11 +795,15 @@ pub fn tracedecay_bin() -> PathBuf {
         output.status
     );
     let actual = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let expected = format!("tracedecay {}", tracedecay::version::build_version());
-    assert_eq!(
-        actual,
-        expected,
-        "{} is not the CLI built from the current checkout; rebuild it with `cargo build -p tracedecay-cli --bin tracedecay` or set TRACEDECAY_TEST_BIN",
+    // The spawned CLI reports its own registered provenance
+    // (`<release>+<full sha>[.dirty]`), which an in-process test cannot know:
+    // this test process only ever registers the fixture product runtime. The
+    // released version is the strongest in-process comparison left, so pin
+    // the release and accept any build-metadata suffix.
+    let expected_release = format!("tracedecay {}", tracedecay::version::PACKAGE_VERSION);
+    assert!(
+        actual == expected_release || actual.starts_with(&format!("{expected_release}+")),
+        "{} reported `{actual}`, not release {expected_release}; rebuild it with `cargo build -p tracedecay-cli --bin tracedecay` or set TRACEDECAY_TEST_BIN",
         binary.display()
     );
     binary
@@ -890,7 +925,9 @@ pub fn ensure_tracedecay_daemon(home: &Path) {
 /// the spawn with `ENOENT` even though git is installed; resolving to an
 /// absolute path up front removes the per-spawn PATH walk.
 pub fn git_program() -> std::ffi::OsString {
-    tracedecay_runtime_core::git::git_program().to_os_string()
+    tracedecay_runtime_core::git::try_git_program()
+        .expect("absolute git executable should resolve")
+        .to_os_string()
 }
 
 #[cfg(unix)]
@@ -1193,7 +1230,7 @@ impl LcmTestRuntime {
         &self,
         provider: &str,
         message_id: &str,
-    ) -> Option<tracedecay_sessions::runtime::lcm::LcmRawMessage> {
+    ) -> Option<tracedecay_lcm::LcmRawMessage> {
         self.runtime
             .lcm_load_raw_message_for_test(provider, message_id)
             .await
@@ -1201,11 +1238,8 @@ impl LcmTestRuntime {
 
     pub async fn lcm_insert_summary_node(
         &self,
-        draft: tracedecay_sessions::runtime::lcm::LcmSummaryNodeDraft,
-    ) -> Result<
-        tracedecay_sessions::runtime::lcm::LcmSummaryNode,
-        tracedecay_sessions::runtime::lcm::LcmError,
-    > {
+        draft: tracedecay_lcm::LcmSummaryNodeDraft,
+    ) -> Result<tracedecay_lcm::LcmSummaryNode, tracedecay_lcm::LcmError> {
         self.runtime
             .lcm_insert_summary_node_for_test(HostAdmissionScope::Profile, draft)
             .await
@@ -1213,11 +1247,8 @@ impl LcmTestRuntime {
 
     pub async fn lcm_update_lifecycle(
         &self,
-        update: tracedecay_sessions::runtime::lcm::LcmLifecycleUpdate,
-    ) -> Result<
-        tracedecay_sessions::runtime::lcm::LcmLifecycleState,
-        tracedecay_sessions::runtime::lcm::LcmError,
-    > {
+        update: tracedecay_lcm::LcmLifecycleUpdate,
+    ) -> Result<tracedecay_lcm::LcmLifecycleState, tracedecay_lcm::LcmError> {
         self.runtime
             .lcm_update_lifecycle_for_test(HostAdmissionScope::Profile, update)
             .await
@@ -1227,10 +1258,7 @@ impl LcmTestRuntime {
         &self,
         provider: &str,
         conversation_id: &str,
-    ) -> Result<
-        tracedecay_sessions::runtime::lcm::LcmLifecycleState,
-        tracedecay_sessions::runtime::lcm::LcmError,
-    > {
+    ) -> Result<tracedecay_lcm::LcmLifecycleState, tracedecay_lcm::LcmError> {
         self.runtime
             .lcm_lifecycle_state_for_test(provider, conversation_id)
             .await
@@ -1238,21 +1266,15 @@ impl LcmTestRuntime {
 
     pub async fn lcm_preflight(
         &self,
-        request: tracedecay_sessions::runtime::lcm::LcmPreflightRequest,
-    ) -> Result<
-        tracedecay_sessions::runtime::lcm::LcmPreflightResponse,
-        tracedecay_sessions::runtime::lcm::LcmError,
-    > {
+        request: tracedecay_lcm::LcmPreflightRequest,
+    ) -> Result<tracedecay_lcm::LcmPreflightResponse, tracedecay_lcm::LcmError> {
         self.runtime.lcm_preflight_for_test(request).await
     }
 
     pub async fn lcm_compress(
         &self,
-        request: tracedecay_sessions::runtime::lcm::LcmCompressionRequest,
-    ) -> Result<
-        tracedecay_sessions::runtime::lcm::LcmCompressionResponse,
-        tracedecay_sessions::runtime::lcm::LcmError,
-    > {
+        request: tracedecay_lcm::LcmCompressionRequest,
+    ) -> Result<tracedecay_lcm::LcmCompressionResponse, tracedecay_lcm::LcmError> {
         self.runtime.lcm_compress_for_test(request).await
     }
 
@@ -1260,40 +1282,28 @@ impl LcmTestRuntime {
         &self,
         provider: &str,
         session_id: Option<&str>,
-    ) -> Result<
-        tracedecay_sessions::runtime::lcm::LcmStatus,
-        tracedecay_sessions::runtime::lcm::LcmError,
-    > {
+    ) -> Result<tracedecay_lcm::LcmStatus, tracedecay_lcm::LcmError> {
         self.runtime.lcm_status_for_test(provider, session_id).await
     }
 
     pub async fn lcm_load_session(
         &self,
-        request: tracedecay_sessions::runtime::lcm::LcmLoadSessionRequest,
-    ) -> Result<
-        tracedecay_sessions::runtime::lcm::LcmLoadSessionPage,
-        tracedecay_sessions::runtime::lcm::LcmError,
-    > {
+        request: tracedecay_lcm::LcmLoadSessionRequest,
+    ) -> Result<tracedecay_lcm::LcmLoadSessionPage, tracedecay_lcm::LcmError> {
         self.runtime.lcm_load_session_for_test(request).await
     }
 
     pub async fn lcm_grep(
         &self,
-        request: tracedecay_sessions::runtime::lcm::LcmGrepRequest,
-    ) -> Result<
-        tracedecay_sessions::runtime::lcm::LcmGrepOutcome,
-        tracedecay_sessions::runtime::lcm::LcmError,
-    > {
+        request: tracedecay_lcm::LcmGrepRequest,
+    ) -> Result<tracedecay_lcm::LcmGrepOutcome, tracedecay_lcm::LcmError> {
         self.runtime.lcm_grep_for_test(request).await
     }
 
     pub async fn lcm_expand(
         &self,
-        request: tracedecay_sessions::runtime::lcm::LcmExpandRequest,
-    ) -> Result<
-        tracedecay_sessions::runtime::lcm::LcmExpandResponse,
-        tracedecay_sessions::runtime::lcm::LcmError,
-    > {
+        request: tracedecay_lcm::LcmExpandRequest,
+    ) -> Result<tracedecay_lcm::LcmExpandResponse, tracedecay_lcm::LcmError> {
         self.runtime.lcm_expand_for_test(request).await
     }
 
@@ -1302,10 +1312,7 @@ impl LcmTestRuntime {
         provider: &str,
         session_id: &str,
         node_id: &str,
-    ) -> Result<
-        tracedecay_sessions::runtime::lcm::LcmSummaryExpansion,
-        tracedecay_sessions::runtime::lcm::LcmError,
-    > {
+    ) -> Result<tracedecay_lcm::LcmSummaryExpansion, tracedecay_lcm::LcmError> {
         self.runtime
             .lcm_expand_summary_node_for_test(provider, session_id, node_id)
             .await
@@ -1313,11 +1320,8 @@ impl LcmTestRuntime {
 
     pub async fn lcm_session_boundary(
         &self,
-        request: tracedecay_sessions::runtime::lcm::LcmSessionBoundaryRequest,
-    ) -> Result<
-        tracedecay_sessions::runtime::lcm::LcmSessionBoundaryResponse,
-        tracedecay_sessions::runtime::lcm::LcmError,
-    > {
+        request: tracedecay_lcm::LcmSessionBoundaryRequest,
+    ) -> Result<tracedecay_lcm::LcmSessionBoundaryResponse, tracedecay_lcm::LcmError> {
         self.runtime.lcm_session_boundary_for_test(request).await
     }
 
@@ -1326,7 +1330,7 @@ impl LcmTestRuntime {
         scope: HostAdmissionScope,
         node_id: &str,
         source_node_id: &str,
-    ) -> tracedecay_runtime_core::errors::Result<()> {
+    ) -> tracedecay_domain::errors::Result<()> {
         self.runtime
             .replace_lcm_summary_source_for_test(scope, node_id, source_node_id)
             .await
@@ -1340,13 +1344,19 @@ impl LcmTestRuntime {
 
     pub fn observation_store(
         &self,
-    ) -> Result<tracedecay::store::GlobalDbObservationStore, HostAdmissionOutcome> {
+    ) -> Result<tracedecay_global_db::GlobalDbObservationStore, HostAdmissionOutcome> {
         self.runtime.observation_store(HostAdmissionScope::Profile)
     }
 
     pub fn session_temporal_store(
         &self,
-    ) -> Result<tracedecay::store::GlobalDbSessionTemporalStore<'_>, HostAdmissionOutcome> {
+    ) -> Result<
+        tracedecay_session_temporal_store::GlobalDbSessionTemporalStore<
+            '_,
+            tracedecay_global_db::RegisteredGlobalDb,
+        >,
+        HostAdmissionOutcome,
+    > {
         self.runtime
             .session_temporal_store(HostAdmissionScope::Profile)
     }
@@ -1360,7 +1370,7 @@ impl LcmTestStore<'_> {
     pub async fn ingest_raw_message(
         &self,
         message: &SessionMessageRecord,
-    ) -> Result<(), tracedecay_sessions::runtime::lcm::LcmError> {
+    ) -> Result<(), tracedecay_lcm::LcmError> {
         self.runtime
             .lcm_ingest_raw_message_for_test(HostAdmissionScope::Profile, message)
             .await
@@ -1373,21 +1383,15 @@ impl LcmTestStore<'_> {
         payload_ref: &str,
         offset: usize,
         limit: usize,
-    ) -> Result<
-        tracedecay_sessions::runtime::lcm::LcmExpandResponse,
-        tracedecay_sessions::runtime::lcm::LcmError,
-    > {
+    ) -> Result<tracedecay_lcm::LcmExpandResponse, tracedecay_lcm::LcmError> {
         self.runtime
-            .lcm_expand_for_test(tracedecay_sessions::runtime::lcm::LcmExpandRequest {
+            .lcm_expand_for_test(tracedecay_lcm::LcmExpandRequest {
                 provider: provider.to_string(),
                 session_id: session_id.to_string(),
-                target: tracedecay_sessions::runtime::lcm::LcmExpandTarget::ExternalPayload {
+                target: tracedecay_lcm::LcmExpandTarget::ExternalPayload {
                     payload_ref: payload_ref.to_string(),
                 },
-                content_slice: Some(tracedecay_sessions::runtime::lcm::LcmContentSlice {
-                    offset,
-                    limit,
-                }),
+                content_slice: Some(tracedecay_lcm::LcmContentSlice { offset, limit }),
                 source_offset: 0,
                 source_limit: None,
             })

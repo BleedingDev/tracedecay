@@ -63,6 +63,7 @@ pub struct CandidateFieldCaps {
 }
 
 impl CandidateFieldCaps {
+    #[hotpath::skip]
     pub(super) const fn new(
         stable_id_bytes: usize,
         anchor_id_bytes: usize,
@@ -75,14 +76,17 @@ impl CandidateFieldCaps {
         }
     }
 
+    #[hotpath::skip]
     pub const fn stable_id_bytes(self) -> usize {
         self.stable_id_bytes
     }
 
+    #[hotpath::skip]
     pub const fn metadata_field_bytes(self) -> usize {
         self.metadata_field_bytes
     }
 
+    #[hotpath::skip]
     pub const fn anchor_id_bytes(self) -> usize {
         self.anchor_id_bytes
     }
@@ -116,6 +120,7 @@ pub struct PageRequest {
 
 impl PageRequest {
     #[cfg(any(test, feature = "test-helpers"))]
+    #[hotpath::skip]
     pub const fn for_test(
         remaining_items: usize,
         remaining_total_bytes: usize,
@@ -136,6 +141,7 @@ impl PageRequest {
         }
     }
 
+    #[hotpath::skip]
     pub const fn page_index(&self) -> usize {
         self.page_index
     }
@@ -144,30 +150,37 @@ impl PageRequest {
         self.keyset.as_ref()
     }
 
+    #[hotpath::skip]
     pub const fn remaining_items(&self) -> usize {
         self.remaining_items
     }
 
+    #[hotpath::skip]
     pub const fn remaining_total_bytes(&self) -> usize {
         self.remaining_total_bytes
     }
 
+    #[hotpath::skip]
     pub const fn max_item_bytes(&self) -> usize {
         self.max_item_bytes
     }
 
+    #[hotpath::skip]
     pub const fn page_item_limit(&self) -> usize {
         self.page_item_limit
     }
 
+    #[hotpath::skip]
     pub const fn page_total_byte_limit(&self) -> usize {
         self.page_total_byte_limit
     }
 
+    #[hotpath::skip]
     pub const fn max_key_bytes(&self) -> usize {
         self.max_key_bytes
     }
 
+    #[hotpath::skip]
     pub const fn candidate_field_caps(&self) -> Option<CandidateFieldCaps> {
         self.candidate_field_caps
     }
@@ -196,10 +209,12 @@ impl<T> BoundedPage<T> {
         self.items
     }
 
+    #[hotpath::skip]
     pub const fn encoded_bytes(&self) -> usize {
         self.encoded_bytes
     }
 
+    #[hotpath::skip]
     pub const fn status(&self) -> PageStatus {
         self.status
     }
@@ -219,6 +234,7 @@ pub struct ReadState<T> {
 }
 
 impl<T> ReadState<T> {
+    #[hotpath::skip]
     pub const fn new(limits: PageLimits) -> Self {
         Self {
             limits,
@@ -230,10 +246,12 @@ impl<T> ReadState<T> {
         }
     }
 
+    #[hotpath::skip]
     pub const fn consumed_items(&self) -> usize {
         self.consumed_items
     }
 
+    #[hotpath::skip]
     pub const fn consumed_bytes(&self) -> usize {
         self.consumed_bytes
     }

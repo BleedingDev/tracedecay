@@ -98,6 +98,7 @@ pub enum AggregateShareDimensionV1 {
 }
 
 impl AggregateShareDimensionV1 {
+    #[hotpath::skip]
     const fn discriminant(&self) -> u8 {
         match self {
             Self::Capability(_) => 0,
@@ -241,6 +242,7 @@ impl<E> ObservabilityAggregateExportApplicationV1<E>
 where
     E: ObservabilityAggregateExportPort,
 {
+    #[hotpath::skip]
     pub const fn new(exporter: E) -> Self {
         Self { exporter }
     }

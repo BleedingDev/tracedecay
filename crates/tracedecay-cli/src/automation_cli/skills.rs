@@ -5,14 +5,14 @@ use crate::cli::AutomationSkillsAction;
 /// There is no separate operator export/install phase.
 pub(super) async fn handle_automation_skills_command(
     action: AutomationSkillsAction,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     use tracedecay_automation_runtime::automation::managed_skills::{
         ManagedSkillDraft, ManagedSkillProvenance, ManagedSkillSource, ManagedSkillUpdate,
         apply_managed_skill_update, archive_managed_skill, create_managed_skill,
         disable_managed_skill, list_managed_skills, load_managed_skill, restore_managed_skill,
     };
 
-    let profile_root = tracedecay::storage::default_profile_root()?;
+    let profile_root = tracedecay_runtime_core::storage::default_profile_root()?;
     let skill = match action {
         AutomationSkillsAction::List { json } => {
             let skills = list_managed_skills(&profile_root).await?;
@@ -125,11 +125,11 @@ pub(super) async fn handle_automation_skills_command(
 
 fn deploy_skills_to_current_project(
     profile_root: &std::path::Path,
-) -> tracedecay_runtime_core::errors::Result<
+) -> tracedecay_domain::errors::Result<
     tracedecay_automation_runtime::automation::skill_writer::ManagedSkillDeploymentReceipt,
 > {
     let current = std::env::current_dir().map_err(|error| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: format!("resolve current project for managed-skill deployment: {error}"),
         }
     })?;

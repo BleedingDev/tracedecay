@@ -4,11 +4,12 @@ TraceDecay pins `hotpath`, `hotpath-macros`, and `hotpath-meta` 0.24.0. Prefer t
 
 ## Build lanes
 
-Use a distinct process and target directory for each lane. Keep product/default builds free of profiling features.
+Run one lane at a time with plain `cargo` — cargo-conductor brokers it
+(see `AGENTS.md`). Do not set `CARGO_TARGET_DIR` or isolate builds. Keep
+product/default builds free of profiling features.
 
 ```bash
-CARGO_TARGET_DIR=target/hotpath-off \
-  cargo build --locked --profile perf -p tracedecay-cli --bin tracedecay \
+cargo build --locked --profile perf -p tracedecay-cli --bin tracedecay \
   --no-default-features --features production
 
 # Env RUSTFLAGS replaces cargo config rustflags. Source the composed set
@@ -16,20 +17,16 @@ CARGO_TARGET_DIR=target/hotpath-off \
 # `--cfg tokio_unstable` alone. See scripts/hotpath-rustflags.sh.
 source scripts/hotpath-rustflags.sh
 
-CARGO_TARGET_DIR=target/hotpath-timing \
-  cargo build --locked --profile perf -p tracedecay-cli --bin tracedecay \
+cargo build --locked --profile perf -p tracedecay-cli --bin tracedecay \
   --no-default-features --features production,hotpath,hotpath-mcp
 
-CARGO_TARGET_DIR=target/hotpath-alloc \
-  cargo build --locked --profile perf -p tracedecay-cli --bin tracedecay \
+cargo build --locked --profile perf -p tracedecay-cli --bin tracedecay \
   --no-default-features --features production,hotpath-alloc,hotpath-mcp
 
-CARGO_TARGET_DIR=target/hotpath-cpu \
-  cargo build --locked --profile perf -p tracedecay-cli --bin tracedecay \
+cargo build --locked --profile perf -p tracedecay-cli --bin tracedecay \
   --no-default-features --features production,hotpath-cpu,hotpath-mcp
 
-CARGO_TARGET_DIR=target/hotpath-all \
-  cargo build --locked --profile perf -p tracedecay-cli --bin tracedecay \
+cargo build --locked --profile perf -p tracedecay-cli --bin tracedecay \
   --no-default-features \
   --features production,hotpath,hotpath-alloc,hotpath-cpu,hotpath-mcp
 ```
@@ -185,6 +182,7 @@ Recommended order:
 - Async `#[measure]` bridges allocation attribution per poll. A synchronous `measure_block!` spanning `.await` can migrate threads; wall time remains useful but allocation attribution may be unavailable.
 - Axum/HTTP client durations end at response headers. Measure streamed body/download/decode separately.
 - Direct rusqlite emits no automatic SQL report. Use TraceDecay's writer/reader/transaction/checkpoint spans and truthful work gauges.
+- The `sql` report and `sql_logs` tools are fed only by the crate's third-party front-ends: the `sqlx` feature's `sqlx_tracing_layer()` — a `tracing_subscriber` layer that harvests sqlx's `sqlx::query` completed-query events (sqlx-measured `elapsed`, statement text normalized into parameter-insensitive buckets, attribution to the innermost measured frame via the caller stack) — the `toasty` feature's equivalent layer, and the `diesel` feature's `instrument_diesel_sql`. The layer never times anything itself and holds every other target at `Interest::never`, but a *global* `EnvFilter` runs before per-layer filters and can suppress `sqlx::query` for the whole stack: attach `EnvFilter` per layer. Bridges fit third-party emitters that already pay tracing's cost; first-party code keeps compile-out macros.
 - I/O wrapper timing starts on first poll and completes on Ready. Cancellation while Pending is not detected; do not treat it as a full future-lifecycle replacement.
 - Dynamic HTTP paths, SQL identifiers/comments, debug values, and per-instance `iter = true` can leak or explode cardinality. Keep production keys static and bounded.
 

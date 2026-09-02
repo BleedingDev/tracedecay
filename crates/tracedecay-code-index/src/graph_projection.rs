@@ -16,10 +16,11 @@ use tracedecay_domain::{
     RepositoryId, SourceFreshness, SourceSpan, SymbolOccurrenceId, canonical_sha256,
 };
 use tracedecay_graph_db::{
-    GraphCancellation, GraphDbError, GraphEntity, GraphEntityId, GraphEntityRef, GraphGenerationId,
-    GraphGenerationManifest, GraphIdempotencyKey, GraphLabel, GraphNamespace, GraphProjectionId,
-    GraphProjectionIdentity, GraphProjectorRevision, GraphProperty, GraphPropertyName,
-    GraphTraversalDirection, SourceGeneration, TraversalRequest, VerifiedGraphSnapshot,
+    GraphCancellation, GraphConflictContextV1, GraphDbError, GraphEntity, GraphEntityId,
+    GraphEntityRef, GraphGenerationId, GraphGenerationManifest, GraphIdempotencyKey, GraphLabel,
+    GraphNamespace, GraphProjectionId, GraphProjectionIdentity, GraphProjectorRevision,
+    GraphProperty, GraphPropertyName, GraphTraversalDirection, SourceGeneration, TraversalRequest,
+    VerifiedGraphSnapshot,
 };
 #[cfg(any(feature = "test-helpers", feature = "eval-helpers"))]
 use tracedecay_graph_db::{GraphWatermark, NeverCancelled};
@@ -75,8 +76,8 @@ pub enum CodeGraphProjectionError {
     BudgetExhausted { budget: String, limit: u64 },
     #[error("code graph operation deadline exceeded")]
     DeadlineExceeded,
-    #[error("code graph database conflict")]
-    Conflict,
+    #[error("code graph database conflict {context}")]
+    Conflict { context: GraphConflictContextV1 },
     #[error(
         "code graph projection `{namespace}/{projection}` is quarantined after recovery mismatch: {message}"
     )]
@@ -111,7 +112,7 @@ impl From<GraphDbError> for CodeGraphProjectionError {
         match error {
             GraphDbError::Cancelled => Self::Cancelled,
             GraphDbError::InvalidRequest { message } => Self::Contract(message),
-            GraphDbError::Conflict => Self::Conflict,
+            GraphDbError::Conflict { context } => Self::Conflict { context },
             GraphDbError::BudgetExhausted { kind, limit } => Self::BudgetExhausted {
                 budget: kind.as_str().to_owned(),
                 limit,
@@ -342,7 +343,7 @@ impl InMemoryCodeGraphProjectionBuilder {
         &self,
         generation: &CodeGenerationId,
         edges: &[CanonicalRelationEdgeV1],
-        chunks: &[CodeSearchChunkV1],
+        chunks: &[Arc<CodeSearchChunkV1>],
         cancellation: &CancellationSignal,
     ) -> Result<GraphWatermark, CodeGraphProjectionError> {
         self.publish_with_cancellation(
@@ -357,7 +358,7 @@ impl InMemoryCodeGraphProjectionBuilder {
         &self,
         generation: &CodeGenerationId,
         edges: &[CanonicalRelationEdgeV1],
-        chunks: &[CodeSearchChunkV1],
+        chunks: &[Arc<CodeSearchChunkV1>],
         cancellation: Arc<dyn GraphCancellation>,
     ) -> Result<GraphWatermark, CodeGraphProjectionError> {
         if cancellation.is_cancelled() {
@@ -392,7 +393,7 @@ impl InMemoryCodeGraphProjectionBuilder {
         &self,
         generation: &CodeGenerationId,
         edges: &[CanonicalRelationEdgeV1],
-        chunks: &[CodeSearchChunkV1],
+        chunks: &[Arc<CodeSearchChunkV1>],
         files: &[tracedecay_domain::SanitizedCodeFileV1],
         symbols: &crate::lineage::GenerationSymbolIndexV1,
         cancellation: Arc<dyn GraphCancellation>,
@@ -508,7 +509,7 @@ impl HermeticCodeGraphProjectionStore {
         &self,
         generation: &CodeGenerationId,
         edges: &[CanonicalRelationEdgeV1],
-        chunks: &[CodeSearchChunkV1],
+        chunks: &[Arc<CodeSearchChunkV1>],
         cancellation: &CancellationSignal,
     ) -> Result<GraphWatermark, CodeGraphProjectionError> {
         self.inner
@@ -519,7 +520,7 @@ impl HermeticCodeGraphProjectionStore {
         &self,
         generation: &CodeGenerationId,
         edges: &[CanonicalRelationEdgeV1],
-        chunks: &[CodeSearchChunkV1],
+        chunks: &[Arc<CodeSearchChunkV1>],
         cancellation: Arc<dyn GraphCancellation>,
     ) -> Result<GraphWatermark, CodeGraphProjectionError> {
         self.inner
@@ -533,7 +534,7 @@ impl HermeticCodeGraphProjectionStore {
         &self,
         generation: &CodeGenerationId,
         edges: &[CanonicalRelationEdgeV1],
-        chunks: &[CodeSearchChunkV1],
+        chunks: &[Arc<CodeSearchChunkV1>],
         files: &[tracedecay_domain::SanitizedCodeFileV1],
         symbols: &crate::lineage::GenerationSymbolIndexV1,
         cancellation: Arc<dyn GraphCancellation>,
@@ -646,7 +647,7 @@ pub fn build_code_graph_manifest(
     projection: GraphProjectionIdentity,
     generation: &CodeGenerationId,
     edges: &[CanonicalRelationEdgeV1],
-    chunks: &[CodeSearchChunkV1],
+    chunks: &[Arc<CodeSearchChunkV1>],
     projector_revision: &GraphProjectorRevision,
     cancellation: Arc<dyn GraphCancellation>,
 ) -> Result<GraphGenerationManifest, CodeGraphProjectionError> {
@@ -671,7 +672,7 @@ pub fn build_code_graph_manifest_checked(
     projection: GraphProjectionIdentity,
     generation: &CodeGenerationId,
     edges: &[CanonicalRelationEdgeV1],
-    chunks: &[CodeSearchChunkV1],
+    chunks: &[Arc<CodeSearchChunkV1>],
     projector_revision: &GraphProjectorRevision,
     check: &dyn Fn() -> Result<(), GraphDbError>,
 ) -> Result<GraphGenerationManifest, CodeGraphProjectionError> {
@@ -690,7 +691,7 @@ fn build_code_graph_manifest_inputs_checked(
     projection: GraphProjectionIdentity,
     generation: &CodeGenerationId,
     edges: &[CanonicalRelationEdgeV1],
-    chunks: &[CodeSearchChunkV1],
+    chunks: &[Arc<CodeSearchChunkV1>],
     production: Option<ProductionCodeGraphInputs<'_>>,
     projector_revision: &GraphProjectorRevision,
     check: &dyn Fn() -> Result<(), GraphDbError>,
@@ -725,6 +726,7 @@ struct CurrentGenerationV1 {
     projection_node_count: usize,
 }
 
+#[hotpath::measure(label = "code_graph.projection.read_current_generation")]
 fn read_current_generation(
     snapshot: &VerifiedGraphSnapshot,
     projection: &GraphProjectionIdentity,

@@ -25,6 +25,7 @@ impl SnapshotReadControl {
         }
     }
 
+    #[hotpath::skip]
     pub(super) const fn is_unlimited(&self) -> bool {
         self.deadline.is_none()
     }

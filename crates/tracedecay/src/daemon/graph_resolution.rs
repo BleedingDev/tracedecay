@@ -8,6 +8,7 @@
 //! a graph-only authority from registry paths.
 
 use super::*;
+use tracedecay_daemon_identity::authority;
 
 fn sole_mounted_server_matching(
     servers: &[(
@@ -31,7 +32,7 @@ fn sole_mounted_server_matching(
 pub(super) fn retained_project_server_resolver(
     administration: StoreAdministration,
 ) -> crate::mcp::server::RetainedProjectServerResolver {
-    Arc::new(move |request| {
+    crate::mcp::server::install_retained_project_server_resolver(move |request| {
         let administration = administration.clone();
         Box::pin(hotpath::future!(
             async move {

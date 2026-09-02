@@ -75,6 +75,7 @@ impl GlobalDbObservationStore {
     /// (`tracedecay_rusqlite_runtime::repository::observation_cursor_authority`)
     /// that the runtime write path also executes. No record content is
     /// decoded, derived, or hashed.
+    #[hotpath::skip]
     async fn record_refusal_with_coverage(
         &self,
         write: &AnchoredObservationWrite,
@@ -235,12 +236,14 @@ impl GlobalDbObservationStore {
         Ok(())
     }
 
+    #[hotpath::skip]
     pub async fn converge_projection_predecessor(
         &self,
     ) -> ProjectionStoreResult<ProjectionPredecessorConvergence> {
         crate::converge_projection_predecessor(&self.database).await
     }
 
+    #[hotpath::skip]
     async fn prepare_observation_persist(
         &self,
         write: AnchoredObservationWrite,
@@ -1095,6 +1098,7 @@ impl PreparedObservationPersist {
 }
 
 impl ObservationStore for GlobalDbObservationStore {
+    #[hotpath::skip]
     async fn persist_observation(
         &self,
         write: AnchoredObservationWrite,
@@ -1199,6 +1203,7 @@ impl ObservationStore for GlobalDbObservationStore {
         .await
     }
 
+    #[hotpath::skip]
     async fn get_source_cursor(
         &self,
         source: &ClaudeSourceIdentityV1,
@@ -1207,6 +1212,7 @@ impl ObservationStore for GlobalDbObservationStore {
         read_runtime_source_cursor(&self.runtime, source, scope)
     }
 
+    #[hotpath::skip]
     async fn advance_source_cursor(
         &self,
         advance: ObservationCursorAdvance,
@@ -1271,6 +1277,7 @@ impl ObservationStore for GlobalDbObservationStore {
         }
     }
 
+    #[hotpath::skip]
     async fn get_observation(
         &self,
         observation_id: &CanonicalObservationIdV1,
@@ -1278,6 +1285,7 @@ impl ObservationStore for GlobalDbObservationStore {
         read_runtime_stored_observation(&self.runtime, observation_id)
     }
 
+    #[hotpath::skip]
     async fn replay_observations(
         &self,
         request: ObservationReplayRequest,
@@ -1904,6 +1912,7 @@ fn runtime_storage_error(
 }
 
 impl ObservationProjectionStore for GlobalDbObservationStore {
+    #[hotpath::skip]
     async fn next_queued_observation(
         &self,
     ) -> ProjectionStoreResult<Option<CanonicalObservationIdV1>> {
@@ -1923,6 +1932,7 @@ impl ObservationProjectionStore for GlobalDbObservationStore {
         }
     }
 
+    #[hotpath::skip]
     async fn project_observation(
         &self,
         observation_id: &CanonicalObservationIdV1,
@@ -1930,6 +1940,17 @@ impl ObservationProjectionStore for GlobalDbObservationStore {
         crate::project_observation(&self.database, observation_id).await
     }
 
+    #[hotpath::skip]
+    async fn project_queued_observations(
+        &self,
+        max: usize,
+    ) -> ProjectionStoreResult<Option<tracedecay_store::ProjectionDrainBatch>> {
+        crate::project_queued_observations(&self.database, max)
+            .await
+            .map(Some)
+    }
+
+    #[hotpath::skip]
     async fn projection_checkpoint(&self) -> ProjectionStoreResult<ProjectionCheckpoint> {
         match dispatch_runtime_observation_read(
             &self.runtime,
@@ -1947,6 +1968,7 @@ impl ObservationProjectionStore for GlobalDbObservationStore {
         }
     }
 
+    #[hotpath::skip]
     async fn rebuild_projection(
         &self,
         frontier_sequence: u64,

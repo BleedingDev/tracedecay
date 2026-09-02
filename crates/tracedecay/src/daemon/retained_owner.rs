@@ -9,20 +9,18 @@ use tracedecay_application::{
     RequestAdmission, RetainedSurfaceExecutionContextV1, RetainedSurfaceExecutionErrorV1,
     RetainedSurfacePortsV1, now_micros,
 };
+use tracedecay_daemon_service::DaemonInvocationService;
 use tracedecay_domain::ManifestDigest;
 
 use crate::tracedecay::TraceDecay;
-use tracedecay_runtime_core::errors::TraceDecayError;
+use tracedecay_domain::errors::TraceDecayError;
 
 mod automation;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod cognitive_recall;
 mod lcm;
 mod memory;
-mod memory_mapping;
-mod memory_mutation;
 mod memory_target;
-mod memory_tracking;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod native_provider;
 #[cfg(all(test, feature = "memory-provider-host"))]
@@ -31,17 +29,21 @@ mod native_provider_parity_tests;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod observation_journey;
 mod profile;
-pub(crate) mod receipts;
 mod session;
-pub(crate) mod session_queries;
 pub(crate) mod session_refresh;
 
-pub(crate) use memory_mapping::public_search_page;
 pub(crate) use memory_target::{MemoryTargetAccessV1, open_project_retained_memory_target};
+pub(crate) use tracedecay_application::retained_receipts as receipts;
+pub(crate) use tracedecay_session_memory::memory_mapping;
+pub(crate) use tracedecay_session_memory::memory_mapping::search_page;
+pub(crate) use tracedecay_session_memory::memory_mutation;
+pub(crate) use tracedecay_session_memory::memory_tracking;
+pub(crate) use tracedecay_session_runtime::session_queries;
 
 pub(crate) use profile::{
     ProfileRetainedAuthoritiesV1, ProfileRetainedConnectionAuthorityV1,
     execute_profile_retained_application, profile_retained_connection_authority,
+    profile_session_retrieval_serving_identity,
 };
 
 /// Exact authorities used by independently mounted project retained families.
@@ -52,17 +54,18 @@ pub(crate) struct ProductionRetainedAuthoritiesV1 {
     pub(crate) project_root: PathBuf,
     pub(crate) project_id: tracedecay_domain::ProjectId,
     pub(crate) mounted_profile_id: Option<tracedecay_domain::UserProfileId>,
-    pub(crate) mounted_session_store_id: Option<tracedecay_usecases::context::SessionStoreId>,
-    pub(crate) mounted_session_root_id: Option<tracedecay_usecases::context::SessionRootId>,
+    pub(crate) mounted_session_store_id: Option<tracedecay_session_memory::context::SessionStoreId>,
+    pub(crate) mounted_session_root_id: Option<tracedecay_session_memory::context::SessionRootId>,
     pub(crate) registered_session_db: Option<tracedecay_global_db::RegisteredGlobalDbLeaseV1>,
     pub(crate) project_refresh: Option<Arc<dyn session_refresh::RetainedSessionRefreshPortV1>>,
-    pub(crate) project_retrieval:
-        Option<Arc<dyn crate::daemon::session_retrieval::SessionApplicationRetrievalPortV1>>,
+    pub(crate) project_retrieval: Option<
+        Arc<dyn tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1>,
+    >,
     pub(crate) project_workflow_index: Option<Arc<dyn tracedecay_sessions::WorkflowIndexReadPort>>,
-    pub(crate) project_lcm: Option<Arc<dyn crate::daemon::lcm_authority::MountedLcmAuthorityPort>>,
+    pub(crate) project_lcm:
+        Option<Arc<dyn tracedecay_session_runtime::lcm_authority::MountedLcmAuthorityPort>>,
     pub(crate) configuration_digest: ManifestDigest,
-    pub(crate) invocation_service:
-        Option<crate::daemon::service::invocation::DaemonInvocationService>,
+    pub(crate) invocation_service: Option<DaemonInvocationService>,
 }
 
 pub(crate) fn retained_surface_ports(
@@ -165,6 +168,17 @@ where
     }
 }
 
+/// One rendering of the typed session-retrieval unavailability reason shared
+/// by every retained family that consumes the retrieval service.
+pub(in crate::daemon) fn session_retrieval_unavailable_detail(
+    unavailable: &tracedecay_session_runtime::session_retrieval::SessionRetrievalUnavailable,
+) -> String {
+    format!(
+        "the session retrieval service is unavailable: {:?}",
+        unavailable.reason
+    )
+}
+
 pub(super) fn map_execution_error(error: TraceDecayError) -> RetainedSurfaceExecutionErrorV1 {
     match error {
         TraceDecayError::Config { .. } => RetainedSurfaceExecutionErrorV1::InvalidRequest,
@@ -177,7 +191,10 @@ pub(super) fn map_execution_error(error: TraceDecayError) -> RetainedSurfaceExec
         TraceDecayError::ResetRequired { .. } => {
             RetainedSurfaceExecutionErrorV1::ProjectResetRequired
         }
-        TraceDecayError::SyncLock { .. }
+        // The Display text already reaches operators on other surfaces (CLI
+        // config errors print it), so threading it here keeps the retained
+        // problem diagnostic equally honest about what actually failed.
+        error @ (TraceDecayError::SyncLock { .. }
         | TraceDecayError::ProjectRoute { .. }
         | TraceDecayError::Database { .. }
         | TraceDecayError::Search { .. }
@@ -186,7 +203,9 @@ pub(super) fn map_execution_error(error: TraceDecayError) -> RetainedSurfaceExec
         | TraceDecayError::Io(_)
         | TraceDecayError::Sqlite(_)
         | TraceDecayError::Json(_)
-        | TraceDecayError::Automation(_) => RetainedSurfaceExecutionErrorV1::Unavailable,
+        | TraceDecayError::Automation(_)) => {
+            RetainedSurfaceExecutionErrorV1::unavailable(error.to_string())
+        }
     }
 }
 
@@ -201,9 +220,36 @@ mod tests {
             lifecycle: "kiro MCP registry lifecycle".to_string(),
         };
 
+        let RetainedSurfaceExecutionErrorV1::Unavailable { detail } = map_execution_error(error)
+        else {
+            panic!("host CLI unavailability must map to the unavailable terminal");
+        };
+        assert!(
+            detail.contains("kiro-cli"),
+            "the detail must name the missing host CLI, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn unavailable_execution_problem_names_the_underlying_cause() {
+        let error = map_execution_error(TraceDecayError::Database {
+            message: "lcm store open failed: profile shard missing".to_owned(),
+            operation: "lcm_store_open".to_owned(),
+        });
+
+        let problem = tracedecay_application::retained_surface_execution_problem(error);
+        let diagnostic = problem
+            .diagnostic()
+            .expect("an unavailable problem carries a diagnostic")
+            .clone();
         assert_eq!(
-            map_execution_error(error),
-            RetainedSurfaceExecutionErrorV1::Unavailable
+            diagnostic.code,
+            "application.retained.authority-unavailable"
+        );
+        assert!(
+            diagnostic.message.contains("lcm store open failed"),
+            "the problem must name the underlying cause, got: {}",
+            diagnostic.message
         );
     }
 }

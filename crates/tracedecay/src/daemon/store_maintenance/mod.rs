@@ -9,12 +9,14 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::branch::BranchAdminAction;
 use crate::config::RetentionConfig;
 use crate::daemon::maintenance::now_secs_i64;
 use crate::tracedecay::TraceDecay;
 use tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1;
 use tracedecay_maintenance::retention::branch_compaction::CompactionThresholdConfig;
+use tracedecay_runtime_core::branch::BranchAdminAction;
+use tracedecay_semantic_contracts::SemanticConfig;
+use tracedecay_usecases::semantic_runtime::ProjectSemanticActivationExt;
 
 use super::branch_admin::StoreAdministration;
 use super::log_daemon_event;
@@ -22,7 +24,7 @@ use super::log_daemon_event;
 mod graph_replay;
 #[cfg(test)]
 mod vector_retention_tests;
-use graph_replay::log_code_generation_retention_degraded;
+use graph_replay::{defer_graph_replay_pool_busy, log_code_generation_retention_degraded};
 
 const MAX_GIT_WORKTREES_PER_SCOPE_INVENTORY: usize = 256;
 
@@ -151,14 +153,14 @@ pub(super) async fn run_semantic_vector_generation_retention(
     graph: &TraceDecay,
     schedulers: &CodeIndexSchedulerRegistryV1,
     observations: &crate::daemon::maintenance::StoreTelemetrySamplingRegistry,
-    cancellation: &tracedecay_usecases::context::CancellationToken,
+    cancellation: &tracedecay_session_memory::context::CancellationToken,
 ) -> crate::daemon::maintenance::MaintenanceTickOutcome {
+    let root = graph.project_root();
     if cancellation.is_cancelled() {
-        observations.record_semantic_vector_retention_failure(graph.project_root());
-        log_semantic_vector_retention_degraded("retention_cancelled");
+        observations.record_semantic_vector_retention_failure(root);
+        log_semantic_vector_retention_degraded(observations, root, "retention_cancelled");
         return crate::daemon::maintenance::MaintenanceTickOutcome::Retry;
     }
-    let root = graph.project_root();
     let Some(configuration) = graph
         .configuration_runtime()
         .semantic_configuration_inventory_authority()
@@ -184,12 +186,20 @@ pub(super) async fn run_semantic_vector_generation_retention(
             }
             Ok(_) => {
                 observations.record_semantic_vector_retention_failure(root);
-                log_semantic_vector_retention_degraded("configuration_inventory_unavailable");
+                log_semantic_vector_retention_degraded(
+                    observations,
+                    root,
+                    "configuration_inventory_unavailable",
+                );
                 crate::daemon::maintenance::MaintenanceTickOutcome::Retry
             }
             Err(_) => {
                 observations.record_semantic_vector_retention_failure(root);
-                log_semantic_vector_retention_degraded("runtime_configuration_unavailable");
+                log_semantic_vector_retention_degraded(
+                    observations,
+                    root,
+                    "runtime_configuration_unavailable",
+                );
                 crate::daemon::maintenance::MaintenanceTickOutcome::Retry
             }
         };
@@ -217,7 +227,7 @@ pub(super) async fn run_semantic_vector_generation_retention(
                 .record_semantic_vector_retention_census(root, &census)
                 .as_failure_label()
             {
-                log_semantic_vector_retention_degraded(failure);
+                log_semantic_vector_retention_degraded(observations, root, failure);
                 return crate::daemon::maintenance::MaintenanceTickOutcome::Retry;
             }
             if !matches!(
@@ -244,28 +254,36 @@ pub(super) async fn run_semantic_vector_generation_retention(
             reason,
         ) => {
             observations.record_semantic_vector_retention_failure(root);
-            log_semantic_vector_retention_degraded(&format!("reset_required:{reason}"));
+            log_semantic_vector_retention_degraded(
+                observations,
+                root,
+                &format!("reset_required:{reason}"),
+            );
             crate::daemon::maintenance::MaintenanceTickOutcome::Retry
         }
         tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::ProjectSemanticVectorRetentionStep::Corrupt(
             reason,
         ) => {
             observations.record_semantic_vector_retention_failure(root);
-            log_semantic_vector_retention_degraded(&format!("corrupt:{reason}"));
+            log_semantic_vector_retention_degraded(observations, root, &format!("corrupt:{reason}"));
             crate::daemon::maintenance::MaintenanceTickOutcome::Retry
         }
         tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::ProjectSemanticVectorRetentionStep::Unavailable(
             reason,
         ) => {
             observations.record_semantic_vector_retention_failure(root);
-            log_semantic_vector_retention_degraded(&format!("unavailable:{reason}"));
+            log_semantic_vector_retention_degraded(
+                observations,
+                root,
+                &format!("unavailable:{reason}"),
+            );
             crate::daemon::maintenance::MaintenanceTickOutcome::Retry
         }
         tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::ProjectSemanticVectorRetentionStep::Denied(
             reason,
         ) => {
             observations.record_semantic_vector_retention_failure(root);
-            log_semantic_vector_retention_degraded(&format!("denied:{reason}"));
+            log_semantic_vector_retention_degraded(observations, root, &format!("denied:{reason}"));
             crate::daemon::maintenance::MaintenanceTickOutcome::Retry
         }
     }
@@ -275,18 +293,16 @@ pub(super) async fn run_semantic_vector_generation_retention(
 /// configuration commits neither an active nor a rollback retrieval profile.
 /// A committed profile with an unseated activation coordinator is a transient
 /// (or genuinely degraded) state that must stay retryable, not a quiet pin.
-fn semantic_retrieval_profiles_disabled(semantic: &crate::config::SemanticConfig) -> bool {
+fn semantic_retrieval_profiles_disabled(semantic: &SemanticConfig) -> bool {
     semantic.active_profile.is_none() && semantic.rollback_profile.is_none()
 }
 
-fn log_semantic_vector_retention_degraded(failure: &str) {
-    log_daemon_event(
-        "retention_degraded",
-        &[
-            ("pass", "semantic_vector_generations".to_owned()),
-            ("failure", failure.to_owned()),
-        ],
-    );
+fn log_semantic_vector_retention_degraded(
+    observations: &crate::daemon::maintenance::StoreTelemetrySamplingRegistry,
+    project_root: &Path,
+    failure: &str,
+) {
+    observations.emit_retention_degraded(project_root, "semantic_vector_generations", failure);
 }
 
 /// Vector protection inventory for one code-generation retention pass.
@@ -415,6 +431,20 @@ fn classify_vector_readable_sources(
     }
 }
 
+/// Outcome of one bounded code-generation retention pass.
+///
+/// `MoreWork` reports bounded progress with a remaining backlog — another
+/// collectable superseded generation, or unconsumed graph-replay release
+/// evidence — so the maintenance owner keeps the short cadence until the
+/// store converges instead of parking multi-GiB debris behind the full
+/// maintenance interval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::daemon) enum CodeGenerationRetentionOutcomeV1 {
+    Complete,
+    MoreWork,
+    Failed,
+}
+
 /// Collect superseded code-index generations for one mounted project.
 ///
 /// Sealed generations are ordinary files, so no database retention or
@@ -437,29 +467,49 @@ fn classify_vector_readable_sources(
     label = "daemon.git.maintenance.code_generation_retention",
     future = true
 )]
-pub(super) async fn run_code_generation_retention(
+pub(in crate::daemon) async fn run_code_generation_retention(
     graph: &TraceDecay,
     schedulers: &CodeIndexSchedulerRegistryV1,
     observations: &crate::daemon::maintenance::StoreTelemetrySamplingRegistry,
-    cancellation: &tracedecay_usecases::context::CancellationToken,
-) -> bool {
+    cancellation: &tracedecay_session_memory::context::CancellationToken,
+) -> CodeGenerationRetentionOutcomeV1 {
     if cancellation.is_cancelled() {
-        log_code_generation_retention_degraded("retention_cancelled");
-        return false;
+        log_code_generation_retention_degraded(
+            observations,
+            graph.project_root(),
+            "retention_cancelled",
+        );
+        return CodeGenerationRetentionOutcomeV1::Failed;
     }
     let layout = graph.hook_store_layout();
     let store_root = code_index_store_root(&layout.data_root, &layout.project_root);
-    // No published generation means nothing has been sealed for this project.
-    if !store_root.join("active-code-generation-v1.json").is_file() {
-        return true;
+    // A store directory that never materialized has nothing to sweep. A store
+    // *without* an active pointer is different: it is crash debris from a
+    // publish that never reached its pointer write (an OOM-killed rebuild is
+    // the ordinary cause), and the planner collects it as a typed unpublished
+    // store — before this, such orphaned partial generations were unreachable
+    // by every retention pass while their worktree root stayed live.
+    if !store_root.is_dir() {
+        return CodeGenerationRetentionOutcomeV1::Complete;
     }
     let vector_inventory =
         resolve_vector_retention_inventory(graph, schedulers, observations).await;
-    apply_code_generation_retention(graph, schedulers, vector_inventory, cancellation).await
+    apply_code_generation_retention(
+        graph,
+        schedulers,
+        observations,
+        vector_inventory,
+        cancellation,
+    )
+    .await
 }
 
 /// The offline protection pin: the generation the mounted scheduler is
 /// currently serving, when one is mounted at all.
+#[hotpath::measure(
+    label = "daemon.git.maintenance.serving_generation_pins",
+    future = true
+)]
 async fn serving_generation_pins(
     schedulers: &CodeIndexSchedulerRegistryV1,
     project_root: &Path,
@@ -477,12 +527,17 @@ async fn serving_generation_pins(
 /// inventory. Emitting `retention_degraded` is decided exclusively by
 /// [`VectorRetentionInventoryV1::degraded_reason`], so quiet states cannot be
 /// reintroduced into the degraded log by a divergent match arm.
+#[hotpath::measure(
+    label = "daemon.git.maintenance.code_generation_retention_apply",
+    future = true
+)]
 async fn apply_code_generation_retention(
     graph: &TraceDecay,
     schedulers: &CodeIndexSchedulerRegistryV1,
+    observations: &crate::daemon::maintenance::StoreTelemetrySamplingRegistry,
     vector_inventory: VectorRetentionInventoryV1,
-    cancellation: &tracedecay_usecases::context::CancellationToken,
-) -> bool {
+    cancellation: &tracedecay_session_memory::context::CancellationToken,
+) -> CodeGenerationRetentionOutcomeV1 {
     use tracedecay_code_index_retention::code_index_generations::{
         CodeGenerationRetentionErrorV1, CodeGenerationRetentionModeV1,
         DEFAULT_SUPERSEDED_GENERATION_FLOOR, execute_code_generation_retention_cancellable,
@@ -496,7 +551,7 @@ async fn apply_code_generation_retention(
     // the graph confirms it no longer needs them.
     let graph_replay_pool_root = graph.db().database_path().with_extension("graph-replay");
     if let Some(failure) = vector_inventory.degraded_reason() {
-        log_code_generation_retention_degraded(&failure);
+        log_code_generation_retention_degraded(observations, graph.project_root(), &failure);
     }
     // Published vectors live in the mounted code graph. When the graph is
     // resolvable, its inventory is the exact vector pin set. Without a seated
@@ -514,13 +569,31 @@ async fn apply_code_generation_retention(
             serving_generation_pins(schedulers, &layout.project_root).await,
             "semantic_unseated",
         ),
-        VectorRetentionInventoryV1::CensusScanning => return true,
+        VectorRetentionInventoryV1::CensusScanning => {
+            return CodeGenerationRetentionOutcomeV1::Complete;
+        }
         VectorRetentionInventoryV1::Offline { .. } => (
             serving_generation_pins(schedulers, &layout.project_root).await,
             "offline",
         ),
-        VectorRetentionInventoryV1::Refused { .. } => return false,
+        VectorRetentionInventoryV1::Refused { .. } => {
+            return CodeGenerationRetentionOutcomeV1::Failed;
+        }
     };
+    // A held replay pool makes every later phase of this pass fail closed:
+    // the release reconcile's pool acquisition would burn its whole
+    // graph-operation deadline discovering the holder (the live wedge logged
+    // that as `graph_replay_release_failed error=DeadlineExceeded` on every
+    // tick), and the collection executor would then contend for the same
+    // lock while holding the daemon writer gate. One non-blocking probe
+    // defers the pass for this tick instead — before the multi-GiB
+    // full-digest planning below is paid — and the executor's own checked
+    // acquire returns `GraphReplayPoolBusy` if a publisher wins the
+    // probe-to-execute window, so the writer gate is never pinned on a
+    // blocking flock. Both paths arm the same bounded release backoff.
+    if graph_replay::replay_pool_is_held(&graph_replay_pool_root) {
+        return defer_graph_replay_pool_busy(observations, graph.project_root());
+    }
     // Full digest verification routinely reads several GiB. Run it before
     // entering the graph transaction and preserve the daemon shutdown token
     // through the blocking boundary; the planner checks it after every bounded
@@ -544,39 +617,85 @@ async fn apply_code_generation_retention(
         Ok(Err(
             tracedecay_code_index_retention::code_index_generations::CodeGenerationRetentionErrorV1::Cancelled,
         )) => {
-            log_code_generation_retention_degraded("retention_cancelled");
-            return false;
+            log_code_generation_retention_degraded(observations, graph.project_root(), "retention_cancelled");
+            return CodeGenerationRetentionOutcomeV1::Failed;
         }
-        Ok(Err(_)) => {
-            log_code_generation_retention_degraded("retention_plan_failed");
-            return false;
+        Ok(Err(
+            tracedecay_code_index_retention::code_index_generations::CodeGenerationRetentionErrorV1::GraphReplayPoolBusy,
+        )) => {
+            return defer_graph_replay_pool_busy(observations, graph.project_root());
+        }
+        Ok(Err(error)) => {
+            // The bare label proved undiagnosable on a live profile: without
+            // the typed error, a pointer CAS loss under rebuild churn is
+            // indistinguishable from unrecognized-file or storage failures.
+            observations.mark_loud_retention_log();
+            log_daemon_event(
+                "retention_degraded",
+                &[
+                    ("pass", "code_generations".to_string()),
+                    ("failure", "retention_plan_failed".to_string()),
+                    ("error", error.to_string()),
+                ],
+            );
+            return CodeGenerationRetentionOutcomeV1::Failed;
         }
         Err(_) => {
-            log_code_generation_retention_degraded("retention_task_panicked");
-            return false;
+            log_code_generation_retention_degraded(observations, graph.project_root(), "retention_task_panicked");
+            return CodeGenerationRetentionOutcomeV1::Failed;
         }
     };
-    // A failed replay reconcile in offline mode keeps its journaled release
-    // evidence for a later graph-available pass; deletion of newly planned
-    // files stays safe, but the pass reports degraded so the retry cadence
-    // stays short.
-    let mut offline_replay_reconcile_failed = false;
-    match graph_replay::reconcile_graph_replay_releases(graph, &store_root, cancellation).await {
-        graph_replay::ReconcileOutcome::Complete => {}
-        graph_replay::ReconcileOutcome::Retained => return true,
-        graph_replay::ReconcileOutcome::Failed => {
-            if matches!(&vector_inventory, VectorRetentionInventoryV1::Online { .. }) {
-                return false;
-            }
-            offline_replay_reconcile_failed = true;
+    // A failed, deferred, or retained replay reconcile keeps its durable
+    // release evidence for a later graph-available pass. Deleting newly
+    // planned files stays safe in every inventory mode — retention hard-links
+    // each retired generation into the replay pool before its release event
+    // becomes durable, so the graph can always finish its retirement later.
+    // The pass therefore keeps collecting instead of letting sealed
+    // generations and their multi-GiB text artifacts accumulate without bound
+    // whenever the graph is dark, wedged, or busy (a recurring
+    // `graph_replay_release_failed` used to abort every pass here and grew
+    // one store by tens of GiB in a single crash-rebuild night). A failure
+    // still reports degraded and fails the pass so the retry cadence stays
+    // short; a deferral fails the pass quietly under the bounded backoff.
+    let mut replay_reconcile_failed = false;
+    let mut release_backlog_remains = false;
+    let replay_reconcile_attemptable = match graph_replay::reconcile_graph_replay_releases(
+        graph,
+        &store_root,
+        observations,
+        cancellation,
+    )
+    .await
+    {
+        graph_replay::ReconcileOutcome::Complete | graph_replay::ReconcileOutcome::Retained => true,
+        graph_replay::ReconcileOutcome::MoreWork => {
+            release_backlog_remains = true;
+            true
         }
-    }
+        // A deferred or failed attempt must not be repeated by the
+        // post-collection reconcile below: the graph runtime already proved
+        // it cannot serve this tick.
+        graph_replay::ReconcileOutcome::Deferred | graph_replay::ReconcileOutcome::Failed => {
+            replay_reconcile_failed = true;
+            false
+        }
+    };
     if !plan.has_collectable_work() {
-        return !offline_replay_reconcile_failed;
+        return if replay_reconcile_failed {
+            CodeGenerationRetentionOutcomeV1::Failed
+        } else if release_backlog_remains {
+            CodeGenerationRetentionOutcomeV1::MoreWork
+        } else {
+            CodeGenerationRetentionOutcomeV1::Complete
+        };
     }
     if cancellation.is_cancelled() {
-        log_code_generation_retention_degraded("retention_cancelled");
-        return false;
+        log_code_generation_retention_degraded(
+            observations,
+            graph.project_root(),
+            "retention_cancelled",
+        );
+        return CodeGenerationRetentionOutcomeV1::Failed;
     }
 
     // Freeze the vector writer, then re-read the committed active+rollback
@@ -595,8 +714,12 @@ async fn apply_code_generation_retention(
                 &layout.project_root,
             )
         else {
-            log_code_generation_retention_degraded("vector_writer_unavailable");
-            return false;
+            log_code_generation_retention_degraded(
+                observations,
+                graph.project_root(),
+                "vector_writer_unavailable",
+            );
+            return CodeGenerationRetentionOutcomeV1::Failed;
         };
         let vector_writer_freeze = vector_runtime.freeze_vector_mutations().await;
         let pinned_vector_sources =
@@ -615,39 +738,43 @@ async fn apply_code_generation_retention(
                 tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::ProjectVectorReadableSources::ResetRequired(
                     reason,
                 ) => {
-                    log_code_generation_retention_degraded(&format!(
+                    log_code_generation_retention_degraded(observations, graph.project_root(), &format!(
                         "vector_inventory_reset_required:{reason}"
                     ));
-                    return false;
+                    return CodeGenerationRetentionOutcomeV1::Failed;
                 }
                 tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::ProjectVectorReadableSources::Corrupt(
                     reason,
                 ) => {
-                    log_code_generation_retention_degraded(&format!(
+                    log_code_generation_retention_degraded(observations, graph.project_root(), &format!(
                         "vector_inventory_corrupt:{reason}"
                     ));
-                    return false;
+                    return CodeGenerationRetentionOutcomeV1::Failed;
                 }
                 tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::ProjectVectorReadableSources::Unavailable(
                     reason,
                 ) => {
-                    log_code_generation_retention_degraded(&format!(
+                    log_code_generation_retention_degraded(observations, graph.project_root(), &format!(
                         "vector_inventory_unavailable:{reason}"
                     ));
-                    return false;
+                    return CodeGenerationRetentionOutcomeV1::Failed;
                 }
                 tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::ProjectVectorReadableSources::Denied(
                     reason,
                 ) => {
-                    log_code_generation_retention_degraded(&format!(
+                    log_code_generation_retention_degraded(observations, graph.project_root(), &format!(
                         "vector_inventory_denied:{reason}"
                     ));
-                    return false;
+                    return CodeGenerationRetentionOutcomeV1::Failed;
                 }
             };
         if pinned_vector_sources != vector_readable_sources {
-            log_code_generation_retention_degraded("vector_inventory_changed");
-            return false;
+            log_code_generation_retention_degraded(
+                observations,
+                graph.project_root(),
+                "vector_inventory_changed",
+            );
+            return CodeGenerationRetentionOutcomeV1::Failed;
         }
         tracedecay_usecases::semantic_runtime::retain_project_semantic_code_sources(
             &layout.project_root,
@@ -669,7 +796,7 @@ async fn apply_code_generation_retention(
                     // reads this exact source. It was absent from the root-only
                     // planning inventory, so retain it and let vector convergence
                     // make the next maintenance tick eligible.
-                    return true;
+                    return CodeGenerationRetentionOutcomeV1::Complete;
                 }
                 tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::ProjectSemanticVectorSourceLiveness::Ready(
                     false,
@@ -677,34 +804,34 @@ async fn apply_code_generation_retention(
                 tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::ProjectSemanticVectorSourceLiveness::Unavailable(
                     reason,
                 ) => {
-                    log_code_generation_retention_degraded(&format!(
+                    log_code_generation_retention_degraded(observations, graph.project_root(), &format!(
                         "vector_source_liveness_unavailable:{reason}"
                     ));
-                    return false;
+                    return CodeGenerationRetentionOutcomeV1::Failed;
                 }
                 tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::ProjectSemanticVectorSourceLiveness::Denied(
                     reason,
                 ) => {
-                    log_code_generation_retention_degraded(&format!(
+                    log_code_generation_retention_degraded(observations, graph.project_root(), &format!(
                         "vector_source_liveness_denied:{reason}"
                     ));
-                    return false;
+                    return CodeGenerationRetentionOutcomeV1::Failed;
                 }
                 tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::ProjectSemanticVectorSourceLiveness::ResetRequired(
                     reason,
                 ) => {
-                    log_code_generation_retention_degraded(&format!(
+                    log_code_generation_retention_degraded(observations, graph.project_root(), &format!(
                         "vector_source_liveness_reset_required:{reason}"
                     ));
-                    return false;
+                    return CodeGenerationRetentionOutcomeV1::Failed;
                 }
                 tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::ProjectSemanticVectorSourceLiveness::Corrupt(
                     reason,
                 ) => {
-                    log_code_generation_retention_degraded(&format!(
+                    log_code_generation_retention_degraded(observations, graph.project_root(), &format!(
                         "vector_source_liveness_corrupt:{reason}"
                     ));
-                    return false;
+                    return CodeGenerationRetentionOutcomeV1::Failed;
                 }
             }
         }
@@ -713,10 +840,18 @@ async fn apply_code_generation_retention(
         None
     };
     if cancellation.is_cancelled() {
-        log_code_generation_retention_degraded("retention_cancelled");
-        return false;
+        log_code_generation_retention_degraded(
+            observations,
+            graph.project_root(),
+            "retention_cancelled",
+        );
+        return CodeGenerationRetentionOutcomeV1::Failed;
     }
-    let completed_at = tracedecay_domain::UtcMicros(crate::tracedecay::current_timestamp());
+    // `current_timestamp()` counts seconds; wrapping it in `UtcMicros` stamped
+    // every deletion receipt with a seconds value in a micros-typed field
+    // (live receipts read as 1970). The receipt is durable journal evidence,
+    // so it takes the canonical micros clock.
+    let completed_at = tracedecay_application::clock::now_micros();
     let execution_root = store_root.clone();
     let execution_pool_root = graph_replay_pool_root.clone();
     let execution_cancellation = cancellation.clone();
@@ -774,22 +909,79 @@ async fn apply_code_generation_retention(
                     ],
                 );
             }
-            graph_replay::reconcile_graph_replay_releases(graph, &store_root, cancellation)
+            // The just-collected generation queued fresh release evidence;
+            // offer it to the graph immediately — but only when this tick's
+            // earlier reconcile was actually served. A deferred or failed
+            // runtime must not be probed twice in one tick.
+            let mut release_reconcile_failed = replay_reconcile_failed;
+            if replay_reconcile_attemptable {
+                match graph_replay::reconcile_graph_replay_releases(
+                    graph,
+                    &store_root,
+                    observations,
+                    cancellation,
+                )
                 .await
-                .succeeded()
-                && !offline_replay_reconcile_failed
+                {
+                    graph_replay::ReconcileOutcome::Complete
+                    | graph_replay::ReconcileOutcome::Retained => {}
+                    graph_replay::ReconcileOutcome::MoreWork => {
+                        release_backlog_remains = true;
+                    }
+                    graph_replay::ReconcileOutcome::Deferred
+                    | graph_replay::ReconcileOutcome::Failed => {
+                        release_reconcile_failed = true;
+                    }
+                }
+            }
+            if release_reconcile_failed {
+                CodeGenerationRetentionOutcomeV1::Failed
+            } else if release_backlog_remains
+                || !report.deleted_generations.is_empty()
+                || !report.deleted_text_artifacts.is_empty()
+            {
+                // Something was collected, so the next bounded census may find
+                // another collectable unit; stay on the short cadence until a
+                // pass proves the store converged. A census that finds nothing
+                // returns Complete one tick later at metadata cost only.
+                CodeGenerationRetentionOutcomeV1::MoreWork
+            } else {
+                CodeGenerationRetentionOutcomeV1::Complete
+            }
         }
         Ok(Err(CodeGenerationRetentionErrorV1::Cancelled)) => {
-            log_code_generation_retention_degraded("retention_cancelled");
-            false
+            log_code_generation_retention_degraded(
+                observations,
+                graph.project_root(),
+                "retention_cancelled",
+            );
+            CodeGenerationRetentionOutcomeV1::Failed
         }
-        Ok(Err(_)) => {
-            log_code_generation_retention_degraded("retention_pass_failed");
-            false
+        Ok(Err(CodeGenerationRetentionErrorV1::GraphReplayPoolBusy)) => {
+            defer_graph_replay_pool_busy(observations, graph.project_root())
+        }
+        Ok(Err(error)) => {
+            // Same diagnosability contract as the plan failure above: the
+            // apply step's typed error names the exact refusal (CAS loss,
+            // unsafe state, storage) instead of a bare retry label.
+            observations.mark_loud_retention_log();
+            log_daemon_event(
+                "retention_degraded",
+                &[
+                    ("pass", "code_generations".to_string()),
+                    ("failure", "retention_pass_failed".to_string()),
+                    ("error", error.to_string()),
+                ],
+            );
+            CodeGenerationRetentionOutcomeV1::Failed
         }
         Err(_) => {
-            log_code_generation_retention_degraded("retention_task_panicked");
-            false
+            log_code_generation_retention_degraded(
+                observations,
+                graph.project_root(),
+                "retention_task_panicked",
+            );
+            CodeGenerationRetentionOutcomeV1::Failed
         }
     }
 }
@@ -1253,7 +1445,9 @@ pub(super) async fn run_code_index_scope_reconciliation(
             return false;
         }
     };
-    let completed_at = tracedecay_domain::UtcMicros(crate::tracedecay::current_timestamp());
+    // Same micros-typed receipt contract as the code-generation pass above:
+    // `current_timestamp()` is a seconds clock and must not be stored as micros.
+    let completed_at = tracedecay_application::clock::now_micros();
     let Some(vector_runtime) =
         tracedecay_usecases::semantic_runtime::project_semantic_production_runtime(
             graph.project_root(),
@@ -1627,7 +1821,7 @@ pub(super) async fn run_session_retention(
                 "all",
                 None,
                 &config.session_lcm,
-                tracedecay_sessions::runtime::lcm::RetentionMode::Apply,
+                tracedecay_lcm::RetentionMode::Apply,
                 now,
             )
             .await
@@ -1789,19 +1983,19 @@ enum RetainedCompactionStore<'a> {
 }
 
 impl RetainedCompactionStore<'_> {
-    async fn storage_page_counts(
-        &self,
-    ) -> tracedecay_runtime_core::errors::Result<(u64, u64, u64)> {
+    #[hotpath::skip]
+    async fn storage_page_counts(&self) -> tracedecay_domain::errors::Result<(u64, u64, u64)> {
         match self {
             Self::Registered(database) => database.storage_page_counts().await,
             Self::Project(database) => database.storage_page_counts().await,
         }
     }
 
+    #[hotpath::skip]
     async fn run_bounded_incremental_compaction(
         &self,
         max_pages: u64,
-    ) -> tracedecay_runtime_core::errors::Result<()> {
+    ) -> tracedecay_domain::errors::Result<()> {
         match self {
             Self::Registered(database) => {
                 database.run_bounded_incremental_compaction(max_pages).await
@@ -2117,11 +2311,14 @@ mod code_index_root_alignment_tests {
     }
 
     fn scope_fixture_git(root: &Path, args: &[&str]) {
-        let status = Command::new(tracedecay_runtime_core::git::git_program())
-            .current_dir(root)
-            .args(args)
-            .status()
-            .expect("run git fixture command");
+        let status = Command::new(
+            tracedecay_runtime_core::git::try_git_program()
+                .expect("absolute git executable should resolve"),
+        )
+        .current_dir(root)
+        .args(args)
+        .status()
+        .expect("run git fixture command");
         assert!(status.success(), "git fixture command failed: {args:?}");
     }
 

@@ -46,7 +46,7 @@ use crate::code_index::{
     CodeIndexIgnoredDependencyAdmissionErrorV1, CodeIndexIgnoredDependencyAdmissionFutureV1,
     CodeIndexIgnoredDependencyAdmissionPortV1, CodeIndexIgnoredDependencyAdmissionRequestV1,
 };
-use crate::graph::{
+use tracedecay_graph_query::{
     CodeGraphProjectionReadPort, CodeGraphReadError, CodeGraphReadFuture, CodeGraphReadRequest,
     VerifiedCodeGraphRead,
 };
@@ -75,7 +75,11 @@ impl CodeGraphProjectionReadPort for FixtureCodeGraphProjection {
                 RequestAdmission::Cancelled => return Err(CodeGraphReadError::Cancelled),
                 RequestAdmission::TimedOut => return Err(CodeGraphReadError::TimedOut),
             }
-            VerifiedCodeGraphRead::new(self.scope.clone(), Arc::clone(&self.store))
+            VerifiedCodeGraphRead::new(
+                self.scope.clone(),
+                Arc::clone(&self.store),
+                tracedecay_graph_query::CodeGraphReadFreshnessV1::Current,
+            )
         })
     }
 }

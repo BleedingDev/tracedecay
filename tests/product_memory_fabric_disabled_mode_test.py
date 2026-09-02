@@ -186,15 +186,27 @@ class MemoryFabricDisabledModeTest(unittest.TestCase):
             compact_resolver,
         )
 
+        # The selector carries exactly one variant. The pinned-activation
+        # seam (`Pinned`, its resolve arm, and its only construction
+        # `open_with_native_provider_for_test`) was removed: the harness that
+        # built it lives in the upstream-owned `production_harness.rs`, whose
+        # convergence-map entry (`shutdown_deadline` /
+        # `production_harness_shutdown`) authorizes only the shared shutdown
+        # deadline, so the seam was unauthorized. Asserting that the selector
+        # is single-variant is strictly stronger than the old assertion that a
+        # second, test-gated variant existed: no build of any kind can now
+        # express an activation the runtime configuration did not decide.
         selector = _rust_body(
             self.composition,
             "pub(super) enum ProjectMemoryProviderActivationSelector {",
         )
-        self.assertIn(
-            '#[cfg(any(test, feature = "test-transport"))]\n'
-            "    Pinned(ProjectMemoryProviderActivation),",
-            selector,
-        )
+        self.assertNotIn("Pinned", selector)
+        variants = [
+            line.strip()
+            for line in selector.splitlines()
+            if line.strip() and not line.strip().startswith(("///", "//", "#["))
+        ]
+        self.assertEqual(variants, ["FromRuntimeConfiguration,"])
 
         mount = _rust_body(
             self.composition,

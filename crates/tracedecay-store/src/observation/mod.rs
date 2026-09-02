@@ -823,6 +823,7 @@ pub struct ObservationBatchPersistOutcome {
 }
 
 impl ObservationBatchPersistOutcome {
+    #[hotpath::skip]
     pub const fn new(
         outcome: ObservationPersistOutcome,
         stored: Option<StoredObservation>,
@@ -830,10 +831,12 @@ impl ObservationBatchPersistOutcome {
         Self { outcome, stored }
     }
 
+    #[hotpath::skip]
     pub const fn outcome(&self) -> &ObservationPersistOutcome {
         &self.outcome
     }
 
+    #[hotpath::skip]
     pub const fn stored(&self) -> Option<&StoredObservation> {
         self.stored.as_ref()
     }
@@ -1045,6 +1048,7 @@ impl<T> ObservationCaptureSink for T
 where
     T: ObservationStore + ?Sized,
 {
+    #[hotpath::skip]
     async fn persist_admitted_observation(
         &self,
         write: AnchoredObservationWrite,
@@ -1057,6 +1061,7 @@ impl<T> ObservationCursorPort for T
 where
     T: ObservationStore + ?Sized,
 {
+    #[hotpath::skip]
     async fn read_source_cursor(
         &self,
         source: &ObservationSourceIdentityV1,
@@ -1065,6 +1070,7 @@ where
         self.get_source_cursor(source, scope).await
     }
 
+    #[hotpath::skip]
     async fn advance_admitted_source_cursor(
         &self,
         advance: ObservationCursorAdvance,
@@ -1077,6 +1083,7 @@ impl<T> ObservationAdmissionPort for T
 where
     T: ObservationStore + ?Sized,
 {
+    #[hotpath::skip]
     async fn read_admitted_observation(
         &self,
         observation_id: &CanonicalObservationIdV1,
@@ -1084,6 +1091,7 @@ where
         self.get_observation(observation_id).await
     }
 
+    #[hotpath::skip]
     async fn replay_admitted_observations(
         &self,
         request: ObservationReplayRequest,

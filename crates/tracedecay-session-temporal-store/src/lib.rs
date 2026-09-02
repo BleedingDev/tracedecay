@@ -62,15 +62,15 @@ use self::execution::{
     TaskSessionTemporalExecutionReportV1, TemporalExecutionFuture,
 };
 use self::render::{CanonicalLcmSourceHydration, apply_canonical_summary_source_content};
+use tracedecay_lcm::contracts::{
+    LcmContentSlice, LcmDescribeRequest, LcmDescribeResponse, LcmDescribeTarget, LcmError,
+    LcmExpandRequest, LcmExpandResponse, LcmExpandTarget, LcmSourceRef,
+};
 use tracedecay_query::retrieval::evidence_lanes::{
     CanonicalTaskSessionCandidateExportPortV1, TaskSessionLaneRequestV1,
     TaskSessionLaneRetrieverV1, TaskSessionPlan23BindingV1,
 };
 use tracedecay_runtime_core::db::engine::Error as EngineError;
-use tracedecay_sessions::lcm::contracts::{
-    LcmContentSlice, LcmDescribeRequest, LcmDescribeResponse, LcmDescribeTarget, LcmError,
-    LcmExpandRequest, LcmExpandResponse, LcmExpandTarget, LcmSourceRef,
-};
 use tracedecay_sessions::runtime::git_correlation::{
     GitCorrelationError, GitScopeFilter, git_evidence_projection_identity,
     recover_git_evidence_projection,
@@ -95,7 +95,7 @@ use self::participant_freeze::{
 };
 use self::retrieval::{GlobalDbPreparedCandidatePort, GlobalDbTemporalReadPort};
 use self::sql::TemporalSqlRead;
-use tracedecay_sessions::runtime::lcm::payload::read_verified_payload_content_with_checkpoint;
+use tracedecay_lcm::payload::read_verified_payload_content_with_checkpoint;
 
 pub use doctor_health::{
     SessionTemporalHealthFindingKind, SessionTemporalHealthReport, SessionTemporalHealthStatus,
@@ -141,23 +141,28 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         Ok(Some(session_ids))
     }
 
+    #[hotpath::measure(future = true, label = "session_temporal.txn.ensure_cursor_key")]
     pub async fn ensure_active_session_cursor_key_result(
         &self,
     ) -> tracedecay_store::SessionStoreResult<SignedCursorKeyRefV1> {
         const OPERATION: &str = "provision registered session cursor authentication key";
-        let transaction = self
-            .begin_write_transaction()
-            .await
-            .map_err(|error| query::storage(OPERATION, error))?;
+        let transaction = hotpath::measure_block!("session_temporal.txn.begin", {
+            self.begin_write_transaction()
+                .await
+                .map_err(|error| query::storage(OPERATION, error))?
+        });
         let key =
             cursor_keys::ensure_active_session_cursor_key_in_transaction(&transaction).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|error| query::storage(OPERATION, error))?;
+        hotpath::measure_block!("session_temporal.txn.commit", {
+            transaction
+                .commit()
+                .await
+                .map_err(|error| query::storage(OPERATION, error))?
+        });
         Ok(key)
     }
 
+    #[hotpath::skip]
     pub async fn load_session_cursor_key_provider_result(
         &self,
     ) -> Result<GlobalDbCursorKeyProvider, cursor_keys::GlobalDbCursorKeyProviderError> {
@@ -174,6 +179,7 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         GlobalDbCursorKeyProvider::from_registered_key_ref(&read, key).await
     }
 
+    #[hotpath::skip]
     pub async fn load_preprovisioned_session_cursor_key_provider_result(
         &self,
     ) -> Result<GlobalDbCursorKeyProvider, cursor_keys::GlobalDbCursorKeyProviderError> {
@@ -210,6 +216,7 @@ pub enum SessionPageReconstructionRequest<'a> {
 }
 
 impl<'a> SessionPageReconstructionRequest<'a> {
+    #[hotpath::skip]
     pub const fn occurrence(
         snapshot: &'a TemporalExecutionSnapshot,
         anchor_id: &'a RetrievalAnchorId,
@@ -226,6 +233,7 @@ impl<'a> SessionPageReconstructionRequest<'a> {
         }
     }
 
+    #[hotpath::skip]
     pub const fn summary(
         snapshot: &'a TemporalExecutionSnapshot,
         provider: &'a str,
@@ -264,6 +272,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
         SessionTemporalAccess::new(self.db)
     }
 
+    #[hotpath::skip]
     pub const fn new(db: &'db D) -> Self {
         Self { db }
     }
@@ -272,6 +281,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
     /// Every request must carry the exact same authorized root; accepting a
     /// mixed-root batch would make a registered shard an implicit cross-project
     /// cache.
+    #[hotpath::skip]
     pub async fn reconstruct_session_page<'a>(
         &self,
         requests: impl IntoIterator<Item = SessionPageReconstructionRequest<'a>>,
@@ -391,6 +401,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
         Ok(reconstructed)
     }
 
+    #[hotpath::skip]
     pub async fn resolve_lcm_describe_target(
         &self,
         provider: &str,
@@ -411,6 +422,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
         .await
     }
 
+    #[hotpath::skip]
     pub async fn resolve_lcm_expand_target(
         &self,
         provider: &str,
@@ -431,6 +443,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
         .await
     }
 
+    #[hotpath::skip]
     pub async fn render_lcm_describe(
         &self,
         request: LcmDescribeRequest,
@@ -452,6 +465,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
             .map_err(map_lcm_error)
     }
 
+    #[hotpath::skip]
     pub async fn render_lcm_expand(
         &self,
         request: LcmExpandRequest,
@@ -472,6 +486,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
             .map_err(map_lcm_error)
     }
 
+    #[hotpath::skip]
     async fn lcm_summary_relations(
         &self,
         session_id: &str,
@@ -533,6 +548,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
         Ok(relations)
     }
 
+    #[hotpath::skip]
     pub async fn hydrate_lcm_external_payload(
         &self,
         snapshot: &TemporalExecutionSnapshot,
@@ -624,6 +640,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
         .map_err(map_lcm_error)
     }
 
+    #[hotpath::skip]
     pub async fn hydrate_lcm_summary_sources(
         &self,
         snapshot: &TemporalExecutionSnapshot,
@@ -754,6 +771,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
             .map_err(|_| SessionTemporalExecutionError::Unavailable)
     }
 
+    #[hotpath::skip]
     pub async fn encode_lcm_source_cursor(
         &self,
         snapshot: &TemporalExecutionSnapshot,
@@ -776,6 +794,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
         .map_err(map_lcm_cursor_error)
     }
 
+    #[hotpath::skip]
     pub async fn decode_lcm_source_cursor(
         &self,
         snapshot: &TemporalExecutionSnapshot,

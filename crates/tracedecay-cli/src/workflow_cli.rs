@@ -21,13 +21,13 @@ use tracedecay_application::{
 use tracedecay_domain::UtcMicros;
 use tracedecay_tool_catalog::OperationId;
 
+use tracedecay_application::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_daemon_protocol::{
     DaemonInvocationOutcome, DaemonInvocationProblem, DaemonInvocationRequest,
     WorkflowApplicationInvocation, WorkflowApplicationOutcome,
 };
 use tracedecay_daemon_protocol::{InvocationCancellationPolicy, invocation_now_micros};
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
-use tracedecay_usecases::request_identity::{GlobalRequestSurface, mint_global_request_id};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 fn workflow_cli_deadline(operation: WorkflowOperation, observed_at: UtcMicros) -> Result<Deadline> {
     let operation_id =
@@ -213,7 +213,7 @@ pub async fn invoke_workflow_cli(
     );
     let handshake =
         tracedecay::daemon::handshake_for_current_client(Some(project_root), None, false, false)?;
-    let response = match tracedecay::daemon::invocation_client_for_current(handshake)?
+    let response = match tracedecay_daemon_identity::invocation_client_for_current(handshake)?
         .invoke_controlled(
             request,
             deadline,

@@ -39,7 +39,9 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
+use rayon::prelude::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -52,12 +54,18 @@ use tracedecay_store::{ParseOffset, TranscriptStoreError, TranscriptWriteBatch};
 /// it from.
 pub use tracedecay_domain::canonical_text::canonical_framed_sha256;
 
-use crate::admission::{HostAdmission, WireReadOutcome, read_bounded_to_string};
+use crate::admission::HostAdmission;
 pub use crate::runtime::shared::{NewRows, StoredCursor, TranscriptIngestStats};
 use crate::runtime::store_port::TranscriptIngestStore;
 use crate::runtime::{SessionMessageRecord, SessionRecord};
+use tracedecay_framing::{WireReadOutcome, read_bounded_to_string};
 
 pub type TranscriptIngestResult<T> = Result<T, TranscriptIngestError>;
+
+/// Shared across the two daemon-wide admitted history passes, so one daemon
+/// runs at most four filesystem parsers regardless of mounted project count.
+const MAX_CONCURRENT_FILE_PREPARATIONS: usize = 4;
+static TRANSCRIPT_PARSE_POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HostProviderCoverage {
@@ -233,6 +241,7 @@ pub enum TranscriptIngestError {
 }
 
 impl TranscriptIngestError {
+    #[hotpath::skip]
     pub const fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled { .. })
     }
@@ -461,6 +470,46 @@ pub trait TranscriptSource: Send + Sync {
     }
 }
 
+/// Runs one synchronous transcript discovery/parse section without stalling
+/// the async worker that drives ingest.
+///
+/// [`TranscriptSource`] is deliberately synchronous: adapters walk host
+/// directories and read transcript files with plain `std` IO. Ingest runs on
+/// the daemon's Tokio workers, and a catch-up walk or a large parse would
+/// otherwise pin one worker for its whole duration. `block_in_place` hands
+/// the worker's run queue to another thread for the section; it panics
+/// outside a multi-thread runtime, so the flavor is checked first and
+/// everything else (current-thread runtimes, plain threads) keeps the
+/// previous inline behavior. The remaining `block_in_place` panic case is a
+/// `LocalSet` on a multi-thread runtime, which this workspace does not use.
+/// `spawn_blocking` is not usable at this boundary because the section
+/// borrows `&dyn TranscriptSource`, which is not `'static`.
+pub(crate) fn run_blocking_transcript_section<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
+/// Spawns a task on `handle` and waits for it from a blocking section.
+///
+/// On a one-worker multi-thread runtime this only succeeds when the caller
+/// is inside [`run_blocking_transcript_section`]: `block_in_place` hands the
+/// worker queue to another thread so the spawned task can run. An inline
+/// filesystem/JSONL section deadlocks until the receive timeout fails.
+#[cfg(test)]
+pub(crate) fn require_blocking_section_releases_worker(handle: tokio::runtime::Handle) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    handle.spawn(async move {
+        let _ = sender.send(());
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("host transcript filesystem work must release the only Tokio worker");
+}
+
 /// Fallible production boundary that drives a single source to completion
 /// against `store`, ingesting every transcript it locates for `project_root`.
 /// Source parse misses are skipped; authoritative store failures abort the
@@ -485,37 +534,122 @@ pub async fn try_ingest_source_with_store<S: TranscriptIngestStore>(
     max_new_bytes: Option<u64>,
 ) -> TranscriptIngestResult<TranscriptIngestStats> {
     let mut stats = TranscriptIngestStats::default();
-    let discovery =
-        source.discover_transcript_paths(project_root, TranscriptDiscoveryBounds::default_walk());
+    let discovery = hotpath::measure_block!(
+        "sessions.ingest.discover_blocking",
+        run_blocking_transcript_section(|| {
+            source
+                .discover_transcript_paths(project_root, TranscriptDiscoveryBounds::default_walk())
+        })
+    );
+    let mut loaded = Vec::with_capacity(discovery.paths.len());
     for path in discovery.paths {
-        stats = stats.merge(ingest_one(store, source, &path, project_root, max_new_bytes).await?);
+        loaded.push(
+            load_transcript_cursor(store, source.cursor_key(&path))
+                .await
+                .map(|loaded| LoadedTranscriptFile {
+                    previous: loaded.checkpoint.clone(),
+                    path,
+                    loaded,
+                }),
+        );
+    }
+    let parse_pool = TRANSCRIPT_PARSE_POOL
+        .get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(MAX_CONCURRENT_FILE_PREPARATIONS)
+                .thread_name(|index| format!("tracedecay-transcript-parse-{index}"))
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|_| TranscriptIngestError::BackgroundResourceUnavailable {
+            provider: source.provider(),
+            resource: "transcript_parse_pool",
+        })?;
+    let preparations = hotpath::measure_block!(
+        "sessions.ingest.parse_files_blocking",
+        run_blocking_transcript_section(|| {
+            parse_pool.install(|| {
+                loaded
+                    .into_par_iter()
+                    .map(|loaded| {
+                        loaded.and_then(|loaded| {
+                            prepare_loaded_transcript(source, loaded, project_root, max_new_bytes)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+    );
+    for prepared in preparations {
+        stats = stats.merge(
+            persist_prepared_transcript(store, source.provider(), project_root, prepared?).await?,
+        );
     }
     Ok(stats)
 }
 
-/// Ingest one transcript file: load the prior durable cursor through the store
-/// contract, parse new content, and submit one atomic session/message/cursor
-/// batch. The root adapter commits that SQL batch first, then publishes its Git
-/// evidence to the project graph. A graph error remains a typed ingest failure;
-/// it never rewinds the truthful parse cursor or falls back to relational
-/// correlation tables.
-async fn ingest_one<S: TranscriptIngestStore>(
-    store: &S,
+enum PreparedTranscriptFile {
+    Empty,
+    Parsed {
+        path: PathBuf,
+        loaded: LoadedTranscriptCursor,
+        previous: TranscriptCursorCheckpoint,
+        parsed: ParsedTranscript,
+    },
+}
+
+struct LoadedTranscriptFile {
+    path: PathBuf,
+    loaded: LoadedTranscriptCursor,
+    previous: TranscriptCursorCheckpoint,
+}
+
+/// Parses one already-loaded source cursor without publishing writes.
+/// Ordered persistence begins only after this bounded concurrent stage.
+#[hotpath::measure(label = "sessions.ingest.prepare_file")]
+fn prepare_loaded_transcript(
     source: &dyn TranscriptSource,
-    path: &Path,
+    loaded_file: LoadedTranscriptFile,
     project_root: &Path,
     max_new_bytes: Option<u64>,
+) -> TranscriptIngestResult<PreparedTranscriptFile> {
+    let LoadedTranscriptFile {
+        path,
+        loaded,
+        previous,
+    } = loaded_file;
+    let Some(parsed) = source.try_parse_new(&path, previous.state, project_root, max_new_bytes)?
+    else {
+        return Ok(PreparedTranscriptFile::Empty);
+    };
+    Ok(PreparedTranscriptFile::Parsed {
+        path,
+        loaded,
+        previous,
+        parsed,
+    })
+}
+
+async fn persist_prepared_transcript<S: TranscriptIngestStore>(
+    store: &S,
+    provider: &'static str,
+    project_root: &Path,
+    prepared: PreparedTranscriptFile,
 ) -> TranscriptIngestResult<TranscriptIngestStats> {
-    let loaded = load_transcript_cursor(store, source.cursor_key(path)).await?;
-    let previous = loaded.checkpoint.clone();
-    let Some(parsed) = source.try_parse_new(path, previous.state, project_root, max_new_bytes)?
+    let PreparedTranscriptFile::Parsed {
+        path,
+        loaded,
+        previous,
+        parsed,
+    } = prepared
     else {
         return Ok(TranscriptIngestStats::default());
     };
     persist_parsed_transcript(
         store,
-        source.provider(),
-        path,
+        provider,
+        &path,
         project_root,
         loaded,
         &previous,
@@ -972,16 +1106,11 @@ fn stable_jsonl_file_id(
     }
     #[cfg(windows)]
     {
-        if let Ok(information) = tracedecay_private_fs::windows_file::information(file) {
-            hasher.update(information.volume_serial_number.to_le_bytes());
-            hasher.update(information.file_index.to_le_bytes());
-        } else {
-            // Some virtual file systems do not expose native handle
-            // identity. Keep creation time plus the head fingerprint as
-            // the deterministic fallback used before native IDs existed.
-            hasher.update(0_u32.to_le_bytes());
-            hasher.update(0_u64.to_le_bytes());
-        }
+        // Match `jsonl_native_file_identity`: a native-handle miss is typed,
+        // never a fabricated 0/0 identity that would collide across files.
+        let information = tracedecay_private_fs::windows_file::information(file)?;
+        hasher.update(information.volume_serial_number.to_le_bytes());
+        hasher.update(information.file_index.to_le_bytes());
         hasher.update(meta.creation_time().to_le_bytes());
     }
     #[cfg(not(any(unix, windows)))]
@@ -1036,7 +1165,11 @@ pub fn content_hash64(contents: &str) -> u64 {
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];
     bytes.copy_from_slice(&digest[..8]);
-    u64::from_be_bytes(bytes)
+    // The hash rides in `StoredCursor::position`, whose persisted column is a
+    // typed non-negative i64 (strict encode and decode). Masking to 63 bits
+    // keeps every hash inside that domain; the entropy loss is immaterial for
+    // change detection.
+    u64::from_be_bytes(bytes) & (u64::MAX >> 1)
 }
 
 #[cfg(test)]

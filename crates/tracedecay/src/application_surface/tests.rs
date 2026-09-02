@@ -5,6 +5,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
+use tracedecay_api::is_http_application_operation_exposed;
 use tracedecay_application::{
     ApplicationContractError, ApplicationProblem, ApplicationProblemEnvelope, CancellationContext,
     CancellationSignal, CancellationState, CapabilityGrantId, CapabilityGrantSnapshot, Deadline,
@@ -17,31 +18,36 @@ use tracedecay_domain::{
     ActorId, ManifestDigest, ProjectId, QueryNormalizationRevision, RefId, RepositoryId,
     SanitizerRevision, UtcMicros, WorktreeId,
 };
-use tracedecay_tool_catalog::{BindingId, CapabilityId, SchemaId, UseCaseId};
+use tracedecay_tool_catalog::{
+    ApplicationSurfaceOperation, BindingId, CapabilityId, SchemaId, UseCaseId,
+};
 
 use super::handoff::validate_catalog_bindings as validate_handoff_catalog_bindings;
 use super::workflow::validate_catalog_bindings as validate_workflow_catalog_bindings;
 use super::{
     APPLICATION_PROTOCOL_REVISION, ActiveHttpRequest, ApplicationSurfaceAdapterError,
-    ApplicationSurfaceOperation, ApplicationSurfaceRequest, CallableCodeSurfaceRequest,
-    ContextScoutClaimSurfaceRequest, ContextScoutClaimWindowSurfaceV1,
-    ContextScoutControlSurfaceRequest, ContextScoutSurfaceRequest, FeedbackSurfaceRequest,
-    HttpCancellationRegistry, HttpOperationEventState, NativeIntegrationSurfaceRequest,
-    PrimitiveCodeSurfaceRequest, application_http_context, application_negotiated_features,
+    ApplicationSurfaceRequest, CallableCodeSurfaceRequest, ContextScoutClaimSurfaceRequest,
+    ContextScoutClaimWindowSurfaceV1, ContextScoutControlSurfaceRequest,
+    ContextScoutSurfaceRequest, FeedbackSurfaceRequest, HttpCancellationRegistry,
+    HttpOperationEventState, NativeIntegrationSurfaceRequest, PrimitiveCodeSurfaceRequest,
+    application_http_context, application_negotiated_features,
     application_surface_dispatch_input_with_controls, current_micros, execute_application_surface,
     feedback_sse_stream_event, http_operation_event_router, invocation_problem,
     normalize_application_tool_args, parse_application_surface_request,
     resolve_application_binding, resolve_application_surface_dispatch,
     resolve_authenticated_http_request_context, surface_rejection_metadata,
 };
-use tracedecay_daemon_protocol::RequestedOutputFormat;
-use tracedecay_usecases::feedback::observations::{
+use tracedecay_application::context_scout::ContextScoutAddressV1;
+use tracedecay_application::feedback::observations::{
     FeedbackArgumentRejectionClassV1, FeedbackOutcomeV1, FeedbackRejectedArgumentV1,
+    FeedbackSseLifecycleV1,
 };
+use tracedecay_application::retrieval::PrimitiveRequest;
+use tracedecay_daemon_protocol::RequestedOutputFormat;
 use tracedecay_usecases::operation_stream::{
     OperationEventAuthority, OperationEventError, OperationId, OperationKind, OperationStreamConfig,
 };
-use tracedecay_usecases::primitives::{PrimitiveRequest, StorageStatusPrimitiveRequest};
+use tracedecay_usecases::primitives::StorageStatusPrimitiveRequest;
 
 fn operation_context(project_id: &ProjectId) -> RequestContext {
     let observed_at = current_micros().expect("current time");
@@ -115,8 +121,8 @@ fn every_http_exposed_operation_resolves_from_the_canonical_catalog() {
     let catalog = super::application_surface_catalog_ref().expect("application catalog");
     let resolver = tracedecay_daemon_protocol::CatalogBindingResolver::new(catalog);
 
-    for operation in tracedecay_api::HttpApplicationOperation::ALL {
-        if operation.is_http_exposed() {
+    for operation in ApplicationSurfaceOperation::ALL {
+        if is_http_application_operation_exposed(operation) {
             assert!(
                 resolve_application_binding(
                     &resolver,
@@ -376,7 +382,7 @@ fn cli_mcp_and_http_resolve_every_operation_through_the_current_catalog_gate() {
         let resolution_profile = &profile_id;
         // The production HTTP-exposure authority decides which operations
         // carry a public HTTP binding; everything resolves via CLI and MCP.
-        let expected_surfaces = if operation.is_http_exposed() {
+        let expected_surfaces = if is_http_application_operation_exposed(operation) {
             &[
                 (tracedecay_tool_catalog::BindingSurface::Cli, "cli"),
                 (tracedecay_tool_catalog::BindingSurface::Mcp, "mcp"),
@@ -416,11 +422,7 @@ fn cli_mcp_and_http_resolve_every_operation_through_the_current_catalog_gate() {
 }
 
 #[test]
-fn root_surface_operation_authority_is_the_http_catalog_authority() {
-    assert_eq!(
-        ApplicationSurfaceOperation::ALL,
-        tracedecay_api::HttpApplicationOperation::ALL
-    );
+fn catalog_operation_authority_preserves_tool_name_compatibility() {
     assert_eq!(
         ApplicationSurfaceOperation::from_tool_name("tracedecay_git_preview"),
         Some(ApplicationSurfaceOperation::GitPreview)
@@ -645,23 +647,23 @@ async fn http_git_read_routes_preserve_the_canonical_typed_request() {
     for (index, (route, operation)) in [
         (
             "/git/status?page_size=7",
-            tracedecay_api::HttpApplicationOperation::GitStatus,
+            ApplicationSurfaceOperation::GitStatus,
         ),
         (
             "/git/diff?page_size=7",
-            tracedecay_api::HttpApplicationOperation::GitDiff,
+            ApplicationSurfaceOperation::GitDiff,
         ),
         (
             "/git/history?page_size=7",
-            tracedecay_api::HttpApplicationOperation::GitHistory,
+            ApplicationSurfaceOperation::GitHistory,
         ),
         (
             "/git/blame?page_size=7",
-            tracedecay_api::HttpApplicationOperation::GitBlame,
+            ApplicationSurfaceOperation::GitBlame,
         ),
         (
             "/git/hunks?page_size=7",
-            tracedecay_api::HttpApplicationOperation::GitHunks,
+            ApplicationSurfaceOperation::GitHunks,
         ),
     ]
     .into_iter()
@@ -792,7 +794,7 @@ fn catalog_bound_compatibility_tools_resolve_before_retained_dispatch() {
 
 #[test]
 fn context_scout_controls_and_claims_preserve_the_exact_address() {
-    let address = crate::agents::context_scout_v2::ContextScoutAddressV1 {
+    let address = ContextScoutAddressV1 {
         profile_id: [1; 16],
         provider_id: [2; 16],
         protected_session_id: [3; 32],
@@ -1036,7 +1038,7 @@ fn callable_symbol_graph_operations_reuse_primitive_requests() {
         QueryNormalizationRevision::new("normalization.daemon-owned-test.v1")
             .expect("normalization revision");
     let PrimitiveRequest::SymbolSearch(symbol_search) =
-        crate::application_surface::primitive_code_into_primitive(
+        tracedecay_application::primitive_code_into_primitive(
             symbol_search,
             sanitizer_revision.clone(),
             normalization_revision.clone(),
@@ -1309,11 +1311,7 @@ fn sse_item_maps_to_content_free_delivery_lifecycle() {
     let event = StreamEvent::item(7, "content-is-not-observed").expect("stream item");
     assert_eq!(
         feedback_sse_stream_event(&event),
-        Some((
-            tracedecay_usecases::feedback::observations::FeedbackSseLifecycleV1::EventDelivered,
-            1,
-            false,
-        ))
+        Some((FeedbackSseLifecycleV1::EventDelivered, 1, false,))
     );
 }
 
@@ -1652,6 +1650,114 @@ fn storage_status_empty_request_uses_typed_default() {
         ApplicationSurfaceRequest::Primitive(PrimitiveRequest::StorageStatus(request))
             if !request.include_details
     ));
+}
+
+/// A dead daemon socket must be a fail-fast dispatch error carrying the
+/// typed connect diagnostic — never a retryable problem envelope. Wrapping
+/// it as retryable made the CLI re-dispatch (re-paying the 8 s connect
+/// grace each pass) until its 120 s deadline: 131 s measured for
+/// `storage_status` against a dead socket while sibling compatibility tools
+/// failed typed in ~9 s.
+#[tokio::test]
+async fn dead_daemon_surface_dispatch_fails_fast_with_typed_unreachable() {
+    struct UnreachableExecutor;
+
+    impl tracedecay_application::ApplicationInvocationExecutor for UnreachableExecutor {
+        fn invoke(
+            &self,
+            _invocation: tracedecay_application::ApplicationInvocation,
+        ) -> tracedecay_application::ApplicationInvocationFuture<
+            '_,
+            Result<
+                tracedecay_application::ApplicationResponse,
+                tracedecay_application::InvocationError,
+            >,
+        > {
+            Box::pin(async {
+                Err(tracedecay_application::InvocationError::Unreachable {
+                    reason_code: "daemon_connect_down".to_owned(),
+                    detail: "could not connect to TraceDecay daemon endpoint 'unix:///dead.sock'"
+                        .to_owned(),
+                })
+            })
+        }
+    }
+
+    impl tracedecay_daemon_protocol::DaemonInvocationExecutor for UnreachableExecutor {
+        fn invoke_controlled(
+            &self,
+            _request: tracedecay_daemon_protocol::DaemonInvocationRequest,
+            _deadline: Deadline,
+            _cancellation: CancellationSignal,
+            _policy: tracedecay_daemon_protocol::InvocationCancellationPolicy,
+        ) -> tracedecay_daemon_protocol::DaemonInvocationExecutorFuture<
+            '_,
+            Result<
+                tracedecay_daemon_protocol::DaemonInvocationResponse,
+                tracedecay_daemon_protocol::DaemonInvocationError,
+            >,
+        > {
+            Box::pin(async {
+                Err(
+                    tracedecay_daemon_protocol::DaemonInvocationError::Unreachable {
+                        reason_code: "daemon_connect_down".to_owned(),
+                        detail:
+                            "could not connect to TraceDecay daemon endpoint 'unix:///dead.sock'"
+                                .to_owned(),
+                    },
+                )
+            })
+        }
+
+        fn observe_feedback(
+            &self,
+            _subject_digest: ManifestDigest,
+            _observed_at: UtcMicros,
+            _event: tracedecay_application::feedback::observations::FeedbackSourceEventV1,
+        ) -> tracedecay_daemon_protocol::DaemonInvocationExecutorFuture<
+            '_,
+            tracedecay_domain::errors::Result<()>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let request = parse_application_surface_request(
+        ApplicationSurfaceOperation::StorageStatus,
+        serde_json::json!({}),
+    )
+    .expect("storage-status request");
+    let dispatched = resolve_application_surface_dispatch(
+        tracedecay_tool_catalog::BindingSurface::Cli,
+        ApplicationSurfaceOperation::StorageStatus,
+        RequestId::new("request.dead-daemon-storage-status").expect("request id"),
+        request,
+        RequestedOutputFormat::Json,
+    )
+    .expect("storage-status dispatch");
+
+    let result = execute_application_surface(
+        ApplicationSurfaceOperation::StorageStatus,
+        dispatched,
+        Some(&UnreachableExecutor),
+    )
+    .await;
+    match result {
+        Err(ApplicationSurfaceAdapterError::DaemonUnreachable {
+            reason_code,
+            detail,
+        }) => {
+            assert_eq!(reason_code, "daemon_connect_down");
+            assert!(
+                detail.contains("could not connect"),
+                "the connect diagnostic must survive to the dispatcher: {detail}"
+            );
+        }
+        Err(other) => panic!(
+            "a dead daemon must be a fail-fast typed dispatch error, not a problem envelope: {other:?}"
+        ),
+        Ok(_) => panic!("a dead daemon must be a fail-fast typed dispatch error, not a success"),
+    }
 }
 
 #[tokio::test]

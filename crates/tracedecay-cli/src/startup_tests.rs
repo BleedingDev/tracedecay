@@ -1,18 +1,19 @@
 use super::{
-    AnalyticsAction, Cli, CommandFamily, Commands, DAEMON_CPU_THREADS_ENV,
+    AnalyticsAction, AsyncRuntimeFlavor, Cli, CommandFamily, Commands, DAEMON_CPU_THREADS_ENV,
     DEFAULT_MAX_DAEMON_CPU_THREADS, DaemonAction, GitAction, GitProjectArgs, HostBundleCliOptions,
     HostBundleComponentArg, MAX_ASYNC_WORKER_THREADS, PackageHookAction, ProfileStorageAction,
-    RAYON_NUM_THREADS_ENV, ScoopPackageHookAction, StderrTracingDefault, async_worker_threads,
-    command_profile_label, daemon_cpu_threads_from, hotpath_focus_is_valid,
-    hotpath_output_format_is_none, hotpath_output_format_is_valid, hotpath_output_path_is_valid,
-    hotpath_requires_protocol_safe_output, is_daemon_run, is_full_component_set_adoption,
-    is_local_install_command, should_skip_agent_install_check, should_skip_startup_maintenance,
-    stderr_tracing_default, validate_host_bundle_options,
+    ProjectsAction, RAYON_NUM_THREADS_ENV, ScoopPackageHookAction, StderrTracingDefault,
+    async_runtime_flavor, async_worker_threads, command_profile_label, daemon_cpu_threads_from,
+    hotpath_focus_is_valid, hotpath_output_format_is_none, hotpath_output_format_is_valid,
+    hotpath_output_path_is_valid, hotpath_requires_protocol_safe_output, is_daemon_run,
+    is_full_component_set_adoption, is_local_install_command, normalize_tool_reserved_global_flags,
+    requires_eager_mcp_tool_catalog, should_skip_agent_install_check,
+    should_skip_startup_maintenance, stderr_tracing_default, validate_host_bundle_options,
 };
 use clap::{CommandFactory, Parser};
 use std::iter;
 use std::path::PathBuf;
-use tracedecay_usecases::user_config::UserConfig;
+use tracedecay_session_memory::user_config::UserConfig;
 
 fn parse_command(args: &[&str]) -> Commands {
     Cli::try_parse_from(iter::once("tracedecay").chain(args.iter().copied()))
@@ -201,6 +202,70 @@ fn storage_reset_project_store_parses_and_accepts_the_confirmation_flag() {
         .expect("storage reset-project-store --yes must be accepted");
 }
 
+/// `projects forget` REQUIRES `--yes` (its handler refuses without it) and
+/// takes the global `--dry-run` as its preview, so the pre-dispatch validator
+/// must accept both exactly as documented.
+#[test]
+fn projects_forget_accepts_confirmation_and_preview_flags() {
+    for flags in [&["--yes"][..], &["--dry-run"][..]] {
+        let mut args = vec!["tracedecay", "projects", "forget", "proj_123"];
+        args.extend_from_slice(flags);
+        let cli = Cli::try_parse_from(args).expect("documented forget invocation must parse");
+        let options = HostBundleCliOptions {
+            component: cli.component,
+            dry_run: cli.dry_run,
+            yes: cli.yes,
+            adopt: cli.adopt,
+        };
+        let command = cli.command.expect("subcommand parsed");
+        assert!(matches!(
+            command,
+            Commands::Projects {
+                action: ProjectsAction::Forget { .. }
+            }
+        ));
+        validate_host_bundle_options(&command, CommandFamily::for_command(&command), &options)
+            .unwrap_or_else(|error| panic!("projects forget {flags:?} must be accepted: {error}"));
+    }
+}
+
+/// `projects forget` owns no host component, so the component/adopt lifecycle
+/// flags stay rejected on it; and read-only `projects` verbs still reject the
+/// confirmation flags entirely.
+#[test]
+fn projects_forget_rejects_component_and_projects_list_rejects_yes() {
+    let forget = Commands::Projects {
+        action: ProjectsAction::Forget {
+            selector: "proj_123".to_string(),
+            keep_store: false,
+        },
+    };
+    let component = HostBundleCliOptions {
+        component: Some(HostBundleComponentArg::Core),
+        dry_run: false,
+        yes: true,
+        adopt: false,
+    };
+    assert!(
+        validate_host_bundle_options(&forget, CommandFamily::for_command(&forget), &component)
+            .is_err()
+    );
+
+    let list = Commands::Projects {
+        action: ProjectsAction::List {
+            limit: 25,
+            json: false,
+        },
+    };
+    let yes = HostBundleCliOptions {
+        component: None,
+        dry_run: false,
+        yes: true,
+        adopt: false,
+    };
+    assert!(validate_host_bundle_options(&list, CommandFamily::for_command(&list), &yes).is_err());
+}
+
 /// `storage reset-authority` carries the same required `--yes` confirmation.
 #[test]
 fn storage_reset_authority_accepts_the_confirmation_flag() {
@@ -371,6 +436,7 @@ fn unrelated_and_uninstall_commands_reject_adoption() {
 fn async_runtime_bounds_parallel_allocators() {
     assert!((1..=MAX_ASYNC_WORKER_THREADS).contains(&async_worker_threads()));
     assert_eq!(MAX_ASYNC_WORKER_THREADS, 16);
+    assert_eq!(async_runtime_flavor(None), AsyncRuntimeFlavor::MultiThread);
     // The blocking pool is no longer a flat constant: `blocking_thread_limit_tests`
     // covers `tokio_blocking_thread_limit_from`, which derives the width from the
     // installed indexing workers plus a serving reserve.
@@ -558,14 +624,16 @@ fn explicit_agent_config_commands_skip_startup_maintenance() {
 
 #[test]
 fn normal_commands_keep_startup_maintenance() {
-    assert!(!should_skip_startup_maintenance(&Commands::Status {
+    let command = Commands::Status {
         path: None,
         project_id: None,
         project_path: None,
         json: false,
         short: false,
         runtime: false,
-    }));
+    };
+    assert!(!should_skip_startup_maintenance(&command));
+    assert!(requires_eager_mcp_tool_catalog(Some(&command)));
 }
 
 #[test]
@@ -577,6 +645,34 @@ fn tool_fallback_skips_network_and_agent_startup_maintenance() {
     };
     assert!(should_skip_startup_maintenance(&command));
     assert!(should_skip_agent_install_check(&command));
+    assert!(!requires_eager_mcp_tool_catalog(Some(&command)));
+    assert_eq!(
+        async_runtime_flavor(Some(&command)),
+        AsyncRuntimeFlavor::CurrentThread
+    );
+}
+
+#[test]
+fn tool_dry_run_is_forwarded_from_the_global_clap_flag() {
+    let mut cli = Cli::try_parse_from([
+        "tracedecay",
+        "tool",
+        "storage_status",
+        "--dry-run",
+        "--args",
+        "-",
+    ])
+    .expect("tool invocation");
+    assert!(cli.dry_run);
+
+    normalize_tool_reserved_global_flags(&mut cli);
+
+    assert!(!cli.dry_run);
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Tool { args, .. })
+            if args == ["--args", "-", "--dry-run"]
+    ));
 }
 
 #[test]

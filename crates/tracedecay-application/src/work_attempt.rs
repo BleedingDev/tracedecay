@@ -442,6 +442,7 @@ impl<S> WorkAttemptService<S>
 where
     S: WorkAttemptStoragePort,
 {
+    #[hotpath::skip]
     pub const fn new(attempts: S) -> Self {
         Self { attempts }
     }

@@ -13,7 +13,7 @@ pub(super) async fn run_git_sync(
     since: Option<String>,
     limit_sessions: usize,
     dry_run: bool,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     let project_root = resolve_cli_project_root(None, project_id, project_path).await?;
     let since_ts = resolve_git_sync_since(since.as_deref())?;
     let outcome = call_daemon_tool(
@@ -47,37 +47,31 @@ pub(super) enum SessionSyncPollState {
 pub(super) fn session_sync_poll_state(
     label: &str,
     outcome: &serde_json::Value,
-) -> tracedecay_runtime_core::errors::Result<SessionSyncPollState> {
+) -> tracedecay_domain::errors::Result<SessionSyncPollState> {
     let status = outcome
         .get("status")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(
-            || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: format!("daemon {label} response omitted its typed status"),
-            },
-        )?;
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!("daemon {label} response omitted its typed status"),
+        })?;
     match status {
         "accepted" | "joined" => {
             let operation_id = outcome
                 .get("operation_id")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(
-                    || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                        message: format!(
-                            "daemon {label} response reported {status} without an operation id"
-                        ),
-                    },
-                )?;
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!(
+                        "daemon {label} response reported {status} without an operation id"
+                    ),
+                })?;
             let idempotency_key = outcome
                 .get("idempotency_key")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(
-                    || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                        message: format!(
-                            "daemon {label} response reported {status} without an idempotency key"
-                        ),
-                    },
-                )?;
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!(
+                        "daemon {label} response reported {status} without an idempotency key"
+                    ),
+                })?;
             Ok(SessionSyncPollState::Pending {
                 operation_id: operation_id.to_owned(),
                 idempotency_key: idempotency_key.to_owned(),
@@ -87,25 +81,21 @@ pub(super) fn session_sync_poll_state(
             let operation_id = outcome
                 .get("operation_id")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(
-                    || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                        message: format!(
-                            "daemon {label} response reported complete without an operation id"
-                        ),
-                    },
-                )?;
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!(
+                        "daemon {label} response reported complete without an operation id"
+                    ),
+                })?;
             let termination = outcome
                 .get("termination")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(
-                    || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                        message: format!(
-                            "daemon {label} response reported complete without a termination"
-                        ),
-                    },
-                )?;
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!(
+                        "daemon {label} response reported complete without a termination"
+                    ),
+                })?;
             let remaining_work = session_sync_remaining_work(outcome).ok_or_else(|| {
-                tracedecay_runtime_core::errors::TraceDecayError::Config {
+                tracedecay_domain::errors::TraceDecayError::Config {
                     message: format!(
                         "daemon {label} response reported complete without truthful source coverage"
                     ),
@@ -129,7 +119,7 @@ pub(super) fn session_sync_poll_state(
                 } else {
                     format!("{detail}; remaining work {remaining_work}")
                 };
-                return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                return Err(tracedecay_domain::errors::TraceDecayError::Config {
                     message: format!("{label} did not complete successfully ({detail})"),
                 });
             }
@@ -137,7 +127,7 @@ pub(super) fn session_sync_poll_state(
             Ok(SessionSyncPollState::Completed)
         }
         "cancelled" | "deadline_exceeded" | "wrong_scope" => {
-            Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!("{label} did not complete successfully ({status})"),
             })
         }
@@ -145,18 +135,16 @@ pub(super) fn session_sync_poll_state(
             let reason = outcome
                 .get("reason_code")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(
-                    || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                        message: format!(
-                            "daemon {label} response reported unavailable without a reason code"
-                        ),
-                    },
-                )?;
-            Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!(
+                        "daemon {label} response reported unavailable without a reason code"
+                    ),
+                })?;
+            Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!("{label} unavailable ({reason})"),
             })
         }
-        unexpected => Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        unexpected => Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: format!("daemon {label} response reported unknown status {unexpected:?}"),
         }),
     }
@@ -183,7 +171,7 @@ pub(super) async fn await_session_sync_completion(
     project_root: &Path,
     label: &str,
     mut outcome: Value,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     let client_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(35);
     // Poll with exponential backoff so a long-running sync costs dozens of
     // daemon round trips instead of one every 50 ms for up to 35 s.
@@ -197,7 +185,7 @@ pub(super) async fn await_session_sync_completion(
                 idempotency_key,
             } => {
                 if tokio::time::Instant::now() >= client_deadline {
-                    return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                    return Err(tracedecay_domain::errors::TraceDecayError::Config {
                         message: format!(
                             "{label} operation {operation_id} did not reach a terminal state"
                         ),
@@ -221,7 +209,7 @@ pub(super) async fn await_session_sync_completion(
 
 /// Resolves the `--since` argument (ISO-8601 or unix seconds) to a unix-second
 /// lower bound, defaulting to 90 days before now when unset.
-fn resolve_git_sync_since(since: Option<&str>) -> tracedecay_runtime_core::errors::Result<i64> {
+fn resolve_git_sync_since(since: Option<&str>) -> tracedecay_domain::errors::Result<i64> {
     let Some(raw) = since.map(str::trim).filter(|value| !value.is_empty()) else {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -232,12 +220,12 @@ fn resolve_git_sync_since(since: Option<&str>) -> tracedecay_runtime_core::error
         if unix >= 0 {
             return Ok(unix);
         }
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: "--since must be >= 0".to_string(),
         });
     }
     tracedecay_runtime_core::timeutil::parse_rfc3339_timestamp(raw).ok_or_else(|| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: format!(
                 "--since must be a non-negative Unix timestamp or ISO/RFC3339 string (got `{raw}`)"
             ),

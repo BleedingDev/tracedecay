@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tracedecay_application::{ApplicationProblem, Deadline, RetryDirective, SafeDiagnostic};
 use tracedecay_domain::UtcMicros;
 use tracedecay_lsp::analyzer::broker::{DiagnosticBroker, MountedLspProvider};
-use tracedecay_usecases::context::MonotonicDeadline;
+use tracedecay_session_memory::context::MonotonicDeadline;
 use tracedecay_usecases::lsp_runtime::DaemonLspSessionFactory;
 
 /// State retained after independent owners publish and consumed only after the
@@ -15,12 +15,12 @@ pub(crate) struct ProjectOpenDependentOwnerState {
         tracedecay_global_db::RegisteredGlobalDbLeaseV1,
     pub(in crate::daemon::project_open_owners) graph: Arc<crate::tracedecay::TraceDecay>,
     pub(in crate::daemon::project_open_owners) code_graph:
-        Arc<dyn tracedecay_usecases::graph::CodeGraphProjectionReadPort>,
+        Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
     pub(in crate::daemon::project_open_owners) scope: tracedecay_application::ResolvedScope,
     pub(in crate::daemon::project_open_owners) access:
         tracedecay_usecases::source_authorization::ProjectSourceAccessSnapshot,
     pub(in crate::daemon::project_open_owners) scout_configuration:
-        tracedecay_usecases::configuration::ConfigurationCurrentStateV1,
+        tracedecay_configuration::ConfigurationCurrentStateV1,
     pub(in crate::daemon::project_open_owners) requester: tracedecay_domain::ActorId,
     pub(in crate::daemon::project_open_owners) mounted_providers: Vec<MountedLspProvider>,
     pub(in crate::daemon::project_open_owners) admitted_root_uri: String,

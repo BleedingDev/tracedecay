@@ -23,6 +23,7 @@ use tracedecay_domain::{
 use tracedecay_tool_catalog::{CapabilityId, UseCaseId};
 
 use super::http_application::{DaemonHttpApplicationRegistry, DaemonHttpApplicationService};
+use tracedecay_daemon_service::DaemonInvocationService;
 use tracedecay_usecases::operation_stream::{
     OperationEventAuthority, OperationId, OperationKind, OperationStreamConfig,
 };
@@ -259,6 +260,10 @@ async fn service_with_canonical_application(
     tokio::task::JoinHandle<()>,
     tempfile::TempDir,
 ) {
+    // The canonical handshake reports the client's build version from the
+    // product runtime; this composition never passes through the binary's
+    // registration.
+    crate::product_runtime::register_fixture_product_runtime();
     let project = tempfile::tempdir().expect("canonical application project");
     let broker = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -279,12 +284,7 @@ async fn service_with_canonical_application(
     )
     .expect("canonical application handshake");
     let client = tracedecay_daemon_protocol::DaemonInvocationClient::new(
-        super::DaemonConnection {
-            endpoint: broker_endpoint,
-            auth_token: None,
-            authority_record: None,
-        }
-        .into_protocol(),
+        tracedecay_daemon_protocol::DaemonConnection::new(broker_endpoint, None),
         handshake,
     );
     let canonical =
@@ -696,7 +696,7 @@ async fn daemon_http_cold_resolution_failure_returns_a_safe_typed_problem() {
     let registry = DaemonHttpApplicationRegistry::default();
     registry
         .install_resolver(|_| async {
-            Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: "sensitive resolver detail must not cross HTTP".to_owned(),
             })
         })
@@ -878,7 +878,7 @@ async fn daemon_http_unavailable_cold_resolution_preserves_curate_request_identi
     let registry = DaemonHttpApplicationRegistry::default();
     registry
         .install_resolver(|_| async {
-            Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: "resolver unavailable".to_owned(),
             })
         })
@@ -995,8 +995,7 @@ async fn daemon_http_timed_out_cold_resolution_preserves_curate_request_identity
             let resolver_calls = Arc::clone(&observed_resolver_calls);
             async move {
                 resolver_calls.fetch_add(1, Ordering::Relaxed);
-                std::future::pending::<tracedecay_runtime_core::errors::Result<Option<Router>>>()
-                    .await
+                std::future::pending::<tracedecay_domain::errors::Result<Option<Router>>>().await
             }
         })
         .expect("install parked project resolver");
@@ -1073,9 +1072,12 @@ async fn authenticated_remote_node_provisioning_creates_and_registers_first_stor
     );
     #[cfg(not(unix))]
     let endpoint = tracedecay_daemon_protocol::default_loopback_endpoint();
-    let daemon_authority =
-        super::authority::DaemonAuthority::acquire(&profile_root, &endpoint, "test")
-            .expect("daemon authority");
+    let daemon_authority = tracedecay_daemon_identity::authority::DaemonAuthority::acquire(
+        &profile_root,
+        &endpoint,
+        "test",
+    )
+    .expect("daemon authority");
     let _database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         &profile_root,
         daemon_authority.record().epoch,
@@ -1084,11 +1086,9 @@ async fn authenticated_remote_node_provisioning_creates_and_registers_first_stor
     .expect("daemon database scope");
     let identity = daemon_authority.profile_identity().clone();
     let runtime = Arc::new(
-        super::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity.clone(),
-        )
-        .await
-        .expect("session runtime registry"),
+        tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity.clone())
+            .await
+            .expect("session runtime registry"),
     );
     let node_id = BrainNodeId::new("node.remote-http-provision").expect("node identity");
     let secret = [7_u8; 32];
@@ -1104,7 +1104,7 @@ async fn authenticated_remote_node_provisioning_creates_and_registers_first_stor
     let remote = super::remote_protocol::build_daemon_remote_protocol_router(
         Arc::clone(&credentials),
         runtime.remote_replay_transaction(),
-        super::service::invocation::DaemonInvocationService::default(),
+        DaemonInvocationService::default(),
     )
     .expect("remote protocol router");
     let registry = DaemonHttpApplicationRegistry::default();
@@ -1147,13 +1147,13 @@ async fn authenticated_remote_node_provisioning_creates_and_registers_first_stor
 async fn remote_protocol_mount_authenticates_before_json_and_outside_local_admission() {
     let registry = DaemonHttpApplicationRegistry::default();
     let credentials = Arc::new(
-        super::remote_protocol::DaemonRemoteCredentialAuthorityV1::new(
+        tracedecay_store_runtime::DaemonRemoteCredentialAuthorityV1::new(
             BrainId::new("brain.remote-http").expect("remote brain identity"),
             UserProfileId::new("profile.remote-http").expect("remote profile identity"),
         ),
     );
     let transaction = Arc::new(
-        super::remote_replay_transaction::DaemonRemoteReplayTransactionAuthorityV1::new(
+        tracedecay_store_runtime::DaemonRemoteReplayTransactionAuthorityV1::new(
             tokio::runtime::Handle::current(),
         )
         .expect("remote replay transaction authority"),
@@ -1161,7 +1161,7 @@ async fn remote_protocol_mount_authenticates_before_json_and_outside_local_admis
     let router = super::remote_protocol::build_daemon_remote_protocol_router(
         Arc::clone(&credentials),
         transaction,
-        super::service::invocation::DaemonInvocationService::default(),
+        DaemonInvocationService::default(),
     )
     .expect("remote protocol router");
     registry
@@ -1213,9 +1213,12 @@ async fn local_remote_status_reads_the_mounted_runtime() {
         tracedecay_daemon_protocol::DaemonEndpoint::Unix(profile_root.join("remote-status.sock"));
     #[cfg(not(unix))]
     let endpoint = tracedecay_daemon_protocol::default_loopback_endpoint();
-    let daemon_authority =
-        super::authority::DaemonAuthority::acquire(&profile_root, &endpoint, "test")
-            .expect("daemon authority");
+    let daemon_authority = tracedecay_daemon_identity::authority::DaemonAuthority::acquire(
+        &profile_root,
+        &endpoint,
+        "test",
+    )
+    .expect("daemon authority");
     let _database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         &profile_root,
         daemon_authority.record().epoch,
@@ -1224,18 +1227,16 @@ async fn local_remote_status_reads_the_mounted_runtime() {
     .expect("daemon database scope");
     let identity = daemon_authority.profile_identity().clone();
     let runtime = Arc::new(
-        super::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity.clone(),
-        )
-        .await
-        .expect("session runtime registry"),
+        tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity.clone())
+            .await
+            .expect("session runtime registry"),
     );
     let credentials = runtime.remote_credential_authority();
     credentials.publish_listener_serving();
     let remote = super::remote_protocol::build_daemon_remote_protocol_router(
         Arc::clone(&credentials),
         runtime.remote_replay_transaction(),
-        super::service::invocation::DaemonInvocationService::default(),
+        DaemonInvocationService::default(),
     )
     .expect("remote protocol router");
     let registry = DaemonHttpApplicationRegistry::default();

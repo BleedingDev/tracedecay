@@ -200,6 +200,7 @@ impl std::fmt::Debug for SessionRelationGraphStore {
 
 impl SessionRelationGraphStore {
     #[must_use]
+    #[hotpath::skip]
     pub const fn new(database: GraphDbLeaseV1) -> Self {
         Self { database }
     }
@@ -892,7 +893,7 @@ fn map_graph_error(error: GraphDbError) -> SessionRelationError {
         GraphDbError::Cancelled => SessionRelationError::Cancelled,
         GraphDbError::DeadlineExceeded => SessionRelationError::DeadlineExceeded,
         GraphDbError::BudgetExhausted { .. } => SessionRelationError::BudgetExhausted,
-        GraphDbError::Conflict => SessionRelationError::Conflict,
+        GraphDbError::Conflict { .. } => SessionRelationError::Conflict,
         GraphDbError::InvalidRequest { .. } => SessionRelationError::Invalid,
         GraphDbError::ResetRequired { .. } => SessionRelationError::ResetRequired,
         GraphDbError::DurabilityUncertain { .. } => SessionRelationError::DurabilityUncertain,

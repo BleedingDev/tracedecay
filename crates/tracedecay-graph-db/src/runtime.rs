@@ -299,7 +299,9 @@ impl GraphDb {
                     )?
                     .map(|state| state.commit.watermark);
                     if current.as_ref() != expected {
-                        return Err(GraphDbError::Conflict);
+                        return Err(GraphDbError::conflict(
+                            "runtime.replace_projection_unverified_inner",
+                        ));
                     }
                 }
                 let retained: BTreeSet<_> = replacement
@@ -381,7 +383,7 @@ impl GraphDb {
             return if existing.digest == digests.publication {
                 Ok(existing.commit)
             } else {
-                Err(GraphDbError::Conflict)
+                Err(GraphDbError::conflict("runtime.publish_unverified"))
             };
         }
         let current = latest_projection(
@@ -391,7 +393,7 @@ impl GraphDb {
         )?
         .map(|state| state.commit.watermark);
         if current.as_ref() != publication_request.expected_watermark.as_ref() {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict("runtime.publish_unverified"));
         }
         let publication_record = (
             publication_request.idempotency_key,
@@ -564,6 +566,40 @@ impl GraphDb {
         Ok(batches)
     }
 
+    /// Same shape as [`Self::outgoing_relations`], but stops at `max_relations`
+    /// and returns the prefix instead of refusing the whole batch.
+    #[hotpath::measure(label = "graph_db.traversal.outgoing_truncated", impl_type = "GraphDb")]
+    pub fn outgoing_relations_truncated(
+        &self,
+        namespace: &GraphNamespace,
+        starts: &[GraphEntityId],
+        relation_kinds: &BTreeSet<GraphRelationKind>,
+        max_relations: usize,
+        cancellation: Arc<dyn GraphCancellation>,
+    ) -> Result<Vec<Vec<GraphRelation>>, GraphDbError> {
+        let guard = self.read_guard()?;
+        let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
+        self.ensure_start_projections_readable(database, namespace, starts)?;
+        let batches = traversal::outgoing_relations_truncated(
+            database,
+            namespace,
+            starts,
+            relation_kinds,
+            max_relations,
+            cancellation.as_ref(),
+            &|namespace, projection| self.ensure_projection_readable(namespace, projection),
+        )?;
+        #[cfg(feature = "hotpath")]
+        {
+            let edges = batches.iter().map(Vec::len).sum();
+            crate::hotpath_observe::record_counts(starts.len(), edges, 0, 0);
+            crate::hotpath_observe::record_hydration_source(
+                crate::hotpath_observe::HydrationSource::Live,
+            );
+        }
+        Ok(batches)
+    }
+
     #[hotpath::measure(label = "graph_db.traversal.outgoing_targets", impl_type = "GraphDb")]
     pub fn outgoing_relation_targets(
         &self,
@@ -596,6 +632,40 @@ impl GraphDb {
         Ok(batches)
     }
 
+    #[hotpath::measure(
+        label = "graph_db.traversal.outgoing_targets.visit",
+        impl_type = "GraphDb"
+    )]
+    pub fn visit_outgoing_relation_targets(
+        &self,
+        namespace: &GraphNamespace,
+        start: &GraphEntityId,
+        relation_kinds: &BTreeSet<GraphRelationKind>,
+        cancellation: Arc<dyn GraphCancellation>,
+        visitor: &mut dyn FnMut(GraphRelationTarget),
+    ) -> Result<usize, GraphDbError> {
+        let guard = self.read_guard()?;
+        let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
+        self.ensure_start_projections_readable(database, namespace, std::slice::from_ref(start))?;
+        let edges = traversal::visit_outgoing_relation_targets(
+            database,
+            namespace,
+            start,
+            relation_kinds,
+            cancellation.as_ref(),
+            &|namespace, projection| self.ensure_projection_readable(namespace, projection),
+            visitor,
+        )?;
+        #[cfg(feature = "hotpath")]
+        {
+            crate::hotpath_observe::record_counts(1, edges, 0, 0);
+            crate::hotpath_observe::record_hydration_source(
+                crate::hotpath_observe::HydrationSource::Live,
+            );
+        }
+        Ok(edges)
+    }
+
     /// Bulk kind-filtered incoming fan-out with the same shape, cancellation,
     /// and aggregate relation budget as [`Self::outgoing_relations`].
     #[hotpath::measure(label = "graph_db.traversal.incoming", impl_type = "GraphDb")]
@@ -611,6 +681,40 @@ impl GraphDb {
         let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
         self.ensure_start_projections_readable(database, namespace, starts)?;
         let batches = traversal::incoming_relations(
+            database,
+            namespace,
+            starts,
+            relation_kinds,
+            max_relations,
+            cancellation.as_ref(),
+            &|namespace, projection| self.ensure_projection_readable(namespace, projection),
+        )?;
+        #[cfg(feature = "hotpath")]
+        {
+            let edges = batches.iter().map(Vec::len).sum();
+            crate::hotpath_observe::record_counts(starts.len(), edges, 0, 0);
+            crate::hotpath_observe::record_hydration_source(
+                crate::hotpath_observe::HydrationSource::Live,
+            );
+        }
+        Ok(batches)
+    }
+
+    /// Same shape as [`Self::incoming_relations`], but stops at `max_relations`
+    /// and returns the prefix instead of refusing the whole batch.
+    #[hotpath::measure(label = "graph_db.traversal.incoming_truncated", impl_type = "GraphDb")]
+    pub fn incoming_relations_truncated(
+        &self,
+        namespace: &GraphNamespace,
+        starts: &[GraphEntityId],
+        relation_kinds: &BTreeSet<GraphRelationKind>,
+        max_relations: usize,
+        cancellation: Arc<dyn GraphCancellation>,
+    ) -> Result<Vec<Vec<GraphRelation>>, GraphDbError> {
+        let guard = self.read_guard()?;
+        let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
+        self.ensure_start_projections_readable(database, namespace, starts)?;
+        let batches = traversal::incoming_relations_truncated(
             database,
             namespace,
             starts,
@@ -709,11 +813,11 @@ impl GraphDb {
         let label = vector::native_vector_label(&request.namespace, &request.projection);
         let property = vector_property_key(&request.property, request.dimension, request.metric);
         match vector::classify_vector_index(database, &label, &property) {
-            GraphVectorIndexStatus::Available => {
+            status @ GraphVectorIndexStatus::Available { .. } => {
                 if request.cancellation.is_cancelled() {
                     return Err(GraphDbError::Cancelled);
                 }
-                return Ok(GraphVectorIndexStatus::Available);
+                return Ok(status);
             }
             GraphVectorIndexStatus::Stale => {
                 // A registered index covering nothing answers every
@@ -812,6 +916,23 @@ impl GraphDb {
         // close into a reported durability fault.
         if !was_uncertain && let Err(error) = self.inner.markers.publish() {
             let _ = error;
+        }
+        // Sealed per-generation readers are separate databases with their own
+        // verify-once markers; closing them through the typed close is what
+        // re-publishes each marker against the checkpointed container the
+        // next open will stat. Left to `Drop`, the engine still checkpoints
+        // but the marker goes stale and the next boot pays a full sealed
+        // proof. Failures are swallowed for the same reason as the marker
+        // publish above: a derived reader that failed to close costs a
+        // re-proof, never a durability fault on this staging close.
+        let sealed = self
+            .inner
+            .sealed_generations
+            .write()
+            .map(|mut sealed| std::mem::take(&mut *sealed))
+            .unwrap_or_default();
+        for store in sealed.into_values() {
+            let _ = store.database().close();
         }
         if was_uncertain {
             Err(durability_uncertain())
@@ -956,8 +1077,11 @@ impl GraphDb {
                 // `mutation::apply` has already committed this exact scalar. Grafeo
                 // Session mutations do not maintain HNSW, so this identical direct
                 // write is index refresh only. The outer database write guard keeps
-                // readers excluded; after reopen the non-durable index is Missing
-                // until an explicit retained owner calls `ensure_vector_index`.
+                // readers excluded. The pinned grafeo persists the refreshed index
+                // at checkpoint and restores it on open; a store whose index is
+                // still Missing after reopen (written before index maintenance, or
+                // torn before its first checkpoint) needs an explicit retained
+                // owner to call `ensure_vector_index`.
                 if database.graph_store().has_vector_index(
                     &vector::native_vector_label(&namespace, &stored.projection),
                     &property,
@@ -976,8 +1100,10 @@ impl GraphDb {
         Ok(commit)
     }
 
-    /// Commits a persistence-only batch without maintaining an ephemeral
-    /// HNSW index that the next close/reopen would discard.
+    /// Commits a persistence-only batch without creating or refreshing any
+    /// HNSW index. Callers that serve vector search from the written rows
+    /// use [`Self::apply_locked`] instead, which keeps the persisted index
+    /// aligned with every committed vector row.
     pub(crate) fn apply_locked_without_vector_index_maintenance(
         &self,
         database: &GrafeoDB,

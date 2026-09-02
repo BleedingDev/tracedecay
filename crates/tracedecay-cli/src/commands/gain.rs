@@ -20,8 +20,8 @@ struct SavingsTotalPayload {
 ///
 /// Pure lookup against the deterministic bundled pricing authority.
 pub(crate) fn estimate_dollars_saved(saved_tokens: u64) -> Option<f64> {
-    let table = tracedecay_usecases::provider_pricing::load_table();
-    let price = tracedecay_usecases::provider_pricing::resolve_model_price(
+    let table = tracedecay_session_memory::provider_pricing::load_table();
+    let price = tracedecay_session_memory::provider_pricing::resolve_model_price(
         table,
         "claude",
         "claude-sonnet-4-6",
@@ -35,7 +35,7 @@ pub async fn handle_gain(
     history: bool,
     range: &str,
     json_output: bool,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     handle_gain_inner(all, history, range, json_output).await
 }
 
@@ -45,17 +45,15 @@ fn handle_gain_inner(
     range: &str,
     json_output: bool,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = tracedecay_runtime_core::errors::Result<()>> + Send + '_>,
+    Box<dyn std::future::Future<Output = tracedecay_domain::errors::Result<()>> + Send + '_>,
 > {
     // Erase the deeply nested gain-read future before it reaches the measured
     // wrapper so every profiling feature can compute its layout.
     Box::pin(async move {
-        let since = tracedecay_usecases::provider_usage::provider_usage_range_start(range)
-            .map_err(
-                |message| tracedecay_runtime_core::errors::TraceDecayError::Config { message },
-            )?;
+        let since = tracedecay_session_memory::provider_usage::provider_usage_range_start(range)
+            .map_err(|message| tracedecay_domain::errors::TraceDecayError::Config { message })?;
         let since = i64::try_from(since).map_err(|_| {
-            tracedecay_runtime_core::errors::TraceDecayError::Config {
+            tracedecay_domain::errors::TraceDecayError::Config {
                 message: "savings range exceeds the supported timestamp domain".to_owned(),
             }
         })?;
@@ -82,11 +80,9 @@ fn handle_gain_inner(
             let rows = result
                 .get("history")
                 .and_then(serde_json::Value::as_array)
-                .ok_or_else(
-                    || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                        message: "daemon gain history response is missing history rows".to_owned(),
-                    },
-                )?;
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: "daemon gain history response is missing history rows".to_owned(),
+                })?;
             let rows = rows
                 .iter()
                 .cloned()
@@ -113,7 +109,7 @@ fn handle_gain_inner(
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&arr)?);
             } else {
-                tracedecay::display::print_gain_history(&rows, estimate_dollars_saved);
+                crate::display::print_gain_history(&rows, estimate_dollars_saved);
             }
             return Ok(());
         }
@@ -133,7 +129,7 @@ fn handle_gain_inner(
             });
             println!("{}", serde_json::to_string_pretty(&out)?);
         } else {
-            tracedecay::display::print_gain_total(
+            crate::display::print_gain_total(
                 project_filter.as_deref().unwrap_or("ALL projects"),
                 range,
                 saved_tokens,

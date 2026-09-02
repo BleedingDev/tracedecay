@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::SystemTime;
 
-use crate::storage::{self, StoreLayout};
 use crate::tracedecay::current_timestamp;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::{
     GraphScopeUpsert, RegisteredGlobalDb, StoreArtifactUpsert, StoreInstanceUpsert,
 };
 use tracedecay_runtime_core::branch_meta;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use tracedecay_runtime_core::storage::{self, StoreLayout};
 
 use super::TraceDecay;
 
@@ -56,6 +56,34 @@ fn registration_digest_matches(
     digest: &RegistrationDigest,
 ) -> bool {
     cache.get(project_id) == Some(digest)
+}
+
+/// Whether the cached registration may be honored: the digest cache proves
+/// this process registered exactly this digest once, not that the registry
+/// still holds it — a sibling process, the CLI, or any out-of-band upsert can
+/// re-pin `canonical_root` afterwards. One indexed point-read keeps the skip
+/// honest before it bypasses the stale-canonical-root repair below; the skip
+/// still avoids the registry write lock and every upsert.
+async fn cached_registration_is_current(
+    global_db: &RegisteredGlobalDb,
+    project_id: &str,
+    digest: &RegistrationDigest,
+    registration_root: &Path,
+) -> Result<bool> {
+    {
+        let cache = LAST_REGISTERED_DIGEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !registration_digest_matches(&cache, project_id, digest) {
+            return Ok(false);
+        }
+    }
+    let registered_root = global_db
+        .get_code_project(project_id)
+        .await?
+        .map(|record| record.canonical_root);
+    Ok(registered_root.as_deref()
+        == Some(RegisteredGlobalDb::canonical_project_key(registration_root).as_str()))
 }
 
 fn artifact_mtime(path: &Path) -> Option<SystemTime> {
@@ -102,7 +130,7 @@ impl TraceDecay {
                 // happens to touch the project last pin its canonical_root /
                 // display_root to a transient worktree path. Redirect registration
                 // to the primary checkout when one is detected and still exists.
-                let primary_root = crate::project_registry::primary_checkout_root(
+                let primary_root = tracedecay_runtime_core::worktree::primary_checkout_root(
                     &self.project_root,
                     git_common_dir.as_deref(),
                 );
@@ -137,27 +165,19 @@ impl TraceDecay {
         let default_branch = meta.as_ref().map(|meta| meta.default_branch.as_str());
         let registration_root = primary_root.as_deref().unwrap_or(&self.project_root);
 
+        if cached_registration_is_current(global_db, project_id, &digest, registration_root).await?
         {
-            let cache = LAST_REGISTERED_DIGEST
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if registration_digest_matches(&cache, project_id, &digest) {
-                hotpath::gauge!("lifecycle.register_project_store.cached_total").inc(1u64);
-                return Ok(());
-            }
+            hotpath::gauge!("lifecycle.register_project_store.cached_total").inc(1u64);
+            return Ok(());
         }
 
         let _registry_write = REGISTRY_WRITE_LOCK.lock().await;
         // Re-check under the write lock: a concurrent writable open may have
         // just registered the same digest while we were computing ours.
+        if cached_registration_is_current(global_db, project_id, &digest, registration_root).await?
         {
-            let cache = LAST_REGISTERED_DIGEST
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if registration_digest_matches(&cache, project_id, &digest) {
-                hotpath::gauge!("lifecycle.register_project_store.cached_total").inc(1u64);
-                return Ok(());
-            }
+            hotpath::gauge!("lifecycle.register_project_store.cached_total").inc(1u64);
+            return Ok(());
         }
 
         let previous_canonical_root = if primary_root.is_some() {

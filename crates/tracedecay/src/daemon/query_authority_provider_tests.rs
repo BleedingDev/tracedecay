@@ -4,11 +4,6 @@ use crate::config::retrieval::{
     RetrievalProfileStateSnapshotV1, RetrievalRuntimeCompatibilityV1, SemanticCompatibilityPinsV1,
     SemanticResourceRequirementV1,
 };
-use crate::search_eval::{
-    DirectEvaluationReportV1, DirectEvaluationStatusV1, DirectProfileEvaluationV1,
-    DirectQualityMetricsV1, DirectRatioMetricV1, EvaluationExecutionContractV1,
-    OptionalStageMeasurementV1, OptionalStageMeasurementsV1,
-};
 use std::{collections::BTreeMap, path::Path, process::Command, time::Duration};
 use tempfile::TempDir;
 use tracedecay_domain::configuration::{ConfigurationRevisionId, ConfigurationSnapshotId};
@@ -25,6 +20,11 @@ use tracedecay_domain::{
     SanitizerRevision, SingleRootScopeV1, TemporalModeV1, VectorWatermark, WorktreeId,
 };
 use tracedecay_query::retrieval::semantic::SemanticCalibrationProfileV1;
+use tracedecay_search_eval::{
+    DirectEvaluationReportV1, DirectEvaluationStatusV1, DirectProfileEvaluationV1,
+    DirectQualityMetricsV1, DirectRatioMetricV1, EvaluationExecutionContractV1,
+    OptionalStageMeasurementV1, OptionalStageMeasurementsV1,
+};
 use tracedecay_usecases::semantic_runtime::{
     CommittedRetrievalProfileStateV1, SemanticActivationCommandV1, SemanticActivationReceiptV1,
     SemanticActivationRequestV1, SemanticConfigurationPinV1, SemanticCurrentLinkedActivationV1,
@@ -91,11 +91,12 @@ fn passing_report(evaluated_profile_id: &str) -> DirectEvaluationReportV1 {
             fusion_revision: "fusion.aggregate-only-test.v1".to_owned(),
             runtime_revision: "runtime.aggregate-only-test.v1".to_owned(),
             cache_state: "empty".to_owned(),
-            concurrency: crate::search_eval::candidate_output::EvaluationConcurrencyContractV1 {
-                query_workers: 1,
-                projection_workers: 1,
-                query_execution: "serial".to_owned(),
-            },
+            concurrency:
+                tracedecay_search_eval::candidate_output::EvaluationConcurrencyContractV1 {
+                    query_workers: 1,
+                    projection_workers: 1,
+                    query_execution: "serial".to_owned(),
+                },
         },
         profile_material_digests: BTreeMap::new(),
         raw_output_digest: "sha256:aggregate-only-test".to_owned(),
@@ -463,15 +464,12 @@ async fn evaluated_initial_query_state_is_available_without_a_fake_activation_ev
 
     let directory = TempDir::new().expect("temporary cursor store");
     let profile_root = directory.path().join("profile");
-    let identity =
-        crate::daemon::profile_identity::load_or_create(&profile_root).expect("profile identity");
+    let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+        .expect("profile identity");
     let _scope_guard =
         tracedecay_runtime_core::db::enter_daemon_database_scope(&profile_root, 1, "query-initial")
             .expect("database scope");
-    let session_registry =
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            identity,
-        )
+    let session_registry = tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity)
         .await
         .expect("session registry");
     let database = session_registry
@@ -541,7 +539,7 @@ async fn retiring_project_query_authority_preserves_same_project_in_another_prof
     let directory = TempDir::new().expect("temporary cursor store");
     let (retiring_profile, retiring_cursor_keys) = {
         let profile_root = directory.path().join("retiring-profile");
-        let identity = crate::daemon::profile_identity::load_or_create(&profile_root)
+        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
             .expect("retiring profile identity");
         let _scope_guard = tracedecay_runtime_core::db::enter_daemon_database_scope(
             &profile_root,
@@ -550,11 +548,9 @@ async fn retiring_project_query_authority_preserves_same_project_in_another_prof
         )
         .expect("retiring database scope");
         let session_registry =
-            crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-                identity,
-            )
-            .await
-            .expect("retiring session registry");
+            tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity)
+                .await
+                .expect("retiring session registry");
         let database = session_registry
             .profile_sessions()
             .await
@@ -570,7 +566,7 @@ async fn retiring_project_query_authority_preserves_same_project_in_another_prof
     };
     let (surviving_profile, surviving_cursor_keys) = {
         let profile_root = directory.path().join("surviving-profile");
-        let identity = crate::daemon::profile_identity::load_or_create(&profile_root)
+        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
             .expect("surviving profile identity");
         let _scope_guard = tracedecay_runtime_core::db::enter_daemon_database_scope(
             &profile_root,
@@ -579,11 +575,9 @@ async fn retiring_project_query_authority_preserves_same_project_in_another_prof
         )
         .expect("surviving database scope");
         let session_registry =
-            crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-                identity,
-            )
-            .await
-            .expect("surviving session registry");
+            tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity)
+                .await
+                .expect("surviving session registry");
         let database = session_registry
             .profile_sessions()
             .await

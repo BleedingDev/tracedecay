@@ -85,6 +85,7 @@ pub struct CheckpointBlockers {
 }
 
 impl CheckpointBlockers {
+    #[hotpath::skip]
     pub const fn is_clear(&self) -> bool {
         self.blockers.is_empty() && self.omitted == 0
     }
@@ -128,6 +129,7 @@ pub(crate) struct CheckpointReport {
 }
 
 impl CheckpointReport {
+    #[hotpath::skip]
     pub(crate) const fn complete(self) -> bool {
         !self.busy && self.checkpointed_frames >= self.log_frames
     }

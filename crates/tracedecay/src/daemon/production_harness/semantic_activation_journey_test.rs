@@ -8,6 +8,10 @@ use serde_json::{Value, json};
 use tracedecay_application::ConfigurationSetRequestV1;
 use tracedecay_domain::configuration::{ConfigurationLayerIdV1, ConfigurationValueV1, SettingKey};
 use tracedecay_domain::{ManifestDigest, VectorGenerationIdV1};
+use tracedecay_semantic_contracts::{
+    DEFAULT_FASTEMBED_MODEL_ID, SemanticConfig, SemanticModelLifecycleStateV1,
+    SemanticProfileSelection, SemanticResourceCeilings,
+};
 use tracedecay_usecases::semantic_runtime::SemanticRuntimeStateV1;
 use tracedecay_usecases::store::vector_generations::{
     GraphVectorGenerationStoreV1, PublishedVectorGenerationV1,
@@ -45,11 +49,11 @@ fn assert_tool_effect_succeeded(response: &JsonRpcResponse) {
 pub(super) fn seed_distribution_fixture(
     lifecycle_root: &Path,
     fixture_root: &Path,
-    owner: &crate::semantic_code::SemanticModelLifecycleOwnerV1,
+    owner: &tracedecay_semantic::SemanticModelLifecycleOwnerV1,
 ) {
     let model = owner
         .catalog()
-        .get(crate::semantic_code::DEFAULT_FASTEMBED_MODEL_ID)
+        .get(DEFAULT_FASTEMBED_MODEL_ID)
         .expect("production catalog contains default model");
     let repository = format!("models--{}", model.model_code.replace('/', "--"));
     let repository_root = lifecycle_root.join("hf-hub-cache").join(repository);
@@ -70,15 +74,15 @@ pub(super) fn seed_distribution_fixture(
 }
 
 pub(super) fn installed_selection_material(
-    owner: &crate::semantic_code::SemanticModelLifecycleOwnerV1,
+    owner: &tracedecay_semantic::SemanticModelLifecycleOwnerV1,
 ) -> (String, PathBuf) {
     match owner.status().state.expect("installed model state") {
-        crate::semantic_code::SemanticModelLifecycleStateV1::Installed {
+        SemanticModelLifecycleStateV1::Installed {
             artifact_digest,
             install_path,
             ..
         }
-        | crate::semantic_code::SemanticModelLifecycleStateV1::Ready {
+        | SemanticModelLifecycleStateV1::Ready {
             artifact_digest,
             install_path,
             ..
@@ -223,7 +227,7 @@ pub(super) async fn evaluate_native_profile(
     project: &Path,
 ) -> ManifestDigest {
     let resources = harness.resources.as_ref().expect("live harness");
-    let evaluation_limits = crate::config::SemanticResourceCeilings::default();
+    let evaluation_limits = SemanticResourceCeilings::default();
     let observed_at = tracedecay_domain::UtcMicros(
         i64::try_from(
             std::time::SystemTime::now()
@@ -237,8 +241,8 @@ pub(super) async fn evaluate_native_profile(
     // vector generation is a `sha256:<hex>` digest, which cannot be embedded
     // in a daemon request token; doing so truthfully fails at request
     // validation before the evaluator is reached.
-    let request_id = tracedecay_usecases::request_identity::mint_global_request_id(
-        tracedecay_usecases::request_identity::GlobalRequestSurface::SemanticEvaluation,
+    let request_id = tracedecay_application::request_identity::mint_global_request_id(
+        tracedecay_application::request_identity::GlobalRequestSurface::SemanticEvaluation,
     )
     .expect("mint a production semantic-evaluation request id");
     let response = resources
@@ -272,9 +276,11 @@ pub(super) async fn evaluate_native_profile(
             report,
             ..
         } => {
+            let report: tracedecay_query::search_quality::DirectEvaluationReportV1 =
+                serde_json::from_value(report).expect("direct evaluation report wire");
             assert_eq!(
                 report.status,
-                crate::search_eval::DirectEvaluationStatusV1::Pass,
+                tracedecay_query::search_quality::DirectEvaluationStatusV1::Pass,
                 "only a native evaluator PASS may enter activation"
             );
             let mut measured_projection_matrices = 0;
@@ -284,7 +290,7 @@ pub(super) async fn evaluate_native_profile(
                 .filter_map(|output| output.native_resources.as_ref())
             {
                 for result in evidence.samples.values() {
-                    let crate::search_eval::semantic_native::SemanticNativeStageResultV1::Complete(
+                    let tracedecay_query::search_quality::semantic_native::SemanticNativeStageResultV1::Complete(
                         sample,
                     ) = result
                     else {
@@ -298,7 +304,7 @@ pub(super) async fn evaluate_native_profile(
                     let cancellation = sample
                         .projection_cases
                         .get(
-                            &crate::search_eval::semantic_native::SemanticProjectionCaseV1::Cancellation,
+                            &tracedecay_query::search_quality::semantic_native::SemanticProjectionCaseV1::Cancellation,
                         )
                         .expect("cancellation case");
                     assert!(
@@ -318,10 +324,10 @@ pub(super) async fn evaluate_native_profile(
                 .semantic_activation_resource_pins(EVALUATED_PROFILE_ID)
                 .expect("PASS carries exact current/10x resource pins");
             let lifecycle =
-                crate::semantic_code::shared_lifecycle_owner().expect("production lifecycle");
+                tracedecay_semantic::default_shared_lifecycle_owner().expect("production lifecycle");
             let model = lifecycle
                 .catalog()
-                .get(crate::semantic_code::DEFAULT_FASTEMBED_MODEL_ID)
+                .get(DEFAULT_FASTEMBED_MODEL_ID)
                 .expect("default model manifest");
             assert_eq!(
                 measured.model_bytes, model.members["model"].length,
@@ -363,8 +369,8 @@ pub(super) async fn evaluate_native_profile(
 pub(super) async fn set_semantic_profile(
     harness: &ProductionProjectCompositionHarnessV1,
     project: &Path,
-    active: crate::config::SemanticProfileSelection,
-    rollback: Option<crate::config::SemanticProfileSelection>,
+    active: SemanticProfileSelection,
+    rollback: Option<SemanticProfileSelection>,
 ) {
     let graph = harness.server(project).expect("project server").cg().await;
     let project_id = graph
@@ -384,12 +390,12 @@ pub(super) async fn set_semantic_profile(
         key: SettingKey::new(crate::config::SEMANTIC_RUNTIME_SETTING_KEY)
             .expect("semantic runtime setting key"),
         value: ConfigurationValueV1::Text(
-            serde_json::to_string(&crate::config::SemanticConfig {
-                selected_model: Some(crate::semantic_code::DEFAULT_FASTEMBED_MODEL_ID.to_owned()),
+            serde_json::to_string(&SemanticConfig {
+                selected_model: Some(DEFAULT_FASTEMBED_MODEL_ID.to_owned()),
                 auto_download: false,
                 active_profile: Some(active),
                 rollback_profile: rollback,
-                resources: crate::config::SemanticResourceCeilings::default(),
+                resources: SemanticResourceCeilings::default(),
             })
             .expect("semantic runtime JSON"),
         ),
@@ -547,8 +553,8 @@ pub(super) fn selection(
     digest: ManifestDigest,
     artifact_digest: &str,
     artifact_path: &Path,
-) -> crate::config::SemanticProfileSelection {
-    crate::config::SemanticProfileSelection {
+) -> SemanticProfileSelection {
+    SemanticProfileSelection {
         profile_id: EVALUATED_PROFILE_ID.to_owned(),
         accepted_profile_digest: digest,
         artifact_digest: artifact_digest.to_owned(),
@@ -586,12 +592,12 @@ async fn public_semantic_activation_rollback_and_exact_retry_preserve_graph_auth
         );
     let _profile = crate::config::PinnedUserDataDir::new();
     let lifecycle_root =
-        crate::semantic_code::default_lifecycle_root().expect("isolated lifecycle root");
+        tracedecay_semantic::default_lifecycle_root().expect("isolated lifecycle root");
     let lifecycle =
-        crate::semantic_code::shared_lifecycle_owner().expect("production lifecycle owner");
+        tracedecay_semantic::default_shared_lifecycle_owner().expect("production lifecycle owner");
     seed_distribution_fixture(&lifecycle_root, &fixture_root, &lifecycle);
     lifecycle
-        .select_model(Some(crate::semantic_code::DEFAULT_FASTEMBED_MODEL_ID), true)
+        .select_model(Some(DEFAULT_FASTEMBED_MODEL_ID), true)
         .expect("select production semantic model");
     lifecycle
         .acquire_blocking_for_tests()

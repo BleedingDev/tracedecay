@@ -14,11 +14,12 @@ mod use_parsing;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
-use crate::types::{MoveHint, MoveResult, Visibility};
+use tracedecay_application::source_edit::{MoveHint, MoveResult};
 use tracedecay_code_extraction::source_mask::{MaskOptions, masked_rust_source_with};
 use tracedecay_domain::RelationEdgeKindV1;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
-use tracedecay_usecases::graph::{map_code_graph_read_runtime_error, map_projection_error};
+use tracedecay_domain::code_intelligence::Visibility;
+use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_graph_query::{map_code_graph_read_runtime_error, map_projection_error};
 use tracedecay_usecases::tracedecay::SourceEditGraphReadV1;
 
 use super::TraceDecay;
@@ -60,6 +61,7 @@ impl TraceDecay {
     ///
     /// `update_references` is reserved for a future version; in v1 caller
     /// references are never auto-edited — the exact change rides in the hints.
+    #[hotpath::skip]
     pub(crate) async fn move_symbol(
         &self,
         graph: SourceEditGraphReadV1,
@@ -426,6 +428,7 @@ impl TraceDecay {
     /// Dependency analysis for the moved body: same-file symbols and source
     /// `use`-imports the body references that will no longer resolve at the
     /// destination. Produces auto-insertable imports plus hints for the rest.
+    #[hotpath::skip]
     async fn analyze_dependencies(
         &self,
         target: &EditSymbolV1,
@@ -604,6 +607,7 @@ impl TraceDecay {
     /// whether the caller shared the source module (unqualified call — needs a
     /// `use` for the new module) or referenced it via another module (path/use
     /// now points at the old location).
+    #[hotpath::skip]
     async fn caller_hints(
         &self,
         graph: &SourceEditGraphReadV1,
@@ -693,6 +697,7 @@ impl TraceDecay {
 
     /// Hint when the destination file's module is not declared anywhere in the
     /// crate. Existing-but-unlinked files need the same hint as fresh files.
+    #[hotpath::skip]
     async fn module_missing_hint(&self, dest_rel: &str) -> Option<MoveHint> {
         let stem = module_stem(dest_rel)?;
         if self.module_declared(dest_rel, &stem) {

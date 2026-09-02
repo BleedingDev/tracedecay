@@ -120,6 +120,7 @@ impl WorkHandoffFrontierV1 {
         &self.task_id
     }
 
+    #[hotpath::skip]
     pub const fn work_version(&self) -> WorkVersion {
         self.work_version
     }

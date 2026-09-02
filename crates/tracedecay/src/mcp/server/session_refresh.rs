@@ -11,19 +11,17 @@ use sha2::{Digest, Sha256};
 use tracedecay_application::RequestContext;
 use tracedecay_domain::ProjectId;
 
-use crate::mcp::tools::{
-    SessionRefreshCommand, SessionRefreshCoverageView, SessionRefreshFrontierView,
-    SessionRefreshProgressView, SessionRefreshReceiptView, SessionRefreshServiceOutcome,
-    SessionRefreshServicePort, utc_micros_value,
-};
-use crate::store::GlobalDbSessionTemporalStore;
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
-use tracedecay_usecases::session::{
+use tracedecay_session_memory::session::{
     AuthorizationGrantId, SessionAuthorizationError, SessionAuthorizationGrant,
-    SessionRefreshConfiguration, SessionRefreshHandle, SessionRefreshOutcome,
+    SessionRefreshAction, SessionRefreshCommand, SessionRefreshConfiguration,
+    SessionRefreshCoverageView, SessionRefreshFrontierView, SessionRefreshHandle,
+    SessionRefreshOutcome, SessionRefreshProgressView, SessionRefreshReceiptView,
     SessionRefreshSchedulerError, SessionRefreshSchedulerPort, SessionRefreshService,
-    SessionRequestBinding, SessionScopeAuthorizationRequest, SessionScopeAuthorizer,
+    SessionRefreshServiceOutcome, SessionRefreshServicePort, SessionRequestBinding,
+    SessionScopeAuthorizationRequest, SessionScopeAuthorizer, utc_micros_value,
 };
+use tracedecay_session_temporal_store::GlobalDbSessionTemporalStore;
 
 const SESSION_REFRESH_PROJECTOR_VERSION: &str = "session-temporal-projector.v1";
 const SESSION_REFRESH_CONFIG_VERSION: &str = "session-refresh-config.v1";
@@ -55,7 +53,7 @@ impl SessionScopeAuthorizer for DaemonSessionRefreshAuthorizer<'_> {
 
 #[derive(Clone)]
 struct DaemonSessionRefreshWake(
-    crate::daemon::session_temporal_refresh_scheduler::SessionTemporalRefreshWake,
+    std::sync::Arc<dyn tracedecay_application::SessionTemporalRefreshWakePort>,
 );
 
 impl SessionRefreshSchedulerPort for DaemonSessionRefreshWake {
@@ -83,7 +81,7 @@ enum SessionRefreshHandleLookup {
 impl DaemonSessionRefreshService {
     pub(crate) fn new(
         database: RegisteredGlobalDbLeaseV1,
-        wake: crate::daemon::session_temporal_refresh_scheduler::SessionTemporalRefreshWake,
+        wake: std::sync::Arc<dyn tracedecay_application::SessionTemporalRefreshWakePort>,
         expected_project_id: Option<String>,
     ) -> Self {
         Self {
@@ -99,7 +97,7 @@ impl DaemonSessionRefreshService {
     ) -> Option<
         SessionRefreshService<
             DaemonSessionRefreshAuthorizer<'_>,
-            GlobalDbSessionTemporalStore<'_>,
+            GlobalDbSessionTemporalStore<'_, tracedecay_global_db::RegisteredGlobalDb>,
             &DaemonSessionRefreshWake,
         >,
     > {
@@ -151,6 +149,7 @@ impl DaemonSessionRefreshService {
         token
     }
 
+    #[hotpath::skip]
     async fn execute_command(
         &self,
         command: SessionRefreshCommand,
@@ -159,12 +158,12 @@ impl DaemonSessionRefreshService {
             return SessionRefreshServiceOutcome::Unavailable;
         };
         let outcome = match command.action {
-            crate::mcp::tools::SessionRefreshAction::Begin => {
+            SessionRefreshAction::Begin => {
                 service
                     .begin_or_join(&command.context, &command.binding, command.target)
                     .await
             }
-            crate::mcp::tools::SessionRefreshAction::Status => {
+            SessionRefreshAction::Status => {
                 let handle = match command.handle.as_deref().map(|token| self.handle(token)) {
                     Some(SessionRefreshHandleLookup::Found(handle)) => handle,
                     Some(SessionRefreshHandleLookup::Stale) => {
@@ -178,7 +177,7 @@ impl DaemonSessionRefreshService {
                     .status(&command.context, &command.binding, &handle)
                     .await
             }
-            crate::mcp::tools::SessionRefreshAction::Cancel => {
+            SessionRefreshAction::Cancel => {
                 let handle = match command.handle.as_deref().map(|token| self.handle(token)) {
                     Some(SessionRefreshHandleLookup::Found(handle)) => handle,
                     Some(SessionRefreshHandleLookup::Stale) => {

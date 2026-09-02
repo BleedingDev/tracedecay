@@ -11,20 +11,20 @@ use tracedecay_application::{
     CancellationSignal, Deadline, now_micros, retained_surface_execution_problem,
 };
 use tracedecay_domain::Confidence;
+use tracedecay_session_memory::memory::memory_application_error;
 use tracedecay_store::{
     FactReadControl, ProjectMemoryFactSearchFilterV1, ProjectMemoryFactSearchKindV1,
     ProjectMemoryFactSearchQuery,
 };
-use tracedecay_usecases::memory::memory_application_error;
 
-use crate::context::{
+use crate::tracedecay::TraceDecay;
+use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_mcp::context_headings::{
     CONTEXT_CODE_HEADING, CONTEXT_ENTRY_POINTS_HEADING, CONTEXT_EXTENSION_POINTS_HEADING,
     CONTEXT_INDEX_COVERAGE_HINT_HEADING, CONTEXT_MEMORY_FEEDBACK_HINT,
     CONTEXT_MEMORY_MATCHES_HEADING, CONTEXT_RELATED_SYMBOLS_HEADING, CONTEXT_SEEN_NODE_IDS_LABEL,
     CONTEXT_TEST_COVERAGE_HEADING,
 };
-use crate::tracedecay::TraceDecay;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 use tracedecay_runtime_core::text::utf8_prefix_at_or_before;
 
 const CONTEXT_MEMORY_MATCH_LIMIT: usize = 3;
@@ -72,7 +72,7 @@ fn push_context_lane_preview(preview: &mut String, lane_key: &str, lane: &str) {
     }
     let prefix = utf8_prefix_at_or_before(lane, budget);
     preview.push_str(prefix);
-    if crate::mcp::tools::render::has_open_markdown_fence(prefix) {
+    if tracedecay_mcp::tools::render::has_open_markdown_fence(prefix) {
         preview.push_str("\n```\n");
     }
     preview.push_str(CONTEXT_LANE_TRUNCATED_NOTE);
@@ -309,7 +309,7 @@ async fn context_memory_matches(
         .search_project_memory_facts(query, read_control)
         .await
         .map_err(memory_application_error)?;
-    let public = crate::daemon::retained_owner::public_search_page(&page).map_err(|error| {
+    let mapped = crate::daemon::retained_owner::search_page(&page).map_err(|error| {
         let problem = retained_surface_execution_problem(error);
         TraceDecayError::Database {
             operation: "project canonical context memory".to_string(),
@@ -317,7 +317,7 @@ async fn context_memory_matches(
         }
     })?;
     Ok(ContextMemoryMatches {
-        hits: public.hits,
-        graph_coverage: public.graph_coverage,
+        hits: mapped.hits,
+        graph_coverage: mapped.graph_coverage,
     })
 }

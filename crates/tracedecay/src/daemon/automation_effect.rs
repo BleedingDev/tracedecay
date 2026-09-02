@@ -5,16 +5,15 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use tracedecay_application::retained_surfaces::{
     AutomationCommittedReceiptV1, AutomationRunProblemV1, AutomationRunRequestV1,
     AutomationRunResultV1, AutomationRunSummaryV1, AutomationRunTerminalV1, AutomationSkipReasonV1,
     AutomationTaskV1, RetainedSurfaceResultV1,
 };
 use tracedecay_application::{
-    ApplicationOutcome, ApplicationProblem, ApplicationProblemEnvelope, CancellationSignal,
-    Deadline, ProblemOwningLayer, RequestContext, RequestId, ResolvedScope,
-    RetainedSurfaceExecutionContextV1, RetainedSurfaceExecutionErrorV1, RetainedSurfaceOperation,
+    ApplicationProblem, ApplicationProblemEnvelope, CancellationSignal, Deadline,
+    ProblemOwningLayer, RequestContext, RequestId, RetainedSurfaceExecutionContextV1,
+    RetainedSurfaceExecutionErrorV1, RetainedSurfaceOperation,
     retained_surface_application_operation, retained_surface_execution_problem,
     retained_surface_outcome_matches_terminal, retained_surface_problem_matches_terminal,
 };
@@ -34,22 +33,7 @@ use tracedecay_private_fs::framed_log::{DirectorySyncPolicy, sync_parent_directo
 use tracedecay_store::FactReadControl;
 
 use crate::daemon::retained_owner::receipts::{PreparedRetainedEffect, prepare_retained_effect};
-use crate::daemon::service::invocation::{
-    DaemonInvocationService, RegisteredRetainedRequestContextError,
-};
-use tracedecay_runtime_core::errors::Result;
-
-mod authority;
-mod contract;
-mod input;
-mod journal;
-mod problem;
-mod projection;
-mod recovery_index;
-mod retirement;
-use authority::finalize_terminal_housekeeping as finalize_terminal_housekeeping_owned;
-use contract::{contract_error, digest};
-use journal::{
+use tracedecay_automation_runtime::automation::effect_runtime::journal::{
     AutomationRecoveryBinding, AutomationReservationClaim, DurableAutomationAdmission,
     DurableSettlementClassification, ReservationResult, abandon_reservation_blocking,
     classify_durable_settlement_blocking, persist_prepared_terminal_blocking,
@@ -57,14 +41,28 @@ use journal::{
     promote_prepared_terminal_blocking, replay_exact_binding_after_error_blocking,
     reserve_or_replay_indexed_blocking, retained_source_bindings,
 };
-use problem::{
+use tracedecay_automation_runtime::automation::effect_runtime::problem::{
     failed_ledger_problem, indeterminate_external_effect_problem, reset_required_problem,
     runtime_problem, shipped_proposal_reset_required_problem,
 };
-use projection::{
+use tracedecay_automation_runtime::automation::effect_runtime::projection::{
     project_committed_receipts, project_recovered_committed_receipts, project_run_summary,
     project_skip_reason,
 };
+use tracedecay_automation_runtime::automation::effect_runtime::{
+    AutomationSettledProblem, AutomationSettledTerminal, contract_error, digest, journal,
+    retirement,
+};
+use tracedecay_daemon_service::{DaemonInvocationService, RegisteredRetainedRequestContextError};
+use tracedecay_domain::errors::Result;
+
+mod authority;
+pub(crate) mod recovery_index;
+use authority::finalize_terminal_housekeeping as finalize_terminal_housekeeping_owned;
+
+#[cfg(test)]
+#[path = "automation_effect/journal/tests.rs"]
+mod journal_tests;
 
 /// Total wall-clock budget for a retained-settlement blocking-pool retry
 /// loop before it gives up and returns an error instead of retrying
@@ -105,13 +103,13 @@ pub(crate) struct RetainedSettlementWaiter<T> {
 }
 
 pub(crate) struct ReusedSchedulerSkipStartError {
-    error: tracedecay_runtime_core::errors::TraceDecayError,
+    error: tracedecay_domain::errors::TraceDecayError,
     _authority: AutomationEffectAuthority,
     _guard: AutomationRunSettlementGuard,
 }
 
 impl ReusedSchedulerSkipStartError {
-    pub(crate) fn into_error(self) -> tracedecay_runtime_core::errors::TraceDecayError {
+    pub(crate) fn into_error(self) -> tracedecay_domain::errors::TraceDecayError {
         self.error
     }
 }
@@ -123,6 +121,7 @@ impl std::fmt::Display for ReusedSchedulerSkipStartError {
 }
 
 impl<T: Send + 'static> RetainedSettlementWaiter<Result<T>> {
+    #[hotpath::skip]
     pub(crate) async fn wait(self) -> Result<T> {
         self.task.await.map_err(|error| {
             contract_error(format!(
@@ -302,11 +301,12 @@ struct RetainedPairOwnerOutcome {
 pub(crate) struct RetainedSettlementPairWaiter {
     first: RetainedSettlementWaiter<Result<RetainedPairOwnerOutcome>>,
     second: RetainedSettlementWaiter<Result<RetainedPairOwnerOutcome>>,
-    first_submission_error: Option<tracedecay_runtime_core::errors::TraceDecayError>,
-    second_submission_error: Option<tracedecay_runtime_core::errors::TraceDecayError>,
+    first_submission_error: Option<tracedecay_domain::errors::TraceDecayError>,
+    second_submission_error: Option<tracedecay_domain::errors::TraceDecayError>,
 }
 
 impl RetainedSettlementPairWaiter {
+    #[hotpath::skip]
     pub(crate) async fn wait(
         self,
     ) -> (
@@ -385,7 +385,7 @@ fn submit_pair_request(
     sender: Option<SyncSender<DeferredSettlementRequest>>,
     request: DeferredSettlementRequest,
     leg: &'static str,
-) -> Option<tracedecay_runtime_core::errors::TraceDecayError> {
+) -> Option<tracedecay_domain::errors::TraceDecayError> {
     let Some(sender) = sender else {
         return Some(contract_error(format!(
             "retained settlement pair {leg} request channel was already transferred"
@@ -435,121 +435,6 @@ struct RetainedAbandonment {
     authority: AutomationEffectAuthority,
     guard: RetainedSettlementGuardOwner,
     reservation_abandoned: bool,
-}
-
-pub(crate) type AutomationSettledProblem = AutomationRunProblemV1;
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(
-    tag = "kind",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub(crate) enum AutomationSettledTerminal {
-    Outcome {
-        scope: ResolvedScope,
-        outcome: Box<ApplicationOutcome<RetainedSurfaceResultV1>>,
-    },
-    Problem(AutomationSettledProblem),
-}
-
-impl AutomationSettledTerminal {
-    pub(crate) fn into_outcome(
-        self,
-    ) -> std::result::Result<
-        ApplicationOutcome<RetainedSurfaceResultV1>,
-        Box<AutomationSettledProblem>,
-    > {
-        match self {
-            Self::Outcome { outcome, .. } => Ok(*outcome),
-            Self::Problem(problem) => Err(Box::new(problem)),
-        }
-    }
-
-    fn matches_admission(&self, admission: &DurableAutomationAdmission) -> bool {
-        match self {
-            Self::Outcome {
-                scope: terminal_scope,
-                outcome,
-            } => {
-                terminal_scope == &admission.scope
-                    && retained_surface_outcome_matches_terminal(
-                        RetainedSurfaceOperation::FactStoreCurate,
-                        &admission.request_id,
-                        &admission.scope,
-                        outcome,
-                    )
-                    && matches!(
-                        outcome.as_ref(),
-                        ApplicationOutcome::Effect(effect)
-                            if matches!(
-                                effect.payload.as_ref(),
-                                Some(RetainedSurfaceResultV1::FactStoreCurate(result))
-                                    if result.matches_admission(&admission.request)
-                            )
-                    )
-            }
-            Self::Problem(problem) => {
-                problem.scope == admission.scope
-                    && problem.matches_terminal(&admission.request_id)
-                    && problem.matches_admission(&admission.request, &admission.request_id)
-            }
-        }
-    }
-
-    pub(crate) fn run_result(&self) -> Option<&AutomationRunResultV1> {
-        let Self::Outcome { outcome, .. } = self else {
-            return None;
-        };
-        let ApplicationOutcome::Effect(effect) = outcome.as_ref() else {
-            return None;
-        };
-        let Some(RetainedSurfaceResultV1::FactStoreCurate(result)) = effect.payload.as_ref() else {
-            return None;
-        };
-        Some(result)
-    }
-
-    pub(crate) fn problem(&self) -> Option<&AutomationSettledProblem> {
-        match self {
-            Self::Outcome { .. } => None,
-            Self::Problem(problem) => Some(problem),
-        }
-    }
-
-    pub(crate) fn is_completed(&self) -> bool {
-        let Self::Outcome { outcome, .. } = self else {
-            return false;
-        };
-        let ApplicationOutcome::Effect(effect) = outcome.as_ref() else {
-            return false;
-        };
-        let Some(RetainedSurfaceResultV1::FactStoreCurate(result)) = effect.payload.as_ref() else {
-            return false;
-        };
-        matches!(result.terminal, AutomationRunTerminalV1::Completed { .. })
-    }
-
-    fn is_retirement_terminal(&self) -> bool {
-        let Self::Outcome { outcome, .. } = self else {
-            return false;
-        };
-        let ApplicationOutcome::Effect(effect) = outcome.as_ref() else {
-            return false;
-        };
-        let Some(RetainedSurfaceResultV1::FactStoreCurate(result)) = effect.payload.as_ref() else {
-            return false;
-        };
-        matches!(
-            &result.terminal,
-            AutomationRunTerminalV1::Skipped { reason, .. }
-                if Some(*reason)
-                    == AutomationSkipReasonV1::from_ledger_reason(
-                        "shipped_fact_proposal_history_retired"
-                    )
-        ) && result.committed_receipts.is_empty()
-    }
 }
 
 fn ledger_record_matches_result(
@@ -617,12 +502,6 @@ fn observe_admission_decision(admission: &AutomationEffectAdmission) {
         }
     }
 }
-
-pub(crate) use input::{
-    memory_curator_run_request, session_reflector_run_request, skill_writer_run_request,
-    user_job_run_request,
-};
-pub(crate) use recovery_index::reconcile_reserved_automation_effects_for_project;
 
 pub(crate) fn pinned_automation_configuration_digest(
     revision: &ConfigurationRevisionId,
@@ -1131,7 +1010,7 @@ impl AutomationEffectAuthority {
     fn finish_projection_failure<T>(
         self,
         guard: RetainedSettlementGuardOwner,
-        error: tracedecay_runtime_core::errors::TraceDecayError,
+        error: tracedecay_domain::errors::TraceDecayError,
     ) -> Result<T> {
         let terminal =
             AutomationSettledTerminal::Problem(self.admission.recovery_problem().clone());
@@ -1144,6 +1023,7 @@ impl AutomationEffectAuthority {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[hotpath::skip]
     pub(crate) async fn prepare(
         invocation: &DaemonInvocationService,
         memory: &crate::tracedecay::TraceDecay,
@@ -1667,10 +1547,12 @@ impl AutomationEffectAuthority {
         self.success_terminal(result)
     }
 
+    #[hotpath::skip]
     async fn settle_retirement(&self) -> Result<AutomationSettledTerminal> {
         self.persist_success_result(self.retirement_result()?).await
     }
 
+    #[hotpath::skip]
     async fn settle_recovered_retirement(&self) -> Result<AutomationSettledTerminal> {
         let terminal = self.success_terminal(self.retirement_result()?)?;
         self.persist_recovered_terminal(terminal).await
@@ -1703,6 +1585,7 @@ impl AutomationEffectAuthority {
         })
     }
 
+    #[hotpath::skip]
     async fn persist_success_result(
         &self,
         result: AutomationRunResultV1,
@@ -1855,6 +1738,7 @@ impl AutomationEffectAuthority {
         Ok(())
     }
 
+    #[hotpath::skip]
     pub(crate) async fn abandon_uncommitted(self) -> Result<()> {
         let path = self.journal_path;
         let admission = self.admission;
@@ -1933,6 +1817,7 @@ impl AutomationEffectAuthority {
         .map_err(contract_error)
     }
 
+    #[hotpath::skip]
     async fn persist_terminal(
         &self,
         terminal: AutomationSettledTerminal,
@@ -1946,6 +1831,7 @@ impl AutomationEffectAuthority {
             })?
     }
 
+    #[hotpath::skip]
     async fn promote_prepared_terminal(
         &self,
         terminal: AutomationSettledTerminal,
@@ -1994,6 +1880,7 @@ impl AutomationEffectAuthority {
         Ok(terminal)
     }
 
+    #[hotpath::skip]
     async fn persist_recovered_terminal(
         &self,
         terminal: AutomationSettledTerminal,

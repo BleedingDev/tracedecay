@@ -192,6 +192,7 @@ impl JsonlFrameAdmission {
         }
     }
 
+    #[hotpath::skip]
     pub(in crate::runtime) const fn needs_preparation() -> Self {
         Self::NeedsPreparation
     }
@@ -222,6 +223,7 @@ pub(in crate::runtime) struct JsonlObservationScan {
     pub replacement_rescan: bool,
     pub start_offset: u64,
     pub generation: u64,
+    pub mtime: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -232,6 +234,7 @@ struct JsonlCheckpoint {
 }
 
 impl JsonlCheckpoint {
+    #[hotpath::skip]
     const fn new(offset: u64, end_offset: u64, resume_fingerprint: u64) -> Self {
         Self {
             offset,
@@ -264,6 +267,14 @@ struct SharedJsonlPreparationAuthority {
 static SHARED_JSONL_PREPARATION_AUTHORITY: OnceLock<SharedJsonlPreparationAuthority> =
     OnceLock::new();
 
+/// Mount the process-wide JSONL page-preparation authority.
+///
+/// The first successful install wins. Later calls — including concurrent
+/// `OnceLock::set` losers and fixtures that carry a distinct
+/// [`ProcessResidentMemoryV1`] Arc — are no-ops. `InvalidFrameState` is a
+/// frame-parse failure, not "another caller already mounted preparation".
+/// Treating a second installer as a frame error poisons every later
+/// host-admission fixture in the same process (the `mcp_suite` cascade).
 pub(crate) fn install_shared_jsonl_preparation_authority(
     memory: Arc<ProcessResidentMemoryV1>,
 ) -> TranscriptIngestResult<()> {
@@ -272,16 +283,8 @@ pub(crate) fn install_shared_jsonl_preparation_authority(
         component: ResidentMemoryComponentIdV1::new("sessions.codex.prepared-pages")
             .map_err(|_| TranscriptIngestError::InvalidFrameState { provider: "codex" })?,
     };
-    if let Some(installed) = SHARED_JSONL_PREPARATION_AUTHORITY.get() {
-        return if Arc::ptr_eq(&installed.memory, &authority.memory) {
-            Ok(())
-        } else {
-            Err(TranscriptIngestError::InvalidFrameState { provider: "codex" })
-        };
-    }
-    SHARED_JSONL_PREPARATION_AUTHORITY
-        .set(authority)
-        .map_err(|_| TranscriptIngestError::InvalidFrameState { provider: "codex" })
+    let _ = SHARED_JSONL_PREPARATION_AUTHORITY.set(authority);
+    Ok(())
 }
 
 pub(crate) fn shared_jsonl_preparation_workers() -> usize {
@@ -1567,6 +1570,7 @@ impl ActiveAdmission<'_> {
         .with_resume_checkpoint(self.file_identity, resume_fingerprint))
     }
 
+    #[hotpath::skip]
     async fn advance_coverage(
         &self,
         expected_cursor: &mut Option<ObservationSourceCursorV1>,
@@ -1665,6 +1669,7 @@ impl ActiveAdmission<'_> {
         })
     }
 
+    #[hotpath::skip]
     async fn apply_capture_result(
         &self,
         expected_cursor: &mut Option<ObservationSourceCursorV1>,
@@ -1759,6 +1764,7 @@ impl ActiveAdmission<'_> {
         }
     }
 
+    #[hotpath::skip]
     async fn capture(
         &self,
         expected_cursor: &mut Option<ObservationSourceCursorV1>,
@@ -1777,6 +1783,7 @@ impl ActiveAdmission<'_> {
             .await
     }
 
+    #[hotpath::skip]
     async fn capture_window(
         &self,
         expected_cursor: &mut Option<ObservationSourceCursorV1>,
@@ -1975,6 +1982,7 @@ pub(in crate::runtime) async fn admit_jsonl_observations<State: Clone>(
         replacement_rescan: raw.replacement_generation,
         start_offset: raw.start_offset,
         generation: raw.new_cursor.file_id,
+        mtime: raw.new_cursor.mtime,
     });
     let active = ActiveAdmission {
         provider,
@@ -1990,6 +1998,7 @@ pub(in crate::runtime) async fn admit_jsonl_observations<State: Clone>(
     let mut pending_bytes = 0_u64;
     let mut pending_start_state: Option<State> = None;
 
+    #[hotpath::skip]
     async fn flush_pending<State: Clone>(
         active: &ActiveAdmission<'_>,
         window: PendingAdmissionWindow<'_, State>,

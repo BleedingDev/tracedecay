@@ -86,6 +86,7 @@ enum RootAuthorityChannel {
 }
 
 impl RootAuthorityChannel {
+    #[hotpath::skip]
     const fn from_candidate(channel: CandidateChannel) -> Self {
         match channel {
             CandidateChannel::Summary => Self::Summary,
@@ -100,6 +101,7 @@ impl RootAuthorityChannel {
         }
     }
 
+    #[hotpath::skip]
     const fn tag(self) -> &'static str {
         match self {
             Self::Summary => "summary",

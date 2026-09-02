@@ -11,7 +11,7 @@
 //! `handle_tool_call` — the same dispatch path an agent's MCP client uses —
 //! against `tests/fixtures/context_eval_labeled.json`. Metrics
 //! (recall@5, required-anchor hit rate) are recomputed from the live
-//! `entry_points` ranking by the test itself, mirroring the redundancy
+//! `ContextResultV1.search_matches` ranking by the test itself, mirroring the redundancy
 //! eval's recomputed-metrics pattern
 //! (`redundancy_eval_fixture_scores_real_cases` in `src/redundancy.rs`): a
 //! fixture whose `expected_metrics` disagree with its own cases fails
@@ -58,6 +58,7 @@ async fn context_eval_fixture_scores_real_queries() {
     let mut recalls: Vec<f64> = Vec::new();
     let mut anchors_total = 0usize;
     let mut anchors_hit = 0usize;
+    let mut unexpected_anchor_misses: Vec<String> = Vec::new();
 
     for case in cases {
         let id = case["id"].as_str().expect("case id");
@@ -95,13 +96,7 @@ async fn context_eval_fixture_scores_real_queries() {
             .unwrap_or_else(|err| {
                 panic!("case {id}: tracedecay_context returned invalid JSON: {err}")
             });
-        let entry_points = payload["entry_points"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {id}: missing entry_points array in {payload}"));
-        let ranked: Vec<&str> = entry_points
-            .iter()
-            .filter_map(|n| n["qualified_name"].as_str())
-            .collect();
+        let ranked = ranked_context_qualified_names(&payload, id);
 
         let recall = recall_at_k(&ranked, &relevant, TOP_K);
         let anchors_hit_here = required_top3
@@ -119,12 +114,19 @@ async fn context_eval_fixture_scores_real_queries() {
             continue;
         }
 
-        assert!(
-            anchors_hit_here == required_top3.len(),
-            "case {id} ({task}): required_top3 {required_top3:?} not all within top {ANCHOR_K} of ranked entry_points {ranked:?}"
-        );
+        if anchors_hit_here != required_top3.len() {
+            unexpected_anchor_misses.push(format!(
+                "case {id} ({task}): required_top3 {required_top3:?} not all within top {ANCHOR_K} of ranked context names {ranked:?}"
+            ));
+        }
         recalls.push(recall);
     }
+
+    assert!(
+        unexpected_anchor_misses.is_empty(),
+        "ContextResultV1 ranking missed required anchors:\n{}",
+        unexpected_anchor_misses.join("\n")
+    );
 
     let mean_recall = round2(recalls.iter().sum::<f64>() / recalls.len() as f64);
     let anchor_hit_rate = round2(if anchors_total == 0 {
@@ -156,6 +158,23 @@ async fn context_eval_fixture_scores_real_queries() {
         "anchor_hit_rate regressed: computed {anchor_hit_rate}, floor is {expected_anchor_rate}"
     );
     production.harness.shutdown().await;
+}
+
+/// Ranked qualified names from the live `ContextResultV1` envelope
+/// (`crates/tracedecay-application/src/retrieval/primitive_surface.rs`).
+/// Context races primary search against the verified graph with
+/// `require_graph_for_empty_result = false`
+/// (`race_primary_search_with_graph` in
+/// `crates/tracedecay/src/mcp/tools/handlers/graph.rs`), so lexical
+/// `search_matches` is the stable ranking. Graph `symbols` only appear when
+/// the graph future wins that race and must not be the eval's authority.
+fn ranked_context_qualified_names<'a>(payload: &'a Value, id: &str) -> Vec<&'a str> {
+    payload["search_matches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {id}: ContextResultV1 missing search_matches in {payload}"))
+        .iter()
+        .filter_map(|node| node["qualified_name"].as_str())
+        .collect()
 }
 
 /// `recall@k` for a single query: the fraction of the labeled `relevant`

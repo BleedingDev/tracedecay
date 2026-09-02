@@ -110,6 +110,68 @@ pub struct CodeIndexBuildProgressV1 {
     pub blocked_reason: Option<CodeIndexBuildBlockedReasonV1>,
 }
 
+/// A deterministic contract violation that parked background convergence.
+///
+/// Parked is not dead: the worker keeps re-observing the violation on its
+/// ordinary wake cadence, so an operator fix (for example restoring an
+/// owner-private mode) is picked up on the next wake without a restart. The
+/// state exists so `status`, doctor, and the dashboard report the violation
+/// typed instead of an indefinite "warming".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CodeIndexConvergenceParkedV1 {
+    /// Exact typed failure that parked convergence.
+    pub reason: String,
+    /// Operator action that clears the violation.
+    pub remediation: String,
+    /// When the violation was first observed (microseconds since the Unix epoch).
+    pub parked_at_micros: i64,
+    /// Background passes that re-observed the violation since parking.
+    pub observed_passes: u64,
+    /// Whether the worker re-checks this violation on every ordinary wake.
+    /// True for filesystem/contract violations an operator fix clears in
+    /// place; false for an abnormal task failure that only changed input (a
+    /// new sealed generation) retries.
+    pub retries_on_wake: bool,
+}
+
+/// Recovery state for a durable generation sealed under a different production
+/// owner configuration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CodeIndexGenerationRecoveryV1 {
+    /// Generation retired from incremental reuse.
+    pub incompatible_generation_id: String,
+    /// Stable owner-input reason codes reported by the code-index authority.
+    pub incompatibilities: Vec<String>,
+    /// Whether the prior generation may continue serving while its replacement
+    /// builds under the current configuration.
+    pub serving: CodeIndexGenerationRecoveryServingV1,
+}
+
+/// Serving disposition of an incompatible generation during recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeIndexGenerationRecoveryServingV1 {
+    Preserved,
+    Refused,
+}
+
+/// Interactive graph-serving state for the latest sealed generation.
+///
+/// A sealed generation can expose truthful census statistics before its graph
+/// projection is ready to serve queries, so readiness is reported separately.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CodeGraphServingReadinessV1 {
+    /// No graph-serving authority exists for this worktree or generation.
+    Unavailable { reason: String },
+    /// The sealed generation exists, but graph activation has not completed.
+    Pending,
+    /// Graph activation completed without a serving projection.
+    Refused { reason: String },
+    /// The verified graph projection is installed for interactive reads.
+    Ready,
+}
+
 /// Freshness/generation state for one mounted worktree.
 ///
 /// `Deserialize` is part of the wire contract: the CLI status command decodes
@@ -129,6 +191,10 @@ pub struct CodeIndexWorktreeFreshnessV1 {
     pub source_revision: Option<String>,
     /// Latest sealed generation identity, when a complete generation exists.
     pub latest_generation_id: Option<String>,
+    /// Whether that generation's verified graph projection can serve reads.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_graph_serving: Option<CodeGraphServingReadinessV1>,
     /// Content identity of the complete source snapshot.
     pub snapshot_content_identity: Option<String>,
     /// Time the complete generation was durably sealed.
@@ -139,12 +205,26 @@ pub struct CodeIndexWorktreeFreshnessV1 {
     /// the scheduler most recently observed a fresh source; the status read
     /// does not probe the worktree to revalidate that observation.
     pub staleness_state: Option<String>,
+    /// Whether the exact scheduler route owns a reconcile pass or has a
+    /// pending wake. A stale seated generation with this false is stalled,
+    /// not in a routine rebuild window.
+    #[serde(default)]
+    pub rebuild_in_flight: bool,
     /// Pending hook-hint count, when cheaply available.
     pub hook_hint_count: Option<u64>,
     /// Whether this read covers the complete mounted scheduler state.
     pub coverage: String,
     /// Latest committed progress for the active generation, if one is mounted.
     pub progress: Option<CodeIndexBuildProgressV1>,
+    /// Deterministic contract violation currently parking background
+    /// convergence, when one is observed. `staleness_state` reads `parked`
+    /// while this is set and no generation serves.
+    pub parked: Option<CodeIndexConvergenceParkedV1>,
+    /// One-shot owner-configuration recovery currently replacing an
+    /// incompatible durable generation.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_recovery: Option<CodeIndexGenerationRecoveryV1>,
 }
 
 pub type CodeIndexFreshnessReadFuture =
@@ -207,6 +287,28 @@ async fn project_code_index_freshness(
                 payload,
             )
         }
+        // A parked deterministic contract violation with nothing serving is a
+        // typed error surface, not an indefinite loading spinner: the reason
+        // and remediation ride in the worktree payload.
+        Some(worktree) if worktree.parked.is_some() && worktree.latest_generation_id.is_none() => {
+            let reason = worktree
+                .parked
+                .as_ref()
+                .map(|parked| parked.reason.clone())
+                .unwrap_or_default();
+            DashboardEnvelopeV1::new(
+                scope_from_state(state),
+                DashboardDomainStateV1::Error,
+                DashboardCoverageV1::partial(
+                    1,
+                    0,
+                    "mounted_worktree",
+                    vec![format!("background convergence is parked: {reason}")],
+                ),
+                DashboardFreshnessV1::unknown(),
+                payload,
+            )
+        }
         Some(worktree) if worktree.latest_generation_id.is_none() => DashboardEnvelopeV1::new(
             scope_from_state(state),
             if worktree.staleness_state.as_deref() == Some("indexing") {
@@ -259,6 +361,47 @@ mod tests {
         crate::events_api::dashboard_state_fixture("project.dashboard-code-index").await
     }
 
+    #[test]
+    fn graph_serving_readiness_is_additive_for_older_daemon_responses() {
+        let mut value = serde_json::to_value(CodeIndexWorktreeFreshnessV1::default())
+            .expect("freshness serializes");
+        value
+            .as_object_mut()
+            .expect("freshness object")
+            .remove("code_graph_serving");
+        value
+            .as_object_mut()
+            .expect("freshness object")
+            .remove("rebuild_in_flight");
+
+        let decoded: CodeIndexWorktreeFreshnessV1 =
+            serde_json::from_value(value).expect("older response remains readable");
+        assert_eq!(decoded.code_graph_serving, None);
+        assert!(!decoded.rebuild_in_flight);
+
+        let ready = serde_json::to_value(CodeGraphServingReadinessV1::Ready)
+            .expect("ready state serializes");
+        assert_eq!(ready, serde_json::json!({ "state": "ready" }));
+    }
+
+    #[test]
+    fn generation_recovery_serializes_typed_serving_disposition() {
+        let recovery = CodeIndexGenerationRecoveryV1 {
+            incompatible_generation_id: "generation.config-a".to_owned(),
+            incompatibilities: vec!["policy_revision".to_owned()],
+            serving: CodeIndexGenerationRecoveryServingV1::Refused,
+        };
+
+        assert_eq!(
+            serde_json::to_value(recovery).expect("generation recovery serializes"),
+            serde_json::json!({
+                "incompatible_generation_id": "generation.config-a",
+                "incompatibilities": ["policy_revision"],
+                "serving": "refused"
+            })
+        );
+    }
+
     #[tokio::test]
     async fn freshness_route_is_typed_unsupported_without_daemon_authority() {
         let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
@@ -284,13 +427,17 @@ mod tests {
                     source_reference: Some("refs/heads/main".to_owned()),
                     source_revision: Some("commit.fixture".to_owned()),
                     latest_generation_id: Some("generation.fixture".to_owned()),
+                    code_graph_serving: Some(CodeGraphServingReadinessV1::Ready),
                     snapshot_content_identity: Some("sha256:fixture".to_owned()),
                     sealed_at_micros: Some(41),
                     last_reconcile_micros: Some(42),
                     staleness_state: Some("fresh".to_owned()),
+                    rebuild_in_flight: false,
                     hook_hint_count: Some(0),
                     coverage: "complete".to_owned(),
                     progress: None,
+                    parked: None,
+                    generation_recovery: None,
                 })
             })
         }));
@@ -322,13 +469,19 @@ mod tests {
                     source_reference: None,
                     source_revision: None,
                     latest_generation_id: None,
+                    code_graph_serving: Some(CodeGraphServingReadinessV1::Unavailable {
+                        reason: "generation_unavailable".to_owned(),
+                    }),
                     snapshot_content_identity: None,
                     sealed_at_micros: None,
                     last_reconcile_micros: Some(42),
                     staleness_state: Some("indexing".to_owned()),
+                    rebuild_in_flight: false,
                     hook_hint_count: Some(0),
                     coverage: "complete".to_owned(),
                     progress: None,
+                    parked: None,
+                    generation_recovery: None,
                 })
             })
         }));
@@ -352,10 +505,14 @@ mod tests {
                     source_reference: Some("refs/heads/main".to_owned()),
                     source_revision: Some("commit.fixture".to_owned()),
                     latest_generation_id: None,
+                    code_graph_serving: Some(CodeGraphServingReadinessV1::Unavailable {
+                        reason: "generation_unavailable".to_owned(),
+                    }),
                     snapshot_content_identity: None,
                     sealed_at_micros: None,
                     last_reconcile_micros: Some(42),
                     staleness_state: Some("indexing".to_owned()),
+                    rebuild_in_flight: false,
                     hook_hint_count: Some(0),
                     coverage: "complete".to_owned(),
                     progress: Some(CodeIndexBuildProgressV1 {
@@ -383,6 +540,8 @@ mod tests {
                         last_progress_micros: 43,
                         blocked_reason: None,
                     }),
+                    parked: None,
+                    generation_recovery: None,
                 })
             })
         }));

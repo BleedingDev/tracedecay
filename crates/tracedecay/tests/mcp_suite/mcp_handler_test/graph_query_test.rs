@@ -7,8 +7,8 @@ use std::process::Command;
 use std::time::Duration;
 use tempfile::TempDir;
 use tracedecay::daemon::ProductionProjectCompositionHarnessV1;
-use tracedecay::mcp::tools::ToolResult;
-use tracedecay_runtime_core::errors::TraceDecayError;
+use tracedecay_domain::errors::TraceDecayError;
+use tracedecay_mcp::ToolResult;
 
 struct GraphQueryFixture {
     production: ProductionCompositionFixture,
@@ -86,16 +86,26 @@ async fn shutdown_graph_fixture(fixture: GraphQueryFixture) {
 async fn call_production_tool(
     fixture: &GraphQueryFixture,
     tool_name: &str,
-    arguments: Value,
+    mut arguments: Value,
     _server_stats: Option<Value>,
     scope_prefix: Option<&str>,
-) -> tracedecay_runtime_core::errors::Result<ToolResult> {
+) -> tracedecay_domain::errors::Result<ToolResult> {
     if scope_prefix.is_some() {
         return Err(TraceDecayError::Config {
             message:
                 "graph-query production tests must express scope through public tool arguments"
                     .to_owned(),
         });
+    }
+    // The shared raw helper defaults every tool to `format: "json"`; tools
+    // whose production default is markdown must keep that default so these
+    // journeys assert the rendering agents actually receive.
+    if tracedecay_mcp::tool_defaults_to_markdown(tool_name)
+        && let Some(object) = arguments.as_object_mut()
+    {
+        object
+            .entry("format".to_owned())
+            .or_insert_with(|| json!("markdown"));
     }
     let server = fixture
         .production
@@ -168,9 +178,30 @@ async fn search_limit_above_retrieval_budget_serves_full_candidate_set() {
         payload["status"].is_null(),
         "high-limit search must not fail closed: {payload}"
     );
+    // A budget-bounded page over the shared fixture can exceed the transport's
+    // response budget; the truncation envelope hands back the canonical
+    // retrieve handle, and following it is the same journey an agent takes.
+    if payload["truncated"].as_bool() == Some(true) {
+        let handle = payload["handle"]
+            .as_str()
+            .unwrap_or_else(|| panic!("truncated search must mint a retrieve handle: {payload}"));
+        let retrieved = handle_real_server_tool_call(
+            &server,
+            "tracedecay_retrieve",
+            json!({ "handle": handle }),
+        )
+        .await;
+        let envelope: Value = serde_json::from_str(extract_real_server_text(&retrieved)).unwrap();
+        payload = serde_json::from_str(
+            envelope["content"]
+                .as_str()
+                .unwrap_or_else(|| panic!("retrieve must return the original text: {envelope}")),
+        )
+        .unwrap();
+    }
     let results = payload["results"]
         .as_array()
-        .expect("high-limit search results");
+        .unwrap_or_else(|| panic!("high-limit search results: {payload}"));
     assert!(
         !results.is_empty(),
         "high-limit search must return the fused candidates: {payload}"
@@ -1400,7 +1431,17 @@ async fn test_complexity_response_fields() {
 
 #[tokio::test]
 async fn test_doc_coverage_response_structure() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let (cg, _dir) = graph_query_fixture_with_sources(|project| {
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(
+            project.join("src/lib.rs"),
+            "/// This public function is documented.\n\
+             pub fn documented() {}\n\
+             pub fn undocumented() {}\n",
+        )
+        .unwrap();
+    })
+    .await;
     let result = call_production_tool(&cg, "tracedecay_doc_coverage", json!({}), None, None)
         .await
         .unwrap();
@@ -1412,20 +1453,23 @@ async fn test_doc_coverage_response_structure() {
     );
     assert!(parsed.get("file_count").is_some(), "should have file_count");
     assert!(parsed.get("files").is_some(), "should have files array");
-    // If there are files, check their structure
-    if let Some(files) = parsed["files"].as_array()
-        && let Some(first) = files.first()
-    {
-        assert!(first.get("file").is_some(), "file entry should have 'file'");
-        assert!(
-            first.get("count").is_some(),
-            "file entry should have 'count'"
-        );
-        assert!(
-            first.get("symbols").is_some(),
-            "file entry should have 'symbols'"
-        );
-    }
+    assert_eq!(
+        parsed["total_undocumented"].as_u64(),
+        Some(1),
+        "only the public symbol without a doc comment should be reported: {parsed}"
+    );
+    assert_eq!(parsed["file_count"].as_u64(), Some(1), "{parsed}");
+    let first = parsed["files"]
+        .as_array()
+        .and_then(|files| files.first())
+        .unwrap_or_else(|| panic!("doc coverage should report src/lib.rs: {parsed}"));
+    assert_eq!(first["file"].as_str(), Some("src/lib.rs"), "{parsed}");
+    assert_eq!(first["count"].as_u64(), Some(1), "{parsed}");
+    assert_eq!(
+        first["symbols"][0]["name"].as_str(),
+        Some("undocumented"),
+        "documented public symbols must be excluded: {parsed}"
+    );
 }
 
 #[tokio::test]

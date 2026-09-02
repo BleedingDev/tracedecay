@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tracedecay_application::retained_surfaces::{
-    FactIdentitySourceResultV1, FactSearchHitV1, FactStoreSearchResultV1,
+    FactIdentitySourceResultV1, FactRetrievalTelemetryV1, FactSearchHitV1, FactStoreSearchResultV1,
 };
 use tracedecay_domain::{Confidence, FactCategoryV1, FactOwnerV1, ProjectId};
 use tracedecay_memory_provider_registry::{
@@ -15,14 +15,14 @@ use tracedecay_memory_provider_registry::{
     OwnedVersionedId, ProviderCall, ProviderCallParts, ProviderOperation, ProviderReply,
     TerminalCode, parse_rfc3339_nanos,
 };
+use tracedecay_session_memory::memory::{
+    ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
+};
 use tracedecay_store::{
     FactReadControl, FactWriteControl, ProjectMemoryFactSearchKindV1, ProjectMemoryFactSearchQuery,
 };
-use tracedecay_usecases::memory::{
-    ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
-};
 
-use super::memory_mapping::public_search_page;
+use super::memory_mapping::search_page;
 use super::native_provider::ProjectNativeMemoryApplicationPort;
 use crate::tracedecay::{TraceDecay, TraceDecayOpenOptions};
 
@@ -82,7 +82,7 @@ async fn project_fixture() -> StoreFixture {
     let profile_root = temporary.path().join("profile");
     std::fs::create_dir_all(&project_root).expect("project root");
     std::fs::create_dir_all(&profile_root).expect("profile root");
-    crate::storage::pin_fixture_repository_identity(&project_root, PROJECT_ID)
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(&project_root, PROJECT_ID)
         .expect("project enrollment");
     let graph = Arc::new(
         TraceDecay::init_with_options(
@@ -179,7 +179,14 @@ async fn direct_search(fixture: &StoreFixture) -> FactStoreSearchResultV1 {
         .search_project_memory_facts(query, &FactReadControl::new(Arc::new(|| false)))
         .await
         .expect("direct project-memory search");
-    public_search_page(&page).expect("public direct search projection")
+    let mapped = search_page(&page).expect("public direct search projection");
+    FactStoreSearchResultV1 {
+        owner: mapped.owner,
+        hits: mapped.hits,
+        next_after: mapped.next_after,
+        graph_coverage: mapped.graph_coverage,
+        retrieval_telemetry: FactRetrievalTelemetryV1::NotApplicable,
+    }
 }
 
 /// The daemon profile the port under test is mounted for: the one profile

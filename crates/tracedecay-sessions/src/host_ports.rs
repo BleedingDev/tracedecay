@@ -60,6 +60,7 @@ pub mod session_review {
     }
 
     /// Requests a review pass; a no-op when unwired.
+    #[hotpath::skip]
     pub async fn schedule(provider: &str, session_id: Option<&str>) {
         if let Some(scheduler) = SCHEDULER.get() {
             scheduler(provider, session_id).await;

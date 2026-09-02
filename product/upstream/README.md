@@ -12,7 +12,7 @@ and every isolated train uses the strict
 - `observed_pull_request.head_sha` is only a dated observation of moving PR #707.
 
 The current pinned floor is
-<!-- pinned-floor -->`08fbe33a7c7f403191fd5d6e356c7b6681b96403`.
+<!-- pinned-floor -->`5749e4fcfe268e17bd19a0e6ef90c646f7b37289`.
 The verifier requires that commit to exist locally and remain an ancestor of
 the checked-out product head. The marker before the SHA is the anchored floor
 pin the sync train rewrites; no other prose in this directory may quote the

@@ -5,21 +5,16 @@
 //! repository outside the daemon's admitted scope.
 
 use serde_json::{Value, json};
+use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
 use crate::cli::{GitAction, GitDiffScopeArg, GitProjectArgs};
 use crate::{resolve_cli_project_root, tool_command::dispatch_catalogued_cli_operation};
 
-pub(crate) async fn handle_git_action(
-    action: GitAction,
-) -> tracedecay_runtime_core::errors::Result<()> {
+pub(crate) async fn handle_git_action(action: GitAction) -> tracedecay_domain::errors::Result<()> {
     match action {
         GitAction::Status { project } => {
             hotpath::future!(
-                dispatch_git_read(
-                    tracedecay::application_surface::ApplicationSurfaceOperation::GitStatus,
-                    json!({}),
-                    project,
-                ),
+                dispatch_git_read(ApplicationSurfaceOperation::GitStatus, json!({}), project,),
                 label = "cli.git.status"
             )
             .await
@@ -32,11 +27,7 @@ pub(crate) async fn handle_git_action(
         } => {
             let payload = git_diff_payload(scope, base, head)?;
             hotpath::future!(
-                dispatch_git_read(
-                    tracedecay::application_surface::ApplicationSurfaceOperation::GitDiff,
-                    payload,
-                    project,
-                ),
+                dispatch_git_read(ApplicationSurfaceOperation::GitDiff, payload, project,),
                 label = "cli.git.diff"
             )
             .await
@@ -50,11 +41,7 @@ pub(crate) async fn handle_git_action(
         } => {
             let payload = git_history_payload(count, path, follow, first_parent)?;
             hotpath::future!(
-                dispatch_git_read(
-                    tracedecay::application_surface::ApplicationSurfaceOperation::GitHistory,
-                    payload,
-                    project,
-                ),
+                dispatch_git_read(ApplicationSurfaceOperation::GitHistory, payload, project,),
                 label = "cli.git.history"
             )
             .await
@@ -66,7 +53,7 @@ pub(crate) async fn handle_git_action(
         } => {
             hotpath::future!(
                 dispatch_git_read(
-                    tracedecay::application_surface::ApplicationSurfaceOperation::GitBlame,
+                    ApplicationSurfaceOperation::GitBlame,
                     json!({
                         "path": path,
                         "follow_renames": follow_renames,
@@ -81,7 +68,7 @@ pub(crate) async fn handle_git_action(
             let scope = git_hunk_scope(scope)?;
             hotpath::future!(
                 dispatch_git_read(
-                    tracedecay::application_surface::ApplicationSurfaceOperation::GitHunks,
+                    ApplicationSurfaceOperation::GitHunks,
                     json!({ "scope": scope }),
                     project,
                 ),
@@ -93,10 +80,10 @@ pub(crate) async fn handle_git_action(
 }
 
 async fn dispatch_git_read(
-    operation: tracedecay::application_surface::ApplicationSurfaceOperation,
+    operation: ApplicationSurfaceOperation,
     payload: Value,
     project: GitProjectArgs,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     let GitProjectArgs {
         project,
         project_id,
@@ -111,7 +98,7 @@ fn git_diff_payload(
     scope: GitDiffScopeArg,
     base: Option<String>,
     head: Option<String>,
-) -> tracedecay_runtime_core::errors::Result<Value> {
+) -> tracedecay_domain::errors::Result<Value> {
     match scope {
         GitDiffScopeArg::WorkingTree => no_range_payload("working_tree", base, head),
         GitDiffScopeArg::Staged => no_range_payload("staged", base, head),
@@ -127,7 +114,7 @@ fn git_diff_payload(
     }
 }
 
-fn git_hunk_scope(scope: GitDiffScopeArg) -> tracedecay_runtime_core::errors::Result<&'static str> {
+fn git_hunk_scope(scope: GitDiffScopeArg) -> tracedecay_domain::errors::Result<&'static str> {
     match scope {
         GitDiffScopeArg::WorkingTree => Ok("working_tree"),
         GitDiffScopeArg::Staged => Ok("staged"),
@@ -142,7 +129,7 @@ fn git_history_payload(
     path: Option<String>,
     follow: bool,
     first_parent: bool,
-) -> tracedecay_runtime_core::errors::Result<Value> {
+) -> tracedecay_domain::errors::Result<Value> {
     if follow && path.is_none() {
         return Err(config_error("--follow requires --path"));
     }
@@ -163,7 +150,7 @@ fn no_range_payload(
     scope: &'static str,
     base: Option<String>,
     head: Option<String>,
-) -> tracedecay_runtime_core::errors::Result<Value> {
+) -> tracedecay_domain::errors::Result<Value> {
     if base.is_some() || head.is_some() {
         return Err(config_error(
             "--base and --head are valid only with --scope commit-range",
@@ -175,14 +162,14 @@ fn no_range_payload(
 fn required_commit_range_bound(
     name: &str,
     value: Option<String>,
-) -> tracedecay_runtime_core::errors::Result<String> {
+) -> tracedecay_domain::errors::Result<String> {
     value
         .filter(|value| !value.trim().is_empty() && value.trim() == value)
         .ok_or_else(|| config_error(&format!("--{name} is required with --scope commit-range")))
 }
 
-fn config_error(message: &str) -> tracedecay_runtime_core::errors::TraceDecayError {
-    tracedecay_runtime_core::errors::TraceDecayError::Config {
+fn config_error(message: &str) -> tracedecay_domain::errors::TraceDecayError {
+    tracedecay_domain::errors::TraceDecayError::Config {
         message: message.to_string(),
     }
 }

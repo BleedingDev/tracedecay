@@ -457,6 +457,7 @@ impl<A> RemoteEnrollmentServiceV1<A>
 where
     A: RemoteEnrollmentAuthorityPortV1,
 {
+    #[hotpath::skip]
     pub const fn new(authority: A) -> Self {
         Self { authority }
     }

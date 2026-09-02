@@ -16,13 +16,18 @@ use tracedecay_domain::{
 };
 use tracedecay_graph_db::NeverCancelled;
 use tracedecay_semantic::projector::{PreparedVectorGenerationV1, ProjectedChunkVectorV1};
+use tracedecay_semantic_contracts::{
+    DEFAULT_FASTEMBED_MODEL_ID, SemanticConfig, SemanticResourceCeilings,
+};
 
 use super::journey_test_support::git;
 use super::*;
 use tracedecay_code_index_retention::code_index_generations::{
     DEFAULT_SUPERSEDED_GENERATION_FLOOR, prepare_next_code_generation_retention_cancellable,
 };
-use tracedecay_usecases::semantic_runtime::project_semantic_retained_vector_generations;
+use tracedecay_usecases::semantic_runtime::{
+    ProjectSemanticActivationExt, project_semantic_retained_vector_generations,
+};
 use tracedecay_usecases::store::vector_generations::{
     GraphVectorGenerationStoreV1, SemanticVectorStageDescriptorV1, VectorGenerationPlanV1,
 };
@@ -325,7 +330,7 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
     assert!(first_source_file.is_file());
 
     let observations = resources.store_administration.store_telemetry_sampling();
-    let cancellation = tracedecay_usecases::context::CancellationToken::new();
+    let cancellation = tracedecay_session_memory::context::CancellationToken::new();
     assert!(
         !crate::daemon::maintenance::generation::run_project_generation_maintenance(
             graph.as_ref(),
@@ -428,7 +433,7 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
     let restarted_observations = restarted_resources
         .store_administration
         .store_telemetry_sampling();
-    let restarted_cancellation = tracedecay_usecases::context::CancellationToken::new();
+    let restarted_cancellation = tracedecay_session_memory::context::CancellationToken::new();
     let mut converged = false;
     for _ in 0..4 {
         converged = crate::daemon::maintenance::generation::run_project_generation_maintenance(
@@ -524,12 +529,12 @@ async fn set_semantic_disabled(harness: &ProductionProjectCompositionHarnessV1, 
         )
         .expect("semantic runtime setting key"),
         value: tracedecay_domain::configuration::ConfigurationValueV1::Text(
-            serde_json::to_string(&crate::config::SemanticConfig {
-                selected_model: Some(crate::semantic_code::DEFAULT_FASTEMBED_MODEL_ID.to_owned()),
+            serde_json::to_string(&SemanticConfig {
+                selected_model: Some(DEFAULT_FASTEMBED_MODEL_ID.to_owned()),
                 auto_download: false,
                 active_profile: None,
                 rollback_profile: None,
-                resources: crate::config::SemanticResourceCeilings::default(),
+                resources: SemanticResourceCeilings::default(),
             })
             .expect("disabled semantic runtime JSON"),
         ),
@@ -595,7 +600,7 @@ async fn run_generation_cadence(
         graph.as_ref(),
         &resources.invocation.code_index_schedulers,
         &resources.store_administration.store_telemetry_sampling(),
-        &tracedecay_usecases::context::CancellationToken::new(),
+        &tracedecay_session_memory::context::CancellationToken::new(),
         &crate::config::RetentionConfig::default(),
         None,
     )
@@ -637,12 +642,12 @@ async fn linked_worktree_scope_retention_crash_replay_and_pure_inventory_journey
         .expect("linked-worktree retention journey requires the distribution FastEmbed fixture");
     let _profile = crate::config::PinnedUserDataDir::new();
     let lifecycle_root =
-        crate::semantic_code::default_lifecycle_root().expect("isolated lifecycle root");
+        tracedecay_semantic::default_lifecycle_root().expect("isolated lifecycle root");
     let lifecycle =
-        crate::semantic_code::shared_lifecycle_owner().expect("production lifecycle owner");
+        tracedecay_semantic::default_shared_lifecycle_owner().expect("production lifecycle owner");
     seed_distribution_fixture(&lifecycle_root, &fixture_root, &lifecycle);
     lifecycle
-        .select_model(Some(crate::semantic_code::DEFAULT_FASTEMBED_MODEL_ID), true)
+        .select_model(Some(DEFAULT_FASTEMBED_MODEL_ID), true)
         .expect("select production semantic model");
     lifecycle
         .acquire_blocking_for_tests()

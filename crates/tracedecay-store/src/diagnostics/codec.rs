@@ -47,6 +47,7 @@ impl DiagnosticRecordStateKindV1 {
     }
 
     /// The exact text persisted in `record_state`.
+    #[hotpath::skip]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Current => DIAGNOSTIC_STATE_CURRENT,
@@ -59,6 +60,7 @@ impl DiagnosticRecordStateKindV1 {
     /// carries, or `None` for the current state, which stores SQL `NULL`.
     ///
     /// Callers use the name to build a decode error naming the exact field.
+    #[hotpath::skip]
     pub const fn state_generation_field(self) -> Option<&'static str> {
         match self {
             Self::Current => None,

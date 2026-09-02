@@ -10,12 +10,14 @@ impl Database {
     }
 
     /// Applies the canonical retained runtime's bounded WAL checkpoint policy.
+    #[hotpath::skip]
     pub async fn checkpoint(&self) -> Result<()> {
         self.require_active_write_scope("checkpoint")?;
         let _writer = self.writer().await;
         self.checkpoint_unguarded().await
     }
 
+    #[hotpath::skip]
     pub async fn release_connection_memory(&self) -> Result<()> {
         // Both connections derive from the same registry runtime handle and
         // share one reader pool, so releasing through either covers every
@@ -41,6 +43,7 @@ impl Database {
     }
 
     /// Forces a complete WAL truncation through the retained writer actor.
+    #[hotpath::skip]
     pub async fn truncate_wal_for_offline_maintenance(&self) -> Result<()> {
         const OPERATION: &str = "truncate WAL for offline maintenance";
         self.require_active_write_scope(OPERATION)?;
@@ -116,10 +119,12 @@ impl Database {
 
     #[cfg(any(test, feature = "test-transport"))]
     #[doc(hidden)]
+    #[hotpath::skip]
     pub async fn truncate_wal_for_test_artifact(&self) -> Result<()> {
         self.truncate_wal_for_offline_maintenance().await
     }
 
+    #[hotpath::skip]
     pub(crate) async fn checkpoint_unguarded(&self) -> Result<()> {
         let authority = self.write_authority()?;
         let request = CheckpointRequest::new(
@@ -148,6 +153,7 @@ impl Database {
         }
     }
 
+    #[hotpath::skip]
     pub async fn size(&self) -> Result<u64> {
         let mut rows = self
             .inner
@@ -181,10 +187,12 @@ impl Database {
         Ok(size as u64)
     }
 
+    #[hotpath::skip]
     pub async fn quick_check(&self) -> Result<bool> {
         Ok(self.quick_check_report().await?.is_none())
     }
 
+    #[hotpath::skip]
     pub async fn quick_check_report(&self) -> Result<Option<String>> {
         Ok(match self.health_on_fresh_reader("quick_check").await? {
             DatabaseHealth::Healthy => None,
@@ -192,6 +200,7 @@ impl Database {
         })
     }
 
+    #[hotpath::skip]
     async fn health_on_fresh_reader(&self, operation: &str) -> Result<DatabaseHealth> {
         let queued_at = std::time::Instant::now();
         let _health_guard = DATABASE_HEALTH_GATE
@@ -244,17 +253,28 @@ impl Database {
         })
     }
 
+    #[hotpath::skip]
     pub async fn storage_page_counts(&self) -> Result<(u64, u64, u64)> {
-        self.client
-            .runtime()
-            .storage_page_counts(std::time::Duration::from_secs(5))
-            .map_err(|error| TraceDecayError::Database {
-                message: format!("failed to sample SQLite-store pages: {error:?}"),
-                operation: "sample SQLite-store pages".to_owned(),
-            })
+        // The registry sampler blocks on reserved-health reader acquisition
+        // and a worker rendezvous (each bounded below); run it on the blocking
+        // pool so a busy store cannot capture an async executor thread.
+        let runtime = self.client.runtime().clone();
+        tokio::task::spawn_blocking(move || {
+            runtime.storage_page_counts(std::time::Duration::from_secs(5))
+        })
+        .await
+        .map_err(|error| TraceDecayError::Database {
+            message: format!("store-size sampling task failed: {error}"),
+            operation: "sample SQLite-store pages".to_owned(),
+        })?
+        .map_err(|error| TraceDecayError::Database {
+            message: format!("failed to sample SQLite-store pages: {error:?}"),
+            operation: "sample SQLite-store pages".to_owned(),
+        })
     }
 
     /// Runs bounded incremental vacuum through the canonical writer lane.
+    #[hotpath::skip]
     pub async fn run_incremental_vacuum(&self, pages: u64) -> Result<()> {
         let authority = self.write_authority()?;
         self.client
@@ -270,6 +290,7 @@ impl Database {
     /// Produces an online snapshot through this database's canonical writer
     /// runtime. Read-only clients cannot request a snapshot because the
     /// writer samples the retained write authority throughout publication.
+    #[hotpath::skip]
     pub async fn snapshot_to(&self, destination: &std::path::Path) -> Result<()> {
         let authority = self.write_authority()?;
         self.client
@@ -286,6 +307,7 @@ impl Database {
     /// Produces an interruption-aware online snapshot through this database's
     /// canonical writer runtime. The caller supplies only request control;
     /// this guarded facade retains and revalidates the exact write authority.
+    #[hotpath::skip]
     pub async fn snapshot_to_interruptible(
         &self,
         destination: &std::path::Path,

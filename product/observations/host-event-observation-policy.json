@@ -739,7 +739,7 @@
         "authority": "TraceDecay Native explicit fact authority",
         "settled_state": "Validated promotion committed with lineage, idempotency, and privacy receipt",
         "source_paths": [
-          "crates/tracedecay-usecases/src/memory/project_memory.rs",
+          "crates/tracedecay-session-memory/src/memory/project_memory.rs",
           "crates/tracedecay-global-db/src/native_integration"
         ],
         "receipt_fields": ["fact_id", "promotion_operation_id", "lineage_digest", "privacy_receipt", "resolved_scope_digest"],

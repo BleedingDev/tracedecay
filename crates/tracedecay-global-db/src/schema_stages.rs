@@ -396,7 +396,7 @@ const DELIVERY_SETTLEMENT_SCHEMA: &str = "
 /// stepped forward from an older shape.
 pub async fn ensure_registered_schema(
     installation: &RegisteredSchemaInstallationV1,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     let convergence = ensure_registered_schema_for_admission(installation).await?;
     converge_registered_schema_on(installation, convergence).await
 }
@@ -424,7 +424,7 @@ struct RegisteredSchemaAdmissionClassification {
 async fn classify_registered_schema_admission(
     connection: &impl QueryExecutor,
     binding: &tracedecay_store::StoreRuntimeBindingV1,
-) -> tracedecay_runtime_core::errors::Result<RegisteredSchemaAdmissionClassification> {
+) -> tracedecay_domain::errors::Result<RegisteredSchemaAdmissionClassification> {
     crate::registered_legacy_relations::reject_legacy_session_relation_shape(connection, binding)
         .await?;
     // The LCM authority classifies profile content first: a legacy or
@@ -432,13 +432,13 @@ async fn classify_registered_schema_admission(
     // state instead of being masked by the coarser workflow/configuration
     // schema resets, which would also flag a store those features were simply
     // never installed in.
-    tracedecay_sessions::runtime::lcm::schema::require_admissible_lcm_schema(connection)
+    tracedecay_lcm::schema::require_admissible_lcm_schema(connection)
         .await
         .map_err(|error| match error {
-            tracedecay_sessions::runtime::lcm::LcmError::ProfileResetRequired {
+            tracedecay_lcm::LcmError::ProfileResetRequired {
                 found_version,
                 required_version,
-            } => tracedecay_runtime_core::errors::TraceDecayError::ProfileResetRequired {
+            } => tracedecay_domain::errors::TraceDecayError::ProfileResetRequired {
                 component: "LCM",
                 found_version,
                 required_version,
@@ -449,10 +449,7 @@ async fn classify_registered_schema_admission(
         .await
         .map_err(|error| match error {
             configuration::ConfigurationSchemaError::ResetRequired { reason } => {
-                tracedecay_runtime_core::errors::TraceDecayError::reset_required(
-                    "configuration",
-                    reason,
-                )
+                tracedecay_domain::errors::TraceDecayError::reset_required("configuration", reason)
             }
             configuration::ConfigurationSchemaError::Storage(error) => {
                 global_db_operation_error("inspect configuration schema freshness", error)
@@ -468,10 +465,7 @@ async fn classify_registered_schema_admission(
         .await
         .map_err(|error| match error {
             configuration::ConfigurationSchemaError::ResetRequired { reason } => {
-                tracedecay_runtime_core::errors::TraceDecayError::reset_required(
-                    "configuration",
-                    reason,
-                )
+                tracedecay_domain::errors::TraceDecayError::reset_required("configuration", reason)
             }
             configuration::ConfigurationSchemaError::Storage(error) => {
                 global_db_operation_error("admit configuration schema", error)
@@ -484,12 +478,10 @@ async fn classify_registered_schema_admission(
     if configuration_fresh.is_none()
         && let Err(error) = validate_remote_deletion_schema_contract(connection).await
     {
-        return Err(
-            tracedecay_runtime_core::errors::TraceDecayError::reset_required(
-                "remote deletion tombstones",
-                error.to_string(),
-            ),
-        );
+        return Err(tracedecay_domain::errors::TraceDecayError::reset_required(
+            "remote deletion tombstones",
+            error.to_string(),
+        ));
     }
     Ok(RegisteredSchemaAdmissionClassification {
         configuration_fresh,
@@ -504,7 +496,7 @@ async fn classify_registered_schema_admission(
 #[hotpath::measure(future = true, label = "global_db.schema.persist.admission")]
 pub async fn ensure_registered_schema_for_admission(
     installation: &RegisteredSchemaInstallationV1,
-) -> tracedecay_runtime_core::errors::Result<RegisteredSchemaConvergence> {
+) -> tracedecay_domain::errors::Result<RegisteredSchemaConvergence> {
     const OPERATION: &str = "initialize registered global database schema";
     let RegisteredSchemaAdmissionClassification {
         configuration_fresh,
@@ -548,6 +540,20 @@ pub async fn ensure_registered_schema_for_admission(
         .map_err(|error| {
             global_db_operation_error("initialize observation projection indexes", error)
         })?;
+    // Stores installed before the LCM status indexes existed are already at
+    // the current LCM schema version, so the in-transaction LCM stage above
+    // returned without touching them. Each build is one idempotent
+    // authority-revalidated batch outside the shared schema transaction: a
+    // real-scale index build over the raw-message store gets the long lease
+    // instead of holding every other admission stage open.
+    for sql in tracedecay_lcm::schema::LCM_STATUS_PERFORMANCE_INDEX_SQL {
+        installation
+            .execute_authority_revalidated_batch(sql)
+            .await
+            .map_err(|error| {
+                global_db_operation_error("initialize LCM status performance indexes", error)
+            })?;
+    }
     validate_authority_schema_contract(installation).await?;
     Ok(RegisteredSchemaConvergence {
         force_exhaustive,
@@ -565,17 +571,14 @@ async fn install_registered_schema_stages(
     temporal_admission: session_temporal_schema::SessionTemporalSchemaAdmission,
     workflow_admission: WorkflowSchemaAdmission,
     force_exhaustive: bool,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     crate::hotpath_observe::record_transaction_rows(1);
     let is_fresh = configuration_fresh.is_some();
     configuration::ensure_configuration_schema(transaction, configuration_fresh)
         .await
         .map_err(|error| match error {
             configuration::ConfigurationSchemaError::ResetRequired { reason } => {
-                tracedecay_runtime_core::errors::TraceDecayError::reset_required(
-                    "configuration",
-                    reason,
-                )
+                tracedecay_domain::errors::TraceDecayError::reset_required("configuration", reason)
             }
             configuration::ConfigurationSchemaError::Storage(error) => {
                 global_db_operation_error("initialize configuration schema", error)
@@ -619,12 +622,10 @@ async fn install_registered_schema_stages(
         if is_fresh {
             return Err(error);
         }
-        return Err(
-            tracedecay_runtime_core::errors::TraceDecayError::reset_required(
-                project_registry::PROJECT_REGISTRY_AUTHORITY,
-                error.to_string(),
-            ),
-        );
+        return Err(tracedecay_domain::errors::TraceDecayError::reset_required(
+            project_registry::PROJECT_REGISTRY_AUTHORITY,
+            error.to_string(),
+        ));
     }
     project_registry::validate_project_rows_have_canonical_keys(transaction).await?;
 
@@ -702,7 +703,15 @@ async fn install_registered_schema_stages(
         "initialize registered external source state",
     )
     .await?;
-    if temporal_admission != session_temporal_schema::SessionTemporalSchemaAdmission::Current {
+    // `force_exhaustive` means admission observed damaged or missing guard
+    // triggers (for example a dropped guarded table takes its triggers with
+    // it). Reinstall them here so the post-commit contract validation sees a
+    // whole schema, and let the armed exhaustive audit re-earn trust; leaving
+    // them broken would fail every subsequent open of an otherwise
+    // repairable store.
+    if force_exhaustive
+        || temporal_admission != session_temporal_schema::SessionTemporalSchemaAdmission::Current
+    {
         ensure_authority_invariant_schema(transaction).await?;
         if !authority_invariant_triggers_intact(transaction).await? {
             return Err(global_db_operation_message(
@@ -712,13 +721,13 @@ async fn install_registered_schema_stages(
         }
     }
 
-    tracedecay_sessions::runtime::lcm::schema::ensure_lcm_schema_in_transaction(transaction)
+    tracedecay_lcm::schema::ensure_lcm_schema_in_transaction(transaction)
         .await
         .map_err(|error| match error {
-            tracedecay_sessions::runtime::lcm::LcmError::ProfileResetRequired {
+            tracedecay_lcm::LcmError::ProfileResetRequired {
                 found_version,
                 required_version,
-            } => tracedecay_runtime_core::errors::TraceDecayError::ProfileResetRequired {
+            } => tracedecay_domain::errors::TraceDecayError::ProfileResetRequired {
                 component: "LCM",
                 found_version,
                 required_version,
@@ -750,7 +759,7 @@ async fn install_registered_schema_stages(
 pub async fn converge_registered_schema(
     database: &Database,
     convergence: RegisteredSchemaConvergence,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     // The invariant pass pages historical authority rows and can legitimately
     // outlive an ordinary open on a large store. The admission phase has
     // already installed and validated its guard triggers, so daemon reads and
@@ -768,7 +777,7 @@ pub async fn converge_registered_schema(
 async fn converge_registered_schema_on(
     connection: &impl Executor,
     convergence: RegisteredSchemaConvergence,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     ensure_authority_invariants(
         connection,
         convergence.force_exhaustive,
@@ -789,7 +798,7 @@ async fn converge_registered_schema_on(
 #[hotpath::measure(future = true, label = "global_db.schema.persist.converge_attached")]
 pub async fn converge_attached_registered_schema(
     database: &Database,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     let transaction = database
         .begin_bulk_write_transaction("converge attached global database authority schema")
         .await?;
@@ -819,7 +828,7 @@ pub async fn converge_attached_registered_schema(
 #[hotpath::measure(future = true, label = "global_db.schema.persist.attach")]
 pub async fn ensure_attached_registered_schema(
     database: &Database,
-) -> tracedecay_runtime_core::errors::Result<RegisteredSchemaConvergence> {
+) -> tracedecay_domain::errors::Result<RegisteredSchemaConvergence> {
     let read_connection = database.read_connection();
     let RegisteredSchemaAdmissionClassification {
         configuration_fresh,
@@ -863,6 +872,15 @@ pub async fn ensure_attached_registered_schema(
         })?;
         transaction.commit().await?;
     }
+    for sql in tracedecay_lcm::schema::LCM_STATUS_PERFORMANCE_INDEX_SQL {
+        let transaction = database
+            .begin_bulk_write_transaction("install LCM status performance index")
+            .await?;
+        transaction.execute_batch(sql).await.map_err(|error| {
+            global_db_operation_error("initialize LCM status performance indexes", error)
+        })?;
+        transaction.commit().await?;
+    }
     validate_authority_schema_contract(&read_connection).await?;
     Ok(RegisteredSchemaConvergence {
         force_exhaustive,
@@ -878,7 +896,7 @@ enum WorkflowSchemaAdmission {
 
 async fn inspect_workflow_schema_for_admission(
     conn: &impl QueryExecutor,
-) -> tracedecay_runtime_core::errors::Result<WorkflowSchemaAdmission> {
+) -> tracedecay_domain::errors::Result<WorkflowSchemaAdmission> {
     let mut rows = conn
         .query(
             "SELECT type, name, sql FROM sqlite_master
@@ -1017,28 +1035,26 @@ async fn inspect_workflow_schema_for_admission(
     Ok(WorkflowSchemaAdmission::Complete)
 }
 
-fn workflow_schema_reset_required(
-    reason: &str,
-) -> tracedecay_runtime_core::errors::TraceDecayError {
-    tracedecay_runtime_core::errors::TraceDecayError::reset_required("workflow", reason)
+fn workflow_schema_reset_required(reason: &str) -> tracedecay_domain::errors::TraceDecayError {
+    tracedecay_domain::errors::TraceDecayError::reset_required("workflow", reason)
 }
 
 pub async fn validate_observation_authority_connection(
     conn: &impl QueryExecutor,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     validate_authority_schema_contract(conn).await?;
     validate_authority_rows_exhaustive(conn).await
 }
 
 pub async fn begin_observation_authority_canonical_repair(
     conn: &impl Executor,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     suspend_immutability_for_canonical_repair(conn).await
 }
 
 pub async fn finish_observation_authority_canonical_repair(
     conn: &impl Executor,
-) -> tracedecay_runtime_core::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<()> {
     restore_immutability_after_canonical_repair(conn).await
 }
 
@@ -1063,7 +1079,7 @@ mod tests {
 
     async fn registered_admission_error(
         database_path: &std::path::Path,
-    ) -> tracedecay_runtime_core::errors::TraceDecayError {
+    ) -> tracedecay_domain::errors::TraceDecayError {
         match open_registered_test_database_fixture(
             database_path,
             TestDatabaseRuntimeScope::ProfileSessions,
@@ -1194,7 +1210,7 @@ mod tests {
         assert!(
             matches!(
                 error,
-                tracedecay_runtime_core::errors::TraceDecayError::ResetRequired { .. }
+                tracedecay_domain::errors::TraceDecayError::ResetRequired { .. }
             ),
             "incompatible final V2 catalog returned the wrong typed problem: {error}"
         );
@@ -1317,7 +1333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_trigger_is_refused_before_row_audit_without_repair() {
+    async fn restored_triggers_still_refuse_corrupt_rows_without_repairing_them() {
         let directory = TempDir::new().unwrap();
         let database_path = directory.path().join("sessions.db");
         install_registered_schema(&database_path).await;
@@ -1339,18 +1355,22 @@ mod tests {
                     ('cursor-b', 2, X'02', 200, NULL);
                  DELETE FROM authority_audit_checkpoints;",
                 )
-                .expect("seed a repair followed by a late audit failure");
+                .expect("seed corrupt rows behind dropped guard triggers");
         }
 
-        let error = registered_admission_error(&database_path).await;
+        // Damaged guard triggers are restored during admission so the store
+        // stays repairable, but restoration must not launder the rows the
+        // triggers failed to guard: the row audit still refuses the store.
+        for attempt in 1..=2u8 {
+            let error = registered_admission_error(&database_path).await;
+            assert!(
+                error
+                    .to_string()
+                    .contains("session cursor key rotation state is invalid"),
+                "open attempt {attempt} must keep refusing the corrupt rotation state: {error}"
+            );
+        }
         let connection = TestConnection::open(&database_path);
-        assert!(
-            error
-                .to_string()
-                .contains("projection_queue_identity_insert_v1"),
-            "schema refusal must identify the missing final trigger: {error}"
-        );
-
         let mut rows = connection
             .query("SELECT COUNT(*) FROM projection_queue", ())
             .await
@@ -1358,7 +1378,20 @@ mod tests {
         assert_eq!(
             rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
             1,
-            "schema refusal must not repair queued rows before row admission"
+            "audit refusal must not repair queued rows before row admission"
+        );
+        drop(rows);
+        let mut rows = connection
+            .query(
+                "SELECT COUNT(*) FROM session_query_cursor_keys WHERE retired_at IS NULL",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            2,
+            "audit refusal must not retire or delete the conflicting cursor keys"
         );
         drop(rows);
         let mut rows = connection
@@ -1370,13 +1403,13 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            rows.next().await.unwrap().is_none(),
-            "schema refusal must not recreate a missing final trigger"
+            rows.next().await.unwrap().is_some(),
+            "admission must restore the dropped guard trigger before refusing on rows"
         );
     }
 
     #[tokio::test]
-    async fn missing_trigger_refusal_precedes_foreign_key_audit_without_repair() {
+    async fn restored_triggers_arm_a_persistent_audit_that_refuses_fk_violations() {
         let directory = TempDir::new().unwrap();
         let database_path = directory.path().join("sessions.db");
         install_registered_schema(&database_path).await;
@@ -1396,16 +1429,28 @@ mod tests {
                 .expect("seed a foreign-key violation behind a broken trigger");
         }
 
-        for attempt in 1..=2 {
+        // The damaged trigger arms an exhaustive foreign-key audit whose
+        // requirement is persisted before the trigger evidence is repaired,
+        // so every subsequent open keeps refusing the violation even though
+        // the trigger itself is already restored.
+        for attempt in 1..=2u8 {
             let error = registered_admission_error(&database_path).await;
             assert!(
-                error
-                    .to_string()
-                    .contains("projection_queue_identity_insert_v1"),
-                "open attempt {attempt} returned an unexpected error: {error}"
+                error.to_string().contains("foreign-key violation"),
+                "open attempt {attempt} must refuse the foreign-key violation: {error}"
             );
         }
         let connection = TestConnection::open(&database_path);
+        let mut rows = connection
+            .query("SELECT COUNT(*) FROM audit_child WHERE parent_id = 99", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            1,
+            "audit refusal must not repair or delete the violating row"
+        );
+        drop(rows);
         let mut rows = connection
             .query(
                 "SELECT 1 FROM sqlite_schema
@@ -1415,8 +1460,46 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            rows.next().await.unwrap().is_none(),
-            "repeated schema refusals must not recreate the missing trigger"
+            rows.next().await.unwrap().is_some(),
+            "admission must restore the dropped guard trigger while the audit refuses"
+        );
+    }
+
+    #[tokio::test]
+    async fn damaged_triggers_on_a_clean_store_are_restored_and_admitted() {
+        let directory = TempDir::new().unwrap();
+        let database_path = directory.path().join("sessions.db");
+        install_registered_schema(&database_path).await;
+        {
+            let connection = rusqlite::Connection::open(&database_path).unwrap();
+            connection
+                .execute_batch(
+                    "DROP TRIGGER IF EXISTS projection_queue_identity_insert_v1;
+                     DROP TRIGGER IF EXISTS session_query_cursor_keys_insert_guard_v1;",
+                )
+                .expect("drop guard triggers on an otherwise clean store");
+        }
+
+        // A guarded table rebuild drops its triggers with it; the next open
+        // must restore them and re-admit the store once the armed exhaustive
+        // audit finds nothing wrong, instead of refusing it forever.
+        install_registered_schema(&database_path).await;
+        let connection = TestConnection::open(&database_path);
+        let mut rows = connection
+            .query(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'trigger' AND name IN (
+                    'projection_queue_identity_insert_v1',
+                    'session_query_cursor_keys_insert_guard_v1'
+                 )",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            2,
+            "admission must restore every dropped guard trigger"
         );
     }
 }

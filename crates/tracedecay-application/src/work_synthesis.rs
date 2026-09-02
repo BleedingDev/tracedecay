@@ -142,6 +142,7 @@ pub enum WorkSynthesisRefusalV1 {
 }
 
 impl WorkSynthesisRefusalV1 {
+    #[hotpath::skip]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::NoCitableSources => "no_citable_sources",

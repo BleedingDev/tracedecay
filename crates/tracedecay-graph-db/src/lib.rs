@@ -22,6 +22,7 @@ mod schema;
 mod sealed_store;
 pub mod semantic_vector_native;
 mod state;
+mod store_quarantine;
 mod traversal;
 mod vector;
 mod verified_marker;
@@ -33,7 +34,7 @@ pub use bundle::{
     SealedReadBundleWriterV1, load_sealed_read_bundle_artifact, retire_sealed_read_bundle,
     sweep_aborted_sealed_read_bundle_temporaries,
 };
-pub use error::{GraphBudgetKind, GraphDbError};
+pub use error::{GraphBudgetKind, GraphConflictContextV1, GraphDbError};
 pub use generation::{
     GraphEntityRef, GraphGenerationDependency, GraphGenerationManifest,
     GraphGenerationManifestIdentity, GraphGenerationManifestProvider, GraphGenerationRelation,
@@ -90,7 +91,8 @@ pub use registry::{
     GraphDbOwnerRegistrationV1, GraphDbRegistration, GraphDbRegistry, GraphDbRegistryCapacity,
     GraphDbRegistryConfig, GraphDbRegistryStatus, GraphDbRetirementCommit,
     GraphDbRetirementOutcome, GraphDbRetirementRefusal, GraphDbRetirementReservation,
-    SemanticVectorRetentionAction, SemanticVectorRetentionCensus, SemanticVectorRetentionStep,
+    GraphPublicationPreparationV1, ProvenGraphPublicationV1, SemanticVectorRetentionAction,
+    SemanticVectorRetentionCensus, SemanticVectorRetentionStep,
     SemanticVectorRetirementReservation, VerifiedGenerationBatchApply,
     VerifiedGenerationBatchCommit,
 };
@@ -144,16 +146,10 @@ pub fn take_graph_db_verification_counters() -> GraphDbVerificationCounters {
     hotpath_observe::take_verification_counters()
 }
 pub use traversal::{
-    GraphRelationTarget, GraphTraversalDirection, TraversalRequest, TraversalResult, TraversalVisit,
+    GraphRelationTarget, GraphTraversalDirection, RelationFanoutOverflow, TraversalRequest,
+    TraversalResult, TraversalVisit,
 };
-#[cfg(not(any(feature = "test-helpers", feature = "eval-helpers")))]
-pub(crate) use vector::{GraphVectorIndexRequest, GraphVectorIndexStatus};
-#[cfg(any(feature = "test-helpers", feature = "eval-helpers"))]
 pub use vector::{
     GraphVectorIndexRequest, GraphVectorIndexStatus, MAX_VECTOR_SEARCH_LIMIT, VectorMatch,
     VectorMetric, VectorSearchRequest, VectorSearchResult,
-};
-#[cfg(not(any(feature = "test-helpers", feature = "eval-helpers")))]
-pub use vector::{
-    MAX_VECTOR_SEARCH_LIMIT, VectorMatch, VectorMetric, VectorSearchRequest, VectorSearchResult,
 };

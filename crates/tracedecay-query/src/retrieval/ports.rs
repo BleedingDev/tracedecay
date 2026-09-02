@@ -11,8 +11,8 @@ use thiserror::Error;
 use tracedecay_domain::{
     CodeGenerationId, CodeSearchChunkId, CompactCandidate, CursorPayloadDigest,
     ExactTechnicalTermKindV1, FileOccurrenceId, LanguageDescriptorRevision, RetrievalAnchorId,
-    RetrievalBudget, RetrieverBatch, RetrieverKind, RetrieverOutcome, SourceOccurrenceId,
-    SymbolOccurrenceId, canonical_sha256,
+    RetrievalBudget, RetrievalError, RetrieverBatch, RetrieverKind, RetrieverOutcome,
+    SourceOccurrenceId, SymbolOccurrenceId, canonical_sha256,
 };
 
 use super::exact::{ExactLaneEvidence, ExactLaneRequest};
@@ -40,6 +40,33 @@ pub enum RetrievalPortError {
     BudgetExceeded,
     #[error("contract violation: {0}")]
     Contract(String),
+}
+
+impl RetrievalPortError {
+    /// True when this failure is a deterministic contract violation that the
+    /// same input reproduces on every pass — a wrong filesystem mode, a
+    /// symlinked or non-directory store path, a corrupt identity. Background
+    /// workers park these visibly instead of masking them as warming, unlike
+    /// transient capacity, availability, staleness, and cancellation failures
+    /// that a later pass can clear on its own.
+    pub fn is_deterministic_contract(&self) -> bool {
+        matches!(self, Self::Contract(_))
+    }
+}
+
+impl From<RetrievalPortError> for RetrievalError {
+    fn from(error: RetrievalPortError) -> Self {
+        match error {
+            RetrievalPortError::CapabilityManifestRejected => Self::CapabilityManifestRejected,
+            RetrievalPortError::GenerationMismatch => Self::GenerationMismatch,
+            RetrievalPortError::AuthorityUnavailable(detail) => Self::AuthorityUnavailable(detail),
+            RetrievalPortError::IncompatibleProjection => Self::IncompatibleProjection,
+            RetrievalPortError::StaleEvidence => Self::StaleEvidence,
+            RetrievalPortError::Cancelled => Self::Cancelled,
+            RetrievalPortError::BudgetExceeded => Self::BudgetExceeded,
+            RetrievalPortError::Contract(detail) => Self::LaneContract(detail),
+        }
+    }
 }
 
 /// Lift any displayable validation failure into `RetrievalPortError::Contract`.
@@ -231,4 +258,47 @@ pub struct CodeCandidateBindingV1 {
     pub language_descriptor_revision: LanguageDescriptorRevision,
     pub matched_term_kinds: Vec<ExactTechnicalTermKindV1>,
     pub source_occurrence: SourceOccurrenceId,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RetrievalError, RetrievalPortError};
+
+    #[test]
+    fn retrieval_port_error_preserves_identity_in_retrieval_error() {
+        let cases = [
+            (
+                RetrievalPortError::CapabilityManifestRejected,
+                RetrievalError::CapabilityManifestRejected,
+            ),
+            (
+                RetrievalPortError::GenerationMismatch,
+                RetrievalError::GenerationMismatch,
+            ),
+            (
+                RetrievalPortError::AuthorityUnavailable("index offline".to_owned()),
+                RetrievalError::AuthorityUnavailable("index offline".to_owned()),
+            ),
+            (
+                RetrievalPortError::IncompatibleProjection,
+                RetrievalError::IncompatibleProjection,
+            ),
+            (
+                RetrievalPortError::StaleEvidence,
+                RetrievalError::StaleEvidence,
+            ),
+            (RetrievalPortError::Cancelled, RetrievalError::Cancelled),
+            (
+                RetrievalPortError::BudgetExceeded,
+                RetrievalError::BudgetExceeded,
+            ),
+            (
+                RetrievalPortError::Contract("row binding".to_owned()),
+                RetrievalError::LaneContract("row binding".to_owned()),
+            ),
+        ];
+        for (port, expected) in cases {
+            assert_eq!(RetrievalError::from(port), expected);
+        }
+    }
 }

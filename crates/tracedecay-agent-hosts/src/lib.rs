@@ -56,17 +56,25 @@ pub mod native_integration;
 pub mod ports;
 pub mod product_version;
 pub mod shell;
+pub mod task_classifier;
 pub mod tool_name;
 
+/// The automation runtime whose host-io ports [`register_automation_host_io`]
+/// binds. Exposed so downstream test processes (including the runtime crate's
+/// own unit tests, which compile as a separate crate copy) can reach the
+/// registered production surface instead of re-implementing it.
+pub use tracedecay_automation_runtime as automation_runtime;
+
 pub use product_version::PRODUCT_VERSION;
-pub(crate) use tracedecay_usecases::user_config;
+pub(crate) use tracedecay_session_memory::user_config;
 
 // Kernel shims. `tracedecay-runtime-core` owns the substrate these two
 // subsystems were extracted alongside; aliasing the kernel modules into this
 // crate's root keeps every historical `crate::<module>::…` path in the moved
 // code resolving verbatim, exactly as the root crate's `src/<module>.rs` shims
 // do on the other side of the split.
-pub(crate) use tracedecay_runtime_core::{branch, config, db, errors, storage, worktree};
+pub(crate) use tracedecay_domain::errors;
+pub(crate) use tracedecay_runtime_core::{branch, config, db, storage, worktree};
 
 /// Kernel-owned slice of the former root `tracedecay` façade module.
 pub(crate) mod tracedecay {

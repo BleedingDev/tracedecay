@@ -23,7 +23,8 @@ use crate::{
     GraphGenerationRelation, GraphNamespace, GraphProjectionId, GraphProjectionIdentity,
     GraphProjectionPage, GraphProjectionReadRequest, GraphProjectionTelemetry,
     GraphProjectionTelemetryRequest, GraphRelation, GraphRelationId, GraphRelationRef,
-    TraversalRequest, VectorSearchRequest, VectorSearchResult,
+    GraphVectorIndexRequest, GraphVectorIndexStatus, TraversalRequest, VectorSearchRequest,
+    VectorSearchResult,
 };
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -120,7 +121,7 @@ impl VerifiedGenerationState {
         lease: &Arc<VerifiedGenerationLease>,
     ) -> Result<(), GraphDbError> {
         if self.retiring.contains(&lease.locator) || self.collected.contains(&lease.locator) {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict("lease.remember"));
         }
         self.quarantined.remove(&lease.locator);
         self.known
@@ -373,7 +374,7 @@ impl VerifiedGraphSnapshot {
         request: TraversalRequest,
     ) -> Result<VerifiedTraversalResult, GraphDbError> {
         if request.namespace != self.head.locator.projection.namespace {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict("lease.traverse"));
         }
         self.with_operation(|| {
             // A dependency-free snapshot's whole closure is one generation,
@@ -401,6 +402,22 @@ impl VerifiedGraphSnapshot {
         self.require_head_projection(&request.namespace, &request.projection)?;
         request.namespace = self.head.locator.physical_namespace()?;
         self.with_operation(|| self.database.vector_search(request))
+    }
+
+    /// Typed coverage of the vector index serving this snapshot's head
+    /// generation. Callers that require the index to cover a complete row
+    /// set compare the reported vector count before trusting searches.
+    #[hotpath::measure(
+        label = "graph_db.lease.vector_index_status",
+        impl_type = "VerifiedGraphSnapshot"
+    )]
+    pub fn vector_index_status(
+        &self,
+        mut request: GraphVectorIndexRequest,
+    ) -> Result<GraphVectorIndexStatus, GraphDbError> {
+        self.require_head_projection(&request.namespace, &request.projection)?;
+        request.namespace = self.head.locator.physical_namespace()?;
+        self.with_operation(|| self.database.vector_index_status(request))
     }
 
     #[hotpath::measure(
@@ -480,6 +497,30 @@ impl VerifiedGraphSnapshot {
         })
     }
 
+    /// Page-shaped outgoing fan-out: stops at `max_relations` instead of
+    /// refusing the batch.
+    #[hotpath::measure(
+        label = "graph_db.lease.outgoing_relations_truncated",
+        impl_type = "VerifiedGraphSnapshot"
+    )]
+    pub fn outgoing_relations_truncated(
+        &self,
+        starts: &[GraphEntityId],
+        relation_kinds: &BTreeSet<crate::GraphRelationKind>,
+        max_relations: usize,
+        cancellation: Arc<dyn GraphCancellation>,
+    ) -> Result<Vec<Vec<GraphRelation>>, GraphDbError> {
+        self.with_operation(|| {
+            self.database.outgoing_relations_truncated(
+                &self.head.locator.physical_namespace()?,
+                starts,
+                relation_kinds,
+                max_relations,
+                cancellation,
+            )
+        })
+    }
+
     #[hotpath::measure(
         label = "graph_db.lease.outgoing_relation_targets",
         impl_type = "VerifiedGraphSnapshot"
@@ -502,6 +543,24 @@ impl VerifiedGraphSnapshot {
         })
     }
 
+    pub fn visit_outgoing_relation_targets(
+        &self,
+        start: &GraphEntityId,
+        relation_kinds: &BTreeSet<crate::GraphRelationKind>,
+        cancellation: Arc<dyn GraphCancellation>,
+        visitor: &mut dyn FnMut(crate::GraphRelationTarget),
+    ) -> Result<usize, GraphDbError> {
+        self.with_operation(|| {
+            self.database.visit_outgoing_relation_targets(
+                &self.head.locator.physical_namespace()?,
+                start,
+                relation_kinds,
+                cancellation,
+                visitor,
+            )
+        })
+    }
+
     /// Bulk incoming relation rows over this verified generation.
     #[hotpath::measure(
         label = "graph_db.lease.incoming_relations",
@@ -516,6 +575,30 @@ impl VerifiedGraphSnapshot {
     ) -> Result<Vec<Vec<GraphRelation>>, GraphDbError> {
         self.with_operation(|| {
             self.database.incoming_relations(
+                &self.head.locator.physical_namespace()?,
+                starts,
+                relation_kinds,
+                max_relations,
+                cancellation,
+            )
+        })
+    }
+
+    /// Page-shaped incoming fan-out: stops at `max_relations` instead of
+    /// refusing the batch.
+    #[hotpath::measure(
+        label = "graph_db.lease.incoming_relations_truncated",
+        impl_type = "VerifiedGraphSnapshot"
+    )]
+    pub fn incoming_relations_truncated(
+        &self,
+        starts: &[GraphEntityId],
+        relation_kinds: &BTreeSet<crate::GraphRelationKind>,
+        max_relations: usize,
+        cancellation: Arc<dyn GraphCancellation>,
+    ) -> Result<Vec<Vec<GraphRelation>>, GraphDbError> {
+        self.with_operation(|| {
+            self.database.incoming_relations_truncated(
                 &self.head.locator.physical_namespace()?,
                 starts,
                 relation_kinds,
@@ -554,7 +637,7 @@ impl VerifiedGraphSnapshot {
         if namespace != &self.head.locator.projection.namespace
             || projection != &self.head.locator.projection.projection
         {
-            return Err(GraphDbError::Conflict);
+            return Err(GraphDbError::conflict("lease.require_head_projection"));
         }
         Ok(())
     }

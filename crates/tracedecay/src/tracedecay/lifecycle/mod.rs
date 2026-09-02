@@ -6,25 +6,27 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock};
 
-use crate::branch;
 use crate::config::{
     install_usecase_runtime_configuration_authority, materialize_root_runtime_configuration,
 };
-use crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1;
-use crate::storage::{self, StoreLayout};
-use crate::support::weak_registry::WeakRegistry;
-use tokio::sync::Mutex as AsyncMutex;
-use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
-use tracedecay_runtime_core::branch_meta::{self, BranchMeta};
-use tracedecay_runtime_core::db::{Database, DatabaseAccessMode, DatabaseAuthority};
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
+use crate::project_store_runtime::{ProjectStoreRuntimeHandle, join_standalone_session_registry};
 #[cfg(any(test, feature = "test-transport"))]
-use tracedecay_store::ProjectId;
-use tracedecay_usecases::config::{
+use tokio::sync::Mutex as AsyncMutex;
+use tracedecay_configuration::ProjectConfigurationRuntime;
+use tracedecay_configuration::config::{
     open_runtime_configuration_for_registered_database,
     open_runtime_configuration_for_registered_database_read_only,
 };
-use tracedecay_usecases::configuration::ProjectConfigurationRuntime;
+use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_runtime_core::branch;
+use tracedecay_runtime_core::branch_meta::{self, BranchMeta};
+use tracedecay_runtime_core::db::{Database, DatabaseAccessMode, DatabaseAuthority};
+use tracedecay_runtime_core::storage::{self, StoreLayout};
+use tracedecay_runtime_core::weak_registry::WeakRegistry;
+#[cfg(any(test, feature = "test-transport"))]
+use tracedecay_store::ProjectId;
+use tracedecay_usecases::tracedecay::ProjectStoreRuntimeV1;
 
 use super::{TraceDecay, TraceDecayOpenOptions};
 
@@ -40,32 +42,6 @@ pub use tracedecay_daemon_protocol::MovedStoreAdoption;
 static STANDALONE_MAINTENANCE_SCOPES: LazyLock<
     WeakRegistry<PathBuf, tracedecay_runtime_core::db::OwnedMaintenanceDatabaseScope>,
 > = LazyLock::new(WeakRegistry::new);
-
-/// One standalone session runtime registry per profile, process-wide.
-///
-/// Direct init/open still has a single writer for the profile session-relation
-/// graph (an exclusive Grafeo file lock). A second independent registry on the
-/// same profile cannot open that store. Concurrent opens in one process join
-/// the live registry; entries are weak so close-then-reopen constructs a
-/// fresh mount after the last holder drops.
-static STANDALONE_SESSION_REGISTRIES: LazyLock<
-    AsyncMutex<WeakRegistry<PathBuf, DaemonSessionRuntimeRegistryV1>>,
-> = LazyLock::new(|| AsyncMutex::new(WeakRegistry::new()));
-
-#[hotpath::measure(label = "lifecycle.join_session_registry", future = true)]
-async fn join_standalone_session_registry(
-    identity: crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1,
-) -> Result<Arc<DaemonSessionRuntimeRegistryV1>> {
-    let profile_key =
-        tracedecay_runtime_core::lifecycle_lease::canonical_or_original(identity.profile_root());
-    let registries = STANDALONE_SESSION_REGISTRIES.lock().await;
-    if let Some(registry) = registries.get_live(&profile_key) {
-        return Ok(registry);
-    }
-    let registry = Arc::new(DaemonSessionRuntimeRegistryV1::open(identity).await?);
-    registries.insert(profile_key, &registry);
-    Ok(registry)
-}
 
 /// One retained standalone test runtime per (profile root, project root).
 ///
@@ -130,6 +106,7 @@ impl TraceDecay {
     }
 
     #[cfg(any(test, feature = "test-transport"))]
+    #[hotpath::skip]
     async fn standalone_test_runtime(
         project_root: &Path,
         open_options: &TraceDecayOpenOptions,
@@ -170,7 +147,7 @@ impl TraceDecay {
 
     #[hotpath::measure(label = "lifecycle.mount_project_graph", future = true)]
     pub(super) async fn mount_project_graph(
-        runtime_registry: &DaemonSessionRuntimeRegistryV1,
+        runtime: &dyn ProjectStoreRuntimeV1,
         project_root: &Path,
         store_layout: &StoreLayout,
         operation: &'static str,
@@ -179,12 +156,12 @@ impl TraceDecay {
         let project_id = Self::registered_project_id(store_layout)?;
         let canonical_database_path = &store_layout.graph_db_path;
         if matches!(access, DatabaseAccessMode::ReadOnly) {
-            return runtime_registry
+            return runtime
                 .project_graph_registered(project_id, canonical_database_path.clone(), access)
                 .await;
         }
         let authority = DatabaseAuthority::for_runtime(canonical_database_path, operation)?;
-        runtime_registry
+        runtime
             .project_graph(
                 project_root,
                 project_id,
@@ -199,10 +176,12 @@ impl TraceDecay {
     ///
     /// Initializes the graph and its durable configuration revision. It never
     /// creates or rewrites legacy `config.json`.
+    #[hotpath::skip]
     pub async fn init(project_root: &Path) -> Result<Self> {
         Self::init_with_options(project_root, TraceDecayOpenOptions::default()).await
     }
 
+    #[hotpath::skip]
     pub async fn init_with_options(
         project_root: &Path,
         open_options: TraceDecayOpenOptions,
@@ -247,7 +226,7 @@ impl TraceDecay {
     ) -> Result<Self> {
         let profile_root = open_options.resolved_profile_root()?;
         if let Some(message) =
-            crate::project_registry::ephemeral_root_rejection(project_root, &profile_root)
+            tracedecay_global_db::ephemeral_root_rejection(project_root, &profile_root)
         {
             return Err(TraceDecayError::Config { message });
         }
@@ -258,9 +237,9 @@ impl TraceDecay {
                         .to_owned(),
             });
         }
-        let identity = crate::daemon::profile_identity::load_or_create(&profile_root)?;
+        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)?;
         let runtime_registry = join_standalone_session_registry(identity).await?;
-        let profile_database = runtime_registry.profile_database().await?;
+        let profile_database = runtime_registry.port().profile_database().await?;
         let store_layout = Self::resolve_first_touch_configuration_layout(
             project_root,
             &open_options,
@@ -273,9 +252,13 @@ impl TraceDecay {
         // nothing here — its identity is deterministic from the canonical
         // path and durably owned by the profile registry. TraceDecay never
         // creates files inside a project's working tree.
-        crate::storage::write_repository_identity_marker(project_root, project_id.as_str())?;
+        tracedecay_runtime_core::storage::write_repository_identity_marker(
+            project_root,
+            project_id.as_str(),
+        )?;
         let configuration_database = runtime_registry
-            .project_sessions(project_id, [project_root.to_path_buf()])
+            .port()
+            .project_sessions(project_id, vec![project_root.to_path_buf()])
             .await?;
         Self::init_with_registered_configuration(
             project_root,
@@ -289,11 +272,12 @@ impl TraceDecay {
     }
 
     #[cfg(test)]
+    #[hotpath::skip]
     pub(crate) async fn init_test_fixture_with_registered_runtime(
         project_root: &Path,
         project_id: &str,
     ) -> Result<(Self, Arc<crate::host_admission::HostAdmissionTestRuntimeV1>)> {
-        let profile_root = crate::storage::default_profile_root()?;
+        let profile_root = tracedecay_runtime_core::storage::default_profile_root()?;
         let project_id = tracedecay_domain::ProjectId::new(project_id).map_err(|error| {
             TraceDecayError::Config {
                 message: format!("invalid test fixture project identity: {error}"),
@@ -326,15 +310,16 @@ impl TraceDecay {
         store_layout: StoreLayout,
         configuration_database: RegisteredGlobalDbLeaseV1,
         profile_database: RegisteredGlobalDbLeaseV1,
-        runtime_registry: Arc<DaemonSessionRuntimeRegistryV1>,
+        runtime_registry: impl Into<ProjectStoreRuntimeHandle>,
     ) -> Result<Self> {
+        let runtime_registry = runtime_registry.into();
         // Computed once and reused below (for `active_branch`) instead of
         // calling `branch::current_branch` twice for the same project root.
         let active_branch = branch::current_branch(project_root);
         let (serving_branch, fallback_warning) =
             Self::resolve_branch_provenance(project_root, &store_layout, &active_branch);
         let db = Self::mount_project_graph(
-            runtime_registry.as_ref(),
+            runtime_registry.port(),
             project_root,
             &store_layout,
             "init",
@@ -416,6 +401,7 @@ impl TraceDecay {
         &self.db
     }
 
+    #[hotpath::skip]
     async fn schema_version(db: &Database, operation: &str) -> Result<u32> {
         let connection = db.read_connection();
         let mut rows = connection
@@ -441,6 +427,7 @@ impl TraceDecay {
         }
     }
 
+    #[hotpath::skip]
     async fn ensure_database_schema_current(db: &Database) -> Result<()> {
         let current = Self::schema_version(db, "ensure_schema_current").await?;
         let supported = tracedecay_runtime_core::db::migrations::SCHEMA_VERSION;
@@ -472,10 +459,12 @@ impl TraceDecay {
     /// provenance. Registered open admits only the exact final relational
     /// schema; code-index activation and reconciliation happen after open
     /// through the daemon-owned scheduler.
+    #[hotpath::skip]
     pub async fn open(project_root: &Path) -> Result<Self> {
         Self::open_with_options(project_root, TraceDecayOpenOptions::default()).await
     }
 
+    #[hotpath::skip]
     pub async fn open_with_options(
         project_root: &Path,
         open_options: TraceDecayOpenOptions,
@@ -520,9 +509,9 @@ impl TraceDecay {
                     .to_owned(),
             });
         }
-        let identity = crate::daemon::profile_identity::load_or_create(&profile_root)?;
+        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)?;
         let runtime_registry = join_standalone_session_registry(identity).await?;
-        let profile_database = runtime_registry.profile_database().await?;
+        let profile_database = runtime_registry.port().profile_database().await?;
         let store_layout = Self::resolve_registered_configuration_layout(
             project_root,
             &open_options,
@@ -538,6 +527,7 @@ impl TraceDecay {
         )
         .await?;
         let configuration_database = runtime_registry
+            .port()
             .project_sessions(project_id, enrollment_roots)
             .await?;
         Self::open_with_registered_configuration(
@@ -558,8 +548,9 @@ impl TraceDecay {
         store_layout: StoreLayout,
         configuration_database: RegisteredGlobalDbLeaseV1,
         profile_database: RegisteredGlobalDbLeaseV1,
-        runtime_registry: Arc<DaemonSessionRuntimeRegistryV1>,
+        runtime_registry: impl Into<ProjectStoreRuntimeHandle>,
     ) -> Result<Self> {
+        let runtime_registry = runtime_registry.into();
         let active_branch = branch::current_branch(project_root);
         let db_path = store_layout.graph_db_path.clone();
         let (serving_branch, fallback_warning) =
@@ -578,7 +569,7 @@ impl TraceDecay {
         // open never repairs, rebuilds, or indexes the graph inline; retained
         // code-index activation is owned by the daemon after publication.
         let db = Self::mount_project_graph(
-            runtime_registry.as_ref(),
+            runtime_registry.port(),
             project_root,
             &store_layout,
             "open project store",
@@ -679,10 +670,12 @@ impl TraceDecay {
     /// sentinels, clear markers, or rewrite corrupted DBs. It is intended for
     /// status/verification commands that must be able to inspect read-only
     /// stores without mutating them.
+    #[hotpath::skip]
     pub async fn open_read_only(project_root: &Path) -> Result<Self> {
         Self::open_read_only_with_options(project_root, TraceDecayOpenOptions::default()).await
     }
 
+    #[hotpath::skip]
     pub async fn open_read_only_with_options(
         project_root: &Path,
         open_options: TraceDecayOpenOptions,
@@ -727,9 +720,9 @@ impl TraceDecay {
                         .to_owned(),
             });
         }
-        let identity = crate::daemon::profile_identity::load_or_create(&profile_root)?;
+        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)?;
         let runtime_registry = join_standalone_session_registry(identity).await?;
-        let profile_database = runtime_registry.profile_database().await?;
+        let profile_database = runtime_registry.port().profile_database().await?;
         let store_layout = Self::resolve_registered_configuration_layout(
             project_root,
             &open_options,
@@ -745,6 +738,7 @@ impl TraceDecay {
         )
         .await?;
         let configuration_database = runtime_registry
+            .port()
             .project_sessions(project_id, enrollment_roots)
             .await?;
         Self::open_read_only_with_registered_configuration(
@@ -765,8 +759,9 @@ impl TraceDecay {
         store_layout: StoreLayout,
         configuration_database: RegisteredGlobalDbLeaseV1,
         profile_database: RegisteredGlobalDbLeaseV1,
-        runtime_registry: Arc<DaemonSessionRuntimeRegistryV1>,
+        runtime_registry: impl Into<ProjectStoreRuntimeHandle>,
     ) -> Result<Self> {
+        let runtime_registry = runtime_registry.into();
         let active_branch = branch::current_branch(project_root);
         let db_path = store_layout.graph_db_path.clone();
         let (serving_branch, fallback_warning) =
@@ -782,7 +777,7 @@ impl TraceDecay {
         }
 
         let db = Self::mount_project_graph(
-            runtime_registry.as_ref(),
+            runtime_registry.port(),
             project_root,
             &store_layout,
             "open project store read-only",

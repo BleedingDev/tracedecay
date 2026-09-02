@@ -24,19 +24,17 @@ use tracedecay_domain::{
     ManifestDigest, ProjectId, RetrieverKind, TaskId, TemporalModeV1, UtcMicros,
     VectorGenerationIdV1, WorkAttemptIdentityV1,
 };
-use tracedecay_global_db::configuration::semantic::{SemanticConfig, SemanticProfileSelection};
 use tracedecay_sdk::client::Client;
 use tracedecay_sdk::operations::{
     ApplicationConfigurationGet, ApplicationConfigurationObservedState,
     ApplicationConfigurationSet, WorkRetrieveEvidence,
 };
-use tracedecay_semantic::{
-    DEFAULT_FASTEMBED_MODEL_ID, SemanticModelLifecycleOwnerV1, SemanticModelLifecycleStateV1,
-    SemanticResourceCeilings,
+use tracedecay_semantic::SemanticModelLifecycleOwnerV1;
+use tracedecay_semantic_contracts::{
+    DEFAULT_FASTEMBED_MODEL_ID, SemanticConfig, SemanticFallbackReasonV1,
+    SemanticModelLifecycleStateV1, SemanticProfileSelection, SemanticResourceCeilings,
 };
-use tracedecay_usecases::semantic_runtime::{
-    SemanticFallbackReasonV1, SemanticRuntimeStateV1, SemanticRuntimeStatusV1,
-};
+use tracedecay_usecases::semantic_runtime::{SemanticRuntimeStateV1, SemanticRuntimeStatusV1};
 
 use super::{
     PROVIDER_SESSION_ID, advance_provider_transcript_participant_generation, common,
@@ -214,7 +212,7 @@ pub(super) fn install_semantic_fixture(home: &Path) -> InstalledSemanticFixture 
              TRACEDECAY_DISTRIBUTION_FASTEMBED_FIXTURE",
         );
     let profile = home.join(".tracedecay");
-    tracedecay::storage::PrivateStoreIo::create_dir_all(&profile)
+    tracedecay_runtime_core::storage::PrivateStoreIo::create_dir_all(&profile)
         .expect("private semantic fixture profile");
     let lifecycle_root = tracedecay_semantic::default_lifecycle_root_in(&profile);
     let owner = SemanticModelLifecycleOwnerV1::open_default(&lifecycle_root)
@@ -392,7 +390,7 @@ fn activate_evaluated_semantic_profile(
 ) -> ManifestDigest {
     let _ = wait_for_semantic_generation(home, project);
     let mut evaluator =
-        std::process::Command::new(env!("CARGO_BIN_EXE_tracedecay-search-eval-direct"));
+        std::process::Command::new(common::search_eval_bin("tracedecay-search-eval-direct"));
     common::apply_tracedecay_home_env(&mut evaluator, home);
     eprintln!("semantic evaluate-and-publish starting");
     let evaluation_started = Instant::now();
@@ -626,7 +624,9 @@ fn read_active_code_generation(
     home: &Path,
     project: &Path,
 ) -> Option<tracedecay_code_index::production::CodeIndexPublishedGenerationV1> {
-    let layout = tracedecay::storage::resolve_layout(project, &home.join(".tracedecay")).ok()?;
+    let layout =
+        tracedecay_runtime_core::storage::resolve_layout(project, &home.join(".tracedecay"))
+            .ok()?;
     let scope = scoped_code_index_store_root(&layout.data_root.join("code-index-v1"), project);
     let pointer = serde_json::from_slice::<DurablePublicationPointerV1>(
         &std::fs::read(scope.join("active-code-generation-v1.json")).ok()?,

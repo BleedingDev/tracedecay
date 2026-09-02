@@ -23,6 +23,7 @@ use super::identity::{
     LanguageDescriptorRevision, PolicyRevisionId, QueryNormalizationRevision, SanitizerRevision,
     SourceSpan, SymbolOccurrenceId,
 };
+use super::token_grammar;
 
 /// Maximum canonical bytes of one chunk's sanitized text (contract bound;
 /// oversized bodies split on deterministic structural boundaries or pinned
@@ -465,84 +466,22 @@ fn validate_self_authenticating_technical_term(
     let text = std::str::from_utf8(bytes).map_err(|_| DomainError::NonCanonical {
         field: "exact technical term UTF-8",
     })?;
-    let is_ident = |segment: &str| {
-        !segment.is_empty()
-            && segment
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || character == '_')
-            && segment
-                .chars()
-                .next()
-                .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
-    };
     let valid = match kind {
-        ExactTechnicalTermKindV1::QualifiedName => {
-            text.contains("::") && text.split("::").all(is_ident)
-        }
-        ExactTechnicalTermKindV1::Path => {
-            text.contains('/')
-                && text.split('/').all(|segment| {
-                    !segment.is_empty()
-                        && segment.chars().all(|character| {
-                            character.is_ascii_alphanumeric()
-                                || matches!(character, '_' | '-' | '.')
-                        })
-                })
-                && text
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|filename| filename.contains('.'))
-        }
+        ExactTechnicalTermKindV1::QualifiedName => token_grammar::is_qualified_name_token(text),
+        ExactTechnicalTermKindV1::Path => token_grammar::is_path_token(text),
         ExactTechnicalTermKindV1::CompilerErrorCode => {
-            ["E", "TS", "CS"].into_iter().any(|prefix| {
-                text.strip_prefix(prefix).is_some_and(|digits| {
-                    digits.len() == 4 && digits.chars().all(|character| character.is_ascii_digit())
-                })
-            })
+            token_grammar::is_compiler_error_code_token(text)
         }
         ExactTechnicalTermKindV1::RuntimeErrorCode => {
-            text.strip_prefix("ERR_").is_some_and(|suffix| {
-                !suffix.is_empty()
-                    && suffix.chars().all(|character| {
-                        character.is_ascii_uppercase()
-                            || character.is_ascii_digit()
-                            || character == '_'
-                    })
-            })
+            token_grammar::is_runtime_error_code_token(text)
         }
-        ExactTechnicalTermKindV1::CliFlag => text.strip_prefix("--").is_some_and(|flag| {
-            !flag.is_empty()
-                && !flag.ends_with('-')
-                && flag
-                    .chars()
-                    .next()
-                    .is_some_and(|character| character.is_ascii_alphabetic())
-                && flag.chars().all(|character| {
-                    character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
-                })
-        }),
-        ExactTechnicalTermKindV1::ToolName => matches!(
-            text.to_ascii_lowercase().as_str(),
-            "cargo" | "rustc" | "tracedecay" | "pytest" | "kubectl" | "fastembed" | "ast-grep"
-        ),
+        ExactTechnicalTermKindV1::CliFlag => token_grammar::is_cli_flag_token(text),
+        ExactTechnicalTermKindV1::ToolName => token_grammar::is_tool_name_token(text),
         ExactTechnicalTermKindV1::ConfigurationKey => {
-            text.split('.').count() >= 3
-                && text.split('.').all(|segment| {
-                    !segment.is_empty()
-                        && segment.chars().all(|character| {
-                            character.is_ascii_lowercase()
-                                || character.is_ascii_digit()
-                                || character == '_'
-                        })
-                })
+            token_grammar::is_configuration_key_token(text)
         }
         ExactTechnicalTermKindV1::CommitIdentifier => {
-            text.strip_prefix("commit:").is_some_and(|identifier| {
-                (7..=40).contains(&identifier.len())
-                    && identifier
-                        .chars()
-                        .all(|character| character.is_ascii_hexdigit())
-            })
+            token_grammar::is_commit_identifier_token(text)
         }
         ExactTechnicalTermKindV1::WholeSymbol
         | ExactTechnicalTermKindV1::CompilerErrorText
@@ -1128,6 +1067,11 @@ impl AdmittedEmbeddingProjectionKeyV1 {
 #[serde(rename_all = "snake_case")]
 pub enum SemanticSearchIndexKindV1 {
     ExactFlat,
+    /// Approximate HNSW candidate generation over the serving generation's
+    /// persisted vector index, exact-rescored with the canonical distance.
+    /// Candidate coverage is index-bounded: published distances stay exact,
+    /// but the candidate set is not guaranteed to equal a full scan's.
+    AnnHnswExactRescore,
 }
 
 /// Complete identity inputs for one semantic search structure.
@@ -1157,6 +1101,22 @@ impl SemanticSearchIndexProfileV1 {
                 "tracedecay.semantic-exact-flat-parameters.v1",
                 "scan-all-compatible-vectors",
                 "canonical-distance-then-anchor",
+            ))?,
+        })
+    }
+
+    /// HNSW candidate generation with exact rescoring. The parameters digest
+    /// commits to the candidate-oversample policy so a tuning change mints a
+    /// new index identity instead of silently shifting served candidate sets.
+    pub fn ann_hnsw_exact_rescore_v1() -> Result<Self, DomainError> {
+        Ok(Self {
+            kind: SemanticSearchIndexKindV1::AnnHnswExactRescore,
+            implementation_revision: "semantic.ann-hnsw-exact-rescore.v1".to_owned(),
+            parameters_digest: canonical_sha256(&(
+                "tracedecay.semantic-ann-hnsw-exact-rescore-parameters.v1",
+                "hnsw-candidates-oversample-4x",
+                "exact-rescore-canonical-distance-then-anchor",
+                "flat-fallback-on-missing-or-incomplete-index",
             ))?,
         })
     }

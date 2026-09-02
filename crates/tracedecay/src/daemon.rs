@@ -17,15 +17,13 @@ use tokio::time::{Duration, timeout};
 use tokio_stream::StreamExt;
 use tracedecay_lsp::{AdmittedRoot, AuthorizedLspWorkspace};
 
-use crate::mcp::ReplayTransport;
 use crate::mcp::server::{
     McpMethod, RmcpConnectionAdapter, RmcpInitializeResponseDecorator, SERVER_INSTRUCTIONS,
     classify_mcp_method, initialize_result,
 };
 use crate::mcp::tools::{
-    ToolRegistryMode, default_catalog_discovery_authority, explore_call_budget,
-    get_catalog_filtered_tool_definitions_with_budget,
-    get_catalog_filtered_tool_definitions_with_warming_budget, project_catalog_discovery_scope,
+    default_catalog_discovery_authority, get_catalog_filtered_tool_definitions_with_budget,
+    get_catalog_filtered_tool_definitions_with_warming_budget,
 };
 use branch_add::{branch_add_response, parse_branch_add_request};
 use branch_admin::{StoreAdministration, parse_branch_admin_request, write_branch_admin_response};
@@ -47,13 +45,13 @@ pub use tracedecay_daemon_protocol::{DaemonClientIdentity, DaemonHandshake};
 pub(crate) use tracedecay_daemon_protocol::{
     ensure_private_socket_parent, unix_socket_path_within_limit,
 };
+use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_mcp::transport::ReplayTransport;
 use tracedecay_mcp::{ErrorCode, JsonRpcRequest, JsonRpcResponse, McpTransport};
+use tracedecay_mcp::{ToolRegistryMode, explore_call_budget, project_catalog_discovery_scope};
 use tracedecay_runtime_core::cancellation::CancellationToken;
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 
-pub const SERVICE_NAME: &str = "tracedecay.service";
 pub use tracedecay_daemon_protocol::SOCKET_ENV;
-pub(crate) const DAEMON_SHUTDOWN_METHOD: &str = "tracedecay/daemon/shutdown";
 pub(crate) const PROJECT_WARMING_RETRY_HINT: &str =
     "is warming in the background; retry the same tool shortly";
 #[cfg(unix)]
@@ -96,7 +94,11 @@ const PROJECT_OPEN_CAPACITY_ERROR_KINDS: [&str; 2] = [
     "project_server_capacity_reached",
 ];
 /// Message fragments emitted when a daemon request misses its read deadline.
-const DAEMON_READ_DEADLINE_MESSAGES: [&str; 2] = ["before deadline", "deadline already elapsed"];
+const DAEMON_READ_DEADLINE_MESSAGES: [&str; 3] = [
+    "before deadline",
+    "deadline already elapsed",
+    "did not answer after",
+];
 
 /// True when a daemon error message carries the project warming hint.
 pub(crate) fn error_message_is_project_warming(message: &str) -> bool {
@@ -133,7 +135,15 @@ pub fn error_message_is_read_deadline(message: &str) -> bool {
         .any(|deadline| message.contains(deadline))
 }
 
-mod authority;
+/// True when a daemon client missed its read deadline, including the typed
+/// `daemon_response_stalled` reason code.
+pub fn error_is_read_deadline(error: &TraceDecayError) -> bool {
+    matches!(
+        error.project_route_context(),
+        Some((tracedecay_daemon_protocol::DAEMON_RESPONSE_STALLED, _, _))
+    ) || error_message_is_read_deadline(&error.to_string())
+}
+
 pub(crate) mod automation_effect;
 mod bootstrap;
 mod bootstrap_route;
@@ -204,10 +214,13 @@ pub(crate) use dashboard_configuration_test_runtime::{
     dashboard_configuration_authorities_for_test, register_dashboard_test_retained_runtime,
 };
 pub(crate) mod query_authority_provider;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-transport"))]
 pub(crate) mod retained_test_support;
 mod shutdown_coordination;
 mod shutdown_orchestration;
+mod shutdown_watchdog;
+#[cfg(feature = "hotpath")]
+pub use shutdown_watchdog::install_hotpath_shutdown_finalizer;
 mod store_shutdown;
 pub(crate) use core_admission::*;
 pub use core_client::*;
@@ -226,7 +239,6 @@ pub use http_application::live_remote_operational_status;
 mod http_application_router;
 pub(crate) mod remote_protocol;
 mod remote_query;
-mod remote_replay_transaction;
 pub(crate) mod retained_owner;
 use http_application_router::{
     install_http_application_cold_resolver, install_remote_http_application_router,
@@ -251,9 +263,7 @@ use invocation_executor::{
 };
 mod invocation_state;
 pub(crate) use invocation_state::DaemonInvocationState;
-pub(crate) mod lcm_authority;
 mod lsp_sessions;
-mod request_cancellation;
 use lsp_sessions::{
     admitted_lsp_root_for_project_path, admitted_lsp_workspace_for_request,
     cleanup_connection_lsp_sessions, invocation_lsp_session_transition,
@@ -278,7 +288,6 @@ use projectless::projectless_tools_call_response;
 use projectless::{
     projectless_tool_call, projectless_user_session_request, serve_projectless_client,
 };
-pub(crate) mod profile_identity;
 mod project_composition;
 mod project_delivery_mount;
 #[cfg(test)]
@@ -295,8 +304,10 @@ use project_open_admission::{
 use project_open_admission::{
     ProjectOpenFailure, ProjectOpenGate, ProjectOpenGates, ProjectOpenTaskClaim,
     ProjectOpenTaskState, ProjectOpenTasks, ProjectRouteKey, ProjectServerKey,
-    ProjectServerPublication, ProjectServerRequirement, StoreOwnerKey, project_server_requirement,
+    ProjectServerPublication, ProjectServerRequirement, project_server_requirement,
+    store_owner_key_from_paths,
 };
+pub(crate) use tracedecay_session_runtime::StoreOwnerKey;
 mod project_open_handshake;
 #[cfg(test)]
 use project_open_handshake::is_missing_index_error;
@@ -339,31 +350,15 @@ use project_server_lifecycle::{
     schedule_project_server_retirement, schedule_user_profile_host_admission_replay_for_identity,
     shutdown_project_servers,
 };
-pub(crate) mod lcm_effects;
-mod lcm_summarization;
 mod query_mcp_admission;
 #[cfg(unix)]
 mod scheduler;
-mod service;
-pub(crate) mod session_retrieval;
-pub(crate) mod session_sync;
-pub(crate) mod session_temporal_refresh_scheduler;
+#[cfg(test)]
+pub(crate) mod session_runtime_tests;
 
-/// Truthy `TRACEDECAY_SESSION_INGEST_DISABLED` turns off every session
-/// transcript ingest lane for the daemon's lifetime - the session-temporal
-/// refresh workers and the session-sync import service alike. A dev/profiling
-/// switch: session history simply stays un-ingested, reported as a typed
-/// unavailable outcome rather than an empty success.
-pub(crate) fn session_ingest_disabled() -> bool {
-    std::env::var("TRACEDECAY_SESSION_INGEST_DISABLED").is_ok_and(|v| !v.is_empty() && v != "0")
-}
+#[cfg(test)]
+pub(crate) mod store_runtime_tests;
 
-/// The typed unavailable reason a configured-off ingest lane reports.
-///
-/// Named because callers must distinguish a deliberate no-op from a genuine
-/// admission failure: treating it as a failure retires the project's session
-/// context and fails the whole project mount.
-pub(crate) const SESSION_INGEST_DISABLED_REASON_V1: &str = "session_ingest_disabled_by_env";
 pub(crate) mod store_runtime;
 mod store_writer_gate;
 mod wire_io;
@@ -372,28 +367,11 @@ use wire_io::{
     read_line_handling_wire_oversized, write_daemon_invocation_response, write_json_rpc_response,
 };
 
-pub use bootstrap::{RemoteBrainTlsConfig, run_foreground};
-pub(crate) use service::invocation::{
-    DaemonConfigurationRuntimeRegistrar, DaemonContextScoutRuntimeRegistrar,
-    DaemonContextScoutRuntimeRegistrationError, DaemonFeedbackRuntimeRegistrar,
-    DaemonFeedbackRuntimeRegistrationError, DaemonInvocationService, DaemonLspOwnerRegistrar,
-    DaemonPrimitiveRuntimeRegistrar, DaemonPrimitiveRuntimeRegistrationError,
-    DaemonSemanticRuntimeRegistrar, DaemonSemanticRuntimeRegistrationError,
-    DaemonWorkRuntimeRegistrar, HookOrchestrationAdmissionV1, admit_registered_hook_orchestration,
-    daemon_operation_event_authority,
-};
-pub use service::{
-    DaemonServiceSpec, DaemonServiceState, QuiescedDaemonLifecycle, daemon_reachable,
-    default_socket_path, install_service, install_service_under_lease,
-    installed_service_socket_path, prepare_scoop_package_service,
-    quiesce_installed_service_before_lease, refresh_installed_service_under_lease_with_state,
-    restore_installed_service_after_update, restore_scoop_package_service, service_spec,
-    service_spec_with_remote_tls, service_status, socket_path_or_default, start_service,
-    stop_service, uninstall_service, verify_installed_service_quiesced_under_lease,
-    wait_for_installed_service_state, with_exclusive_maintenance_window,
-    with_quiesced_installed_service,
-};
-pub(crate) use service::{installed_service_state, unavailable_daemon_socket_advice};
+pub use bootstrap::run_foreground;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod invocation_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]

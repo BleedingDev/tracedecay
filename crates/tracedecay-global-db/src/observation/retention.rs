@@ -12,7 +12,7 @@
 //!
 //! Superseded and deleted dispositions release their storage. This module
 //! is the retention pass that does that, mirroring the
-//! sibling LCM slice ([`tracedecay_sessions::runtime::lcm::retention`]): a bounded,
+//! sibling LCM slice ([`tracedecay_lcm::retention`]): a bounded,
 //! DryRun/Apply, before/after-measured engine.
 //!
 //! # The disposition ledger is the governing authority
@@ -77,11 +77,11 @@ use serde::{Deserialize, Serialize};
 use tracedecay_domain::ObservationSourceCursorV1;
 use tracedecay_store::observation::ObservationCoverageV1;
 
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_runtime_core::db::{
     Database, DatabaseEngineReadConnection, DatabaseWriteTransaction,
     engine::{Executor, IntoParams, Params, QueryExecutor, Value, opt_text, params},
 };
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
 
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
@@ -477,6 +477,7 @@ enum RetentionQueryExecutor<'reader, 'database> {
 }
 
 impl RetentionQueryExecutor<'_, '_> {
+    #[hotpath::skip]
     async fn query(
         &self,
         sql: &str,

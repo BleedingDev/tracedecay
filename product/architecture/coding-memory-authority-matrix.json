@@ -103,7 +103,7 @@
       "source_paths": [
         "crates/tracedecay/src/tracedecay/edits/file_authority.rs",
         "crates/tracedecay/src/daemon/project_open_owners/source_edit_owner.rs",
-        "crates/tracedecay-usecases/src/context/source_read.rs"
+        "crates/tracedecay-graph-query/src/context/source_read.rs"
       ]
     },
     {
@@ -138,8 +138,8 @@
         "silently accepting a missing identity marker"
       ],
       "source_paths": [
-        "crates/tracedecay-usecases/src/context/registered_scope.rs",
-        "crates/tracedecay/src/project_registry.rs",
+        "crates/tracedecay-session-memory/src/context/registered_scope.rs",
+        "crates/tracedecay-dashboard-api/src/project_registry.rs",
         "crates/tracedecay/src/tracedecay/lifecycle/identity.rs"
       ]
     },
@@ -174,8 +174,8 @@
         "sharing mutable provider state across worktrees by default"
       ],
       "source_paths": [
-        "crates/tracedecay-usecases/src/context/registered_scope.rs",
-        "crates/tracedecay-usecases/src/context/mod.rs",
+        "crates/tracedecay-session-memory/src/context/registered_scope.rs",
+        "crates/tracedecay-session-memory/src/context/mod.rs",
         "crates/tracedecay-runtime-core/src/worktree.rs"
       ]
     },
@@ -216,9 +216,10 @@
         "provider-controlled branch routing"
       ],
       "source_paths": [
-        "crates/tracedecay/src/branch.rs",
-        "crates/tracedecay-usecases/src/context/registered_scope.rs",
-        "crates/tracedecay-usecases/src/context/mod.rs"
+        "crates/tracedecay-runtime-core/src/branch.rs",
+        "crates/tracedecay-runtime-core/src/branch/tracking.rs",
+        "crates/tracedecay-session-memory/src/context/registered_scope.rs",
+        "crates/tracedecay-session-memory/src/context/mod.rs"
       ]
     },
     {
@@ -262,8 +263,8 @@
       ],
       "source_paths": [
         "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
-        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
-        "crates/tracedecay/src/store/session_ingest_authority.rs"
+        "crates/tracedecay-session-runtime/src/session_retrieval/admitted.rs",
+        "crates/tracedecay-host-admission/src/session_ingest_authority.rs"
       ]
     },
     {
@@ -308,7 +309,7 @@
         "provider output changing Native feedback or trust"
       ],
       "source_paths": [
-        "crates/tracedecay-usecases/src/memory/mod.rs",
+        "crates/tracedecay-session-memory/src/memory/mod.rs",
         "crates/tracedecay-runtime-core/src/store/memory/mod.rs",
         "crates/tracedecay/src/daemon/retained_owner/memory.rs",
         "product/architecture/native-memory-surface-map.json"
@@ -364,7 +365,7 @@
         "crates/tracedecay-memory-observation/src/sqlite/retention.rs",
         "crates/tracedecay-memory-observation/src/sqlite/schema.rs",
         "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
-        "crates/tracedecay/src/daemon/service/invocation/feedback.rs",
+        "crates/tracedecay-daemon-service/src/invocation/feedback.rs",
         "product/architecture/native-memory-surface-map.json"
       ]
     },
@@ -439,8 +440,8 @@
         "silent fallback to a different provider"
       ],
       "source_paths": [
-        "crates/tracedecay-usecases/src/context/mod.rs",
-        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
+        "crates/tracedecay-session-memory/src/context/mod.rs",
+        "crates/tracedecay-session-runtime/src/session_retrieval/admitted.rs",
         "product/architecture/native-memory-surface-map.json"
       ]
     },
@@ -483,9 +484,9 @@
         "silent activation on invalid or unavailable configuration"
       ],
       "source_paths": [
-        "crates/tracedecay-usecases/src/configuration/runtime.rs",
-        "crates/tracedecay-usecases/src/configuration/authorization.rs",
-        "crates/tracedecay-usecases/src/configuration/operations.rs"
+        "crates/tracedecay-configuration/src/configuration/runtime.rs",
+        "crates/tracedecay-configuration/src/configuration/authorization.rs",
+        "crates/tracedecay-configuration/src/configuration/operations.rs"
       ]
     },
     {
@@ -522,10 +523,10 @@
         "context compilation mutating any source authority"
       ],
       "source_paths": [
-        "crates/tracedecay-usecases/src/context/mod.rs",
-        "crates/tracedecay-usecases/src/context/read_modes.rs",
-        "crates/tracedecay-usecases/src/context/read_cache.rs",
-        "crates/tracedecay/src/daemon/session_retrieval/admitted.rs",
+        "crates/tracedecay-session-memory/src/context/mod.rs",
+        "crates/tracedecay-graph-query/src/context/read_modes.rs",
+        "crates/tracedecay-session-memory/src/context/read_cache.rs",
+        "crates/tracedecay-session-runtime/src/session_retrieval/admitted.rs",
         "product/architecture/native-memory-surface-map.json"
       ]
     }

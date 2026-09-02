@@ -10,12 +10,28 @@ pub use tracedecay_rusqlite_runtime::reader::{ReaderPoolSnapshot, ReaderPoolStat
 
 #[cfg(any(test, feature = "test-helpers"))]
 use super::Statement;
-use super::{IntoParams, ReadSnapshot, Result, Rows, Transaction, TransactionBehavior, Value};
+use super::{
+    Error, IntoParams, ReadSnapshot, Result, Rows, Transaction, TransactionBehavior, Value,
+    WriteStatement,
+};
 
 const READER_WAIT: Duration = Duration::from_secs(5);
 
 pub(super) trait Runtime: Send + Sync {
     fn execute(&self, statement: ExactSqlStatement) -> Result<ExactSqlExecuteResult>;
+    fn execute_statements(
+        &self,
+        statements: Vec<ExactSqlStatement>,
+    ) -> Result<Vec<ExactSqlExecuteResult>> {
+        let mut results = Vec::with_capacity(statements.len());
+        for (index, statement) in statements.into_iter().enumerate() {
+            results.push(
+                self.execute(statement)
+                    .map_err(|error| Error::statement_batch(index, error))?,
+            );
+        }
+        Ok(results)
+    }
     fn query(
         &self,
         statement: ExactSqlStatement,
@@ -126,6 +142,7 @@ pub struct ReadConnection {
 }
 
 impl ReadConnection {
+    #[hotpath::skip]
     pub async fn query<P>(&self, sql: &str, params: P) -> Result<Rows>
     where
         P: IntoParams,
@@ -133,6 +150,7 @@ impl ReadConnection {
         self.connection.query(sql, params).await
     }
 
+    #[hotpath::skip]
     pub async fn read_snapshot(&self) -> Result<ReadSnapshot> {
         self.connection.read_snapshot().await
     }
@@ -203,6 +221,7 @@ impl Connection {
         }
     }
 
+    #[hotpath::skip]
     pub async fn execute<P>(&self, sql: &str, params: P) -> Result<u64>
     where
         P: IntoParams,
@@ -215,6 +234,25 @@ impl Connection {
             .map(|result| result.changed_rows as u64)
     }
 
+    #[hotpath::measure(label = "runtime_core.db.execute_statements", future = true)]
+    pub async fn execute_statements(&self, statements: Vec<WriteStatement>) -> Result<Vec<u64>> {
+        let statements = statements
+            .into_iter()
+            .map(WriteStatement::into_exact)
+            .collect();
+        let runtime = Arc::clone(&self.runtime);
+        tokio::task::spawn_blocking(move || runtime.execute_statements(statements))
+            .await
+            .map_err(join_error)?
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|result| result.changed_rows as u64)
+                    .collect()
+            })
+    }
+
+    #[hotpath::skip]
     pub async fn query<P>(&self, sql: &str, params: P) -> Result<Rows>
     where
         P: IntoParams,
@@ -236,6 +274,7 @@ impl Connection {
         ))
     }
 
+    #[hotpath::skip]
     pub async fn checkpoint_wal_truncate(&self) -> Result<Rows> {
         let runtime = Arc::clone(&self.runtime);
         let rows = tokio::task::spawn_blocking(move || runtime.checkpoint_wal_truncate())
@@ -252,6 +291,7 @@ impl Connection {
         ))
     }
 
+    #[hotpath::skip]
     pub async fn execute_batch(&self, sql: &str) -> Result<()> {
         let runtime = Arc::clone(&self.runtime);
         let sql = sql.to_owned();
@@ -261,6 +301,7 @@ impl Connection {
             .map(|_| ())
     }
 
+    #[hotpath::skip]
     pub async fn release_connection_memory(&self) -> Result<MemoryReleaseOutcome> {
         let runtime = Arc::clone(&self.runtime);
         tokio::task::spawn_blocking(move || runtime.release_connection_memory())
@@ -268,6 +309,7 @@ impl Connection {
             .map_err(join_error)?
     }
 
+    #[hotpath::skip]
     pub async fn repair_incremental_auto_vacuum(&self) -> Result<()> {
         let runtime = Arc::clone(&self.runtime);
         tokio::task::spawn_blocking(move || runtime.repair_incremental_auto_vacuum())
@@ -276,6 +318,7 @@ impl Connection {
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
+    #[hotpath::skip]
     pub async fn prepare(&self, sql: &str) -> Result<Statement<'_>> {
         let statement = statement(sql, ())?;
         let runtime = Arc::clone(&self.runtime);
@@ -309,6 +352,7 @@ impl Connection {
             .map(ReadSnapshot::from_runtime)
     }
 
+    #[hotpath::skip]
     pub(crate) async fn health_read_snapshot(&self) -> Result<ReadSnapshot> {
         let runtime = Arc::clone(&self.runtime);
         tokio::task::spawn_blocking(move || runtime.begin_health_read_snapshot())
@@ -318,6 +362,7 @@ impl Connection {
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
+    #[hotpath::skip]
     pub async fn transaction(&self) -> Result<Transaction> {
         self.transaction_with_behavior(TransactionBehavior::Deferred)
             .await

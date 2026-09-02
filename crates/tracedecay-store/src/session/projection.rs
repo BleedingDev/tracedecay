@@ -103,6 +103,7 @@ impl SessionTemporalProjectionBatchV1 {
         &self.session_id
     }
 
+    #[hotpath::skip]
     pub const fn generation(&self) -> SessionProjectionGenerationV1 {
         self.generation
     }
@@ -111,14 +112,17 @@ impl SessionTemporalProjectionBatchV1 {
         &self.watermarks
     }
 
+    #[hotpath::skip]
     pub const fn batch_ordinal(&self) -> u64 {
         self.batch_ordinal
     }
 
+    #[hotpath::skip]
     pub const fn source_through(&self) -> u64 {
         self.source_through
     }
 
+    #[hotpath::skip]
     pub const fn projection_through(&self) -> u64 {
         self.projection_through
     }
@@ -277,6 +281,7 @@ impl SessionTemporalProjectionBatchReceiptV1 {
         &self.session_id
     }
 
+    #[hotpath::skip]
     pub const fn generation(&self) -> SessionProjectionGenerationV1 {
         self.generation
     }
@@ -285,6 +290,7 @@ impl SessionTemporalProjectionBatchReceiptV1 {
         &self.watermarks
     }
 
+    #[hotpath::skip]
     pub const fn batch_ordinal(&self) -> u64 {
         self.batch_ordinal
     }
@@ -293,30 +299,37 @@ impl SessionTemporalProjectionBatchReceiptV1 {
         &self.batch_digest
     }
 
+    #[hotpath::skip]
     pub const fn source_through(&self) -> u64 {
         self.source_through
     }
 
+    #[hotpath::skip]
     pub const fn projection_through(&self) -> u64 {
         self.projection_through
     }
 
+    #[hotpath::skip]
     pub const fn persisted_occurrences(&self) -> usize {
         self.persisted_occurrences
     }
 
+    #[hotpath::skip]
     pub const fn persisted_copies(&self) -> usize {
         self.persisted_copies
     }
 
+    #[hotpath::skip]
     pub const fn persisted_assertions(&self) -> usize {
         self.persisted_assertions
     }
 
+    #[hotpath::skip]
     pub const fn disposition(&self) -> SessionTemporalProjectionBatchDispositionV1 {
         self.disposition
     }
 
+    #[hotpath::skip]
     pub const fn committed_at(&self) -> UtcMicros {
         self.committed_at
     }
@@ -360,6 +373,7 @@ impl SessionGenerationRebuildRequestV1 {
         &self.session_id
     }
 
+    #[hotpath::skip]
     pub const fn candidate_generation(&self) -> SessionProjectionGenerationV1 {
         self.candidate_generation
     }
@@ -380,6 +394,7 @@ pub enum SessionGenerationRebuildDispositionV1 {
 impl SessionGenerationRebuildDispositionV1 {
     /// Valid durable transitions: started/resumed may resume or complete;
     /// complete is terminal and may only be observed again as complete.
+    #[hotpath::skip]
     pub const fn can_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),
@@ -420,6 +435,7 @@ impl SessionGenerationRebuildReceiptV1 {
         &self.session_id
     }
 
+    #[hotpath::skip]
     pub const fn generation(&self) -> SessionProjectionGenerationV1 {
         self.generation
     }
@@ -428,10 +444,12 @@ impl SessionGenerationRebuildReceiptV1 {
         &self.snapshot
     }
 
+    #[hotpath::skip]
     pub const fn disposition(&self) -> SessionGenerationRebuildDispositionV1 {
         self.disposition
     }
 
+    #[hotpath::skip]
     pub const fn recorded_at(&self) -> UtcMicros {
         self.recorded_at
     }
@@ -487,6 +505,7 @@ impl SessionGenerationActivationRequestV1 {
         &self.session_id
     }
 
+    #[hotpath::skip]
     pub const fn generation(&self) -> SessionProjectionGenerationV1 {
         self.generation
     }
@@ -536,10 +555,12 @@ impl SessionGenerationActivationReceiptV1 {
         &self.session_id
     }
 
+    #[hotpath::skip]
     pub const fn generation(&self) -> SessionProjectionGenerationV1 {
         self.generation
     }
 
+    #[hotpath::skip]
     pub const fn previous_generation(&self) -> Option<SessionProjectionGenerationV1> {
         self.previous_generation
     }
@@ -548,6 +569,7 @@ impl SessionGenerationActivationReceiptV1 {
         &self.watermarks
     }
 
+    #[hotpath::skip]
     pub const fn activated_at(&self) -> UtcMicros {
         self.activated_at
     }

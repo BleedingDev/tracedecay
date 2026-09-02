@@ -655,10 +655,96 @@ fn batch_outgoing_reads_are_filtered_ordered_and_budgeted() {
         GraphDbError::budget_exhausted(GraphBudgetKind::Read, 0)
     );
     assert_eq!(
-        db.outgoing_relations(&namespace(), &starts, &kinds, 1, Arc::new(Cancelled),)
+        db.outgoing_relations(&namespace(), &starts, &kinds, 1, Arc::new(Cancelled))
             .unwrap_err(),
         GraphDbError::Cancelled
     );
+}
+
+#[test]
+fn wide_fanout_refuse_errors_and_truncate_returns_the_prefix() {
+    let db = memory_db();
+    let mut mutations = vec![GraphMutation::UpsertEntity(entity("hub"))];
+    for index in 0..32 {
+        let spoke = format!("spoke-{index:02}");
+        mutations.push(GraphMutation::UpsertEntity(entity(&spoke)));
+        mutations.push(GraphMutation::UpsertRelation(relation(
+            &format!("edge-{index:02}"),
+            "hub",
+            &spoke,
+            "calls",
+        )));
+    }
+    db.apply_unverified(batch("code", "g1", "w1", mutations))
+        .unwrap();
+    let starts = [entity_id("hub")];
+    let kinds = BTreeSet::from([GraphRelationKind::new("calls").unwrap()]);
+    assert_eq!(
+        db.outgoing_relations(&namespace(), &starts, &kinds, 8, live())
+            .unwrap_err(),
+        GraphDbError::budget_exhausted(GraphBudgetKind::Read, 8)
+    );
+    let truncated = db
+        .outgoing_relations_truncated(&namespace(), &starts, &kinds, 8, live())
+        .unwrap();
+    assert_eq!(truncated.len(), 1);
+    assert_eq!(truncated[0].len(), 8);
+}
+
+#[test]
+fn outgoing_target_visitor_streams_rows_and_observes_cancellation() {
+    let db = memory_db();
+    db.apply_unverified(batch(
+        "code",
+        "g1",
+        "w1",
+        vec![
+            GraphMutation::UpsertEntity(entity("a")),
+            GraphMutation::UpsertEntity(entity("b")),
+            GraphMutation::UpsertEntity(entity("c")),
+            GraphMutation::UpsertRelation(relation("ab", "a", "b", "calls")),
+            GraphMutation::UpsertRelation(relation("ac", "a", "c", "calls")),
+        ],
+    ))
+    .unwrap();
+    let kinds = BTreeSet::from([GraphRelationKind::new("calls").unwrap()]);
+    let mut visited = Vec::new();
+    let count = db
+        .visit_outgoing_relation_targets(
+            &namespace(),
+            &entity_id("a"),
+            &kinds,
+            live(),
+            &mut |target| {
+                visited.push((
+                    target.relation.identity.as_str().to_owned(),
+                    target.target.identity.as_str().to_owned(),
+                ));
+            },
+        )
+        .unwrap();
+    visited.sort();
+    assert_eq!(count, 2);
+    assert_eq!(
+        visited,
+        vec![
+            ("ab".to_owned(), "b".to_owned()),
+            ("ac".to_owned(), "c".to_owned()),
+        ]
+    );
+
+    let mut visited_before_cancel = 0_usize;
+    let error = db
+        .visit_outgoing_relation_targets(
+            &namespace(),
+            &entity_id("a"),
+            &kinds,
+            Arc::new(CancelOnPoll::new(3)),
+            &mut |_| visited_before_cancel += 1,
+        )
+        .unwrap_err();
+    assert_eq!(error, GraphDbError::Cancelled);
+    assert_eq!(visited_before_cancel, 1);
 }
 
 /// Plan 39 G7b: reverse adjacency must be readable in bulk through the graph
@@ -1049,10 +1135,10 @@ fn vector_upsert_clears_prior_dimension_and_metric_keys() {
         GraphVectorIndexStatus::Missing,
         "a new vector shape must wait for the retained index owner"
     );
-    assert_eq!(
+    assert!(matches!(
         db.ensure_vector_index(current_index).unwrap(),
-        GraphVectorIndexStatus::Available
-    );
+        GraphVectorIndexStatus::Available { .. }
+    ));
     let current = db
         .vector_search(vector_request(VectorMetric::Euclidean, vec![1.0, 0.0]))
         .unwrap();
@@ -1175,7 +1261,7 @@ fn conditional_projection_replacement_rejects_a_stale_source_snapshot() {
             None,
         )
         .unwrap_err();
-    assert_eq!(stale, GraphDbError::Conflict);
+    assert!(matches!(stale, GraphDbError::Conflict { .. }));
     assert!(db.traverse(traversal("current")).is_ok());
     assert!(matches!(
         db.traverse(traversal("stale")),
@@ -1321,15 +1407,15 @@ fn publication_changed_input_and_stale_watermark_conflict() {
     let mut changed = publication("event-1", None);
     changed.next_watermark = watermark("w2");
     changed.batch.next_watermark = watermark("w2");
-    assert_eq!(
+    assert!(matches!(
         db.publish_unverified(changed).unwrap_err(),
-        GraphDbError::Conflict
-    );
-    assert_eq!(
+        GraphDbError::Conflict { .. }
+    ));
+    assert!(matches!(
         db.publish_unverified(publication("event-2", Some("stale")))
             .unwrap_err(),
-        GraphDbError::Conflict
-    );
+        GraphDbError::Conflict { .. }
+    ));
 }
 
 #[test]
@@ -1364,9 +1450,11 @@ fn persistent_close_and_reopen_preserves_graph_and_vector() {
     // pinned grafeo restores it at open, so the reopened store serves
     // vector search with no `ensure_vector_index` step and no rebuild.
     // Gated in the fork by `vector_index_reopen` / `torn_vector_checkpoint`.
-    assert_eq!(
-        reopened.vector_index_status(index).unwrap(),
-        GraphVectorIndexStatus::Available,
+    assert!(
+        matches!(
+            reopened.vector_index_status(index).unwrap(),
+            GraphVectorIndexStatus::Available { .. }
+        ),
         "reopen must restore the persisted vector index"
     );
     assert_eq!(
@@ -1416,7 +1504,7 @@ fn large_vector_corpus_reopens_without_synchronous_index_rebuild() {
                 cancellation: live(),
             })
             .unwrap(),
-        GraphVectorIndexStatus::Available,
+        GraphVectorIndexStatus::Available { vectors: 2_049 },
         "the persisted corpus index must come back restored"
     );
     // Both assertions carry weight: the admission bound above proves the
@@ -1454,7 +1542,7 @@ fn vector_write_after_reopen_updates_the_restored_index() {
     };
     assert_eq!(
         reopened.vector_index_status(index.clone()).unwrap(),
-        GraphVectorIndexStatus::Available,
+        GraphVectorIndexStatus::Available { vectors: 1 },
         "reopen must restore the persisted vector index"
     );
     reopened
@@ -1471,7 +1559,7 @@ fn vector_write_after_reopen_updates_the_restored_index() {
         .unwrap();
     assert_eq!(
         reopened.vector_index_status(index).unwrap(),
-        GraphVectorIndexStatus::Available,
+        GraphVectorIndexStatus::Available { vectors: 2 },
         "an ordinary write lands in the restored index, no rebuild step"
     );
     assert_eq!(
@@ -1642,12 +1730,12 @@ fn a_stale_index_rebuilds_once_its_vectors_arrive() {
 
     assert_eq!(
         db.ensure_vector_index(index.clone()).unwrap(),
-        GraphVectorIndexStatus::Available,
+        GraphVectorIndexStatus::Available { vectors: 1 },
         "the rebuild must pick up the vectors that have since landed"
     );
     assert_eq!(
         db.vector_index_status(index).unwrap(),
-        GraphVectorIndexStatus::Available
+        GraphVectorIndexStatus::Available { vectors: 1 }
     );
     assert_eq!(
         db.vector_search(vector_request(VectorMetric::Cosine, vec![1.0, 0.0]))
@@ -1684,6 +1772,6 @@ fn a_populated_index_reports_available_and_needs_no_build() {
             cancellation: live(),
         })
         .unwrap();
-    assert_eq!(status, GraphVectorIndexStatus::Available);
+    assert_eq!(status, GraphVectorIndexStatus::Available { vectors: 1 });
     assert!(!status.needs_build());
 }

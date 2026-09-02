@@ -57,6 +57,69 @@ fn canonicalizes_alias_and_strip_prefix() {
 }
 
 #[test]
+fn whole_payload_invocation_parses_without_a_tool_definition() {
+    let parsed = parse_whole_payload_invocation_with_stdin(
+        &[
+            "--project".to_owned(),
+            "/tmp/project".to_owned(),
+            "--args".to_owned(),
+            r#"{"format":"json","include_branch_diagnostics":false}"#.to_owned(),
+            "--json".to_owned(),
+        ],
+        || panic!("inline JSON must not read stdin"),
+    )
+    .expect("whole-payload invocation")
+    .expect("whole-payload fast path");
+
+    assert_eq!(
+        parsed.tool_args,
+        json!({"format": "json", "include_branch_diagnostics": false})
+    );
+    assert_eq!(parsed.project.as_deref(), Some("/tmp/project"));
+    assert!(parsed.raw_json);
+    assert!(!parsed.dry_run);
+    assert!(!parsed.show_help);
+}
+
+#[test]
+fn whole_payload_invocation_defers_schema_dependent_flags() {
+    for args in [
+        vec!["--query".to_owned(), "needle".to_owned()],
+        vec!["--args".to_owned(), "{}".to_owned(), "--dry-run".to_owned()],
+        vec!["--help".to_owned()],
+    ] {
+        assert!(
+            parse_whole_payload_invocation_with_stdin(&args, || {
+                panic!("schema-dependent invocations must not read stdin")
+            })
+            .expect("schema-dependent invocation detection")
+            .is_none(),
+            "{args:?} must retain the schema-driven path"
+        );
+    }
+
+    for args in [
+        vec!["--args".to_owned(), "-".to_owned(), "--help".to_owned()],
+        vec!["--args".to_owned(), "-".to_owned(), "--dry-run".to_owned()],
+        vec!["--dry-run".to_owned(), "--args".to_owned(), "-".to_owned()],
+    ] {
+        let mut stdin_reads = 0;
+        assert!(
+            parse_whole_payload_invocation_with_stdin(&args, || {
+                stdin_reads += 1;
+                Ok("{}".to_owned())
+            })
+            .expect("schema-dependent invocation detection")
+            .is_none()
+        );
+        assert_eq!(
+            stdin_reads, 0,
+            "fast-path detection must leave stdin for the schema-driven parser: {args:?}"
+        );
+    }
+}
+
+#[test]
 fn parses_positional_required_string() {
     let d = def("search");
     let parsed = parse_invocation(&d, &["foo".to_string()]).unwrap();
@@ -381,6 +444,52 @@ fn valid_enum_passes() {
     let d = def("gini");
     let parsed = parse_invocation(&d, &["--metric".to_string(), "fan_in".to_string()]).unwrap();
     assert_eq!(parsed.tool_args["metric"], json!("fan_in"));
+}
+
+/// The fact category vocabulary reaches the schema through a `$defs`
+/// reference inside a nullable `anyOf`; client-side validation must resolve
+/// it and reject an unknown value with the admitted list.
+#[test]
+fn invalid_ref_enum_errors_with_allowed_values() {
+    let d = def("fact_store_add");
+    let err = parse_invocation(
+        &d,
+        &[
+            "--content".to_string(),
+            "categorized fact".to_string(),
+            "--category".to_string(),
+            "pitfall".to_string(),
+        ],
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("`pitfall` is not one of:"), "got: {msg}");
+    for admitted in [
+        "general",
+        "user_pref",
+        "project",
+        "tool",
+        "decision",
+        "code_area",
+    ] {
+        assert!(msg.contains(admitted), "missing `{admitted}` in: {msg}");
+    }
+}
+
+#[test]
+fn valid_ref_enum_passes() {
+    let d = def("fact_store_add");
+    let parsed = parse_invocation(
+        &d,
+        &[
+            "--content".to_string(),
+            "categorized fact".to_string(),
+            "--category".to_string(),
+            "decision".to_string(),
+        ],
+    )
+    .unwrap();
+    assert_eq!(parsed.tool_args["category"], json!("decision"));
 }
 
 #[test]
@@ -1102,4 +1211,20 @@ fn markdown_remains_the_default_presentation() {
     let (_request, format) =
         cli_surface_invocation("tracedecay_storage_status", json!({}), false).expect("default");
     assert_eq!(format, RequestedOutputFormat::Markdown);
+}
+
+#[test]
+fn application_surface_rejects_invalid_output_formats() {
+    for format in [json!("yaml"), json!(42), Value::Null] {
+        let error = cli_surface_invocation(
+            "tracedecay_storage_status",
+            json!({"format": format}),
+            false,
+        )
+        .expect_err("format outside the schema must fail");
+        assert!(matches!(
+            error,
+            ApplicationSurfaceAdapterError::InvalidSurfaceRequest
+        ));
+    }
 }

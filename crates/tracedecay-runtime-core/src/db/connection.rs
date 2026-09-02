@@ -12,8 +12,8 @@ use tracedecay_store::{
 use crate::db::engine::{
     Connection, ReadConnection, ReadSnapshot, Transaction, TransactionBehavior,
 };
-use crate::errors::{Result, TraceDecayError};
 use crate::store_runtime::registry::StoreRuntimeClientLease;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 use super::{DatabaseAuthority, DatabaseAuthorityRole};
 
@@ -86,6 +86,7 @@ pub enum DatabaseAccessMode {
 }
 
 impl DatabaseAccessMode {
+    #[hotpath::skip]
     const fn is_writable(&self) -> bool {
         matches!(self, Self::ReadWrite)
     }

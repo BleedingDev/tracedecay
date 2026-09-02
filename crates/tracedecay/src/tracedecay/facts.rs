@@ -1,17 +1,17 @@
 //! Session-memory (holographic fact store) surface of [`TraceDecay`].
 
-use tracedecay_usecases::memory::MemoryApplication;
-// The shared resolvers live in `tracedecay_usecases::memory` (the crate that
+use tracedecay_session_memory::memory::MemoryApplication;
+// The shared resolvers live in `tracedecay_session_memory::memory` (the crate that
 // owns `MemoryApplication`/`MemoryApplicationError`) rather than in
 // `tracedecay-runtime-core` — that crate is a *dependency* of
 // `tracedecay-usecases`, so hosting these there would require a circular
 // crate dependency. Both this module and
 // `tracedecay-dashboard-api::tracedecay::facts` delegate to the same
 // functions instead of keeping independent copies.
-use crate::store::memory::{ProjectFactStore, ProjectMemoryDbHandle};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{FactOwnerV1, ProjectId};
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
-use tracedecay_usecases::memory::memory_application_error;
+use tracedecay_runtime_core::store::memory::{ProjectFactStore, ProjectMemoryDbHandle};
+use tracedecay_session_memory::memory::memory_application_error;
 
 use super::TraceDecay;
 
@@ -37,6 +37,7 @@ impl TraceDecay {
 
     /// Opens the sole project fact authority selected by the retained project
     /// layout. Code-index routing never changes this database identity.
+    #[hotpath::skip]
     pub(crate) async fn project_memory_db(&self) -> Result<ProjectMemoryDbHandle<'_>> {
         if self.db_path() == self.store_layout.graph_db_path {
             Ok(ProjectMemoryDbHandle::Active(&self.db))
@@ -53,6 +54,7 @@ impl TraceDecay {
     /// Resolves the project-memory owner and database into one owner-bound
     /// application over a fact store that owns its resolved handle. Every
     /// project-memory route builds its application through this accessor.
+    #[hotpath::skip]
     pub(crate) async fn project_memory_application(
         &self,
     ) -> Result<MemoryApplication<ProjectFactStore<'_>>> {

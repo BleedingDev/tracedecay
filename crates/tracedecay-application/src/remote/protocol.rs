@@ -107,6 +107,7 @@ pub struct RemoteProtocolServiceV1<Port> {
 }
 
 impl<Port> RemoteProtocolServiceV1<Port> {
+    #[hotpath::skip]
     pub const fn new(port: Port) -> Self {
         Self { port }
     }

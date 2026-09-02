@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 /// many clients, and each client identity scopes profile-backed state such as
 /// project caches, registries, and accounting databases.
 ///
-/// Process-state construction (`current()`) stays in the composition root: it
-/// reads the user-data directory and global-db path from the running process.
+/// Process-state construction that reads the runtime-core config path helpers
+/// lives above this crate so the wire contract does not depend on the runtime
+/// kernel.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DaemonClientIdentity {
     pub profile_root: PathBuf,

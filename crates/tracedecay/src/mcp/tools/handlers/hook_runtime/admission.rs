@@ -4,9 +4,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use tracedecay_domain::errors::Result;
 use tracedecay_domain::{ProviderId, SessionId, UtcMicros};
 use tracedecay_global_db::RegisteredGlobalDb;
-use tracedecay_runtime_core::errors::Result;
 
 use super::context_scout::{
     admit_native_context_scout_lifecycle, hook_v2_context_scout_lifecycle_for_session,
@@ -237,7 +237,7 @@ fn forget_hook_v2_admission_ledger_for_test(data_root: &Path, host: tracedecay_h
 /// idempotency record.
 pub(crate) enum HookV2AdmissionOutcomeV1 {
     Admitted {
-        orchestration: crate::daemon::HookOrchestrationAdmissionV1,
+        orchestration: tracedecay_daemon_service::HookOrchestrationAdmissionV1,
         ready_guidance: Value,
         feedback_notice: Value,
         github_stack_signal_available: bool,
@@ -363,9 +363,9 @@ async fn admit_hook_v2_envelope_with_lifecycle(
     // host. Publish it here, where the project scope is already resolved; the
     // application lane retains it across dashboard disconnects and restarts.
     if first_admission && let Some(project_sessions) = project_sessions {
-        tracedecay_usecases::event_lane::publish(
+        tracedecay_session_memory::event_lane::publish(
             project_sessions,
-            tracedecay_usecases::event_lane::ActivityFamilyV1::Hook,
+            tracedecay_session_memory::event_lane::ActivityFamilyV1::Hook,
             cg.project_root(),
             cg.store_layout().identity.project_id.as_deref(),
             1,
@@ -417,7 +417,7 @@ async fn admit_hook_v2_envelope_with_lifecycle(
         },
         _ => Value::Null,
     };
-    let orchestration = crate::daemon::admit_registered_hook_orchestration(
+    let orchestration = tracedecay_daemon_service::admit_registered_hook_orchestration(
         envelope.clone(),
         snapshot.binding.clone(),
         lifecycle,
@@ -533,7 +533,7 @@ pub(super) fn hook_v2_profile_admit(
     args: &Value,
     action: &str,
     profile_root: &Path,
-    profile_identity: &crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1,
+    profile_identity: &dyn tracedecay_application::ProfileIdentityReadPort,
 ) -> Result<Value> {
     let routed_profile_root = std::fs::canonicalize(profile_root).map_err(|error| {
         tracedecay_automation_runtime::automation::config_error(format!(
@@ -598,7 +598,7 @@ pub(super) fn hook_v2_profile_admit(
 }
 
 fn profile_hook_v2_binding(
-    profile_identity: &crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1,
+    profile_identity: &dyn tracedecay_application::ProfileIdentityReadPort,
     host: tracedecay_hooks::HookHostV1,
 ) -> tracedecay_hooks::HookScopeBindingV1 {
     let profile_key = format!(

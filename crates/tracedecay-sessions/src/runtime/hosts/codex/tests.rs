@@ -146,11 +146,14 @@ mod goal_event_tests {
         let other = temp.path().join("other");
         std::fs::create_dir_all(&project_src).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        let status = std::process::Command::new(tracedecay_runtime_core::git::git_program())
-            .args(["init", "--quiet"])
-            .current_dir(&project_root)
-            .status()
-            .unwrap();
+        let status = std::process::Command::new(
+            tracedecay_runtime_core::git::try_git_program()
+                .expect("absolute git executable should resolve"),
+        )
+        .args(["init", "--quiet"])
+        .current_dir(&project_root)
+        .status()
+        .unwrap();
         assert!(status.success(), "git init failed");
 
         let project_id = ProjectId::new("project-id").unwrap();
@@ -804,23 +807,25 @@ mod source_matcher_cache_tests {
     use super::CodexSource;
     use crate::runtime::shared::{ProjectRootMatcherCache, StoredCursor};
     use crate::runtime::source::TranscriptSource;
+    use tracedecay_runtime_core::git_discovery::{
+        GitDiscoveryUnknown, GitRepositoryIdentity, GitRepositoryIdentityOutcome,
+    };
 
     static UNKNOWN_PATH_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 
-    fn retrying_identity(path: &Path) -> tracedecay_runtime_core::worktree::GitRepoIdentityOutcome {
+    fn retrying_identity(path: &Path) -> GitRepositoryIdentityOutcome {
         let root = path
             .ancestors()
             .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "repo"))
             .unwrap_or(path);
         if UNKNOWN_PATH_ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 1 {
-            return tracedecay_runtime_core::worktree::GitRepoIdentityOutcome::Unknown;
+            return GitRepositoryIdentityOutcome::Unknown(GitDiscoveryUnknown::DeadlineExceeded);
         }
-        tracedecay_runtime_core::worktree::GitRepoIdentityOutcome::Resolved(
-            tracedecay_runtime_core::worktree::GitRepoIdentity {
-                worktree_root: root.to_path_buf(),
-                common_dir: root.join(".git"),
-            },
-        )
+        GitRepositoryIdentityOutcome::Resolved(GitRepositoryIdentity {
+            worktree_root: root.to_path_buf(),
+            git_dir: root.join(".git"),
+            common_dir: root.join(".git"),
+        })
     }
 
     fn write_rollout(path: &Path, session_id: &str, cwd: &Path) {

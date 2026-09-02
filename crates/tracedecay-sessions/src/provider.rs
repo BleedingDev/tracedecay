@@ -33,6 +33,7 @@ impl SessionProvider {
         Self::Vibe,
     ];
 
+    #[hotpath::skip]
     pub const fn id(self) -> &'static str {
         match self {
             Self::Cursor => "cursor",
@@ -70,17 +71,20 @@ impl SessionProvider {
     /// provider identifier. Canonical capture from provider ingestion is a
     /// separate capability: Vibe has canonical capture but is not admitted
     /// through direct host calls.
+    #[hotpath::skip]
     pub const fn supports_host_admission(self) -> bool {
         !matches!(self, Self::Vibe)
     }
 
     /// Whether this provider's driver scans every destination store in one pass,
     /// so a per-destination catch-up loop must skip it once user ingestion ran.
+    #[hotpath::skip]
     pub const fn scans_all_destinations(self) -> bool {
         matches!(self, Self::Hermes)
     }
 
     /// Whether the production provider driver persists bounded sweep coverage.
+    #[hotpath::skip]
     pub const fn writes_typed_history_coverage(self) -> bool {
         matches!(self, Self::Kimi | Self::OpenCode)
     }
@@ -137,6 +141,7 @@ impl ProviderScope {
         }
     }
 
+    #[hotpath::skip]
     pub const fn provider(self) -> Option<SessionProvider> {
         match self {
             Self::All => None,
@@ -144,6 +149,7 @@ impl ProviderScope {
         }
     }
 
+    #[hotpath::skip]
     pub const fn provider_id(self) -> Option<&'static str> {
         match self {
             Self::All => None,
@@ -151,6 +157,7 @@ impl ProviderScope {
         }
     }
 
+    #[hotpath::skip]
     pub const fn response_label(self) -> &'static str {
         match self {
             Self::All => "all",

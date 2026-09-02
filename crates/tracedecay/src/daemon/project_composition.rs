@@ -6,6 +6,13 @@
 
 use super::*;
 use tracedecay_code_index_runtime::code_index_scheduler;
+use tracedecay_daemon_identity::profile_identity;
+use tracedecay_daemon_service::DaemonSemanticRuntimeRegistrationError;
+use tracedecay_semantic_contracts::SemanticResourceCeilings;
+use tracedecay_session_runtime::session_sync::DaemonSessionSyncConfig;
+use tracedecay_session_runtime::session_temporal_refresh_scheduler::{
+    ProfileSessionHistoricalIngestor, ProjectSessionHistoricalIngestor,
+};
 
 mod code_index_activation;
 mod runtime;
@@ -58,8 +65,7 @@ pub(super) enum ProjectMemoryProviderActivation {
 /// How one project composition decides its provider activation.
 ///
 /// Normal production has exactly one answer — read the authoritative runtime
-/// configuration — and cannot express any other. Only the daemon's own test
-/// harness can pin an activation directly, which is what keeps a compiled
+/// configuration — and cannot express any other. That is what keeps a compiled
 /// feature from implying activation: building with `memory-provider-host` makes
 /// the code reachable, and the configuration decides whether it runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,9 +74,6 @@ pub(super) enum ProjectMemoryProviderActivationSelector {
     /// loaded. Default-false configuration yields
     /// [`ProjectMemoryProviderActivation::Disabled`].
     FromRuntimeConfiguration,
-    /// Pin one activation explicitly. Test and transport builds only.
-    #[cfg(any(test, feature = "test-transport"))]
-    Pinned(ProjectMemoryProviderActivation),
 }
 
 impl ProjectMemoryProviderActivationSelector {
@@ -91,8 +94,6 @@ impl ProjectMemoryProviderActivationSelector {
             Self::FromRuntimeConfiguration => {
                 resolve_memory_provider_activation(&runtime_configuration.config)
             }
-            #[cfg(any(test, feature = "test-transport"))]
-            Self::Pinned(activation) => Ok(activation),
         }
     }
 }
@@ -100,7 +101,7 @@ impl ProjectMemoryProviderActivationSelector {
 /// The one reading of the host and routing gates. Pure so the selection table
 /// is unit-testable without a resolved snapshot.
 fn resolve_memory_provider_activation(
-    config: &tracedecay_usecases::config::TraceDecayConfig,
+    config: &tracedecay_configuration::TraceDecayConfig,
 ) -> Result<ProjectMemoryProviderActivation> {
     let routing = &config.memory_provider_recall_routing;
     routing
@@ -158,7 +159,7 @@ fn is_mountable_active_provider(_provider: &str) -> bool {
 #[cfg(feature = "memory-provider-host")]
 fn project_recall_routing_policy(
     activation: ProjectMemoryProviderActivation,
-    config: &tracedecay_usecases::config::TraceDecayConfig,
+    config: &tracedecay_configuration::TraceDecayConfig,
 ) -> Result<Option<tracedecay_memory_provider_registry::ActiveRoutingPolicy>> {
     use tracedecay_memory_provider_registry::{
         ActiveRoutingPolicy, FallbackRule, NATIVE_PROVIDER_ID, OwnedProviderId,
@@ -370,7 +371,7 @@ async fn release_one_idle_project_server_before_open(
                 .await?;
             let project_sessions_path = retired_owner
                 .store_root
-                .join(crate::storage::SESSIONS_DB_FILENAME);
+                .join(tracedecay_runtime_core::storage::SESSIONS_DB_FILENAME);
             retirement_administration
                 .git_index_transaction_services()
                 .retire_project_database(&project_id, &project_sessions_path)
@@ -781,13 +782,24 @@ async fn production_project_server_inner(
         invocation.code_index_schedulers.clone(),
         canonical_project_path.to_path_buf(),
     );
-    let code_index_activation = Arc::new(code_index_scheduler::CodeIndexActivationV1::new(
-        canonical_project_path,
-        Arc::clone(&route_registered),
-        cancellation.clone(),
-        code_index_mount,
-        code_index_hint_sink,
-    ));
+    let code_index_automatic_admission =
+        if tracedecay_runtime_core::worktree::is_linked_worktree(canonical_project_path)
+            && !cg.get_config().sync.watch_linked_worktrees
+        {
+            code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled
+        } else {
+            code_index_scheduler::CodeIndexAutomaticAdmissionV1::Admitted
+        };
+    let code_index_activation = Arc::new(
+        code_index_scheduler::CodeIndexActivationV1::new_with_admission(
+            canonical_project_path,
+            Arc::clone(&route_registered),
+            cancellation.clone(),
+            code_index_automatic_admission,
+            code_index_mount,
+            code_index_hint_sink,
+        ),
+    );
     let code_index_hook_sink = code_index_hook_sink(Arc::clone(&code_index_activation));
     let code_index_reconcile_sink = code_index_reconcile_sink(
         invocation.code_index_schedulers.clone(),
@@ -819,8 +831,8 @@ async fn production_project_server_inner(
     let dashboard_code_index_freshness_reader =
         project_dashboard_freshness_reader(invocation.code_index_schedulers.clone());
     let configuration_client = cg.configuration_runtime().client();
-    let dashboard_explorer_semantic_reader: crate::dashboard::ExplorerSemanticReader = Arc::new(
-        move |project_root: std::path::PathBuf| {
+    let dashboard_explorer_semantic_reader: tracedecay_dashboard_api::ExplorerSemanticReader =
+        Arc::new(move |project_root: std::path::PathBuf| {
             let configuration_client = Arc::clone(&configuration_client);
             Box::pin(async move {
                 let activated =
@@ -834,7 +846,7 @@ async fn production_project_server_inner(
                     .ok()
                     .and_then(|pinned| {
                         tracedecay_usecases::semantic_runtime::SemanticConfigurationPinV1::from_current(
-                            &tracedecay_usecases::configuration::ConfigurationCurrentStateV1 {
+                            &tracedecay_configuration::ConfigurationCurrentStateV1 {
                                 revision_id: pinned.revision_id,
                                 snapshot: pinned.snapshot,
                             },
@@ -842,18 +854,18 @@ async fn production_project_server_inner(
                         .ok()
                     });
                 let status = Some(
-                    crate::semantic_code::resolve_project_semantic_runtime_status(
+                    tracedecay_usecases::semantic_runtime::resolve_project_semantic_runtime_status(
                         Some(&project_root),
                         configuration,
                     ),
                 );
-                crate::dashboard::ExplorerSemanticReadV1 { activated, status }
+                tracedecay_dashboard_api::ExplorerSemanticReadV1 { activated, status }
             })
-        },
-    );
-    let dashboard_feedback_status_reader = crate::dashboard::feedback_api::feedback_status_reader(
-        invocation.feedback_runtime_registrar(),
-    );
+        });
+    let dashboard_feedback_status_reader =
+        tracedecay_dashboard_api::feedback_api::feedback_status_reader(
+            invocation.feedback_runtime_registrar(),
+        );
     let application_invocation_executor: Arc<
         dyn tracedecay_daemon_protocol::DaemonInvocationExecutor,
     > = Arc::new(InProcessDaemonInvocationExecutor::new(
@@ -894,6 +906,13 @@ async fn production_project_server_inner(
         &code_index_ignored_dependency_admission,
     ))
     .with_code_graph_read_admission_port(Arc::clone(&code_graph_read_admission_port))
+    .with_verified_graph_query_port(
+        crate::tracedecay::queries::graph::admitted_verified_graph_query_port_with_source(
+            Arc::clone(&code_graph_read_admission_port),
+            Arc::clone(&code_graph_projection_read_port),
+            Some(Arc::clone(&cg) as Arc<dyn tracedecay_graph_query::SourceReadRuntimePort>),
+        ),
+    )
     .with_code_index_search_authority(code_search_authority.clone())
     .with_project_server_live(Arc::clone(&route_registered))
     .with_application_invocation_executor(Arc::clone(&application_invocation_executor))
@@ -1036,12 +1055,23 @@ async fn production_project_server_inner(
             ],
         );
         let semantic_startup_project = canonical_project_path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
+        let semantic_startup_schedulers = invocation.code_index_schedulers.clone();
+        tokio::spawn(async move {
             let started = Instant::now();
-            let _ = crate::semantic_code::apply_config_selection(
-                semantic_startup_selection.as_deref(),
-                semantic_auto_download_enabled,
-            );
+            let selected = tokio::task::spawn_blocking(move || {
+                tracedecay_semantic::apply_default_config_selection(
+                    semantic_startup_selection.as_deref(),
+                    semantic_auto_download_enabled,
+                )
+            })
+            .await
+            .ok()
+            .flatten();
+            if selected.is_some() {
+                let _ = semantic_startup_schedulers
+                    .reschedule_semantic_generation(&semantic_startup_project)
+                    .await;
+            }
             log_daemon_event(
                 "project_open_phase",
                 &[
@@ -1092,7 +1122,7 @@ async fn production_project_server_inner(
             .await?;
             if !project_database_is_read_only {
                 Box::pin(bind_verified_project_graph_runtime(
-                    Arc::new(cg.db().clone()),
+                    cg.db(),
                     registered_project_session_db.as_ref(),
                 ))
                 .await?;
@@ -1165,18 +1195,16 @@ async fn production_project_server_inner(
                     .ensure_project_with_history(
                     key.owner.clone(),
                     session_db.clone(),
-                    Arc::new(
-                        session_temporal_refresh_scheduler::ProjectSessionHistoricalIngestor::new(
-                            session_db.clone(),
-                            profile_identity.clone(),
-                            canonical_project_path.to_path_buf(),
-                            code_search_project_id.clone(),
-                            transcript_source_home.clone(),
-                            store_administration
-                                .session_temporal_refresh_schedulers()
-                                .codex_discovery(),
-                        ),
-                    ),
+                    Arc::new(ProjectSessionHistoricalIngestor::new(
+                        session_db.clone(),
+                        Arc::new(profile_identity.clone()),
+                        canonical_project_path.to_path_buf(),
+                        code_search_project_id.clone(),
+                        transcript_source_home.clone(),
+                        store_administration
+                            .session_temporal_refresh_schedulers()
+                            .codex_discovery(),
+                    )),
                 ),
             )
             .await;
@@ -1186,23 +1214,21 @@ async fn production_project_server_inner(
                     .ensure_profile_with_history(
                     user_session_db.db_path().to_path_buf(),
                     user_session_db.clone(),
-                    Arc::new(
-                        session_temporal_refresh_scheduler::ProfileSessionHistoricalIngestor::new(
-                            user_session_db.clone(),
-                            registry_db.clone(),
-                            profile_identity.clone(),
-                            transcript_source_home.clone(),
-                            store_administration
-                                .session_temporal_refresh_schedulers()
-                                .codex_discovery(),
-                        ),
-                    ),
+                    Arc::new(ProfileSessionHistoricalIngestor::new(
+                        user_session_db.clone(),
+                        registry_db.clone(),
+                        Arc::new(profile_identity.clone()),
+                        transcript_source_home.clone(),
+                        store_administration
+                            .session_temporal_refresh_schedulers()
+                            .codex_discovery(),
+                    )),
                 ),
             )
             .await;
             let session_sync_owner = store_administration.session_sync_service();
             Box::pin(session_sync_owner.register_project(
-                crate::daemon::session_sync::DaemonSessionSyncConfig {
+                DaemonSessionSyncConfig {
                     brain_id: profile_identity.brain_id().clone(),
                     profile_id: profile_identity.profile_id().clone(),
                     project_id: code_search_project_id.clone(),
@@ -1240,13 +1266,13 @@ async fn production_project_server_inner(
             // enrollment, spool, replay, backup, and failover state through
             // this one provider; typed `Unavailable` remains only when the
             // remote plane is genuinely unreadable.
-            let remote_operational_status: crate::daemon::remote_protocol::RemoteOperationalStatusProviderV1 = {
+            let remote_operational_status: tracedecay_store_runtime::RemoteOperationalStatusProviderV1 = {
                 let remote_credentials = graph_runtime.remote_credential_authority();
                 Arc::new(move || remote_credentials.operational_status())
             };
             let remote_operational_read: doctor_kernel::RemoteOperationalReadProviderV1 = {
                 let remote_operational_status = Arc::clone(&remote_operational_status);
-                Arc::new(move || remote_operational_status().doctor_read())
+                Arc::new(move || remote_operational_status.read().doctor_read())
             };
             let doctor_report_reader = doctor_kernel::production_doctor_report_reader(
                 canonical_project_path.to_path_buf(),
@@ -1314,6 +1340,13 @@ async fn production_project_server_inner(
                 &code_index_ignored_dependency_admission,
             ))
             .with_code_graph_read_admission_port(Arc::clone(&code_graph_read_admission_port))
+            .with_verified_graph_query_port(
+                crate::tracedecay::queries::graph::admitted_verified_graph_query_port_with_source(
+                    Arc::clone(&code_graph_read_admission_port),
+                    Arc::clone(&code_graph_projection_read_port),
+                    Some(Arc::clone(&cg) as Arc<dyn tracedecay_graph_query::SourceReadRuntimePort>),
+                ),
+            )
             .with_code_index_search_authority(code_search_authority)
             .with_project_server_live(Arc::clone(&route_registered))
             .with_application_invocation_executor(application_invocation_executor)
@@ -1505,21 +1538,34 @@ async fn production_project_server_inner(
             ))
             .await;
             full_candidate.publish_doctor_report();
-            let indexing_requested = code_index_activation.activate();
+            let code_index_status = match code_index_activation.automatic_admission() {
+                code_index_scheduler::CodeIndexAutomaticAdmissionV1::Admitted => {
+                    if code_index_activation.activate() {
+                        "warming"
+                    } else {
+                        "unavailable"
+                    }
+                }
+                code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled => {
+                    log_daemon_event(
+                        "code_index_activation_skipped",
+                        &[
+                            (
+                                "project",
+                                canonical_project_path.display().to_string(),
+                            ),
+                            ("reason", "linked_worktree_disabled".to_owned()),
+                        ],
+                    );
+                    "linked_worktree_disabled"
+                }
+            };
             log_daemon_event(
                 "project_open_phase",
                 &[
                     ("project", canonical_project_path.display().to_string()),
                     ("phase", "full_published".to_owned()),
-                    (
-                        "code_index",
-                        if indexing_requested {
-                            "warming"
-                        } else {
-                            "unavailable"
-                        }
-                        .to_owned(),
-                    ),
+                    ("code_index", code_index_status.to_owned()),
                     (
                         "elapsed_ms",
                         project_open_started.elapsed().as_millis().to_string(),
@@ -1640,9 +1686,9 @@ fn cached_project_composition(
 /// Semantic-code choices this route resolves once from its authoritative
 /// runtime configuration.
 struct SemanticProjectRuntime {
-    handle: crate::semantic_code::DaemonSemanticRuntimeHandleV1,
-    lifecycle: Option<Arc<crate::semantic_code::SemanticModelLifecycleOwnerV1>>,
-    resources: crate::config::SemanticResourceCeilings,
+    handle: tracedecay_semantic::DaemonSemanticRuntimeHandleV1,
+    lifecycle: Option<Arc<tracedecay_semantic::SemanticModelLifecycleOwnerV1>>,
+    resources: SemanticResourceCeilings,
     auto_download_enabled: bool,
     startup_selection: Option<String>,
 }
@@ -1651,7 +1697,7 @@ struct SemanticProjectRuntime {
 /// composition runtime can veto auto-download even when configuration allows
 /// it, so both inputs are consulted here rather than at the use site.
 fn semantic_project_runtime(
-    runtime_configuration: &tracedecay_usecases::config::PinnedRuntimeConfiguration,
+    runtime_configuration: &tracedecay_configuration::config::PinnedRuntimeConfiguration,
     runtime: &ProductionProjectCompositionRuntime,
 ) -> Result<SemanticProjectRuntime> {
     let semantic_config = &runtime_configuration.config.semantic;
@@ -1659,7 +1705,7 @@ fn semantic_project_runtime(
     // The configured ceiling still caps concurrency; this only narrows it to
     // what the serving reservation leaves room for and adds one slot so an
     // interactive query keeps a warm session while a rebuild holds the rest.
-    let handle = crate::semantic_code::DaemonSemanticRuntimeHandleV1::new(
+    let handle = tracedecay_semantic::DaemonSemanticRuntimeHandleV1::new(
         tracedecay_semantic::embedding_parallelism::embedding_pool_sessions(
             semantic_resources.max_threads,
             semantic_resources.max_concurrent_sessions,
@@ -1674,7 +1720,7 @@ fn semantic_project_runtime(
     })?;
     Ok(SemanticProjectRuntime {
         handle,
-        lifecycle: crate::semantic_code::shared_lifecycle_owner(),
+        lifecycle: tracedecay_semantic::default_shared_lifecycle_owner(),
         resources: *semantic_resources,
         auto_download_enabled: semantic_config.auto_download && runtime.semantic_auto_download(),
         startup_selection: semantic_config.selected_model.clone(),
@@ -1686,10 +1732,10 @@ struct ProjectCodeIndexAuthorities {
     publication_identity: crate::mcp::server::CodeIndexPublicationIdentityResolver,
     project_id: tracedecay_domain::ProjectId,
     scope: tracedecay_application::ResolvedScope,
-    graph_projection_read_port: Arc<dyn tracedecay_usecases::graph::CodeGraphProjectionReadPort>,
+    graph_projection_read_port: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
     ignored_dependency_admission:
         Arc<dyn tracedecay_usecases::code_index::CodeIndexIgnoredDependencyAdmissionPortV1>,
-    generation_census_reader: crate::runtime_telemetry::GenerationCensusReader,
+    generation_census_reader: tracedecay_session_memory::runtime_telemetry::GenerationCensusReader,
     graph_read_admission_port: crate::mcp::server::CodeGraphReadAdmissionPort,
     search_authority: tracedecay_query::code_search::CodeIndexSearchAuthorityV1,
     read_admission_provider: query_mcp_admission::QueryMcpReadAdmissionProviderV1,
@@ -1703,7 +1749,7 @@ fn project_code_index_authorities(
     cg: &Arc<crate::tracedecay::TraceDecay>,
     canonical_project_path: &Path,
     authoritative_project_id: &str,
-    profile_identity: &crate::daemon::profile_identity::LocalProfileIdentityAuthorityV1,
+    profile_identity: &profile_identity::LocalProfileIdentityAuthorityV1,
     route_registered: &Arc<AtomicBool>,
     project_database_is_read_only: bool,
 ) -> Result<ProjectCodeIndexAuthorities> {
@@ -1713,8 +1759,9 @@ fn project_code_index_authorities(
         .map_err(|error| TraceDecayError::Config {
             message: format!("project search identity is invalid: {error}"),
         })?;
-    let scope = project_open_owners::resolved_scope_for_project(cg.project_root(), &project_id)
-        .map_err(|error| TraceDecayError::Config {
+    let scope =
+        tracedecay_code_index_runtime::resolved_scope_for_project(cg.project_root(), &project_id)
+            .map_err(|error| TraceDecayError::Config {
             message: format!("project search scope is invalid: {error:?}"),
         })?;
     let graph_projection_read_port = project_open_owners::project_code_graph_projection_read_port(
@@ -1772,8 +1819,8 @@ fn project_code_index_authorities(
 /// Dashboard-facing freshness reader for this route's code-index schedulers.
 fn project_dashboard_freshness_reader(
     schedulers: code_index_scheduler::CodeIndexSchedulerRegistryV1,
-) -> crate::dashboard::code_index_freshness_api::CodeIndexFreshnessReader {
-    let reader: crate::dashboard::code_index_freshness_api::CodeIndexFreshnessReader =
+) -> tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader {
+    let reader: tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader =
         Arc::new(move |project_root| {
             let schedulers = schedulers.clone();
             Box::pin(async move { schedulers.dashboard_freshness(&project_root).await })
@@ -1917,8 +1964,9 @@ mod memory_provider_routing_tests {
     //! gates; these tests pin it without a resolved snapshot.
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-    use tracedecay_usecases::config::{
-        MemoryProviderRecallFallbackV1, MemoryProviderRecallRoutingV1, TraceDecayConfig,
+    use tracedecay_configuration::TraceDecayConfig;
+    use tracedecay_domain::configuration::{
+        MemoryProviderRecallFallbackV1, MemoryProviderRecallRoutingV1,
     };
 
     use super::{ProjectMemoryProviderActivation, resolve_memory_provider_activation};

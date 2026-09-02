@@ -2,11 +2,11 @@ use super::*;
 use crate::daemon::ProductionProjectCompositionHarnessV1;
 use crate::daemon::{ProjectServerRequirement, project_server_requirement};
 use std::process::Command;
+#[cfg(unix)]
+use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_mcp::JsonRpcResponse;
 #[cfg(unix)]
-use tracedecay_runtime_core::errors::TraceDecayError;
-#[cfg(unix)]
-use tracedecay_usecases::context::CancellationToken;
+use tracedecay_session_memory::context::CancellationToken;
 
 static PRODUCTION_DASHBOARD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -206,16 +206,17 @@ async fn unenrolled_ambient_directory_is_rejected_before_project_warmup() {
 
 #[test]
 fn daemon_project_route_rejects_the_user_profile_root() {
-    let _env_lock = crate::config::lock_user_data_dir_test_env();
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-        return;
-    };
+    // Portable production path: `project_route_for_handshake` is the Windows
+    // and Unix authority. `DaemonEngine::project_route` is only a unix wrapper
+    // around it and must not be referenced from this un-gated contract test.
+    let _profile = crate::config::PinnedUserDataDir::new();
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("pinned HOME"));
     let handshake = DaemonHandshake {
         project_path: Some(home),
         ..test_handshake_defaults()
     };
 
-    let error = DaemonEngine::project_route(&handshake)
+    let error = super::super::project_route_for_handshake(&handshake)
         .expect_err("ambient home route must fail before project open");
 
     assert!(error.to_string().contains("ambient user/filesystem root"));
@@ -231,20 +232,27 @@ pub(super) fn enroll_project_on_disk_only(
     project_root: &std::path::Path,
     profile_root: &std::path::Path,
     project_id: &str,
-) -> crate::storage::StoreLayout {
+) -> tracedecay_runtime_core::storage::StoreLayout {
     assert!(
-        crate::storage::write_repository_identity_marker(project_root, project_id)
-            .expect("repository identity marker"),
+        tracedecay_runtime_core::storage::write_repository_identity_marker(
+            project_root,
+            project_id
+        )
+        .expect("repository identity marker"),
         "fixture repository must accept an identity marker"
     );
-    let marker = crate::storage::EnrollmentMarker {
+    let marker = tracedecay_runtime_core::storage::EnrollmentMarker {
         project_id: project_id.to_owned(),
-        storage_mode: crate::storage::StorageMode::ProfileSharded,
+        storage_mode: tracedecay_runtime_core::storage::StorageMode::ProfileSharded,
     };
-    let layout = crate::storage::profile_sharded_layout(project_root, profile_root, &marker)
-        .expect("layout");
+    let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
+        project_root,
+        profile_root,
+        &marker,
+    )
+    .expect("layout");
     std::fs::create_dir_all(&layout.data_root).expect("profile store root");
-    crate::storage::write_store_manifest(&layout).expect("store manifest");
+    tracedecay_runtime_core::storage::write_store_manifest(&layout).expect("store manifest");
     let sessions = rusqlite::Connection::open(&layout.sessions_db_path).expect("sessions database");
     sessions
         .execute_batch("PRAGMA user_version = 1;")
@@ -294,7 +302,7 @@ async fn durably_enrolled_project_is_admitted_after_a_registry_reset() {
         .expect("a durably enrolled project must be admitted without allow_init");
 
     // Admission must mount the recovered store, never mint a replacement.
-    let marker = crate::storage::read_repository_identity_marker(&project)
+    let marker = tracedecay_runtime_core::storage::read_repository_identity_marker(&project)
         .expect("read repository identity marker")
         .expect("repository identity marker retained");
     assert_eq!(marker.project_id, "proj_forward_boundary");
@@ -409,7 +417,7 @@ async fn orphaned_store_with_repository_identity_is_readopted_without_aliasing()
         !roots.is_empty(),
         "re-adoption must produce enrollment roots"
     );
-    let retained = crate::storage::read_repository_identity_marker(&project)
+    let retained = tracedecay_runtime_core::storage::read_repository_identity_marker(&project)
         .expect("read repository identity marker")
         .expect("repository identity marker must be retained");
     assert_eq!(
@@ -437,15 +445,19 @@ fn enroll_nongit_project_on_disk(
     project_root: &std::path::Path,
     profile_root: &std::path::Path,
     project_id: &str,
-) -> crate::storage::StoreLayout {
-    let marker = crate::storage::EnrollmentMarker {
+) -> tracedecay_runtime_core::storage::StoreLayout {
+    let marker = tracedecay_runtime_core::storage::EnrollmentMarker {
         project_id: project_id.to_owned(),
-        storage_mode: crate::storage::StorageMode::ProfileSharded,
+        storage_mode: tracedecay_runtime_core::storage::StorageMode::ProfileSharded,
     };
-    let layout = crate::storage::profile_sharded_layout(project_root, profile_root, &marker)
-        .expect("nongit layout");
+    let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
+        project_root,
+        profile_root,
+        &marker,
+    )
+    .expect("nongit layout");
     std::fs::create_dir_all(&layout.data_root).expect("profile store root");
-    crate::storage::write_store_manifest(&layout).expect("store manifest");
+    tracedecay_runtime_core::storage::write_store_manifest(&layout).expect("store manifest");
     let sessions = rusqlite::Connection::open(&layout.sessions_db_path).expect("sessions database");
     sessions
         .execute_batch("PRAGMA user_version = 1;")
@@ -515,7 +527,9 @@ async fn moved_nongit_project_is_readopted_only_when_confirmed() {
         .expect("ambient first-touch mints fresh");
     assert_eq!(
         ambient.identity.project_id.as_deref(),
-        Some(crate::storage::default_profile_project_id(&moved_canonical).as_str()),
+        Some(
+            tracedecay_runtime_core::storage::default_profile_project_id(&moved_canonical).as_str()
+        ),
         "ambient first-touch must mint the path-derived identity, never adopt"
     );
 
@@ -633,7 +647,10 @@ async fn ambient_first_touch_never_adopts_a_moved_nongit_store() {
         .expect("ambient first-touch on a fresh directory mints a fresh identity");
     assert_eq!(
         layout.identity.project_id.as_deref(),
-        Some(crate::storage::default_profile_project_id(&scratch_canonical).as_str()),
+        Some(
+            tracedecay_runtime_core::storage::default_profile_project_id(&scratch_canonical)
+                .as_str()
+        ),
         "ambient first-touch must never inherit a stale project identity"
     );
     let stale = registry
@@ -719,7 +736,10 @@ async fn moved_nongit_adoption_is_refused_when_ambiguous() {
     let target_canonical = target.canonicalize().expect("canonical target");
     assert_eq!(
         fresh.identity.project_id.as_deref(),
-        Some(crate::storage::default_profile_project_id(&target_canonical).as_str()),
+        Some(
+            tracedecay_runtime_core::storage::default_profile_project_id(&target_canonical)
+                .as_str()
+        ),
         "opting out of adoption must mint the path-derived identity"
     );
 }
@@ -873,16 +893,17 @@ async fn interrupted_moved_nongit_remap_resumes_on_next_explicit_init() {
     std::fs::rename(&original, &moved).expect("move nongit project");
     // Simulate the interruption: the remap wrote the shard manifest for the
     // new root but crashed before the registry upsert.
-    let torn_layout = crate::storage::profile_sharded_layout(
+    let torn_layout = tracedecay_runtime_core::storage::profile_sharded_layout(
         &moved,
         &profile_root,
-        &crate::storage::EnrollmentMarker {
+        &tracedecay_runtime_core::storage::EnrollmentMarker {
             project_id: project_id.to_owned(),
-            storage_mode: crate::storage::StorageMode::ProfileSharded,
+            storage_mode: tracedecay_runtime_core::storage::StorageMode::ProfileSharded,
         },
     )
     .expect("layout for the interrupted remap");
-    crate::storage::write_store_manifest(&torn_layout).expect("journal manifest write");
+    tracedecay_runtime_core::storage::write_store_manifest(&torn_layout)
+        .expect("journal manifest write");
 
     let resumed =
         crate::tracedecay::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
@@ -1356,7 +1377,8 @@ async fn remote_account_deletion_joins_admitted_open_before_enumeration_and_reco
         project_path: project_root,
         scope_prefix: None,
     };
-    let data_root = crate::storage::profile_sharded_data_root(&profile_root, project_id);
+    let data_root =
+        tracedecay_runtime_core::storage::profile_sharded_data_root(&profile_root, project_id);
     let racing_data_root = data_root.clone();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -1384,6 +1406,9 @@ async fn remote_account_deletion_joins_admitted_open_before_enumeration_and_reco
     };
     started_rx.await.expect("racing project open started");
 
+    let persist_receipt = engine
+        .store_administration
+        .remote_account_deletion_tombstone_persist_receipt();
     let deletion_administration = engine.store_administration.clone();
     let deletion_owners = owners.clone();
     let deletion = tokio::spawn(async move {
@@ -1396,22 +1421,16 @@ async fn remote_account_deletion_joins_admitted_open_before_enumeration_and_reco
             )
             .await
     });
-    tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
-        loop {
-            if engine
-                .store_administration
-                .remote_account_deletion_tombstone()
-                .await
-                .expect("read account tombstone")
-                .is_some()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("account tombstone was not persisted");
+    let persisted =
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), persist_receipt.wait())
+            .await
+            .expect("account tombstone persist receipt was not settled")
+            .expect("account tombstone persist receipt");
+    assert_eq!(persisted.tombstone_id, "tombstone.remote-account-race");
+    assert_eq!(
+        persisted.target,
+        tracedecay_global_db::RemoteDeletionTarget::Account
+    );
     release_tx.send(()).expect("release racing shard creation");
     super::super::ProjectOpenTasks::wait_for_completion(open)
         .await
@@ -1462,6 +1481,21 @@ async fn remote_account_deletion_joins_admitted_open_before_enumeration_and_reco
     assert!(
         !data_root.exists(),
         "Deleted replay must reconcile every shard present after the tombstone"
+    );
+}
+
+#[tokio::test]
+async fn remote_account_deletion_tombstone_persist_receipt_fails_when_never_settled() {
+    let administration = super::super::StoreAdministration::default();
+    let receipt = administration.remote_account_deletion_tombstone_persist_receipt();
+    drop(administration);
+    let error = receipt
+        .wait()
+        .await
+        .expect_err("unset persist receipt must fail closed");
+    assert!(
+        error.to_string().contains("dropped before it settled"),
+        "unexpected persist failure: {error}"
     );
 }
 
@@ -1834,7 +1868,7 @@ async fn repeated_bootstrap_requests_share_one_bounded_invariant_open_failure() 
     let first = tasks
         .start(route.clone(), async move {
             first_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err(tracedecay_runtime_core::errors::TraceDecayError::Database {
+            Err(tracedecay_domain::errors::TraceDecayError::Database {
                 message: "session temporal receipts or cursor keys are mutable".to_string(),
                 operation: "ensure global database authority invariants".to_string(),
             })
@@ -1940,7 +1974,7 @@ async fn project_open_task_registry_caps_distinct_inflight_routes() {
         let claim = tasks
             .start(
                 project_open_test_route(&format!("bounded-{index}")),
-                std::future::pending::<tracedecay_runtime_core::errors::Result<()>>(),
+                std::future::pending::<tracedecay_domain::errors::Result<()>>(),
             )
             .await;
         assert!(
@@ -2061,8 +2095,8 @@ async fn project_open_failure_cache_is_bounded_separately() {
     );
 }
 
-fn authority_invariant_error(message: &str) -> tracedecay_runtime_core::errors::TraceDecayError {
-    tracedecay_runtime_core::errors::TraceDecayError::Database {
+fn authority_invariant_error(message: &str) -> tracedecay_domain::errors::TraceDecayError {
+    tracedecay_domain::errors::TraceDecayError::Database {
         message: message.to_string(),
         operation: "ensure global database authority invariants".to_string(),
     }
@@ -2070,7 +2104,7 @@ fn authority_invariant_error(message: &str) -> tracedecay_runtime_core::errors::
 
 #[test]
 fn deterministic_code_authority_conflicts_do_not_spin_project_warmup() {
-    let error = tracedecay_runtime_core::errors::TraceDecayError::Database {
+    let error = tracedecay_domain::errors::TraceDecayError::Database {
         message: "DuplicateCodeAuthority { shard_id: fixture }".to_string(),
         operation: "register code-shard authority".to_string(),
     };
@@ -2083,7 +2117,7 @@ fn deterministic_code_authority_conflicts_do_not_spin_project_warmup() {
 
 #[test]
 fn exhausted_code_runtime_capacity_retries_at_resource_cadence() {
-    let error = tracedecay_runtime_core::errors::TraceDecayError::Database {
+    let error = tracedecay_domain::errors::TraceDecayError::Database {
         message: "ProjectCodeBudgetExhausted { limit: 4 }".to_string(),
         operation: "open registered session runtime".to_string(),
     };
@@ -2166,7 +2200,7 @@ fn transient_authority_failures_stay_immediately_retryable() {
     );
     assert_eq!(
         super::super::project_open_retry_backoff(
-            &tracedecay_runtime_core::errors::TraceDecayError::Database {
+            &tracedecay_domain::errors::TraceDecayError::Database {
                 message: "invalid committed observation authority JSON: trailing characters"
                     .to_string(),
                 operation: "read observation".to_string(),
@@ -2188,7 +2222,7 @@ async fn route_open_backoff_retries_after_deadline_without_cross_route_blocking(
     let rejected_state = match tasks
         .start(rejected.clone(), async move {
             rejected_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: "identity cutover conflict: strict route invariant".to_string(),
             })
         })
@@ -2264,7 +2298,7 @@ async fn project_open_task_shutdown_cancels_and_clears_route_registry() {
         .start_cancellable(route, move |cancellation| async move {
             task_started.notify_one();
             cancellation.cancelled().await;
-            Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: "project open cancelled".to_string(),
             })
         })
@@ -2315,7 +2349,7 @@ async fn project_open_shutdown_waits_for_inflight_unit_then_joins() {
                 .send(())
                 .expect("publish safe unit completion");
             cancellation.cancelled().await;
-            Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+            Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: "project open cancelled after safe unit".to_string(),
             })
         })
@@ -2416,15 +2450,15 @@ async fn project_open_identity_shutdown_ignores_unrelated_retiring_routes() {
     let state = tasks
         .start(unrelated.clone(), async move {
             started_tx.send(()).map_err(|()| {
-                tracedecay_runtime_core::errors::TraceDecayError::Config {
+                tracedecay_domain::errors::TraceDecayError::Config {
                     message: "unrelated open observer dropped".to_owned(),
                 }
             })?;
-            release_rx.await.map_err(|_| {
-                tracedecay_runtime_core::errors::TraceDecayError::Config {
+            release_rx
+                .await
+                .map_err(|_| tracedecay_domain::errors::TraceDecayError::Config {
                     message: "unrelated open release dropped".to_owned(),
-                }
-            })?;
+                })?;
             Ok(())
         })
         .await;
@@ -2486,8 +2520,11 @@ async fn project_deletion_retires_rootless_open_by_persisted_project_identity() 
     let project_root = temp.path().join("repository");
     std::fs::create_dir_all(&profile_root).expect("profile root");
     std::fs::create_dir_all(&project_root).expect("project root");
-    crate::storage::pin_fixture_repository_identity(&project_root, "proj_rootless_open")
-        .expect("pin fixture repository identity");
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+        &project_root,
+        "proj_rootless_open",
+    )
+    .expect("pin fixture repository identity");
     let route = ProjectRouteKey {
         profile_root: profile_root.canonicalize().expect("canonical profile"),
         global_db_path: profile_root.join("global.db"),
@@ -2605,8 +2642,9 @@ async fn portable_broker_bootstrap_bypasses_project_writer_gate() {
         ..test_handshake_defaults()
     };
     let owners = Arc::new(tokio::sync::Mutex::new(DatabaseOwnerRegistry::default()));
-    let profile_identity = crate::daemon::profile_identity::load_or_create(&profile_root)
-        .expect("load test profile identity");
+    let profile_identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+            .expect("load test profile identity");
     let store_administration = StoreAdministration::with_project_servers(Arc::clone(&owners))
         .with_profile_identity(profile_identity);
     store_administration
@@ -2615,6 +2653,17 @@ async fn portable_broker_bootstrap_bypasses_project_writer_gate() {
         .expect("prewarm portable bootstrap profile registry");
     super::super::prewarm_daemon_bootstrap_catalog()
         .expect("prewarm portable static bootstrap catalog");
+    // Daemon bootstrap installs the profile-scoped code-index worker plan
+    // before publishing any transport endpoint
+    // (`bootstrap::install_profile_worker_plan`), and project open refuses
+    // outright without it. This test drives `serve_windows_broker_client`
+    // directly, so it must reproduce that ordering itself or the warmup poll
+    // fails with "profile code-index worker plan was not installed".
+    super::super::DaemonInvocationState::default()
+        .install_worker_selection(
+            tracedecay_domain::configuration::CodeIndexWorkerSelectionV1::default(),
+        )
+        .expect("install portable broker profile worker plan");
     let gates = Arc::new(tokio::sync::Mutex::new(
         super::super::ProjectOpenGates::default(),
     ));
@@ -2767,7 +2816,7 @@ async fn portable_broker_bootstrap_bypasses_project_writer_gate() {
         "portable initialize warmup must singleflight one project open"
     );
     let receipt = super::super::shutdown_project_servers(
-        tokio::time::Instant::now() + super::super::DAEMON_SHUTDOWN_DEADLINE,
+        tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE,
         &store_administration,
     )
     .await;
@@ -2902,8 +2951,9 @@ async fn portable_project_warmup_rejects_after_shutdown_snapshot() {
         }))
         .expect("initialize request");
     let owners = Arc::new(tokio::sync::Mutex::new(DatabaseOwnerRegistry::default()));
-    let profile_identity = crate::daemon::profile_identity::load_or_create(&profile_root)
-        .expect("load test profile identity");
+    let profile_identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+            .expect("load test profile identity");
     let store_administration = StoreAdministration::with_project_servers(Arc::clone(&owners))
         .with_profile_identity(profile_identity);
     let project_open_gates = Arc::new(tokio::sync::Mutex::new(
@@ -2973,7 +3023,7 @@ async fn project_warmup_settles_when_drain_is_simultaneously_ready() {
                     open_polled_by_future.notify_one();
                     open_lifecycle.wait_for_draining().await;
                     open_won_by_future.store(true, std::sync::atomic::Ordering::Release);
-                    Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+                    Err(tracedecay_domain::errors::TraceDecayError::Config {
                         message: "simultaneous warmup completion".to_string(),
                     })
                 },
@@ -3265,7 +3315,7 @@ async fn foreground_project_open_wait_is_bounded_and_accepts_quick_publication()
     let project_path = std::path::PathBuf::from("/projects/uncontended");
     let published = super::super::project_open_orchestration::wait_for_project_open_publication(
         &project_path,
-        async { Ok::<(), tracedecay_runtime_core::errors::TraceDecayError>(()) },
+        async { Ok::<(), tracedecay_domain::errors::TraceDecayError>(()) },
     )
     .await;
     assert!(
@@ -3275,7 +3325,7 @@ async fn foreground_project_open_wait_is_bounded_and_accepts_quick_publication()
 
     let warming = super::super::project_open_orchestration::wait_for_project_open_publication(
         &project_path,
-        std::future::pending::<tracedecay_runtime_core::errors::Result<()>>(),
+        std::future::pending::<tracedecay_domain::errors::Result<()>>(),
     )
     .await
     .expect_err("an uncontended warm-up must not pin the foreground request");
@@ -3786,18 +3836,16 @@ async fn production_composition_harness_shutdown_allows_immediate_profile_reopen
     let profile_root = harness.profile_root().to_path_buf();
     harness.shutdown().await;
 
-    let profile_identity = crate::daemon::profile_identity::load_or_create(&profile_root)
-        .expect("reload isolated profile identity");
+    let profile_identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+            .expect("reload isolated profile identity");
     let _database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         &profile_root,
         100,
         "production-composition-reopen",
     )
     .expect("fresh daemon election");
-    let registry =
-        crate::daemon::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1::open(
-            profile_identity,
-        )
+    let registry = tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(profile_identity)
         .await
         .expect("immediately reopen profile runtime");
     registry
@@ -3808,7 +3856,7 @@ async fn production_composition_harness_shutdown_allows_immediate_profile_reopen
         .profile_sessions()
         .await
         .expect("immediately reopen profile session database");
-    let project_id = crate::storage::read_repository_identity_marker(&project)
+    let project_id = tracedecay_runtime_core::storage::read_repository_identity_marker(&project)
         .expect("read project identity")
         .expect("project identity marker");
     registry

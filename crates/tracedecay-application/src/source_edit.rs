@@ -176,6 +176,7 @@ pub enum SourceEditKind {
 }
 
 impl SourceEditKind {
+    #[hotpath::skip]
     pub const fn operation_name(self) -> &'static str {
         match self {
             Self::StrReplace => "str_replace",
@@ -264,6 +265,7 @@ pub enum SourceEditRequest {
 }
 
 impl SourceEditRequest {
+    #[hotpath::skip]
     pub const fn kind(&self) -> SourceEditKind {
         match self {
             Self::StrReplace { .. } => SourceEditKind::StrReplace,
@@ -277,6 +279,7 @@ impl SourceEditRequest {
         }
     }
 
+    #[hotpath::skip]
     pub const fn dry_run(&self) -> bool {
         match self {
             Self::StrReplace { dry_run, .. }
@@ -290,6 +293,7 @@ impl SourceEditRequest {
         }
     }
 
+    #[hotpath::skip]
     pub const fn verify(&self) -> bool {
         match self {
             Self::StrReplace { verify, .. }

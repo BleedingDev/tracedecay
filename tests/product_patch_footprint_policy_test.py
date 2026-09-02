@@ -280,11 +280,11 @@ class PatchFootprintPolicyTest(unittest.TestCase):
                 "production_harness_shutdown",
                 "shutdown_deadline",
             ),
-            "crates/tracedecay/src/daemon/service/invocation/lsp.rs": (
+            "crates/tracedecay-daemon-service/src/invocation/lsp.rs": (
                 "daemon_shutdown_deadline",
                 "shutdown_deadline",
             ),
-            "crates/tracedecay/src/daemon/service/project_runtime/shutdown.rs": (
+            "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs": (
                 "daemon_shutdown_deadline",
                 "shutdown_deadline",
             ),

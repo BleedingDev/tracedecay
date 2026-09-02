@@ -44,10 +44,11 @@ use tracedecay_application::{
     APPLICATION_REQUEST_ID_HEADER, ApplicationProblem, LegalAction, RequestId, RetryDirective,
     SafeDiagnostic,
 };
+use tracedecay_daemon_control::RemoteBrainTlsConfig;
 use tracedecay_domain::{EnrollmentGrantV1, ProjectId};
 
-use tracedecay_runtime_core::errors::{Result, TraceDecayError};
-use tracedecay_usecases::request_identity::{GlobalRequestSurface, mint_global_request_id};
+use tracedecay_application::request_identity::{GlobalRequestSurface, mint_global_request_id};
+use tracedecay_domain::errors::{Result, TraceDecayError};
 
 const MAX_HTTP_APPLICATION_PROJECT_ROUTERS: usize = 8;
 const MAX_HTTP_APPLICATION_COLD_RESOLUTIONS: usize = 8;
@@ -132,8 +133,8 @@ impl ProjectRouterCache {
 #[derive(Clone)]
 struct RemoteHttpApplicationMount {
     router: Router,
-    credentials: Arc<super::remote_protocol::DaemonRemoteCredentialAuthorityV1>,
-    runtime: Option<Arc<super::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1>>,
+    credentials: Arc<tracedecay_store_runtime::DaemonRemoteCredentialAuthorityV1>,
+    runtime: Option<Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>>,
 }
 
 #[derive(Deserialize)]
@@ -168,6 +169,7 @@ impl Default for DaemonHttpApplicationRegistry {
 }
 
 impl DaemonHttpApplicationRegistry {
+    #[hotpath::skip]
     pub(super) async fn mount(&self, project_id: &str, router: Router) -> Result<()> {
         let project_id =
             ProjectId::new(project_id.to_owned()).map_err(|error| TraceDecayError::Config {
@@ -200,10 +202,8 @@ impl DaemonHttpApplicationRegistry {
     pub(super) fn install_remote(
         &self,
         router: Router,
-        credentials: Arc<super::remote_protocol::DaemonRemoteCredentialAuthorityV1>,
-        runtime: Option<
-            Arc<super::store_runtime::session_registry::DaemonSessionRuntimeRegistryV1>,
-        >,
+        credentials: Arc<tracedecay_store_runtime::DaemonRemoteCredentialAuthorityV1>,
+        runtime: Option<Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>>,
     ) -> Result<()> {
         let mut slot = self.remote.write().map_err(|_| TraceDecayError::Config {
             message: "daemon HTTP Remote Brain router lock is poisoned".to_owned(),
@@ -251,6 +251,7 @@ impl DaemonHttpApplicationRegistry {
             })
     }
 
+    #[hotpath::skip]
     pub(super) async fn forget_remote_deleted_routes(
         &self,
         target: super::remote_deletion::RemoteDeletionReceiptTarget,
@@ -267,6 +268,7 @@ impl DaemonHttpApplicationRegistry {
         }
     }
 
+    #[hotpath::skip]
     async fn resolve(
         &self,
         project_id: &str,
@@ -317,7 +319,7 @@ impl DaemonHttpApplicationRegistry {
         admission: LocalHttpAdmission,
     ) -> Result<(
         Router,
-        Option<Arc<super::remote_protocol::DaemonRemoteCredentialAuthorityV1>>,
+        Option<Arc<tracedecay_store_runtime::DaemonRemoteCredentialAuthorityV1>>,
     )> {
         let local = Router::new()
             .route(
@@ -366,7 +368,7 @@ impl DaemonHttpApplicationRegistry {
     ) -> Result<
         Option<(
             Router,
-            Arc<super::remote_protocol::DaemonRemoteCredentialAuthorityV1>,
+            Arc<tracedecay_store_runtime::DaemonRemoteCredentialAuthorityV1>,
         )>,
     > {
         let remote = self
@@ -432,11 +434,8 @@ const REMOTE_STATUS_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 /// The CLI must not open a local store or construct a fresh in-process
 /// registry; this is the daemon's live mounted operational state.
 pub fn live_remote_operational_status() -> Result<RemoteOperationalStatusReadV1> {
-    let connection = super::current_daemon_connection()?;
-    let Some(record) = connection.authority_record.as_ref() else {
-        return Err(missing_daemon_authority());
-    };
-    let Some(endpoint) = record.http_application_endpoint else {
+    let connection = tracedecay_daemon_identity::current_daemon_connection()?;
+    let Some(endpoint) = connection.http_application_endpoint() else {
         return Err(TraceDecayError::Config {
             message: "TraceDecay daemon HTTP application endpoint is not published. Start or restart the daemon.".to_owned(),
         });
@@ -489,7 +488,7 @@ fn missing_daemon_authority() -> TraceDecayError {
 }
 
 fn remote_status_daemon_unavailable() -> TraceDecayError {
-    match super::default_socket_path() {
+    match tracedecay_daemon_control::default_socket_path() {
         Ok(socket_path) => super::unavailable_error(&socket_path),
         Err(error) => error,
     }
@@ -694,7 +693,7 @@ pub(super) struct DaemonHttpApplicationService {
     #[cfg(test)]
     origin: String,
     active: Arc<AtomicBool>,
-    remote_credentials: Option<Arc<super::remote_protocol::DaemonRemoteCredentialAuthorityV1>>,
+    remote_credentials: Option<Arc<tracedecay_store_runtime::DaemonRemoteCredentialAuthorityV1>>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<()>>>,
     remote_tls_shutdown: Option<oneshot::Sender<()>>,
@@ -710,7 +709,7 @@ struct RemoteBrainTlsServer {
     endpoint: SocketAddr,
     router: Router,
     admission: Arc<Semaphore>,
-    credentials: Arc<super::remote_protocol::DaemonRemoteCredentialAuthorityV1>,
+    credentials: Arc<tracedecay_store_runtime::DaemonRemoteCredentialAuthorityV1>,
     #[cfg(test)]
     egress: Arc<RemoteBrainTlsEgressObserver>,
 }
@@ -768,6 +767,7 @@ impl RemoteBrainTlsEgressObserver {
 
 impl DaemonHttpApplicationService {
     #[cfg(test)]
+    #[hotpath::skip]
     pub(super) async fn bind(
         registry: DaemonHttpApplicationRegistry,
         auth_token: &str,
@@ -775,10 +775,11 @@ impl DaemonHttpApplicationService {
         Self::bind_with_remote_tls(registry, auth_token, None).await
     }
 
+    #[hotpath::skip]
     pub(super) async fn bind_with_remote_tls(
         registry: DaemonHttpApplicationRegistry,
         auth_token: &str,
-        remote_tls: Option<&super::bootstrap::RemoteBrainTlsConfig>,
+        remote_tls: Option<&RemoteBrainTlsConfig>,
     ) -> Result<Self> {
         let remote_tls_server = match remote_tls {
             Some(config) => {
@@ -936,6 +937,7 @@ impl DaemonHttpApplicationService {
         &self.origin
     }
 
+    #[hotpath::skip]
     pub(super) async fn shutdown(mut self) -> Result<()> {
         self.active.store(false, Ordering::Release);
         if let Some(credentials) = self.remote_credentials.take() {
@@ -992,7 +994,8 @@ struct RemoteBrainTlsListener {
 }
 
 impl RemoteBrainTlsListener {
-    async fn bind(config: &super::bootstrap::RemoteBrainTlsConfig) -> Result<Self> {
+    #[hotpath::skip]
+    async fn bind(config: &RemoteBrainTlsConfig) -> Result<Self> {
         let certificates = CertificateDer::pem_file_iter(config.certificate_chain())
             .map_err(|error| tls_configuration_error("open Remote Brain TLS certificate", error))?
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -1043,6 +1046,7 @@ impl RemoteBrainTlsListener {
         self.listener.local_addr()
     }
 
+    #[hotpath::skip]
     async fn accept(&self) -> Option<(RemoteBrainTlsIo, SocketAddr)> {
         let (stream, address) = match self.listener.accept().await {
             Ok(accepted) => accepted,

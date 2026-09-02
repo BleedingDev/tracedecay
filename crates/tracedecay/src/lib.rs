@@ -48,63 +48,54 @@
 // across the tree churns far more than the lint is worth here.
 #![allow(clippy::large_futures)]
 
-pub mod accounting;
 pub mod agents;
 pub use tracedecay_agent_hosts::cli_fallback_args_invocation_lit;
-pub mod analytics_bridge;
-// Phase 2 removes this composition-root re-export once callers import mcp directly.
-pub use tracedecay_mcp::application_output;
 pub mod application_surface;
-pub(crate) mod hint_outcomes;
 // Fixture surface for integration tests, assembled by the composition root.
 // Gated so a default or `production` build carries none of it.
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod host_admission;
 pub use tracedecay_code_index::ast_grep_search;
 pub mod bench;
-pub mod branch;
 pub mod catalog_composition;
-pub mod client_identity;
 pub mod cloud;
 pub use tracedecay_code_index as code_index;
 pub use tracedecay_query as query;
 pub mod config;
-pub mod context;
 pub mod daemon;
 pub mod dashboard;
-pub mod diagnostics;
-pub(crate) use diagnostics::lsp::semantic::production_semantic_authorities;
-pub mod display;
 pub mod doctor;
-pub mod external_tools;
 pub use tracedecay_usecases::git_query;
 pub mod graph;
 mod hooks;
 #[cfg(test)]
 mod host_admission_test;
 pub mod mcp;
-pub mod monitor;
+pub mod product_runtime;
+pub use product_runtime::{
+    ProductRuntimeError, ProductRuntimeProvider, ProductSourceProvenance, product_runtime,
+    register_product_runtime,
+};
 pub mod profile_registry_maintenance;
-pub mod project_registry;
-pub mod resolution;
+mod project_store_runtime;
 mod runtime_ports;
-pub use runtime_ports::register_runtime_ports;
+pub use runtime_ports::{register_runtime_ports, register_runtime_ports_without_mcp_tool_catalog};
 #[cfg(test)]
 #[path = "sessions/claude_observation_benchmark.rs"]
 mod claude_observation_benchmark;
 pub mod runtime_telemetry;
-pub mod search_eval;
-mod semantic_code;
 pub mod serve;
 #[cfg(test)]
 #[path = "sessions/ingest_tests.rs"]
 mod session_ingest_tests;
+// Benchmark harness, not product surface: the shipped library must not carry
+// its fixture provisioning or process-environment mutation. The `session_temporal`
+// bench target and the `test-helpers` integration lanes select it explicitly.
+#[cfg(any(test, feature = "test-helpers"))]
 pub mod session_temporal_benchmark;
-pub mod storage;
-pub mod store;
-pub(crate) mod support;
 pub mod tracedecay;
-pub mod types;
+#[doc(hidden)]
+pub mod vector_generation_test_support;
 pub mod version;
 #[cfg(test)]
 #[path = "sessions/workflow_ingest_tests.rs"]

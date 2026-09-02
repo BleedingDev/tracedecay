@@ -9,10 +9,12 @@ impl MaintenanceTaskTermination {
         Self { finished }
     }
 
+    #[hotpath::skip]
     pub(in crate::daemon) async fn wait(&self) {
         self.wait_for_finish(self.finished.subscribe()).await;
     }
 
+    #[hotpath::skip]
     async fn wait_for_finish(&self, mut finished: tokio::sync::watch::Receiver<bool>) {
         while !*finished.borrow_and_update() {
             if finished.changed().await.is_err() {

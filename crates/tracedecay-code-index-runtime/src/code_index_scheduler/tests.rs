@@ -20,15 +20,15 @@ use tracedecay_application::{
     SourceMetadataRequest, callable_code_operation,
 };
 use tracedecay_domain::{
-    ActorId, AuthorizationRevision, CalibrationProfileId, CodeGenerationId, CommitId,
-    ComponentRevision, DiversityPolicy, EphemeralSanitizedQueryViewV1, ExactAdmissionRuleRevision,
-    ExactClass, FreshnessVectorDigest, FusedCandidate, FusionProfile, LogicalEvidenceId,
-    ManifestDigest, OptionalStagePublicStatus, PrincipalId, PrivacyDomainId, ProjectId,
-    PublicRetrieverStatus, QueryNormalizationRevision, RankedCandidate, RefId, RelationEdgeKindV1,
-    RepositoryId, RerankPolicy, RetrievalAnchorId, RetrievalBudget, RetrievalCursorKeyId,
-    RetrievalRequest, RetrievalScope, RetrievalSnapshot, RetrieverKind, RetrieverOutcome,
-    SanitizerRevision, ScoreDomainCalibrationV1, ScoreDomainId, SensitivityLevelV1,
-    SingleRootScopeV1, TemporalModeV1, UtcMicros, VectorWatermark, WorktreeId,
+    ActorId, AuthorizationRevision, CalibrationProfileId, ChunkerRevision, CodeGenerationId,
+    CommitId, ComponentRevision, DiversityPolicy, EphemeralSanitizedQueryViewV1,
+    ExactAdmissionRuleRevision, ExactClass, FreshnessVectorDigest, FusedCandidate, FusionProfile,
+    LogicalEvidenceId, ManifestDigest, OptionalStagePublicStatus, PolicyRevisionId, PrincipalId,
+    PrivacyDomainId, ProjectId, PublicRetrieverStatus, QueryNormalizationRevision, RankedCandidate,
+    RefId, RelationEdgeKindV1, RepositoryId, RerankPolicy, RetrievalAnchorId, RetrievalBudget,
+    RetrievalCursorKeyId, RetrievalRequest, RetrievalScope, RetrievalSnapshot, RetrieverKind,
+    RetrieverOutcome, SanitizerRevision, ScoreDomainCalibrationV1, ScoreDomainId,
+    SensitivityLevelV1, SingleRootScopeV1, TemporalModeV1, UtcMicros, VectorWatermark, WorktreeId,
 };
 
 #[cfg(feature = "semantic-fastembed")]
@@ -38,11 +38,12 @@ use crate::semantic_code::{
     production_fastembed_catalog,
 };
 #[cfg(feature = "semantic-fastembed")]
-use tracedecay_global_db::configuration::semantic::SemanticResourceCeilings;
-#[cfg(feature = "semantic-fastembed")]
 use tracedecay_graph_db::NeverCancelled;
 #[cfg(feature = "semantic-fastembed")]
 use tracedecay_runtime_core::db::{Database, DatabaseAuthority, TestDatabaseRuntimeMode};
+use tracedecay_semantic_contracts::SemanticFallbackReasonV1;
+#[cfg(feature = "semantic-fastembed")]
+use tracedecay_semantic_contracts::{DEFAULT_FASTEMBED_MODEL_ID, SemanticResourceCeilings};
 #[cfg(feature = "semantic-fastembed")]
 use tracedecay_usecases::semantic_runtime::{
     ProductionSemanticRuntimeV1, RetainedSemanticVectorGraphV1, SemanticRuntimeFuture,
@@ -51,12 +52,13 @@ use tracedecay_usecases::semantic_runtime::{
 
 use super::registry::{
     ColdMountOpenEventV1, ServingGenerationInstallationOutcomeV1,
-    ServingGenerationRollbackOutcomeV1,
+    ServingGenerationRollbackOutcomeV1, dashboard_code_graph_serving,
 };
 use super::{
     CodeIndexBuildProgressStateV1, CodeIndexCadenceOutcomeV1, CodeIndexCadenceTriggerV1,
-    CodeIndexCommittedProgressSampleV1, CodeIndexReconcileOutcomeV1, CodeIndexSchedulerRegistryV1,
-    CodeIndexWorktreeSchedulerV1, GenerationDecodeAdmissionV1, SharedCodeIndexBytePoolV1,
+    CodeIndexCommittedProgressSampleV1, CodeIndexIgnoredDependencyRequestV1,
+    CodeIndexReconcileOutcomeV1, CodeIndexSchedulerRegistryV1, CodeIndexWorktreeSchedulerV1,
+    GenerationDecodeAdmissionV1, SharedCodeIndexBytePoolV1,
 };
 use crate::code_index::production::{CodeIndexAtomicPublicationPort, CodeIndexExecutionControlV1};
 use crate::semantic_code::rerank_adapter::GenerationBoundCodeRerankViewsV1;
@@ -162,20 +164,26 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
 }
 
 fn git(root: &Path, args: &[&str]) {
-    let status = Command::new(tracedecay_runtime_core::git::git_program())
-        .current_dir(root)
-        .args(args)
-        .status()
-        .expect("run git fixture command");
+    let status = Command::new(
+        tracedecay_runtime_core::git::try_git_program()
+            .expect("absolute git executable should resolve"),
+    )
+    .current_dir(root)
+    .args(args)
+    .status()
+    .expect("run git fixture command");
     assert!(status.success(), "git fixture command failed: {args:?}");
 }
 
 fn git_stdout(root: &Path, args: &[&str]) -> String {
-    let output = Command::new(tracedecay_runtime_core::git::git_program())
-        .current_dir(root)
-        .args(args)
-        .output()
-        .expect("run git fixture command");
+    let output = Command::new(
+        tracedecay_runtime_core::git::try_git_program()
+            .expect("absolute git executable should resolve"),
+    )
+    .current_dir(root)
+    .args(args)
+    .output()
+    .expect("run git fixture command");
     assert!(
         output.status.success(),
         "git fixture command failed: {args:?}"
@@ -205,9 +213,38 @@ fn scheduler(
         .expect("open worktree scheduler")
 }
 
+fn replace_scheduler_policy_revision(scheduler: &mut CodeIndexWorktreeSchedulerV1, revision: &str) {
+    let mut config = scheduler.production_config.clone();
+    config.policy_revision = PolicyRevisionId::new(revision).expect("policy revision");
+    scheduler.owner = super::open_production_code_index_owner_v1(
+        config.clone(),
+        scheduler.publication.clone(),
+        super::DaemonProjectionSinkV1,
+    )
+    .expect("open reconfigured production owner")
+    .with_physical_artifact_pool(scheduler.byte_pool.physical_artifacts.clone());
+    scheduler.production_config = config;
+}
+
+fn replace_scheduler_chunker_revision(
+    scheduler: &mut CodeIndexWorktreeSchedulerV1,
+    revision: &str,
+) {
+    let mut config = scheduler.production_config.clone();
+    config.chunker_revision = ChunkerRevision::new(revision).expect("chunker revision");
+    scheduler.owner = super::open_production_code_index_owner_v1(
+        config.clone(),
+        scheduler.publication.clone(),
+        super::DaemonProjectionSinkV1,
+    )
+    .expect("open reconfigured production owner")
+    .with_physical_artifact_pool(scheduler.byte_pool.physical_artifacts.clone());
+    scheduler.production_config = config;
+}
+
 fn build_progress_snapshot(
     scheduler: &CodeIndexWorktreeSchedulerV1,
-) -> Arc<crate::dashboard::code_index_freshness_api::CodeIndexBuildProgressV1> {
+) -> Arc<tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildProgressV1> {
     scheduler
         .build_progress_slot()
         .read()
@@ -219,14 +256,15 @@ fn build_progress_snapshot(
 fn progress_snapshot_for_generation(
     generation_id: &CodeGenerationId,
     committed_pages: u64,
-) -> crate::dashboard::code_index_freshness_api::CodeIndexBuildProgressV1 {
-    crate::dashboard::code_index_freshness_api::CodeIndexBuildProgressV1 {
+) -> tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildProgressV1 {
+    tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildProgressV1 {
         generation_id: generation_id.as_str().to_owned(),
         daemon_incarnation: 1,
         producer_incarnation: 1,
         progress_epoch: 0,
         sealed_source_digest: format!("sha256:{}", "a".repeat(64)),
-        phase: crate::dashboard::code_index_freshness_api::CodeIndexBuildPhaseV1::BulkCommit,
+        phase:
+            tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildPhaseV1::BulkCommit,
         committed_pages,
         committed_chunks: committed_pages,
         committed_imports: 0,
@@ -316,6 +354,217 @@ fn remove_historical_pointer_entries(store_root: &Path) {
         serde_json::to_vec(&pointer).expect("encode legacy publication pointer"),
     )
     .expect("write legacy publication pointer");
+}
+
+#[test]
+fn partitioned_publication_reuses_unchanged_file_segments() {
+    let unchanged = (0..256)
+        .map(|index| format!("pub fn unchanged_{index}() -> usize {{ {index} }}\n"))
+        .collect::<String>();
+    let fixture = GitFixture::new(&[
+        ("src/large.rs", unchanged.as_str()),
+        ("src/edited.rs", "pub fn edited() -> usize { 1 }\n"),
+    ]);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+
+    published(
+        scheduler
+            .reconcile_now()
+            .expect("publish first segmented generation"),
+    );
+    let pointer_path = store.path().join("active-code-generation-v1.json");
+    let first_pointer: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&pointer_path).expect("read first pointer"))
+            .expect("decode first pointer");
+    let first_manifest_path = store.path().join("code-generations-v1").join(
+        first_pointer["generation_file"]
+            .as_str()
+            .expect("first generation manifest"),
+    );
+    let first_manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&first_manifest_path).expect("read first manifest"))
+            .expect("decode first manifest");
+    assert_eq!(first_manifest["generation"]["format_revision"], 7);
+    let first_segments = first_manifest["generation"]["file_segments"]
+        .as_array()
+        .expect("first generation file segments");
+    assert_eq!(first_segments.len(), 2);
+
+    fixture.edit("src/edited.rs", "pub fn edited() -> usize { 2 }\n");
+    scheduler.notify_hook_paths([PathBuf::from("src/edited.rs")]);
+    published(
+        scheduler
+            .reconcile_now()
+            .expect("publish one-line-edit generation"),
+    );
+    let second_pointer: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&pointer_path).expect("read second pointer"))
+            .expect("decode second pointer");
+    let second_manifest_path = store.path().join("code-generations-v1").join(
+        second_pointer["generation_file"]
+            .as_str()
+            .expect("second generation manifest"),
+    );
+    let second_manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&second_manifest_path).expect("read second manifest"),
+    )
+    .expect("decode second manifest");
+    let second_segments = second_manifest["generation"]["file_segments"]
+        .as_array()
+        .expect("second generation file segments");
+    assert_eq!(second_segments.len(), 2);
+
+    let segment_digest = |segments: &[serde_json::Value], file_key: u64| {
+        segments
+            .iter()
+            .find(|segment| segment["file_key"].as_u64() == Some(file_key))
+            .and_then(|segment| segment["segment_digest"].as_str())
+            .expect("segment descriptor")
+            .to_owned()
+    };
+    let file_key = |manifest: &serde_json::Value, logical_path: &str| {
+        manifest["generation"]["snapshot"]["files"]
+            .as_array()
+            .expect("snapshot files")
+            .iter()
+            .position(|file| file["logical_path"].as_str() == Some(logical_path))
+            .and_then(|key| u64::try_from(key).ok())
+            .expect("snapshot file key")
+    };
+    let large_key = file_key(&first_manifest, "src/large.rs");
+    let edited_key = file_key(&first_manifest, "src/edited.rs");
+    let shared_segment = segment_digest(first_segments, large_key);
+    let retired_edited_segment = segment_digest(first_segments, edited_key);
+    let second_shared_segment = segment_digest(second_segments, large_key);
+    assert_eq!(
+        shared_segment, second_shared_segment,
+        "the unchanged large file must reuse the exact segment content address"
+    );
+    assert_ne!(
+        retired_edited_segment,
+        segment_digest(second_segments, edited_key),
+        "the one-line edit must publish exactly one replacement segment"
+    );
+
+    let segment_root = store.path().join("code-generation-segments-v1");
+    let component_sizes = |manifest: &serde_json::Value| {
+        let mut components = manifest["generation"]["file_segments"]
+            .as_array()
+            .expect("file segment descriptors")
+            .iter()
+            .map(|segment| {
+                (
+                    segment["segment_digest"]
+                        .as_str()
+                        .expect("file segment digest")
+                        .to_owned(),
+                    segment["segment_size_bytes"]
+                        .as_u64()
+                        .expect("file segment size"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        components.insert(
+            manifest["generation"]["generation_evidence"]["segment_digest"]
+                .as_str()
+                .expect("evidence segment digest")
+                .to_owned(),
+            manifest["generation"]["generation_evidence"]["segment_size_bytes"]
+                .as_u64()
+                .expect("evidence segment size"),
+        );
+        components
+    };
+    let first_components = component_sizes(&first_manifest);
+    let second_components = component_sizes(&second_manifest);
+    let second_generation_growth = std::fs::metadata(&second_manifest_path)
+        .expect("second manifest metadata")
+        .len()
+        .saturating_add(
+            second_components
+                .iter()
+                .filter(|(digest, _)| !first_components.contains_key(*digest))
+                .map(|(_, size)| *size)
+                .sum::<u64>(),
+        );
+    let monolithic_second_bytes = scheduler
+        .latest_complete_already_decoded()
+        .expect("second generation remains decoded")
+        .generation
+        .encode_sealed()
+        .expect("encode monolithic comparison")
+        .len() as u64;
+    assert!(
+        second_generation_growth.saturating_mul(2) < monolithic_second_bytes,
+        "one-line edit added {second_generation_growth} physical bytes versus a \
+         {monolithic_second_bytes}-byte monolithic rewrite"
+    );
+    let segment_sizes = std::fs::read_dir(&segment_root)
+        .expect("list content-addressed segments")
+        .map(|entry| {
+            entry
+                .expect("segment entry")
+                .metadata()
+                .expect("segment metadata")
+                .len()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        segment_sizes.len(),
+        5,
+        "three shared/edited file segments plus one evidence segment per generation"
+    );
+    let first_generation_segment_bytes = first_segments
+        .iter()
+        .map(|segment| {
+            segment["segment_size_bytes"]
+                .as_u64()
+                .expect("segment size")
+        })
+        .sum::<u64>();
+    let second_generation_new_bytes = second_segments
+        .iter()
+        .find(|segment| segment["file_key"].as_u64() == Some(edited_key))
+        .and_then(|segment| segment["segment_size_bytes"].as_u64())
+        .expect("edited segment size");
+    assert!(
+        second_generation_new_bytes.saturating_mul(8) < first_generation_segment_bytes,
+        "one-line edit rewrote {second_generation_new_bytes} bytes from a \
+         {first_generation_segment_bytes}-byte first generation"
+    );
+
+    remove_historical_pointer_entries(store.path());
+    let report = tracedecay_code_index_retention::code_index_generations::run_code_generation_retention(
+        store.path(),
+        &BTreeSet::new(),
+        tracedecay_code_index_retention::code_index_generations::DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+        tracedecay_code_index_retention::code_index_generations::CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(9_000_000),
+        None,
+    )
+    .expect("collect retired partitioned generation");
+    assert_eq!(report.deleted_generations.len(), 1);
+    let segment_path = |digest: &str| {
+        segment_root.join(format!(
+            "segment-{}.json",
+            digest
+                .strip_prefix("sha256:")
+                .expect("tagged segment digest")
+        ))
+    };
+    assert!(
+        segment_path(&shared_segment).is_file(),
+        "retention must preserve a segment referenced by the active generation"
+    );
+    assert!(
+        !segment_path(&retired_edited_segment).exists(),
+        "retention must collect a segment referenced only by the retired generation"
+    );
 }
 
 #[test]
@@ -1274,8 +1523,7 @@ fn semantic_mcp_reasons_bind_runtime_state_and_exact_source_generation() {
         (
             tracedecay_usecases::semantic_runtime::SemanticRuntimeStateV1::Degraded {
                 active_generation: None,
-                reason:
-                    tracedecay_usecases::semantic_runtime::SemanticFallbackReasonV1::RuntimeFailure,
+                reason: SemanticFallbackReasonV1::RuntimeFailure,
             },
             "semantic_degraded",
         ),
@@ -1496,6 +1744,133 @@ async fn restart_remount_serves_the_retained_generation_without_republishing() {
     restarted.shutdown().await;
 }
 
+/// A restart over a dirty checkout must seat the retained complete generation
+/// before the successor rebuild finishes. Waiting for that rebuild left remount
+/// serving empty (`last_reconcile_micros` unset, no seated publication) while
+/// a sealed artifact was already on disk.
+#[tokio::test]
+async fn restart_remount_seats_the_retained_generation_before_a_dirty_rebuild() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let first = CodeIndexSchedulerRegistryV1::new(1);
+    first
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("mount worktree");
+    let sealed = wait_for_live_complete_generation(&first, fixture.path()).await;
+    let sealed_id = sealed.generation().manifest().generation_id.clone();
+    first.shutdown().await;
+
+    fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 2 }\n");
+
+    let restarted = CodeIndexSchedulerRegistryV1::new(1);
+    restarted
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("remount worktree over a dirty checkout");
+    let seated = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(latest) = restarted
+                .latest_complete_serving_for_test(fixture.path())
+                .await
+            {
+                break latest;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("dirty remount must seat the retained generation before the successor rebuild");
+    assert_eq!(
+        seated.generation().manifest().generation_id,
+        sealed_id,
+        "the empty serving slot takes the retained generation, not the in-flight rebuild"
+    );
+
+    let rebuilt = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(latest) = restarted
+                .latest_complete_serving_for_test(fixture.path())
+                .await
+                && latest.generation().manifest().generation_id != sealed_id
+            {
+                break latest.generation().manifest().generation_id.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("dirty remount must still publish the successor generation");
+    assert_ne!(rebuilt, sealed_id, "the dirty checkout must rebuild");
+    restarted.shutdown().await;
+}
+
+/// Dirty remount seating must not park on the publication decode barrier
+/// while holding the scheduler lock. Activation may already own that cache;
+/// joining it left remount warming with no seated generation.
+#[tokio::test]
+async fn dirty_retained_seat_does_not_join_the_publication_decode_cache() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("mount worktree");
+    wait_for_live_complete_generation(&registry, fixture.path()).await;
+
+    fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 2 }\n");
+    let scheduler = registry
+        .scheduler_handle(fixture.path())
+        .await
+        .expect("scheduler handle");
+    let held_decode = scheduler
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .hold_active_decode();
+    let seating = scheduler.clone();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking(move || {
+            seating
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .seat_retained_generation_on_empty_serving_for_test()
+        }),
+    )
+    .await
+    .expect("dirty retained seat must not wait for the decode cache")
+    .expect("seat task")
+    .expect("seat result");
+    assert!(
+        matches!(outcome, Some(CodeIndexReconcileOutcomeV1::Noop(_))),
+        "dirty remount must still emit a retained-seat Noop without decoding"
+    );
+    assert_eq!(
+        held_decode.waiter_count(),
+        0,
+        "retained seating must not join the publication decode flight"
+    );
+
+    drop(held_decode);
+    registry.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scheduler_notifications_remain_nonblocking_while_reconcile_is_busy() {
     let fixture = GitFixture::new(ALPHA_LIB_V1);
@@ -1541,6 +1916,13 @@ async fn scheduler_notifications_remain_nonblocking_while_reconcile_is_busy() {
         .expect("scheduler notification must not wait for the reconcile lock")
         .expect("notification task");
     assert!(notified);
+    assert!(
+        registry
+            .latest_complete_ready(fixture.path())
+            .await
+            .is_none(),
+        "a hook epoch invalidates the memoized freshness proof before reconcile"
+    );
 
     let registry_read = tokio::time::timeout(
         Duration::from_millis(100),
@@ -1605,6 +1987,263 @@ fn saved_edit_incremental_publish() {
     let _ = latest
         .production_graph_serving()
         .expect("graph owner is activated");
+}
+
+/// Committing content the index already serves re-seals for provenance (see
+/// `same_content_head_move_publishes_new_source_identity`), and that re-seal
+/// must be delta-empty at the parse boundary: zero capture-declared changed
+/// files and zero changed chunks, with every chunk reused. This pins the
+/// evidence the downstream phases receive — graph activation, text-artifact
+/// projection, and semantic staging currently rebuild generation-scoped
+/// state from scratch even when these counters say the corpus is
+/// byte-identical, which is what makes a small drift cost a full pass.
+#[test]
+fn provenance_only_reseal_carries_the_full_parse_forward() {
+    let fixture = GitFixture::new(&[
+        ("src/lib.rs", "pub fn alpha() -> u32 { 1 }\n"),
+        ("src/other.rs", "pub fn gamma() -> u32 { 3 }\n"),
+    ]);
+    let store = TempDir::new().expect("store root");
+    let bytes = Arc::new(SharedCodeIndexBytePoolV1::default());
+    let mut scheduler = scheduler(&fixture, store.path().to_path_buf(), bytes);
+    published(scheduler.reconcile_now().expect("initial publish"));
+
+    fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 2 }\n");
+    scheduler.notify_path(fixture.path().join("src/lib.rs"));
+    let dirty = published(
+        scheduler
+            .reconcile_now()
+            .expect("dirty incremental publish"),
+    );
+    assert!(
+        scheduler
+            .latest_complete()
+            .expect("dirty generation serves")
+            .generation()
+            .snapshot()
+            .source_revision
+            .is_none(),
+        "a dirty capture seals without an exact source revision"
+    );
+
+    git(fixture.path(), &["add", "."]);
+    git(fixture.path(), &["commit", "-qm", "commit indexed content"]);
+    let resealed = published(
+        scheduler
+            .reconcile_now()
+            .expect("provenance-only reseal publishes"),
+    );
+    assert_ne!(dirty.generation_id, resealed.generation_id);
+    assert_eq!(
+        resealed.snapshot_content_identity, dirty.snapshot_content_identity,
+        "committing indexed content must not change the content identity"
+    );
+    assert_eq!(
+        resealed.reextracted_files, 0,
+        "a provenance-only reseal declares no changed files to re-extract"
+    );
+    assert_eq!(
+        resealed.changed_chunks, 0,
+        "a provenance-only reseal produces no added, changed, or deleted chunks"
+    );
+    assert!(
+        resealed.reused_chunks > 0,
+        "a provenance-only reseal reuses every sealed chunk"
+    );
+    assert_eq!(
+        scheduler
+            .latest_complete()
+            .expect("resealed generation serves")
+            .generation()
+            .snapshot()
+            .source_revision
+            .clone()
+            .expect("the reseal carries the committed revision")
+            .as_str(),
+        git_stdout(fixture.path(), &["rev-parse", "HEAD"]),
+        "the reseal records the moved tip as its exact source revision"
+    );
+}
+
+#[test]
+fn policy_transition_rebuilds_incompatible_active_generation() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let bytes = Arc::new(SharedCodeIndexBytePoolV1::default());
+    let mut config_a = scheduler(&fixture, store.path().to_path_buf(), Arc::clone(&bytes));
+    let generation_a = published(
+        config_a
+            .reconcile_now()
+            .expect("publish configuration A generation"),
+    )
+    .generation_id;
+    drop(config_a);
+
+    fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 2 }\n");
+    let mut config_b = scheduler(&fixture, store.path().to_path_buf(), bytes);
+    replace_scheduler_policy_revision(&mut config_b, "policy.daemon.v2");
+
+    let generation_b = published(
+        config_b
+            .reconcile_now()
+            .expect("configuration B must rebuild instead of rejecting A"),
+    )
+    .generation_id;
+    assert_ne!(generation_b, generation_a);
+    assert!(
+        config_b
+            .latest_complete()
+            .expect("configuration B generation")
+            .generation()
+            .chunks()
+            .chunks()
+            .iter()
+            .all(|chunk| chunk.sensitivity.policy_revision.as_str() == "policy.daemon.v2")
+    );
+}
+
+#[test]
+fn unchanged_policy_transition_refuses_unsafe_serving_and_rebuilds_once() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let bytes = Arc::new(SharedCodeIndexBytePoolV1::default());
+    let mut config_a = scheduler(&fixture, store.path().to_path_buf(), Arc::clone(&bytes));
+    let generation_a = published(
+        config_a
+            .reconcile_now()
+            .expect("publish configuration A generation"),
+    )
+    .generation_id;
+    drop(config_a);
+
+    let mut config_b = scheduler(&fixture, store.path().to_path_buf(), Arc::clone(&bytes));
+    replace_scheduler_policy_revision(&mut config_b, "policy.daemon.v2");
+    assert!(
+        config_b.latest_complete().is_none(),
+        "a generation sealed under a foreign policy must not serve while B rebuilds"
+    );
+    let recovery = config_b
+        .generation_recovery()
+        .read()
+        .expect("generation recovery status")
+        .clone()
+        .expect("policy recovery status");
+    assert_eq!(recovery.incompatible_generation_id, generation_a.as_str());
+    assert_eq!(recovery.incompatibilities, ["policy_revision"]);
+    assert_eq!(
+        recovery.serving,
+        tracedecay_dashboard_api::code_index_freshness_api::CodeIndexGenerationRecoveryServingV1::Refused
+    );
+    let generation_b = published(
+        config_b
+            .reconcile_now()
+            .expect("unchanged source still requires a configuration B generation"),
+    )
+    .generation_id;
+    assert_ne!(generation_b, generation_a);
+    let pointer = config_b
+        .publication
+        .read_publication_pointer()
+        .expect("read configuration B publication")
+        .expect("configuration B publication pointer");
+    assert_eq!(pointer.generation_id, generation_b.as_str());
+    assert_eq!(
+        pointer
+            .generation_index
+            .iter()
+            .filter(|entry| entry.generation_id == generation_a.as_str())
+            .count(),
+        0,
+        "the replacement is the sole durable candidate for this exact Git evidence"
+    );
+    assert!(
+        config_b
+            .generation_recovery()
+            .read()
+            .expect("generation recovery status")
+            .is_none(),
+        "the replacement publication clears recovery status"
+    );
+    assert!(matches!(
+        config_b
+            .reconcile_now()
+            .expect("configuration B must settle after one rebuild"),
+        CodeIndexReconcileOutcomeV1::Noop(_)
+    ));
+    drop(config_b);
+
+    let mut restarted = scheduler(&fixture, store.path().to_path_buf(), bytes);
+    replace_scheduler_policy_revision(&mut restarted, "policy.daemon.v2");
+    assert!(matches!(
+        restarted
+            .reconcile_now()
+            .expect("restart must adopt the persisted configuration B generation"),
+        CodeIndexReconcileOutcomeV1::Noop(_)
+    ));
+    assert_eq!(
+        restarted
+            .latest_complete()
+            .expect("configuration B survives restart")
+            .generation()
+            .manifest()
+            .generation_id,
+        generation_b
+    );
+}
+
+#[test]
+fn chunker_transition_preserves_safe_serving_until_replacement() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let bytes = Arc::new(SharedCodeIndexBytePoolV1::default());
+    let mut config_a = scheduler(&fixture, store.path().to_path_buf(), Arc::clone(&bytes));
+    let generation_a = published(
+        config_a
+            .reconcile_now()
+            .expect("publish configuration A generation"),
+    )
+    .generation_id;
+    drop(config_a);
+
+    let mut config_b = scheduler(&fixture, store.path().to_path_buf(), bytes);
+    replace_scheduler_chunker_revision(&mut config_b, "chunker.daemon.v4");
+    assert_eq!(
+        config_b
+            .latest_complete()
+            .expect("chunker-only incompatibility may preserve serving")
+            .generation()
+            .manifest()
+            .generation_id,
+        generation_a
+    );
+    let recovery = config_b
+        .generation_recovery()
+        .read()
+        .expect("generation recovery status")
+        .clone()
+        .expect("chunker recovery status");
+    assert_eq!(recovery.incompatibilities, ["chunker_revision"]);
+    assert_eq!(
+        recovery.serving,
+        tracedecay_dashboard_api::code_index_freshness_api::CodeIndexGenerationRecoveryServingV1::Preserved
+    );
+    let generation_b = published(
+        config_b
+            .reconcile_now()
+            .expect("chunker transition must publish a replacement"),
+    )
+    .generation_id;
+    assert_ne!(generation_b, generation_a);
+    assert_eq!(
+        config_b
+            .latest_complete()
+            .expect("replacement generation")
+            .generation()
+            .manifest()
+            .chunker_revision
+            .as_str(),
+        "chunker.daemon.v4"
+    );
 }
 
 #[test]
@@ -1821,7 +2460,7 @@ fn duplicate_save_and_overflow_equals_clean_scan() {
         hinted_publish.snapshot_content_identity,
         clean_publish.snapshot_content_identity
     );
-    assert_eq!(hinted_publish._lane_digest, clean_publish._lane_digest);
+    assert_eq!(hinted_publish.lane_digest, clean_publish.lane_digest);
     assert!(hinted_publish.overflow_reconciled);
 }
 
@@ -1874,7 +2513,7 @@ fn cross_worktree_byte_reuse_without_identity_alias() {
         second_publish.snapshot_content_identity
     );
     assert_ne!(
-        first_publish._file_occurrence_ids, second_publish._file_occurrence_ids,
+        first_publish.file_occurrence_ids, second_publish.file_occurrence_ids,
         "shared artifacts must never alias worktree occurrence identity"
     );
     assert_ne!(first_publish.generation_id, second_publish.generation_id);
@@ -2245,21 +2884,35 @@ fn one_symbol_unrelated_work_skip() {
     )]);
     let store = TempDir::new().expect("store root");
     let bytes = Arc::new(SharedCodeIndexBytePoolV1::default());
-    let mut scheduler = scheduler(&fixture, store.path().to_path_buf(), bytes);
-    published(scheduler.reconcile_now().expect("baseline"));
+    let mut incremental = scheduler(
+        &fixture,
+        store.path().join("incremental"),
+        Arc::clone(&bytes),
+    );
+    published(incremental.reconcile_now().expect("baseline"));
 
     fixture.edit(
         "src/lib.rs",
         "pub fn alpha() -> u32 { 2 }\n\npub fn unrelated() -> u32 { 99 }\n",
     );
-    scheduler.notify_path(fixture.path().join("src/lib.rs"));
-    let changed = published(scheduler.reconcile_now().expect("one-symbol publish"));
+    incremental.notify_path(fixture.path().join("src/lib.rs"));
+    let changed = published(incremental.reconcile_now().expect("one-symbol publish"));
 
     assert_eq!(changed.reextracted_files, 1);
     assert!(changed.changed_chunks > 0);
     assert!(
         changed.reused_chunks > 0,
         "unrelated symbol chunks must skip projection work"
+    );
+    let mut clean = scheduler(&fixture, store.path().join("clean"), bytes);
+    let rebuilt = published(clean.reconcile_now().expect("clean rebuild"));
+    assert_eq!(
+        changed.snapshot_content_identity, rebuilt.snapshot_content_identity,
+        "one-file incremental capture must equal a clean capture of the same source"
+    );
+    assert_eq!(
+        changed.lane_digest, rebuilt.lane_digest,
+        "one-file incremental projection must equal a clean projection"
     );
 }
 
@@ -2311,7 +2964,7 @@ fn superseding_notifies_publish_only_latest_content() {
         superseded.snapshot_content_identity, expected.snapshot_content_identity,
         "fair supersession must publish only the latest reconciled content"
     );
-    assert_eq!(superseded._lane_digest, expected._lane_digest);
+    assert_eq!(superseded.lane_digest, expected.lane_digest);
     assert!(superseded.overflow_reconciled);
 }
 
@@ -2436,7 +3089,7 @@ fn production_text_serving_builds_publishes_and_reopens_the_artifact_head() {
         let progress = build_progress_snapshot(&scheduler);
         assert_eq!(
             progress.phase,
-            crate::dashboard::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
+            tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
         );
         progress
     };
@@ -2500,7 +3153,7 @@ fn production_text_serving_builds_publishes_and_reopens_the_artifact_head() {
     let completed_after_restart = build_progress_snapshot(&scheduler);
     assert_eq!(
         completed_after_restart.phase,
-        crate::dashboard::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
+        tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
     );
     assert_eq!(
         completed_after_restart.generation_id,
@@ -2686,7 +3339,7 @@ fn retained_text_generation_reaches_query_owners_without_full_sealed_decode() {
     let scan = build_progress_snapshot(&reopened);
     assert_eq!(
         scan.phase,
-        crate::dashboard::code_index_freshness_api::CodeIndexBuildPhaseV1::SourceScan
+        tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildPhaseV1::SourceScan
     );
     assert!(scan.total_lexical_bytes > 0);
     assert_eq!(scan.completed_lexical_bytes, scan.total_lexical_bytes);
@@ -3879,7 +4532,7 @@ fn dashboard_progress_advances_only_after_durable_batch_commit() {
                 .snapshot()
                 .is_some_and(|snapshot| {
                     snapshot.phase
-                        == crate::dashboard::code_index_freshness_api::CodeIndexBuildPhaseV1::BulkCommit
+                        == tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildPhaseV1::BulkCommit
                 });
             if cancel {
                 self.observed_bulk_commit
@@ -3967,7 +4620,7 @@ fn dashboard_progress_advances_only_after_durable_batch_commit() {
     let dashboard_after = build_progress_snapshot(&scheduler);
     assert_eq!(
         dashboard_after.phase,
-        crate::dashboard::code_index_freshness_api::CodeIndexBuildPhaseV1::BulkCommit
+        tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildPhaseV1::BulkCommit
     );
     assert_eq!(dashboard_after.current_batch_pages, 1);
     assert_eq!(
@@ -3988,7 +4641,7 @@ fn dashboard_progress_advances_only_after_durable_batch_commit() {
     let dashboard_ready = build_progress_snapshot(&scheduler);
     assert_eq!(
         dashboard_ready.phase,
-        crate::dashboard::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
+        tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
     );
     assert!(dashboard_ready.progress_epoch > dashboard_after.progress_epoch);
 }
@@ -4233,7 +4886,7 @@ fn generation_replacement_drops_incomplete_text_projection_state() {
     );
     assert!(replacement_progress.progress_epoch > original_progress.progress_epoch);
     original.publish_text_progress_phase(
-        crate::dashboard::code_index_freshness_api::CodeIndexBuildPhaseV1::BulkCommit,
+        tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildPhaseV1::BulkCommit,
         99,
         99,
     );
@@ -4859,12 +5512,15 @@ fn moved_reference_scope(scope: &ResolvedScope) -> ResolvedScope {
     .expect("moved scope")
 }
 
-/// The defect this covers: during any generation rebuild the ready gate
-/// abstains, and search used to collapse into `GenerationUnavailable` for the
-/// whole window while callers/grep/context kept serving. Holding the scheduler
-/// mutex reproduces exactly that window — the background worker owns the
-/// scheduler, so the ready gate's `try_lock` abstains — while the last complete
-/// generation stays in `serving_generation`.
+/// The defect this covers: during any generation rebuild search used to
+/// collapse into `GenerationUnavailable` for the whole window while
+/// callers/grep/context kept serving. Holding the scheduler mutex reproduces
+/// exactly that window — the background worker owns the scheduler — while the
+/// last complete generation stays in `serving_generation`. A seat whose
+/// currency witness still re-proves against the unchanged checkout serves as
+/// current; once the checkout drifts under the held mutex the witness
+/// disproves, the ready gate abstains, and the fallback serves the same
+/// complete generation reported stale.
 // Holding the scheduler guard across the awaits is the scenario, not an
 // oversight: it is how this test occupies the rebuild window that the fallback
 // exists to serve through. The guard is released before shutdown.
@@ -4914,13 +5570,32 @@ async fn search_serves_the_last_complete_generation_while_the_scheduler_rebuilds
         "the last complete generation is still held and needs no re-read"
     );
 
+    // An unchanged checkout re-proves the seat's currency witness without the
+    // scheduler, so the rebuild window alone does not degrade the answer.
+    let witnessed = registry
+        .execute_query_search(&scope, core_search_request("main"))
+        .await
+        .expect("search keeps serving through the rebuild instead of failing");
+    assert!(
+        !witnessed.served_stale,
+        "a seat re-proven current against the unchanged checkout serves as current"
+    );
+
+    // Drift the checkout while the rebuild still owns the scheduler: the
+    // witness disproves, the ready gate abstains, and the fallback serves the
+    // last complete generation reported stale.
+    std::fs::write(
+        fixture.path().join("src/main.rs"),
+        "fn main() { drifted(); }\n",
+    )
+    .expect("drift the checkout under the held scheduler");
     let stale = registry
         .execute_query_search(&scope, core_search_request("main"))
         .await
         .expect("search keeps serving through the rebuild instead of failing");
     assert!(
         stale.served_stale,
-        "a fallback answer must be reported stale, never as current"
+        "a fallback answer past the disproved witness must be reported stale, never as current"
     );
     assert_eq!(
         stale.generation, fresh_generation,
@@ -4952,11 +5627,10 @@ async fn search_serves_the_last_complete_generation_while_the_scheduler_rebuilds
     registry.shutdown().await;
 }
 
-/// The resolution-order defect: asking the ready gate first made every query
-/// queue on the single-flight decode of the generation being activated, so a
-/// query holding a perfectly servable generation still paid an O(store) sweep
-/// before it could reach the stale fallback. Await-new must never preempt
-/// serve-old.
+/// The resolution-order defect: asking the graph-ready gate first made every
+/// query queue on the single-flight decode of the generation being activated,
+/// so a query with a current text owner still paid an O(store) sweep. Optional
+/// graph enrichment must neither block nor mark that text owner stale.
 ///
 /// This occupies the decode barrier exactly as activation of a new generation
 /// does — pinned slot empty, one decode in flight — and deliberately leaves the
@@ -5003,7 +5677,7 @@ async fn search_never_awaits_an_in_flight_decode_while_a_generation_is_servable(
         "the last complete generation is still held and needs no decode"
     );
 
-    let stale = tokio::time::timeout(
+    let current = tokio::time::timeout(
         Duration::from_secs(30),
         registry.execute_query_search(&scope, core_search_request("main")),
     )
@@ -5011,16 +5685,16 @@ async fn search_never_awaits_an_in_flight_decode_while_a_generation_is_servable(
     .expect("a servable generation must never queue on the decode barrier")
     .expect("search serves through the activation window");
     assert!(
-        stale.served_stale,
-        "a fallback answer must be reported stale, never as current"
+        !current.served_stale,
+        "a current text authority must stay fresh while optional graph decode is in flight"
     );
     assert_eq!(
-        stale.generation, fresh_generation,
-        "the stale answer names the complete generation that actually answered"
+        current.generation, fresh_generation,
+        "the current answer names the complete generation that actually answered"
     );
     assert_eq!(
-        stale.authorized.fallback.ordered_candidates, fresh_candidates,
-        "serving stale changes only the coverage marker, not ranking identity"
+        current.authorized.fallback.ordered_candidates, fresh_candidates,
+        "optional graph decode cannot change exact and lexical ranking identity"
     );
     assert_eq!(
         scheduler
@@ -5032,6 +5706,752 @@ async fn search_never_awaits_an_in_flight_decode_while_a_generation_is_servable(
     );
 
     drop(held_decode);
+    registry.shutdown().await;
+}
+
+/// The cold-restore window: a sealed active generation is on disk and the
+/// freshness fences pass, but the serving slot is empty because activation has
+/// not seated anything yet. The typed refusal is already determined — the
+/// activation gate can only ever admit the seated slot — so search resolution
+/// must deliver that verdict without joining (or starting) the single-flight
+/// O(store) decode. Before the reorder, a cold `search` against a rebuilding
+/// generation parked on that decode for 76 s before returning the refusal the
+/// daemon already knew; the same refusal is sub-second once delivered
+/// decode-free.
+#[tokio::test]
+async fn search_refusal_with_nothing_servable_never_joins_the_decode() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+
+    // Baseline: the mounted worktree serves before the window opens.
+    registry
+        .execute_query_search(&scope, core_search_request("main"))
+        .await
+        .expect("ready generation serves the fresh path");
+
+    // Enter the window: nothing seated, and the active-generation decode is
+    // owned by an in-flight activation that has not completed.
+    registry.clear_serving_generation_for_scope(&scope).await;
+    let scheduler = {
+        let mounted = registry.mounted.lock().await;
+        Arc::clone(
+            &mounted
+                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .expect("mounted worktree")
+                .scheduler,
+        )
+    };
+    let held_decode = scheduler
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .hold_active_decode();
+
+    let refusal = match tokio::time::timeout(
+        Duration::from_secs(5),
+        registry.execute_query_search(&scope, core_search_request("main")),
+    )
+    .await
+    .expect("a refusal the scheduler already knows must not wait on the decode")
+    {
+        Err(refusal) => refusal,
+        Ok(_) => panic!("nothing servable stays a typed refusal"),
+    };
+    assert!(
+        matches!(
+            refusal,
+            super::query_runtime::QuerySearchExecutionErrorV1::GenerationUnavailable
+                | super::query_runtime::QuerySearchExecutionErrorV1::GenerationUnverified
+        ),
+        "the verdict itself is unchanged: {refusal:?}"
+    );
+    assert_eq!(
+        held_decode.waiter_count(),
+        0,
+        "the refusal path must not park on the publication decode flight"
+    );
+
+    drop(held_decode);
+    registry.shutdown().await;
+}
+
+/// A seated graph generation is already the decoded serving authority. Root
+/// graph/status reads must not ask the publication decoder cache to prove that
+/// fact again: the cache may be temporarily claimed by unrelated activation
+/// work while the immutable serving handle remains fully usable.
+#[tokio::test]
+async fn root_graph_ready_does_not_depend_on_the_publication_decode_cache() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+    let serving = registry
+        .latest_complete_serving_for_scope(&scope)
+        .await
+        .expect("mounted graph generation serves");
+    serving
+        .production_graph_serving()
+        .expect("the serving generation has activated its graph lane");
+    let generation_id = serving.generation().manifest().generation_id.clone();
+
+    let scheduler = {
+        let mounted = registry.mounted.lock().await;
+        Arc::clone(
+            &mounted
+                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .expect("mounted worktree")
+                .scheduler,
+        )
+    };
+    let held_decode = scheduler
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .hold_active_decode();
+
+    let ready = tokio::time::timeout(
+        Duration::from_secs(30),
+        registry.latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope),
+    )
+    .await
+    .expect("root graph readiness must not wait for the decode cache")
+    .expect("the seated graph generation remains ready");
+    assert_eq!(
+        ready.generation().manifest().generation_id,
+        generation_id,
+        "the exact seated generation remains authoritative"
+    );
+    assert_eq!(
+        held_decode.waiter_count(),
+        0,
+        "root graph readiness must not join the publication decode flight"
+    );
+
+    let scope_ready = tokio::time::timeout(
+        Duration::from_secs(30),
+        registry.latest_complete_ready_decoded_for_scope(&scope),
+    )
+    .await
+    .expect("scope query readiness must not wait for the decode cache")
+    .expect("the seated graph generation remains ready for scoped queries");
+    assert_eq!(
+        scope_ready.generation().manifest().generation_id,
+        generation_id,
+        "scoped query admission must trust the exact seated generation"
+    );
+    assert_eq!(
+        held_decode.waiter_count(),
+        0,
+        "scope query readiness must not join the publication decode flight"
+    );
+
+    drop(held_decode);
+    registry.shutdown().await;
+}
+
+/// The live outage this covers: a background reconcile owns the scheduler
+/// mutex for its whole pass — sealing a production-scale corpus holds it for
+/// minutes per generation — while the seated serving generation stays fully
+/// decoded, activated, and proven current from before the pass began.
+/// Verified graph reads (redundancy, diagnose, `dead_code`, callers, impact)
+/// resolve through `latest_complete_ready_decoded_for_root_scope`; refusing
+/// them "not ready" for the whole pass turned bounded background work into a
+/// tool outage that outlived exact/lexical retrieval by 25+ minutes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proven_seated_generation_serves_verified_reads_while_reconcile_owns_the_scheduler() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+
+    // Seating races the publication event; poll the ready gate bounded until
+    // the quiet probe proves the seated generation current (arming the
+    // busy-read witness).
+    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(ready) = registry
+                .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+                .await
+            {
+                break ready;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the mounted generation becomes ready-decoded");
+    let generation_id = ready.generation().manifest().generation_id.clone();
+
+    let scheduler = {
+        let mounted = registry.mounted.lock().await;
+        Arc::clone(
+            &mounted
+                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .expect("mounted worktree")
+                .scheduler,
+        )
+    };
+    // Occupy the scheduler mutex exactly as an in-flight reconcile pass does:
+    // a std mutex held on a blocking thread until released.
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = locked_tx.send(());
+        let _ = release_rx.recv();
+    });
+    locked_rx.await.expect("scheduler mutex held");
+
+    let busy = tokio::time::timeout(
+        Duration::from_secs(30),
+        registry.latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope),
+    )
+    .await
+    .expect("verified reads must not join the in-flight reconcile")
+    .expect("the proven seated generation keeps serving while the scheduler is busy");
+    assert_eq!(
+        busy.generation().manifest().generation_id,
+        generation_id,
+        "the busy read serves the exact generation the quiet probe proved current"
+    );
+    assert!(
+        registry.has_current_ready_decoded_for_root_scope(fixture.path(), &scope),
+        "the readiness census reports the proven seated generation while the scheduler is busy"
+    );
+
+    release_tx.send(()).expect("release the held scheduler");
+    holder.join().expect("scheduler holder thread");
+    registry.shutdown().await;
+}
+
+/// Fail-closed half of the busy-read witness: a seated generation whose
+/// currency was never proven (a boot-restored seat, a stale seat, or a
+/// withdrawn proof) must stay a typed abstention while the scheduler mutex is
+/// busy, exactly as before. Only the exact-source probe's own verdict may arm
+/// busy serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_scheduler_still_refuses_a_seated_generation_without_a_currency_witness() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+
+    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(ready) = registry
+                .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+                .await
+            {
+                break ready;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the mounted generation becomes ready-decoded");
+    let generation_id = ready.generation().manifest().generation_id.clone();
+
+    let scheduler = {
+        let mounted = registry.mounted.lock().await;
+        Arc::clone(
+            &mounted
+                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .expect("mounted worktree")
+                .scheduler,
+        )
+    };
+    let witness = registry
+        .serving_source_witness_for_root(fixture.path())
+        .await
+        .expect("mounted worktree witness");
+    // Hold the scheduler first so no reconcile pass can re-prove the seat,
+    // then withdraw the proof — the exact state a restart-restored seat is in
+    // before its first passing probe.
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = locked_tx.send(());
+        let _ = release_rx.recv();
+    });
+    locked_rx.await.expect("scheduler mutex held");
+    *witness
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+    assert!(
+        registry
+            .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+            .await
+            .is_none(),
+        "an unproven seat must stay a typed abstention while the scheduler is busy"
+    );
+    assert!(
+        !registry.has_current_ready_decoded_for_root_scope(fixture.path(), &scope),
+        "the readiness census must not report an unproven seat while the scheduler is busy"
+    );
+
+    release_tx.send(()).expect("release the held scheduler");
+    holder.join().expect("scheduler holder thread");
+
+    // With the scheduler quiet again the exact-source probe re-proves the
+    // unchanged checkout and re-arms the witness.
+    let reproved = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(ready) = registry
+                .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+                .await
+            {
+                break ready;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the quiet probe re-proves the unchanged seat");
+    assert_eq!(
+        reproved.generation().manifest().generation_id,
+        generation_id
+    );
+
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verified_empty_source_remains_observable_while_scheduler_is_busy() {
+    let fixture = GitFixture::new(&[("assets/blob.bin", "not source\n")]);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("mount worktree");
+    let identity = super::identity::IndexingIdentityV1::resolve(fixture.path())
+        .expect("mounted worktree identity");
+    let scope = ResolvedScope::new(
+        test_project_id(),
+        identity.repository_id().clone(),
+        identity.worktree_id().clone(),
+        identity.head_ref().cloned(),
+    )
+    .expect("resolved scope");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !registry
+            .reconciled_without_generation_for_scope(&scope)
+            .await
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("empty source becomes verified");
+
+    let scheduler = registry
+        .scheduler_handle(fixture.path())
+        .await
+        .expect("scheduler handle");
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = locked_tx.send(());
+        let _ = release_rx.recv();
+    });
+    locked_rx.await.expect("scheduler lock held");
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            registry.reconciled_without_generation_for_scope(&scope),
+        )
+        .await
+        .expect("freshness probe does not wait for scheduler metadata"),
+        "verified empty source is not reclassified as warming during a build"
+    );
+
+    release_tx.send(()).expect("release scheduler lock");
+    holder.join().expect("scheduler holder joins");
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mounted_map_contention_cannot_hide_query_authority() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+    let held = registry.mounted.lock().await;
+    let lookup_registry = registry.clone();
+    let lookup_scope = scope.clone();
+    let lookup = tokio::spawn(async move {
+        lookup_registry
+            .query_authority_for_scope(&lookup_scope)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        !lookup.is_finished(),
+        "map contention waits for the micro-held map authority instead of fabricating unavailability"
+    );
+
+    drop(held);
+    assert!(
+        lookup
+            .await
+            .expect("query-authority lookup joins")
+            .is_some(),
+        "the mounted query authority remains visible after map contention"
+    );
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_worker_waits_for_global_admission_before_publication_gate() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 0);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("mount worktree");
+    let publication_gate = {
+        let mounted = registry.mounted.lock().await;
+        Arc::clone(
+            &mounted
+                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .expect("mounted worktree")
+                .semantic_evaluation_publication_gate,
+        )
+    };
+
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let publication = tokio::time::timeout(Duration::from_millis(100), publication_gate.lock())
+        .await
+        .expect("global admission wait must not hold the per-worktree publication gate");
+    drop(publication);
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ignored_dependency_waits_for_global_admission_before_publication_gate() {
+    struct ActiveControl;
+
+    impl CodeIndexExecutionControlV1 for ActiveControl {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+
+        fn is_deadline_exceeded(&self) -> bool {
+            false
+        }
+    }
+
+    let fixture = GitFixture::new(&[
+        (".gitignore", "node_modules/\n"),
+        (
+            "src/app.ts",
+            "import type { PublicWidget } from \"pkg\";\nexport const anchor = 1;\n",
+        ),
+    ]);
+    write(
+        fixture.path(),
+        "node_modules/pkg/index.d.ts",
+        "export interface PublicWidget { value: string }\n",
+    );
+    let store = TempDir::new().expect("store root");
+    let (registry, _) = mounted_core_query_worktree_with_one_permit(&fixture, &store).await;
+    let latest = wait_for_live_complete_generation(&registry, fixture.path()).await;
+    let generation = latest.generation();
+    let verified_import = generation
+        .imports()
+        .iter()
+        .find(|import| import.module_specifier == "pkg")
+        .expect("verified package import")
+        .clone();
+    let snapshot = generation.snapshot();
+    let scope = ResolvedScope::new(
+        generation.manifest().project_id.clone(),
+        snapshot.repository.clone(),
+        snapshot.worktree.clone().expect("worktree identity"),
+        snapshot.reference.clone(),
+    )
+    .expect("resolved scope");
+    let request = CodeIndexIgnoredDependencyRequestV1 {
+        scope: scope.clone(),
+        expected_generation: generation.manifest().generation_id.clone(),
+        verified_imports: vec![verified_import],
+    };
+    let publication_gate = {
+        let mounted = registry.mounted.lock().await;
+        Arc::clone(
+            &mounted
+                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .expect("mounted worktree")
+                .semantic_evaluation_publication_gate,
+        )
+    };
+    let global_admission = registry.background_reconcile_admission();
+    registry.clear_pending_wake_for_scope(&scope).await;
+    let publication = publication_gate.lock().await;
+    assert_eq!(
+        global_admission.available_permits(),
+        1,
+        "test setup requires an idle global admission"
+    );
+
+    let request_registry = registry.clone();
+    let project_root = fixture.path().to_path_buf();
+    let request_task = tokio::spawn(async move {
+        request_registry
+            .index_verified_ignored_dependency(&project_root, request, Arc::new(ActiveControl))
+            .await
+    });
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while global_admission.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ignored dependency must acquire global admission before waiting on publication");
+    drop(publication);
+    request_task
+        .await
+        .expect("ignored-dependency task joins")
+        .expect("ignored dependency publishes after admission");
+    registry.shutdown().await;
+}
+
+/// Busy-read stat proof reuse is explicitly bounded: an out-of-band write with
+/// no Git or scheduler hint may reuse the prior proof inside the memo window,
+/// but the first probe after that window must sweep and withdraw the witness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disproving_exact_source_probe_withdraws_the_busy_read_witness() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+
+    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(ready) = registry
+                .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+                .await
+            {
+                break ready;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the mounted generation becomes ready-decoded");
+    let disproved_generation_id = ready.generation().manifest().generation_id.clone();
+
+    let witness = registry
+        .serving_source_witness_for_root(fixture.path())
+        .await
+        .expect("mounted worktree witness");
+
+    // Drift the worktree; the stat-signature fence disproves the seat.
+    std::fs::write(
+        fixture.path().join("src/main.rs"),
+        "fn main() { drifted(); }\n",
+    )
+    .expect("drift the worktree");
+
+    assert!(
+        registry
+            .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+            .await
+            .is_some(),
+        "a raw unhinted write may reuse the proof only inside the explicit bounded interval"
+    );
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert!(
+        registry
+            .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+            .await
+            .is_none(),
+        "a drifted worktree disproves the seated generation's currency"
+    );
+    // The probe posts a reconcile wake, so the worker may already be sealing a
+    // successor; what must hold is that the witness never keeps naming the
+    // disproved generation.
+    assert_ne!(
+        witness
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|witness| witness.generation_id.clone()),
+        Some(disproved_generation_id),
+        "the disproving probe withdraws the busy-read witness"
+    );
+
+    registry.shutdown().await;
+}
+
+/// Flip the last hexadecimal character of a durable identifier so the result
+/// stays format-valid while naming something else.
+fn flip_trailing_hex(value: &str) -> String {
+    let mut renamed = value.to_owned();
+    let last = renamed.pop().expect("identifier has a trailing character");
+    renamed.push(if last == '0' { '1' } else { '0' });
+    renamed
+}
+
+/// Rewrite the durable publication pointer exactly as a convergence
+/// republication leaves it between its publish and its seat: the active
+/// generation id advances to an unseated successor, replacing the
+/// predecessor's index entry (same-revision entries are replaced, not
+/// appended), while the sealed artifact and Git evidence stay in place.
+/// `drift_content` additionally flips the sealed source content identity,
+/// staging a successor sealed from different bytes.
+fn advance_pointer_to_unseated_successor(scoped_store_root: &Path, drift_content: bool) {
+    use tracedecay_code_index_retention::code_index_generations::durable_generation_index_digest;
+
+    let pointer_path = scoped_store_root.join("active-code-generation-v1.json");
+    let mut pointer: super::DurablePublicationPointerV1 =
+        serde_json::from_slice(&std::fs::read(&pointer_path).expect("read active pointer"))
+            .expect("decode active pointer");
+    let predecessor_id = pointer.generation_id.clone();
+    pointer.generation_id = flip_trailing_hex(&predecessor_id);
+    if drift_content {
+        pointer.snapshot_content_identity = flip_trailing_hex(&pointer.snapshot_content_identity);
+    }
+    let active_entry = pointer
+        .generation_index
+        .iter_mut()
+        .find(|entry| entry.generation_id == predecessor_id)
+        .expect("active generation index entry");
+    active_entry.generation_id = pointer.generation_id.clone();
+    active_entry.snapshot_content_identity = pointer.snapshot_content_identity.clone();
+    pointer.generation_index_digest = Some(
+        durable_generation_index_digest(
+            &pointer.generation_index,
+            pointer.generation_index_truncated,
+        )
+        .expect("digest successor publication index"),
+    );
+    std::fs::write(
+        &pointer_path,
+        serde_json::to_vec(&pointer).expect("encode successor pointer"),
+    )
+    .expect("write successor pointer");
+}
+
+/// The pointer-supersession half of the verified-read outage: a reconcile
+/// pass publishes a successor generation and flips the durable pointer
+/// minutes before the successor's O(store) decode + native activation seats
+/// it. When that successor sealed the SAME source content — a convergence or
+/// repair republication, not an edit — the seated predecessor still describes
+/// exactly the bytes on disk, so verified reads must keep serving it through
+/// the successor's activation window instead of refusing "not ready".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_same_content_successor_pointer_keeps_the_seated_generation_serving() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+
+    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(ready) = registry
+                .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+                .await
+            {
+                break ready;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the mounted generation becomes ready-decoded");
+    let generation_id = ready.generation().manifest().generation_id.clone();
+
+    // Flip the durable pointer to an unseated successor sealed from the same
+    // source content — the exact durable state between a convergence
+    // republication's publish and its seat.
+    advance_pointer_to_unseated_successor(
+        &super::scoped_code_index_store_root(store.path(), fixture.path()),
+        false,
+    );
+
+    let served = registry
+        .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+        .await
+        .expect("the same-content predecessor keeps serving while its successor activates");
+    assert_eq!(
+        served.generation().manifest().generation_id,
+        generation_id,
+        "the read serves the seated predecessor, not a phantom of the unseated successor"
+    );
+    assert!(
+        registry.has_current_ready_decoded_for_root_scope(fixture.path(), &scope),
+        "the readiness census reports the same-content predecessor through the activation window"
+    );
+
+    registry.shutdown().await;
+}
+
+/// Fail-closed half of pointer supersession: a successor sealed from
+/// DIFFERENT source content means the seat lags the reconciled truth. The
+/// read must refuse and withdraw the busy-read witness so neither the quiet
+/// nor the busy path serves the stale seat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_different_content_successor_pointer_refuses_the_stale_seat() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+
+    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(ready) = registry
+                .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+                .await
+            {
+                break ready;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the mounted generation becomes ready-decoded");
+    let stale_generation_id = ready.generation().manifest().generation_id.clone();
+
+    let witness = registry
+        .serving_source_witness_for_root(fixture.path())
+        .await
+        .expect("mounted worktree witness");
+    advance_pointer_to_unseated_successor(
+        &super::scoped_code_index_store_root(store.path(), fixture.path()),
+        true,
+    );
+
+    assert!(
+        registry
+            .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+            .await
+            .is_none(),
+        "a different-content successor pointer disproves the seat"
+    );
+    assert_ne!(
+        witness
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|witness| witness.generation_id.clone()),
+        Some(stale_generation_id),
+        "the disproving probe withdraws the busy-read witness"
+    );
+
     registry.shutdown().await;
 }
 
@@ -5179,9 +6599,23 @@ fn graph_publication_conflict_re_arms_activation_instead_of_orphaning_serving() 
     use crate::code_index::graph_projection::CodeGraphProjectionError;
 
     assert!(
-        super::CodeIndexSchedulerErrorV1::GraphProjection(CodeGraphProjectionError::Conflict)
-            .is_retryable_activation(),
+        super::CodeIndexSchedulerErrorV1::GraphProjection(
+            tracedecay_graph_db::GraphDbError::conflict("test.publication_conflict").into()
+        )
+        .is_retryable_activation(),
         "a publication conflict leaves the sealed artifact intact and must retry with backoff"
+    );
+    assert!(
+        super::CodeIndexSchedulerErrorV1::GraphProjection(CodeGraphProjectionError::Cancelled)
+            .is_retryable_activation(),
+        "cancellation mid-publication is typed and must resume from the journaled replay"
+    );
+    assert!(
+        super::CodeIndexSchedulerErrorV1::GraphProjection(
+            CodeGraphProjectionError::DeadlineExceeded
+        )
+        .is_retryable_activation(),
+        "a deadline mid-publication is typed and must resume from the journaled replay"
     );
     assert!(
         !super::CodeIndexSchedulerErrorV1::GraphProjection(CodeGraphProjectionError::Corrupt(
@@ -5189,6 +6623,85 @@ fn graph_publication_conflict_re_arms_activation_instead_of_orphaning_serving() 
         ))
         .is_retryable_activation(),
         "payload corruption stays terminal so reconcile can rebuild"
+    );
+}
+
+/// A conflict verdict identical to the previous seat attempt's — same guard
+/// site, same compared evidence, same sealed generation — is deterministic:
+/// the sealed inputs are immutable, so replaying activation reproduces the
+/// exact refusal forever. The seat loop must recognize the repeat and take
+/// the terminal typed-refusal arm instead of looping at the backoff ceiling
+/// (issue #765). Anything short of an exact repeat stays a retry: a first
+/// conflict, a different guard site, different compared evidence, another
+/// generation, or a non-conflict failure in between.
+#[test]
+fn repeated_identical_conflict_verdict_is_terminal_not_retryable() {
+    use tracedecay_graph_db::GraphDbError;
+
+    let generation = CodeGenerationId::new("gen.sealed-1").expect("generation id");
+    let other_generation = CodeGenerationId::new("gen.sealed-2").expect("generation id");
+    let conflict_error = |site: &'static str| {
+        super::CodeIndexSchedulerErrorV1::GraphProjection(GraphDbError::conflict(site).into())
+    };
+    let context_of = |site: &'static str| {
+        let error = conflict_error(site);
+        error
+            .activation_conflict_context()
+            .expect("conflict error carries its context")
+            .clone()
+    };
+
+    let error = conflict_error("publication.prepare.expected_prior_head");
+    let prior = (
+        generation.clone(),
+        context_of("publication.prepare.expected_prior_head"),
+    );
+
+    assert!(
+        super::registry::is_repeated_conflict_verdict(&error, &generation, Some(&prior)),
+        "an identical verdict for the same generation is deterministic and terminal"
+    );
+    assert!(
+        !super::registry::is_repeated_conflict_verdict(&error, &generation, None),
+        "the first conflict retries; it may be a concurrent-publisher race"
+    );
+    assert!(
+        !super::registry::is_repeated_conflict_verdict(&error, &other_generation, Some(&prior)),
+        "a different sealed generation is a fresh attempt, not a repeat"
+    );
+    let different_site = (
+        generation.clone(),
+        context_of("publication.complete.cas_prior_head"),
+    );
+    assert!(
+        !super::registry::is_repeated_conflict_verdict(&error, &generation, Some(&different_site)),
+        "a different guard site is a different verdict"
+    );
+    let different_evidence = (
+        generation.clone(),
+        match GraphDbError::conflict_observed(
+            "publication.prepare.expected_prior_head",
+            "head seq 1",
+            "head seq 2",
+        ) {
+            GraphDbError::Conflict { context } => context,
+            _ => unreachable!("conflict constructor produces the conflict variant"),
+        },
+    );
+    assert!(
+        !super::registry::is_repeated_conflict_verdict(
+            &error,
+            &generation,
+            Some(&different_evidence)
+        ),
+        "different compared evidence is a different verdict"
+    );
+    let non_conflict = super::CodeIndexSchedulerErrorV1::GraphProjection(
+        crate::code_index::graph_projection::CodeGraphProjectionError::DeadlineExceeded,
+    );
+    assert!(
+        !super::registry::is_repeated_conflict_verdict(&non_conflict, &generation, Some(&prior)),
+        "only a conflict verdict can repeat a conflict verdict"
     );
 }
 
@@ -5579,6 +7092,12 @@ async fn dashboard_freshness_projects_the_mounted_scheduler_generation() {
     );
     assert_eq!(projected.staleness_state.as_deref(), Some("fresh"));
     assert_eq!(projected.coverage, "complete");
+    assert_eq!(
+        projected.code_graph_serving,
+        Some(
+            tracedecay_dashboard_api::code_index_freshness_api::CodeGraphServingReadinessV1::Ready
+        )
+    );
 }
 
 #[tokio::test]
@@ -5657,6 +7176,75 @@ async fn dashboard_progress_does_not_wait_for_the_scheduler_mutex() {
     );
     assert_eq!(projected.coverage, "complete");
     assert_eq!(projected.hook_hint_count, Some(0));
+    let _ = release_tx.send(());
+    scheduler_holder
+        .await
+        .expect("scheduler mutex holder joined");
+    registry.shutdown().await;
+}
+
+// Two workers so the timeout timer stays live if a regression parks one
+// runtime worker on the scheduler mutex: the test then fails instead of
+// deadlocking against its own release channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_binding_does_not_wait_for_the_scheduler_mutex() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("mount daemon-owned scheduler");
+    let generation_id = wait_for_initial_generation(&registry, fixture.path()).await;
+    let canonical_root = fixture
+        .path()
+        .canonicalize()
+        .expect("canonical fixture root");
+    let scheduler = {
+        let mounted = registry.mounted.lock().await;
+        Arc::clone(
+            &mounted
+                .get(&canonical_root)
+                .expect("mounted worktree")
+                .scheduler,
+        )
+    };
+    // Model a background reconcile that owns the scheduler mutex for its
+    // whole pass; the sealed replay binding must stay answerable through it.
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let scheduler_holder = tokio::task::spawn_blocking(move || {
+        let _scheduler_guard = scheduler.lock().expect("hold scheduler mutex");
+        let _ = locked_tx.send(());
+        let _ = release_rx.blocking_recv();
+    });
+    locked_rx.await.expect("scheduler mutex holder started");
+    // Spawn the probe so a regression parks only its own task: the timeout
+    // then observes the parked join handle and fails cleanly instead of
+    // hanging this test task inside the probe's poll.
+    let probe_registry = registry.clone();
+    let probe_root = fixture.path().to_path_buf();
+    let probe_generation = generation_id.clone();
+    let probe = tokio::spawn(async move {
+        probe_registry
+            .code_graph_replay_binding(&probe_root, &probe_generation)
+            .await
+    });
+    let binding = tokio::time::timeout(Duration::from_secs(1), probe)
+        .await
+        .expect("replay binding must not wait for the scheduler mutex")
+        .expect("replay binding probe task joined")
+        .expect("mounted worktree resolves a replay binding")
+        .expect("sealed replay binding");
+    assert!(
+        binding.generations_root.starts_with(store.path()),
+        "replay binding must name this worktree's scoped generations root"
+    );
     let _ = release_tx.send(());
     scheduler_holder
         .await
@@ -5752,6 +7340,48 @@ async fn elapsed_freshness_window_alone_does_not_make_dashboard_state_stale() {
     registry.shutdown().await;
 }
 
+#[tokio::test]
+async fn dashboard_freshness_reports_pending_rebuild_liveness() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("mount daemon-owned scheduler");
+    wait_for_initial_generation(&registry, fixture.path()).await;
+    wait_for_dashboard_ready(&registry, fixture.path()).await;
+
+    let admission = registry
+        .background_reconcile_admission()
+        .acquire_owned()
+        .await
+        .expect("hold background reconcile admission");
+    fixture.edit("src/main.rs", "fn main() { println!(\"changed\"); }\n");
+    assert!(
+        registry
+            .notify_hook_paths(fixture.path(), &["src/main.rs".to_owned()])
+            .await,
+        "the source change must publish a pending scheduler wake"
+    );
+    let projected = registry
+        .dashboard_freshness(fixture.path())
+        .await
+        .expect("dashboard freshness");
+
+    assert!(
+        projected.rebuild_in_flight,
+        "a pending scheduler wake must keep stale serving typed as rebuilding"
+    );
+    drop(admission);
+    registry.shutdown().await;
+}
+
 /// A dashboard status view reports the last execution-owned scheduler state; it
 /// must not run the freshness ladder, wake a worker, or publish an out-of-band
 /// source change merely because an operator opened the view.
@@ -5819,6 +7449,48 @@ fn restart_restores_complete_generation_and_content_noop() {
             panic!("restart with identical content must not republish")
         }
     }
+}
+
+#[test]
+fn layout_scan_progress_publish_does_not_wait_for_status_reader() {
+    let generation = CodeGenerationId::new("generation.progress-scan").expect("generation");
+    let slot = Arc::new(std::sync::RwLock::new(
+        super::CodeIndexBuildProgressSlotStateV1::default(),
+    ));
+    let owner = slot
+        .write()
+        .expect("progress owner")
+        .replace_generation(generation.clone());
+    let status_reader = slot.read().expect("status progress reader");
+
+    let started = Instant::now();
+    let published = super::try_publish_build_progress(
+        &slot,
+        &generation,
+        owner,
+        progress_snapshot_for_generation(&generation, 1),
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "observational progress must not block the authenticated layout scan"
+    );
+    assert!(!published, "a busy observational slot must skip the sample");
+    drop(status_reader);
+
+    assert!(super::try_publish_build_progress(
+        &slot,
+        &generation,
+        owner,
+        progress_snapshot_for_generation(&generation, 2),
+    ));
+    assert_eq!(
+        slot.read()
+            .expect("published progress")
+            .snapshot()
+            .expect("progress snapshot")
+            .committed_pages,
+        2
+    );
 }
 
 #[test]
@@ -5928,22 +7600,21 @@ fn exact_source_readiness_abstains_when_a_file_is_added_inside_freshness_window(
     published(scheduler.reconcile_now().expect("initial publish"));
     assert!(
         scheduler
-            .latest_complete_ready_for_exact_source_with(
-                GenerationDecodeAdmissionV1::AlreadyDecoded,
-            )
+            .exact_source_is_ready()
             .expect("exact source readiness")
+    );
+    assert!(
+        scheduler
+            .latest_complete_with(GenerationDecodeAdmissionV1::AlreadyDecoded)
             .is_some()
     );
 
     fixture.edit("src/added.rs", "pub fn added() {}\n");
 
     assert!(
-        scheduler
-            .latest_complete_ready_for_exact_source_with(
-                GenerationDecodeAdmissionV1::AlreadyDecoded,
-            )
-            .expect("exact source readiness after file add")
-            .is_none(),
+        !scheduler
+            .exact_source_is_ready()
+            .expect("exact source readiness after file add"),
         "workspace completeness must abstain before the added file is published"
     );
 }
@@ -6082,7 +7753,64 @@ fn restart_rejects_corrupt_sealed_generation() {
 }
 
 #[test]
-fn durable_publication_streams_canonical_bytes_and_reuses_immutable_target() {
+fn restart_rejects_corrupt_partitioned_file_segment() {
+    let fixture = GitFixture::new(&[("src/lib.rs", "pub fn alpha() -> u32 { 1 }\n")]);
+    let store = TempDir::new().expect("store root");
+    {
+        let mut scheduler = scheduler(
+            &fixture,
+            store.path().to_path_buf(),
+            Arc::new(SharedCodeIndexBytePoolV1::default()),
+        );
+        published(scheduler.reconcile_now().expect("initial publish"));
+    }
+    let pointer: super::DurablePublicationPointerV1 = serde_json::from_slice(
+        &std::fs::read(store.path().join("active-code-generation-v1.json"))
+            .expect("read active pointer"),
+    )
+    .expect("decode active pointer");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            store
+                .path()
+                .join("code-generations-v1")
+                .join(pointer.generation_file),
+        )
+        .expect("read generation manifest"),
+    )
+    .expect("decode generation manifest");
+    let segment_digest = manifest["generation"]["file_segments"][0]["segment_digest"]
+        .as_str()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .expect("file segment digest");
+    let segment_path = store
+        .path()
+        .join("code-generation-segments-v1")
+        .join(format!("segment-{segment_digest}.json"));
+    let mut bytes = std::fs::read(&segment_path).expect("read file segment");
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+    std::fs::write(&segment_path, bytes).expect("corrupt file segment");
+
+    let mut reopened = CodeIndexWorktreeSchedulerV1::open(
+        test_project_id(),
+        fixture.path(),
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    )
+    .expect("foreground open defers segment validation");
+    assert!(
+        reopened.activate_or_reconcile().is_err(),
+        "retained activation must reject a corrupt file segment"
+    );
+    assert!(
+        reopened.latest_complete_already_decoded().is_none(),
+        "a generation with a corrupt segment never becomes serving state"
+    );
+}
+
+#[test]
+fn durable_publication_writes_partitioned_manifest_and_reuses_immutable_targets() {
     let fixture =
         GitFixture::new(&[("src/lib.rs", "pub fn streamed_publication() -> u32 { 1 }\n")]);
     let store = TempDir::new().expect("store root");
@@ -6103,15 +7831,23 @@ fn durable_publication_streams_canonical_bytes_and_reuses_immutable_target() {
         .path()
         .join("code-generations-v1")
         .join(&pointer.generation_file);
-    let streamed = std::fs::read(&generation_path).expect("read streamed generation");
-    let canonical = latest
-        .generation
-        .encode_sealed()
-        .expect("encode canonical reference");
+    let canonical = std::fs::read(&generation_path).expect("read generation manifest");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&canonical).expect("decode generation manifest");
     assert_eq!(
-        streamed, canonical,
-        "streaming must preserve exact v6 bytes"
+        manifest["generation"]["format_revision"], 7,
+        "durable publication must emit the partitioned format"
     );
+    assert_eq!(
+        manifest["generation"]["file_segments"]
+            .as_array()
+            .expect("partitioned file segments")
+            .len(),
+        1
+    );
+    let segment_count = std::fs::read_dir(store.path().join("code-generation-segments-v1"))
+        .expect("read segment directory")
+        .count();
 
     let active_generation = latest.generation.manifest().generation_id.clone();
     let mut reopened = super::DaemonCodeIndexPublicationStoreV1::new(
@@ -6132,7 +7868,14 @@ fn durable_publication_streams_canonical_bytes_and_reuses_immutable_target() {
     assert_eq!(
         std::fs::read(&generation_path).expect("read republished generation"),
         canonical,
-        "an existing content-addressed target must remain byte exact"
+        "an existing content-addressed manifest must remain byte exact"
+    );
+    assert_eq!(
+        std::fs::read_dir(store.path().join("code-generation-segments-v1"))
+            .expect("read segment directory")
+            .count(),
+        segment_count,
+        "identical republication must not duplicate content-addressed segments"
     );
     assert!(
         std::fs::read_dir(store.path().join("code-generations-v1"))
@@ -7017,8 +8760,25 @@ async fn background_reconciles_respect_a_single_admission_permit() {
             .await
             .expect("mount worktree");
     }
-    let first_generation = wait_for_initial_generation(&registry, first.path()).await;
-    let second_generation = wait_for_initial_generation(&registry, second.path()).await;
+    // Publication broadcasts at publish time, before the pass's deliberately
+    // admission-free tail (graph prepare, activation, serving seat) has run.
+    // Wait for both serving seats — the tail's last scheduler-lock step — so
+    // each worker is parked on its wake. Holding the first scheduler's lock
+    // any earlier wedges that worker inside its tail, where it holds no
+    // permit, and the second worktree would overtake through the free permit
+    // before the first worker's edit pass is ever admitted.
+    let first_generation = wait_for_live_complete_generation(&registry, first.path())
+        .await
+        .generation()
+        .manifest()
+        .generation_id
+        .clone();
+    let second_generation = wait_for_live_complete_generation(&registry, second.path())
+        .await
+        .generation()
+        .manifest()
+        .generation_id
+        .clone();
 
     let first_handle = registry
         .scheduler_handle(first.path())
@@ -7062,6 +8822,46 @@ async fn background_reconciles_respect_a_single_admission_permit() {
     lock_thread.join().expect("first lock thread joins");
     let _ = wait_for_generation_change(&registry, first.path(), &first_generation).await;
     let _ = wait_for_generation_change(&registry, second.path(), &second_generation).await;
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn build_publication_lock_serializes_source_reconcile() {
+    let fixture = GitFixture::new(&[("src/lib.rs", "pub fn source() -> u32 { 1 }\n")]);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("mount worktree");
+    let initial = wait_for_initial_generation(&registry, fixture.path()).await;
+    let build_lock = registry
+        .build_publication_lock_handle(fixture.path())
+        .await
+        .expect("build/publication lock");
+    let held = build_lock.lock_owned().await;
+
+    fixture.edit("src/lib.rs", "pub fn source() -> u32 { 2 }\n");
+    assert!(
+        registry
+            .notify_hook_paths(fixture.path(), &["src/lib.rs".to_owned()])
+            .await
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        registry.latest_generation_id(fixture.path()).await,
+        Some(initial.clone()),
+        "the source reconcile cannot publish while another same-store build owns exclusivity"
+    );
+
+    drop(held);
+    let advanced = wait_for_generation_change(&registry, fixture.path(), &initial).await;
+    assert_ne!(advanced, initial);
     registry.shutdown().await;
 }
 
@@ -7291,10 +9091,7 @@ async fn configured_jina_lifecycle_publishes_and_restores_semantic_generation() 
         .expect("Jina lifecycle"),
     );
     lifecycle
-        .select_model(
-            Some(tracedecay_global_db::configuration::semantic::DEFAULT_FASTEMBED_MODEL_ID),
-            true,
-        )
+        .select_model(Some(DEFAULT_FASTEMBED_MODEL_ID), true)
         .expect("select configured Jina model");
     lifecycle
         .acquire_blocking_for_tests()
@@ -7873,7 +9670,7 @@ fn rename_reconciliation_matches_clean_scan() {
         "rename reconciliation must capture the same final tree as a clean scan"
     );
     assert_eq!(
-        renamed._lane_digest, clean._lane_digest,
+        renamed.lane_digest, clean.lane_digest,
         "rename reconciliation must publish byte-identical code lanes"
     );
     let latest = incremental.latest_complete().expect("renamed generation");
@@ -7937,7 +9734,7 @@ fn index_only_reconciliation_matches_clean_scan() {
         "staged-only reconciliation must capture the same final tree as a clean scan"
     );
     assert_eq!(
-        staged._lane_digest, clean._lane_digest,
+        staged.lane_digest, clean.lane_digest,
         "staged-only reconciliation must publish byte-identical code lanes"
     );
 }
@@ -7985,7 +9782,7 @@ fn deleting_a_file_tombstones_its_prior_chunks() {
     );
     assert!(
         !after
-            ._file_occurrence_ids
+            .file_occurrence_ids
             .iter()
             .any(|occurrence| gone_occurrences.contains(occurrence)),
         "the deleted file's occurrence must be absent from the new generation"
@@ -8267,7 +10064,7 @@ fn reparse_matches_full_parse_chunks() {
         "identical final content yields identical snapshot identity"
     );
     assert_eq!(
-        second._lane_digest, full_publish._lane_digest,
+        second.lane_digest, full_publish.lane_digest,
         "sequential-edit and fresh-store reconcile produce byte-identical chunk lanes"
     );
 }
@@ -9606,7 +11403,7 @@ fn real_branch_switch_reconcile_matches_clean_scan() {
         switched.snapshot_content_identity,
         clean_publish.snapshot_content_identity
     );
-    assert_eq!(switched._lane_digest, clean_publish._lane_digest);
+    assert_eq!(switched.lane_digest, clean_publish.lane_digest);
     assert_eq!(
         main_snapshot.reference.as_ref().map(RefId::as_str),
         Some("refs/heads/main")
@@ -9682,7 +11479,7 @@ fn real_rebase_reconcile_matches_clean_scan() {
         rebased.snapshot_content_identity,
         clean_publish.snapshot_content_identity
     );
-    assert_eq!(rebased._lane_digest, clean_publish._lane_digest);
+    assert_eq!(rebased.lane_digest, clean_publish.lane_digest);
     assert_eq!(
         rebased_generation
             .generation()
@@ -10139,7 +11936,7 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
     let (scope, privacy_domain) = {
         let mut scheduler = scheduler(
             &fixture,
-            scoped_store,
+            scoped_store.clone(),
             Arc::new(SharedCodeIndexBytePoolV1::default()),
         );
         published(scheduler.reconcile_now().expect("seed retained generation"));
@@ -10156,11 +11953,13 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
             latest.generation.manifest().privacy_domain.clone(),
         )
     };
-    std::fs::remove_file(
-        super::scoped_code_index_store_root(store.path(), fixture.path())
-            .join("freshness_witness.v1"),
-    )
-    .expect("remove restore witness to reproduce a cold preserved-profile mount");
+    let freshness_witness = scoped_store.join("freshness_witness.v1");
+    assert!(
+        freshness_witness.is_file(),
+        "seeding the preserved profile persists its restore witness"
+    );
+    std::fs::remove_file(freshness_witness)
+        .expect("remove restore witness to reproduce a cold preserved-profile mount");
 
     let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
     registry
@@ -10202,7 +12001,7 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
         if let (owner_epoch, Some(progress)) = observed
             && progress.committed_pages > 0
             && progress.phase
-                != crate::dashboard::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
+                != tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
         {
             break (owner_epoch, progress);
         }
@@ -10363,19 +12162,17 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
     assert!(progress_after_overflow.committed_pages >= progress_before_overflow.committed_pages);
     assert_eq!(
         progress_after_overflow.phase,
-        crate::dashboard::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
+        tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
     );
     assert_eq!(
         decode_count, 0,
         "graph-off text serving must not decode the full generation"
     );
-    let artifact_names = std::fs::read_dir(super::code_text_artifacts_root(
-        &super::scoped_code_index_store_root(store.path(), fixture.path()),
-    ))
-    .expect("read text artifact root")
-    .filter_map(Result::ok)
-    .map(|entry| entry.file_name().to_string_lossy().into_owned())
-    .collect::<Vec<_>>();
+    let artifact_names = std::fs::read_dir(super::code_text_artifacts_root(&scoped_store))
+        .expect("read text artifact root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
     assert_eq!(
         artifact_names
             .iter()
@@ -10429,7 +12226,7 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
             .as_ref()
             .expect("ready progress stays observable")
             .phase,
-        crate::dashboard::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
+        tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
     );
     let current = registry
         .execute_query_search(&scope, core_search_request("alpha_0000"))
@@ -10615,13 +12412,23 @@ fn graph_off_stale_witness_reconciles_unchanged_source_without_full_decode() {
     .expect("advance only the git index mtime");
 
     let mut reopened = scheduler(&fixture, store.path().to_path_buf(), bytes);
+    assert_eq!(
+        reopened.sealed_decode_count(),
+        0,
+        "foreground reopen must remain decode-free"
+    );
     let metadata = reopened
         .servable_retained_text_generation()
         .expect("authenticated retained text generation")
         .metadata()
         .clone();
+    assert_eq!(
+        reopened.sealed_decode_count(),
+        0,
+        "partitioned text metadata must not enter the full-generation decoder"
+    );
     let outcome = reopened
-        .reconcile_retained_text_generation(&metadata)
+        .reconcile_retained_text_generation_with(&metadata, true)
         .expect("graph-off retained reconcile")
         .expect("stale witness must be verified by text-only capture");
     let CodeIndexReconcileOutcomeV1::Noop(evidence) = outcome else {
@@ -10689,7 +12496,7 @@ fn graph_off_changed_source_worker_memory_denial_retries_without_decode() {
     );
     let tight = Arc::new(ProcessResidentMemoryV1::new(tight_limit));
     scheduler.bind_resident_memory(Arc::clone(&tight));
-    let denied = scheduler.reconcile_retained_text_generation(&metadata_a);
+    let denied = scheduler.reconcile_retained_text_generation_with(&metadata_a, true);
     assert!(
         matches!(
             denied,
@@ -10717,7 +12524,7 @@ fn graph_off_changed_source_worker_memory_denial_retries_without_decode() {
     ));
     scheduler.bind_resident_memory(Arc::clone(&adequate));
     let outcome = scheduler
-        .reconcile_retained_text_generation(&metadata_a)
+        .reconcile_retained_text_generation_with(&metadata_a, true)
         .expect("adequately funded graph-off retry")
         .expect("graph-off retry outcome");
     let generation_b = published(outcome);
@@ -11296,6 +13103,119 @@ async fn same_root_remount_updates_retained_graph_policy_before_worker_activatio
     registry.shutdown().await;
 }
 
+/// A same-root remount is a control-plane reconciliation request, not an
+/// expendable text-projection follow-up. If an unhinted edit races the remount,
+/// the remount wake must enter the canonical pending-work authority so the
+/// graph-off settled-text fast path cannot discard the only source probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_off_remount_preserves_an_unhinted_source_reconcile() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let scoped_store = super::scoped_code_index_store_root(
+        store.path(),
+        &fixture.path().canonicalize().expect("canonical fixture"),
+    );
+    let (scope, generation_a) = {
+        let mut scheduler = scheduler(
+            &fixture,
+            scoped_store,
+            Arc::new(SharedCodeIndexBytePoolV1::default()),
+        );
+        published(scheduler.reconcile_now().expect("seed retained generation"));
+        let latest = scheduler.latest_complete().expect("retained generation");
+        let snapshot = latest.generation.snapshot();
+        (
+            ResolvedScope::new(
+                test_project_id(),
+                snapshot.repository.clone(),
+                snapshot.worktree.clone().expect("worktree id"),
+                snapshot.reference.clone(),
+            )
+            .expect("resolved scope"),
+            latest.generation.manifest().generation_id.clone(),
+        )
+    };
+
+    let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
+    registry
+        .mount_worktree_with_graph_policy(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+            super::CodeGraphActivationPolicyV1::RefusedByConfiguration,
+        )
+        .await
+        .expect("mount graph-off retained generation");
+    let settled_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text_ready = registry
+            .latest_text_serving_freshness_for_scope(&scope)
+            .await
+            .is_some_and(|(latest, _)| latest.query_owners_are_warm());
+        if text_ready
+            && !registry
+                .reconcile_in_progress_for_test(fixture.path())
+                .await
+        {
+            break;
+        }
+        assert!(
+            Instant::now() <= settled_deadline,
+            "graph-off retained generation never settled"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    let admission = registry
+        .background_reconcile_admission()
+        .acquire_owned()
+        .await
+        .expect("hold worker after remount dequeue");
+    registry.clear_pending_wake_for_scope(&scope).await;
+    fixture.edit("src/lib.rs", "pub fn beta() -> usize { 2 }\n");
+    git(fixture.path(), &["commit", "-qam", "unhinted remount edit"]);
+
+    assert!(
+        !registry
+            .mount_worktree_with_graph_policy(
+                test_project_id(),
+                fixture.path(),
+                store.path().to_path_buf(),
+                None,
+                super::CodeGraphActivationPolicyV1::RefusedByConfiguration,
+            )
+            .await
+            .expect("remount existing graph-off owner"),
+        "same-root remount must reuse the mounted owner"
+    );
+    assert!(
+        registry
+            .pending_wake_micros_for_scope(&scope)
+            .await
+            .is_some_and(|micros| micros != 0),
+        "the remount must publish authoritative pending work"
+    );
+    drop(admission);
+
+    let reconcile_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let generation = registry.latest_generation_id(fixture.path()).await;
+        if generation
+            .as_ref()
+            .is_some_and(|generation| generation != &generation_a)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() <= reconcile_deadline,
+            "the remount wake never reconciled the unhinted edit"
+        );
+        tokio::task::yield_now().await;
+    }
+    registry.shutdown().await;
+}
+
 /// A retryable graph-activation failure may delay only native graph serving.
 /// Exact and lexical refresh must still publish a changed worktree generation
 /// while activation retries remain isolated to the immutable graph artifact.
@@ -11369,7 +13289,44 @@ async fn retryable_graph_activation_does_not_block_changed_text_generation() {
         .scheduler_handle(fixture.path())
         .await
         .expect("mounted scheduler");
+    // One budget covers both pre-edit observations: they are two stages of
+    // the same retained-mount journey. Text owners deliberately install only
+    // when the artifact build finishes and the Ready snapshot publishes in
+    // the same step, so live build progress and ready text are sequential
+    // states, never a simultaneous one.
     let progress_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let progress_mid_build = loop {
+        let observed = {
+            let scheduler = scheduler
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let progress = scheduler.build_progress_slot();
+            let progress = progress
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            progress.snapshot()
+        };
+        if let Some(progress) = observed
+            && progress.committed_pages > 0
+            && progress.phase
+                != tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
+        {
+            break progress;
+        }
+        assert!(
+            std::time::Instant::now() <= progress_deadline,
+            "graph-on text projection never exposed bounded live progress"
+        );
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(
+        progress_mid_build.generation_id,
+        sealed_generation_id.as_str(),
+        "the live build progress must belong to the retained generation"
+    );
+    // Exact and lexical owners must finish and serve while native graph
+    // activation keeps failing; this ready owner is the pre-edit baseline
+    // the changed generation must replace.
     let (text_owner_before_retry, owner_epoch_before_retry, progress_before_retry) = loop {
         let text = registry.latest_text_serving_for_scope(&scope).await;
         let observed = {
@@ -11382,16 +13339,12 @@ async fn retryable_graph_activation_does_not_block_changed_text_generation() {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (progress.owner_epoch, progress.snapshot())
         };
-        if let (Some(text), (owner_epoch, Some(progress))) = (text, observed)
-            && progress.committed_pages > 0
-            && progress.phase
-                != crate::dashboard::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
-        {
+        if let (Some(text), (owner_epoch, Some(progress))) = (text, observed) {
             break (text, owner_epoch, progress);
         }
         assert!(
             std::time::Instant::now() <= progress_deadline,
-            "graph-on text projection never exposed bounded live progress"
+            "graph retries withheld retained exact and lexical readiness"
         );
         tokio::task::yield_now().await;
     };
@@ -11462,7 +13415,7 @@ async fn retryable_graph_activation_does_not_block_changed_text_generation() {
         assert_ne!(progress.generation_id, progress_before_retry.generation_id);
         assert_eq!(
             progress.phase,
-            crate::dashboard::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
+            tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildPhaseV1::Ready
         );
     }
     assert!(
@@ -11496,31 +13449,90 @@ async fn retryable_graph_activation_does_not_block_changed_text_generation() {
     registry.shutdown().await;
 }
 
-/// A graph projection can remain busy for minutes on a large retained
-/// generation. Source reconciliation and the replacement text projection must
-/// finish before that optional graph work starts, so exact and lexical serving
-/// never inherit graph activation latency.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn changed_text_generation_is_ready_before_slow_graph_activation_starts() {
-    let sources = (0..64)
-        .map(|index| {
-            (
-                format!("src/file_{index:04}.rs"),
-                format!("pub fn alpha_{index:04}() -> usize {{ {index} }}\n"),
-            )
-        })
-        .collect::<Vec<_>>();
-    let source_refs = sources
-        .iter()
-        .map(|(path, source)| (path.as_str(), source.as_str()))
-        .collect::<Vec<_>>();
-    let fixture = GitFixture::new(&source_refs);
+/// A retryable graph seat owns one scheduled wake. A retained `Noop` pass may
+/// consume a notification queued before backoff was armed, but that skip must
+/// not enqueue another pass and recursively poll until the retry deadline.
+#[test]
+fn graph_activation_retry_window_emits_one_self_driven_seat_skip() {
+    let mut queued_wake = true;
+    let mut seat_skips = 0_usize;
+    while queued_wake && seat_skips < 1_000 {
+        seat_skips += 1;
+        queued_wake = super::registry::retained_noop_requires_follow_up_wake(
+            true, // no graph generation is seated
+            true, // activation retry deadline is still pending
+            true, // this pass consumed a real external arrival
+            true, // retained source reconciliation completed as Noop
+        );
+    }
+
+    assert_eq!(
+        seat_skips, 1,
+        "one deferred pass may report one skip, but must wait for the scheduled retry afterward"
+    );
+    assert!(
+        super::registry::retained_noop_requires_follow_up_wake(true, false, true, true),
+        "without activation backoff the empty retained Noop still needs its follow-up pass"
+    );
+    assert!(
+        !super::registry::retained_noop_requires_follow_up_wake(true, false, false, true),
+        "a self-woken pass with no consumed arrival reproduces the identical Noop and must not \
+         re-arm itself"
+    );
+}
+
+/// Dashboard graph readiness belongs to the current sealed text generation,
+/// even while an older generation still owns a fully ready graph seat.
+#[test]
+fn dashboard_graph_readiness_follows_the_current_text_generation() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
     let store = TempDir::new().expect("store root");
     let scoped_store = super::scoped_code_index_store_root(
         store.path(),
         &fixture.path().canonicalize().expect("canonical fixture"),
     );
-    let (scope, sealed_worktree_id, sealed_generation_id) = {
+    let mut scheduler = scheduler(
+        &fixture,
+        scoped_store,
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    published(scheduler.reconcile_now().expect("seed generation"));
+    let old_ready = scheduler.latest_complete().expect("seeded generation");
+    old_ready.warm_serving_caches();
+    assert_eq!(
+        old_ready.code_graph_serving_readiness(),
+        tracedecay_dashboard_api::code_index_freshness_api::CodeGraphServingReadinessV1::Ready
+    );
+
+    fixture.edit("src/current.rs", "pub fn current() -> u32 { 2 }\n");
+    published(
+        scheduler
+            .reconcile_now()
+            .expect("publish changed generation"),
+    );
+    let current = scheduler.latest_complete().expect("changed generation");
+    assert_eq!(
+        dashboard_code_graph_serving(
+            Some(&old_ready),
+            Some(&current.text_generation_handle()),
+            true,
+        ),
+        Some(
+            tracedecay_dashboard_api::code_index_freshness_api::CodeGraphServingReadinessV1::Pending
+        ),
+        "an older Ready graph must not mask the current text generation's Pending state"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_graph_activation_failure_is_typed_for_current_text_generation() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let scoped_store = super::scoped_code_index_store_root(
+        store.path(),
+        &fixture.path().canonicalize().expect("canonical fixture"),
+    );
+    let (scope, worktree_id) = {
         let mut scheduler = scheduler(
             &fixture,
             scoped_store,
@@ -11529,7 +13541,7 @@ async fn changed_text_generation_is_ready_before_slow_graph_activation_starts() 
         published(scheduler.reconcile_now().expect("seed generation"));
         let latest = scheduler.latest_complete().expect("seeded generation");
         let snapshot = latest.generation.snapshot();
-        let worktree_id = snapshot.worktree.clone().expect("seeded worktree id");
+        let worktree_id = snapshot.worktree.clone().expect("worktree id");
         (
             ResolvedScope::new(
                 test_project_id(),
@@ -11539,13 +13551,10 @@ async fn changed_text_generation_is_ready_before_slow_graph_activation_starts() 
             )
             .expect("resolved scope"),
             worktree_id,
-            latest.generation.manifest().generation_id.clone(),
         )
     };
-    fixture.edit("src/current.rs", "pub fn current() -> u32 { 2 }\n");
+    let activation_gate = super::graph_activation::install_injected_activation_gate(&worktree_id);
 
-    let activation_gate =
-        super::graph_activation::install_injected_activation_gate(&sealed_worktree_id);
     let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
     registry
         .mount_worktree(
@@ -11556,42 +13565,46 @@ async fn changed_text_generation_is_ready_before_slow_graph_activation_starts() 
         )
         .await
         .expect("mount retained generation");
-
     tokio::time::timeout(
         Duration::from_secs(10),
         activation_gate.wait_until_started(),
     )
     .await
-    .expect("graph activation did not reach the deterministic hold point");
-    assert!(
-        !registry
-            .reconcile_in_progress_for_test(fixture.path())
-            .await,
-        "optional graph activation must not keep source reconciliation in progress"
-    );
-    let (_, text_is_current) = registry
-        .latest_text_serving_freshness_for_scope(&scope)
-        .await
-        .expect("ready text generation remains queryable during graph activation");
-    assert!(
-        text_is_current,
-        "slow graph activation must not mark reconciled exact and lexical serving stale"
-    );
-    let observed_generation_id = registry.latest_generation_id(fixture.path()).await;
-    let text_ready = registry
-        .latest_text_serving_for_scope(&scope)
-        .await
-        .is_some_and(|text| text.query_owners_are_warm());
+    .expect("graph activation did not reach the terminal-failure boundary");
+    super::graph_activation::set_injected_terminal_activation_failure(&worktree_id, true);
     activation_gate.release();
 
-    assert_ne!(
-        observed_generation_id,
-        Some(sealed_generation_id),
-        "slow graph activation started before the changed text generation replaced the retained seal"
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let reason = loop {
+        let freshness = registry
+            .dashboard_freshness(fixture.path())
+            .await
+            .expect("mounted dashboard freshness");
+        if let Some(
+            tracedecay_dashboard_api::code_index_freshness_api::CodeGraphServingReadinessV1::Unavailable {
+                ref reason,
+            },
+        ) = freshness.code_graph_serving
+            && reason != "generation_unavailable"
+        {
+            break reason.clone();
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "terminal graph activation failure remained pending: {freshness:?}"
+        );
+        tokio::task::yield_now().await;
+    };
+    assert!(
+        reason.contains("injected terminal graph activation failure"),
+        "typed failure must retain its terminal cause: {reason}"
     );
     assert!(
-        text_ready,
-        "slow graph activation started before the changed generation became exact/lexical ready"
+        registry
+            .latest_text_serving_for_scope(&scope)
+            .await
+            .is_some_and(|text| text.query_owners_are_warm()),
+        "terminal native graph failure must not withdraw exact/lexical serving"
     );
     registry.shutdown().await;
 }

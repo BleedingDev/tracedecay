@@ -73,8 +73,8 @@ use crate::operation_stream::{
     ManagedTestRunSnapshot, ManagedTestRunStaleReason, ManagedTestRunUnavailableReason,
     operation_event_authority,
 };
-use crate::request_identity::{GlobalRequestSurface, mint_global_request_id};
-use crate::response_handles::{
+use tracedecay_application::request_identity::{GlobalRequestSurface, mint_global_request_id};
+use tracedecay_session_memory::response_handles::{
     ResponseHandleLookup, micros_to_seconds, retrieve_response_handle, store_response_handle,
 };
 const LSP_CONTEXT_EXPANSION_HANDLE_SCHEMA_VERSION: u16 = 1;
@@ -153,6 +153,8 @@ mod overlay_admission;
 use overlay_admission::admit_overlay;
 mod diagnostic_records;
 pub use diagnostic_records::LspFeedbackDiagnosticRecordPort;
+mod semantic;
+pub use semantic::{ProductionSemanticAuthorities, production_semantic_authorities};
 #[cfg(test)]
 mod advisory_source_tests;
 

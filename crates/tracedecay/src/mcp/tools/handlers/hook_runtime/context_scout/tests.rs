@@ -1,5 +1,6 @@
 use std::sync::Mutex as StdMutex;
 
+use crate::agents::context_scout_v2::ContextScoutDurableStoreOutcomeV1;
 use crate::daemon::context_scout_lifecycle::AuthorityRegistrationV1;
 use serde_json::json;
 use tracedecay_domain::{ObservationSourceRangeV1, ProjectId, ProviderId, SessionId, UtcMicros};
@@ -58,8 +59,6 @@ fn retained_claims_backpressure_at_a_deterministic_bound() {
 
 #[test]
 fn receipt_outcomes_release_claims_and_only_retry_unavailable() {
-    use crate::agents::context_scout_v2::ContextScoutDurableStoreOutcomeV1;
-
     let _guard = RETAINED_CLAIM_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -98,7 +97,7 @@ fn scout_read_actions_are_closed_and_read_only() {
 fn hook_v2_scout_prepare_accepts_no_caller_candidates() {
     let response = orchestration_response(
         "hook_v2_scout_prepare",
-        crate::daemon::HookOrchestrationAdmissionV1::Unavailable,
+        tracedecay_daemon_service::HookOrchestrationAdmissionV1::Unavailable,
     );
     assert_eq!(response["status"], "unavailable");
     assert_eq!(response["reason"], "orchestration_unavailable");

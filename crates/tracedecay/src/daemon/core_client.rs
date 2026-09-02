@@ -1,24 +1,38 @@
-//! Daemon client side: connection discovery, restart-grace connects, and
-//! one-shot JSON-RPC tool calls against the daemon.
+//! Daemon client side: restart-grace connects and one-shot JSON-RPC tool
+//! calls against the daemon. Connection discovery — resolving the profile's
+//! authority record into an endpoint plus credential — lives in
+//! `tracedecay-daemon-identity`; this module only consumes the
+//! [`DaemonConnection`] it resolves.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::time::{Duration, Instant, timeout};
-use tracedecay_daemon_protocol::DaemonLivenessProbe;
+use tracedecay_daemon_control::default_socket_path;
+#[cfg(not(unix))]
+use tracedecay_daemon_identity::current_daemon_connection;
+use tracedecay_daemon_identity::{DaemonConnection, client_connection};
+use tracedecay_framing::{
+    WIRE_RECORD_TOO_LARGE, is_wire_oversized_io_error, read_bounded_mcp_line,
+};
+
+pub use tracedecay_daemon_protocol::{
+    DAEMON_CONNECT_DOWN, DAEMON_CONNECT_SATURATED, DAEMON_RESPONSE_STALLED,
+    DAEMON_TOOL_RESPONSE_GRACE, DEFAULT_TOOL_REQUEST_DEADLINE, MAX_TOOL_REQUEST_DEADLINE,
+    TOOL_REQUEST_DEADLINE_ENV, tool_request_deadline,
+};
+pub(crate) use tracedecay_daemon_protocol::{
+    DAEMON_TOOL_HEALTH_CONNECT_TIMEOUT, DAEMON_TOOL_LIVENESS_POLL_INTERVAL,
+};
 
 #[cfg(unix)]
 use super::unavailable_error;
 use super::{
-    BrokerStream, DaemonAuthPreface, DaemonClientDeadline, DaemonEndpoint, DaemonHandshake,
-    JsonRpcRequest, JsonRpcResponse, PROJECT_OPEN_RETRY_GRACE, PROJECT_OPEN_RETRY_INTERVAL, Result,
-    TraceDecayError, authority, default_socket_path, error_message_is_project_open_retryable,
+    BrokerStream, DaemonAuthPreface, DaemonClientDeadline, DaemonHandshake, JsonRpcRequest,
+    JsonRpcResponse, PROJECT_OPEN_RETRY_GRACE, PROJECT_OPEN_RETRY_INTERVAL, Result,
+    TraceDecayError, error_message_is_project_open_retryable,
 };
-
-pub(crate) const DAEMON_TOOL_LIVENESS_POLL_INTERVAL: Duration = Duration::from_secs(5);
-pub(crate) const DAEMON_TOOL_HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Bounded grace a client keeps reading for *after* the caller's request
 /// deadline has elapsed.
@@ -33,7 +47,6 @@ pub(crate) const DAEMON_TOOL_HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_s
 /// outcome was already on the wire. The read bound must therefore outlive the
 /// request deadline; this is by how much. It bounds only a dead or wedged
 /// daemon, never the request.
-pub const DAEMON_TOOL_RESPONSE_GRACE: Duration = Duration::from_secs(30);
 
 /// The local read bound for a request whose caller deadline is `request_deadline`.
 pub fn daemon_tool_response_bound(request_deadline: Instant) -> Result<Instant> {
@@ -72,133 +85,12 @@ fn wire_request_deadline_micros(request_deadline: Instant) -> tracedecay_domain:
 pub(crate) const DAEMON_RESTART_GRACE: Duration = Duration::from_secs(8);
 pub(crate) const DAEMON_RESTART_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-#[derive(Clone)]
-pub(crate) struct DaemonConnection {
-    pub(crate) endpoint: DaemonEndpoint,
-    pub(crate) auth_token: Option<String>,
-    pub(super) authority_record: Option<authority::DaemonAuthorityRecord>,
-}
-
-impl DaemonConnection {
-    pub(crate) fn into_protocol(self) -> tracedecay_daemon_protocol::DaemonConnection {
-        let connection =
-            tracedecay_daemon_protocol::DaemonConnection::new(self.endpoint, self.auth_token);
-        match self.authority_record {
-            Some(record) => connection.with_liveness(Arc::new(AuthorityLivenessProbe { record })),
-            None => connection,
-        }
-    }
-}
-
-struct AuthorityLivenessProbe {
-    record: authority::DaemonAuthorityRecord,
-}
-
-impl DaemonLivenessProbe for AuthorityLivenessProbe {
-    fn ensure_live(&self, request_label: &str) -> Result<()> {
-        let current = authority::current_record(&self.record.profile_root)?;
-        let Some(current) = current else {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "daemon authority disappeared while request '{request_label}' was awaiting a response; the request was already sent and was not retried"
-                ),
-            });
-        };
-        if current.epoch != self.record.epoch
-            || current.process_run_id != self.record.process_run_id
-        {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "daemon restarted while request '{request_label}' was awaiting a response (expected epoch {}, current epoch {}); the request was already sent and was not retried",
-                    self.record.epoch, current.epoch
-                ),
-            });
-        }
-        Ok(())
-    }
-}
-
-/// Authenticated invocation client for this process's current daemon authority.
-pub fn invocation_client_for_current(
-    handshake: tracedecay_daemon_protocol::DaemonHandshake,
-) -> Result<tracedecay_daemon_protocol::DaemonInvocationClient> {
-    Ok(tracedecay_daemon_protocol::DaemonInvocationClient::new(
-        current_daemon_connection()?.into_protocol(),
-        handshake,
-    ))
-}
-
-pub(crate) fn current_daemon_connection() -> Result<DaemonConnection> {
-    let profile_root = crate::config::user_data_dir().ok_or_else(|| TraceDecayError::Config {
-        message: "could not determine TraceDecay user data directory".to_string(),
-    })?;
-    let record =
-        authority::current_record(&profile_root)?.ok_or_else(|| TraceDecayError::Config {
-            message:
-                "TraceDecay daemon authority record is not available. Start or restart the daemon."
-                    .to_string(),
-        })?;
-    Ok(DaemonConnection {
-        endpoint: record.endpoint.clone(),
-        auth_token: Some(record.auth_token.clone()),
-        authority_record: Some(record),
-    })
-}
-
-#[cfg(unix)]
-pub(crate) fn connection_for_socket_path(socket_path: &Path) -> DaemonConnection {
-    if let Ok(connection) = current_daemon_connection()
-        && let DaemonEndpoint::Unix(authority_path) = &connection.endpoint
-        && authority::canonical_identity_path(authority_path).ok()
-            == authority::canonical_identity_path(socket_path).ok()
-    {
-        return connection;
-    }
-    if let Some(profile_root) = socket_path.parent()
-        && let Ok(Some(record)) = authority::current_record(profile_root)
-        && let DaemonEndpoint::Unix(authority_path) = &record.endpoint
-        && authority::canonical_identity_path(authority_path).ok()
-            == authority::canonical_identity_path(socket_path).ok()
-    {
-        return DaemonConnection {
-            endpoint: record.endpoint.clone(),
-            auth_token: Some(record.auth_token.clone()),
-            authority_record: Some(record),
-        };
-    }
-    // Explicit paths are retained for test harnesses and legacy one-shot
-    // callers without a discoverable authority record. Default production
-    // routing always uses the authority record.
-    DaemonConnection {
-        endpoint: DaemonEndpoint::Unix(socket_path.to_path_buf()),
-        auth_token: None,
-        authority_record: None,
-    }
-}
-
 #[hotpath::measure(label = "daemon.core.ensure_connection_live", future = true)]
 pub(crate) async fn ensure_daemon_connection_live(
     connection: &DaemonConnection,
     request_label: &str,
 ) -> Result<()> {
-    if let Some(expected) = connection.authority_record.as_ref() {
-        let current = authority::current_record(&expected.profile_root)?;
-        let Some(current) = current else {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "daemon authority disappeared while request '{request_label}' was awaiting a response; the request was already sent and was not retried"
-                ),
-            });
-        };
-        if current.epoch != expected.epoch || current.process_run_id != expected.process_run_id {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "daemon restarted while request '{request_label}' was awaiting a response (expected epoch {}, current epoch {}); the request was already sent and was not retried",
-                    expected.epoch, current.epoch
-                ),
-            });
-        }
-    }
+    connection.ensure_authority_current(request_label)?;
 
     timeout(
         DAEMON_TOOL_HEALTH_CONNECT_TIMEOUT,
@@ -230,8 +122,6 @@ pub(crate) async fn next_daemon_response_line<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    use tracedecay_sessions::admission::{is_wire_oversized_io_error, read_bounded_mcp_line};
-
     // Pin one frame-read future for the whole wait. Liveness polls must not
     // recreate `read_bounded_mcp_line`: that future owns the partial-frame
     // accumulator after bytes have already been consumed from `reader`.
@@ -245,8 +135,7 @@ where
                     Err(error) if is_wire_oversized_io_error(&error) => {
                         Err(TraceDecayError::Config {
                             message: format!(
-                                "daemon {request_label} response exceeded wire message bound ({})",
-                                tracedecay_sessions::admission::WIRE_RECORD_TOO_LARGE
+                                "daemon {request_label} response exceeded wire message bound ({WIRE_RECORD_TOO_LARGE})"
                             ),
                         })
                     }
@@ -260,23 +149,8 @@ where
     }
 }
 
-// Windows discovers the current daemon through a fallible endpoint lookup;
-// Unix keeps the same cross-platform contract even though its path is infallible.
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn client_connection(socket_path: &Path) -> Result<DaemonConnection> {
-    #[cfg(unix)]
-    {
-        Ok(connection_for_socket_path(socket_path))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = socket_path;
-        current_daemon_connection()
-    }
-}
-
 pub(crate) async fn write_daemon_preamble(
-    writer: &mut tokio::io::WriteHalf<BrokerStream>,
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     connection: &DaemonConnection,
     handshake: &DaemonHandshake,
 ) -> Result<()> {
@@ -376,12 +250,19 @@ async fn connect_with_restart_grace_resolving(
             Ok(stream) => return Ok((connection, stream)),
             Err(TraceDecayError::Io(err)) => {
                 if !is_transient_daemon_connect_error(err.kind()) || Instant::now() >= deadline {
-                    return Err(TraceDecayError::Config {
-                        message: format!(
-                            "could not connect to TraceDecay daemon endpoint '{}': {err}. {}",
-                            connection.endpoint,
-                            daemon_connect_failure_advice(err.kind())
-                        ),
+                    return Err(if is_transient_daemon_connect_error(err.kind()) {
+                        tracedecay_daemon_protocol::daemon_connect_failure(
+                            &connection.endpoint,
+                            &err,
+                        )
+                    } else {
+                        TraceDecayError::Config {
+                            message: format!(
+                                "could not connect to TraceDecay daemon endpoint '{}': {err}. {}",
+                                connection.endpoint,
+                                daemon_connect_failure_advice(err.kind())
+                            ),
+                        }
                     });
                 }
                 tokio::time::sleep(poll_interval).await;
@@ -420,7 +301,7 @@ pub(crate) async fn call_tool_with_liveness_poll(
         }
         None => connect_to_current_daemon_within(socket_path, None).await?,
     };
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_owned_split();
     let id = json!(1);
     let mut params = json!({
         "name": tool_name,
@@ -431,9 +312,7 @@ pub(crate) async fn call_tool_with_liveness_poll(
     {
         params.insert(
             "_meta".to_owned(),
-            crate::mcp::tool_call_deadline::tool_call_deadline_meta(wire_request_deadline_micros(
-                deadline,
-            )),
+            tracedecay_mcp::tool_call_deadline_meta(wire_request_deadline_micros(deadline)),
         );
     }
     let request = JsonRpcRequest {
@@ -471,6 +350,16 @@ pub(crate) async fn call_tool_with_liveness_poll(
                     .to_string(),
             });
         };
+        // A daemon that refused this connection's preamble answers with one
+        // refusal frame (no JSON-RPC id) before EOF; skipping it as a
+        // non-matching response line reported the definitive refusal as a
+        // closed-connection mystery.
+        if let Some(refusal) = tracedecay_daemon_protocol::DaemonHandshakeRefusal::from_line(&line)
+        {
+            return Err(tracedecay_daemon_protocol::handshake_refusal_error(
+                &refusal, handshake,
+            ));
+        }
         let response = if let Some(deadline) = client_deadline {
             deadline
                 .run("decode", tool_name, async {
@@ -519,6 +408,9 @@ pub(crate) async fn call_tool_with_liveness_poll(
     }
 }
 
+/// Unbounded one-shot call. Production clients use [`call_default_tool`] or
+/// [`call_tool_within`]; this primitive stays for tests and harnesses that
+/// supply their own outer deadline.
 pub async fn call_tool(
     socket_path: &Path,
     handshake: &DaemonHandshake,
@@ -599,20 +491,38 @@ async fn call_tool_with_project_open_retry(
     }
 }
 
+/// Calls a daemon tool with the shared [`tool_request_deadline`] envelope.
+///
+/// Production one-shot clients must not read forever against a stalled-but
+/// accepting daemon. The request deadline travels on the wire; the local read
+/// waits that deadline plus the 30s response grace. A warming project still
+/// retries for at most the 15s open grace, never past this envelope. Callers
+/// that need a different budget use [`call_default_tool_within`] or
+/// [`call_default_tool_awaiting_project_open`].
 pub async fn call_default_tool(
     handshake: &DaemonHandshake,
     tool_name: &str,
     arguments: serde_json::Value,
 ) -> Result<serde_json::Value> {
     let socket_path = default_available_socket_path()?;
-    match call_tool(&socket_path, handshake, tool_name, arguments.clone()).await {
+    let deadline = Instant::now() + tool_request_deadline()?;
+    match call_tool_within(
+        &socket_path,
+        handshake,
+        tool_name,
+        arguments.clone(),
+        deadline,
+    )
+    .await
+    {
         Err(error) if is_project_open_retryable_error(&error) => {
+            let retry_deadline = Instant::now() + PROJECT_OPEN_RETRY_GRACE;
             call_tool_with_project_open_retry(
                 &socket_path,
                 handshake,
                 tool_name,
                 arguments,
-                Instant::now() + PROJECT_OPEN_RETRY_GRACE,
+                retry_deadline.min(deadline),
             )
             .await
         }
@@ -657,26 +567,25 @@ pub async fn call_default_tool_awaiting_project_open(
 pub fn tool_json_payload(
     result: &serde_json::Value,
     tool_name: &str,
-) -> tracedecay_runtime_core::errors::Result<serde_json::Value> {
+) -> tracedecay_domain::errors::Result<serde_json::Value> {
     let blocks = result
         .get("content")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(
-            || tracedecay_runtime_core::errors::TraceDecayError::Config {
-                message: format!("daemon tool {tool_name} returned no content blocks"),
-            },
-        )?;
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!("daemon tool {tool_name} returned no content blocks"),
+        })?;
     let mut payloads = blocks
         .iter()
         .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
         .filter_map(|text| serde_json::from_str(text).ok());
-    let payload = payloads.next().ok_or_else(|| {
-        tracedecay_runtime_core::errors::TraceDecayError::Config {
-            message: format!("daemon tool {tool_name} returned no JSON payload"),
-        }
-    })?;
+    let payload =
+        payloads
+            .next()
+            .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                message: format!("daemon tool {tool_name} returned no JSON payload"),
+            })?;
     if payloads.next().is_some() {
-        return Err(tracedecay_runtime_core::errors::TraceDecayError::Config {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: format!("daemon tool {tool_name} returned multiple JSON payloads"),
         });
     }

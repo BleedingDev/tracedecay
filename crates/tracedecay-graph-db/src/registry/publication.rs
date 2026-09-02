@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tracedecay_store::runtime::{
-    GraphProjectionIdentityV1, GraphPublicationKeyV1, GraphPublicationOperationContextV1,
+    GraphPendingReplayDiscardOutcomeV1, GraphPendingReplayDiscardV1, GraphProjectionIdentityV1,
+    GraphPublicationKeyV1, GraphPublicationOperationContextV1,
     GraphPublicationProjectionPageRequestV1, GraphPublicationReplayLookupV1,
-    GraphPublicationReplayPageRequestV1, GraphPublicationReplayRetirementV1,
-    GraphPublicationRetiredCleanupPageRequestV1, GraphPublicationStoreV1,
-    GraphRecoveredGenerationDigestV1, GraphReplayRetirementOutcomeV1,
+    GraphPublicationReplayPageRequestV1, GraphPublicationReplayRecordV1,
+    GraphPublicationReplayRetirementV1, GraphPublicationRetiredCleanupPageRequestV1,
+    GraphPublicationStoreV1, GraphRecoveredGenerationDigestV1, GraphReplayRetirementOutcomeV1,
     GraphRetiredReplayCleanupFinalizeOutcomeV1, GraphVerifiedHeadCasOutcomeV1,
     GraphVerifiedHeadCompareAndSwapV1, GraphVerifiedHeadV1,
     MAX_GRAPH_PUBLICATION_PROJECTION_PAGE_RECORDS_V1, MAX_GRAPH_REPLAY_PAGE_RECORDS_V1,
@@ -21,6 +22,7 @@ use super::publication_support::{
 };
 use super::{GraphDbRegistration, GraphDbRegistry, check_registration_request};
 use crate::generation::{metadata_manifest_from_replay, validate_supplied_manifest_binding};
+use crate::generation_runtime::GenerationStageOutcome;
 use crate::lease::{
     GenerationLocator, VerifiedGenerationLease, VerifiedGraphSnapshot, generation_lease,
 };
@@ -31,19 +33,51 @@ use crate::{
     GraphReplayCollectionOutcome, VerifiedGraphCommit,
 };
 
-/// The three publication mode choices `publish_verified_inner` varies on.
+/// The publication mode choices `publish_verified_inner` varies on.
 ///
 /// Grouped because passing them positionally put the function at 8 arguments,
-/// and three adjacent bools at a call site read as noise: `false, true` says
+/// and adjacent bools at a call site read as noise: `false, true` says
 /// nothing about which knob is which.
 struct GraphPublishModeV1 {
     /// A manifest supplied by the caller instead of one derived from replay.
     supplied_manifest: Option<Arc<GraphGenerationManifest>>,
     /// Reopen metadata rather than treating the existing handle as current.
     reopen_metadata: bool,
-    /// This call writes a durable staging page, so it retries across the
-    /// boundary to prove the exact commit rather than assuming it landed.
-    durable_stage_boundary: bool,
+}
+
+/// A publication whose durable generation proof completed but whose
+/// relational verified-head CAS has not yet run.
+///
+/// This is the boundary that lets a serving gate cover only the atomic swap:
+/// everything in here — native staging, the sealed-store build, and the
+/// recovered-digest proof — reads the immutable staged generation and writes
+/// derived artifacts, so it runs without any publication gate held. The CAS
+/// and the read-side lease install in
+/// [`GraphDbRegistry::complete_verified_publication`] are the only phases a
+/// caller needs to serialize against readers of the freshly published head.
+///
+/// The retained lease pins the exact mounted database instance the proof ran
+/// on; completion re-validates that the lease still names the current
+/// registry owner, so a store that was retired and remounted between the two
+/// phases answers a typed conflict instead of installing an instance-foreign
+/// proof.
+pub struct ProvenGraphPublicationV1 {
+    database: GraphDbLeaseV1,
+    identity: GraphGenerationManifestIdentity,
+    dependencies: BTreeMap<GraphProjectionIdentity, Arc<VerifiedGenerationLease>>,
+    commit: GraphCommit,
+    recovered_digest: GraphRecoveredGenerationDigestV1,
+    replay: GraphPublicationReplayRecordV1,
+}
+
+/// Outcome of [`GraphDbRegistry::prepare_verified_publication`].
+pub enum GraphPublicationPreparationV1 {
+    /// The publication was already durably linearized (an idempotent replay
+    /// or a historical head); the snapshot is ready and no CAS is pending.
+    Settled(Box<VerifiedGraphCommit>),
+    /// The durable proof completed; the relational CAS and read-side install
+    /// remain, through [`GraphDbRegistry::complete_verified_publication`].
+    Proven(Box<ProvenGraphPublicationV1>),
 }
 
 impl GraphDbRegistry {
@@ -112,6 +146,7 @@ impl GraphDbRegistry {
             locator.generation,
             &head.recovered_digest,
             Arc::clone(&registration.authority_lease),
+            &|| check_all(&registration, context, "generation.recover.direct_sealed"),
         )?
         .ok_or_else(|| GraphDbError::unavailable("sealed generation store is absent"))?;
         if identity.dependency_closure_digest(&|| {
@@ -125,6 +160,7 @@ impl GraphDbRegistry {
         }
         check_all(&registration, context, "generation.recover.direct_sealed")?;
         let lease = generation_lease(&identity, head, BTreeMap::new());
+        self.track_direct_sealed_reader(&lease)?;
         Ok(VerifiedGraphSnapshot::new_direct_sealed(database, lease))
     }
 
@@ -283,7 +319,15 @@ impl GraphDbRegistry {
             }
         }
         if sealed_digest_mismatch {
-            return Err(GraphDbError::Conflict);
+            tracing::warn!(
+                event = "graph_replay_retire_digest_mismatch",
+                generation = generation.as_str(),
+                "a journaled replay for this code generation carries a different sealed \
+                 digest; retirement conflicts"
+            );
+            return Err(GraphDbError::conflict(
+                "publication.retire_one_code_generation_replay",
+            ));
         }
         if candidates.is_empty() {
             for (locator, _) in retired_cleanup {
@@ -303,6 +347,9 @@ impl GraphDbRegistry {
                     retained.insert(locator.clone());
                 }
             }
+            // Direct-sealed readers bypass this database's generation state
+            // entirely; their liveness is tracked on the registry.
+            retained.extend(self.live_direct_sealed_locators()?);
             let selected = candidates
                 .into_iter()
                 .find(|(locator, _, _)| !retained.contains(locator));
@@ -312,8 +359,20 @@ impl GraphDbRegistry {
             selected
         };
         let Some((locator, replay, source)) = selected else {
+            tracing::debug!(
+                event = "graph_replay_retirement_retained",
+                generation = generation.as_str(),
+                "every replay for this code generation is still referenced; nothing retires"
+            );
             return Ok(GraphReplayCollectionOutcome::Retained);
         };
+        tracing::debug!(
+            event = "graph_replay_retirement_selected",
+            generation = generation.as_str(),
+            graph_generation = %locator.generation,
+            replay_sequence = replay.sequence.get(),
+            "unreferenced sealed code-generation replay selected for retirement"
+        );
         let retirement = match GraphPublicationReplayRetirementV1::new(
             replay.publication.key.clone(),
             replay.publication.input_digest.clone(),
@@ -360,7 +419,16 @@ impl GraphDbRegistry {
             }
             GraphReplayRetirementOutcomeV1::Conflict => {
                 clear_retiring_fence(&database, &locator)?;
-                Err(GraphDbError::Conflict)
+                tracing::warn!(
+                    event = "graph_replay_retirement_conflict",
+                    generation = generation.as_str(),
+                    graph_generation = %locator.generation,
+                    replay_sequence = replay.sequence.get(),
+                    "relational replay retirement conflicted with a concurrent authority change"
+                );
+                Err(GraphDbError::conflict(
+                    "publication.retire_one_code_generation_replay",
+                ))
             }
             GraphReplayRetirementOutcomeV1::Missing => {
                 clear_retiring_fence(&database, &locator)?;
@@ -369,6 +437,69 @@ impl GraphDbRegistry {
                 })
             }
         }
+    }
+
+    /// Discard one interrupted publication: the journaled pending replay row
+    /// a dead publisher can never complete, plus whatever partial native
+    /// generation contents its interrupted staging left behind. The target
+    /// is named by the exact observed record (compare-and-swap shaped), so a
+    /// row that completed, was superseded, or was re-journaled since the
+    /// diagnosis is refused with its evidence instead of deleted. On
+    /// `Discarded` the journal position is open again and a fresh replay for
+    /// the same generation can be journaled and published (issue #765).
+    #[hotpath::measure(
+        label = "graph_db.generation.discard_interrupted",
+        impl_type = "GraphDbRegistry"
+    )]
+    pub fn discard_interrupted_publication(
+        &self,
+        registration: GraphDbRegistration,
+        authority: &mut dyn GraphPublicationStoreV1,
+        context: &GraphPublicationOperationContextV1<'_>,
+        pending: &GraphPublicationReplayRecordV1,
+    ) -> Result<GraphPendingReplayDiscardOutcomeV1, GraphDbError> {
+        let operation = self.registered_operation(registration.clone())?;
+        operation.check(self, context)?;
+        require_projection_binding(&registration, &pending.publication.key.projection)?;
+        let database = operation.database().clone();
+        let locator = locator_from_key(&pending.publication.key)?;
+        // Fence the generation against concurrent recover/open while its
+        // journal row and stored rows are removed, and refuse while anything
+        // live still retains it: a retained pending generation means an
+        // in-flight publisher on this instance still holds its proof lease.
+        {
+            let mut state = database.wait_verified_generations_write()?;
+            if state.retains(&locator) || state.retiring.contains(&locator) {
+                return Err(GraphDbError::conflict(
+                    "publication.discard_interrupted.generation_retained",
+                ));
+            }
+            state.retiring.insert(locator.clone());
+        }
+        let request = GraphPendingReplayDiscardV1 {
+            key: pending.publication.key.clone(),
+            sequence: pending.sequence,
+        };
+        let outcome = match authority.discard_pending_replay(&request, context) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                clear_retiring_fence(&database, &locator)?;
+                return Err(map_publication_error(error));
+            }
+        };
+        if matches!(outcome, GraphPendingReplayDiscardOutcomeV1::Discarded(_)) {
+            // The journal discard is the linearization point. A failure here
+            // may leak partial staged rows, but the reopened journal position
+            // means the next publication of this generation restages them.
+            if let Err(error) = database.delete_generation_contents(&locator, &|| {
+                check_registration_request(&registration, "publication.interrupted_discard")
+            }) {
+                clear_retiring_fence(&database, &locator)?;
+                return Err(error);
+            }
+        }
+        clear_retiring_fence(&database, &locator)?;
+        Ok(outcome)
     }
 
     #[hotpath::measure(label = "graph_db.replay_pool.finalize", impl_type = "GraphDbRegistry")]
@@ -427,7 +558,15 @@ impl GraphDbRegistry {
                             && &source.generation == generation
                         {
                             if &source.sealed_state_digest != sealed_state_digest {
-                                return Err(GraphDbError::Conflict);
+                                tracing::warn!(
+                                    event = "graph_replay_cleanup_digest_mismatch",
+                                    generation = generation.as_str(),
+                                    "retired cleanup for this code generation carries a \
+                                     different sealed digest; finalization conflicts"
+                                );
+                                return Err(GraphDbError::conflict(
+                                    "publication.finalize_one_code_generation_replay_cleanup",
+                                ));
                             }
                             return match authority
                                 .finalize_retired_replay_cleanup(&tombstone.retirement(), context)
@@ -438,7 +577,14 @@ impl GraphDbRegistry {
                                     Ok(true)
                                 }
                                 GraphRetiredReplayCleanupFinalizeOutcomeV1::Conflict => {
-                                    Err(GraphDbError::Conflict)
+                                    tracing::warn!(
+                                        event = "graph_replay_cleanup_finalize_conflict",
+                                        generation = generation.as_str(),
+                                        "retired replay cleanup finalization conflicted"
+                                    );
+                                    Err(GraphDbError::conflict(
+                                        "publication.finalize_one_code_generation_replay_cleanup",
+                                    ))
                                 }
                                 GraphRetiredReplayCleanupFinalizeOutcomeV1::Missing => {
                                     Err(GraphDbError::Corrupt {
@@ -511,25 +657,30 @@ impl GraphDbRegistry {
             GraphPublishModeV1 {
                 supplied_manifest,
                 reopen_metadata: false,
-                durable_stage_boundary: false,
             },
         )
     }
 
-    /// Publishes a native generation in two bounded, crash-safe attempts when
-    /// this call writes any durable staging page. The retry proves the exact
-    /// finalization receipt, then performs the durable generation proof
-    /// without repeating native staging.
-    pub fn publish_verified_with_durable_stage_boundary(
+    /// Runs the gateless phase of one verified publication — replay
+    /// resolution, native staging, the sealed-store build, and the durable
+    /// recovered-digest proof — without advancing the relational verified
+    /// head or installing a read-side lease.
+    ///
+    /// A publication that turns out to be already durably linearized
+    /// (an idempotent replay of the current head, or superseded history)
+    /// settles here with its snapshot; otherwise the returned proof completes
+    /// through [`Self::complete_verified_publication`], which is the only
+    /// phase a publication gate needs to cover.
+    pub fn prepare_verified_publication(
         &self,
         registration: GraphDbRegistration,
         authority: &mut dyn GraphPublicationStoreV1,
         context: &GraphPublicationOperationContextV1<'_>,
         publication_key: &GraphPublicationKeyV1,
         supplied_manifest: Option<Arc<GraphGenerationManifest>>,
-    ) -> Result<VerifiedGraphCommit, GraphDbError> {
+    ) -> Result<GraphPublicationPreparationV1, GraphDbError> {
         let operation = self.registered_operation(registration)?;
-        self.publish_verified_inner(
+        self.prepare_verified_publication_inner(
             &operation,
             authority,
             context,
@@ -537,9 +688,25 @@ impl GraphDbRegistry {
             GraphPublishModeV1 {
                 supplied_manifest,
                 reopen_metadata: false,
-                durable_stage_boundary: true,
             },
         )
+    }
+
+    /// Completes a prepared publication: the relational verified-head
+    /// compare-and-swap and the read-side lease install.
+    ///
+    /// The proof's retained lease must still name the current registry owner
+    /// of the same mounted instance; a store retired and remounted between
+    /// the phases answers a typed conflict, and the caller re-prepares.
+    pub fn complete_verified_publication(
+        &self,
+        registration: GraphDbRegistration,
+        authority: &mut dyn GraphPublicationStoreV1,
+        context: &GraphPublicationOperationContextV1<'_>,
+        proven: ProvenGraphPublicationV1,
+    ) -> Result<VerifiedGraphCommit, GraphDbError> {
+        let operation = self.registered_operation(registration)?;
+        self.complete_verified_publication_inner(&operation, authority, context, proven)
     }
 
     /// Publishes through an already-issued, registry-validated graph lease.
@@ -563,7 +730,6 @@ impl GraphDbRegistry {
             GraphPublishModeV1 {
                 supplied_manifest: None,
                 reopen_metadata: false,
-                durable_stage_boundary: false,
             },
         )
     }
@@ -584,7 +750,6 @@ impl GraphDbRegistry {
             GraphPublishModeV1 {
                 supplied_manifest: None,
                 reopen_metadata: true,
-                durable_stage_boundary: false,
             },
         )
     }
@@ -598,10 +763,41 @@ impl GraphDbRegistry {
         publication_key: &GraphPublicationKeyV1,
         mode: GraphPublishModeV1,
     ) -> Result<VerifiedGraphCommit, GraphDbError> {
+        match self.prepare_verified_publication_inner(
+            operation,
+            authority,
+            context,
+            publication_key,
+            mode,
+        )? {
+            GraphPublicationPreparationV1::Settled(commit) => Ok(*commit),
+            GraphPublicationPreparationV1::Proven(proven) => {
+                self.complete_verified_publication_inner(operation, authority, context, *proven)
+            }
+        }
+    }
+
+    /// The gateless phase of one verified publication: replay resolution,
+    /// native staging, the sealed-store build, and the durable
+    /// recovered-digest proof. Nothing here advances the relational verified
+    /// head or installs a read-side lease, so a caller that serializes
+    /// publication against readers holds its gate only across
+    /// [`Self::complete_verified_publication`].
+    #[hotpath::measure(
+        label = "graph_db.generation.publish.prepare",
+        impl_type = "GraphDbRegistry"
+    )]
+    fn prepare_verified_publication_inner(
+        &self,
+        operation: &RegisteredGraphDbOperationV1,
+        authority: &mut dyn GraphPublicationStoreV1,
+        context: &GraphPublicationOperationContextV1<'_>,
+        publication_key: &GraphPublicationKeyV1,
+        mode: GraphPublishModeV1,
+    ) -> Result<GraphPublicationPreparationV1, GraphDbError> {
         let GraphPublishModeV1 {
             supplied_manifest,
             reopen_metadata,
-            durable_stage_boundary,
         } = mode;
         operation.check(self, context)?;
         operation.require_publication_binding(publication_key)?;
@@ -613,7 +809,16 @@ impl GraphDbRegistry {
             .map_err(map_publication_error)?;
         let replay = match replay {
             GraphPublicationReplayLookupV1::Active(replay) => replay,
-            GraphPublicationReplayLookupV1::Retired(_) => return Err(GraphDbError::Conflict),
+            GraphPublicationReplayLookupV1::Retired(tombstone) => {
+                tracing::warn!(
+                    event = "graph_publication_replay_retired_conflict",
+                    generation = tombstone.key.generation.as_str(),
+                    retired_sequence = tombstone.sequence.get(),
+                    "the journaled replay for this publication key is retired; \
+                     publication conflicts before any journal write"
+                );
+                return Err(GraphDbError::conflict("publication.prepare.replay_retired"));
+            }
             GraphPublicationReplayLookupV1::Missing => {
                 return Err(GraphDbError::invalid(
                     "verified graph publication has no durable active replay record",
@@ -665,12 +870,22 @@ impl GraphDbRegistry {
             .map_err(|error| GraphDbError::Corrupt {
                 message: format!("historical graph publication evidence is invalid: {error}"),
             })?;
-            let is_current_head = current.as_ref() == Some(&historical_head);
-            if is_current_head
-                || current
-                    .as_ref()
-                    .is_some_and(|head| head.sequence > replay.sequence)
-            {
+            let relation = publication_head_relation(current.as_ref(), &replay, &historical_head);
+            if matches!(
+                relation,
+                PublicationHeadRelationV1::OwnLinearizedHead
+                    | PublicationHeadRelationV1::SupersededHistory
+            ) {
+                let is_current_head =
+                    matches!(relation, PublicationHeadRelationV1::OwnLinearizedHead);
+                let historical_head = if is_current_head {
+                    current.clone().ok_or_else(|| GraphDbError::Corrupt {
+                        message: "linearized graph publication head disappeared during seating"
+                            .to_owned(),
+                    })?
+                } else {
+                    historical_head
+                };
                 let locator = locator_from_key(&historical_head.key)?;
                 // This exact mounted instance may already hold the verified
                 // lease for this head: a racing publisher or an earlier
@@ -681,8 +896,11 @@ impl GraphDbRegistry {
                 // fields byte-exactly), the same trust decision the recover
                 // fast path makes in `load_verified_head`. A fresh-from-disk
                 // instance starts with an empty cache and pays the full
-                // proof below.
-                if let Some(lease) = database.verified_generation(&locator)?
+                // proof below, and a quarantined generation is deliberately
+                // a cache miss here: this publication re-projects the rows
+                // and re-proves the digest, which is the repair the
+                // quarantine was waiting for.
+                if let Some(lease) = database.republishable_verified_generation(&locator)?
                     && lease.head == historical_head
                 {
                     operation.check(self, context)?;
@@ -712,7 +930,8 @@ impl GraphDbRegistry {
                         is_current_head,
                         commit,
                         recovered_digest,
-                    );
+                    )
+                    .map(|commit| GraphPublicationPreparationV1::Settled(Box::new(commit)));
                 }
                 let mut visiting = BTreeSet::new();
                 let dependencies = self.load_dependencies(
@@ -732,27 +951,45 @@ impl GraphDbRegistry {
                 let (historical_commit, recovered_digest) =
                     match (apply_native, has_supplied_manifest) {
                         (true, _) => {
-                            // Staging consumes the manifest and drops its rows
-                            // once the last page commit is durable, so the
-                            // artifact proof below no longer overlaps them.
                             let staged = database
                                 .apply_generation_unverified_with_digest_observed(
                                     manifest,
                                     sealed_digest,
                                     &check,
                                 )?;
-                            if durable_stage_boundary && staged.was_applied() {
-                                return Err(GraphDbError::DeadlineExceeded);
+                            match staged {
+                                GenerationStageOutcome::Applied(commit) => {
+                                    // A repair that wrote missing native rows is
+                                    // a new seal: build and prove its derived
+                                    // artifact before seating it.
+                                    let (_, recovered) = database
+                                        .verify_generation_for_publication(
+                                            &identity,
+                                            sealed_digest,
+                                            row_counts,
+                                            true,
+                                            &check,
+                                        )?;
+                                    (commit, recovered)
+                                }
+                                GenerationStageOutcome::Reseated(commit) => {
+                                    // An already-complete generation is an
+                                    // activation. Verify the staging authority
+                                    // and adopt an existing sealed artifact, but
+                                    // never construct a missing whole-generation
+                                    // copy before the rows can serve.
+                                    let recovered = database.verify_activated_generation(
+                                        &identity,
+                                        sealed_digest,
+                                        &check,
+                                    )?;
+                                    database.open_sealed_generation_store_if_present(
+                                        &identity,
+                                        sealed_digest,
+                                    )?;
+                                    (commit, recovered)
+                                }
                             }
-                            let commit = staged.commit();
-                            let (_, recovered) = database.verify_generation_for_publication(
-                                &identity,
-                                sealed_digest,
-                                row_counts,
-                                true,
-                                &check,
-                            )?;
-                            (commit, recovered)
                         }
                         (false, true) => {
                             drop(manifest);
@@ -793,23 +1030,10 @@ impl GraphDbRegistry {
                 // was validated when it was loaded, so the verified lease is
                 // built directly from that proof. Re-loading the head
                 // through its replay would hydrate the manifest and stream
-                // the rows a second time without adding durability.
-                let physical_namespace = locator.physical_namespace()?;
-                match database.ensure_projection_readable(
-                    &physical_namespace,
-                    &identity.projection.projection,
-                ) {
-                    Ok(()) => {}
-                    Err(GraphDbError::ProjectionMismatch { message, .. }) => {
-                        return Err(GraphDbError::GenerationMismatch {
-                            namespace: identity.projection.namespace.to_string(),
-                            projection: identity.projection.projection.to_string(),
-                            generation: identity.generation.to_string(),
-                            message,
-                        });
-                    }
-                    Err(error) => return Err(error),
-                }
+                // the rows a second time without adding durability. Seating
+                // records this fresh proof and clears any prior quarantine;
+                // the read-side quarantine guard must remain closed until
+                // that proof-bearing lease is installed.
                 let lease = generation_lease(&identity, historical_head.clone(), dependencies);
                 return seat_historical_verified_lease(
                     database,
@@ -818,9 +1042,29 @@ impl GraphDbRegistry {
                     is_current_head,
                     historical_commit,
                     recovered_digest,
-                );
+                )
+                .map(|commit| GraphPublicationPreparationV1::Settled(Box::new(commit)));
             }
-            return Err(GraphDbError::Conflict);
+            let expected = replay.publication.expected_prior_head.as_ref();
+            tracing::warn!(
+                event = "graph_publication_prior_head_conflict",
+                generation = replay.publication.key.generation.as_str(),
+                replay_sequence = replay.sequence.get(),
+                expected_prior_generation =
+                    expected.map_or("none", |head| head.key.generation.as_str()),
+                expected_prior_sequence = expected.map_or(0, |head| head.sequence.get()),
+                current_generation = current
+                    .as_ref()
+                    .map_or("none", |head| head.key.generation.as_str()),
+                current_sequence = current.as_ref().map_or(0, |head| head.sequence.get()),
+                "journaled replay expects a different prior verified head and the current \
+                 head is not newer; publication conflicts before the verified-head CAS"
+            );
+            return Err(GraphDbError::conflict_observed(
+                "publication.prepare.expected_prior_head",
+                describe_verified_head(replay.publication.expected_prior_head.as_ref()),
+                describe_verified_head(current.as_ref()),
+            ));
         }
         let mut visiting = BTreeSet::new();
         let dependencies = self.load_dependencies(
@@ -853,9 +1097,6 @@ impl GraphDbRegistry {
                     sealed_digest,
                     &check,
                 )?;
-                if durable_stage_boundary && staged.was_applied() {
-                    return Err(GraphDbError::DeadlineExceeded);
-                }
                 let commit = staged.commit();
                 database
                     .verify_generation_for_publication(
@@ -907,6 +1148,58 @@ impl GraphDbRegistry {
         database
             .record_memory_checkpoint(crate::hotpath_observe::GrafeoMemoryPhase::NativeVerified);
         operation.check(self, context)?;
+        Ok(GraphPublicationPreparationV1::Proven(Box::new(
+            ProvenGraphPublicationV1 {
+                database,
+                identity,
+                dependencies,
+                commit,
+                recovered_digest,
+                replay,
+            },
+        )))
+    }
+
+    /// The linearization phase of one verified publication: the relational
+    /// verified-head compare-and-swap and the read-side lease install. This
+    /// is the only publication phase that changes what readers observe, so a
+    /// caller that gates publication against reads holds its gate across
+    /// exactly this call.
+    #[hotpath::measure(
+        label = "graph_db.generation.publish.complete",
+        impl_type = "GraphDbRegistry"
+    )]
+    fn complete_verified_publication_inner(
+        &self,
+        operation: &RegisteredGraphDbOperationV1,
+        authority: &mut dyn GraphPublicationStoreV1,
+        context: &GraphPublicationOperationContextV1<'_>,
+        proven: ProvenGraphPublicationV1,
+    ) -> Result<VerifiedGraphCommit, GraphDbError> {
+        let ProvenGraphPublicationV1 {
+            database,
+            identity,
+            dependencies,
+            commit,
+            recovered_digest,
+            replay,
+        } = proven;
+        operation.check(self, context)?;
+        operation.require_publication_binding(&replay.publication.key)?;
+        // The proof is bound to the exact mounted instance it streamed; a
+        // completion arriving through a different instance of the same store
+        // must not install it.
+        if !database.shares_runtime_with(operation.database()) {
+            tracing::warn!(
+                event = "graph_publication_instance_conflict",
+                generation = replay.publication.key.generation.as_str(),
+                "publication proof was bound to a different mounted graph instance; \
+                 completion conflicts"
+            );
+            return Err(GraphDbError::conflict(
+                "publication.complete.foreign_instance",
+            ));
+        }
         let cas = GraphVerifiedHeadCompareAndSwapV1 {
             publication_key: replay.publication.key.clone(),
             input_digest: replay.publication.input_digest.clone(),
@@ -923,9 +1216,66 @@ impl GraphDbRegistry {
         {
             GraphVerifiedHeadCasOutcomeV1::Advanced(head)
             | GraphVerifiedHeadCasOutcomeV1::ExactReplay(head) => head,
-            GraphVerifiedHeadCasOutcomeV1::Conflict { .. }
-            | GraphVerifiedHeadCasOutcomeV1::ReplayInputConflict { .. } => {
-                return Err(GraphDbError::Conflict);
+            GraphVerifiedHeadCasOutcomeV1::Conflict { actual } => {
+                if let Some(head) = actual
+                    .as_ref()
+                    .filter(|head| head.key == cas.publication_key)
+                    .cloned()
+                {
+                    // The live head is this publication: a twin publisher
+                    // linearized the same journal, or the CAS observed its
+                    // own write as a conflict. Seat that head instead of
+                    // looping Conflict on the incumbent.
+                    let lease = generation_lease(&identity, head.clone(), dependencies);
+                    database.install_verified_generation(Arc::clone(&lease))?;
+                    database.record_memory_checkpoint(
+                        crate::hotpath_observe::GrafeoMemoryPhase::Published,
+                    );
+                    let mut closure = BTreeMap::new();
+                    collect_closure(&lease, &mut closure)?;
+                    return Ok(VerifiedGraphCommit {
+                        commit,
+                        recovered_digest: head.recovered_digest.clone(),
+                        head,
+                        snapshot: VerifiedGraphSnapshot::new(database, lease, closure),
+                    });
+                }
+                let expected = cas.expected_prior_head.as_ref();
+                tracing::warn!(
+                    event = "graph_publication_cas_conflict",
+                    generation = cas.publication_key.generation.as_str(),
+                    expected_prior_generation =
+                        expected.map_or("none", |head| head.key.generation.as_str()),
+                    expected_prior_sequence = expected.map_or(0, |head| head.sequence.get()),
+                    actual_generation = actual
+                        .as_ref()
+                        .map_or("none", |head| head.key.generation.as_str()),
+                    actual_sequence = actual.as_ref().map_or(0, |head| head.sequence.get()),
+                    "relational verified-head compare-and-swap observed a different \
+                     current head"
+                );
+                return Err(GraphDbError::conflict_observed(
+                    "publication.complete.cas_prior_head",
+                    describe_verified_head(cas.expected_prior_head.as_ref()),
+                    describe_verified_head(actual.as_ref()),
+                ));
+            }
+            GraphVerifiedHeadCasOutcomeV1::ReplayInputConflict { existing } => {
+                tracing::warn!(
+                    event = "graph_publication_cas_replay_input_conflict",
+                    generation = cas.publication_key.generation.as_str(),
+                    existing_sequence = existing.sequence.get(),
+                    "relational verified-head compare-and-swap found the journaled \
+                     replay bound to different inputs"
+                );
+                return Err(GraphDbError::conflict_observed(
+                    "publication.complete.cas_replay_inputs",
+                    format!("replay input {}", cas.input_digest.as_str()),
+                    format!(
+                        "journaled input {}",
+                        existing.publication.input_digest.as_str()
+                    ),
+                ));
             }
             GraphVerifiedHeadCasOutcomeV1::RecoveredDigestMismatch { expected, actual } => {
                 return Err(GraphDbError::GenerationMismatch {
@@ -945,8 +1295,17 @@ impl GraphDbRegistry {
                         .to_owned(),
                 });
             }
-            GraphVerifiedHeadCasOutcomeV1::RetiredReplay(_) => {
-                return Err(GraphDbError::Conflict);
+            GraphVerifiedHeadCasOutcomeV1::RetiredReplay(tombstone) => {
+                tracing::warn!(
+                    event = "graph_publication_cas_retired_replay",
+                    generation = tombstone.key.generation.as_str(),
+                    retired_sequence = tombstone.sequence.get(),
+                    "the journaled replay was retired before the verified-head \
+                     compare-and-swap"
+                );
+                return Err(GraphDbError::conflict(
+                    "publication.complete.replay_retired",
+                ));
             }
         };
 
@@ -1047,7 +1406,11 @@ impl GraphDbRegistry {
             .map_err(map_publication_error)?;
         let replay = match replay {
             GraphPublicationReplayLookupV1::Active(replay) => replay,
-            GraphPublicationReplayLookupV1::Retired(_) => return Err(GraphDbError::Conflict),
+            GraphPublicationReplayLookupV1::Retired(_) => {
+                return Err(GraphDbError::conflict(
+                    "publication.snapshot.replay_retired",
+                ));
+            }
             GraphPublicationReplayLookupV1::Missing => {
                 return Err(GraphDbError::Corrupt {
                     message: "exact verified graph generation has no durable active replay"
@@ -1064,7 +1427,19 @@ impl GraphDbRegistry {
         if current.sequence < replay.sequence
             || (current.sequence == replay.sequence && current.key != replay.publication.key)
         {
-            return Err(GraphDbError::Conflict);
+            tracing::debug!(
+                event = "graph_generation_snapshot_superseded",
+                generation = replay.publication.key.generation.as_str(),
+                replay_sequence = replay.sequence.get(),
+                current_generation = current.key.generation.as_str(),
+                current_sequence = current.sequence.get(),
+                "exact verified generation lookup conflicts with the current verified head"
+            );
+            return Err(GraphDbError::conflict_observed(
+                "publication.snapshot.replay_ahead_of_head",
+                format!("head seq >= {}", replay.sequence.get()),
+                describe_verified_head(Some(&current)),
+            ));
         }
         let historical_head = GraphVerifiedHeadV1::from_replay(
             &replay,
@@ -1088,6 +1463,10 @@ impl GraphDbRegistry {
         Ok(VerifiedGraphSnapshot::new(database, lease, closure))
     }
 
+    #[hotpath::measure(
+        label = "graph_db.generation.load_dependencies",
+        impl_type = "GraphDbRegistry"
+    )]
     fn load_dependencies(
         &self,
         operation: &RegisteredGraphDbOperationV1,
@@ -1115,9 +1494,28 @@ impl GraphDbRegistry {
             let relational_head = authority
                 .verified_head(&key.projection, context)
                 .map_err(map_publication_error)?
-                .ok_or(GraphDbError::Conflict)?;
+                .ok_or_else(|| {
+                    tracing::warn!(
+                        event = "graph_dependency_head_missing",
+                        dependency_generation = %dependency.generation,
+                        "dependency projection has no relational verified head; \
+                         publication conflicts"
+                    );
+                    GraphDbError::conflict("publication.dependencies.missing_verified_head")
+                })?;
             if relational_head.sequence < replay.sequence {
-                return Err(GraphDbError::Conflict);
+                tracing::warn!(
+                    event = "graph_dependency_head_stale",
+                    dependency_generation = %dependency.generation,
+                    head_sequence = relational_head.sequence.get(),
+                    replay_sequence = replay.sequence.get(),
+                    "dependency verified head is older than its replay; publication conflicts"
+                );
+                return Err(GraphDbError::conflict_observed(
+                    "publication.dependencies.replay_ahead_of_head",
+                    format!("head seq >= {}", replay.sequence.get()),
+                    describe_verified_head(Some(&relational_head)),
+                ));
             }
             if relational_head.sequence == replay.sequence
                 && relational_head.key != replay.publication.key
@@ -1142,6 +1540,10 @@ impl GraphDbRegistry {
         Ok(loaded)
     }
 
+    #[hotpath::measure(
+        label = "graph_db.generation.load_verified_head",
+        impl_type = "GraphDbRegistry"
+    )]
     fn load_verified_head(
         &self,
         operation: &RegisteredGraphDbOperationV1,
@@ -1239,12 +1641,65 @@ impl GraphDbRegistry {
     }
 }
 
+/// How a journaled replay relates to the live verified head.
+///
+/// Full-struct equality is not the linearization: a remount can reconstruct
+/// the same publication key with a drifted digest field. Foreign and newer
+/// markers stay conflicts so recovery never clears a marker it did not adopt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationHeadRelationV1 {
+    /// Live head matches the journaled prior; first-publish apply may proceed.
+    ExpectedPrior,
+    /// This journaled publication already owns the head (CAS linearized it).
+    OwnLinearizedHead,
+    /// A later publication already won; seat this replay as history.
+    SupersededHistory,
+    /// A foreign or incomparable marker occupies the projection.
+    ForeignMarker,
+}
+
+fn publication_head_relation(
+    current: Option<&GraphVerifiedHeadV1>,
+    replay: &GraphPublicationReplayRecordV1,
+    historical_head: &GraphVerifiedHeadV1,
+) -> PublicationHeadRelationV1 {
+    let expected = replay.publication.expected_prior_head.as_ref();
+    if current == expected {
+        return PublicationHeadRelationV1::ExpectedPrior;
+    }
+    if current.is_some_and(|head| head.key == replay.publication.key)
+        || current == Some(historical_head)
+    {
+        return PublicationHeadRelationV1::OwnLinearizedHead;
+    }
+    if current.is_some_and(|head| head.sequence > replay.sequence) {
+        return PublicationHeadRelationV1::SupersededHistory;
+    }
+    PublicationHeadRelationV1::ForeignMarker
+}
+
+/// Compact operator-log rendering of one verified-head position, used as the
+/// expected/actual evidence in conflict verdicts: the head sequence, the
+/// generation it seats, and the input digest sealing its identity.
+fn describe_verified_head(head: Option<&GraphVerifiedHeadV1>) -> String {
+    match head {
+        Some(head) => format!(
+            "head seq {} generation `{}` input {}",
+            head.sequence.get(),
+            head.key.generation,
+            head.input_digest.as_str(),
+        ),
+        None => "no verified head".to_owned(),
+    }
+}
+
 /// Seats a verified lease for a historical (already durably linearized)
 /// publication and assembles its commit receipt.
 ///
 /// The lease is either freshly built from a digest proof this call just ran,
 /// or reused from this exact instance's verified-generation cache; both carry
 /// the same instance-bound proof, so seating is identical.
+#[hotpath::measure(label = "graph_db.generation.seat_historical")]
 fn seat_historical_verified_lease(
     database: GraphDbLeaseV1,
     lease: Arc<VerifiedGenerationLease>,
@@ -1313,6 +1768,8 @@ mod historical_publication_reuse_tests {
         recovered_generation_enumerations, reset_recovered_generation_enumerations,
         reset_sealed_copy_proofs, sealed_copy_proofs,
     };
+    #[cfg(feature = "graph-sealed-store")]
+    use crate::generation::{reset_sealed_copy_marker_hits, sealed_copy_marker_hits};
     use crate::{
         GraphCancellation, GraphDbError, GraphDbOwnerRegistrationV1, GraphDbRegistration,
         GraphDbRegistry, GraphDbRegistryConfig, GraphEntity, GraphEntityId, GraphGenerationId,
@@ -1514,6 +1971,16 @@ mod historical_publication_reuse_tests {
             Err(GraphPublicationStoreErrorV1::Infrastructure)
         }
 
+        fn discard_pending_replay(
+            &mut self,
+            _request: &tracedecay_store::runtime::GraphPendingReplayDiscardV1,
+            _context: &GraphPublicationOperationContextV1,
+        ) -> GraphPublicationStoreResultV1<
+            tracedecay_store::runtime::GraphPendingReplayDiscardOutcomeV1,
+        > {
+            Err(GraphPublicationStoreErrorV1::Infrastructure)
+        }
+
         fn retired_cleanup_page(
             &mut self,
             _request: &GraphPublicationRetiredCleanupPageRequestV1,
@@ -1622,10 +2089,19 @@ mod historical_publication_reuse_tests {
                 GraphEntity::new(
                     GraphEntityId::new("entity:reuse").unwrap(),
                     BTreeSet::new(),
-                    BTreeMap::from([(
-                        GraphPropertyName::new("marker").unwrap(),
-                        GraphProperty::String("reuse".to_owned()),
-                    )]),
+                    BTreeMap::from([
+                        (
+                            GraphPropertyName::new("marker").unwrap(),
+                            GraphProperty::String("reuse".to_owned()),
+                        ),
+                        // A Bytes property matches the serialized-record shape
+                        // every production code graph takes, so these reuse
+                        // and marker tests exercise the compact artifact form.
+                        (
+                            GraphPropertyName::new("payload").unwrap(),
+                            GraphProperty::Bytes(vec![0x7d, 0x11, 0x03]),
+                        ),
+                    ]),
                 )
                 .unwrap(),
             ],
@@ -1961,6 +2437,48 @@ mod historical_publication_reuse_tests {
             recovered_generation_enumerations(),
             usize::from(counters.full_verifications == 1),
             "row enumeration must happen only when the proof was not inherited"
+        );
+    }
+
+    /// A remount that recovers the generation adopts the on-disk sealed
+    /// artifact through its verify-once marker: the artifact's bytes are the
+    /// ones the build's post-reopen proof ran over, so adoption resolves by
+    /// stat instead of re-streaming the sealed row proof — which is exactly
+    /// the second half of the boot-from-sealed double verification.
+    #[cfg(feature = "graph-sealed-store")]
+    #[test]
+    fn a_fresh_from_disk_recover_adopts_the_sealed_artifact_by_marker() {
+        let mut fixture = published_fixture();
+        assert!(
+            fixture
+                .registry
+                .close(&registration(fixture.binding.clone(), &fixture.root))
+                .unwrap()
+        );
+        mount(&fixture.registry, &fixture.binding, &fixture.root);
+        let (control, probe) = control_and_probe();
+        let context = GraphPublicationOperationContextV1::new(&control, &probe).unwrap();
+        reset_sealed_copy_proofs();
+        reset_sealed_copy_marker_hits();
+        let recovered = fixture
+            .registry
+            .recover_verified_snapshot(
+                registration(fixture.binding.clone(), &fixture.root),
+                &mut fixture.authority,
+                &context,
+                &fixture.key.projection,
+            )
+            .unwrap();
+        assert_eq!(recovered.generation(), &fixture.generation);
+        assert_eq!(
+            sealed_copy_proofs(),
+            0,
+            "adopting unchanged sealed bytes must not re-stream the sealed row proof"
+        );
+        assert_eq!(
+            sealed_copy_marker_hits(),
+            1,
+            "the artifact's own verify-once marker resolves the adoption proof by stat"
         );
     }
 

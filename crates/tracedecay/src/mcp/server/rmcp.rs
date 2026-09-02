@@ -17,9 +17,9 @@ use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{RoleServer, ServerHandler};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{RwLock, Semaphore};
 
-use crate::mcp::transport::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use tracedecay_mcp::transport::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 
 use super::{ConnectionRouteState, McpServer};
 
@@ -39,18 +39,16 @@ pub(crate) struct RmcpSelectedProjectResponseAuthority {
 }
 
 impl RmcpSelectedProjectResponseAuthority {
-    fn request_key(id: &Value) -> tracedecay_runtime_core::errors::Result<String> {
+    fn request_key(id: &Value) -> tracedecay_domain::errors::Result<String> {
         if id.is_null() {
-            return Err(
-                tracedecay_runtime_core::errors::TraceDecayError::project_route(
-                    "project_route_unavailable",
-                    true,
-                    "selected RMCP response has no request identity",
-                ),
-            );
+            return Err(tracedecay_domain::errors::TraceDecayError::project_route(
+                "project_route_unavailable",
+                true,
+                "selected RMCP response has no request identity",
+            ));
         }
         serde_json::to_string(id).map_err(|error| {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "project_route_unavailable",
                 true,
                 format!("selected RMCP response identity is invalid: {error}"),
@@ -62,23 +60,21 @@ impl RmcpSelectedProjectResponseAuthority {
         &self,
         id: &Value,
         lease: super::routing::SelectedProjectResponseLease,
-    ) -> tracedecay_runtime_core::errors::Result<()> {
+    ) -> tracedecay_domain::errors::Result<()> {
         let key = Self::request_key(id)?;
         let mut leases = self.leases.lock().map_err(|_| {
-            tracedecay_runtime_core::errors::TraceDecayError::project_route(
+            tracedecay_domain::errors::TraceDecayError::project_route(
                 "project_route_unavailable",
                 true,
                 "selected RMCP response authority is poisoned during handler handoff",
             )
         })?;
         if leases.contains_key(&key) {
-            return Err(
-                tracedecay_runtime_core::errors::TraceDecayError::project_route(
-                    "project_route_unavailable",
-                    true,
-                    "selected RMCP response identity is already awaiting transport delivery",
-                ),
-            );
+            return Err(tracedecay_domain::errors::TraceDecayError::project_route(
+                "project_route_unavailable",
+                true,
+                "selected RMCP response identity is already awaiting transport delivery",
+            ));
         }
         leases.insert(key, lease);
         Ok(())
@@ -87,7 +83,7 @@ impl RmcpSelectedProjectResponseAuthority {
     pub(crate) fn take(
         &self,
         id: Option<&Value>,
-    ) -> tracedecay_runtime_core::errors::Result<Option<super::routing::SelectedProjectResponseLease>>
+    ) -> tracedecay_domain::errors::Result<Option<super::routing::SelectedProjectResponseLease>>
     {
         let Some(id) = id else {
             return Ok(None);
@@ -104,7 +100,7 @@ impl RmcpSelectedProjectResponseAuthority {
         self.leases
             .lock()
             .map_err(|_| {
-                tracedecay_runtime_core::errors::TraceDecayError::project_route(
+                tracedecay_domain::errors::TraceDecayError::project_route(
                     "project_route_unavailable",
                     true,
                     "selected RMCP response authority is poisoned during transport delivery",
@@ -216,7 +212,7 @@ async fn await_dispatch_with_cancellation<F, C, N>(
     handling: F,
     cancellation: N,
     mut cancel_registered_request: C,
-) -> F::Output
+) -> Option<F::Output>
 where
     F: std::future::Future,
     C: FnMut() -> bool,
@@ -225,15 +221,13 @@ where
     tokio::pin!(handling);
     tokio::pin!(cancellation);
     tokio::select! {
-        response = &mut handling => response,
+        response = &mut handling => Some(response),
         () = &mut cancellation => {
-            while !cancel_registered_request() {
-                tokio::select! {
-                    response = &mut handling => return response,
-                    () = tokio::task::yield_now() => {}
-                }
+            if cancel_registered_request() {
+                Some(handling.await)
+            } else {
+                None
             }
-            handling.await
         }
     }
 }
@@ -242,7 +236,8 @@ where
 /// authority.
 pub(crate) struct RmcpConnectionAdapter {
     server: Arc<McpServer>,
-    connection: Mutex<ConnectionRouteState>,
+    connection: RwLock<ConnectionRouteState>,
+    request_admission: Semaphore,
     memory_request_scope: String,
     timings_enabled: bool,
     selected_project_responses: RmcpSelectedProjectResponseAuthority,
@@ -254,6 +249,24 @@ pub(crate) struct RmcpConnectionAdapter {
     /// is what lets a tool call parked on a generation decode hand its admission
     /// slot back instead of starving tools that need no generation at all.
     admission: Option<Arc<crate::daemon::ParkableConnectionAdmission>>,
+    /// Resolved from the registered product runtime at construction, because
+    /// `ServerHandler::get_info` is infallible and must not fabricate one.
+    build_version: &'static str,
+}
+
+struct RmcpQueueDepthGuard;
+
+impl RmcpQueueDepthGuard {
+    fn enter() -> Self {
+        hotpath::gauge!("mcp.server.rmcp.queue_depth").inc(1_u64);
+        Self
+    }
+}
+
+impl Drop for RmcpQueueDepthGuard {
+    fn drop(&mut self) {
+        hotpath::gauge!("mcp.server.rmcp.queue_depth").dec(1_u64);
+    }
 }
 
 impl RmcpConnectionAdapter {
@@ -261,17 +274,19 @@ impl RmcpConnectionAdapter {
         server: Arc<McpServer>,
         timings_enabled: bool,
         initialize_response_decorator: Option<RmcpInitializeResponseDecorator>,
-    ) -> tracedecay_runtime_core::errors::Result<Self> {
+    ) -> tracedecay_domain::errors::Result<Self> {
         let connection = server.new_connection_route_state()?;
         let memory_request_scope = connection.memory_request_scope().to_owned();
         Ok(Self {
             server,
-            connection: Mutex::new(connection),
+            connection: RwLock::new(connection),
+            request_admission: Semaphore::new(super::connection::MAX_CONCURRENT_CONNECTION_READS),
             memory_request_scope,
             timings_enabled,
             selected_project_responses: RmcpSelectedProjectResponseAuthority::default(),
             initialize_response_decorator,
             admission: crate::daemon::current_connection_admission(),
+            build_version: crate::version::build_version()?,
         })
     }
 
@@ -286,17 +301,38 @@ impl RmcpConnectionAdapter {
         self.selected_project_responses.clone()
     }
 
+    #[hotpath::measure(label = "mcp.server.rmcp.dispatch_total", future = true)]
     async fn dispatch(
         &self,
         context: RequestContext<RoleServer>,
         method: &str,
         params: Option<Value>,
     ) -> Result<JsonRpcResponse, ErrorData> {
-        crate::daemon::in_connection_admission(
+        let queued_at = std::time::Instant::now();
+        let queued = RmcpQueueDepthGuard::enter();
+        let request_permit = self.acquire_request_permit().await?;
+        drop(queued);
+        hotpath::gauge!("mcp.server.rmcp.queue_wait_us")
+            .set(queued_at.elapsed().as_micros() as u64);
+        // Heap-allocate the admission + dispatch composition: rmcp's generated
+        // `handle_request` polls every handler-method future inline, and the
+        // combined resident frame overflows the worker stack in perf-profile
+        // layouts when this mega-future is embedded by value.
+        let result = Box::pin(crate::daemon::in_connection_admission(
             self.admission.clone(),
             self.dispatch_admitted(context, method, params),
-        )
-        .await
+        ))
+        .await;
+        drop(request_permit);
+        result
+    }
+
+    #[hotpath::measure(label = "mcp.server.rmcp.queue_wait", future = true)]
+    async fn acquire_request_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, ErrorData> {
+        self.request_admission
+            .acquire()
+            .await
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))
     }
 
     #[hotpath::measure(label = "mcp.server.rmcp.dispatch", future = true)]
@@ -316,23 +352,46 @@ impl RmcpConnectionAdapter {
             method: method.to_owned(),
             params,
         };
-        let mut connection = self.connection.lock().await;
+        if super::connection::request_is_independent_read(&request) {
+            let ordering_guard = self.connection.read().await;
+            let mut request_connection = ordering_guard.fork_for_independent_read();
+            let result = self
+                .dispatch_request_with_connection(
+                    request,
+                    id,
+                    request_cancellation,
+                    &mut request_connection,
+                )
+                .await;
+            drop(ordering_guard);
+            return result;
+        }
+        let mut connection = self.connection.write().await;
+        self.dispatch_request_with_connection(request, id, request_cancellation, &mut connection)
+            .await
+    }
+
+    #[hotpath::measure(label = "mcp.server.rmcp.dispatch_request", future = true)]
+    async fn dispatch_request_with_connection(
+        &self,
+        request: JsonRpcRequest,
+        id: Value,
+        request_cancellation: tokio_util::sync::CancellationToken,
+        connection: &mut ConnectionRouteState,
+    ) -> Result<JsonRpcResponse, ErrorData> {
         let pre_cancelled = request_cancellation.is_cancelled();
         let response = if pre_cancelled {
-            self.server
-                .handle_request_for_connection(
-                    &request,
-                    self.timings_enabled,
-                    &mut connection,
-                    true,
-                )
-                .await
+            Some(
+                self.server
+                    .handle_request_for_connection(&request, self.timings_enabled, connection, true)
+                    .await,
+            )
         } else {
             await_dispatch_with_cancellation(
                 self.server.handle_request_for_connection(
                     &request,
                     self.timings_enabled,
-                    &mut connection,
+                    connection,
                     false,
                 ),
                 request_cancellation.cancelled(),
@@ -343,6 +402,13 @@ impl RmcpConnectionAdapter {
             )
             .await
         }
+        .ok_or_else(|| {
+            ErrorData::new(
+                ErrorCode(-32800),
+                "MCP request cancelled",
+                Some(json!({"reason_code": "request_cancelled"})),
+            )
+        })?
         .ok_or_else(|| ErrorData::internal_error("MCP request did not produce a response", None))?;
         let selected_response_lease = connection.take_selected_response_lease();
         if selected_response_lease
@@ -367,6 +433,7 @@ impl RmcpConnectionAdapter {
         Ok(response)
     }
 
+    #[hotpath::measure(label = "mcp.server.rmcp.notification", future = true)]
     async fn dispatch_notification(&self, method: String, params: Option<Value>) {
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_owned(),
@@ -374,7 +441,7 @@ impl RmcpConnectionAdapter {
             method,
             params,
         };
-        let mut connection = self.connection.lock().await;
+        let mut connection = self.connection.write().await;
         let _ = self
             .server
             .handle_request_for_connection(&request, self.timings_enabled, &mut connection, false)
@@ -411,12 +478,10 @@ impl ServerHandler for RmcpConnectionAdapter {
                 .enable_tools()
                 .build(),
         )
-        .with_server_info(Implementation::new(
-            "tracedecay",
-            crate::version::build_version(),
-        ))
+        .with_server_info(Implementation::new("tracedecay", self.build_version))
     }
 
+    #[hotpath::skip]
     async fn initialize(
         &self,
         request: InitializeRequestParams,
@@ -431,6 +496,7 @@ impl ServerHandler for RmcpConnectionAdapter {
         Self::response_result(response)
     }
 
+    #[hotpath::skip]
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
@@ -439,6 +505,7 @@ impl ServerHandler for RmcpConnectionAdapter {
         Self::response_result(self.dispatch(context, "tools/list", None).await?)
     }
 
+    #[hotpath::skip]
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -452,6 +519,7 @@ impl ServerHandler for RmcpConnectionAdapter {
         .map(Into::into)
     }
 
+    #[hotpath::skip]
     async fn list_resources(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
@@ -460,6 +528,7 @@ impl ServerHandler for RmcpConnectionAdapter {
         Self::response_result(self.dispatch(context, "resources/list", None).await?)
     }
 
+    #[hotpath::skip]
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
@@ -474,6 +543,7 @@ impl ServerHandler for RmcpConnectionAdapter {
         .map(Into::into)
     }
 
+    #[hotpath::skip]
     async fn on_cancelled(
         &self,
         notification: rmcp::model::CancelledNotificationParam,
@@ -482,6 +552,7 @@ impl ServerHandler for RmcpConnectionAdapter {
         let _ = self.cancel_request(notification.request_id);
     }
 
+    #[hotpath::skip]
     async fn on_custom_notification(
         &self,
         notification: CustomNotification,
@@ -513,7 +584,6 @@ mod tests {
 
     use rmcp::model::{CallToolResponse, CallToolResult};
     use serde_json::json;
-    use tokio::sync::Notify;
 
     use super::*;
 
@@ -537,7 +607,7 @@ mod tests {
         let error = RmcpConnectionAdapter::response_result::<ListToolsResult>(
             JsonRpcResponse::error_with_data(
                 json!("request"),
-                crate::mcp::transport::ErrorCode::InvalidParams,
+                tracedecay_mcp::transport::ErrorCode::InvalidParams,
                 "invalid arguments".to_owned(),
                 Some(json!({"reason": "missing_query"})),
             ),
@@ -550,10 +620,12 @@ mod tests {
 
     #[test]
     fn adapter_accepts_the_legacy_initialize_response_shape() {
+        crate::product_runtime::register_fixture_product_runtime();
         let initialized: InitializeResult =
             RmcpConnectionAdapter::response_result(JsonRpcResponse::success(
                 json!(1),
-                crate::mcp::server::initialize_result("TraceDecay instructions"),
+                crate::mcp::server::initialize_result("TraceDecay instructions")
+                    .expect("fixture product runtime registered"),
             ))
             .expect("rmcp must preserve legacy MCP initialization compatibility");
 
@@ -566,35 +638,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_retries_until_the_live_request_registers() {
+    async fn cancellation_stops_dispatch_before_live_request_registration() {
         let attempts = Arc::new(AtomicUsize::new(0));
-        let registered = Arc::new(Notify::new());
-        let handling_registered = Arc::clone(&registered);
         let cancel_attempts = Arc::clone(&attempts);
-        let cancel_registered = Arc::clone(&registered);
 
         let result = await_dispatch_with_cancellation(
-            async move {
-                handling_registered.notified().await;
-                "cancelled"
-            },
+            std::future::pending::<()>(),
             std::future::ready(()),
             move || {
-                if cancel_attempts.fetch_add(1, Ordering::SeqCst) == 2 {
-                    cancel_registered.notify_one();
-                    true
-                } else {
-                    false
-                }
+                cancel_attempts.fetch_add(1, Ordering::SeqCst);
+                false
             },
         )
         .await;
 
-        assert_eq!(result, "cancelled");
+        assert_eq!(result, None);
         assert_eq!(
             attempts.load(Ordering::SeqCst),
-            3,
-            "cancellation must retry until the request registration is visible"
+            1,
+            "an unregistered request has no admitted work to poll for cancellation"
         );
     }
 }

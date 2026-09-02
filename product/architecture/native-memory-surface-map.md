@@ -30,7 +30,7 @@ The governing rules are:
 
 Primary ownership code:
 
-- `crates/tracedecay-usecases/src/memory/mod.rs`
+- `crates/tracedecay-session-memory/src/memory/mod.rs`
 - `crates/tracedecay-runtime-core/src/store/memory/mod.rs`
 - `crates/tracedecay/src/tracedecay/facts.rs`
 - `crates/tracedecay/src/daemon/retained_owner/memory.rs`
@@ -117,7 +117,7 @@ Session-reflector/automatic-fact paths may promote evidence only through idempot
 
 `crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs` admits Claude, Codex, Cursor, and other host transcript material into session/LCM authorities. It does **not** directly write explicit Native facts.
 
-`SessionApplicationRetrievalPortV1` in `crates/tracedecay/src/daemon/session_retrieval/admitted.rs` performs exact mounted-scope retrieval with immutable request identity, cancellation, deadlines, and bounded results before context use.
+`SessionApplicationRetrievalPortV1` in `crates/tracedecay-session-runtime/src/session_retrieval/admitted.rs` performs exact mounted-scope retrieval with immutable request identity, cancellation, deadlines, and bounded results before context use.
 
 ### Dashboard inspection
 
@@ -127,7 +127,7 @@ Session-reflector/automatic-fact paths may promote evidence only through idempot
 
 - `crates/tracedecay/src/daemon/privacy_remediation.rs` performs bounded, receipt-backed quarantine/purge against retained Native/session authorities after admission.
 - `crates/tracedecay/src/daemon/store_maintenance/` owns repair, replay, retention, and store lifecycle work.
-- `crates/tracedecay/src/daemon/store_runtime/session_registry/memory_graph_reconciliation_tasks.rs` owns cancellation, shutdown, and retirement of rebuildable graph workers.
+- `crates/tracedecay-store-runtime/src/session_registry/memory_graph_reconciliation_tasks.rs` owns cancellation, shutdown, and retirement of rebuildable graph workers.
 
 These are Native administrative responsibilities, not cognitive-provider extension points.
 

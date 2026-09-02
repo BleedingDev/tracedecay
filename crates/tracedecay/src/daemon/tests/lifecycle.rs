@@ -92,7 +92,7 @@ fn daemon_admission_preserves_reserved_health_capacity() {
     let shutdown_request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 3,
-        "method": super::super::DAEMON_SHUTDOWN_METHOD,
+        "method": tracedecay_daemon_protocol::DAEMON_SHUTDOWN_METHOD,
     })
     .to_string();
     assert!(super::super::is_reserved_control_request(&status_request));
@@ -235,13 +235,13 @@ fn mcp_discovery_requests_are_reserved_control_traffic() {
 fn daemon_shutdown_requires_a_response_id() {
     let notification = serde_json::json!({
         "jsonrpc": "2.0",
-        "method": super::super::DAEMON_SHUTDOWN_METHOD,
+        "method": tracedecay_daemon_protocol::DAEMON_SHUTDOWN_METHOD,
     })
     .to_string();
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 17,
-        "method": super::super::DAEMON_SHUTDOWN_METHOD,
+        "method": tracedecay_daemon_protocol::DAEMON_SHUTDOWN_METHOD,
     })
     .to_string();
 
@@ -267,7 +267,7 @@ async fn authenticated_daemon_shutdown_acks_and_begins_draining() {
     .expect("loopback listener");
     let server = tokio::spawn(async move {
         let stream = listener.accept().await.expect("accept shutdown client");
-        super::super::serve_windows_broker_client(
+        Box::pin(super::super::serve_windows_broker_client(
             stream,
             TOKEN,
             &server_lifecycle,
@@ -276,7 +276,7 @@ async fn authenticated_daemon_shutdown_acks_and_begins_draining() {
                 super::super::ProjectOpenGates::default(),
             )),
             None,
-        )
+        ))
         .await
         .expect("serve shutdown client");
     });
@@ -314,7 +314,7 @@ async fn authenticated_daemon_shutdown_acks_and_begins_draining() {
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": 23,
-                    "method": super::super::DAEMON_SHUTDOWN_METHOD,
+                    "method": tracedecay_daemon_protocol::DAEMON_SHUTDOWN_METHOD,
                 })
             )
             .as_bytes(),
@@ -516,7 +516,7 @@ async fn reserved_doctor_request_answers_under_general_saturation() {
     let server = tokio::spawn(async move {
         let stream = listener.accept().await.expect("accept Doctor client");
         let lifecycle = DaemonLifecycle::default();
-        super::super::serve_windows_broker_client_with_class(
+        Box::pin(super::super::serve_windows_broker_client_with_class(
             stream,
             TOKEN,
             &lifecycle,
@@ -527,7 +527,7 @@ async fn reserved_doctor_request_answers_under_general_saturation() {
             super::super::DaemonPerClientAdmission::default(),
             reserved.class(),
             None,
-        )
+        ))
         .await
         .expect("serve Doctor client");
     });
@@ -632,7 +632,7 @@ async fn tools_list_answers_under_general_saturation() {
     let server = tokio::spawn(async move {
         let stream = listener.accept().await.expect("accept discovery client");
         let lifecycle = DaemonLifecycle::default();
-        super::super::serve_windows_broker_client_with_class(
+        Box::pin(super::super::serve_windows_broker_client_with_class(
             stream,
             TOKEN,
             &lifecycle,
@@ -643,7 +643,7 @@ async fn tools_list_answers_under_general_saturation() {
             super::super::DaemonPerClientAdmission::default(),
             reserved.class(),
             None,
-        )
+        ))
         .await
         .expect("serve discovery client");
     });
@@ -801,8 +801,9 @@ async fn portable_broker_requests_reuse_one_authenticated_project_owner() {
         super::super::DatabaseOwnerRegistry::default(),
     ));
     prepare_test_profile_root(&profile_root);
-    let profile_identity = crate::daemon::profile_identity::load_or_create(&profile_root)
-        .expect("load test profile identity");
+    let profile_identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+            .expect("load test profile identity");
     let store_administration = StoreAdministration::with_project_servers(Arc::clone(&owners))
         .with_profile_identity(profile_identity);
     // Daemon bootstrap installs the profile-scoped code-index worker plan

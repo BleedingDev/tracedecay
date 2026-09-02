@@ -2,13 +2,13 @@ use std::io::Write;
 
 use tempfile::TempDir;
 use tracedecay::host_admission::HostAdmissionTestRuntimeV1;
-use tracedecay::storage::PrivateStoreIo;
 use tracedecay_domain::{
     ProviderUsageCounterSemanticsV1, ProviderUsageCountersV1, ProviderUsageModelV1,
     ProviderUsageScopeV1,
 };
 #[cfg(all(unix, not(target_os = "macos")))]
 use tracedecay_global_db::ParseOffset;
+use tracedecay_runtime_core::storage::PrivateStoreIo;
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::runtime::SessionProvider;
 use tracedecay_sessions::runtime::claude::ClaudeSource;
@@ -1725,12 +1725,14 @@ async fn claude_observation_path_conflicting_redelivery_does_not_overwrite() {
         .search_session_messages("claude", None, "fixed", 10)
         .await;
     assert_eq!(original.len(), 1);
-    assert_eq!(original[0].message.message_id, "msg_claude_1");
+    // Claude projection identity is the transcript record uuid, not the API
+    // message.id (which repeats across streamed rows of one API response).
+    assert_eq!(original[0].message.message_id, "u2");
     let original_text = original[0].message.text.clone();
     drop(db);
 
-    // Same parser-evidenced message.id with different content is a conflicting
-    // V1 output identity. The observation itself has a distinct byte range, but
+    // Same record uuid with different content is a conflicting V1 output
+    // identity. The observation itself has a distinct byte range, but
     // projection must fail closed and preserve the first durable message row.
     let conflicting = serde_json::json!({
         "type": "assistant",
@@ -1760,7 +1762,7 @@ async fn claude_observation_path_conflicting_redelivery_does_not_overwrite() {
         .search_session_messages("claude", None, "fixed", 10)
         .await;
     assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].message.message_id, "msg_claude_1");
+    assert_eq!(replayed[0].message.message_id, "u2");
     assert_eq!(replayed[0].message.text, original_text);
     assert!(
         again

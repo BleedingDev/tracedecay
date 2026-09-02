@@ -20,24 +20,24 @@ use tracedecay_domain::{
     ActorId, ManifestDigest, ProjectId, RefId, RepositoryId, SessionId,
     SessionRefreshOperationIdV1, UserProfileId, UtcMicros, WorktreeId, canonical_sha256,
 };
+use tracedecay_session_memory::context::{BranchId, ProfileId, SessionRootId, SessionStoreId};
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_store::{
     SessionRefreshReceiptRequestV1, SessionRefreshStore, SessionRefreshTerminalStateV1,
 };
-use tracedecay_usecases::context::{SessionRootId, SessionStoreId};
 
 use super::{DirectRetainedSessionPortV1, ProjectRetainedSessionAuthoritiesV1};
 use crate::daemon::StoreOwnerKey;
 use crate::daemon::retained_owner::session_refresh::admitted_session_refresh_command;
-use crate::daemon::session_retrieval::{
-    DaemonSessionRetrievalRoot, DaemonSessionRetrievalService, SessionApplicationRetrievalPortV1,
-};
-use crate::daemon::session_temporal_refresh_scheduler::SessionTemporalRefreshSchedulerRegistry;
 use crate::host_admission::HostAdmissionTestRuntimeV1;
 use crate::mcp::server::{DaemonSessionRefreshService, DaemonWorkflowIndexReadService};
-use crate::mcp::tools::{SessionRefreshServiceOutcome, SessionRefreshServicePort};
-use crate::store::GlobalDbSessionTemporalStore;
 use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
+use tracedecay_session_memory::session::{SessionRefreshServiceOutcome, SessionRefreshServicePort};
+use tracedecay_session_runtime::session_retrieval::{
+    DaemonSessionRetrievalRoot, DaemonSessionRetrievalService, SessionApplicationRetrievalPortV1,
+};
+use tracedecay_session_runtime::session_temporal_refresh_scheduler::SessionTemporalRefreshSchedulerRegistry;
+use tracedecay_session_temporal_store::GlobalDbSessionTemporalStore;
 
 const DIGEST: &str = "sha256:6161616161616161616161616161616161616161616161616161616161616161";
 const BRANCH_ID: &str = "branch.project.test";
@@ -81,9 +81,15 @@ impl RetiredRefreshFixture {
         registry.retire_project(&owner).await;
 
         let retrieval_root = DaemonSessionRetrievalRoot::project_identity_for_test(
+            ProfileId::new(database.binding().shard_id.profile_id.as_str().to_owned())
+                .expect("profile id"),
+            SessionStoreId::new(format!("store.refresh-{label}")).expect("session store id"),
+            SessionRootId::new(format!("root.refresh-{label}")).expect("session root id"),
+            database.binding().shard_id.clone(),
             project_id.clone(),
             repository_id.clone(),
             worktree_id.clone(),
+            BranchId::new(format!("branch.refresh-{label}")).expect("branch id"),
             project_root.display().to_string(),
         );
         let identity = retrieval_root.identity().clone();
@@ -100,7 +106,7 @@ impl RetiredRefreshFixture {
         .expect("project retrieval service");
         let refresh = Arc::new(DaemonSessionRefreshService::new(
             database.clone(),
-            wake,
+            Arc::new(wake),
             Some(project_id.as_str().to_owned()),
         ));
         let workflow_index = Arc::new(DaemonWorkflowIndexReadService::new(database.clone()));

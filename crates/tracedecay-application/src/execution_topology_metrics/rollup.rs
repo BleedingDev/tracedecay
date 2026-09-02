@@ -202,6 +202,7 @@ impl ExecutionTopologyRollupFragmentV1 {
     }
 
     #[must_use]
+    #[hotpath::skip]
     pub const fn observed_at_micros(&self) -> i64 {
         self.observed_at_micros
     }

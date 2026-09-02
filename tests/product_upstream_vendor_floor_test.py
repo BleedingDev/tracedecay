@@ -15,7 +15,7 @@ REPO = Path(__file__).resolve().parents[1]
 CHECKER = REPO / "scripts/product/check-upstream-vendor-floor.py"
 CHECKED_POLICY = REPO / "product/upstream/sync-policy.json"
 CHECKED_METADATA = REPO / "product/upstream/tracedecay-v2-pr707.json"
-EXPECTED_FLOOR = "08fbe33a7c7f403191fd5d6e356c7b6681b96403"
+EXPECTED_FLOOR = "5749e4fcfe268e17bd19a0e6ef90c646f7b37289"
 
 
 class VendorFloorPreflightTest(unittest.TestCase):
