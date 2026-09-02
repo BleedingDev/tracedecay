@@ -164,6 +164,7 @@ def base_policy() -> dict[str, Any]:
         "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs",
         "crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs",
         "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs",
+        "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs",
     ]
     return {
         "schema_version": 1,

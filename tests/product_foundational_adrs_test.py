@@ -102,7 +102,10 @@ class FoundationalAdrsTest(unittest.TestCase):
         self.assertTrue(receipt["ok"])
         self.assertEqual(receipt["bead_id"], "tdmem-0106")
         self.assertEqual(receipt["status"], "accepted")
-        self.assertEqual(receipt["decision_count"], 9)
+        # The foundational set grows as the program takes new decisions
+        # (ADR-0010 parity projection, ADR-0011 patch-footprint v2, ADR-0012
+        # configuration-registry exception). The floor is what matters.
+        self.assertGreaterEqual(receipt["decision_count"], 9)
         self.assertGreaterEqual(receipt["verification_bead_count"], 30)
         self.assertEqual(receipt["ncm_topology_state"], "selected")
         self.assertEqual(receipt["ncm_production_admission"], "blocked")

@@ -50,6 +50,20 @@ REQUIRED_DEFERRED = {
     "active_multi_provider_blending": "not_authorized",
 }
 
+# The nine decisions the M0 go/no-go was originally signed off against. Later
+# ADRs may be added freely; none of these may disappear.
+REQUIRED_FOUNDATIONAL_ADRS = {
+    "ADR-0001",
+    "ADR-0002",
+    "ADR-0003",
+    "ADR-0004",
+    "ADR-0005",
+    "ADR-0006",
+    "ADR-0007",
+    "ADR-0008",
+    "ADR-0009",
+}
+
 REQUIRED_HARD_GATES = {
     "no_contract_bypass",
     "no_native_cutover_without_parity",
@@ -271,12 +285,27 @@ def validate_evidence(repo: Path, document: dict[str, Any], errors: list[str]) -
         "foundational ADR manifest",
         errors,
     )
-    # ADR-0009 (ncm_execution_topology, "Run each NCM exact scope in a
-    # supervised isolated local process") was added in commit 35e5e5fb2
-    # ("docs(memory): select isolated NCM topology"), bringing the
-    # foundational decision count from eight to nine.
-    if adrs.get("status") != "accepted" or len(adrs.get("decisions", [])) != 9:
-        errors.append("foundational ADR manifest must contain nine accepted decisions")
+    # The M0 gate cares that the foundational decisions are all accepted and
+    # that none of the originally required ones has been dropped — not that the
+    # count is frozen. The set grows as the program takes new decisions:
+    # ADR-0009 selected the isolated NCM topology, ADR-0010 fixed the Native
+    # parity projection, ADR-0011 revised the patch-footprint budget, and
+    # ADR-0012 authorized the additive configuration-registry exception.
+    # Pinning an exact count only forced an edit to this gate each time.
+    decisions = adrs.get("decisions", [])
+    if adrs.get("status") != "accepted":
+        errors.append("foundational ADR manifest must be accepted")
+    if not isinstance(decisions, list) or len(decisions) < 9:
+        errors.append(
+            "foundational ADR manifest must contain at least nine accepted decisions"
+        )
+    else:
+        declared = {row.get("id") for row in decisions if isinstance(row, dict)}
+        missing = sorted(REQUIRED_FOUNDATIONAL_ADRS - declared)
+        if missing:
+            errors.append(
+                f"foundational ADR manifest is missing required decisions: {missing}"
+            )
     try:
         topology = next(
             row for row in adrs["decisions"] if row.get("id") == "ADR-0004"

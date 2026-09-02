@@ -767,7 +767,8 @@
         "crates/tracedecay-global-db/src/configuration/store.rs"
       ],
       "touch_points": [
-        "configuration_registry_mount"
+        "configuration_registry_mount",
+        "exception"
       ],
       "bead_ids": [
         "tdmem-0607"
@@ -1000,7 +1001,7 @@
         "tdmem-0601",
         "tdmem-0607"
       ],
-      "line_budget": 630,
+      "line_budget": 560,
       "rebase_or_removal_plan": "Decompose the oversized module below the hard per-file cap, then remove the local contract if upstream adopts an equivalent typed recall port.",
       "status": "active",
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",
@@ -1643,7 +1644,7 @@
         "tdmem-0402",
         "tdmem-0607"
       ],
-      "line_budget": 40,
+      "line_budget": 62,
       "rebase_or_removal_plan": "Re-apply two additive registrations onto the upstream settings vector; remove them entirely if upstream gains a settings-extension seam a product crate can use.",
       "status": "active",
       "last_verified_upstream_sha": "08fbe33a7c7f403191fd5d6e356c7b6681b96403",

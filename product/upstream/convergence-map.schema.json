@@ -298,6 +298,48 @@
         }
       }
     },
+    "exception": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "zone",
+        "adr",
+        "why_unavoidable",
+        "alternatives_rejected",
+        "policy_revision",
+        "rollback_plan"
+      ],
+      "properties": {
+        "zone": {
+          "type": "string",
+          "minLength": 1
+        },
+        "adr": {
+          "$ref": "#/$defs/exact_path"
+        },
+        "why_unavoidable": {
+          "type": "string",
+          "minLength": 20
+        },
+        "alternatives_rejected": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 20
+          }
+        },
+        "policy_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rollback_plan": {
+          "type": "string",
+          "minLength": 20
+        }
+      }
+    },
     "entry": {
       "type": "object",
       "additionalProperties": false,
@@ -381,6 +423,9 @@
         },
         "generated": {
           "$ref": "#/$defs/generated"
+        },
+        "exception": {
+          "$ref": "#/$defs/exception"
         }
       }
     }

@@ -74,6 +74,7 @@ BEAD_RE = re.compile(r"^tdmem-[0-9]{4}$")
 AREA_ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 FEATURE_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 REPOSITORY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+ADR_PATH_RE = re.compile(r"^product/architecture/adr/ADR-[0-9]{4}-[a-z0-9-]+\.md$")
 GLOB_CHARS = frozenset("*?[")
 MAX_DIAGNOSTIC_ERRORS = 100
 
@@ -129,7 +130,20 @@ ENTRY_REQUIRED_FIELDS = {
     "last_verified_upstream_sha",
     "upstreamability",
 }
-ENTRY_OPTIONAL_FIELDS = {"generated"}
+ENTRY_OPTIONAL_FIELDS = {"generated", "exception"}
+# An entry inside a forbidden exception zone carries its ADR evidence instead
+# of a normal touch point. The patch-footprint checker owns the evidence
+# contract; this registry only has to agree that "exception" is a legal touch
+# point so the two gates classify the same file the same way.
+EXCEPTION_TOUCH_POINT = "exception"
+EXCEPTION_FIELDS = {
+    "zone",
+    "adr",
+    "why_unavoidable",
+    "alternatives_rejected",
+    "policy_revision",
+    "rollback_plan",
+}
 GENERATED_FIELDS = {"generator_path", "reproduction", "zero_drift_check"}
 ENTRY_CONTRACT_FIELDS = {
     "rules",
@@ -269,6 +283,47 @@ def substantive_prose(value: Any, label: str, errors: list[str]) -> str:
     ):
         errors.append(f"{label} must contain substantive prose")
     return text
+
+
+def validate_exception_evidence(
+    repo: Path, value: Any, entry_label: str, errors: list[str]
+) -> None:
+    """Require the ADR evidence that authorizes a forbidden-zone entry.
+
+    The patch-footprint checker enforces the same field set against the same
+    object.  Duplicating the requirement here keeps the two gates from
+    disagreeing about whether a zone file is authorized.
+    """
+    label = f"{entry_label}.exception"
+    exception = validate_closed_object(value, label, EXCEPTION_FIELDS, errors)
+    if exception is None:
+        return
+    canonical_string(exception.get("zone"), f"{label}.zone", errors)
+    adr = canonical_string(exception.get("adr"), f"{label}.adr", errors)
+    if adr and not ADR_PATH_RE.fullmatch(adr):
+        errors.append(f"{label}.adr must reference a product ADR document")
+    elif adr and not resolve(repo, Path(adr)).is_file():
+        errors.append(f"{label}.adr references a missing ADR document")
+    canonical_string(
+        exception.get("policy_revision"), f"{label}.policy_revision", errors
+    )
+    substantive_prose(
+        exception.get("why_unavoidable"), f"{label}.why_unavoidable", errors
+    )
+    substantive_prose(exception.get("rollback_plan"), f"{label}.rollback_plan", errors)
+    rejected = string_list(
+        exception.get("alternatives_rejected"),
+        f"{label}.alternatives_rejected",
+        errors,
+    )
+    if len(rejected) < 2:
+        errors.append(
+            f"{label}.alternatives_rejected must record at least two rejected alternatives"
+        )
+    for offset, alternative in enumerate(rejected):
+        substantive_prose(
+            alternative, f"{label}.alternatives_rejected[{offset}]", errors
+        )
 
 
 def string_list(
@@ -528,6 +583,7 @@ def validate_schema_definition(schema: dict[str, Any], errors: list[str]) -> Non
         "upstreamability",
         "area",
         "generated",
+        "exception",
         "entry",
     }
     if type(definitions) is not dict or set(definitions) != expected_definitions:
@@ -557,6 +613,7 @@ def validate_schema_definition(schema: dict[str, Any], errors: list[str]) -> Non
     require_closed_schema_object("upstreamability", UPSTREAMABILITY_FIELDS)
     require_closed_schema_object("area", AREA_FIELDS)
     require_closed_schema_object("generated", GENERATED_FIELDS)
+    require_closed_schema_object("exception", EXCEPTION_FIELDS)
     require_closed_schema_object(
         "entry", ENTRY_REQUIRED_FIELDS, ENTRY_REQUIRED_FIELDS | ENTRY_OPTIONAL_FIELDS
     )
@@ -811,7 +868,49 @@ def index_touch_points(
             errors.append(f"patch policy contains duplicate touch point {touch_id!r}")
         elif touch_id:
             touches[touch_id] = paths
+    if EXCEPTION_TOUCH_POINT in touches:
+        errors.append(
+            f"patch policy must not declare a touch point named {EXCEPTION_TOUCH_POINT!r}"
+        )
+    else:
+        zone_paths = forbidden_exception_zone_paths(policy, errors)
+        if zone_paths:
+            touches[EXCEPTION_TOUCH_POINT] = zone_paths
     return touches
+
+
+def forbidden_exception_zone_paths(
+    policy: dict[str, Any], errors: list[str]
+) -> list[str]:
+    """Collect the paths of every forbidden exception zone in the patch policy.
+
+    These bound where an ADR-backed exception entry may live.  The zones stay
+    forbidden by default; an entry inside one is legal only when it carries the
+    evidence object the patch-footprint checker also demands.
+    """
+    rows = policy.get("exception_zones")
+    if rows is None:
+        # The patch-footprint checker owns this field; a policy without zones
+        # simply authorizes no exception entries here.
+        return []
+    if type(rows) is not list:
+        errors.append("patch policy.exception_zones must be an array")
+        return []
+    paths: list[str] = []
+    for offset, raw in enumerate(rows):
+        if type(raw) is not dict:
+            errors.append(f"patch policy.exception_zones[{offset}] must be an object")
+            continue
+        if raw.get("default_policy") != "forbidden":
+            continue
+        paths.extend(
+            string_list(
+                raw.get("paths"),
+                f"patch policy.exception_zones[{offset}].paths",
+                errors,
+            )
+        )
+    return paths
 
 
 def index_administrative_exclusions(
@@ -1051,23 +1150,51 @@ def validate_entries(
         touch_point = canonical_string(
             entry.get("touch_point"), f"{label}.touch_point", errors
         )
-        if touch_point not in touches:
-            errors.append(f"{label}.touch_point references unknown policy touch point")
-        if area is not None and touch_point not in area.get("touch_points", []):
-            errors.append(f"{label}.touch_point is not declared by its area")
-        matching_touches = [
-            touch_id
-            for touch_id, patterns in touches.items()
-            if path and any(path_matches(path, pattern) for pattern in patterns)
-        ]
-        if len(matching_touches) != 1:
-            errors.append(
-                f"{label}.path must resolve to exactly one policy touch point; matched {matching_touches!r}"
-            )
-        elif matching_touches[0] != touch_point:
-            errors.append(
-                f"{label}.touch_point does not authorize exact path {path!r}"
-            )
+        if touch_point == EXCEPTION_TOUCH_POINT:
+            # Exception-zone files sit outside every touch point by
+            # construction: the zone is forbidden, so no touch point may
+            # authorize a path inside it. The ADR evidence object replaces the
+            # touch-point authorization.
+            validate_exception_evidence(repo, entry.get("exception"), label, errors)
+            if area is not None and EXCEPTION_TOUCH_POINT not in area.get(
+                "touch_points", []
+            ):
+                errors.append(
+                    f"{label}.touch_point is not declared by its area"
+                )
+            zone_paths = touches.get(EXCEPTION_TOUCH_POINT, [])
+            if not path or not any(
+                path_matches(path, pattern) for pattern in zone_paths
+            ):
+                errors.append(
+                    f"{label}.path is not inside a forbidden exception zone"
+                )
+        else:
+            if entry.get("exception") is not None:
+                errors.append(
+                    f"{label}.exception is only allowed on an exception touch point"
+                )
+            if touch_point not in touches:
+                errors.append(
+                    f"{label}.touch_point references unknown policy touch point"
+                )
+            if area is not None and touch_point not in area.get("touch_points", []):
+                errors.append(f"{label}.touch_point is not declared by its area")
+            matching_touches = [
+                touch_id
+                for touch_id, patterns in touches.items()
+                if touch_id != EXCEPTION_TOUCH_POINT
+                and path
+                and any(path_matches(path, pattern) for pattern in patterns)
+            ]
+            if len(matching_touches) != 1:
+                errors.append(
+                    f"{label}.path must resolve to exactly one policy touch point; matched {matching_touches!r}"
+                )
+            elif matching_touches[0] != touch_point:
+                errors.append(
+                    f"{label}.touch_point does not authorize exact path {path!r}"
+                )
         if path and any(path_matches(path, pattern) for pattern in product_patterns):
             errors.append(f"{label}.path is product-owned and cannot be an upstream entry")
         substantive_prose(entry.get("rationale"), f"{label}.rationale", errors)
