@@ -736,6 +736,7 @@
         "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
         "crates/tracedecay-daemon-service/src/invocation/types.rs",
         "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/types_tests.rs",
         "crates/tracedecay/src/daemon/invocation_tests/lsp_lease_tests.rs",
         "crates/tracedecay/src/daemon/invocation_tests/lsp_tests.rs",
         "crates/tracedecay/src/daemon/invocation_tests/project_lifecycle_tests.rs"
@@ -752,12 +753,14 @@
       "semantic_invariants": [
         "Upstream behavior: daemon shutdown preserves lifecycle ordering and always completes terminal teardown after reporting the observed outcome.",
         "Product behavior: one caller-supplied absolute deadline bounds every nested shutdown and blocking-drain step without refresh.",
-        "The call chain's own unit tests assert the shutdown fence through an observable effect of begin_shutdown - LSP admission closing - under a bounded wait, never through a fixed number of scheduler yields or a lock-contention probe, so the fence assertion is literal rather than probabilistic."
+        "The call chain's own unit tests assert the shutdown fence through an observable effect of begin_shutdown - LSP admission closing - under a bounded wait, never through a fixed number of scheduler yields or a lock-contention probe, so the fence assertion is literal rather than probabilistic.",
+        "A superseded hook receipt terminal is never emitted while work it reports remains in flight; if the shared abort deadline expires, the runtime retains truthful ownership or suppresses that terminal until settlement."
       ],
       "tests": [
         "cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification",
         "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline",
-        "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::lsp_lease_tests::state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep"
+        "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::lsp_lease_tests::state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep",
+        "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::types_tests::superseded_blocking_work_is_joined_before_its_receipt_terminal"
       ],
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
@@ -1652,14 +1655,16 @@
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "daemon_shutdown_deadline",
-      "rationale": "LspLeaseTaskRegistry::shutdown takes every lease task out of the registry before it joins them one at a time, so the caller cannot bound that join from outside: a timeout there drops the future holding the taken tasks, and a dropped JoinHandle detaches its task instead of aborting it. The deadline therefore has to reach the registry, which owns the handles. shutdown now accepts the caller's absolute deadline and is the last file in the shutdown call chain that still minted an unbounded wait.",
+      "rationale": "LspLeaseTaskRegistry::shutdown takes every lease task out of the registry before it joins them one at a time, so the caller cannot bound that join from outside: a timeout there drops the future holding the taken tasks, and a dropped JoinHandle detaches its task instead of aborting it. The deadline therefore has to reach the registry, which owns the handles. shutdown now accepts the caller's absolute deadline and is the last file in the shutdown call chain that still minted an unbounded wait. The same file's BoundedHookOrchestratorV1::admit dropped the superseded work future before emitting its receipt terminal, which detaches nested blocking work for the same reason a dropped JoinHandle does, so the supersession path now joins that future under the shared abort deadline.",
       "semantic_invariants": [
         "Upstream behavior: shutdown still closes admission first, retires every registered lease task, and returns the observed outcome; generation matching, the weak-registry finish path, and Drop-time abort are unchanged.",
         "Product behavior: shutdown consumes the caller's absolute deadline and mints no budget of its own.",
         "Product behavior: every captured task is cancelled before the first join, so one task that outlives its own join cannot leave its successors running uncancelled.",
         "Product behavior: a task still unfinished at the deadline is aborted before the registry releases its handle, rather than merely dropped: dropping a JoinHandle detaches the task instead of stopping it.",
         "Product behavior: the guarantee abort buys is bounded and stated as such. Tokio abort is cooperative, so a task already executing inside its own poll — a lease body blocking a worker thread, for instance — keeps running until it reaches a suspension point, and it may still run that far after shutdown has returned. What is guaranteed is that an aborted task never resumes past that suspension point, so no lease effect sequenced after an await can execute once shutdown has abandoned the join.",
-        "Product behavior: an unfinished, aborted, or panicked join is reported as DaemonInvocationProblem::Unavailable, so an incomplete lease teardown is never hidden behind a successful terminal."
+        "Product behavior: an unfinished, aborted, or panicked join is reported as DaemonInvocationProblem::Unavailable, so an incomplete lease teardown is never hidden behind a successful terminal.",
+        "Product behavior: a superseded hook cycle retains its permit and drives its cancelled work future under TASK_ABORT_DEADLINE; if the work remains unfinished at that deadline, the same bounded owner continues reaping it while holding the permit, so no detached-worker tail can grow and the receipt terminal is emitted only after settlement.",
+        "Upstream behavior: owner-level retirement is unchanged - owner cancellation remains biased, drops the work future immediately, emits no terminal, and does not wait on work whose owner retired; only superseded work is reaped to settlement."
       ],
       "verification": [
         "git diff --check",
@@ -2536,6 +2541,38 @@
       }
     },
     {
+      "path": "crates/tracedecay/src/daemon/invocation_tests/types_tests.rs",
+      "area_id": "shutdown_deadline",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_shutdown_deadline",
+      "rationale": "Exercise the superseded hook-work ownership fix at the daemon invocation composition seam. The regression keeps nested blocking work alive beyond TASK_ABORT_DEADLINE and proves the superseded receipt terminal is withheld until the same future settles, preventing detached work from being reported complete.",
+      "semantic_invariants": [
+        "The test advances virtual time beyond TASK_ABORT_DEADLINE only after observing that the reaper timer is armed, then proves nested work remains unfinished, no superseded receipt terminal was emitted, and the successor has not consumed the retained permit.",
+        "After explicit release, the test observes the superseded receipt terminal under a bounded deadline and proves nested blocking work had settled before that terminal.",
+        "The test uses channels, virtual time, and explicit release signals rather than sleeps, yield loops, or assertions that accept multiple terminal outcomes."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::types_tests::superseded_blocking_work_is_joined_before_its_receipt_terminal"
+      ],
+      "tests": [
+        "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::types_tests::superseded_blocking_work_is_joined_before_its_receipt_terminal"
+      ],
+      "bead_ids": [
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "line_budget": 60,
+      "rebase_or_removal_plan": "Delete this focused regression with the supersession ownership patch when upstream guarantees that hook receipt terminals cannot precede settlement of the work they report.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Preventing a superseded receipt terminal from preceding nested work settlement is a provider-neutral daemon correctness invariant."
+      }
+    },
+    {
       "path": "crates/tracedecay/src/daemon/invocation_tests/lsp_lease_tests.rs",
       "area_id": "shutdown_deadline",
       "owner": "BleedingDev",
@@ -2543,9 +2580,9 @@
       "touch_point": "daemon_shutdown_deadline",
       "rationale": "Make the shutdown-fence test deterministic under bead tdmem-0th. The assertion that a queued LSP open is fenced strictly between begin_shutdown and the endpoint expiry sweep was reached by spinning eight fixed tokio::task::yield_now() calls and then accepting either a finished open or a contended admission lock, so the test could pass without the fence ever having been observed. It now waits, bounded, for the observable effect of begin_shutdown - lsp_admission_open closing - and then for the fenced open to settle, which makes the assertion literal.",
       "semantic_invariants": [
-        "The test proves the fence through an observable effect of begin_shutdown: it waits for lsp_admission_open to close before spawning the racing open, so the open is queued strictly between admission closing and the endpoint expiry sweep the registry guard is holding.",
-        "No fixed yield count, sleep, or lock-contention probe stands in for that observation; every wait is a bounded tokio::time::timeout whose expiry fails the test with the property it was waiting for.",
-        "The settle condition is the open actually finishing, not the admission lock merely being contended, so a run in which the fence never engaged fails instead of passing.",
+        "The test polls the real state-shutdown future once while retaining the endpoint-registry guard, directly asserts that begin_shutdown closed lsp_admission_open, and therefore proves the admission fence precedes the blocked endpoint-expiry sweep.",
+        "The fenced open is awaited under a one-second terminal deadline before the endpoint-registry guard is released; no sleep, yield loop, fixed poll count, or lock-contention proxy is used as synchronization.",
+        "The settle condition is the open actually returning the exact typed Unavailable terminal, followed by zero active sessions, runtimes, and lease tasks.",
         "Production behavior is unchanged: this file is test-only and asserts the existing shutdown ordering rather than altering it."
       ],
       "verification": [

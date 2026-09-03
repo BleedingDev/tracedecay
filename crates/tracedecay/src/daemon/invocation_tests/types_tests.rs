@@ -512,19 +512,25 @@ async fn replayed_admission_after_retryable_failure_completes_a_fresh_cycle() {
     unregister_hook_orchestration_runtime([23; 16], [25; 16], &runtime);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn superseded_blocking_work_is_joined_before_its_receipt_terminal() {
     let (blocking_started, blocking_started_receiver) = tokio::sync::oneshot::channel();
     let blocking_started = Arc::new(std::sync::Mutex::new(Some(blocking_started)));
+    let reap_timer_armed = Arc::new(tokio::sync::Notify::new());
+    let post_deadline_reap = Arc::new(tokio::sync::Notify::new());
     let blocking_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let blocking_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let successor_release = Arc::new(tokio::sync::Notify::new());
     let work_started = Arc::clone(&blocking_started);
+    let work_reap_timer_armed = Arc::clone(&reap_timer_armed);
+    let work_post_deadline_reap = Arc::clone(&post_deadline_reap);
     let work_gate = Arc::clone(&blocking_gate);
     let work_finished = Arc::clone(&blocking_finished);
     let work_successor_release = Arc::clone(&successor_release);
-    let runtime = BoundedHookOrchestratorV1::new(1, move |request, _cancellation| {
+    let runtime = BoundedHookOrchestratorV1::new(1, move |request, cancellation| {
         let started = Arc::clone(&work_started);
+        let reap_timer_armed = Arc::clone(&work_reap_timer_armed);
+        let post_deadline_reap = Arc::clone(&work_post_deadline_reap);
         let gate = Arc::clone(&work_gate);
         let finished = Arc::clone(&work_finished);
         let successor_release = Arc::clone(&work_successor_release);
@@ -549,6 +555,21 @@ async fn superseded_blocking_work_is_joined_before_its_receipt_terminal() {
                     }
                     finished.store(true, std::sync::atomic::Ordering::Release);
                 });
+                cancellation.cancelled().await;
+                reap_timer_armed.notify_one();
+                tokio::time::sleep(TASK_ABORT_DEADLINE + std::time::Duration::from_millis(1)).await;
+                let mut armed = false;
+                std::future::poll_fn(move |context| {
+                    if armed {
+                        post_deadline_reap.notify_one();
+                        std::task::Poll::Ready(())
+                    } else {
+                        armed = true;
+                        context.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
                 let _ = task.await;
             } else {
                 successor_release.notified().await;
@@ -600,20 +621,43 @@ async fn superseded_blocking_work_is_joined_before_its_receipt_terminal() {
         runtime.admit(successor),
         HookOrchestrationAdmissionV1::Enqueued
     );
+    let reap_armed = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        reap_timer_armed.notified(),
+    )
+    .await;
+    tokio::time::advance(TASK_ABORT_DEADLINE + std::time::Duration::from_millis(1)).await;
+    let post_deadline = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        post_deadline_reap.notified(),
+    )
+    .await;
+    let nested_still_running = !blocking_finished.load(std::sync::atomic::Ordering::Acquire);
+    let mut terminal = Box::pin(first_terminal.notified());
+    let terminal_withheld = futures_util::poll!(&mut terminal).is_pending();
+
+    tokio::time::resume();
     let (released, changed) = &*blocking_gate;
     *released
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
     changed.notify_all();
-    let terminal = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        first_terminal.notified(),
-    )
-    .await;
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), &mut terminal).await;
     successor_release.notify_one();
+
+    assert!(
+        reap_armed.is_ok(),
+        "bounded reap must arm its deadline timer"
+    );
+    assert!(
+        post_deadline.is_ok(),
+        "superseded work must remain owned beyond TASK_ABORT_DEADLINE"
+    );
+    assert!(nested_still_running);
+    assert!(terminal_withheld);
     assert!(
         terminal.is_ok(),
-        "the superseded operation must emit its own receipt terminal"
+        "the superseded operation must emit its receipt terminal after settlement"
     );
     assert!(
         nested_finished_at_terminal.load(std::sync::atomic::Ordering::Acquire),

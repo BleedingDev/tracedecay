@@ -583,19 +583,14 @@ async fn state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep() 
     let state = Arc::new(crate::daemon::invocation_state::DaemonInvocationState::default());
     let endpoint_guard = state.lsp_session_registry.lock().await;
     let shutdown_state = Arc::clone(&state);
-    let shutdown = tokio::spawn(async move {
+    let mut shutdown = Box::pin(async move {
         shutdown_state.shutdown().await;
     });
     // Deterministic: begin_shutdown closes LSP admission before the endpoint
     // expiry sweep that this test's registry guard is blocking, so once the
     // gate reads closed the open spawned below is queued strictly between them.
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while *state.service.lsp_admission_open.lock().await {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("shutdown must close LSP admission before the endpoint expiry sweep");
+    assert!(futures_util::poll!(&mut shutdown).is_pending());
+    assert!(!*state.service.lsp_admission_open.lock().await);
 
     let open_state = Arc::clone(&state);
     let (open_started, started) = tokio::sync::oneshot::channel();
@@ -620,20 +615,13 @@ async fn state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep() 
             .await
     });
     started.await.expect("racing open started");
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            if open.is_finished() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        open.await.expect("racing LSP open")
     })
     .await
     .expect("the fenced open must settle before the endpoint expiry sweep");
     drop(endpoint_guard);
-
-    let response = open.await.expect("racing LSP open");
-    shutdown.await.expect("daemon invocation state shutdown");
+    shutdown.await;
 
     assert!(matches!(
         response.outcome,

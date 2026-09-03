@@ -338,10 +338,25 @@ impl BoundedHookOrchestratorV1 {
                 Some(HookOrchestrationWorkOutcomeV1::Completed) => true,
                 Some(HookOrchestrationWorkOutcomeV1::RetryableFailure) => false,
                 None => {
-                    drop(work_future);
-                    operation
+                    let superseded = operation
                         .superseded
-                        .load(std::sync::atomic::Ordering::Acquire)
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    // Keep the permit while reaping past the abort deadline; only
+                    // owner retirement may drop the future without a terminal.
+                    superseded
+                        && tokio::select! {
+                            biased;
+                            () = cancellation.cancelled() => false,
+                            _ = async {
+                                if tokio::time::timeout(
+                                    crate::TASK_ABORT_DEADLINE,
+                                    &mut work_future,
+                                ).await.is_err()
+                                {
+                                    (&mut work_future).await;
+                                }
+                            } => true,
+                        }
                 }
             };
             Self::settle_operation(&in_flight, &address, &operation, emit_terminal);
