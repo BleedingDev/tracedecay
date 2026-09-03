@@ -122,11 +122,18 @@ NATIVE_PROVIDER_PARITY_TESTS_FILE = Path(
 NATIVE_BASELINE_TESTS_FILE = Path(
     "crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs"
 )
+# The Native application port's own provider-local staging store.  It is root
+# owned and feature gated exactly like the port it serves, and it names the
+# registry only for the scope and error types the port hands it.
+NATIVE_STAGED_OBSERVATIONS_FILE = Path(
+    "crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs"
+)
 NATIVE_ADAPTER_FILES = (
     NATIVE_PROVIDER_FILE,
     NATIVE_PROVIDER_TESTS_FILE,
     NATIVE_PROVIDER_PARITY_TESTS_FILE,
     NATIVE_BASELINE_TESTS_FILE,
+    NATIVE_STAGED_OBSERVATIONS_FILE,
 )
 NATIVE_PROVIDER_MODULE_FILE = Path("crates/tracedecay/src/daemon/retained_owner.rs")
 NATIVE_PROVIDER_MODULE_DECLARATION = (
@@ -148,6 +155,10 @@ NATIVE_PROVIDER_PARITY_TESTS_MODULE_DECLARATION = (
     '#[path = "retained_owner/native_provider_parity_tests.rs"]\n'
     "mod native_provider_parity_tests;"
 )
+NATIVE_STAGED_OBSERVATIONS_MODULE_DECLARATION = (
+    f'#[cfg(feature = "{FEATURE}")]\n'
+    "pub(crate) mod native_staged_observations;"
+)
 NATIVE_ADAPTER_CONSTRAINTS = {
     NATIVE_PROVIDER_FILE: (
         (NATIVE_PROVIDER_MODULE_FILE, NATIVE_PROVIDER_MODULE_DECLARATION),
@@ -165,6 +176,12 @@ NATIVE_ADAPTER_CONSTRAINTS = {
     NATIVE_BASELINE_TESTS_FILE: (
         (NATIVE_PROVIDER_MODULE_FILE, NATIVE_PROVIDER_MODULE_DECLARATION),
         (NATIVE_PROVIDER_FILE, NATIVE_BASELINE_TESTS_MODULE_DECLARATION),
+    ),
+    NATIVE_STAGED_OBSERVATIONS_FILE: (
+        (
+            NATIVE_PROVIDER_MODULE_FILE,
+            NATIVE_STAGED_OBSERVATIONS_MODULE_DECLARATION,
+        ),
     ),
 }
 # The two exact production consumers of the provider boundary: the mounted
@@ -282,7 +299,7 @@ STATEMENT_BOUNDARY = ";{}"
 # stay *forbidden* below (see `check_composition_mount` and the root-source
 # scan), which is the stronger invariant the removal leaves behind.
 COMPOSITION_GATING_FRAGMENTS = (
-    f'#[cfg(feature = "{FEATURE}")]\nfn mount_project_memory_provider_host(',
+    f'#[cfg(feature = "{FEATURE}")]\nasync fn mount_project_memory_provider_host(',
 )
 # The four-way resolution table, checked inside the resolver body: disabled
 # stays disabled, a routing gate while disabled is a hard error, host-on alone

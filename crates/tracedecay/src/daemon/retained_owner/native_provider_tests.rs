@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,17 +12,21 @@ use tracedecay_application::retained_surfaces::{
 };
 use tracedecay_domain::canonical_text::sha256_hex;
 use tracedecay_domain::{
-    Confidence, FactAssertionId, FactCategoryV1, FactId, FactIdentityMaterialV1,
-    FactIdentitySourceV1, FactLineageEventKindV1, FactLineageEventV1, FactOwnerV1, ProjectId,
-    ProvenanceId, UtcMicros,
+    CanonicalMessageRoleV1, CanonicalObservationEnvelopeV1, CanonicalObservationEvidenceV1,
+    CanonicalObservationFactV1, CanonicalObservationRelationsV1, Confidence, FactAssertionId,
+    FactCategoryV1, FactId, FactIdentityMaterialV1, FactIdentitySourceV1, FactLineageEventKindV1,
+    FactLineageEventV1, FactOwnerV1, ObservationId, ObservationOrderingDomainV1,
+    ObservationSourceRangeV1, ProjectId, ProvenanceId, ProviderId, SessionId, UtcMicros,
 };
 use tracedecay_memory_provider_registry::{
-    CancellationToken, CanonicalPayload, CommittedEffectState, HandshakeRequest,
+    CancellationToken, CanonicalPayload, CommittedEffectState, HandshakeRequest, MemoryProviderV1,
     NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
-    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort, NativeObservation, OBSERVATION_CONTRACT_ID,
-    OperationControl, OwnedExactScope, OwnedProviderId, OwnedVersionedId,
-    PayloadSanitizationReceipt, PayloadSanitizationReceiptParts, ProviderCall, ProviderCallParts,
-    ProviderOperation, ProviderReply, TerminalCode,
+    NATIVE_PROVIDER_ID, NATIVE_STAGED_SESSION_OBSERVATION_KIND,
+    NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID, NativeMemoryApplicationPort, NativeObservation,
+    NativeObservationEnvelope, NativeProvider, OBSERVATION_CONTRACT_ID, OperationControl,
+    OwnedExactScope, OwnedProviderId, OwnedVersionedId, PayloadSanitizationReceipt,
+    PayloadSanitizationReceiptParts, ProviderCall, ProviderCallParts, ProviderOperation,
+    ProviderReply, TerminalCode,
 };
 use tracedecay_session_memory::memory::{
     ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
@@ -362,12 +366,12 @@ async fn read_store_snapshot(
 }
 
 fn observation_for(call: &ProviderCall, canonical_payload: Value) -> NativeObservation<'_> {
-    NativeObservation {
+    NativeObservation::FactPromotion(NativeObservationEnvelope {
         call,
         observation_kind: NATIVE_FACT_PROMOTION_OBSERVATION_KIND.to_owned(),
         payload_contract: NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID.to_owned(),
         canonical_payload,
-    }
+    })
 }
 
 async fn real_project_fixture() -> (
@@ -530,6 +534,22 @@ fn recall_request_value(project_id: &str) -> Value {
     })
 }
 
+/// The one exact coding scope the recall fixtures use. A staged observation
+/// is only recallable under the identical seven fields, so the observe and the
+/// recall call in the round-trip test share this single definition.
+fn recall_exact_scope(project_id: &str) -> OwnedExactScope {
+    OwnedExactScope::new(
+        "profile.native-bridge-recall",
+        project_id,
+        "repo.native-bridge-recall",
+        "worktree.native-bridge-recall",
+        "branch.native-bridge-recall",
+        "agent.native-bridge-recall",
+        SCOPE_DIGEST,
+    )
+    .expect("valid recall exact scope")
+}
+
 fn valid_recall_call(project_id: &str, request: Value) -> ProviderCall {
     let bytes = serde_json::to_vec(&request).expect("recall request bytes");
     ProviderCall::new(ProviderCallParts {
@@ -537,16 +557,7 @@ fn valid_recall_call(project_id: &str, request: Value) -> ProviderCall {
         provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("valid provider id"),
         registration_revision: 1,
         ready_receipt_sha256: "a".repeat(64),
-        exact_scope: OwnedExactScope::new(
-            "profile.native-bridge-recall",
-            project_id,
-            "repo.native-bridge-recall",
-            "worktree.native-bridge-recall",
-            "branch.native-bridge-recall",
-            "agent.native-bridge-recall",
-            SCOPE_DIGEST,
-        )
-        .expect("valid recall exact scope"),
+        exact_scope: recall_exact_scope(project_id),
         request_id: "request.native-bridge-recall".to_owned(),
         operation_id: "operation.native-bridge-recall".to_owned(),
         expected_state_generation: 0,
@@ -812,8 +823,13 @@ async fn native_observe_verifies_real_store_without_writing() {
         "commit": expected_commit.clone(),
     });
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root, test_profile_id())
-        .expect("construct project Native application port");
+    let port = ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        project_root.clone(),
+        test_profile_id(),
+        &test_provider_state_root(&project_root),
+    )
+    .expect("construct project Native application port");
     let call = valid_observation_call(project_id.as_str(), &canonical_payload);
     let reply = port.observe(observation_for(&call, canonical_payload.clone()));
     assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
@@ -880,8 +896,13 @@ async fn native_recall_current_preserves_order_and_projects_native_score_explain
     assert_eq!(expected_scores.len(), expected_facts.len());
 
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root, test_profile_id())
-        .expect("construct project Native application port");
+    let port = ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        project_root.clone(),
+        test_profile_id(),
+        &test_provider_state_root(&project_root),
+    )
+    .expect("construct project Native application port");
     let call = valid_recall_call(
         project_id.as_str(),
         recall_request_value(project_id.as_str()),
@@ -1093,8 +1114,13 @@ async fn native_recall_current_preserves_order_and_projects_native_score_explain
 async fn native_recall_zero_results_returns_success_zero_results_payload() {
     let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root, test_profile_id())
-        .expect("construct project Native application port");
+    let port = ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        project_root.clone(),
+        test_profile_id(),
+        &test_provider_state_root(&project_root),
+    )
+    .expect("construct project Native application port");
     let mut request = recall_request_value(project_id.as_str());
     request["query"] = json!("query-with-no-native-bridge-match");
     let call = valid_recall_call(project_id.as_str(), request);
@@ -1167,8 +1193,13 @@ async fn native_recall_rejects_malformed_unsupported_inputs_without_mutating_sto
     }
 
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root, test_profile_id())
-        .expect("construct project Native application port");
+    let port = ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        project_root.clone(),
+        test_profile_id(),
+        &test_provider_state_root(&project_root),
+    )
+    .expect("construct project Native application port");
     let base = recall_request_value(project_id.as_str());
     let cases = vec![
         (
@@ -1277,8 +1308,13 @@ async fn native_recall_does_not_mutate_authoritative_fact_telemetry_or_history()
     }
 
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root, test_profile_id())
-        .expect("construct project Native application port");
+    let port = ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        project_root.clone(),
+        test_profile_id(),
+        &test_provider_state_root(&project_root),
+    )
+    .expect("construct project Native application port");
     for _ in 0..2 {
         let reply = port.recall(&valid_recall_call(
             project_id.as_str(),
@@ -1320,8 +1356,13 @@ async fn native_recall_for_foreign_project_scope_is_typed_scope_mismatch() {
     let before = read_store_snapshot(&graph, &owner, &fact.fact_id).await;
 
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root, test_profile_id())
-        .expect("construct project Native application port");
+    let port = ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        project_root.clone(),
+        test_profile_id(),
+        &test_provider_state_root(&project_root),
+    )
+    .expect("construct project Native application port");
     let foreign_project_id = format!("{}-foreign", project_id.as_str());
     assert_ne!(foreign_project_id, project_id.as_str());
     let reply = port.recall(&valid_recall_call(
@@ -1346,4 +1387,887 @@ async fn native_recall_for_foreign_project_scope_is_typed_scope_mismatch() {
         after, before,
         "foreign-scope recall changed the owning project's fact"
     );
+}
+
+/// The canonical payload the host settles for one session message: a real
+/// canonical observation envelope, so the identity the staged store's lifetime
+/// exactly-once index is built on (`stable_record_id` plus the envelope
+/// `version`) is the one production actually carries, not a test-shaped stand
+/// in.
+fn session_message_payload(record_id: &str, session_id: &str, text: &str) -> Value {
+    let envelope = CanonicalObservationEnvelopeV1::new(
+        ProviderId::new("claude").expect("canonical provider"),
+        "message",
+        ObservationId::new(record_id).expect("canonical record id"),
+        CanonicalObservationRelationsV1::new(SessionId::new(session_id).expect("session id")),
+        vec![CanonicalObservationFactV1::Message {
+            role: CanonicalMessageRoleV1::Assistant,
+            content: json!({ "text": text }),
+            model: None,
+            timestamp: None,
+        }],
+        CanonicalObservationEvidenceV1::new(
+            ObservationOrderingDomainV1::SnapshotOrder,
+            ObservationSourceRangeV1::new(0, 1).expect("source range"),
+        ),
+    )
+    .expect("canonical observation envelope");
+    serde_json::to_value(envelope).expect("canonical observation payload")
+}
+
+/// One admitted observation delivery in the exact scope the recall fixtures
+/// use, carrying `observation_kind`/`payload_contract` verbatim so a foreign
+/// pairing can be delivered too.
+fn observation_call_for_kind(
+    project_id: &str,
+    observation_kind: &str,
+    payload_contract: &str,
+    canonical_payload: &Value,
+    idempotency_key: &str,
+    operation_id: &str,
+) -> ProviderCall {
+    let envelope = json!({
+        "canonical_payload": canonical_payload,
+        "observation_kind": observation_kind,
+        "payload_contract": payload_contract,
+    });
+    let bytes = serde_json::to_vec(&envelope).expect("observation envelope bytes");
+    ProviderCall::new(ProviderCallParts {
+        operation: ProviderOperation::Observe,
+        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("valid provider id"),
+        registration_revision: 1,
+        ready_receipt_sha256: "a".repeat(64),
+        exact_scope: recall_exact_scope(project_id),
+        request_id: "request.native-bridge-staged".to_owned(),
+        operation_id: operation_id.to_owned(),
+        expected_state_generation: 0,
+        idempotency_key: Some(idempotency_key.to_owned()),
+        control: OperationControl::new(i64::MAX, 10_000, CancellationToken::new()),
+        payload: CanonicalPayload::new(
+            OwnedVersionedId::new(OBSERVATION_CONTRACT_ID).expect("valid observation contract"),
+            bytes.clone(),
+            sha256_hex(&bytes),
+        )
+        .expect("valid observation payload"),
+        required_capabilities: vec![
+            OwnedVersionedId::new(ProviderOperation::Observe.capability_id())
+                .expect("observe capability"),
+        ],
+        extensions: Vec::new(),
+    })
+    .map(admitted)
+    .expect("valid observation call")
+}
+
+fn staged_session_call(
+    project_id: &str,
+    canonical_payload: &Value,
+    idempotency_key: &str,
+    operation_id: &str,
+) -> ProviderCall {
+    observation_call_for_kind(
+        project_id,
+        NATIVE_STAGED_SESSION_OBSERVATION_KIND,
+        NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID,
+        canonical_payload,
+        idempotency_key,
+        operation_id,
+    )
+}
+
+fn staged_observation_for(call: &ProviderCall, canonical_payload: Value) -> NativeObservation<'_> {
+    NativeObservation::StagedSession(NativeObservationEnvelope {
+        call,
+        observation_kind: NATIVE_STAGED_SESSION_OBSERVATION_KIND.to_owned(),
+        payload_contract: NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID.to_owned(),
+        canonical_payload,
+    })
+}
+
+/// Rows in the port's own staged-observation store, read straight from the
+/// file the port created under the host-granted provider-state root. Zero
+/// proves the path under test wrote no staged row at all — not merely that
+/// recall did not return one.
+fn staged_row_count(provider_state_root: &Path) -> i64 {
+    let path = provider_state_root
+        .join("native")
+        .join("staged-observations-v1.sqlite3");
+    let connection = rusqlite::Connection::open(path).expect("staged observation store");
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM tdmem_native_staged_observation_v1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("staged observation row count")
+}
+
+/// The end-to-end slice this bead exists for: an admitted session message is
+/// durably staged before the success is answered, and the same exact coding
+/// scope recalls it as an advisory candidate carrying all seven attested
+/// identity fields and the extracted human message text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staged_session_observation_round_trips_into_an_advisory_recall_candidate() {
+    const MESSAGE: &str = "native bridge staged observation about the recall merge order";
+    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
+    let provider_state_root = test_provider_state_root(&project_root);
+    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
+    let port = ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        project_root.clone(),
+        test_profile_id(),
+        &provider_state_root,
+    )
+    .expect("construct project Native application port");
+
+    let canonical_payload = session_message_payload(
+        "record.native-bridge-staged",
+        "session.native-bridge-staged",
+        MESSAGE,
+    );
+    let call = staged_session_call(
+        project_id.as_str(),
+        &canonical_payload,
+        "idempotency.native-bridge-staged",
+        "operation.native-bridge-staged",
+    );
+    let reply = port.observe(staged_observation_for(&call, canonical_payload.clone()));
+
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+    let effect = reply.terminal.committed_effect();
+    assert_eq!(effect.state(), CommittedEffectState::Committed);
+    assert_eq!(
+        effect.state_generation_before(),
+        Some(call.expected_state_generation)
+    );
+    // Native's declared state generation is a fixed descriptor identity, so a
+    // commit reports it unchanged; the provider-local admission sequence
+    // travels in the committed item reference instead.
+    assert_eq!(
+        effect.state_generation_after(),
+        Some(call.expected_state_generation)
+    );
+    assert_eq!(reply.state_generation, call.expected_state_generation);
+    let committed_refs = effect.committed_item_refs().to_vec();
+    assert_eq!(committed_refs.len(), 1);
+    let provider_reference = committed_refs[0].clone();
+    assert!(
+        provider_reference.starts_with("native-staged-observation-v1:"),
+        "{provider_reference}"
+    );
+    let receipt = effect
+        .provider_receipt_sha256()
+        .expect("committed effect carries the provider receipt")
+        .to_owned();
+    assert!(effect.verification_sha256().is_some());
+    // The success was answered only after the row was durably committed.
+    assert_eq!(staged_row_count(&provider_state_root), 1);
+
+    let mut request = recall_request_value(project_id.as_str());
+    request["query"] = json!("staged observation recall merge");
+    let recall = port.recall(&valid_recall_call(project_id.as_str(), request));
+    assert_eq!(recall.terminal.terminal_code(), TerminalCode::Success);
+    let body = recall_payload(&recall);
+    let candidates = body["candidates"]
+        .as_array()
+        .expect("recall response carries candidates");
+    let staged = candidates
+        .iter()
+        .find(|candidate| candidate["stable_memory_ref"] == json!(provider_reference))
+        .expect("the staged observation is returned as a candidate");
+
+    // Content is the extracted human message text, never the envelope JSON.
+    assert_eq!(staged["content"], json!(MESSAGE));
+    assert_eq!(
+        staged["content_sha256"],
+        json!(sha256_hex(MESSAGE.as_bytes()))
+    );
+    assert_eq!(staged["content_ref"], Value::Null);
+    assert_eq!(staged["memory_class"], json!("session_observation"));
+
+    // All seven attested fields, under the binding that requires every one of
+    // them to be byte-equal to the admitted scope.
+    assert_eq!(
+        staged["exact_scope_identity"],
+        json!({
+            "scope_binding": "exact_coding_scope",
+            "profile_id": "profile.native-bridge-recall",
+            "project_id": project_id.as_str(),
+            "repository_identity": "repo.native-bridge-recall",
+            "worktree_identity": "worktree.native-bridge-recall",
+            "branch_identity": "branch.native-bridge-recall",
+            "agent_session_id": "agent.native-bridge-recall",
+            "resolved_scope_digest": SCOPE_DIGEST,
+        })
+    );
+
+    // Provenance is provider-attested: the staged row, the operation that
+    // committed it, and the host request identity of that delivery — no shape
+    // that host provenance hydration would read as its own evidence.
+    assert_eq!(staged["provenance"]["state"], json!("available"));
+    assert_eq!(
+        staged["provenance"]["origin_refs"],
+        json!([
+            provider_reference,
+            "operation:operation.native-bridge-staged",
+            "request:request.native-bridge-staged",
+        ])
+    );
+    assert_eq!(staged["provenance"]["source_refs"], json!([]));
+    assert_eq!(
+        staged["provenance"]["native_linkage"]["staged_observation"]["receipt"],
+        json!(receipt)
+    );
+    assert_eq!(staged["source_refs"], json!([]));
+    assert_eq!(staged["trace_refs"], json!([]));
+
+    // Deterministic across repeats: the same request answers the same bytes.
+    let mut repeated_request = recall_request_value(project_id.as_str());
+    repeated_request["query"] = json!("staged observation recall merge");
+    let repeated = port.recall(&valid_recall_call(project_id.as_str(), repeated_request));
+    assert_eq!(
+        recall_payload(&repeated)["candidates"],
+        body["candidates"],
+        "staged recall ordering is not reproducible"
+    );
+}
+
+/// The unchanged paths stay unchanged: a settled fact promotion still verifies
+/// against the retained authority and stages nothing, and a contract-known
+/// kind Native does not accept is still refused with `capability_unsupported`
+/// before the port is reached — again staging nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fact_promotion_and_unaccepted_kinds_write_no_staged_row() {
+    let (_temporary, project_root, graph, owner, project_id) = real_project_fixture().await;
+    let provider_state_root = test_provider_state_root(&project_root);
+    let memory = graph
+        .project_memory_application()
+        .await
+        .expect("project memory application");
+    let preflight = memory
+        .preflight_project_memory_fact_add(
+            ProjectMemoryFactAddRequest {
+                content: "Native bridge staged-regression promotion fact".to_owned(),
+                category: FactCategoryV1::Project,
+                source_label: Some("native-bridge-staged-regression".to_owned()),
+                tags: vec!["native".to_owned(), "bridge".to_owned()],
+                entities: vec!["TraceDecay".to_owned()],
+                trust: Some(Confidence::new(0.91).expect("fact trust")),
+                metadata: json!({"fixture": "native-bridge-staged-regression"}),
+            },
+            None,
+        )
+        .expect("preflight project fact");
+    let outcome = memory
+        .add_preflighted_project_memory_fact(
+            preflight,
+            &FactWriteControl::new(Arc::new(|| false), Arc::new(|| true)),
+        )
+        .await
+        .expect("commit project fact");
+    let ProjectMemoryFactAddRequestOutcome::Applied(applied) = outcome else {
+        panic!("regression fixture fact must be applied");
+    };
+    let promoted_fact = match super::memory_mapping::projection(applied.fact())
+        .expect("map stored fact projection")
+    {
+        FactProjectionV1::Available { fact } => fact.as_ref().clone(),
+        FactProjectionV1::Unavailable { .. } => {
+            panic!("regression fixture fact must remain available")
+        }
+    };
+    let promoted_commit = super::memory_mapping::commit_receipt(
+        applied.commit_receipt().expect("add commit receipt"),
+        applied.commit_replayed(),
+    );
+    let fact_id = promoted_fact.fact_id.clone();
+    drop(applied);
+    drop(memory);
+    let before = read_store_snapshot(&graph, &owner, &fact_id).await;
+
+    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
+    let port = Arc::new(
+        ProjectNativeMemoryApplicationPort::new(
+            graph_cell,
+            project_root.clone(),
+            test_profile_id(),
+            &provider_state_root,
+        )
+        .expect("construct project Native application port"),
+    );
+
+    let canonical_payload = json!({
+        "kind": "settled_native_fact_write",
+        "fact": promoted_fact.clone(),
+        "commit": promoted_commit.clone(),
+    });
+    let promotion_call = observation_call_for_kind(
+        project_id.as_str(),
+        NATIVE_FACT_PROMOTION_OBSERVATION_KIND,
+        NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
+        &canonical_payload,
+        "idempotency.native-bridge-promotion",
+        "operation.native-bridge-promotion",
+    );
+    let promotion = port.observe(observation_for(&promotion_call, canonical_payload));
+    assert_eq!(promotion.terminal.terminal_code(), TerminalCode::Success);
+    // Verification only: no provider-local effect, and no staged row.
+    assert_eq!(
+        promotion.terminal.committed_effect().state(),
+        CommittedEffectState::None
+    );
+    assert_eq!(staged_row_count(&provider_state_root), 0);
+    assert_eq!(
+        read_store_snapshot(&graph, &owner, &fact_id).await,
+        before,
+        "fact promotion verification mutated the authoritative fact"
+    );
+
+    // A contract-known kind Native does not accept is refused by the adapter
+    // itself, so the port is never asked and nothing is staged.
+    let provider = NativeProvider::new(port.clone() as Arc<dyn NativeMemoryApplicationPort>)
+        .expect("construct Native provider adapter");
+    let unsupported = observation_call_for_kind(
+        project_id.as_str(),
+        "source.edit_settled.v1",
+        "tracedecay.memory.observation.source-edit.v1",
+        &json!({"kind": "source_edit"}),
+        "idempotency.native-bridge-unsupported",
+        "operation.native-bridge-unsupported",
+    );
+    let refused = provider.invoke(&unsupported);
+    assert_eq!(
+        refused.terminal.terminal_code(),
+        TerminalCode::CapabilityUnsupported
+    );
+    assert_eq!(
+        refused.terminal.diagnostic_id(),
+        Some("native.observation_unsupported")
+    );
+    assert_eq!(staged_row_count(&provider_state_root), 0);
+}
+
+/// Durability before success, measured at the port and nowhere else.
+///
+/// A fault injected between the staged insert and its commit leaves no row and
+/// answers no committed effect, and the terminal answered instead is
+/// `provider_unavailable`. What this test measures is exactly that: the port's
+/// own answer and the rows the store holds. It does not exercise a journal, a
+/// delivery row, or a dispatcher — the second `observe` here is a manual
+/// re-call, not a redelivery. The journal-driven transition back to pending
+/// and the dispatcher's own retry are proved on the mounted journey by
+/// `a_staged_commit_fault_is_redelivered_by_the_journey_and_settles_once` in
+/// `observation_journey.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commit_fault_stages_no_row_and_answers_the_retryable_terminal() {
+    const MESSAGE: &str = "native bridge staged observation that must not survive a commit fault";
+    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
+    let provider_state_root = test_provider_state_root(&project_root);
+    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
+    let port = ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        project_root.clone(),
+        test_profile_id(),
+        &provider_state_root,
+    )
+    .expect("construct project Native application port");
+
+    let canonical_payload = session_message_payload(
+        "record.native-bridge-durability",
+        "session.native-bridge-durability",
+        MESSAGE,
+    );
+    let call = staged_session_call(
+        project_id.as_str(),
+        &canonical_payload,
+        "idempotency.native-bridge-durability",
+        "operation.native-bridge-durability",
+    );
+
+    port.staged_store().fail_next_commit();
+    let failed = port.observe(staged_observation_for(&call, canonical_payload.clone()));
+
+    assert_eq!(
+        failed.terminal.terminal_code(),
+        TerminalCode::ProviderUnavailable
+    );
+    assert_eq!(
+        failed.terminal.diagnostic_id(),
+        Some("native.staged_observation_store_unavailable")
+    );
+    assert_eq!(
+        failed.terminal.committed_effect().state(),
+        CommittedEffectState::None
+    );
+    assert!(
+        failed
+            .terminal
+            .committed_effect()
+            .committed_item_refs()
+            .is_empty()
+    );
+    // The transaction rolled back, so the row the success would have claimed
+    // does not exist.
+    assert_eq!(staged_row_count(&provider_state_root), 0);
+
+    // Re-calling the very same delivery by hand commits exactly one row. This
+    // is the port's own idempotency, not the journal's redelivery.
+    let retried = port.observe(staged_observation_for(&call, canonical_payload));
+    assert_eq!(retried.terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(
+        retried.terminal.committed_effect().state(),
+        CommittedEffectState::Committed
+    );
+    assert_eq!(staged_row_count(&provider_state_root), 1);
+
+    // And the message that survived the retry is the only one recallable: the
+    // lost attempt left nothing behind to be recalled twice.
+    let mut request = recall_request_value(project_id.as_str());
+    request["query"] = json!("native bridge staged observation");
+    let recalled = recall_payload(&port.recall(&valid_recall_call(project_id.as_str(), request)));
+    let contents: Vec<&str> = recalled["candidates"]
+        .as_array()
+        .expect("recall response carries candidates")
+        .iter()
+        .filter_map(|candidate| candidate["content"].as_str())
+        .collect();
+    assert_eq!(contents, vec![MESSAGE]);
+}
+
+/// Combined budgeting: canonical facts and staged observations are merged into
+/// one ranking under one candidate ceiling.
+///
+/// The tighter answer must be a *prefix* of the wider one, never a different
+/// selection: that is what proves both classes were ranked together and then
+/// truncated once, rather than each class being budgeted on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn facts_and_staged_rows_share_one_candidate_ceiling_with_deterministic_ordering() {
+    fn is_staged(candidate: &Value) -> bool {
+        candidate["stable_memory_ref"]
+            .as_str()
+            .is_some_and(|reference| reference.starts_with("native-staged-observation-v1:"))
+    }
+    fn score_of(candidate: &Value) -> u64 {
+        candidate["native_score"]["components"]["score_millionths"]
+            .as_u64()
+            .expect("every candidate carries a fixed-point score")
+    }
+    fn assert_merge_order(candidates: &[Value]) {
+        for pair in candidates.windows(2) {
+            assert!(
+                score_of(&pair[0]) >= score_of(&pair[1]),
+                "merged candidates are not ordered by descending score"
+            );
+            if score_of(&pair[0]) == score_of(&pair[1]) {
+                assert!(
+                    !(is_staged(&pair[0]) && !is_staged(&pair[1])),
+                    "a staged observation outranked a canonical fact at an equal score"
+                );
+            }
+        }
+    }
+    fn recall_with_ceiling(
+        port: &ProjectNativeMemoryApplicationPort,
+        project_id: &str,
+        ceiling: u64,
+    ) -> Value {
+        let mut request = recall_request_value(project_id);
+        request["budgets"]["maximum_candidates"] = json!(ceiling);
+        recall_payload(&port.recall(&valid_recall_call(project_id, request)))
+    }
+
+    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
+    add_real_project_fact(
+        &graph,
+        "Native bridge deterministic alpha",
+        "native-bridge-budget-alpha",
+    )
+    .await;
+
+    let provider_state_root = test_provider_state_root(&project_root);
+    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
+    let port = ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        project_root.clone(),
+        test_profile_id(),
+        &provider_state_root,
+    )
+    .expect("construct project Native application port");
+
+    // Three staged rows whose text shares no token with the recall query, so
+    // their scores come from admission recency alone and the whole merged
+    // ranking is fixed: the canonical fact first, then the staged rows newest
+    // first.
+    for index in 0..3_u8 {
+        let canonical_payload = session_message_payload(
+            &format!("record.native-bridge-budget-{index}"),
+            "session.native-bridge-budget",
+            &format!("Compiler diagnostics were reviewed in the editor {index}"),
+        );
+        let call = staged_session_call(
+            project_id.as_str(),
+            &canonical_payload,
+            &format!("idempotency.native-bridge-budget-{index}"),
+            &format!("operation.native-bridge-budget-{index}"),
+        );
+        let reply = port.observe(staged_observation_for(&call, canonical_payload));
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+    }
+    assert_eq!(staged_row_count(&provider_state_root), 3);
+
+    // A ceiling of two, with one canonical fact and three staged rows offered.
+    // `reasons == ["candidate_limit"]` is load-bearing: it proves the single
+    // candidate ceiling did the truncation and the response byte ceiling never
+    // trimmed anything, so this is a test of the merged budget and not of the
+    // envelope trim.
+    let capped = recall_with_ceiling(&port, project_id.as_str(), 2);
+    let capped_candidates = capped["candidates"]
+        .as_array()
+        .expect("recall response carries candidates")
+        .clone();
+    assert_eq!(capped_candidates.len(), 2);
+    assert!(
+        u64::try_from(capped_candidates.len()).expect("candidate count fits")
+            <= native_provider_limits().recall_candidates
+    );
+    assert!(
+        !is_staged(&capped_candidates[0]),
+        "staged rows starved the canonical fact out of the shared budget"
+    );
+    assert!(
+        is_staged(&capped_candidates[1]),
+        "the shared budget returned no staged row at all"
+    );
+    assert_merge_order(&capped_candidates);
+    // One fact hit plus the two staged rows the ceiling admitted for scoring.
+    assert_eq!(capped["coverage"]["matched_items"], json!(3));
+    assert_eq!(capped["coverage"]["returned_items"], json!(2));
+    assert_eq!(capped["coverage"]["excluded_items"], json!(1));
+    assert_eq!(capped["coverage"]["reasons"], json!(["candidate_limit"]));
+
+    // A ceiling of one answers the same ranking's first element, not a
+    // separately budgeted class.
+    let single = recall_with_ceiling(&port, project_id.as_str(), 1);
+    let single_candidates = single["candidates"]
+        .as_array()
+        .expect("recall response carries candidates")
+        .clone();
+    assert_eq!(single_candidates.len(), 1);
+    assert_eq!(
+        single_candidates.as_slice(),
+        &capped_candidates[..1],
+        "the tighter ceiling selected a different candidate instead of truncating one ranking"
+    );
+    assert_eq!(single["coverage"]["matched_items"], json!(2));
+    assert_eq!(single["coverage"]["returned_items"], json!(1));
+    assert_eq!(single["coverage"]["excluded_items"], json!(1));
+    assert_eq!(single["coverage"]["reasons"], json!(["candidate_limit"]));
+
+    // Deterministic: the identical request answers the identical ranking.
+    let repeated = recall_with_ceiling(&port, project_id.as_str(), 2);
+    assert_eq!(
+        repeated["candidates"], capped["candidates"],
+        "merged recall ordering is not reproducible"
+    );
+}
+
+/// The stored evidence columns of every staged row, in admission order.
+///
+/// Read from the store's own file rather than from a reply, so a redelivery
+/// can be checked against the row that actually survived.
+fn staged_row_evidence(provider_state_root: &Path) -> Vec<(String, String, String, String)> {
+    let connection = rusqlite::Connection::open(
+        crate::daemon::retained_owner::native_staged_observations::staged_store_path(
+            provider_state_root,
+        ),
+    )
+    .expect("staged observation store");
+    let mut statement = connection
+        .prepare(
+            "SELECT provider_reference, receipt, effect_digest, operation_id \
+             FROM tdmem_native_staged_observation_v1 ORDER BY admitted_sequence",
+        )
+        .expect("staged evidence statement");
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("staged evidence rows");
+    rows.map(|row| row.expect("staged evidence row")).collect()
+}
+
+/// Redelivery idempotency at the wire, not only in the store.
+///
+/// The real defect this catches is a redelivery answered with a freshly minted
+/// acknowledgement instead of the committing row's own evidence: a second row,
+/// a second receipt, or a duplicate that names *this* delivery's operation as
+/// the one that committed. It also pins the committed-effect contract this
+/// provider works inside: `CommittedEffectEvidence::duplicate` refuses
+/// `committed_item_refs` and `verification_sha256` (a duplicate commits
+/// nothing, so it may not describe a committed partition), so the wire-visible
+/// evidence a duplicate reproduces is the receipt plus the committing
+/// operation identity — and the provider reference and effect digest stay on
+/// the durable row, unchanged, where the store can still answer them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redelivered_staged_observation_answers_the_committing_rows_own_evidence() {
+    const MESSAGE: &str = "native bridge staged observation delivered twice";
+    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
+    let provider_state_root = test_provider_state_root(&project_root);
+    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
+    let port = ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        project_root.clone(),
+        test_profile_id(),
+        &provider_state_root,
+    )
+    .expect("construct project Native application port");
+
+    let canonical_payload = session_message_payload(
+        "record.native-bridge-redelivery",
+        "session.native-bridge-redelivery",
+        MESSAGE,
+    );
+    let call = staged_session_call(
+        project_id.as_str(),
+        &canonical_payload,
+        "idempotency.native-bridge-redelivery",
+        "operation.native-bridge-redelivery",
+    );
+
+    let first = port.observe(staged_observation_for(&call, canonical_payload.clone()));
+    assert_eq!(first.terminal.terminal_code(), TerminalCode::Success);
+    let committed = first.terminal.committed_effect();
+    assert_eq!(committed.state(), CommittedEffectState::Committed);
+    let committed_reference = committed
+        .committed_item_refs()
+        .first()
+        .expect("the committed reply names the staged row")
+        .clone();
+    let committed_receipt = committed
+        .provider_receipt_sha256()
+        .expect("the committed reply carries the receipt")
+        .to_owned();
+    let committed_verification = committed
+        .verification_sha256()
+        .expect("the committed reply carries the verification digest")
+        .to_owned();
+    let after_first = staged_row_evidence(&provider_state_root);
+    assert_eq!(after_first.len(), 1);
+    assert_eq!(after_first[0].0, committed_reference);
+    assert_eq!(after_first[0].1, committed_receipt);
+    assert_eq!(after_first[0].2, committed_verification);
+
+    // The identical delivery again: one row, and evidence read back off it.
+    let duplicate = port.observe(staged_observation_for(&call, canonical_payload));
+    assert_eq!(duplicate.terminal.terminal_code(), TerminalCode::Success);
+    let duplicate_effect = duplicate.terminal.committed_effect();
+    assert_eq!(duplicate_effect.state(), CommittedEffectState::Duplicate);
+    assert_eq!(staged_row_count(&provider_state_root), 1);
+    assert_eq!(
+        staged_row_evidence(&provider_state_root),
+        after_first,
+        "a redelivery rewrote the committing row's durable evidence"
+    );
+
+    // Byte-for-byte the committing row's receipt, and the operation that
+    // actually committed — not this delivery's own, and not a fresh digest.
+    assert_eq!(
+        duplicate_effect.provider_receipt_sha256(),
+        Some(committed_receipt.as_str())
+    );
+    assert_eq!(
+        duplicate_effect.duplicate_of_operation_id(),
+        Some("operation.native-bridge-redelivery")
+    );
+    assert_eq!(
+        duplicate_effect.duplicate_of_idempotency_key(),
+        call.idempotency_key.as_deref()
+    );
+    // Unchanged generation: a duplicate commits nothing new.
+    assert_eq!(
+        duplicate_effect.state_generation_before(),
+        duplicate_effect.state_generation_after()
+    );
+    // The contract's own limit on a duplicate, asserted here so a later
+    // widening of `validate_duplicate_effect` cannot silently change what this
+    // provider claims on a redelivery.
+    assert!(
+        duplicate_effect.committed_item_refs().is_empty(),
+        "the duplicate committed-effect state may not claim a committed partition"
+    );
+    assert_eq!(duplicate_effect.verification_sha256(), None);
+}
+
+/// The composition root must not open the staged store on an async worker.
+///
+/// `StagedObservationStore::open` is blocking work with an unbounded tail —
+/// `create_dir_all`, a `SQLite` open, a journal-mode change, `BEGIN
+/// IMMEDIATE`, DDL, and a durable commit. The real defect this catches is
+/// project open regressing to the synchronous constructor and stalling a Tokio
+/// worker on a contended database. It is measured, not asserted in prose: the
+/// store records the thread each open ran on, and a `spawn_blocking` task
+/// never runs on the async caller's own thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_composition_root_opens_the_staged_store_off_the_async_runtime() {
+    let (_temporary, project_root, graph, _owner, _project_id) = real_project_fixture().await;
+    let provider_state_root = test_provider_state_root(&project_root);
+    let store_path = crate::daemon::retained_owner::native_staged_observations::staged_store_path(
+        &provider_state_root,
+    );
+    assert_eq!(
+        crate::daemon::retained_owner::native_staged_observations::open_thread_id(&store_path),
+        None,
+        "the fixture must start with this placement unopened"
+    );
+
+    let caller_thread = std::thread::current().id();
+    let port = project_native_memory_application_port_off_runtime(
+        Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph))),
+        project_root.clone(),
+        test_profile_id(),
+        provider_state_root.clone(),
+    )
+    .await
+    .expect("construct project Native application port off the runtime");
+    drop(port);
+
+    let opened_on =
+        crate::daemon::retained_owner::native_staged_observations::open_thread_id(&store_path)
+            .expect("the port construction opened the staged store");
+    assert_ne!(
+        opened_on, caller_thread,
+        "the staged store was opened on the async caller's own thread"
+    );
+
+    // The measurement is meaningful only if the synchronous constructor does
+    // land on the caller's thread; a second placement proves the instrument
+    // can tell the two apart.
+    let inline_root = project_root.join("inline-provider-state");
+    let inline_path =
+        crate::daemon::retained_owner::native_staged_observations::staged_store_path(&inline_root);
+    let inline_port = project_native_memory_application_port(
+        Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph))),
+        project_root,
+        test_profile_id(),
+        &inline_root,
+    )
+    .expect("construct project Native application port inline");
+    drop(inline_port);
+    assert_eq!(
+        crate::daemon::retained_owner::native_staged_observations::open_thread_id(&inline_path),
+        Some(caller_thread)
+    );
+}
+
+/// Non-starvation under the shared ceiling.
+///
+/// Staged scores and fact scores come from different domains, so a burst of
+/// freshly staged messages can outscore every canonical fact. The real defect
+/// this catches is a ceiling filled purely by merged rank, which would answer
+/// a recall with nothing but advisory provider text and drop the one class the
+/// host can actually cite. One slot is reserved for the highest-ranked fact,
+/// and the answer stays deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn high_scoring_staged_rows_cannot_starve_a_low_scoring_canonical_fact() {
+    fn is_staged(candidate: &Value) -> bool {
+        candidate["stable_memory_ref"]
+            .as_str()
+            .is_some_and(|reference| reference.starts_with("native-staged-observation-v1:"))
+    }
+    fn score_of(candidate: &Value) -> u64 {
+        candidate["native_score"]["components"]["score_millionths"]
+            .as_u64()
+            .expect("every candidate carries a fixed-point score")
+    }
+    fn recall_with_ceiling(
+        port: &ProjectNativeMemoryApplicationPort,
+        project_id: &str,
+        ceiling: u64,
+    ) -> Vec<Value> {
+        let mut request = recall_request_value(project_id);
+        request["query"] = json!("compiler diagnostics reviewed editor");
+        request["budgets"]["maximum_candidates"] = json!(ceiling);
+        recall_payload(&port.recall(&valid_recall_call(project_id, request)))["candidates"]
+            .as_array()
+            .expect("recall response carries candidates")
+            .clone()
+    }
+
+    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
+    // A fact that shares no token with the query, so it is returned as a
+    // low-scoring hit rather than as the top of the ranking.
+    add_real_project_fact(
+        &graph,
+        "compiler notes retained about worktree enrollment and nothing else at all",
+        "native-bridge-starvation-fact",
+    )
+    .await;
+
+    let provider_state_root = test_provider_state_root(&project_root);
+    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
+    let port = ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        project_root.clone(),
+        test_profile_id(),
+        &provider_state_root,
+    )
+    .expect("construct project Native application port");
+
+    for index in 0..4_u8 {
+        let canonical_payload = session_message_payload(
+            &format!("record.native-bridge-starvation-{index}"),
+            "session.native-bridge-starvation",
+            &format!("compiler diagnostics reviewed editor pass {index}"),
+        );
+        let call = staged_session_call(
+            project_id.as_str(),
+            &canonical_payload,
+            &format!("idempotency.native-bridge-starvation-{index}"),
+            &format!("operation.native-bridge-starvation-{index}"),
+        );
+        let reply = port.observe(staged_observation_for(&call, canonical_payload));
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+    }
+    assert_eq!(staged_row_count(&provider_state_root), 4);
+
+    // The scenario's own precondition: the merged ranking is topped by a
+    // staged row that outscores the canonical fact, so a ceiling filled purely
+    // by rank would return no fact at all.
+    let unbounded = recall_with_ceiling(&port, project_id.as_str(), 8);
+    let fact_score = unbounded
+        .iter()
+        .find(|candidate| !is_staged(candidate))
+        .map(score_of)
+        .unwrap_or_else(|| panic!("the canonical fact is offered at all: {unbounded:#?}"));
+    assert!(
+        is_staged(&unbounded[0]) && score_of(&unbounded[0]) > fact_score,
+        "the scenario needs a staged row at the top of the merged ranking: {unbounded:#?}"
+    );
+
+    for ceiling in 1..=3_u64 {
+        let capped = recall_with_ceiling(&port, project_id.as_str(), ceiling);
+        assert!(
+            !capped.is_empty() && capped.len() <= usize::try_from(ceiling).expect("ceiling fits"),
+            "ceiling {ceiling} returned {} candidates: {capped:#?}",
+            capped.len()
+        );
+        assert_eq!(
+            capped
+                .iter()
+                .filter(|candidate| !is_staged(candidate))
+                .count(),
+            1,
+            "the reserved slot did not survive a ceiling of {ceiling}: {capped:#?}"
+        );
+        // Ordering is still the merged one: descending score, so the reserved
+        // fact sits last.
+        for pair in capped.windows(2) {
+            assert!(score_of(&pair[0]) >= score_of(&pair[1]), "{capped:#?}");
+        }
+        assert_eq!(
+            recall_with_ceiling(&port, project_id.as_str(), ceiling),
+            capped,
+            "reserved-slot selection is not reproducible"
+        );
+    }
 }

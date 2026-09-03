@@ -23,7 +23,7 @@ A syntactically valid unknown capability is decoded as `OpaqueMemoryProviderCapa
 
 ## Fail-closed resolution
 
-A registration also records `recall_scope_bindings`: the candidate scope bindings (`exact_coding_scope`, `project_facts`, `profile_facts`) the host authorizes that provider to attest on recall candidates. Providers cannot self-declare bindings; admission receives them with the admitted call, never from a reply. TraceDecay Native is authorized for `project_facts` and `profile_facts`; NCM for `exact_coding_scope`.
+A registration also records `recall_scope_bindings`: the candidate scope bindings (`exact_coding_scope`, `project_facts`, `profile_facts`) the host authorizes that provider to attest on recall candidates. Providers cannot self-declare bindings; admission receives them with the admitted call, never from a reply. TraceDecay Native is authorized for `exact_coding_scope`, `project_facts`, and `profile_facts` — owner-bound facts are attested as project/profile facts, and the session observations the Native application port stages as provider-local advisory state are attested under the full admitted exact scope; NCM for `exact_coding_scope`.
 
 Resolution requires exact provider identity, accepted registration revision, compatible adapter contract, all mandatory capabilities, every explicitly required known capability, exact TraceDecay scope, a live deadline, and live cancellation. There is no implicit fallback and no successful empty resolution.
 

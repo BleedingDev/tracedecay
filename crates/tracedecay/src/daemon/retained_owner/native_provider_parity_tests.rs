@@ -200,6 +200,7 @@ fn native_port(fixture: &StoreFixture) -> ProjectNativeMemoryApplicationPort {
         graph_cell,
         fixture.project_root.clone(),
         tracedecay_domain::UserProfileId::new(PARITY_PROFILE).expect("profile id"),
+        &super::native_provider::test_provider_state_root(&fixture.project_root),
     )
     .expect("construct project Native application port")
 }

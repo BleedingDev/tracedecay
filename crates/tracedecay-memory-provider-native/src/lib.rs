@@ -18,6 +18,11 @@
 //! routes provider operations to narrow port methods, preserves canonical call
 //! bytes and exact scope unchanged, and rejects undeclared optional operations
 //! locally before contacting Native operation authority.
+//!
+//! Observation classification happens here — an admitted envelope is parsed
+//! into one typed [`NativeObservation`] variant — but the durable consequence
+//! of an accepted observation belongs entirely to the application port behind
+//! this boundary. Staging a session message opens no store in this crate.
 
 use std::error::Error;
 use std::fmt;
@@ -36,11 +41,25 @@ pub const NATIVE_PROVIDER_ID: &str = "tracedecay.native";
 
 /// Recall candidate scope bindings the host authorizes Native to attest, in
 /// the wire vocabulary of `tracedecay.memory.provider.recall.v1`
-/// `candidate_scope_binding.bindings`. Native facts carry only their owner
-/// (a project or the profile), so Native never attests the exact coding
-/// scope; the registry records this declaration at registration and passes
-/// it to admission with the admitted call.
-pub const NATIVE_RECALL_SCOPE_BINDINGS: &[&str] = &["project_facts", "profile_facts"];
+/// `candidate_scope_binding.bindings`.
+///
+/// Native facts carry only their owner — a project or the profile — and are
+/// attested as `project_facts` or `profile_facts`. Native additionally
+/// attests `exact_coding_scope`, because the Native application port also
+/// answers recall from the session observations it staged as provider-local
+/// advisory state: a staged row is recorded under the whole admitted exact
+/// scope, so it is attested under that scope and nothing weaker.
+///
+/// `exact_coding_scope` admission compares every exact-scope field
+/// byte-for-byte, `agent_session_id` and `resolved_scope_digest` included, so
+/// a staged row is recallable only inside the session that produced it. That
+/// is a deliberate limitation of this slice, not an oversight; a durable
+/// cross-session binding for staged observations is tracked as `tdmem-b8q`.
+///
+/// The registry records this declaration at registration and passes it to
+/// admission with the admitted call; a provider reply can never widen it.
+pub const NATIVE_RECALL_SCOPE_BINDINGS: &[&str] =
+    &["exact_coding_scope", "project_facts", "profile_facts"];
 
 /// Provider-neutral contract carried by an admitted observation call.
 pub const OBSERVATION_CONTRACT_ID: &str = "tracedecay.memory.provider.observation.v1";
@@ -52,6 +71,20 @@ pub const NATIVE_FACT_PROMOTION_OBSERVATION_KIND: &str = "native.fact_promoted.v
 /// Payload contract paired with [`NATIVE_FACT_PROMOTION_OBSERVATION_KIND`].
 pub const NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID: &str =
     "tracedecay.memory.observation.native-fact-promotion.v1";
+
+/// The one host observation kind Native stages as provider-local advisory
+/// state, from `tracedecay.memory.provider.observation.v1`
+/// `observation_kinds`.
+///
+/// Accepting a kind is a capability commitment: every accepted kind needs its
+/// own candidate projection, retention behaviour, and containment tests. Only
+/// this kind and [`NATIVE_FACT_PROMOTION_OBSERVATION_KIND`] are accepted;
+/// every other contract-known kind stays on the unsupported path.
+pub const NATIVE_STAGED_SESSION_OBSERVATION_KIND: &str = "session.message_committed.v1";
+
+/// Payload contract paired with [`NATIVE_STAGED_SESSION_OBSERVATION_KIND`].
+pub const NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID: &str =
+    "tracedecay.memory.observation.session-message.v1";
 
 const HANDSHAKE_CONTRACT_ID: &str = "tracedecay.memory.provider.handshake.v1";
 const HEALTH_CONTRACT_ID: &str = "tracedecay.memory.provider.health.v1";
@@ -98,15 +131,16 @@ impl fmt::Display for NativeAdapterError {
 
 impl Error for NativeAdapterError {}
 
-/// The parsed, verification-only view of an admitted observation envelope.
+/// The parsed view of an admitted observation envelope.
 ///
 /// `call` is the original provider call, so its exact scope, request and
 /// operation identities, idempotency key, control token, and opaque extensions
 /// remain unchanged. The remaining fields are copied from the canonical JSON
-/// envelope without semantic rewriting. This value authorizes no Native fact
-/// write; fact promotion remains a separate explicitly authorized operation.
+/// envelope without semantic rewriting: the adapter never re-sanitizes,
+/// reshapes, or re-derives what admission already sanitized and bound to a
+/// receipt.
 #[derive(Clone, Debug)]
-pub struct NativeObservation<'call> {
+pub struct NativeObservationEnvelope<'call> {
     /// The original admitted provider call.
     pub call: &'call ProviderCall,
     /// Exact `observation_kind` from the canonical envelope.
@@ -115,6 +149,65 @@ pub struct NativeObservation<'call> {
     pub payload_contract: String,
     /// Parsed `canonical_payload` from the canonical envelope.
     pub canonical_payload: Value,
+}
+
+/// One admitted observation envelope, classified into the exact Native
+/// consequence its kind authorizes.
+///
+/// The classification is the authorization: the adapter accepts exactly two
+/// kinds and the application port branches on this enum rather than
+/// re-reading `observation_kind`, so a kind can never acquire a consequence
+/// it was not admitted for. Every other kind is refused before dispatch.
+#[derive(Clone, Debug)]
+pub enum NativeObservation<'call> {
+    /// [`NATIVE_FACT_PROMOTION_OBSERVATION_KIND`]: an explicitly authorized
+    /// Native promotion event.
+    ///
+    /// Receiving this variant is verification-only and does not by itself
+    /// authorize a fact write; the port re-runs Native validation and owns
+    /// the durable receipt.
+    FactPromotion(NativeObservationEnvelope<'call>),
+    /// [`NATIVE_STAGED_SESSION_OBSERVATION_KIND`]: a canonically settled host
+    /// session message the port stages as provider-local advisory state.
+    ///
+    /// Staging writes no canonical Native fact. A staged row can become an
+    /// accepted fact only through the separate, explicitly authorized
+    /// promotion path.
+    StagedSession(NativeObservationEnvelope<'call>),
+}
+
+impl<'call> NativeObservation<'call> {
+    /// The canonical envelope carried by whichever variant this is.
+    #[must_use]
+    pub const fn envelope(&self) -> &NativeObservationEnvelope<'call> {
+        match self {
+            Self::FactPromotion(envelope) | Self::StagedSession(envelope) => envelope,
+        }
+    }
+
+    /// The original admitted provider call.
+    #[must_use]
+    pub const fn call(&self) -> &'call ProviderCall {
+        self.envelope().call
+    }
+
+    /// Exact `observation_kind` from the canonical envelope.
+    #[must_use]
+    pub fn observation_kind(&self) -> &str {
+        self.envelope().observation_kind.as_str()
+    }
+
+    /// Exact `payload_contract` from the canonical envelope.
+    #[must_use]
+    pub fn payload_contract(&self) -> &str {
+        self.envelope().payload_contract.as_str()
+    }
+
+    /// Parsed `canonical_payload` from the canonical envelope.
+    #[must_use]
+    pub const fn canonical_payload(&self) -> &Value {
+        &self.envelope().canonical_payload
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,7 +233,7 @@ impl ObservationParseError {
             Self::Malformed => "native.observation_envelope_invalid",
             Self::UnknownKind => "native.observation_kind_unknown",
             Self::KindContractMismatch => "native.observation_kind_contract_mismatch",
-            Self::UnsupportedKind => "native.observation_staged",
+            Self::UnsupportedKind => "native.observation_unsupported",
         }
     }
 }
@@ -163,15 +256,21 @@ pub trait NativeMemoryApplicationPort: Send + Sync + 'static {
     /// Executes mandatory Native health without changing state.
     fn health(&self, call: &ProviderCall) -> ProviderReply;
 
-    /// Verifies one explicitly authorized Native promotion observation under
-    /// Native authority.
+    /// Handles one admitted Native observation under Native authority.
     ///
     /// The adapter parses and classifies the provider-neutral envelope before
-    /// this method is called. The trusted application implementation must
-    /// preserve owner, provenance, trust, temporal state, idempotency, and
-    /// receipts. Receiving a [`NativeObservation`] is verification-only and
-    /// must not imply a fact write; a separate authorized operation owns any
-    /// Native mutation.
+    /// this method is called, so the implementation branches on the
+    /// [`NativeObservation`] variant rather than on a kind string. The
+    /// trusted application implementation must preserve owner, provenance,
+    /// trust, temporal state, idempotency, and receipts.
+    ///
+    /// [`NativeObservation::FactPromotion`] is verification-only and must not
+    /// imply a fact write; a separate authorized operation owns any canonical
+    /// Native mutation. [`NativeObservation::StagedSession`] does have a
+    /// durable consequence, but only in the port's own provider-local staged
+    /// store, and it must be committed before a success terminal is returned.
+    /// Neither variant writes a canonical Native fact from this path, and the
+    /// adapter itself still opens no persistence of any kind.
     fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply;
 
     /// Executes existing Native recall and preserves Native ordering, scores,
@@ -346,7 +445,7 @@ impl NativeProvider {
             .ok_or(ObservationParseError::Malformed)?;
 
         let expected_payload_contract = match observation_kind.as_str() {
-            "session.message_committed.v1" => "tracedecay.memory.observation.session-message.v1",
+            NATIVE_STAGED_SESSION_OBSERVATION_KIND => NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID,
             "tool.execution_settled.v1" => "tracedecay.memory.observation.tool-execution.v1",
             "source.edit_settled.v1" => "tracedecay.memory.observation.source-edit.v1",
             "test.execution_settled.v1" => "tracedecay.memory.observation.test-execution.v1",
@@ -362,15 +461,27 @@ impl NativeProvider {
         if payload_contract != expected_payload_contract {
             return Err(ObservationParseError::KindContractMismatch);
         }
-        if observation_kind != NATIVE_FACT_PROMOTION_OBSERVATION_KIND {
-            return Err(ObservationParseError::UnsupportedKind);
-        }
-
-        Ok(NativeObservation {
+        // Classification is the authorization boundary: exactly two kinds are
+        // accepted, and each is handed to the port as its own variant. Every
+        // other contract-known kind is refused here, before the port is
+        // reached, because accepting it would commit Native to a projection,
+        // retention rule, and containment story it does not have.
+        let staged = match observation_kind.as_str() {
+            NATIVE_FACT_PROMOTION_OBSERVATION_KIND => false,
+            NATIVE_STAGED_SESSION_OBSERVATION_KIND => true,
+            _ => return Err(ObservationParseError::UnsupportedKind),
+        };
+        let envelope = NativeObservationEnvelope {
             call,
             observation_kind,
             payload_contract,
             canonical_payload,
+        };
+
+        Ok(if staged {
+            NativeObservation::StagedSession(envelope)
+        } else {
+            NativeObservation::FactPromotion(envelope)
         })
     }
 

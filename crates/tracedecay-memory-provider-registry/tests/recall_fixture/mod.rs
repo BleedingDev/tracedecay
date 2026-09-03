@@ -70,8 +70,25 @@ pub fn authorized_exact() -> RecallScopeBindingsV1 {
     RecallScopeBindingsV1::new([ScopeBinding::ExactCodingScope])
 }
 
-/// The bindings the host records for the Native provider at registration.
+/// The bindings the host records for the Native provider at registration,
+/// mirroring `NATIVE_RECALL_SCOPE_BINDINGS`.
+///
+/// Native attests owner-bound facts as `project_facts`/`profile_facts` and
+/// its provider-local staged session observations as `exact_coding_scope`.
 pub fn authorized_native() -> RecallScopeBindingsV1 {
+    RecallScopeBindingsV1::new([
+        ScopeBinding::ExactCodingScope,
+        ScopeBinding::ProjectFacts,
+        ScopeBinding::ProfileFacts,
+    ])
+}
+
+/// A facts-only authorization set: a provider the host authorized for owner
+/// facts and nothing else.
+///
+/// This is the set that proves binding refusal precedes field comparison; it
+/// is deliberately not Native's own registration record.
+pub fn authorized_facts_only() -> RecallScopeBindingsV1 {
     RecallScopeBindingsV1::new([ScopeBinding::ProjectFacts, ScopeBinding::ProfileFacts])
 }
 
@@ -287,8 +304,10 @@ impl RecallFixturePort {
     fn mixed_outcome_value(&self, call: &ProviderCall) -> Value {
         let scope = scope_value(&call.exact_scope);
         // Candidates attest what the Native adapter attests for project-owned
-        // facts; the host records Native as authorized for `project_facts`
-        // and `profile_facts` only.
+        // facts. The host also records Native as authorized for
+        // `exact_coding_scope`, which its staged session observations use, so
+        // an exact-scope candidate here is judged on its fields rather than
+        // refused on the binding.
         let candidate_scope = project_facts_candidate_value(&call.exact_scope);
         let foreign_worktree = {
             let mut foreign = candidate_scope.clone();
@@ -300,10 +319,12 @@ impl RecallFixturePort {
             foreign["repository_identity"] = json!("repository-other");
             foreign
         };
-        // A full exact-scope attestation from a provider the host never
-        // authorized for `exact_coding_scope` is refused on the binding alone,
-        // before any field comparison.
-        let unauthorized_exact = {
+        // A full exact-scope attestation whose every identity field matches
+        // except the resolved-scope digest: it belongs to an earlier
+        // resolution of this checkout, so it is stale rather than in scope.
+        // This is the shape a staged observation carries after the scope is
+        // re-resolved, and it must not be admitted.
+        let stale_exact_scope = {
             let mut exact = exact_scope_candidate_value(&call.exact_scope);
             exact["resolved_scope_digest"] = json!(STALE_SCOPE_DIGEST);
             exact
@@ -337,9 +358,9 @@ impl RecallFixturePort {
                 current_validity(),
             ),
             candidate_value(
-                "unauthorized-exact-scope",
-                "exact-scope memory from a project-facts provider",
-                unauthorized_exact,
+                "stale-exact-scope",
+                "exact-scope memory from a superseded scope resolution",
+                stale_exact_scope,
                 current_validity(),
             ),
             candidate_value(
@@ -707,7 +728,7 @@ impl tracedecay_memory_provider_api::MemoryProvider for EvaluationObserverProvid
                 CommittedEffectEvidence::none(Some(descriptor.state_generation)),
                 FallbackDirective::forbidden(),
                 &request.request_id,
-                &request.exact_scope.exact_scope_sha256(),
+                request.exact_scope.exact_scope_sha256(),
                 None,
             )
             .expect("observer handshake terminal"),
@@ -753,7 +774,7 @@ impl tracedecay_memory_provider_api::MemoryProvider for EvaluationObserverProvid
                 effect,
                 FallbackDirective::forbidden(),
                 &call.operation_id,
-                &call.exact_scope.exact_scope_sha256(),
+                call.exact_scope.exact_scope_sha256(),
                 None,
             )
             .expect("observer terminal"),

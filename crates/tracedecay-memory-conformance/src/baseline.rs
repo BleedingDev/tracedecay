@@ -2190,10 +2190,10 @@ impl<'run, 'corpus, 'provider> ScenarioExecution<'run, 'corpus, 'provider> {
         // reported items as committed that the provider explicitly refused —
         // a lane whose every observe returns `capability_unsupported` with
         // effect state `none` looked like a lane that committed everything.
-        if committing_effect_state(&outcome) {
-            if let Some(batch) = self.batch.as_mut() {
-                batch.committed.push((item_id.to_owned(), operation_id));
-            }
+        if committing_effect_state(&outcome)
+            && let Some(batch) = self.batch.as_mut()
+        {
+            batch.committed.push((item_id.to_owned(), operation_id));
         }
         Ok(outcome)
     }

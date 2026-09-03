@@ -370,6 +370,55 @@
       ]
     },
     {
+      "id": "native_staged_observations",
+      "implementation_state": "current",
+      "authority_class": "advisory_durable",
+      "owner": "project_native_memory_application_port",
+      "canonical_writer": "TraceDecay ProjectNativeMemoryApplicationPort, writing one provider-local staged-observation store under the host-granted Native provider-state directory.",
+      "write_interfaces": [
+        "NativeMemoryApplicationPort::observe for an admitted session.message_committed.v1 observation, committing the staged row durably before the success terminal is returned",
+        "per-scope retention eviction inside that same writer, which removes staged payload content and leaves a compact tombstone that still answers redelivery with the original committed-effect evidence"
+      ],
+      "read_interfaces": [
+        "NativeMemoryApplicationPort::recall, which merges staged rows with canonical Native fact candidates under one ProviderLimits.recall_candidates budget",
+        "provider-local inspection of staged rows for reconciliation and retention accounting"
+      ],
+      "consistency_model": "One durable row per admitted observation, committed before the observation is acknowledged. Identity is the admitted idempotency key plus a second uniqueness constraint on stable source identity (exact-scope digest, source authority, source event id, source event revision, sanitized payload digest), because the freshly derived idempotency key includes the registration revision and is therefore stable only for redelivery of one admitted journal row. Redelivery of a known key reproduces the original provider reference, receipt, and effect digest; the same key with a different kind or payload digest is a conflict. Payload bytes are stored exactly as admission sanitized them, with their digest and all seven exact-scope identity fields as explicit columns plus the exact-scope digest as immutable provenance.",
+      "failure_behavior": "Fail closed before acknowledgement: a row that did not commit produces no committed-effect evidence and leaves the observation journal item pending for redelivery. Store unavailability, scope resolution failure, cancellation, deadline, and conflicting redelivery return typed terminals. No failure falls back to writing a canonical Native fact, and no recall answers with a row whose stored scope attestation it cannot reproduce.",
+      "namespace_variants": [
+        {
+          "name": "exact_coding_scope_session_observation",
+          "required": [
+            "profile_id",
+            "project_id",
+            "repository_id",
+            "worktree_id",
+            "branch_ref",
+            "agent_session_id",
+            "provider_id",
+            "operation_id"
+          ],
+          "optional": ["request_id"],
+          "forbidden": ["provider_instance_id"]
+        }
+      ],
+      "provider_semantics": "Derivative advisory state owned by the host's own Native provider. Staged rows are returned as advisory recall candidates attested under exact_coding_scope; they never replace TraceDecay's canonical admitted session/transcript evidence, which remains the authority for what a session said, and they never become an accepted Native fact except through the separate explicitly authorized promotion path. Exact-scope admission binds agent_session_id and resolved_scope_digest byte-for-byte, so staged recall is same-session only in this revision; the durable cross-session binding is tracked as tdmem-b8q.",
+      "prohibited_side_effects": [
+        "writing memory_v2 or any canonical Native fact table from the staging path",
+        "acknowledging an observation before its staged row is durably committed",
+        "re-sanitizing, reshaping, or reconstructing the admitted payload bytes",
+        "emitting the observation envelope or raw payload as candidate content instead of the extracted message text",
+        "staged candidates starving canonical fact candidates or exceeding the single recall candidate budget",
+        "presenting a staged row as host-confirmed evidence or as a substitute for admitted session evidence",
+        "attesting a staged row under a scope binding wider than the exact scope it was recorded under"
+      ],
+      "source_paths": [
+        "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
+        "crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs",
+        "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs"
+      ]
+    },
+    {
       "id": "provider_cognitive_state",
       "implementation_state": "planned",
       "authority_class": "canonical_external",

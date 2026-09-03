@@ -42,6 +42,7 @@ CANONICAL_PRODUCT_PATTERNS = {
     "crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs",
+    "crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs",
     "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs",
     "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs",
 }

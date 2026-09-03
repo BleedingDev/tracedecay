@@ -273,6 +273,17 @@ pub enum RecallDenialReason {
         /// The binding the provider claimed.
         binding: ScopeBinding,
     },
+    /// The candidate's declared memory class may not be admitted under the
+    /// scope binding it claimed, whatever the provider is otherwise
+    /// authorized for.
+    MemoryClassBindingUnauthorized {
+        /// Host-recognised memory class the candidate declared. Never
+        /// provider bytes: the field is set from the host's own constant for
+        /// the class the policy matched.
+        memory_class: String,
+        /// The binding the provider claimed for that class.
+        binding: ScopeBinding,
+    },
     /// An identity field differs from the admitted scope.
     ScopeMismatch {
         /// First differing field in contract order.
@@ -327,6 +338,7 @@ impl RecallDenialReason {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::ScopeBindingUnauthorized { .. } => "scope_binding_unauthorized",
+            Self::MemoryClassBindingUnauthorized { .. } => "memory_class_binding_unauthorized",
             Self::ScopeMismatch { .. } => "scope_mismatch",
             Self::StaleIdentity => "stale_identity",
             Self::UnknownIdentity { .. } => "unknown_identity",
@@ -1345,6 +1357,10 @@ fn admit_one(
     authorized: &RecallScopeBindingsV1,
     candidate: &RecallCandidateV1,
 ) -> Result<(AdmitDecision, ValidatedNativeScoreV1), RecallDenialReason> {
+    check_class_binding(
+        &candidate.memory_class,
+        candidate.exact_scope_identity.scope_binding,
+    )?;
     check_scope(admitted_scope, authorized, &candidate.exact_scope_identity)?;
     check_content(candidate)?;
     let decision = check_validity(temporal, &candidate.validity)?;
@@ -1354,6 +1370,49 @@ fn admit_one(
     let native_score = validate_native_score(&candidate.native_score)
         .map_err(|defect| RecallDenialReason::NativeScoreMalformed { defect })?;
     Ok((decision, native_score))
+}
+
+/// Memory class of one provider-local staged session observation.
+///
+/// The host owns this token, not the provider: it is compared against the
+/// class the candidate declared, and it is what the denial reason records, so
+/// no provider byte reaches the ledger through this path.
+const SESSION_OBSERVATION_MEMORY_CLASS: &str = "session_observation";
+
+/// Host-owned policy relating a candidate's declared memory class to the
+/// scope binding it may be admitted under.
+///
+/// Provider authorization is *provider-wide*: a provider authorized for
+/// `exact_coding_scope`, `project_facts`, and `profile_facts` may use any of
+/// the three on any candidate, and [`check_scope`] then applies only that
+/// binding's own field rules. For a staged session observation that is not
+/// enough. `project_facts` and `profile_facts` make repository, worktree and
+/// branch optional and *forbid* session identity and the resolved scope
+/// digest, so a session observation wearing one of them would be admitted in
+/// a different checkout, a different branch, or a different agent session
+/// than the one it was observed in — precisely the cross-scope leak the exact
+/// binding exists to prevent. A session observation is therefore admissible
+/// only under `exact_coding_scope`, which requires all seven identity fields
+/// byte-equal.
+///
+/// The rule is deliberately one-directional. It constrains the class the host
+/// knows is checkout- and session-bound; it does not dictate which binding a
+/// canonical fact class must use, because a fact's ownership binding is the
+/// provider's own attestation about a record the host can independently
+/// confirm.
+fn check_class_binding(
+    memory_class: &Value,
+    binding: ScopeBinding,
+) -> Result<(), RecallDenialReason> {
+    if memory_class.as_str() == Some(SESSION_OBSERVATION_MEMORY_CLASS)
+        && binding != ScopeBinding::ExactCodingScope
+    {
+        return Err(RecallDenialReason::MemoryClassBindingUnauthorized {
+            memory_class: SESSION_OBSERVATION_MEMORY_CLASS.to_owned(),
+            binding,
+        });
+    }
+    Ok(())
 }
 
 /// Applies the claimed scope binding's field rules byte-for-byte in contract

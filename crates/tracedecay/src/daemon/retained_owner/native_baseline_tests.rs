@@ -7,9 +7,11 @@
 //! scope catalog, recall catalog, and host configuration, so the three
 //! reports carry one shared-inputs digest and are comparable.
 //!
-//! Assertions state measured Native behavior: the corpus observation kinds
-//! are not the Native fact-promotion kind, so Native stages them with a typed
-//! `capability_unsupported` terminal, and its recalls at the corpus project
+//! Assertions state measured Native behavior: the corpus emits source-edit,
+//! test-execution, and feedback-outcome observations, none of which Native
+//! accepts — it accepts only its own fact-promotion kind and the host session
+//! message kind — so each is refused with a typed `capability_unsupported`
+//! terminal that commits nothing, and its recalls at the corpus project
 //! resolve to typed zero-result or scope-mismatch terminals without admitting
 //! any context.
 
@@ -89,6 +91,7 @@ fn native_provider(fixture: &StoreFixture) -> NativeProvider {
         graph_cell,
         fixture.project_root.clone(),
         tracedecay_domain::UserProfileId::new("profile.native-baseline").expect("profile id"),
+        &super::test_provider_state_root(&fixture.project_root),
     )
     .expect("construct project Native application port");
     NativeProvider::new(Arc::new(port)).expect("construct Native provider")
@@ -215,9 +218,10 @@ async fn native_baseline_records_typed_terminals_and_zero_admitted_context() {
                     "observe" => {
                         observe_calls += 1;
                         if call.provider_contacted {
-                            // Corpus observation kinds are not the Native
-                            // fact-promotion kind: Native stages them with a
-                            // typed unsupported terminal and commits nothing.
+                            // No corpus observation kind is one of the two
+                            // kinds Native accepts, so each is refused before
+                            // the port with a typed unsupported terminal and
+                            // commits nothing.
                             assert_eq!(
                                 call.terminal_code, "capability_unsupported",
                                 "{} step {} {:?}",
@@ -225,7 +229,7 @@ async fn native_baseline_records_typed_terminals_and_zero_admitted_context() {
                             );
                             assert_eq!(
                                 call.diagnostic_id.as_deref(),
-                                Some("native.observation_staged")
+                                Some("native.observation_unsupported")
                             );
                         } else {
                             // Only the host cancellation preflight refuses dispatch.

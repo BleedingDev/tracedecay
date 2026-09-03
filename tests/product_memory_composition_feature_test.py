@@ -142,7 +142,7 @@ fn resolve_memory_provider_activation(
 }
 
 #[cfg(feature = "memory-provider-host")]
-fn mount_project_memory_provider_host(
+async fn mount_project_memory_provider_host(
     activation: ProjectMemoryProviderActivation,
 ) -> Result<crate::mcp::server::MemoryProviderHostMount> {
     let enabled_mode = match activation {
@@ -223,6 +223,8 @@ pub(crate) mod native_provider;
 #[cfg(all(test, feature = "memory-provider-host"))]
 #[path = "retained_owner/native_provider_parity_tests.rs"]
 mod native_provider_parity_tests;
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod native_staged_observations;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod observation_journey;
 '''
@@ -320,6 +322,9 @@ NATIVE_ADAPTER_PATHS = (
         "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs"
     ),
     Path("crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs"),
+    Path(
+        "crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs"
+    ),
 )
 COGNITIVE_RECALL_PATH = Path(
     "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs"

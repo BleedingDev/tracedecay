@@ -436,8 +436,11 @@ def validate_registration(contract: dict[str, Any], errors: list[str]) -> None:
             errors.append(f'recall scope bindings for {provider_id} must be a unique non-empty list')
         elif any(value not in scope_binding_values for value in declared):
             errors.append(f'recall scope bindings for {provider_id} name an unknown binding')
-    if declarations.get('tracedecay.native') != ['project_facts', 'profile_facts']:
-        errors.append('tracedecay.native must be authorized for project_facts and profile_facts only')
+    if declarations.get('tracedecay.native') != ['exact_coding_scope', 'project_facts', 'profile_facts']:
+        errors.append(
+            'tracedecay.native must be authorized for exact_coding_scope, project_facts, '
+            'and profile_facts only'
+        )
     if declarations.get('ncm') != ['exact_coding_scope']:
         errors.append('ncm must be authorized for exact_coding_scope only')
 

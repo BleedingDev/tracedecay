@@ -40,6 +40,7 @@ Missing project, repository, or worktree identity fails closed. The current work
 | Session evidence | Canonical, separate domain | Host admission plus session/transcript ingest | `SessionApplicationRetrievalPortV1`, LCM/session temporal reads | Idempotent ingest/replay with source cursor and exact session scope. Unavailable is typed, not successful empty history. |
 | Accepted explicit facts | Canonical | TraceDecay Native `MemoryApplication` over owner-bound fact store | Fact add/get/list/search/probe/related/reason/contradict/update/remove/feedback/status | Append-only lineage, provenance, idempotency, privacy admission, durable receipts. Provider output has no implicit promotion. |
 | Provider observation journal | Planned canonical product domain | TraceDecay observation dispatcher | Delivery worker, inspection, reconciliation | Bounded durable outbox, at-least-once delivery, idempotent by operation/provider/scope. Observer failure cannot affect canonical behavior. |
+| Native staged observations | Advisory durable, provider-local | `ProjectNativeMemoryApplicationPort` writing the staged-observation store under the host-granted Native provider-state directory | Native recall, merged with canonical fact candidates under one candidate budget | One durable row per admitted `session.message_committed.v1`, committed before acknowledgement. Idempotency key plus a source-identity unique index give lifetime exactly-once; redelivery reproduces the original effect evidence and a differing payload digest is a conflict. Advisory only: never a canonical fact, never a replacement for admitted session evidence. Attested under `exact_coding_scope`, which makes recall same-session in this revision (`tdmem-b8q` tracks the durable cross-session binding). |
 | Provider cognitive state | Planned canonical external domain | Selected provider instance behind its adapter | Provider observe/feedback/maintenance/recall/health/inspection capabilities | Provider-defined persistence behind versioned contract. TraceDecay never depends on provider DB schemas or co-writes internals. |
 | Provider recall candidates | Advisory ephemeral | Selected provider adapter produces one request result; no canonical writer | Recall capability invoked by context compiler | Provenance, scope, revision, freshness, budget, deadline, cancellation, typed degradation. No direct mutation. |
 | Curated rules | Canonical | Transactional TraceDecay configuration control plane | Pinned effective configuration and managed-skill readers | Revisioned, authorized, audited, rollback-capable. Generated files are projections, not co-writers. |
@@ -93,6 +94,18 @@ canonical host ingest or operation settlement
 ```
 
 Observer mode has no prompt, source-edit, Native-fact, configuration, or externally visible effect. Capacity exhaustion and delivery failure are typed and inspectable; nothing is silently dropped.
+
+### Native staged observations
+
+```text
+admitted session.message_committed.v1 observation
+  → Native application port classifies it as a staged session observation
+  → durable staged row under <provider-state>/native/, committed
+  → success terminal with committed effect evidence
+  → advisory recall candidate attested under exact_coding_scope
+```
+
+The staged store is provider-local state that TraceDecay's own Native provider owns. It writes no canonical fact table, and the acknowledgement follows the commit rather than preceding it, so an acknowledged observation always has a row behind it. Retention evicts payload content but keeps a tombstone, so an evicted key still answers duplicate instead of re-staging.
 
 ### Curated rules
 

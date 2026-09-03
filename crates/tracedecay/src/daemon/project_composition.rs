@@ -212,8 +212,16 @@ fn project_recall_routing_policy(
 #[cfg(feature = "memory-provider-host")]
 pub(super) const PROJECT_NATIVE_REGISTRATION_REVISION: u64 = 1;
 
+/// Mounts the project's memory-provider host.
+///
+/// This is `async` for one reason: the enabled arm opens the Native provider's
+/// durable staged-observation store, and that is blocking filesystem and
+/// `SQLite` work. It is therefore built through
+/// `project_native_memory_application_port_off_runtime`, which runs the whole
+/// construction on a blocking thread; a disabled composition still constructs
+/// nothing and never reaches the blocking pool.
 #[cfg(feature = "memory-provider-host")]
-fn mount_project_memory_provider_host(
+async fn mount_project_memory_provider_host(
     activation: ProjectMemoryProviderActivation,
     cg: &Arc<crate::tracedecay::TraceDecay>,
     canonical_project_path: &Path,
@@ -235,14 +243,25 @@ fn mount_project_memory_provider_host(
         None => tracedecay_memory_provider_registry::NativeProviderActivation::Disabled,
         Some(mode) => {
             let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(cg)));
-            let port =
-                super::retained_owner::native_provider::project_native_memory_application_port(
+            // The host-granted root every supervised provider's state lives
+            // under, in the canonical store layout — the same root the
+            // observation journey grants the provider namespace from. The
+            // Native staged-observation store is opened beneath it, so the
+            // provider never names a path outside its granted namespace.
+            let provider_state_root = cg
+                .store_layout()
+                .data_root
+                .join(super::retained_owner::observation_journey::PROVIDER_STATE_DIR_NAME);
+            let port = super::retained_owner::native_provider::
+                project_native_memory_application_port_off_runtime(
                     graph_cell,
                     canonical_project_path.to_path_buf(),
                     // The adapter attests the daemon's own profile on every
                     // candidate; it is fixed at mount, never read from a call.
                     profile_id.clone(),
+                    provider_state_root,
                 )
+                .await
                 .map_err(|error| TraceDecayError::Config {
                     message: format!(
                         "could not construct project Native application port: {error}"
@@ -714,7 +733,8 @@ async fn production_project_server_inner(
         &cg,
         canonical_project_path,
         profile_identity.profile_id(),
-    )?;
+    )
+    .await?;
     #[cfg(not(feature = "memory-provider-host"))]
     let _ = memory_provider_activation;
 

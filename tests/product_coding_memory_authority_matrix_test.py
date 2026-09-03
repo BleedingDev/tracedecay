@@ -128,8 +128,8 @@ class CodingMemoryAuthorityMatrixTest(unittest.TestCase):
         self.assertTrue(receipt["ok"])
         self.assertEqual(receipt["bead_id"], "tdmem-0104")
         self.assertEqual(receipt["namespace_axes"], 10)
-        self.assertEqual(receipt["authority_domains"], 11)
-        self.assertEqual(receipt["durable_domains"], 9)
+        self.assertEqual(receipt["authority_domains"], 12)
+        self.assertEqual(receipt["durable_domains"], 10)
         self.assertEqual(receipt["cross_domain_rules"], 9)
         self.assertEqual(receipt["context_lanes"], 5)
 

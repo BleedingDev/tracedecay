@@ -241,13 +241,31 @@ class ProviderRegistryContractTest(unittest.TestCase):
         )
         self.assert_rejected("providers cannot self-declare recall scope bindings")
 
-    def test_rejects_widened_native_recall_scope_bindings(self) -> None:
+    def test_rejects_drifted_native_recall_scope_bindings(self) -> None:
+        # Native's authorized set is pinned exactly. It now spans the whole
+        # closed vocabulary — owner facts plus the exact coding scope its
+        # staged session observations are attested under — so drift is proved
+        # by narrowing it rather than by appending a fourth value that the
+        # vocabulary does not contain.
+        self.mutate_contract(
+            lambda contract: contract["registration_contract"]["recall_scope_bindings"][
+                "provider_declarations"
+            ].__setitem__("tracedecay.native", ["project_facts", "profile_facts"])
+        )
+        self.assert_rejected(
+            "tracedecay.native must be authorized for exact_coding_scope, project_facts, "
+            "and profile_facts only"
+        )
+
+    def test_rejects_duplicated_native_recall_scope_bindings(self) -> None:
         self.mutate_contract(
             lambda contract: contract["registration_contract"]["recall_scope_bindings"][
                 "provider_declarations"
             ]["tracedecay.native"].append("exact_coding_scope")
         )
-        self.assert_rejected("tracedecay.native must be authorized for project_facts and profile_facts only")
+        self.assert_rejected(
+            "recall scope bindings for tracedecay.native must be a unique non-empty list"
+        )
 
     def test_rejects_ncm_recall_scope_bindings_beyond_exact_coding_scope(self) -> None:
         self.mutate_contract(

@@ -793,12 +793,7 @@ fn real_fabric_route_admits_only_exact_scope_current_candidates() -> Result<(), 
                     field: ScopeField::RepositoryIdentity
                 }
             ),
-            (
-                "unauthorized-exact-scope",
-                RecallDenialReason::ScopeBindingUnauthorized {
-                    binding: ScopeBinding::ExactCodingScope
-                }
-            ),
+            ("stale-exact-scope", RecallDenialReason::StaleIdentity),
         ]
     );
     assert_eq!(
@@ -1051,7 +1046,7 @@ fn project_facts_candidate_from_another_worktree_of_the_same_project_is_denied()
     );
     assert_eq!(
         ledger["authorized_scope_bindings"],
-        json!(["project_facts", "profile_facts"])
+        json!(["exact_coding_scope", "project_facts", "profile_facts"])
     );
     Ok(())
 }
@@ -1084,13 +1079,27 @@ fn project_facts_candidate_carrying_forbidden_identity_is_denied() -> Result<(),
 #[test]
 fn unauthorized_scope_binding_is_denied_before_any_field_comparison() -> Result<(), Box<dyn Error>>
 {
-    // Native is never authorized for exact_coding_scope, even with a scope
-    // that would match byte-for-byte.
-    let denied = admit_native(vec![candidate(
-        "exact",
-        exact_scope_candidate_value(&admitted_scope()),
-        current_validity(),
-    )])?;
+    // A provider authorized only for owner facts cannot attest
+    // exact_coding_scope, even with a scope that would match byte-for-byte:
+    // the binding is refused before any field is compared.
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &current_query(),
+        &authorized_facts_only(),
+        vec![candidate(
+            "exact",
+            exact_scope_candidate_value(&admitted_scope()),
+            current_validity(),
+        )],
+    )?;
+    assert!(admission.admitted.is_empty());
+    let denied: Vec<_> = admission
+        .report
+        .denied
+        .iter()
+        .map(|denied| denied.reason.clone())
+        .collect();
     assert_eq!(
         denied,
         vec![RecallDenialReason::ScopeBindingUnauthorized {
@@ -1282,5 +1291,86 @@ fn project_facts_candidate_from_a_foreign_project_or_profile_is_denied()
             },
         ]
     );
+    Ok(())
+}
+
+/// A staged session observation may only be admitted under
+/// `exact_coding_scope`, whatever else its provider is authorized for.
+///
+/// The real defect this catches is provider-wide authorization being read as
+/// per-candidate authorization. Native is authorized for `exact_coding_scope`,
+/// `project_facts`, and `profile_facts`, so nothing in binding authorization
+/// alone stops a provider-local staged row from claiming `project_facts` —
+/// and that binding makes the checkout fields optional and *forbids* the
+/// session identity and the resolved scope digest, so the row would be
+/// admitted in another checkout, another branch, or another agent session
+/// than the one it was observed in. The class-to-binding policy denies it
+/// before any field is compared, which is why the mutated candidates below
+/// carry a scope that would otherwise pass.
+#[test]
+fn a_staged_session_observation_cannot_be_admitted_as_project_or_profile_facts()
+-> Result<(), Box<dyn Error>> {
+    for (binding, scope) in [
+        (
+            ScopeBinding::ProjectFacts,
+            project_facts_candidate_value(&admitted_scope()),
+        ),
+        (
+            ScopeBinding::ProfileFacts,
+            json!({
+                "scope_binding": "profile_facts",
+                "profile_id": admitted_scope().profile_id,
+                "project_id": "",
+                "repository_identity": "",
+                "worktree_identity": "",
+                "branch_identity": "",
+                "agent_session_id": "",
+                "resolved_scope_digest": "",
+            }),
+        ),
+    ] {
+        let mut value = candidate_value("staged", "staged session text", scope, current_validity());
+        value["memory_class"] = json!("session_observation");
+        let admission = admit_recall_candidates(
+            &admitted_scope(),
+            "request",
+            &current_query(),
+            // Native's own authorization set: the binding itself is allowed,
+            // so only the class policy can refuse this candidate.
+            &authorized_native(),
+            vec![decode(value)],
+        )?;
+        assert!(admission.admitted.is_empty(), "{:?}", admission.admitted);
+        assert_eq!(
+            admission.report.denied[0].reason,
+            RecallDenialReason::MemoryClassBindingUnauthorized {
+                memory_class: "session_observation".to_owned(),
+                binding,
+            }
+        );
+        assert_eq!(
+            admission.report.denied[0].reason.label(),
+            "memory_class_binding_unauthorized"
+        );
+    }
+
+    // The same class under the binding it belongs to is admitted, so the
+    // policy is a class-to-binding rule and not a blanket refusal.
+    let mut value = candidate_value(
+        "staged",
+        "staged session text",
+        exact_scope_candidate_value(&admitted_scope()),
+        current_validity(),
+    );
+    value["memory_class"] = json!("session_observation");
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &current_query(),
+        &authorized_native(),
+        vec![decode(value)],
+    )?;
+    assert_eq!(admission.admitted.len(), 1);
+    assert!(admission.report.denied.is_empty());
     Ok(())
 }

@@ -18,8 +18,9 @@ use tracedecay_memory_provider_api::{
 };
 use tracedecay_memory_provider_native::{
     NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
-    NATIVE_PROVIDER_ID, NativeAdapterError, NativeMemoryApplicationPort, NativeObservation,
-    NativeProvider, OBSERVATION_CONTRACT_ID,
+    NATIVE_PROVIDER_ID, NATIVE_STAGED_SESSION_OBSERVATION_KIND,
+    NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID, NativeAdapterError, NativeMemoryApplicationPort,
+    NativeObservation, NativeProvider, OBSERVATION_CONTRACT_ID,
 };
 
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -33,6 +34,40 @@ const FACT_SHAPED_OBSERVATION: &[u8] = b"{\"native_fact\":{\"owner\":\"project\"
 const PROMOTED_OBSERVATION: &[u8] = b"{\"canonical_payload\":{\"fact\":\"promote\"},\"observation_kind\":\"native.fact_promoted.v1\",\"payload_contract\":\"tracedecay.memory.observation.native-fact-promotion.v1\"}";
 const PROMOTED_OBSERVATION_SHA: &str =
     "e5e7fdeecb1a62f0ecd1f5330b50cd96bb4e90dc26c37e114d7860ffdcf0e9a2";
+const SESSION_MESSAGE_OBSERVATION: &str = "{\"canonical_payload\":{\"event\":\"staged\"},\"observation_kind\":\"session.message_committed.v1\",\"payload_contract\":\"tracedecay.memory.observation.session-message.v1\"}";
+const SESSION_MESSAGE_OBSERVATION_SHA: &str =
+    "9944b6c6a88edd3d3518110ebcba9566de1b077ff3ae1f0c19a21c47be76b291";
+/// The session kind carrying the fact-promotion payload contract: a kind the
+/// adapter now accepts must still be refused when its declared contract pair
+/// is broken.
+const SESSION_KIND_WRONG_CONTRACT: &str = "{\"canonical_payload\":{\"event\":\"staged\"},\"observation_kind\":\"session.message_committed.v1\",\"payload_contract\":\"tracedecay.memory.observation.native-fact-promotion.v1\"}";
+const SESSION_KIND_WRONG_CONTRACT_SHA: &str =
+    "c4573bb3d11015734ec9a19f8e1294635f65ba8d6b96d77a5e64b7773210f733";
+
+/// What the adapter handed the port: the classified variant plus the exact
+/// envelope fields it carried.
+#[derive(Clone, Debug, PartialEq)]
+struct ObservedVariant {
+    variant: &'static str,
+    observation_kind: String,
+    payload_contract: String,
+    canonical_payload: Value,
+}
+
+impl ObservedVariant {
+    fn capture(observation: &NativeObservation<'_>) -> Self {
+        let variant = match observation {
+            NativeObservation::FactPromotion(_) => "fact_promotion",
+            NativeObservation::StagedSession(_) => "staged_session",
+        };
+        Self {
+            variant,
+            observation_kind: observation.observation_kind().to_owned(),
+            payload_contract: observation.payload_contract().to_owned(),
+            canonical_payload: observation.canonical_payload().clone(),
+        }
+    }
+}
 
 #[derive(Default)]
 struct Counters {
@@ -76,7 +111,7 @@ struct MockNativePort {
     observation_code: TerminalCode,
     counters: Counters,
     last_call: Mutex<Option<ProviderCall>>,
-    last_observation: Mutex<Option<(String, String, Value)>>,
+    last_observation: Mutex<Option<ObservedVariant>>,
     last_handshake: Mutex<Option<HandshakeRequest>>,
 }
 
@@ -217,13 +252,10 @@ impl NativeMemoryApplicationPort for MockNativePort {
 
     fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
         self.counters.observe.fetch_add(1, Ordering::Relaxed);
-        *self.last_observation.lock().expect("last observation lock") = Some((
-            observation.observation_kind.clone(),
-            observation.payload_contract.clone(),
-            observation.canonical_payload.clone(),
-        ));
-        self.record(observation.call);
-        self.terminal(observation.call, self.observation_code)
+        *self.last_observation.lock().expect("last observation lock") =
+            Some(ObservedVariant::capture(&observation));
+        self.record(observation.call());
+        self.terminal(observation.call(), self.observation_code)
     }
 
     fn recall(&self, call: &ProviderCall) -> ProviderReply {
@@ -1107,9 +1139,19 @@ fn promoted_observation_is_typed_and_preserves_the_original_call() {
         .expect("last observation lock")
         .clone()
         .expect("typed observation");
-    assert_eq!(parsed.0, NATIVE_FACT_PROMOTION_OBSERVATION_KIND);
-    assert_eq!(parsed.1, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID);
-    assert_eq!(parsed.2, serde_json::json!({"fact": "promote"}));
+    assert_eq!(parsed.variant, "fact_promotion");
+    assert_eq!(
+        parsed.observation_kind,
+        NATIVE_FACT_PROMOTION_OBSERVATION_KIND
+    );
+    assert_eq!(
+        parsed.payload_contract,
+        NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID
+    );
+    assert_eq!(
+        parsed.canonical_payload,
+        serde_json::json!({"fact": "promote"})
+    );
 
     let recorded = port
         .last_call
@@ -1145,16 +1187,11 @@ fn promoted_observation_is_typed_and_preserves_the_original_call() {
 }
 
 #[test]
-fn known_non_native_observation_kinds_are_staged_without_native_contact() {
+fn known_unaccepted_observation_kinds_are_refused_without_native_contact() {
     let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
     let provider = NativeProvider::new(port.clone()).expect("adapter");
     let descriptor_calls = port.counters.descriptor.load(Ordering::Relaxed);
     let cases = [
-        (
-            "session.message_committed.v1",
-            "tracedecay.memory.observation.session-message.v1",
-            "9944b6c6a88edd3d3518110ebcba9566de1b077ff3ae1f0c19a21c47be76b291",
-        ),
         (
             "tool.execution_settled.v1",
             "tracedecay.memory.observation.tool-execution.v1",
@@ -1203,7 +1240,7 @@ fn known_non_native_observation_kinds_are_staged_without_native_contact() {
         );
         assert_eq!(
             reply.terminal.diagnostic_id(),
-            Some("native.observation_staged")
+            Some("native.observation_unsupported")
         );
     }
 
@@ -1213,6 +1250,79 @@ fn known_non_native_observation_kinds_are_staged_without_native_contact() {
         descriptor_calls
     );
     assert!(port.last_call.lock().expect("last call lock").is_none());
+}
+
+/// The one host kind Native accepts reaches the port as its own typed
+/// variant, with the admitted call and canonical bytes unchanged.
+#[test]
+fn session_message_observation_is_typed_as_staged_and_preserves_the_original_call() {
+    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+    let request = observation_call(SESSION_MESSAGE_OBSERVATION, SESSION_MESSAGE_OBSERVATION_SHA);
+    let reply = provider.invoke(&request);
+
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(port.counters.observe.load(Ordering::Relaxed), 1);
+    let parsed = port
+        .last_observation
+        .lock()
+        .expect("last observation lock")
+        .clone()
+        .expect("typed observation");
+    assert_eq!(
+        parsed,
+        ObservedVariant {
+            variant: "staged_session",
+            observation_kind: NATIVE_STAGED_SESSION_OBSERVATION_KIND.to_owned(),
+            payload_contract: NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID.to_owned(),
+            canonical_payload: serde_json::json!({"event": "staged"}),
+        }
+    );
+
+    // The port receives the admitted call untouched: same sanitized bytes,
+    // same exact scope, same idempotency and operation identity. Staging must
+    // store what admission sanitized, not a re-derived payload.
+    let recorded = port
+        .last_call
+        .lock()
+        .expect("last call lock")
+        .clone()
+        .expect("recorded observation");
+    assert_eq!(recorded.payload, request.payload);
+    assert_eq!(
+        recorded.payload.bytes,
+        SESSION_MESSAGE_OBSERVATION.as_bytes()
+    );
+    assert_eq!(recorded.exact_scope, request.exact_scope);
+    assert_eq!(recorded.idempotency_key, request.idempotency_key);
+    assert_eq!(recorded.operation_id, request.operation_id);
+    assert_eq!(recorded.request_id, request.request_id);
+    assert_eq!(
+        recorded.registration_revision,
+        request.registration_revision
+    );
+    assert_eq!(recorded.extensions, request.extensions);
+}
+
+/// Accepting the session kind does not loosen its contract pairing: the kind
+/// is accepted only with the payload contract the observation contract
+/// declares for it.
+#[test]
+fn session_message_kind_with_a_foreign_payload_contract_is_refused_before_native_contact() {
+    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+    let reply = provider.invoke(&observation_call(
+        SESSION_KIND_WRONG_CONTRACT,
+        SESSION_KIND_WRONG_CONTRACT_SHA,
+    ));
+
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some("native.observation_kind_contract_mismatch")
+    );
+    assert_eq!(port.counters.observe.load(Ordering::Relaxed), 0);
+    assert!(port.last_observation.lock().expect("lock").is_none());
 }
 
 #[test]

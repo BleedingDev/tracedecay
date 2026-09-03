@@ -32,12 +32,16 @@ EXPECTED_DOMAINS = {
     "session_evidence",
     "explicit_facts",
     "provider_observation_journal",
+    "native_staged_observations",
     "provider_cognitive_state",
     "provider_recall_candidates",
     "curated_rules",
     "final_compiled_context",
 }
 
+# Durable domains must each name exactly one canonical writer. Durability is
+# not the same as canonical authority: `native_staged_observations` is durable
+# provider-local state with one writer, and is still advisory.
 DURABLE_DOMAINS = {
     "current_code_truth",
     "repository_identity",
@@ -46,6 +50,7 @@ DURABLE_DOMAINS = {
     "session_evidence",
     "explicit_facts",
     "provider_observation_journal",
+    "native_staged_observations",
     "provider_cognitive_state",
     "curated_rules",
 }
@@ -63,6 +68,7 @@ EXPECTED_CLASSES = {
     "session_evidence": "canonical",
     "explicit_facts": "canonical",
     "provider_observation_journal": "canonical",
+    "native_staged_observations": "advisory_durable",
     "provider_cognitive_state": "canonical_external",
     "provider_recall_candidates": "advisory_ephemeral",
     "curated_rules": "canonical",
@@ -437,6 +443,29 @@ def validate_domain_decisions(domains: dict[str, dict[str, Any]], errors: list[s
     observation_failure = str(observations.get("failure_behavior", ""))
     if not contains_all(observation_failure, ["cannot alter prompts", "cannot alter", "Capacity exhaustion"]):
         errors.append("provider observations must fail visibly without canonical influence")
+
+    staged = domains.get("native_staged_observations", {})
+    if staged.get("owner") != "project_native_memory_application_port":
+        errors.append(
+            "native_staged_observations must be written only by the Native application port"
+        )
+    staged_semantics = str(staged.get("provider_semantics", ""))
+    if not contains_all(
+        staged_semantics,
+        ["advisory", "never replace", "exact_coding_scope"],
+    ):
+        errors.append(
+            "staged observations must stay advisory, scope-bound, and subordinate to canonical "
+            "session evidence"
+        )
+    staged_prohibited = "\n".join(staged.get("prohibited_side_effects", []))
+    for marker in (
+        "canonical Native fact table",
+        "before its staged row is durably committed",
+        "wider than the exact scope",
+    ):
+        if marker not in staged_prohibited:
+            errors.append(f"staged observations must prohibit {marker!r}")
 
     cognitive = domains.get("provider_cognitive_state", {})
     if cognitive.get("owner") != "selected_provider_instance":

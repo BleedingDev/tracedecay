@@ -457,17 +457,16 @@ async fn port_admits_only_exact_scope_current_candidates_and_reports_denials() {
                     field: ScopeField::RepositoryIdentity
                 }
             ),
-            (
-                "unauthorized-exact-scope",
-                RecallDenialReason::ScopeBindingUnauthorized {
-                    binding: ScopeBinding::ExactCodingScope
-                }
-            ),
+            ("stale-exact-scope", RecallDenialReason::StaleIdentity),
         ]
     );
     assert_eq!(
         report.authorized_scope_bindings,
-        RecallScopeBindingsV1::new([ScopeBinding::ProjectFacts, ScopeBinding::ProfileFacts])
+        RecallScopeBindingsV1::new([
+            ScopeBinding::ExactCodingScope,
+            ScopeBinding::ProjectFacts,
+            ScopeBinding::ProfileFacts
+        ])
     );
     assert_eq!(report.request_id, "request.recall-port");
     let expected_scope = TestScopeBinding

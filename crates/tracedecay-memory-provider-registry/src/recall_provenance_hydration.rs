@@ -455,6 +455,36 @@ pub trait HostCanonicalRecordStore: Send + Sync {
     ) -> Result<(), HostEvidenceLookupErrorV1>;
 }
 
+/// Host store that decides whether a claim the host does *not* recognise as
+/// one of its own evidence shapes is nevertheless a provider-local reference
+/// the host itself hosts.
+///
+/// This exists because some provider state is legitimately not host evidence.
+/// A supervised provider's own staged rows live in a store the host granted
+/// and placed, addressed by a reference the host's own product code mints;
+/// there is no source range, session ordinal, or canonical record to cite for
+/// them, and inventing one would be exactly the fabrication
+/// [`HostProvenanceAuthority`] exists to prevent. Recognising such a claim is
+/// therefore *not* confirmation: an accepted claim stays
+/// [`ProviderItemProvenanceV1::Available`] — provider-attested, never cited
+/// grounding, never the host-confirmed trust tier — and its text still passes
+/// every containment gate a provider claim passes. What acceptance buys is
+/// only that the claim is not discarded as malformed.
+pub trait HostProviderLocalAttestationStore: Send + Sync {
+    /// Decides one provider-local reference inside the authoritative scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`HostEvidenceLookupErrorV1`] when the reference is
+    /// not one this host mints, belongs to another scope, or cannot be
+    /// decided.
+    fn attest_provider_local(
+        &self,
+        scope: &HostEvidenceScopeV1,
+        claimed_source: &str,
+    ) -> Result<(), HostEvidenceLookupErrorV1>;
+}
+
 /// Host authority that resolves a provider-claimed source reference into
 /// exact, confirmed host evidence.
 ///
@@ -479,6 +509,31 @@ pub trait HostProvenanceAuthority: Send + Sync {
         scope: &HostEvidenceScopeV1,
         control: &HostEvidenceControlV1<'_>,
     ) -> Result<HostEvidenceRefV1, ProvenanceHydrationError>;
+
+    /// Decides a claim [`Self::resolve`] refused as malformed, when the host
+    /// nevertheless recognises it as provider-local state it hosts itself.
+    ///
+    /// The default refuses everything, so an authority that mounts no
+    /// attestation store behaves exactly as before: a claim that is not a
+    /// host evidence shape stays unresolvable and is excluded under the
+    /// default policy. Accepting a claim here never upgrades it — the
+    /// candidate remains provider-attested.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProvenanceHydrationError::Malformed`] when the claim is not
+    /// provider-local state this host recognises, or
+    /// [`ProvenanceHydrationError::Unresolvable`] when a store refused it.
+    fn attest_provider_local(
+        &self,
+        source: &str,
+        _scope: &HostEvidenceScopeV1,
+        _control: &HostEvidenceControlV1<'_>,
+    ) -> Result<(), ProvenanceHydrationError> {
+        Err(ProvenanceHydrationError::Malformed {
+            claimed_source: source.to_owned(),
+        })
+    }
 }
 
 /// Rejects any claimed source path that is not a plain relative path inside
@@ -525,6 +580,7 @@ pub struct MountedHostProvenanceAuthorityV1 {
     source: Arc<dyn HostSourceEvidenceStore>,
     session: Arc<dyn HostSessionEvidenceStore>,
     record: Arc<dyn HostCanonicalRecordStore>,
+    provider_local: Option<Arc<dyn HostProviderLocalAttestationStore>>,
 }
 
 impl fmt::Debug for MountedHostProvenanceAuthorityV1 {
@@ -547,7 +603,23 @@ impl MountedHostProvenanceAuthorityV1 {
             source,
             session,
             record,
+            provider_local: None,
         }
+    }
+
+    /// Mounts an additional store that decides provider-local references the
+    /// three evidence stores cannot resolve.
+    ///
+    /// A host that mounts one is saying: these references are mine to
+    /// recognise. It is never saying they are cited evidence — an attested
+    /// claim stays provider-attested.
+    #[must_use]
+    pub fn with_provider_local_attestation(
+        mut self,
+        provider_local: Arc<dyn HostProviderLocalAttestationStore>,
+    ) -> Self {
+        self.provider_local = Some(provider_local);
+        self
     }
 }
 
@@ -620,6 +692,23 @@ impl HostProvenanceAuthority for MountedHostProvenanceAuthorityV1 {
             }
         }
         Ok(evidence)
+    }
+
+    fn attest_provider_local(
+        &self,
+        source: &str,
+        scope: &HostEvidenceScopeV1,
+        control: &HostEvidenceControlV1<'_>,
+    ) -> Result<(), ProvenanceHydrationError> {
+        control.check(source)?;
+        let Some(store) = self.provider_local.as_ref() else {
+            return Err(ProvenanceHydrationError::Malformed {
+                claimed_source: source.to_owned(),
+            });
+        };
+        store
+            .attest_provider_local(scope, source)
+            .map_err(|error| unresolvable(source, error.to_string()))
     }
 }
 
@@ -926,10 +1015,29 @@ impl ProvenanceHydrationPassV1 {
                 provenance: ProviderItemProvenanceV1::Hydrated { evidence },
                 excluded: false,
             },
-            Err(ProvenanceHydrationError::Malformed { claimed_source }) => self.unresolved(
-                &claimed_source,
-                "does not name a host-recognised evidence shape",
-            ),
+            // A claim the host cannot resolve is not automatically a claim the
+            // host does not recognise. Provider-local state the host itself
+            // hosts gets one decision here, from a store the host mounted; an
+            // accepted claim survives as `Available` — provider-attested, not
+            // cited grounding, and not the host-confirmed trust tier — while
+            // everything else stays unresolvable exactly as before.
+            Err(ProvenanceHydrationError::Malformed { claimed_source }) => {
+                match authority.attest_provider_local(&claimed_source, scope, control) {
+                    Ok(()) => ProvenanceHydrationDecisionV1 {
+                        provenance: ProviderItemProvenanceV1::Available {
+                            source: claimed_source,
+                        },
+                        excluded: false,
+                    },
+                    Err(ProvenanceHydrationError::Unresolvable { reason, .. }) => {
+                        self.unresolved(&claimed_source, reason)
+                    }
+                    Err(_) => self.unresolved(
+                        &claimed_source,
+                        "does not name a host-recognised evidence shape",
+                    ),
+                }
+            }
             Err(ProvenanceHydrationError::Unresolvable {
                 claimed_source,
                 reason,

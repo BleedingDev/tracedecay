@@ -149,7 +149,8 @@
         "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
         "crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs",
         "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs",
-        "crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs"
+        "crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs",
+        "crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs"
       ],
       "touch_points": [
         "workspace_wiring",
@@ -172,7 +173,7 @@
         "Provider terminals cannot claim effects that the Native application port did not report.",
         "Native recall is read-only, exact-scope bound, and semantically equal to the direct Native search after ADR-documented envelope normalization.",
         "Native recall candidates carry validity instants as utc_rfc3339_nanos strings so the host admission authority can evaluate them; Native emits only current active-fact projections and never fabricates revocation or supersession.",
-        "A Native recall candidate's exact_scope_identity attests only the identity the fact record proves (its owner project); profile, repository, worktree, branch, session, and resolved-scope fields are emitted empty because the retained project store has no such dimension, so the host admission authority denies every Native candidate as unknown_identity with an audit row. Native recall stays scope-denied until fact scope is persisted at commit; the adapter never echoes the request scope onto a candidate.",
+        "A Native recall candidate attests only the identity its own record proves. A canonical fact candidate's exact_scope_identity names the owner project alone; profile, repository, worktree, branch, session, and resolved-scope fields are emitted empty because the retained project store has no such dimension, so the host admission authority denies every such candidate as unknown_identity with an audit row, and fact recall stays scope-denied until fact scope is persisted at commit. A staged session-observation candidate attests all seven fields under exact_coding_scope because the staged store persisted the host-attested exact scope at admission; because exact-scope admission compares agent_session_id and resolved_scope_digest byte-for-byte, staged recall is same-session only (tdmem-b8q). Neither path ever echoes the request scope onto a candidate: scope is read from the stored record, never from the recall request.",
         "The Native baseline runs the production adapter and application port over the provider-neutral scenario corpus and records measured terminals without fabricating admission."
       ],
       "tests": [

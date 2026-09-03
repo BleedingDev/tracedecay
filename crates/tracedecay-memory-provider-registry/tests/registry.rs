@@ -251,7 +251,7 @@ impl NativeMemoryApplicationPort for EvidenceNativePort {
 
     fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
         self.observe_calls.fetch_add(1, Ordering::Relaxed);
-        self.committed_observation_reply(observation.call)
+        self.committed_observation_reply(observation.call())
     }
 
     fn recall(&self, _call: &ProviderCall) -> ProviderReply {

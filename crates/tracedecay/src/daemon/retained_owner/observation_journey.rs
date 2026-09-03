@@ -42,15 +42,19 @@
 //!
 //! # What Native does with these observations today
 //!
-//! Native declares `observation.accept.v1`, and its adapter recognises
-//! `session.message_committed.v1` as a known kind paired with a known payload
-//! contract — but it currently answers `capability_unsupported` with the
-//! diagnostic `native.observation_staged` for every kind except its own fact
-//! promotion. That is a real, typed, non-retryable terminal, and this journey
-//! records it as one: the row settles `Rejected` after a single attempt rather
-//! than retrying forever, and nothing here rounds a staged kind up to a
-//! success. The delivery path is genuinely mounted and genuinely exercised;
-//! what is not yet true is that Native *ingests* session messages.
+//! Native declares `observation.accept.v1`, and its adapter accepts exactly
+//! two kinds: its own `native.fact_promoted.v1`, and
+//! `session.message_committed.v1` paired with its declared payload contract.
+//! A session message reaches the project-owned Native application port, which
+//! durably commits it to the provider-local staged-observation store under the
+//! host-granted provider-state root *before* answering, so the row settles
+//! `Acknowledged` with committed effect evidence after a single attempt. A
+//! staged row is advisory provider state that becomes a recall candidate for
+//! its own exact coding scope; it is never a canonical fact, and promotion to
+//! a fact remains the separate explicit path. Every other contract-known kind
+//! still answers `capability_unsupported` with the diagnostic
+//! `native.observation_unsupported`, which this journey records as one typed,
+//! non-retried rejection.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -107,7 +111,7 @@ const JOURNAL_FILE_NAME: &str = "memory-observation-journal-v1.sqlite3";
 /// contained under, inside the canonical store layout. The host creates it and
 /// grants each admitted namespace a capability rooted beneath it; a provider
 /// never names a path outside it (`tdmem-1107`).
-const PROVIDER_STATE_DIR_NAME: &str = "provider-state";
+pub(crate) const PROVIDER_STATE_DIR_NAME: &str = "provider-state";
 
 /// Domain separator for the product-owned binding from a canonical source
 /// session identity to a provider-qualified `agent_session_id`.
@@ -3391,34 +3395,40 @@ mod tests {
 
         fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
             self.observe_calls.fetch_add(1, Ordering::Relaxed);
+            let call = observation.call();
             self.delivered.lock().unwrap().push(DeliveredObservation {
-                bytes: observation.call.payload.bytes.clone(),
-                exact_scope: observation.call.exact_scope.clone(),
+                bytes: call.payload.bytes.clone(),
+                exact_scope: call.exact_scope.clone(),
             });
-            let generation_after = observation.call.expected_state_generation.saturating_add(1);
+            // The generation this port declares is its descriptor's, and the
+            // descriptor is fixed for the incarnation — exactly like the real
+            // Native port. Reporting an advance here would be read back as a
+            // regression at the next handshake and refuse every later
+            // delivery, so the committed effect is non-regressing and
+            // unchanged, which the contract permits.
             ProviderReply {
                 terminal: TerminalRecord::new(
                     ProviderOperation::Observe,
-                    observation.call.provider_id.clone(),
+                    call.provider_id.clone(),
                     TerminalCode::Success,
                     CommittedEffectEvidence::committed(
-                        observation.call.expected_state_generation,
-                        generation_after,
+                        call.expected_state_generation,
+                        call.expected_state_generation,
                         vec!["observation:journey-test".to_owned()],
                         PROVIDER_RECEIPT,
                         EFFECT_DIGEST,
                     )
                     .expect("committed effect"),
                     FallbackDirective::forbidden(),
-                    observation.call.operation_id.clone(),
-                    observation.call.exact_scope.exact_scope_sha256(),
+                    call.operation_id.clone(),
+                    call.exact_scope.exact_scope_sha256(),
                     None,
                 )
                 .expect("observation terminal"),
-                payload: Some(observation.call.payload.clone()),
+                payload: Some(call.payload.clone()),
                 warnings: Vec::new(),
-                extensions: observation.call.extensions.clone(),
-                state_generation: generation_after,
+                extensions: call.extensions.clone(),
+                state_generation: call.expected_state_generation,
             }
         }
 
@@ -3731,7 +3741,9 @@ mod tests {
         }
     }
 
-    fn composition(port: Arc<JourneyNativePort>) -> Arc<ProjectMemoryProviderComposition> {
+    fn composition(
+        port: Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>,
+    ) -> Arc<ProjectMemoryProviderComposition> {
         Arc::new(
             ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
                 fabric_config: FabricConfig {
@@ -3958,7 +3970,7 @@ mod tests {
         let (state, attempts) = wait_for_settlement(journey.journal_path()).await;
         assert_eq!(
             (state.as_str(), attempts),
-            ("rejected", 1),
+            ("acknowledged", 1),
             "delivery never reached the provider under the verified generation: {}",
             journal_snapshot(journey.journal_path())
         );
@@ -4082,7 +4094,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn live_canonical_commit_settles_typed_native_rejection_with_receipt() {
+    async fn live_canonical_commit_settles_native_session_acknowledgement_with_receipt() {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
             .with_max_level(tracing::Level::DEBUG)
@@ -4104,7 +4116,8 @@ mod tests {
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).expect("journal root");
         let journey = mount_project_observation_journey(ObservationJourneyMountInputsV1 {
-            composition: composition(Arc::clone(&port)),
+            composition: composition(Arc::clone(&port)
+                as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>),
             profile_id: UserProfileId::new("profile.observation-journey").expect("profile id"),
             scope: resolved_scope.clone(),
             authoritative_project_id: project_id.clone(),
@@ -4176,33 +4189,237 @@ mod tests {
             assert_eq!(bytes, expected_bytes);
         }
 
-        // Native currently answers `capability_unsupported` /
-        // `native.observation_staged` for session messages before its port is
-        // reached. The journey must record that as one typed, non-retried
-        // rejection with an immutable attempt receipt, not loop on it.
+        // Native accepts `session.message_committed.v1`, so the record
+        // reaches the provider exactly once and settles as an
+        // acknowledgement carrying the provider's committed-effect
+        // evidence — not as a rejection, and not by retrying.
         let (state, attempts) = wait_for_settlement(journey.journal_path()).await;
         assert_eq!(
             (state.as_str(), attempts),
-            ("rejected", 1),
+            ("acknowledged", 1),
             "{}",
             journal_snapshot(journey.journal_path())
         );
-        assert_eq!(port.observe_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(port.observe_calls.load(Ordering::Relaxed), 1);
+        // The bytes and scope the provider was called with are the journal
+        // row's own, not a re-derivation.
+        {
+            let delivered = port.delivered.lock().unwrap();
+            assert_eq!(delivered.len(), 1);
+            assert_eq!(delivered[0].bytes, expected_bytes);
+            assert_eq!(delivered[0].exact_scope, expected_scope);
+        }
         {
             let connection = rusqlite::Connection::open(journey.journal_path()).unwrap();
-            let (receipts, outcome, effect): (i64, String, String) = connection
+            let (receipts, outcome, effect, receipt_digest): (i64, String, String, String) =
+                connection
+                    .query_row(
+                        "SELECT COUNT(*), MIN(outcome), MIN(committed_effect), \
+                                MIN(provider_receipt_digest) \
+                         FROM tdmem_observation_receipt_v1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .unwrap();
+            assert_eq!(receipts, 1);
+            // `committed` on the provider side is `applied` in the journal's
+            // own vocabulary: the delivery applied a provider-local effect.
+            assert_eq!(effect, "applied");
+            assert_eq!(outcome, "applied");
+            assert_eq!(receipt_digest, PROVIDER_RECEIPT);
+        }
+
+        journey
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+    }
+
+    /// The real Native port on the mounted journey, with a durability fault
+    /// injected between the staged insert and its commit.
+    ///
+    /// The real defect this catches is a lost observation: a staged commit
+    /// that fails must leave the delivery *redeliverable* and stage nothing,
+    /// and the journey's own dispatcher — not a hand-written second call —
+    /// must bring it back and settle it once. The port under test is the
+    /// production `ProjectNativeMemoryApplicationPort`, so the staged store,
+    /// the terminal it answers, the journal's retry classification, and the
+    /// dispatcher's redelivery are all the real ones.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_staged_commit_fault_is_redelivered_by_the_journey_and_settles_once() {
+        let temp = TempDir::new().expect("temporary journey root");
+        let project_id = ProjectId::new("project.observation-journey-fault").expect("project id");
+        let runtime = HostAdmissionTestRuntimeV1::project(
+            &temp.path().join("profile"),
+            &temp.path().join("project"),
+            project_id.clone(),
+        )
+        .await
+        .expect("registered project database");
+        let store = runtime
+            .registered_database_arc(HostAdmissionScope::Project)
+            .expect("project database")
+            .observation_store();
+
+        // The production Native port. Its graph is a real project fixture of
+        // its own; the staged path never consults it, and what matters here is
+        // the provider-local staged store the port opens under the
+        // host-granted provider-state root.
+        let port_project_root = temp.path().join("native-project");
+        let port_profile_root = temp.path().join("native-profile");
+        std::fs::create_dir_all(&port_project_root).expect("native project root");
+        std::fs::create_dir_all(&port_profile_root).expect("native profile root");
+        let graph = Arc::new(
+            crate::tracedecay::TraceDecay::init_with_options(
+                &port_project_root,
+                crate::tracedecay::TraceDecayOpenOptions {
+                    global_db_path: Some(port_profile_root.join("global.db")),
+                    profile_root: Some(port_profile_root),
+                },
+            )
+            .await
+            .expect("initialize the Native port graph"),
+        );
+        let provider_state_root = temp.path().join("provider-state");
+        let port = Arc::new(
+            super::super::native_provider::ProjectNativeMemoryApplicationPort::new(
+                Arc::new(tokio::sync::RwLock::new(graph)),
+                port_project_root,
+                UserProfileId::new("profile.observation-journey-fault").expect("profile id"),
+                &provider_state_root,
+            )
+            .expect("construct the production Native application port"),
+        );
+        let staged_rows = || -> i64 {
+            let path = crate::daemon::retained_owner::native_staged_observations::staged_store_path(
+                &provider_state_root,
+            );
+            rusqlite::Connection::open(path)
+                .expect("staged observation store")
                 .query_row(
-                    "SELECT COUNT(*), MIN(outcome), MIN(committed_effect) \
-                     FROM tdmem_observation_receipt_v1",
+                    "SELECT COUNT(*) FROM tdmem_native_staged_observation_v1",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| row.get(0),
+                )
+                .expect("staged row count")
+        };
+
+        let resolved_scope = scope(project_id.clone());
+        let journal_root = temp.path().join("journey");
+        std::fs::create_dir_all(&journal_root).expect("journal root");
+        let journey = mount_project_observation_journey(ObservationJourneyMountInputsV1 {
+            composition: composition(Arc::clone(&port)
+                as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>),
+            profile_id: UserProfileId::new("profile.observation-journey-fault")
+                .expect("profile id"),
+            scope: resolved_scope,
+            authoritative_project_id: project_id.clone(),
+            store_data_root: journal_root,
+            registration_revision: 1,
+            host_limits: super::super::native_provider::native_provider_limits(),
+            policy: ObservationJourneyPolicyV1::project_default(),
+        })
+        .expect("mounted journey");
+        journey
+            .start_live_replay(store.clone())
+            .expect("live replay task");
+
+        // Arm the fault before the record exists, so the first delivery the
+        // dispatcher makes is the one that cannot commit.
+        port.staged_store().fail_next_commit();
+
+        let session_id = SessionId::new("session.observation-journey-fault").expect("session id");
+        let observation = canonical_observation(&project_id, &session_id, "faulted journey text");
+        store
+            .persist_observation(anchored_write(observation))
+            .await
+            .expect("canonical observation commit");
+
+        // The first attempt: a retryable refusal that stages nothing and
+        // leaves the delivery deliverable.
+        let first_attempt = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let connection =
+                    rusqlite::Connection::open(journey.journal_path()).expect("journal");
+                let row = connection
+                    .query_row(
+                        "SELECT state, attempt_number, last_outcome \
+                         FROM tdmem_observation_delivery_v1",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                            ))
+                        },
+                    )
+                    .ok();
+                match row {
+                    Some((state, attempts, outcome))
+                        if attempts >= 1 && outcome == "provider_unavailable" =>
+                    {
+                        return (state, attempts, staged_rows());
+                    }
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the faulted delivery never reported a retryable outcome; {}",
+                journal_snapshot(journey.journal_path())
+            )
+        });
+        let (first_state, first_attempts, staged_after_fault) = first_attempt;
+        assert_eq!(first_attempts, 1);
+        assert!(
+            first_state == "pending" || first_state == "leased",
+            "a retryable refusal must leave the delivery deliverable, found {first_state}"
+        );
+        assert_eq!(
+            staged_after_fault, 0,
+            "the rolled-back transaction left a staged row behind"
+        );
+
+        // The dispatcher's own redelivery settles it, once.
+        let (state, attempts) = wait_for_settlement(journey.journal_path()).await;
+        assert_eq!(
+            (state.as_str(), attempts),
+            ("acknowledged", 2),
+            "{}",
+            journal_snapshot(journey.journal_path())
+        );
+        assert_eq!(
+            staged_rows(),
+            1,
+            "the redelivery staged a second row instead of committing exactly one"
+        );
+
+        // Both attempts are on the record, in order, with the committed effect
+        // claimed only by the one that actually committed.
+        {
+            let connection = rusqlite::Connection::open(journey.journal_path()).unwrap();
+            let mut statement = connection
+                .prepare(
+                    "SELECT outcome, committed_effect FROM tdmem_observation_receipt_v1 \
+                     ORDER BY attempt_number",
                 )
                 .unwrap();
-            assert_eq!(receipts, 1);
-            assert_eq!(effect, "none");
-            // The journal maps a `capability_unsupported` terminal onto its
-            // unsupported-rejection outcome class.
-            assert_eq!(outcome, "rejected_extension_unsupported");
+            let receipts: Vec<(String, String)> = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect();
+            assert_eq!(
+                receipts,
+                vec![
+                    ("provider_unavailable".to_owned(), "none".to_owned()),
+                    ("applied".to_owned(), "applied".to_owned()),
+                ],
+                "{}",
+                journal_snapshot(journey.journal_path())
+            );
         }
 
         journey
@@ -4342,15 +4559,22 @@ mod tests {
             .expect("beta commit");
 
         let deliveries = wait_for_deliveries(journey.journal_path(), 2).await;
-        for (_, state, attempts) in &deliveries {
+        for (_, state, _) in &deliveries {
             assert_eq!(
-                (state.as_str(), *attempts),
-                ("rejected", 1),
+                state.as_str(),
+                "acknowledged",
                 "{}",
                 journal_snapshot(journey.journal_path())
             );
         }
-        assert_eq!(first_port.observe_calls.load(Ordering::Relaxed), 0);
+        // The attempt count is deliberately not pinned here: two interleaved
+        // session scopes share one registration and therefore one readiness
+        // slot, so a delivery may legitimately spend an attempt on a readiness
+        // the other scope displaced. What this test fixes is that both settle
+        // as acknowledgements, each bound to its own exact scope, and that the
+        // provider was asked exactly once per record — a retry that loses the
+        // readiness race never reaches the provider at all.
+        assert_eq!(first_port.observe_calls.load(Ordering::Relaxed), 2);
         {
             let connection = rusqlite::Connection::open(journey.journal_path()).unwrap();
             let mut statement = connection
@@ -4430,8 +4654,8 @@ mod tests {
             .iter()
             .find(|(id, _, _)| *id == gamma_id)
             .expect("gamma delivery row");
-        assert_eq!((gamma_row.1.as_str(), gamma_row.2), ("rejected", 1));
-        assert_eq!(second_port.observe_calls.load(Ordering::Relaxed), 0);
+        assert_eq!((gamma_row.1.as_str(), gamma_row.2), ("acknowledged", 1));
+        assert_eq!(second_port.observe_calls.load(Ordering::Relaxed), 1);
         {
             let connection = rusqlite::Connection::open(&journal_path).unwrap();
             let (journal, receipts, watermark): (i64, i64, i64) = connection
@@ -4499,7 +4723,8 @@ mod tests {
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).expect("journal root");
         let journey = mount_project_observation_journey(ObservationJourneyMountInputsV1 {
-            composition: composition(Arc::clone(&port)),
+            composition: composition(Arc::clone(&port)
+                as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>),
             profile_id: UserProfileId::new("profile.observation-hygiene").expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
@@ -4826,7 +5051,7 @@ mod tests {
             }
         );
         let (state, _) = wait_for_settlement(fixture.journey.journal_path()).await;
-        assert_eq!(state, "rejected");
+        assert_eq!(state, "acknowledged");
 
         {
             let connection =
@@ -5162,18 +5387,31 @@ mod tests {
             .expect("canonical record still present");
         assert_eq!(stored.observation().payload(), &canonical_payload);
 
-        // Delivery runs over the journalled bytes and settles as Native's typed
-        // staged rejection; the sanitized row is what was offered, not the
-        // source, and a second replay does not re-admit the event.
+        // Delivery runs over the journalled bytes and Native acknowledges
+        // them; the sanitized row is what was offered, not the source, and a
+        // second replay does not re-admit the event.
         fixture.journey.wake_delivery();
         let (state, attempts) = wait_for_settlement(fixture.journey.journal_path()).await;
         assert_eq!(
             (state.as_str(), attempts),
-            ("rejected", 1),
+            ("acknowledged", 1),
             "{}",
             journal_snapshot(fixture.journey.journal_path())
         );
-        assert_eq!(fixture.port.observe_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fixture.port.observe_calls.load(Ordering::Relaxed), 1);
+        // The bytes that reached the provider are the redacted journal bytes:
+        // the secret never leaves the sanitizer, delivery included.
+        {
+            let delivered = fixture.port.delivered.lock().unwrap();
+            assert_eq!(delivered.len(), 1);
+            assert!(
+                !delivered[0]
+                    .bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "the assignment reached the provider call"
+            );
+        }
         let admitted_again = fixture
             .journey
             .replay_canonical_observations(&fixture.store, REPLAY_LIVE_PAGES, open_bounds())
@@ -5405,7 +5643,8 @@ mod tests {
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).expect("journal root");
         let inputs = || ObservationJourneyMountInputsV1 {
-            composition: composition(Arc::clone(&port)),
+            composition: composition(Arc::clone(&port)
+                as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>),
             profile_id: UserProfileId::new("profile.observation-retention").expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
@@ -5433,7 +5672,7 @@ mod tests {
         let (state, attempts) = wait_for_settlement(&journal_path).await;
         assert_eq!(
             (state.as_str(), attempts),
-            ("rejected", 1),
+            ("acknowledged", 1),
             "{}",
             journal_snapshot(&journal_path)
         );
@@ -5475,7 +5714,7 @@ mod tests {
         assert_eq!(journey.journal_path(), journal_path.as_path());
         let state = wait_for_content_purge(&journal_path).await;
         assert_eq!(
-            state, "rejected",
+            state, "acknowledged",
             "a settled row is purged, not re-terminalized"
         );
         let snapshot = journal_snapshot(&journal_path);
@@ -5483,7 +5722,9 @@ mod tests {
             snapshot.starts_with("journal=1 ") && snapshot.contains("receipts=1 "),
             "replay must not re-admit and audit must survive purge: {snapshot}"
         );
-        assert_eq!(port.observe_calls.load(Ordering::Relaxed), 0);
+        // Exactly the one delivery of the first life. The second life neither
+        // re-admits the record nor re-delivers the settled row.
+        assert_eq!(port.observe_calls.load(Ordering::Relaxed), 1);
         journey
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
             .await;
@@ -5693,7 +5934,7 @@ mod tests {
         let (state, attempts) = wait_for_settlement(journey.journal_path()).await;
         assert_eq!(
             (state.as_str(), attempts),
-            ("rejected", 1),
+            ("acknowledged", 1),
             "live replay never converged on the record the busy store withheld: {}",
             journal_snapshot(journey.journal_path())
         );

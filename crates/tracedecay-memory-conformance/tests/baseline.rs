@@ -1455,8 +1455,7 @@ fn refused_batch_items_are_not_recorded_as_committed() -> Result<(), Box<dyn Err
     let healthy = InMemoryTestProvider::new()?;
     let healthy_scratch = ScratchRoot::create("committed-batch")?;
     let healthy_runner = BaselineRunner::new(&corpus, healthy_scratch.config())?;
-    let healthy_lane =
-        BaselineLane::Provider(ProviderLane::new(&healthy, REGISTRATION_REVISION)?);
+    let healthy_lane = BaselineLane::Provider(ProviderLane::new(&healthy, REGISTRATION_REVISION)?);
     let healthy_report = healthy_runner.run(&healthy_lane)?.report;
     let mut passing_boundaries = 0_usize;
     for scenario in &healthy_report.scenarios {

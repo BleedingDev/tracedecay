@@ -27,6 +27,8 @@ pub(crate) mod native_provider;
 #[path = "retained_owner/native_provider_parity_tests.rs"]
 mod native_provider_parity_tests;
 #[cfg(feature = "memory-provider-host")]
+pub(crate) mod native_staged_observations;
+#[cfg(feature = "memory-provider-host")]
 pub(crate) mod observation_journey;
 mod profile;
 mod session;

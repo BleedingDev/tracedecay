@@ -335,6 +335,10 @@ fn denial_reason_detail(reason: &RecallDenialReason) -> Option<String> {
         RecallDenialReason::ScopeBindingUnauthorized { binding } => {
             Some(format!("binding={binding:?}"))
         }
+        RecallDenialReason::MemoryClassBindingUnauthorized {
+            memory_class,
+            binding,
+        } => Some(format!("memory_class={memory_class} binding={binding:?}")),
         RecallDenialReason::ScopeMismatch { field }
         | RecallDenialReason::UnknownIdentity { field }
         | RecallDenialReason::ForbiddenIdentity { field } => Some(format!("field={field:?}")),

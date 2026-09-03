@@ -804,6 +804,7 @@
       "value_source": "tracedecay.memory.provider.recall.v1 candidate_scope_binding.bindings",
       "provider_declarations": {
         "tracedecay.native": [
+          "exact_coding_scope",
           "project_facts",
           "profile_facts"
         ],

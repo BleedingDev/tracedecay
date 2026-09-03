@@ -65,16 +65,15 @@ pub use recall_admission::{
     build_recall_request_payload, decode_recall_outcome, parse_rfc3339_nanos, rfc3339_utc_micros,
 };
 pub use recall_context_pack::{
-    NATIVE_FACTS_HOST_AUTHORITY,
     ADVISORY_CONTEXT_PACK_JSON_KEY, AdvisoryLaneV1, CANONICAL_CONTEXT_TOKENIZER_ID,
     CANONICAL_CONTEXT_TOKENIZER_REVISION, ContextItemProvenanceV1, ContextPackError,
     ContextPackItemV1, ContextPackPolicyError, ContextPackPolicyV1, ContextPackReceiptV1,
     ContextPackRenderFormV1, ContextPackSectionV1, ContextPackV1, ContextSectionKind,
     ContextTokenizer, ExcludedProviderItemV1, HOST_CONTEXT_PACK_POLICY_ID,
-    HOST_CONTEXT_PACK_POLICY_REVISION, HostContextItemV1, O200kBaseContextTokenizer,
-    ProviderContextItemV1, ProviderContributionV1, ProviderExclusionReason,
-    ProviderItemProvenanceV1, ProviderMetadataFieldV1, compile_context_pack,
-    uncontained_item_identity,
+    HOST_CONTEXT_PACK_POLICY_REVISION, HostContextItemV1, NATIVE_FACTS_HOST_AUTHORITY,
+    O200kBaseContextTokenizer, ProviderContextItemV1, ProviderContributionV1,
+    ProviderExclusionReason, ProviderItemProvenanceV1, ProviderMetadataFieldV1,
+    compile_context_pack, uncontained_item_identity,
 };
 pub use recall_explain_trace::{
     ContainedExplanationRedactorV1, EXPLAIN_TRACE_BOUNDARY_LABEL, MAX_EXPLAIN_EXPLANATION_CHARS,
@@ -101,8 +100,8 @@ pub use recall_port::{
 pub use recall_provenance_hydration::{
     DEFAULT_PROVENANCE_HYDRATION_MAX_ATTEMPTS, HostCanonicalRecordStore, HostEvidenceControlV1,
     HostEvidenceLookupErrorV1, HostEvidenceRefV1, HostEvidenceScopeError, HostEvidenceScopeV1,
-    HostProvenanceAuthority, HostSessionEvidenceStore, HostSourceEvidenceStore,
-    MountedHostProvenanceAuthorityV1, ProvenanceHydrationDecisionV1,
+    HostProvenanceAuthority, HostProviderLocalAttestationStore, HostSessionEvidenceStore,
+    HostSourceEvidenceStore, MountedHostProvenanceAuthorityV1, ProvenanceHydrationDecisionV1,
     ProvenanceHydrationDegradationV1, ProvenanceHydrationError, ProvenanceHydrationOutcome,
     ProvenanceHydrationPassV1, ProvenanceHydrationPolicyError, ProvenanceHydrationPolicyV1,
 };
@@ -153,8 +152,9 @@ pub use tracedecay_memory_provider_api::{
 };
 pub use tracedecay_memory_provider_native::{
     NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
-    NATIVE_PROVIDER_ID, NATIVE_RECALL_SCOPE_BINDINGS, NativeAdapterError,
-    NativeMemoryApplicationPort, NativeObservation, NativeProvider, OBSERVATION_CONTRACT_ID,
+    NATIVE_PROVIDER_ID, NATIVE_RECALL_SCOPE_BINDINGS, NATIVE_STAGED_SESSION_OBSERVATION_KIND,
+    NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID, NativeAdapterError, NativeMemoryApplicationPort,
+    NativeObservation, NativeObservationEnvelope, NativeProvider, OBSERVATION_CONTRACT_ID,
 };
 
 /// The adapter this registry mounts for a configured active-provider name.
