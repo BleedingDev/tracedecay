@@ -735,7 +735,10 @@
         "crates/tracedecay/src/daemon/production_harness.rs",
         "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
         "crates/tracedecay-daemon-service/src/invocation/types.rs",
-        "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs"
+        "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/lsp_lease_tests.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/lsp_tests.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/project_lifecycle_tests.rs"
       ],
       "touch_points": [
         "daemon_shutdown_deadline",
@@ -748,11 +751,13 @@
       "rationale": "Constrain the seven existing daemon shutdown and production-harness layers that must share one caller deadline and expose incomplete blocking drain truthfully. Three of those layers moved into the new tracedecay-daemon-service crate at floor 5749e4fc; the area follows them rather than widening its footprint. The LSP lease-task registry joined the area under tdmem-0th because a caller-side timeout cannot bound a join the registry owns without detaching the tasks it already removed.",
       "semantic_invariants": [
         "Upstream behavior: daemon shutdown preserves lifecycle ordering and always completes terminal teardown after reporting the observed outcome.",
-        "Product behavior: one caller-supplied absolute deadline bounds every nested shutdown and blocking-drain step without refresh."
+        "Product behavior: one caller-supplied absolute deadline bounds every nested shutdown and blocking-drain step without refresh.",
+        "The call chain's own unit tests assert the shutdown fence through an observable effect of begin_shutdown - LSP admission closing - under a bounded wait, never through a fixed number of scheduler yields or a lock-contention probe, so the fence assertion is literal rather than probabilistic."
       ],
       "tests": [
         "cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification",
-        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline",
+        "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::lsp_lease_tests::state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep"
       ],
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
@@ -1669,7 +1674,7 @@
         "tdmem-0404",
         "tdmem-1204"
       ],
-      "line_budget": 30,
+      "line_budget": 50,
       "rebase_or_removal_plan": "Delete the deadline parameter and restore the unbounded join when upstream's lease registry retires its tasks under a caller-supplied deadline itself. If upstream moves LspLeaseTaskRegistry out of invocation/types.rs, re-locate this entry with it rather than widening the area.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -2281,7 +2286,7 @@
         "The advisory lane runs under the dispatch control's own admitted deadline and live cancellation identity, clamped to the mount's bounded advisory sub-deadline; no replacement cancellation identity is minted.",
         "A successful ordinary context call reaches the lane: the admission gate takes the host-minted application request identity, so a call that carries no structural session identity binds to its MCP connection scope instead of being skipped.",
         "A dormant provider host, an observer-only routing gate, or a non-context tool leaves the dispatched result exactly as the handler produced it; every other advisory failure is a typed unavailable lane attributed to the routed provider, and the host answer is still delivered unchanged.",
-        "The advisory lane is additionally bounded by wall clock inside its sub-deadline: a provider that ignores the deadline it was handed is abandoned and terminates the lane as advisory_lane_deadline_exceeded, so it can never hold the dispatch task -- and therefore the already-produced canonical answer -- open.",
+        "The advisory lane cannot hold the dispatch task -- and therefore the already-produced canonical answer -- open. The provider's own half of the sub-deadline is enforced inside the cognitive-recall mount by the host provider-invocation boundary, which answers at the deadline with a typed Answered result carrying CognitiveRecallDegradation::TimedOut (or Cancelled when the caller withdraws), keeps the still-running worker accounted as stranded, and refuses the provider before contact until it returns. The wall-clock timeout on this path is a strictly later net past a fixed grace margin for the host-side stages that run after the provider answered; when it fires the lane terminates as advisory_lane_deadline_exceeded and claims nothing about the provider invocation.",
         "The lane is applied after the handler answered, so a coalesced read shared with other callers never carries this caller's advisory candidates.",
         "The dispatch path names no provider, registry, or fabric type; the provider boundary stays behind the cognitive-recall mount."
       ],
@@ -2528,6 +2533,39 @@
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Install idempotence and interrupted-reinstall rollback are host-lifecycle properties upstream owns; the assertions can be upstreamed as they are."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/invocation_tests/lsp_lease_tests.rs",
+      "area_id": "shutdown_deadline",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_shutdown_deadline",
+      "rationale": "Make the shutdown-fence test deterministic under bead tdmem-0th. The assertion that a queued LSP open is fenced strictly between begin_shutdown and the endpoint expiry sweep was reached by spinning eight fixed tokio::task::yield_now() calls and then accepting either a finished open or a contended admission lock, so the test could pass without the fence ever having been observed. It now waits, bounded, for the observable effect of begin_shutdown - lsp_admission_open closing - and then for the fenced open to settle, which makes the assertion literal.",
+      "semantic_invariants": [
+        "The test proves the fence through an observable effect of begin_shutdown: it waits for lsp_admission_open to close before spawning the racing open, so the open is queued strictly between admission closing and the endpoint expiry sweep the registry guard is holding.",
+        "No fixed yield count, sleep, or lock-contention probe stands in for that observation; every wait is a bounded tokio::time::timeout whose expiry fails the test with the property it was waiting for.",
+        "The settle condition is the open actually finishing, not the admission lock merely being contended, so a run in which the fence never engaged fails instead of passing.",
+        "Production behavior is unchanged: this file is test-only and asserts the existing shutdown ordering rather than altering it."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::lsp_lease_tests::state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep"
+      ],
+      "tests": [
+        "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::lsp_lease_tests::state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep"
+      ],
+      "bead_ids": [
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "line_budget": 25,
+      "rebase_or_removal_plan": "Re-apply two bounded waits inside one existing test function; delete them with the shutdown-deadline entries if upstream's own lease registry retires its tasks under a caller-supplied deadline and this test goes away with the seam.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Replacing a fixed yield count with a bounded wait on an observable shutdown effect is a provider-neutral test-determinism fix upstream would carry as it stands."
       }
     }
   ],

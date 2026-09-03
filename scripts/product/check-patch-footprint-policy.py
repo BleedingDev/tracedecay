@@ -112,7 +112,7 @@ EXPECTED_TOUCH_POINT_CAPS = {
     "application_contract_mount": (3, 220),
     "cognitive_recall_contract": (4, 940),
     "daemon_composition_mount": (15, 810),
-    "daemon_shutdown_deadline": (6, 320),
+    "daemon_shutdown_deadline": (8, 360),
     "production_harness_shutdown": (1, 62),
     "integration_test_runtime_isolation": (3, 240),
     "normalized_observation_mount": (2, 160),
@@ -126,13 +126,16 @@ EXPECTED_TOUCH_POINT_CAPS = {
 # revised category must carry a matching `cap_revision` block; a category with
 # no approved revision must not carry one.
 REVISED_TOUCH_POINT_CAPS = {
+    # ADR-0015 supersedes ADR-0013 as the approving decision for this
+    # category. ADR-0013 remains the historical record of the 5/287 -> 6/320
+    # step; the previous caps recorded here are the ones ADR-0015 replaced.
     "daemon_shutdown_deadline": {
         "adr": (
             "product/architecture/adr/"
-            "ADR-0013-daemon-shutdown-touch-point-expansion.md"
+            "ADR-0015-daemon-shutdown-test-fence-and-supersession-headroom.md"
         ),
-        "previous_max_files": 5,
-        "previous_max_changed_lines": 287,
+        "previous_max_files": 6,
+        "previous_max_changed_lines": 320,
     },
 }
 EXPECTED_CAP_REVISION_FIELDS = {

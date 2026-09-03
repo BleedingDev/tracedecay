@@ -120,33 +120,38 @@
       "allowed_changes": [
         "propagate one caller-supplied absolute deadline through daemon shutdown layers",
         "bound blocking drain work by the caller deadline's remaining budget",
-        "report Failed for incomplete shutdown while completing terminal teardown"
+        "report Failed for incomplete shutdown while completing terminal teardown",
+        "make the shutdown call chain's own unit tests assert the fence through an observable effect of begin_shutdown instead of a fixed number of scheduler yields"
       ],
       "cap_revision": {
-        "adr": "product/architecture/adr/ADR-0013-daemon-shutdown-touch-point-expansion.md",
-        "measured_changed_lines": 308,
-        "measured_files": 6,
+        "adr": "product/architecture/adr/ADR-0015-daemon-shutdown-test-fence-and-supersession-headroom.md",
+        "measured_changed_lines": 329,
+        "measured_files": 7,
         "policy_revision": "patch-footprint.v3",
-        "previous_max_changed_lines": 287,
-        "previous_max_files": 5
+        "previous_max_changed_lines": 320,
+        "previous_max_files": 6
       },
       "category": "shutdown",
       "forbidden_changes": [
         "creating a fresh deadline budget in a nested shutdown layer",
         "hiding incomplete shutdown behind a successful terminal",
         "reordering unrelated daemon lifecycle phases",
-        "adding provider or memory integration logic"
+        "adding provider or memory integration logic",
+        "weakening a shutdown assertion, or replacing a bounded wait on an observable shutdown effect with a sleep, a yield count, or a lock-contention probe"
       ],
       "id": "daemon_shutdown_deadline",
-      "max_changed_lines": 320,
-      "max_files": 6,
+      "max_changed_lines": 360,
+      "max_files": 8,
       "paths": [
         "crates/tracedecay/src/daemon/bootstrap.rs",
         "crates/tracedecay/src/daemon/engine/shutdown.rs",
         "crates/tracedecay/src/daemon/invocation_state.rs",
         "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
         "crates/tracedecay-daemon-service/src/invocation/types.rs",
-        "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs"
+        "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/lsp_lease_tests.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/lsp_tests.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/project_lifecycle_tests.rs"
       ],
       "required_verification": [
         "blocking drain deadline regression test",
@@ -677,6 +682,7 @@
     "notes": [
       "Revision patch-footprint.v2 is approved by product/architecture/adr/ADR-0011-patch-footprint-revision-v2.md: every cap equals the M4 observation-journey mount, M5 cognitive-recall port, Native configuration registration, and session-sync exact-scope footprint measured at that revision's tree plus at most roughly fifteen percent headroom. Per-entry line_budget values in the convergence map remain the binding limit for an individual file.",
       "Revision patch-footprint.v3 is approved by product/architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md: it carries every v2 cap forward unchanged except the three the Claude Code host hook ingest journey moves - upstream existing production files 34 -> 37, total upstream changed lines 3300 -> 3500, and exception-zone files 2 -> 4 - each set from the footprint measured at this revision's tree (37 production files, 3393 total changed lines, 4 exception-zone files) plus at most roughly fifteen percent headroom.",
+      "ADR-0015 supersedes ADR-0013 as the approving decision for the daemon_shutdown_deadline touch point, raising it to 8 files and 360 changed lines against a measured 7 files and 329 lines and admitting the shutdown call chain's own invocation_tests paths. It changes no aggregate cap: max_upstream_existing_test_or_fixture_files stays 9 against a measured 8.",
       "Added files under product_owned_paths are excluded from the upstream footprint totals.",
       "Renaming or copying an upstream file counts as touching the destination and source.",
       "Changed lines are additions plus deletions from git numstat against the immutable upstream floor.",

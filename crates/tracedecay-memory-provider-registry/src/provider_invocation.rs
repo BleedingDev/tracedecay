@@ -459,6 +459,50 @@ impl ProviderInvocationBoundaryV1 {
             .map_or_else(ProviderWorkerCensusV1::default, |ledger| ledger.census())
     }
 
+    /// Waits until `provider_id`'s census satisfies `admits`, or `within`
+    /// elapses.
+    ///
+    /// A stranded worker releases its accounting from the worker's own thread,
+    /// whenever the provider finally lets go, so "the route recovered" is an
+    /// event nobody can observe by asking once. Every accounting transition
+    /// publishes it here, which is what lets an operator surface -- or a test
+    /// -- wait for the boundary rather than poll it on a timer. Interest is
+    /// registered *before* the census is read, so a transition that happens
+    /// between the read and the wait is never missed.
+    ///
+    /// `Ok` carries the census that satisfied `admits`; `Err` carries the last
+    /// one seen before `within` elapsed.
+    pub async fn await_worker_census(
+        &self,
+        provider_id: &str,
+        within: Duration,
+        admits: impl Fn(ProviderWorkerCensusV1) -> bool,
+    ) -> Result<ProviderWorkerCensusV1, ProviderWorkerCensusV1> {
+        let ledger = self.ledger(provider_id);
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let mut changed = Box::pin(ledger.changed.notified());
+            // Registers this waiter before the census is read, so a
+            // transition between the read and the wait is not missed.
+            changed.as_mut().enable();
+            let census = ledger.census();
+            if admits(census) {
+                return Ok(census);
+            }
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return Err(ledger.census());
+            };
+            let woken = tokio::select! {
+                biased;
+                () = &mut changed => true,
+                () = tokio::time::sleep(remaining) => false,
+            };
+            if !woken {
+                return Err(ledger.census());
+            }
+        }
+    }
+
     /// Runs `work` on a host-owned worker and answers at whichever comes
     /// first: the worker's outcome, the caller's cancellation, or `budget`.
     ///
@@ -602,11 +646,20 @@ enum WaitEndV1 {
 #[derive(Default)]
 struct ProviderWorkerLedgerV1 {
     census: Mutex<ProviderWorkerCensusV1>,
+    /// Published on every accounting transition, so a waiter learns that a
+    /// stranded worker returned without polling for it.
+    changed: tokio::sync::Notify,
 }
 
 impl ProviderWorkerLedgerV1 {
     fn census(&self) -> ProviderWorkerCensusV1 {
         *ProviderInvocationBoundaryV1::guard(&self.census)
+    }
+
+    /// Wakes every waiter on [`Self::changed`]. Called after the census lock is
+    /// released so a woken waiter can read the new value immediately.
+    fn published(&self) {
+        self.changed.notify_waiters();
     }
 
     fn admit(
@@ -628,29 +681,39 @@ impl ProviderWorkerLedgerV1 {
             });
         }
         census.live = census.live.saturating_add(1);
+        drop(census);
+        self.published();
         Ok(())
     }
 
     fn release_live(&self) {
         let mut census = ProviderInvocationBoundaryV1::guard(&self.census);
         census.live = census.live.saturating_sub(1);
+        drop(census);
+        self.published();
     }
 
     fn release_stranded(&self) {
         let mut census = ProviderInvocationBoundaryV1::guard(&self.census);
         census.stranded = census.stranded.saturating_sub(1);
+        drop(census);
+        self.published();
     }
 
     fn record_terminated(&self) {
         let mut census = ProviderInvocationBoundaryV1::guard(&self.census);
         census.live = census.live.saturating_sub(1);
         census.terminated = census.terminated.saturating_add(1);
+        drop(census);
+        self.published();
     }
 
     fn mark_stranded(&self) {
         let mut census = ProviderInvocationBoundaryV1::guard(&self.census);
         census.live = census.live.saturating_sub(1);
         census.stranded = census.stranded.saturating_add(1);
+        drop(census);
+        self.published();
     }
 }
 

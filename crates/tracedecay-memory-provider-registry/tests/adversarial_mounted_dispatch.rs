@@ -52,10 +52,18 @@ const AMPLE_DEADLINE_MICROS: i64 = 60_000_000;
 /// short enough that the scripted block outlives it.
 const DEADLINE_THAT_EXPIRES_MID_CALL_MICROS: i64 = 600_000;
 
-/// How long the cancelling thread waits before withdrawing the caller's
-/// consent. Long enough that the provider is provably already working (the
-/// ledger asserts it), far shorter than the scripted block.
-const CANCEL_AFTER: Duration = Duration::from_millis(400);
+/// Longest a test waits for the double to be demonstrably inside the call it
+/// is about to cancel. Cancellation is fired on that *event*, never on a
+/// timer: a fixed delay only guesses that the provider has been entered, and
+/// under a loaded scheduler a cancellation that lands before entry proves
+/// nothing about reaching work already in flight.
+const ENTRY_BUDGET: Duration = Duration::from_secs(5);
+
+/// Longest a caller may still be waiting after its cancellation fired. The
+/// host boundary races cancellation against the worker, so a caller that
+/// waits longer than this was waiting out the provider instead
+/// (`tdmem-sz9` acceptance: cancellation returns within 100ms).
+const CANCELLATION_RELEASE_CEILING: Duration = Duration::from_millis(100);
 
 // ---------------------------------------------------------------------------
 // Readiness: a provider that lies about what it is
@@ -600,38 +608,60 @@ async fn a_candidate_flood_beyond_the_dispatched_budget_is_refused() {
 // ---------------------------------------------------------------------------
 
 /// Blocks the test until the host's own worker accounting reaches `predicate`,
-/// so a reclamation assertion waits on the host rather than on a sleep.
+/// so a reclamation assertion waits on the boundary's own published
+/// transition rather than on a sleep.
 async fn settle_workers(
     boundary: &ProviderInvocationBoundaryV1,
     ceiling: Duration,
     predicate: impl Fn(ProviderWorkerCensusV1) -> bool,
 ) -> ProviderWorkerCensusV1 {
-    let started = std::time::Instant::now();
-    loop {
-        let census = boundary.worker_census(NATIVE_PROVIDER_ID);
-        if predicate(census) {
-            return census;
+    match boundary
+        .await_worker_census(NATIVE_PROVIDER_ID, ceiling, predicate)
+        .await
+    {
+        Ok(census) => census,
+        Err(census) => {
+            panic!("the host never reached the expected worker census; last saw {census:?}")
         }
-        assert!(
-            started.elapsed() < ceiling,
-            "the host never reached the expected worker census; last saw {census:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
 /// Blocks the test until the double has finished every call it is inside, so
-/// an assertion about what the provider *did* waits on the provider rather
-/// than on the caller the host already released.
-async fn settle_provider(provider: &AdversarialProviderV1, ceiling: Duration) {
-    let started = std::time::Instant::now();
-    while provider.in_flight() != 0 {
-        assert!(
-            started.elapsed() < ceiling,
-            "the provider never finished the call the host stopped waiting for"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+/// an assertion about what the provider *did* waits on the provider's own exit
+/// rather than on a poll.
+///
+/// The wait itself runs on a blocking worker: the double signals on a
+/// condition variable from the host-owned thread it is parked on, and the test
+/// runtime must stay free to drive everything else while that happens.
+async fn settle_provider(provider: &Arc<AdversarialProviderV1>, ceiling: Duration) {
+    let waited = {
+        let provider = Arc::clone(provider);
+        tokio::task::spawn_blocking(move || provider.wait_until_idle(ceiling))
+            .await
+            .expect("provider settlement waiter")
+    };
+    assert!(
+        waited,
+        "the provider never finished the call the host stopped waiting for"
+    );
+}
+
+/// Blocks the test until at least `calls` invocations are inside the double.
+///
+/// This is the entry proof every cancellation test below fires on: the
+/// provider is demonstrably in the call before consent is withdrawn.
+async fn await_provider_entry(provider: &Arc<AdversarialProviderV1>, calls: u64) {
+    let entered = {
+        let provider = Arc::clone(provider);
+        tokio::task::spawn_blocking(move || provider.wait_until_in_flight(calls, ENTRY_BUDGET))
+            .await
+            .expect("provider entry waiter")
+    };
+    assert!(
+        entered,
+        "the provider was never entered inside {ENTRY_BUDGET:?}, so cancelling now would \
+         prove nothing about reaching work already in flight"
+    );
 }
 
 /// A provider that blocks past the recall's own deadline and then answers a
@@ -863,11 +893,19 @@ async fn a_provider_that_never_returns_is_abandoned_and_reclaimed_when_it_finall
 /// then answers success, must not have that answer published either. The
 /// ledger proves the provider really did ignore a live cancellation rather
 /// than the host merely pre-empting it.
-#[tokio::test]
+///
+/// Cancellation fires on the double's own entry event, never after a fixed
+/// delay: a cancellation that landed before the provider was entered would
+/// prove only that the pre-contact guard works, and a delay is only a guess
+/// that entry has happened. The release latency is measured from that exact
+/// instant, which is what makes "the caller is released by its own
+/// cancellation, not by the provider finally stopping" an assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_provider_that_ignores_cancellation_cannot_publish_its_late_result() {
+    const PROVIDER_BLOCKS_FOR: Duration = Duration::from_millis(1_500);
     let provider = double(
         always(MisbehaviourV1::BlocksPastDeadline {
-            block_millis: 1_500,
+            block_millis: u64::try_from(PROVIDER_BLOCKS_FOR.as_millis()).unwrap(),
         }),
         RecallOutcomeShapeV1::WellFormed { count: 2 },
     );
@@ -876,17 +914,23 @@ async fn a_provider_that_ignores_cancellation_cannot_publish_its_late_result() {
         mount(compose_active(Arc::clone(&provider)), Arc::clone(&observer)).expect("mounted port");
 
     let signal = live_signal();
-    let canceller = signal.clone();
-    let cancelling = std::thread::spawn(move || {
-        std::thread::sleep(CANCEL_AFTER);
-        canceller.cancel(now_micros());
-    });
+    let cancelling = {
+        let signal = signal.clone();
+        let provider = Arc::clone(&provider);
+        tokio::spawn(async move {
+            await_provider_entry(&provider, 1).await;
+            let at = std::time::Instant::now();
+            signal.cancel(now_micros());
+            at
+        })
+    };
 
     let outcome = port
         .recall_admitted(request(AMPLE_DEADLINE_MICROS, 8), &signal)
         .await
         .expect("a cancelled recall is a degradation, not an error");
-    cancelling.join().expect("cancelling thread");
+    let released_at = std::time::Instant::now();
+    let cancelled_at = cancelling.await.expect("cancelling task");
 
     assert_eq!(
         outcome.result.degradation(),
@@ -894,6 +938,12 @@ async fn a_provider_that_ignores_cancellation_cannot_publish_its_late_result() {
         "a recall whose caller walked away must be reported as cancelled"
     );
     assert!(outcome.result.candidates().is_empty());
+    let released_in = released_at.saturating_duration_since(cancelled_at);
+    assert!(
+        released_in <= CANCELLATION_RELEASE_CEILING,
+        "the caller was released {released_in:?} after it withdrew: it waited out the \
+         provider's {PROVIDER_BLOCKS_FOR:?} of blocking work instead of its own cancellation"
+    );
     // The caller is released when it withdraws, not when this provider decides
     // to stop: the host boundary races cancellation against the worker. So the
     // provider is still working here, and the claim this test exists to make --
@@ -916,11 +966,12 @@ async fn a_provider_that_ignores_cancellation_cannot_publish_its_late_result() {
 /// caller's cancellation reach it while it is working and answers `cancelled`
 /// itself. This is what proves the host bridges one live token into the call
 /// rather than handing the provider a token nothing ever fires.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_hosts_live_cancellation_reaches_a_provider_that_is_already_working() {
+    const PROVIDER_CEILING: Duration = Duration::from_millis(3_000);
     let provider = double(
         always(MisbehaviourV1::BlocksUntilCancelled {
-            ceiling_millis: 3_000,
+            ceiling_millis: u64::try_from(PROVIDER_CEILING.as_millis()).unwrap(),
         }),
         RecallOutcomeShapeV1::WellFormed { count: 2 },
     );
@@ -931,28 +982,33 @@ async fn the_hosts_live_cancellation_reaches_a_provider_that_is_already_working(
     .expect("mounted port");
 
     let signal = live_signal();
-    let canceller = signal.clone();
-    let cancelling = std::thread::spawn(move || {
-        std::thread::sleep(CANCEL_AFTER);
-        canceller.cancel(now_micros());
-    });
+    let cancelling = {
+        let signal = signal.clone();
+        let provider = Arc::clone(&provider);
+        tokio::spawn(async move {
+            await_provider_entry(&provider, 1).await;
+            let at = std::time::Instant::now();
+            signal.cancel(now_micros());
+            at
+        })
+    };
 
-    let started = std::time::Instant::now();
     let outcome = port
         .recall_admitted(request(AMPLE_DEADLINE_MICROS, 8), &signal)
         .await
         .expect("a provider-reported cancellation is a degradation");
-    let answered_in = started.elapsed();
-    cancelling.join().expect("cancelling thread");
+    let released_at = std::time::Instant::now();
+    let cancelled_at = cancelling.await.expect("cancelling task");
 
     assert_eq!(
         outcome.result.degradation(),
         Some(CognitiveRecallDegradation::Cancelled)
     );
+    let released_in = released_at.saturating_duration_since(cancelled_at);
     assert!(
-        answered_in < Duration::from_millis(3_000),
-        "the caller waited {answered_in:?}: it was released by the provider's ceiling rather \
-         than by its own cancellation"
+        released_in <= CANCELLATION_RELEASE_CEILING,
+        "the caller was released {released_in:?} after it withdrew: it was released by the \
+         provider's {PROVIDER_CEILING:?} ceiling rather than by its own cancellation"
     );
     // The caller is answered on cancellation without waiting for the provider,
     // so the provider's own record of having seen the token is read once it
@@ -961,7 +1017,7 @@ async fn the_hosts_live_cancellation_reaches_a_provider_that_is_already_working(
     let contacts = provider.ledger().contacts_for(ProviderOperation::Recall);
     assert_eq!(contacts.len(), 1);
     assert!(
-        contacts[0].held_millis < 3_000,
+        contacts[0].held_millis < u64::try_from(PROVIDER_CEILING.as_millis()).unwrap(),
         "the provider must have stopped on the token, not on its own ceiling: {:?}",
         contacts[0]
     );

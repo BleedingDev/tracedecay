@@ -45,7 +45,7 @@ use tracedecay_memory_provider_registry::{
     ExactScopeBindingError, HostCanonicalRecordStore, HostContextItemV1, HostEvidenceControlV1,
     HostEvidenceLookupErrorV1, HostEvidenceScopeV1, HostProviderLocalAttestationStore,
     HostSessionEvidenceStore, HostSourceEvidenceStore, MountedHostProvenanceAuthorityV1,
-    O200kBaseContextTokenizer, OwnedExactScope, ProjectCognitiveRecallPortV1,
+    O200kBaseContextTokenizer, OwnedExactScope, OwnedProviderId, ProjectCognitiveRecallPortV1,
     ProjectMemoryProviderComposition, ProvenanceHydrationPassV1, ProvenanceHydrationPolicyV1,
     ProviderContextItemV1, ProviderContributionV1, ProviderInvocationBoundaryV1,
     ProviderInvocationLimitsV1, ProviderItemProvenanceV1, ProviderLimits, ProviderWorkV1,
@@ -1602,10 +1602,10 @@ pub(crate) async fn advisory_memory_context_for_call(
     let mount = mount?;
     // Every outcome below names the provider this project's routing policy
     // pinned, including the ones that never reach a provider at all.
-    let routed_provider = mount.routing().active_provider().as_str();
+    let routed_provider = mount.routing().active_provider();
     let unavailable = |outcome: AdvisoryRecallUnavailableV1, detail: &str| {
         Some(AdvisoryMemoryContextV1::unavailable(
-            Some(routed_provider.to_owned()),
+            routed_provider.clone(),
             outcome,
             detail,
         ))
@@ -1769,13 +1769,13 @@ pub(crate) async fn advisory_context_recall(
     // provider the mounted routing policy pinned. A refusal that reached no
     // provider is still attributed to the provider that was configured to
     // answer it, so a caller can tell *whose* lane failed.
-    let routed_provider = mount.routing().active_provider().as_str();
+    let routed_provider = mount.routing().active_provider();
 
     let now = match try_now_micros() {
         Ok(now) => now,
         Err(error) => {
             return AdvisoryMemoryContextV1::unavailable(
-                Some(routed_provider.to_owned()),
+                routed_provider.clone(),
                 AdvisoryRecallUnavailableV1::HostClockUnavailable,
                 format!("host clock unavailable for advisory recall: {error}"),
             );
@@ -1790,7 +1790,7 @@ pub(crate) async fn advisory_context_recall(
         Ok(request_id) => request_id,
         Err(error) => {
             return AdvisoryMemoryContextV1::unavailable(
-                Some(routed_provider.to_owned()),
+                routed_provider.clone(),
                 AdvisoryRecallUnavailableV1::RequestIdentityInvalid,
                 format!("advisory recall request identity is invalid: {error}"),
             );
@@ -1809,7 +1809,7 @@ pub(crate) async fn advisory_context_recall(
         Ok(request) => request,
         Err(error) => {
             return AdvisoryMemoryContextV1::unavailable(
-                Some(routed_provider.to_owned()),
+                routed_provider.clone(),
                 AdvisoryRecallUnavailableV1::RequestInvalid,
                 format!("advisory recall request is invalid: {error}"),
             );
@@ -1819,7 +1819,7 @@ pub(crate) async fn advisory_context_recall(
         Ok(outcome) => outcome,
         Err(error) => {
             return AdvisoryMemoryContextV1::unavailable(
-                Some(routed_provider.to_owned()),
+                routed_provider.clone(),
                 AdvisoryRecallUnavailableV1::RecallRefused {
                     port_code: error.code(),
                 },
@@ -1890,7 +1890,7 @@ pub(crate) async fn advisory_context_recall(
         .await;
     let Some(hydration_scope) = mount.host_evidence_scope(inputs.canonical_session_id) else {
         return AdvisoryMemoryContextV1::unavailable(
-            Some(routed_provider.to_owned()),
+            routed_provider.clone(),
             AdvisoryRecallUnavailableV1::LaneInputsMissing,
             "advisory recall cannot mint an authoritative provenance scope for this mount",
         );
@@ -1909,7 +1909,7 @@ pub(crate) async fn advisory_context_recall(
         Ok(now) => now,
         Err(error) => {
             return AdvisoryMemoryContextV1::unavailable(
-                Some(routed_provider.to_owned()),
+                routed_provider.clone(),
                 AdvisoryRecallUnavailableV1::HostClockUnavailable,
                 format!("host clock unavailable for provenance hydration: {error}"),
             );
@@ -1932,7 +1932,7 @@ pub(crate) async fn advisory_context_recall(
         Ok(gate) => gate,
         Err(fault) => {
             return AdvisoryMemoryContextV1::unavailable(
-                Some(routed_provider.to_owned()),
+                routed_provider.clone(),
                 AdvisoryRecallUnavailableV1::UntrustedGateUnavailable,
                 format!("untrusted-memory gate could not be built: {fault}"),
             );
@@ -2126,11 +2126,11 @@ fn advisory_trust_tier(provenance: &ProviderItemProvenanceV1) -> UntrustedRecall
 /// fault, would let a broken classifier look like a quiet provider. The whole
 /// lane terminates instead, and the caller keeps its own answer.
 fn untrusted_gate_faulted(
-    routed_provider: &str,
+    routed_provider: &OwnedProviderId,
     fault: &UntrustedRecallGateFaultV1,
 ) -> AdvisoryMemoryContextV1 {
     AdvisoryMemoryContextV1::unavailable(
-        Some(routed_provider.to_owned()),
+        routed_provider.clone(),
         AdvisoryRecallUnavailableV1::UntrustedGateFaulted,
         format!("untrusted-memory gate faulted while classifying provider text: {fault}"),
     )
@@ -2897,9 +2897,14 @@ pub enum AdvisoryMemoryContextV1 {
     /// it names the provider that was configured to answer it.
     Unavailable {
         /// Provider the mounted routing policy pinned for this project.
-        /// `None` only where no routing policy existed to attribute the
-        /// failure to, which no mounted route can produce.
-        provider_id: Option<String>,
+        ///
+        /// Required, and a validated provider identity rather than free text:
+        /// every unavailable lane is produced *inside* a mounted route, and a
+        /// mounted route always has a pinned active provider. Modelling it as
+        /// an option kept an "unrouted" rendering alive that no production
+        /// path could reach, so the one thing an operator needs from a broken
+        /// lane -- whose lane broke -- could silently go missing.
+        provider_id: OwnedProviderId,
         /// Typed terminal outcome.
         outcome: AdvisoryRecallUnavailableV1,
         /// Bounded human-readable detail beside the code.
@@ -2909,8 +2914,11 @@ pub enum AdvisoryMemoryContextV1 {
 
 impl AdvisoryMemoryContextV1 {
     /// A typed unavailable lane, attributed to the routed provider.
+    ///
+    /// The identity is taken as the validated `OwnedProviderId` the routing
+    /// policy pinned, so a lane cannot be built without naming whose it is.
     pub fn unavailable(
-        provider_id: Option<String>,
+        provider_id: OwnedProviderId,
         outcome: AdvisoryRecallUnavailableV1,
         detail: impl AsRef<str>,
     ) -> Self {
@@ -2923,10 +2931,10 @@ impl AdvisoryMemoryContextV1 {
 
     /// The provider this lane is attributed to, whichever way it terminated.
     #[must_use]
-    pub fn provider_id(&self) -> Option<&str> {
+    pub fn provider_id(&self) -> &str {
         match self {
-            Self::Answered { provider_id, .. } => Some(provider_id.as_str()),
-            Self::Unavailable { provider_id, .. } => provider_id.as_deref(),
+            Self::Answered { provider_id, .. } => provider_id.as_str(),
+            Self::Unavailable { provider_id, .. } => provider_id.as_str(),
         }
     }
 
@@ -2938,12 +2946,11 @@ impl AdvisoryMemoryContextV1 {
                 outcome,
                 detail,
             } => AdvisoryLaneV1::Notice {
-                notice: match provider_id {
-                    Some(provider_id) => {
-                        format!("provider {provider_id}: {} ({detail})", outcome.code())
-                    }
-                    None => format!("unrouted: {} ({detail})", outcome.code()),
-                },
+                notice: format!(
+                    "provider {}: {} ({detail})",
+                    provider_id.as_str(),
+                    outcome.code()
+                ),
             },
             Self::Answered {
                 provider_id,
@@ -3077,13 +3084,14 @@ impl AdvisoryMemoryContextV1 {
 fn withheld_rendering(
     render_form: ContextPackRenderFormV1,
     text: &str,
-    provider_id: Option<&str>,
+    provider_id: &str,
     failure: &AdvisoryContextPackFailureV1,
 ) -> String {
     // The lane still names the provider it was routed to. A withheld lane a
     // reader cannot attribute is indistinguishable from a lane that was never
-    // configured at all.
-    let attribution = provider_id.unwrap_or("unrouted");
+    // configured at all -- and every lane, answered or not, now carries that
+    // identity, so there is no identity-less rendering to fall back to.
+    let attribution = provider_id;
     match render_form {
         ContextPackRenderFormV1::Json => match serde_json::from_str::<Value>(text) {
             Ok(Value::Object(mut object)) => {
@@ -3521,7 +3529,7 @@ mod advisory_rendering_tests {
     #[test]
     fn an_unavailable_lane_reports_its_typed_outcome() {
         let lane = AdvisoryMemoryContextV1::unavailable(
-            Some(NATIVE_PROVIDER_ID.to_owned()),
+            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider id"),
             AdvisoryRecallUnavailableV1::DeadlineElapsed,
             "recall deadline exceeded before provider contact",
         );
@@ -3532,7 +3540,7 @@ mod advisory_rendering_tests {
                 ..
             }
         ));
-        assert_eq!(lane.provider_id(), Some(NATIVE_PROVIDER_ID));
+        assert_eq!(lane.provider_id(), NATIVE_PROVIDER_ID);
         let text = rendered_text(&lane.appended_to(tool_result("## Context\n")));
         assert!(text.contains("advisory_deadline_elapsed"), "{text}");
         assert!(
@@ -3865,11 +3873,14 @@ mod advisory_rendering_tests {
     #[test]
     fn a_gate_fault_is_a_typed_unavailable_lane_and_never_an_answered_one() {
         let fault = UntrustedRecallGateFaultV1::TransientCorpusUnavailable;
-        let lane = untrusted_gate_faulted(NATIVE_PROVIDER_ID, &fault);
+        let lane = untrusted_gate_faulted(
+            &OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider id"),
+            &fault,
+        );
 
         assert_eq!(
             lane.provider_id(),
-            Some(NATIVE_PROVIDER_ID),
+            NATIVE_PROVIDER_ID,
             "a gate fault still names the provider whose text could not be classified"
         );
 
@@ -5882,7 +5893,7 @@ mod tests {
             ),
             "{advisory:?}"
         );
-        assert_eq!(advisory.provider_id(), Some(NATIVE_PROVIDER_ID));
+        assert_eq!(advisory.provider_id(), NATIVE_PROVIDER_ID);
         assert_eq!(
             mount.ledger.report_count(),
             0,
@@ -5986,7 +5997,7 @@ mod tests {
             "a provider that outlived its deadline is a typed deadline outcome carrying no \
              content: {advisory:?}"
         );
-        assert_eq!(advisory.provider_id(), Some(NATIVE_PROVIDER_ID));
+        assert_eq!(advisory.provider_id(), NATIVE_PROVIDER_ID);
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "the lane returned only after {elapsed:?}, so the stalled provider was still \
@@ -6050,25 +6061,25 @@ mod tests {
         .expect("a mounted route always yields a lane")
     }
 
-    /// Blocks the test -- not the host -- until `condition` holds, so a
-    /// reclamation assertion waits on the host's own accounting rather than on
-    /// a sleep long enough to be flaky.
+    /// Blocks the test -- not the host -- until `condition` holds.
+    ///
+    /// A stranded worker releases its accounting from the worker's own thread,
+    /// so the reclamation is an event, and the boundary publishes it. Waiting
+    /// on that publication rather than polling on a timer is what makes this
+    /// assertion about the host's accounting instead of about the scheduler.
     async fn await_worker_census(
         boundary: &ProviderInvocationBoundaryV1,
         ceiling: std::time::Duration,
         condition: impl Fn(tracedecay_memory_provider_registry::ProviderWorkerCensusV1) -> bool,
     ) -> tracedecay_memory_provider_registry::ProviderWorkerCensusV1 {
-        let started = std::time::Instant::now();
-        loop {
-            let census = boundary.worker_census(NATIVE_PROVIDER_ID);
-            if condition(census) {
-                return census;
+        match boundary
+            .await_worker_census(NATIVE_PROVIDER_ID, ceiling, condition)
+            .await
+        {
+            Ok(census) => census,
+            Err(census) => {
+                panic!("the host never reached the expected worker census; last saw {census:?}")
             }
-            assert!(
-                started.elapsed() < ceiling,
-                "the host never reached the expected worker census; last saw {census:?}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     }
 
@@ -6118,7 +6129,7 @@ mod tests {
             ),
             "{first:?}"
         );
-        assert_eq!(first.provider_id(), Some(NATIVE_PROVIDER_ID));
+        assert_eq!(first.provider_id(), NATIVE_PROVIDER_ID);
         assert!(
             first_elapsed < std::time::Duration::from_secs(2),
             "the host waited {first_elapsed:?} on a wedged provider"

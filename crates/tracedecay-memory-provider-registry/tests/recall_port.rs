@@ -540,7 +540,14 @@ async fn cancelled_and_elapsed_requests_degrade_without_provider_contact() {
 /// actually reached the provider's own token.
 struct BlockingRecallPort {
     descriptor: ProviderDescriptor,
-    entered_recall: Arc<std::sync::atomic::AtomicBool>,
+    /// Signalled once, from inside `recall`, the moment the provider is in the
+    /// call. A permit is stored even when nobody is waiting yet, so the test
+    /// can never miss the entry it is about to act on.
+    entered_recall: Arc<tokio::sync::Notify>,
+    /// Signalled once the provider has decided whether it saw the caller's
+    /// cancellation, so the test waits on that decision rather than polling
+    /// for it.
+    cancellation_decided: Arc<tokio::sync::Notify>,
     observed_cancellation: Arc<std::sync::atomic::AtomicBool>,
     handshake_calls: std::sync::atomic::AtomicUsize,
     recall_calls: std::sync::atomic::AtomicUsize,
@@ -550,7 +557,8 @@ impl BlockingRecallPort {
     fn new() -> Self {
         Self {
             descriptor: descriptor(),
-            entered_recall: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            entered_recall: Arc::new(tokio::sync::Notify::new()),
+            cancellation_decided: Arc::new(tokio::sync::Notify::new()),
             observed_cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             handshake_calls: std::sync::atomic::AtomicUsize::new(0),
             recall_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -591,8 +599,7 @@ impl NativeMemoryApplicationPort for BlockingRecallPort {
     fn recall(&self, call: &ProviderCall) -> ProviderReply {
         self.recall_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.entered_recall
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.entered_recall.notify_one();
         let cancellation = call.control.cancellation();
         // Bounded so a regression fails the assertions instead of hanging the
         // suite: a token that is never cancelled falls through to a success
@@ -604,6 +611,7 @@ impl NativeMemoryApplicationPort for BlockingRecallPort {
         let cancelled = cancellation.is_cancelled();
         self.observed_cancellation
             .store(cancelled, std::sync::atomic::Ordering::Release);
+        self.cancellation_decided.notify_one();
         ProviderReply {
             terminal: TerminalRecord::new(
                 call.operation,
@@ -679,6 +687,7 @@ impl NativeMemoryApplicationPort for BlockingRecallPort {
 async fn cancellation_after_dispatch_reaches_the_working_provider() {
     let provider = Arc::new(BlockingRecallPort::new());
     let entered = Arc::clone(&provider.entered_recall);
+    let decided = Arc::clone(&provider.cancellation_decided);
     let observed = Arc::clone(&provider.observed_cancellation);
     let observer = Arc::new(LedgerObserver::default());
     let port = mount(
@@ -693,12 +702,13 @@ async fn cancellation_after_dispatch_reaches_the_working_provider() {
         let signal = signal.clone();
         tokio::spawn(async move {
             // Cancel only once the provider is demonstrably inside the call,
-            // i.e. after the readiness handshake and after dispatch.
-            let mut spins = 0u32;
-            while !entered.load(Ordering::Acquire) && spins < 10_000_000 {
-                spins = spins.saturating_add(1);
-                tokio::task::yield_now().await;
-            }
+            // i.e. after the readiness handshake and after dispatch. The
+            // provider signals that entry itself; waiting on the signal is
+            // what makes "cancellation reached work already in flight" a fact
+            // rather than a guess about scheduling.
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+                .await
+                .expect("the provider must be entered before its caller withdraws");
             signal.cancel(now_micros());
         })
     };
@@ -710,15 +720,15 @@ async fn cancellation_after_dispatch_reaches_the_working_provider() {
     canceller.await.expect("canceller task");
 
     // The caller is released the moment it withdraws, so the provider is still
-    // running when `recall_admitted` returns: reading its ledger immediately
-    // would race the very decoupling this port is supposed to have. The wait is
-    // bounded well under the provider's own 10s give-up, so a port that minted
-    // its own token -- leaving the provider holding a token nothing cancels --
-    // still fails this assertion rather than passing on a delay.
-    let settle_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !observed.load(Ordering::Acquire) && std::time::Instant::now() < settle_by {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    // running when `recall_admitted` returns: reading its record immediately
+    // would race the very decoupling this port is supposed to have. The
+    // provider publishes its own verdict when it reaches it, and the wait is
+    // bounded well under its 10s give-up, so a port that minted its own token
+    // -- leaving the provider holding a token nothing cancels -- still fails
+    // this assertion rather than passing on a delay.
+    tokio::time::timeout(std::time::Duration::from_secs(5), decided.notified())
+        .await
+        .expect("the provider must reach a verdict about the caller's cancellation");
     assert!(
         observed.load(Ordering::Acquire),
         "the working provider must observe the caller's own cancellation token"

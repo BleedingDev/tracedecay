@@ -85,7 +85,10 @@ policy alone, and it requires a category whose caps were revised to carry a
 `cap_revision` block naming this ADR. The ADR must bind the exact category, the
 exact previous caps, the exact approved caps, and the measurement the approved
 caps were derived from; a binding that disagrees with the policy fails the
-gate.
+gate. The gate stays a final-tree check by design: the ordering half of
+invariant 2 — the cap revision landing before the change that needs it — is
+enforced at landing by commit order and reviewed on the commit sequence, not by
+a git-history-aware gate.
 
 ## Touch-point cap revision
 
@@ -100,10 +103,19 @@ gate.
 - Added path: `crates/tracedecay-daemon-service/src/invocation/types.rs`
 
 This binding was approved under revision `patch-footprint.v2`. The approved
-numbers above are unchanged; only the policy-revision field is restated,
+numbers above are unchanged; only the policy-revision field was restated,
 because the checker binds a `cap_revision` to the policy revision currently in
 force and [ADR-0014](./ADR-0014-host-hook-ingest-footprint-revision-v3.md)
 adopted `patch-footprint.v3`.
+
+Superseded as the *approving* decision by
+[ADR-0015](./ADR-0015-daemon-shutdown-test-fence-and-supersession-headroom.md),
+which raised this category to 8 files and 360 changed lines and admitted the
+shutdown call chain's own unit tests. The policy's `cap_revision` block now
+names ADR-0015, and the 6 and 320 it records as the previous caps are the ones
+approved here. Nothing this ADR decided is reversed: it remains the record of
+the 5/287 to 6/320 step and of admitting
+`crates/tracedecay-daemon-service/src/invocation/types.rs`.
 
 ## Consequences
 

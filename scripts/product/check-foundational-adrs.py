@@ -25,6 +25,7 @@ EXPECTED_DECISIONS = {
     "ADR-0012": "configuration_registry_additive_settings",
     "ADR-0013": "daemon_shutdown_touch_point_expansion",
     "ADR-0014": "host_hook_ingest_footprint_revision_v3",
+    "ADR-0015": "daemon_shutdown_test_fence_and_supersession_headroom",
 }
 
 EXPECTED_PATHS = {
@@ -42,6 +43,10 @@ EXPECTED_PATHS = {
     "ADR-0012": "product/architecture/adr/ADR-0012-configuration-registry-additive-settings.md",
     "ADR-0013": "product/architecture/adr/ADR-0013-daemon-shutdown-touch-point-expansion.md",
     "ADR-0014": "product/architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md",
+    "ADR-0015": (
+        "product/architecture/adr/"
+        "ADR-0015-daemon-shutdown-test-fence-and-supersession-headroom.md"
+    ),
 }
 
 EXPECTED_STATUSES = {
@@ -59,6 +64,7 @@ EXPECTED_STATUSES = {
     "ADR-0012": "accepted",
     "ADR-0013": "accepted",
     "ADR-0014": "accepted",
+    "ADR-0015": "accepted",
 }
 
 REQUIRED_SECTIONS = [
@@ -134,6 +140,16 @@ REQUIRED_GLOBAL_PHRASES = {
         "`host_hook_ingest` touch point is capped at 3 files and 200 changed",
         "`host_specific_adapters` zone keeps its `forbidden` default",
         "crates/tracedecay-cli/tests/product_memory_provider_*.rs",
+    ],
+    "ADR-0015": [
+        "never bundled into the change that exceeds the previous cap",
+        "## Touch-point cap revision",
+        "Previous max changed lines: `320`",
+        "Approved max changed lines: `360`",
+        "Measured changed lines: `329`",
+        "Policy revision: `patch-footprint.v3`",
+        "No aggregate cap changes",
+        "crates/tracedecay/src/daemon/invocation_tests/lsp_lease_tests.rs",
     ],
     "ADR-0009": [
         "supervised isolated local process",

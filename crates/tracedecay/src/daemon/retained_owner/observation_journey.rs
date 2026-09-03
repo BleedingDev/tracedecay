@@ -4167,41 +4167,73 @@ mod tests {
             assert_eq!(boundary.census(), BoundedCallCensusV1::default());
         }
 
-        /// A caller cancelled **while its worker is inside the provider** leaves
-        /// the same honest trace as one that ran out of budget: the worker it
-        /// walked away from is abandoned, not lost.
+        /// Longest the boundary may take to hand a withdrawn caller back,
+        /// measured from the instant its consent was withdrawn.
+        ///
+        /// The provider in this test is blocked on a latch nothing releases
+        /// until the assertion has already been made, so anything above this
+        /// means the caller was waiting the *provider* out rather than its own
+        /// cancellation.
+        const CANCELLATION_RELEASE_CEILING: Duration = Duration::from_millis(100);
+
+        /// A caller cancelled **while its worker is inside the provider** is
+        /// handed back promptly and leaves the same honest trace as one that
+        /// ran out of budget: the worker it walked away from is abandoned, not
+        /// lost.
         ///
         /// The cancellation deliberately fires only once the work has been
-        /// entered. Cancelling first proves something else entirely — that no
-        /// worker is borrowed at all — and is asserted separately below.
+        /// entered — the work itself opens the entry latch the withdrawing
+        /// thread is parked on, so "cancellation reached a call already inside
+        /// the provider" is a fact rather than a guess about scheduling.
+        /// Cancelling first proves something else entirely — that no worker is
+        /// borrowed at all — and is asserted separately below.
+        ///
+        /// Real defect this catches: a boundary that notices cancellation only
+        /// when the work finally answers. The provider here holds its worker
+        /// far past the ceiling, so a caller that is released inside it can
+        /// only have been released by its own cancellation.
         #[test]
         fn a_caller_cancelled_mid_call_leaves_its_worker_counted() {
             let boundary = ThreadBoundedProviderCallV1::new(2);
             let latch = ReleaseLatchV1::new();
+            let entry = ReleaseLatchV1::new();
             let cancellation = CancellationToken::new();
-            let entered = Arc::new(AtomicBool::new(false));
 
-            let announced = Arc::clone(&entered);
+            let announced = entry.clone();
             let cancelling = cancellation.clone();
             let withdraw = std::thread::spawn(move || {
-                while !announced.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                announced.wait();
+                let withdrawn_at = Instant::now();
                 cancelling.cancel();
+                withdrawn_at
             });
 
             let held = latch.clone();
+            let opened = entry.clone();
             let refusal = boundary
-                .call_within(5_000, &cancellation, move || {
-                    entered.store(true, Ordering::Release);
+                .call_within(30_000, &cancellation, move || {
+                    opened.release();
                     held.wait();
                     3_u8
                 })
                 .expect_err("a cancelled caller must stop waiting");
-            withdraw.join().expect("the cancelling thread");
+            let released_at = Instant::now();
+            let withdrawn_at = withdraw.join().expect("the cancelling thread");
             assert!(
                 matches!(refusal, BoundedCallRefusalV1::Cancelled),
                 "{refusal:?}"
+            );
+            let waited = released_at.saturating_duration_since(withdrawn_at);
+            assert!(
+                waited <= CANCELLATION_RELEASE_CEILING,
+                "the caller was handed back {waited:?} after it withdrew, past the \
+                 {CANCELLATION_RELEASE_CEILING:?} ceiling: it was waiting out the provider \
+                 rather than its own cancellation"
+            );
+            assert!(
+                !latch.is_released(),
+                "the provider was let go before the assertion, so this proves nothing about \
+                 a caller released while its worker is still inside the provider"
             );
             assert_eq!(
                 boundary.census(),
@@ -4554,12 +4586,22 @@ mod tests {
         /// The descriptor the double registers under: the Native identity, the host's
         /// own limits, and the implementation identity the durable recovery record
         /// compares against.
+        /// The state generation a freshly mounted adversarial double reports.
+        ///
+        /// Deliberately not zero. A provider whose state generation *moved
+        /// backwards* can only be exhibited against a generation there is
+        /// room below: at generation zero the misbehaviour degenerates into a
+        /// compliant one, the mounted case is silently untested, and the
+        /// refusal the test observes comes from some unrelated check further
+        /// down the admission path.
+        const ADVERSARIAL_STATE_GENERATION: u64 = 9;
+
         fn adversarial_descriptor() -> ProviderDescriptor {
             ProviderDescriptor::new(
                 OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider"),
                 "0".repeat(64),
                 "adversarial-journey-v1",
-                0,
+                ADVERSARIAL_STATE_GENERATION,
                 BTreeSet::from([
                     OwnedVersionedId::new("provider.health.v1").expect("health capability"),
                     OwnedVersionedId::new("observation.accept.v1").expect("observe capability"),
@@ -7408,6 +7450,38 @@ mod tests {
         port: Arc<JourneyNativePort>,
         journey: Arc<ProjectObservationJourneyV1>,
         project_id: ProjectId,
+        /// The journal root this fixture's journey was mounted over, so a test
+        /// can mount a *later open* of the same project over the same durable
+        /// state.
+        journal_root: PathBuf,
+    }
+
+    impl HygieneJourneyFixture {
+        /// Mounts a second, independent journey over this fixture's durable
+        /// journal — a genuinely later open of the same project.
+        ///
+        /// Project open is what constructs a journey: `mount_and_replay`
+        /// mounts one, replays into it, and drops it when the open fails. A
+        /// test that re-runs startup replay against the *same* journey is
+        /// therefore not testing a later open at all; it is testing a second
+        /// pass inside the same one, which shares that mount's live provider
+        /// supervisor and its enforced restart pacing. The only durable thing
+        /// a later open inherits is the journal, and that is exactly what this
+        /// hands it.
+        fn reopen(&self) -> Arc<ProjectObservationJourneyV1> {
+            mount_project_observation_journey(ObservationJourneyMountInputsV1 {
+                composition: composition(Arc::clone(&self.port)
+                    as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>),
+                profile_id: UserProfileId::new("profile.observation-hygiene").expect("profile id"),
+                scope: scope(self.project_id.clone()),
+                authoritative_project_id: self.project_id.clone(),
+                store_data_root: self.journal_root.clone(),
+                registration_revision: 1,
+                host_limits: super::super::native_provider::native_provider_limits(),
+                policy: ObservationJourneyPolicyV1::project_default(),
+            })
+            .expect("a later open mounts over the same durable journal")
+        }
     }
 
     /// Mounts the production journey against a real registered project store
@@ -7436,7 +7510,7 @@ mod tests {
             profile_id: UserProfileId::new("profile.observation-hygiene").expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
-            store_data_root: journal_root,
+            store_data_root: journal_root.clone(),
             registration_revision: 1,
             host_limits: super::super::native_provider::native_provider_limits(),
             policy: ObservationJourneyPolicyV1::project_default(),
@@ -7455,6 +7529,7 @@ mod tests {
             port,
             journey,
             project_id,
+            journal_root,
         }
     }
 
@@ -7520,16 +7595,24 @@ mod tests {
             "nothing may be journaled after the caller gave up: {snapshot}"
         );
 
+        // The cancelled open ends here, exactly as `mount_and_replay` ends it:
+        // the typed terminal is returned and the journey that open constructed
+        // is shut down and dropped.
+        let failures = fixture
+            .journey
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        assert!(failures.is_empty(), "{failures:?}");
+
         // Nothing was lost either: both records are still the canonical
-        // store's, and the next open under its own token admits both exactly
-        // once.
-        let pass = run_startup_replay(
-            fixture.journey.as_ref(),
-            &records,
-            &HostCancellationToken::new(),
-        )
-        .await
-        .expect("resumed replay");
+        // store's, and the *next open* — a new journey over the same durable
+        // journal, under its own token — admits both exactly once. The
+        // provider double keeps the cancelling hook armed, so the later open
+        // also proves the dead token cannot reach across mounts.
+        let reopened = fixture.reopen();
+        let pass = run_startup_replay(reopened.as_ref(), &records, &HostCancellationToken::new())
+            .await
+            .expect("resumed replay");
         assert_eq!(
             pass,
             ReplayPassV1 {
@@ -7538,10 +7621,9 @@ mod tests {
                 shed: None,
             }
         );
-        let snapshot = journal_snapshot(fixture.journey.journal_path());
+        let snapshot = journal_snapshot(reopened.journal_path());
         assert!(snapshot.starts_with("journal=2 delivery=2 "), "{snapshot}");
-        let failures = fixture
-            .journey
+        let failures = reopened
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
             .await;
         assert!(failures.is_empty(), "{failures:?}");

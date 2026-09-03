@@ -586,9 +586,16 @@ async fn state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep() 
     let shutdown = tokio::spawn(async move {
         shutdown_state.shutdown().await;
     });
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    // Deterministic: begin_shutdown closes LSP admission before the endpoint
+    // expiry sweep that this test's registry guard is blocking, so once the
+    // gate reads closed the open spawned below is queued strictly between them.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while *state.service.lsp_admission_open.lock().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown must close LSP admission before the endpoint expiry sweep");
 
     let open_state = Arc::clone(&state);
     let (open_started, started) = tokio::sync::oneshot::channel();
@@ -613,16 +620,16 @@ async fn state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep() 
             .await
     });
     started.await.expect("racing open started");
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            if open.is_finished() || state.service.lsp_admission_open.try_lock().is_err() {
+            if open.is_finished() {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("shutdown or open must acquire the LSP admission gate");
+    .expect("the fenced open must settle before the endpoint expiry sweep");
     drop(endpoint_guard);
 
     let response = open.await.expect("racing LSP open");

@@ -19,23 +19,43 @@ use std::time::Duration;
 use tracedecay_daemon_service::{DaemonInvocationService, LspSessionId};
 
 /// What one blocked lease task hands back to the test: the release channel
-/// that unblocks its worker thread and the signal it fires once it resumes.
+/// that unblocks its worker thread, the signal it fires once it resumes, and
+/// the signal fired when the runtime drops the task's future.
 struct BlockedLeaseTask {
     release: mpsc::Sender<()>,
     resumed: mpsc::Receiver<()>,
+    retired: mpsc::Receiver<()>,
+}
+
+/// Fires exactly once, when the runtime drops the lease task's future.
+///
+/// A future is dropped either because the task ran to completion or because it
+/// was aborted, and the drop is the last thing that happens to it either way.
+/// Observing it is therefore a terminal, positive event: after it arrives the
+/// lease body can never execute another statement, so a `side_effect` still at
+/// zero at that moment can never be raised afterwards. That is the deterministic
+/// replacement for waiting out a fixed number of yields and a sleep, which only
+/// ever proved that the effect had not happened *yet*.
+struct LeaseRetirementWitness(mpsc::Sender<()>);
+
+impl Drop for LeaseRetirementWitness {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
 }
 
 /// Start one LSP lease task that blocks its worker thread, so the registry's
 /// cancellation can never preempt it and the shutdown join cannot finish.
 ///
 /// After the block is released the task signals `resumed` and only then
-/// reaches an await point followed by `side_effect`. The two signals separate
-/// the halves of the guarantee the registry actually provides: `resumed` is
+/// reaches an await point followed by `side_effect`. The signals separate the
+/// halves of the guarantee the registry actually provides: `resumed` is
 /// in-body work that a cancelled and aborted task still performs, because
 /// abort is cooperative and cannot preempt a poll that is already running,
 /// while `side_effect` is sequenced after the task's next suspension point and
 /// is therefore reachable only by a task that shutdown detached instead of
-/// aborting.
+/// aborting. `retired` fires when the runtime drops the future, which bounds
+/// the observation: once it has arrived no further lease statement can run.
 async fn blocked_lease_task(
     service: &DaemonInvocationService,
     session_id: &str,
@@ -43,12 +63,16 @@ async fn blocked_lease_task(
 ) -> BlockedLeaseTask {
     let (release, blocked) = mpsc::channel::<()>();
     let (resumed_tx, resumed) = mpsc::channel::<()>();
+    let (retired_tx, retired) = mpsc::channel::<()>();
     let (entered, in_blocking_section) = tokio::sync::oneshot::channel::<()>();
     service
         .lsp_lease_tasks
         .start(
             LspSessionId::new(session_id).expect("lease session id"),
             async move {
+                // Owned by the future, so its drop is the runtime retiring
+                // this task, whether by abort or by normal completion.
+                let _retirement = LeaseRetirementWitness(retired_tx);
                 let _ = entered.send(());
                 // Blocking inside the poll is the one lease shape cancellation
                 // cannot reach: the task never yields, so the join is unbounded
@@ -64,7 +88,11 @@ async fn blocked_lease_task(
     in_blocking_section
         .await
         .expect("lease task reached its blocking section");
-    BlockedLeaseTask { release, resumed }
+    BlockedLeaseTask {
+        release,
+        resumed,
+        retired,
+    }
 }
 
 /// Without the bound, `expire_all_until` joins the blocked lease task forever
@@ -118,19 +146,22 @@ async fn lsp_shutdown_returns_unclean_when_a_lease_join_outlives_the_shared_dead
         );
     }
 
-    // Both tasks are past the block and at an await point. Give the runtime a
-    // real opportunity to poll them again; a detached task would take it.
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
+    // Both tasks are past the block and at an await point, so the abort takes
+    // effect on their next poll. Wait for the runtime to actually drop each
+    // future: that is a positive terminal event, not the absence of one, and
+    // after it the lease body provably cannot execute another statement.
+    for task in [&first, &second] {
+        task.retired
+            .recv_timeout(Duration::from_secs(10))
+            .expect("shutdown must retire the lease task's future, not detach it");
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(
         side_effects.load(Ordering::SeqCst),
         0,
         "a lease task shutdown abandoned at the deadline must be cancelled and aborted, \
          so it can never resume past its next suspension point; a detached task would \
-         have run the effect sequenced after that await"
+         have run the effect sequenced after that await before its future was dropped"
     );
     assert_eq!(
         service.lsp_lease_tasks.active_tasks(),

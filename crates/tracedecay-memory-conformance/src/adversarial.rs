@@ -474,17 +474,77 @@ pub struct AdversarialProviderInputsV1 {
     pub payloads: Arc<dyn AdversarialPayloadSourceV1>,
 }
 
-/// Decrements the in-flight counter however the call leaves the provider:
+/// Calls currently inside the double, published so a test can *wait* for the
+/// provider to be demonstrably in the call instead of sleeping on a guess.
+///
+/// A counter alone cannot do that: a test that wants to cancel a call already
+/// in flight has to know the call is in flight, and polling for it either
+/// sleeps (scheduler-dependent) or spins (burns the runtime). The condition
+/// variable turns both into a bounded wait on the event itself.
+#[derive(Default)]
+struct InFlightGaugeV1 {
+    inside: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl InFlightGaugeV1 {
+    fn enter(&self) {
+        let mut inside = self.guard();
+        *inside = inside.saturating_add(1);
+        drop(inside);
+        self.changed.notify_all();
+    }
+
+    fn leave(&self) {
+        let mut inside = self.guard();
+        *inside = inside.saturating_sub(1);
+        drop(inside);
+        self.changed.notify_all();
+    }
+
+    fn current(&self) -> u64 {
+        *self.guard()
+    }
+
+    /// Blocks until `admits` holds for the number of calls inside the double,
+    /// or `within` elapses. Returns what it last saw and whether the predicate
+    /// held, so a caller can assert on both.
+    fn wait_until(&self, within: Duration, admits: impl Fn(u64) -> bool) -> (bool, u64) {
+        let deadline = Instant::now() + within;
+        let mut inside = self.guard();
+        loop {
+            if admits(*inside) {
+                return (true, *inside);
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return (false, *inside);
+            };
+            let (guard, _) = self
+                .changed
+                .wait_timeout(inside, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inside = guard;
+        }
+    }
+
+    fn guard(&self) -> MutexGuard<'_, u64> {
+        self.inside
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Decrements the in-flight gauge however the call leaves the provider:
 /// a normal return, an error, or the scripted panic unwinding through it.
 ///
 /// This is what makes "no provider work outlived the host's call" an
 /// assertion rather than a hope: a host that walks away from a blocked
-/// provider leaves the counter above zero, and the test sees it.
-struct InFlightGuard(Arc<AtomicU64>);
+/// provider leaves the gauge above zero, and the test sees it.
+struct InFlightGuard(Arc<InFlightGaugeV1>);
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.0.leave();
     }
 }
 
@@ -499,7 +559,7 @@ pub struct AdversarialProviderV1 {
     payloads: Arc<dyn AdversarialPayloadSourceV1>,
     handshakes: AtomicU64,
     invocations: AtomicU64,
-    in_flight: Arc<AtomicU64>,
+    in_flight: Arc<InFlightGaugeV1>,
     ledger: AdversarialLedgerV1,
 }
 
@@ -510,7 +570,7 @@ impl std::fmt::Debug for AdversarialProviderV1 {
             .field("provider_id", &self.descriptor.provider_id.as_str())
             .field("handshakes", &self.handshakes.load(Ordering::Acquire))
             .field("invocations", &self.invocations.load(Ordering::Acquire))
-            .field("in_flight", &self.in_flight.load(Ordering::Acquire))
+            .field("in_flight", &self.in_flight.current())
             .finish_non_exhaustive()
     }
 }
@@ -529,7 +589,7 @@ impl AdversarialProviderV1 {
             payloads: inputs.payloads,
             handshakes: AtomicU64::new(0),
             invocations: AtomicU64::new(0),
-            in_flight: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(InFlightGaugeV1::default()),
             ledger: AdversarialLedgerV1::new(),
         }
     }
@@ -540,7 +600,31 @@ impl AdversarialProviderV1 {
     /// worker to a provider that is still running.
     #[must_use]
     pub fn in_flight(&self) -> u64 {
-        self.in_flight.load(Ordering::Acquire)
+        self.in_flight.current()
+    }
+
+    /// Blocks the calling thread until at least `calls` invocations are inside
+    /// the double, and reports whether that happened inside `within`.
+    ///
+    /// This is the entry proof a cancellation test needs: cancelling before
+    /// the provider is demonstrably in the call proves nothing about reaching
+    /// work already in flight, and a fixed sleep only guesses that it has.
+    #[must_use]
+    pub fn wait_until_in_flight(&self, calls: u64, within: Duration) -> bool {
+        self.in_flight
+            .wait_until(within, |inside| inside >= calls)
+            .0
+    }
+
+    /// Blocks the calling thread until no invocation is inside the double, and
+    /// reports whether that happened inside `within`.
+    ///
+    /// A host answers its caller without waiting for a provider it abandoned,
+    /// so an assertion about what the *provider* finally did has to wait for
+    /// the provider itself — on the event, not on a poll.
+    #[must_use]
+    pub fn wait_until_idle(&self, within: Duration) -> bool {
+        self.in_flight.wait_until(within, |inside| inside == 0).0
     }
 
     /// The shared record of everything this double was asked to do.
@@ -943,7 +1027,7 @@ impl MemoryProvider for AdversarialProviderV1 {
     }
 
     fn invoke(&self, call: &ProviderCall) -> ProviderReply {
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        self.in_flight.enter();
         let _in_flight = InFlightGuard(Arc::clone(&self.in_flight));
         let contact = self.invocations.fetch_add(1, Ordering::AcqRel);
         let misbehaviour = self

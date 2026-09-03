@@ -397,6 +397,33 @@
         "ADR-0011",
         "ADR-0013"
       ]
+    },
+    {
+      "id": "ADR-0015",
+      "topic": "daemon_shutdown_test_fence_and_supersession_headroom",
+      "title": "Approve the daemon shutdown touch point at eight files and 360 changed lines",
+      "path": "product/architecture/adr/ADR-0015-daemon-shutdown-test-fence-and-supersession-headroom.md",
+      "status": "accepted",
+      "decision_summary": "Supersede ADR-0013 as the approving decision for the daemon_shutdown_deadline touch point and approve it at 8 files and 360 changed lines, measured 7 files and 329 lines, admitting the shutdown call chain's own invocation_tests paths so the fence assertion in lsp_lease_tests.rs can be made literal; raise the invocation/types.rs convergence line budget from 30 to 50 ahead of the pending supersession settlement fix. No aggregate cap changes and the policy revision stays patch-footprint.v3.",
+      "required_rejections": [
+        "Leave the fixed `yield_now()` loop and keep the category at six files",
+        "Bound the wait with a sleep or a longer yield count instead of an observable effect",
+        "Classify the shutdown unit tests under `integration_test_runtime_isolation`",
+        "Bundle the cap increase into the supersession fix",
+        "Raise the aggregate test/fixture cap to 11 at the same time",
+        "Raise the category to the global per-category limit of 15 files"
+      ],
+      "verification_beads": [
+        "tdmem-0105",
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "depends_on_adrs": [
+        "ADR-0008",
+        "ADR-0011",
+        "ADR-0013",
+        "ADR-0014"
+      ]
     }
   ]
 }

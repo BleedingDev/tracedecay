@@ -168,17 +168,12 @@ async fn settle_until(
     ceiling: Duration,
     predicate: impl Fn(ProviderWorkerCensusV1) -> bool,
 ) -> ProviderWorkerCensusV1 {
-    let started = Instant::now();
-    loop {
-        let census = boundary.worker_census(PROVIDER);
-        if predicate(census) {
-            return census;
-        }
-        assert!(
-            started.elapsed() < ceiling,
-            "boundary never reached the expected census; last saw {census:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    match boundary
+        .await_worker_census(PROVIDER, ceiling, predicate)
+        .await
+    {
+        Ok(census) => census,
+        Err(census) => panic!("boundary never reached the expected census; last saw {census:?}"),
     }
 }
 
@@ -599,20 +594,54 @@ async fn a_cancelled_non_terminable_worker_holds_the_route_only_until_it_returns
 async fn cancellation_releases_the_caller_without_waiting_out_the_provider() {
     let boundary = boundary();
     const PROVIDER_BLOCKS_FOR: Duration = Duration::from_millis(1_500);
-    const CANCEL_AFTER: Duration = Duration::from_millis(150);
+    /// Longest the caller may still be waiting after its own cancellation
+    /// fired (`tdmem-sz9` acceptance).
+    const RELEASE_CEILING: Duration = Duration::from_millis(100);
 
-    let started = Instant::now();
+    // The provider signals that it is inside the call, the test withdraws on
+    // that event, and the release is measured from the exact instant of the
+    // withdrawal. A timer instead of an entry signal would leave it unproven
+    // that cancellation ever reached work already in flight, and would fold
+    // the arming delay into the measured latency.
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let cancelled_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+    // `notify_one` stores a permit, so the withdrawal can never be lost to the
+    // boundary registering its wait a moment later.
+    let withdrawn = Arc::new(tokio::sync::Notify::new());
+    let request = ProviderInvocationRequestV1 {
+        provider_id: PROVIDER,
+        execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
+        budget: Duration::from_secs(30),
+        cancelled: {
+            let withdrawn = Arc::clone(&withdrawn);
+            Box::pin(async move { withdrawn.notified().await })
+        },
+    };
+
+    let withdrawing = {
+        let entered = Arc::clone(&entered);
+        let cancelled_at = Arc::clone(&cancelled_at);
+        let withdrawn = Arc::clone(&withdrawn);
+        tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .expect("the provider must be inside the call before its caller withdraws");
+            *cancelled_at.lock().expect("cancellation instant") = Some(Instant::now());
+            withdrawn.notify_one();
+        })
+    };
+
+    let announce = Arc::clone(&entered);
     let cancelled = boundary
-        .invoke(
-            cancelled_after(Duration::from_secs(30), CANCEL_AFTER),
-            || {
-                // Non-cooperative on purpose: it never looks at a token.
-                std::thread::sleep(PROVIDER_BLOCKS_FOR);
-                "late answer"
-            },
-        )
+        .invoke(request, move || {
+            announce.notify_one();
+            // Non-cooperative on purpose: it never looks at a token.
+            std::thread::sleep(PROVIDER_BLOCKS_FOR);
+            "late answer"
+        })
         .await;
-    let waited = started.elapsed();
+    let released_at = Instant::now();
+    withdrawing.await.expect("withdrawing task");
 
     match cancelled {
         Err(ProviderInvocationFaultV1::Cancelled {
@@ -625,10 +654,15 @@ async fn cancellation_releases_the_caller_without_waiting_out_the_provider() {
         }
         other => panic!("a withdrawn caller must be told so: {other:?}"),
     }
+    let withdrew_at = cancelled_at
+        .lock()
+        .expect("cancellation instant")
+        .expect("the caller must have withdrawn");
+    let waited = released_at.saturating_duration_since(withdrew_at);
     assert!(
-        waited < PROVIDER_BLOCKS_FOR / 2,
-        "cancellation returned after {waited:?}: the caller waited out the provider's \
-         {PROVIDER_BLOCKS_FOR:?} of blocking work instead of its own cancellation"
+        waited <= RELEASE_CEILING,
+        "cancellation returned {waited:?} after the caller withdrew: it waited out the \
+         provider's {PROVIDER_BLOCKS_FOR:?} of blocking work instead of its own cancellation"
     );
     assert_eq!(
         boundary.worker_census(PROVIDER).live,
