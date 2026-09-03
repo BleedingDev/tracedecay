@@ -176,6 +176,7 @@ fn mount_routed(
     routing: ActiveRoutingPolicy,
 ) -> Result<ProjectCognitiveRecallPortV1, CognitiveRecallPortError> {
     ProjectCognitiveRecallPortV1::mount(CognitiveRecallPortInputsV1 {
+        invocation_boundary: test_invocation_boundary(),
         composition,
         scope_binding: Arc::new(TestScopeBinding),
         admission_observer: observer,
@@ -708,6 +709,16 @@ async fn cancellation_after_dispatch_reaches_the_working_provider() {
         .expect("cancelled recall terminates");
     canceller.await.expect("canceller task");
 
+    // The caller is released the moment it withdraws, so the provider is still
+    // running when `recall_admitted` returns: reading its ledger immediately
+    // would race the very decoupling this port is supposed to have. The wait is
+    // bounded well under the provider's own 10s give-up, so a port that minted
+    // its own token -- leaving the provider holding a token nothing cancels --
+    // still fails this assertion rather than passing on a delay.
+    let settle_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !observed.load(Ordering::Acquire) && std::time::Instant::now() < settle_by {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert!(
         observed.load(Ordering::Acquire),
         "the working provider must observe the caller's own cancellation token"

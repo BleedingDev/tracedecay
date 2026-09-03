@@ -18,6 +18,58 @@ use super::{
     reset_counter_for_project,
 };
 
+/// Largest Claude transcript tail one lifecycle catch-up hook will read.
+/// A larger backlog stays queued for the next hook or the daemon's own
+/// session-sync sweep instead of holding the host's lifecycle event open.
+const CLAUDE_CATCH_UP_INGEST_MAX_BYTES: u64 =
+    tracedecay_sessions::runtime::SESSION_TRANSCRIPT_STALLED_INGEST_WARNING_BYTES;
+
+/// Budget for the `SessionStart` catch-up ingest. Orientation is on the
+/// critical path of the agent's first turn, so this is deliberately short: the
+/// tail that does not fit is picked up by `Stop` or by the daemon's own sweep.
+const CLAUDE_SESSION_START_INGEST_BUDGET: Duration = Duration::from_secs(5);
+
+/// Budget for the `Stop` catch-up ingest, the primary Claude ingest point.
+/// `Stop` runs at a turn boundary under Claude's default 60s hook guard, so a
+/// 25s budget leaves ample headroom for the rest of the handler.
+const CLAUDE_STOP_INGEST_BUDGET: Duration = Duration::from_secs(25);
+
+/// Runs one bounded project-scoped Claude transcript catch-up for a lifecycle
+/// event, reporting -- never discarding -- a route that did not complete.
+///
+/// This is the production moment a Claude session running *inside* a
+/// registered project becomes canonical project observations. The
+/// profile-scoped route these handlers already used covers only sessions that
+/// belong to no registered project, so without this call a project session's
+/// evidence waits for the daemon's next session-sync sweep.
+///
+/// Fail-open by construction: the hook's own answer (orientation guidance, the
+/// turn boundary) is produced regardless, and an unreachable or slow daemon
+/// costs the host nothing but a diagnostic line.
+async fn ingest_claude_project_transcript(
+    hook_event_name: &str,
+    event: &str,
+    root: &Path,
+    budget: Duration,
+    telemetry: &super::analytics::HookTimingSpan,
+) {
+    let outcome = super::ingest_transcript_for_event(
+        "claude",
+        event,
+        Some(root),
+        Some(CLAUDE_CATCH_UP_INGEST_MAX_BYTES),
+        budget,
+        Some(telemetry),
+    )
+    .await;
+    if let Some(reason) = outcome.failure_reason() {
+        eprintln!(
+            "[tracedecay] Claude {hook_event_name} transcript ingest failed open: \
+             stage=project_ingest outcome={reason}"
+        );
+    }
+}
+
 /// `PreToolUse` hook handler for Claude Code's Agent tool matcher.
 #[hotpath::measure(label = "hosts.hooks.claude.pre_tool_use")]
 pub fn hook_pre_tool_use() {
@@ -162,6 +214,16 @@ async fn claude_session_start_response(event: &str) -> (Option<PathBuf>, String)
         event,
         &parsed,
     );
+    if let Some(project_root) = root.as_deref() {
+        ingest_claude_project_transcript(
+            "SessionStart",
+            event,
+            project_root,
+            CLAUDE_SESSION_START_INGEST_BUDGET,
+            &hook_telemetry,
+        )
+        .await;
+    }
     let output = super::dispatch::dispatch_for_scope(
         tracedecay_hooks::HookHostV1::ClaudeCode,
         event,
@@ -486,6 +548,16 @@ async fn claude_stop_response_for_event(event: &str) -> (Option<PathBuf>, String
     let root = event_project_root_with_identity(&parsed).await;
     let hook_telemetry =
         record_hook_invoked_parsed(root.as_deref(), HintAgent::Claude, "Stop", event, &parsed);
+    if let Some(project_root) = root.as_deref() {
+        ingest_claude_project_transcript(
+            "Stop",
+            event,
+            project_root,
+            CLAUDE_STOP_INGEST_BUDGET,
+            &hook_telemetry,
+        )
+        .await;
+    }
     let output = super::dispatch::dispatch_for_scope(
         tracedecay_hooks::HookHostV1::ClaudeCode,
         event,

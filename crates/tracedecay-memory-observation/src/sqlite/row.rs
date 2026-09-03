@@ -159,25 +159,126 @@ source_authority, exact_scope_sha256, source_stream, source_sequence, source_eve
 source_event_revision, receipt_id, reason, source_payload_sha256, extensions_digest, \
 sanitizer_revision, finding_count, findings_digest, forget_source_key";
 
-/// Revalidates every persisted withheld receipt while opening the store.
+/// What one resumable withheld-audit pass did.
 ///
-/// The table carries no payload bytes, so reconstruction is bounded in memory.
-/// The scan is intentionally fail-closed: a restart must not bless an audit row
-/// whose receipt identity no longer matches the evidence stored beside it.
-pub(crate) fn validate_withheld_rows(
+/// This is the operational surface of the bounded audit: a caller drives it
+/// until `complete` is true, and the two fields together say both that
+/// progress is being made and when there is nothing left to make.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WithheldAuditProgressV1 {
+    /// Withheld receipts revalidated by this pass.
+    pub rows_validated: u32,
+    /// Whether every row the store held at open has now been revalidated.
+    pub complete: bool,
+}
+
+/// The primary key of the last withheld row one bounded audit page validated.
+///
+/// It is a *position*, not an identity: the audit walks the table in its own
+/// clustered key order and resumes strictly after this tuple, so the work is
+/// paid for once however many pages it takes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WithheldAuditCursorV1 {
+    pub(crate) source_authority: String,
+    pub(crate) exact_scope_sha256: String,
+    pub(crate) source_stream: String,
+    pub(crate) source_sequence: i64,
+    pub(crate) receipt_id: String,
+}
+
+/// What one bounded withheld-audit page did.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WithheldAuditPageV1 {
+    /// Rows revalidated by this page.
+    pub(crate) rows_validated: u32,
+    /// Where the next page resumes, or `None` when the table is exhausted.
+    ///
+    /// A short page is exhaustion: the statement is bounded by `LIMIT`, so
+    /// fewer rows than the limit means the walk reached the end of the table.
+    pub(crate) resume_after: Option<WithheldAuditCursorV1>,
+}
+
+/// The clustered key order the audit walks and resumes in. It is the table's
+/// own `WITHOUT ROWID` primary key, so a page is an index range scan rather
+/// than a sort.
+const WITHHELD_KEY_ORDER: &str =
+    "source_authority, exact_scope_sha256, source_stream, source_sequence, receipt_id";
+
+/// Revalidates at most `limit` persisted withheld receipts, resuming strictly
+/// after `after`.
+///
+/// The table carries no payload bytes, so reconstruction is bounded in memory —
+/// but it is *not* bounded in rows, and a full-table scan on every open made
+/// project open cost grow with the size of the audit. `LIMIT` plus a resume
+/// cursor makes each pass cost what the caller asked for and nothing more.
+///
+/// The check itself is unchanged and still fail-closed: an audit row whose
+/// receipt identity no longer matches the evidence stored beside it is
+/// corruption, and the pass that meets it refuses rather than blessing it.
+pub(crate) fn validate_withheld_page(
     connection: &Connection,
-) -> Result<(), ObservationJournalError> {
-    let mut statement = connection.prepare(&format!(
-        "SELECT {WITHHELD_SELECT_COLUMNS} FROM tdmem_observation_withheld_v2"
-    ))?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        decode_withheld(row).map_err(|_| ObservationJournalError::Corrupt {
-            table: "tdmem_observation_withheld_v2",
-            field: "receipt_id",
-        })?;
+    after: Option<&WithheldAuditCursorV1>,
+    limit: u32,
+) -> Result<WithheldAuditPageV1, ObservationJournalError> {
+    if limit == 0 {
+        return Err(ObservationJournalError::ValueOutOfRange {
+            field: "withheld_audit_page_limit",
+        });
     }
-    Ok(())
+    let bound = i64::from(limit);
+    let mut page = WithheldAuditPageV1 {
+        rows_validated: 0,
+        resume_after: None,
+    };
+    let mut last: Option<WithheldAuditCursorV1> = None;
+    {
+        // Row-value comparison against the primary key, so the resume is a
+        // seek into the clustered index rather than a scan that skips rows it
+        // has already paid to read.
+        let mut statement = connection.prepare(&match after {
+            Some(_) => format!(
+                "SELECT {WITHHELD_SELECT_COLUMNS} FROM tdmem_observation_withheld_v2 \
+                 WHERE ({WITHHELD_KEY_ORDER}) > (?1, ?2, ?3, ?4, ?5) \
+                 ORDER BY {WITHHELD_KEY_ORDER} LIMIT ?6"
+            ),
+            None => format!(
+                "SELECT {WITHHELD_SELECT_COLUMNS} FROM tdmem_observation_withheld_v2 \
+                 ORDER BY {WITHHELD_KEY_ORDER} LIMIT ?1"
+            ),
+        })?;
+        let mut rows = match after {
+            Some(cursor) => statement.query(rusqlite::params![
+                cursor.source_authority,
+                cursor.exact_scope_sha256,
+                cursor.source_stream,
+                cursor.source_sequence,
+                cursor.receipt_id,
+                bound,
+            ])?,
+            None => statement.query(rusqlite::params![bound])?,
+        };
+        while let Some(row) = rows.next()? {
+            let withheld = decode_withheld(row).map_err(|_| ObservationJournalError::Corrupt {
+                table: "tdmem_observation_withheld_v2",
+                field: "receipt_id",
+            })?;
+            last = Some(WithheldAuditCursorV1 {
+                source_sequence: sql_i64(withheld.source_sequence, "source_sequence")?,
+                source_authority: withheld.source_authority,
+                exact_scope_sha256: withheld.exact_scope_sha256,
+                source_stream: withheld.source_stream,
+                receipt_id: withheld.receipt_id,
+            });
+            page.rows_validated = page.rows_validated.saturating_add(1);
+        }
+    }
+    // A full page means there may be more; a short one means the walk reached
+    // the end. Claiming exhaustion on a full page would leave the tail of the
+    // table permanently unvalidated.
+    if page.rows_validated == limit {
+        page.resume_after = last;
+    }
+    Ok(page)
 }
 
 fn decode_withheld(row: &Row<'_>) -> Result<WithheldAdmissionV1, ObservationJournalError> {

@@ -154,7 +154,9 @@ fn is_mountable_active_provider(_provider: &str) -> bool {
 
 /// Builds the recall routing policy for an active composition from the
 /// pinned routing gate: the Native provider under the product registration
-/// revision, with fallback forbidden unless the gate pins a complete rule.
+/// revision, always with `FallbackRule::Forbidden`. This composition
+/// registers exactly one provider, so any pinned fallback is refused at
+/// project open instead of being carried into the policy.
 /// Observer and disabled activations have no recall route and yield `None`.
 #[cfg(feature = "memory-provider-host")]
 fn project_recall_routing_policy(
@@ -211,6 +213,16 @@ fn project_recall_routing_policy(
 /// journal's idempotency key, which is why it may not be zero.
 #[cfg(feature = "memory-provider-host")]
 pub(super) const PROJECT_NATIVE_REGISTRATION_REVISION: u64 = 1;
+
+/// Product-owned in-flight budget for the project-scoped provider: one active
+/// provider call at a time per checkout.
+///
+/// The same number bounds two separate things, which is why it is named once:
+/// the fabric's active permit lane, and the host execution boundary that owns
+/// the workers those calls run on. If they disagreed, one of them would be
+/// accounting for capacity the other had already given away.
+#[cfg(feature = "memory-provider-host")]
+pub(super) const PROJECT_MEMORY_PROVIDER_MAX_IN_FLIGHT: usize = 1;
 
 /// Mounts the project's memory-provider host.
 ///
@@ -270,7 +282,7 @@ async fn mount_project_memory_provider_host(
             tracedecay_memory_provider_registry::NativeProviderActivation::Enabled {
                 fabric_config: tracedecay_memory_provider_registry::FabricConfig {
                     max_registered_providers: 1,
-                    max_in_flight: 1,
+                    max_in_flight: PROJECT_MEMORY_PROVIDER_MAX_IN_FLIGHT,
                 },
                 port,
                 registration_revision: PROJECT_NATIVE_REGISTRATION_REVISION,
@@ -766,6 +778,17 @@ async fn production_project_server_inner(
                     graph: Arc::clone(&cg),
                     routing,
                     host_limits: super::retained_owner::native_provider::native_provider_limits(),
+                    // The host's own execution capability for synchronous
+                    // provider work. Provider calls run on workers this
+                    // process creates and accounts for, never on the shared
+                    // async blocking pool, so a provider that ignores its
+                    // deadline is answered at the deadline and its stranded
+                    // worker stays bounded and named instead of consuming
+                    // runtime capacity nothing is tracking.
+                    invocation_boundary:
+                        super::retained_owner::cognitive_recall::host_provider_invocation_boundary(
+                            PROJECT_MEMORY_PROVIDER_MAX_IN_FLIGHT,
+                        ),
                 },
             )
             .map_err(|error| TraceDecayError::Config {

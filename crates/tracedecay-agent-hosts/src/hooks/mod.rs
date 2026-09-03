@@ -462,6 +462,19 @@ impl TranscriptIngestOutcome {
     pub(crate) fn should_schedule_user_review(&self) -> bool {
         !self.failed && !self.timed_out && self.user_scope && self.messages_upserted > 0
     }
+
+    /// Stable label for an ingest that did not complete, so a fail-open caller
+    /// can report what it lost instead of discarding this outcome. `None`
+    /// means the daemon answered; it does not mean anything was upserted.
+    pub(crate) fn failure_reason(&self) -> Option<&'static str> {
+        if self.failed {
+            Some("daemon_call_failed")
+        } else if self.timed_out {
+            Some("budget_exceeded")
+        } else {
+            None
+        }
+    }
 }
 
 enum IngestAttempt {

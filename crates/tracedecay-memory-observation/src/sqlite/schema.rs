@@ -33,7 +33,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::error::ObservationJournalError;
 
-use super::row::validate_withheld_rows;
+use super::row::{WithheldAuditCursorV1, validate_withheld_page};
 
 /// Schema version this build writes and understands.
 pub const SCHEMA_VERSION: i64 = 6;
@@ -393,8 +393,24 @@ CREATE INDEX IF NOT EXISTS tdmem_observation_withheld_age_v2
 /// How long a normal statement waits behind another writer.
 pub(crate) const BUSY_TIMEOUT_MILLIS: u64 = 5_000;
 
+/// Rows of the withheld audit one *open* revalidates before it returns.
+///
+/// Open cost has to be flat in the size of that table, so the pass is bounded
+/// here and the remainder is walked by
+/// [`SqliteObservationJournal::validate_withheld_backlog`] on the owner's own
+/// loop. The bound is a page, not a sample: the whole table is still
+/// revalidated, just not all of it on the caller's critical path.
+///
+/// [`SqliteObservationJournal::validate_withheld_backlog`]: super::SqliteObservationJournal::validate_withheld_backlog
+pub const OPEN_WITHHELD_AUDIT_ROWS: u32 = 256;
+
 /// Applies pragmas and the versioned schema, failing closed on a newer store.
-pub(crate) fn initialize(connection: &mut Connection) -> Result<(), ObservationJournalError> {
+///
+/// Returns where the bounded open-time withheld audit stopped, or `None` when
+/// it already reached the end of the table.
+pub(crate) fn initialize(
+    connection: &mut Connection,
+) -> Result<Option<WithheldAuditCursorV1>, ObservationJournalError> {
     // `journal_mode` returns a row, so it cannot go through `execute_batch`.
     let _mode: String = connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     connection.execute_batch(CONNECTION_PRAGMAS)?;
@@ -433,10 +449,10 @@ pub(crate) fn initialize(connection: &mut Connection) -> Result<(), ObservationJ
             });
         }
     }
-    validate_withheld_rows(&transaction)?;
+    let audit = validate_withheld_page(&transaction, None, OPEN_WITHHELD_AUDIT_ROWS)?;
     transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     transaction.commit()?;
-    Ok(())
+    Ok(audit.resume_after)
 }
 
 /// Adds the version-5 recovery columns to a table that predates them.

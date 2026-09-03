@@ -23,6 +23,7 @@
 //! Both reports bind the immutable fixture-controlled inputs through
 //! [`ScenarioIdentity`].
 
+pub mod adversarial;
 mod baseline;
 mod canonical;
 mod error;
@@ -31,6 +32,11 @@ mod report;
 mod runner;
 mod scenario_corpus;
 
+pub use adversarial::{
+    AdversarialLedgerV1, AdversarialPayloadSourceV1, AdversarialProviderInputsV1,
+    AdversarialProviderV1, AdversarialScriptV1, ExhibitedV1, HandshakeMisbehaviourV1,
+    MisbehaviourV1, NoPayloadSourceV1, ReleaseLatchV1,
+};
 pub use baseline::{
     AdjudicationRecord, BaselineComparison, BaselineError, BaselineLane, BaselineReport,
     BaselineRunConfig, BaselineRunIdentity, BaselineRunOutput, BaselineRunner, BaselineStepRecord,

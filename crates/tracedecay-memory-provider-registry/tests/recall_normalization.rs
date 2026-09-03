@@ -648,6 +648,7 @@ fn mount_port(
         .expect("enabled composition"),
     );
     ProjectCognitiveRecallPortV1::mount(CognitiveRecallPortInputsV1 {
+        invocation_boundary: test_invocation_boundary(),
         composition,
         scope_binding: Arc::new(TestScopeBinding),
         admission_observer: observer,

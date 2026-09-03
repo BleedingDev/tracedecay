@@ -6841,6 +6841,7 @@ dependencies = [
  "tokio",
  "tracedecay-application",
  "tracedecay-domain",
+ "tracedecay-memory-conformance",
  "tracedecay-memory-fabric",
  "tracedecay-memory-provider-api",
  "tracedecay-memory-provider-native",

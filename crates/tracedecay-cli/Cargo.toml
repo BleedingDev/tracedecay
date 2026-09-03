@@ -32,6 +32,14 @@ path = "tests/host_lifecycle_cli_acceptance.rs"
 required-features = ["test-transport"]
 
 [[test]]
+name = "product_memory_provider_claude_host_journey"
+path = "tests/product_memory_provider_claude_host_journey.rs"
+# The subprocess journey drives the shipped `tracedecay` binary against a live
+# daemon that must contain the provider mount, so it requires the opt-in host
+# feature rather than silently proving a dormant composition.
+required-features = ["memory-provider-host", "test-transport"]
+
+[[test]]
 name = "opencode_one_analyzer_journey"
 path = "tests/opencode_one_analyzer_journey.rs"
 required-features = ["test-transport"]
@@ -126,6 +134,11 @@ hotpath-cpu = [
 ]
 hotpath-mcp = ["hotpath", "hotpath/hotpath-mcp"]
 production = ["tracedecay/production"]
+# Opt-in pluggable cognitive-memory provider host. Default-off and absent from
+# `default`, so the shipped binary is byte-for-byte the upstream composition
+# unless an operator asks for it; enabling it only mounts the dormant host,
+# which stays inert until the project's own configuration turns a provider on.
+memory-provider-host = ["tracedecay/memory-provider-host"]
 # Opt-in tiered graph storage; not part of `production`.
 graph-disk-tier = ["tracedecay/graph-disk-tier"]
 graph-tiered-storage = ["tracedecay/graph-tiered-storage"]

@@ -361,7 +361,7 @@ impl DaemonInvocationService {
     #[hotpath::measure(label = "daemon.service.lsp.expire_all", future = true)]
     pub async fn expire_all_until(&self, deadline: tokio::time::Instant) -> bool {
         self.begin_shutdown().await;
-        let lease_shutdown = self.lsp_lease_tasks.shutdown().await;
+        let lease_shutdown = self.lsp_lease_tasks.shutdown(deadline).await;
         let work_attempts_clean = self.work_attempt_processes.shutdown().await;
         self.lsp_sessions.lock().await.clear();
         self.authorized_lsp_workspaces.lock().await.clear();

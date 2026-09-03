@@ -22,7 +22,12 @@ thiserror = "2"
 # two numbers that share a name. The vendored ranks are compile-time data;
 # nothing here reaches the filesystem or the network.
 tiktoken-rs = "0.12"
-tokio = { version = "1", default-features = false, features = ["rt"] }
+# `rt` for the cancellation bridge task, `sync` for the one-shot handoff the
+# host execution boundary answers its caller through, `time` for the
+# per-invocation deadline that boundary enforces on a synchronous provider, and
+# `macros` for the one biased race that boundary settles worker completion,
+# caller cancellation, and the deadline in.
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync", "time"] }
 # Contract surface only: port traits and value types.
 #
 # `default-features = false` states this crate's own intent and stops a future
@@ -40,8 +45,14 @@ tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
 tracedecay-memory-provider-native = { path = "../tracedecay-memory-provider-native" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracedecay-domain = { path = "../tracedecay-domain", version = "0.1.0" }
+# Test-only edge to the provider-neutral adversarial harness. It depends only
+# on the provider API, is never compiled into the shipped crate, and exists so
+# the mounted recall and observation-delivery paths are judged against a
+# provider double that misbehaves on demand rather than against bespoke
+# per-test stubs.
+tracedecay-memory-conformance = { path = "../tracedecay-memory-conformance" }
 
 [lints.rust]
 missing_docs = "deny"

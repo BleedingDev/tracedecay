@@ -260,6 +260,10 @@ impl McpServer {
         let advisory_call = crate::daemon::retained_owner::cognitive_recall::advisory_context_call(
             tool_name,
             &handler_arguments,
+            // An ordinary agent call carries no session id in its arguments,
+            // so the lane binds to the connection this request identity was
+            // minted on instead of skipping the call.
+            application_request_id.as_ref(),
             application_deadline.as_ref(),
             application_cancellation.as_ref(),
         );

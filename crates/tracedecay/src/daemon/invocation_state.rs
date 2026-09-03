@@ -1034,10 +1034,9 @@ impl DaemonInvocationState {
 
     #[cfg(test)]
     pub(super) async fn shutdown(&self) -> bool {
-        self.shutdown_until(
-            tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE,
-        )
-        .await
+        let now = tokio::time::Instant::now();
+        self.shutdown_until(now + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE)
+            .await
     }
 
     #[hotpath::measure(label = "daemon.invocation_state.shutdown", future = true)]

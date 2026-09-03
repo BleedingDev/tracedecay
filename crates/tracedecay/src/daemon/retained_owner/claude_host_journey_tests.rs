@@ -1,0 +1,1085 @@
+//! The Claude Code host memory journey.
+//!
+//! Everything here runs against the *production* composition root
+//! ([`ProductionProjectCompositionHarnessV1`] opens projects through
+//! `production_project_server`, the same function the daemon calls), so what
+//! is proved is the shipped path and not a hand-wired mount:
+//!
+//! 1. an operator turns the two project-scoped memory-provider gates on
+//!    through the real `tracedecay_configuration_set` surface and the daemon
+//!    is then restarted on that project -- the sequence those `DaemonRestart`
+//!    settings require, since a composition that is already open keeps the
+//!    mounts it opened with;
+//! 2. Claude Code writes a real transcript into the composition's own pinned
+//!    transcript home;
+//! 3. the shipped project transcript import commits those Claude messages as
+//!    canonical observations, and the mounted observation journey admits them
+//!    into the durable journal and settles them against Native exactly once;
+//! 4. a later `tracedecay_context` call carrying the same host session id
+//!    receives the advisory provider-memory lane, bounded and de-duplicated.
+//!
+//! What this module deliberately does **not** claim is hook *causality*. The
+//! commit above is driven by the administrative transcript import, so it
+//! proves settlement and recall, not that a hook invocation caused them. The
+//! causal proof -- an empty journal, a transcript written only after the
+//! project is mounted, and then the shipped `tracedecay
+//! hook-claude-session-start` binary invoked as a subprocess with Claude
+//! Code's own payload on stdin -- lives in
+//! `crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs`,
+//! where a real daemon and a real binary are available to drive it.
+//!
+//! Two more journeys live beside it:
+//! [`the_advisory_lane_is_additive_and_never_costs_the_claude_host_its_own_answer`]
+//! holds the fail-open property -- a healthy route answers and a genuinely
+//! broken provider degrades in a typed state that names its routed provider,
+//! and in both cases the host answer keeps every section a dormant
+//! composition produced -- and
+//! [`the_shipped_claude_bundle_stages_hooks_and_registers_project_rules_without_disturbing_operator_state`]
+//! holds the bundle-staging property. Deployed *registration* through the
+//! Claude CLI -- install, re-install, update, deactivate, undo, and rollback
+//! against a real `claude` executable -- is proved by
+//! `crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance.rs`.
+//!
+//! Exact project/worktree identity is compared against the authoritative
+//! resolved scope rather than re-derived.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+use tempfile::TempDir;
+
+use tracedecay_domain::configuration::{
+    ConfigurationIdempotencyKey, ConfigurationLayerIdV1, ConfigurationRevisionId,
+    ConfigurationValueV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, SettingKey,
+};
+use tracedecay_domain::{ProjectId, UserProfileId};
+
+use super::{JOURNAL_FILE_NAME, SESSION_MESSAGE_OBSERVATION_KIND, exact_scope_for_session};
+use crate::daemon::production_harness::ProductionProjectCompositionHarnessV1;
+
+/// The Claude Code session id the whole journey is bound to. It is the host's
+/// own identity: the hook route publishes it, the transcript carries it, and
+/// the later context call names it.
+const CLAUDE_SESSION: &str = "claude-memory-journey-session";
+
+/// A term that appears in every transcript record, so a recall that answers at
+/// all has something to answer with.
+const JOURNEY_TERM: &str = "quicksilver";
+
+/// How long the journey waits for the durable journal to settle. The journey
+/// runs a bounded background delivery worker, so this is a convergence bound,
+/// never a sleep: the loop exits as soon as the row is terminal.
+const SETTLEMENT_BUDGET: Duration = Duration::from_secs(30);
+
+fn git(root: &Path, arguments: &[&str]) {
+    let program = tracedecay_runtime_core::git::try_git_program()
+        .expect("absolute git executable should resolve");
+    let status = std::process::Command::new(program)
+        .current_dir(root)
+        .args(arguments)
+        .status()
+        .expect("git command runs");
+    assert!(status.success(), "git {arguments:?} failed");
+}
+
+/// A real git project: the composition refuses to resolve an exact scope
+/// without a repository, a worktree, and a checked-out reference.
+fn initialize_project(project: &Path) {
+    std::fs::create_dir_all(project).expect("project root");
+    git(project, &["init", "-q", "-b", "main"]);
+    git(project, &["config", "user.email", "journey@example.com"]);
+    git(project, &["config", "user.name", "Journey"]);
+    std::fs::create_dir_all(project.join("src")).expect("project source directory");
+    std::fs::write(
+        project.join("src/lib.rs"),
+        "/// Quicksilver transport probe.\npub fn quicksilver_probe() -> u8 { 7 }\n",
+    )
+    .expect("project source file");
+    git(project, &["add", "."]);
+    git(project, &["commit", "-q", "-m", "initial"]);
+}
+
+/// The source edit the Claude Code session itself makes while it runs: the
+/// agent read the quicksilver probe, then changed it.
+///
+/// It is committed between the dormant composition and the restarted one for
+/// a reason that is worth stating plainly. The upstream in-process
+/// composition harness only observes a published code index on a *second*
+/// `open` when the verified source changed in between: with a byte-identical
+/// checkout the restarted scheduler neither republishes a complete generation
+/// nor reports the typed generation-empty state, so
+/// `wait_for_production_composition_code_index`
+/// (`crates/tracedecay/src/daemon/production_harness.rs:833-870`) exhausts its
+/// 20-second budget and `open` fails with `production-composition code index
+/// did not publish`. That is an upstream defect, not a product one -- it also
+/// fails two pre-existing upstream journeys
+/// (`configuration_idempotency_journey_test::
+/// user_profile_configuration_batch_has_cli_dashboard_parity_after_restart`
+/// and `...::configuration_set_has_cli_mcp_http_sdk_parity_and_replays_after_restart`)
+/// and it reproduces with no memory-provider gate and no transcript at all.
+///
+/// Committing a real edit here is therefore not a workaround bolted onto the
+/// journey: it is what the host session under test actually does, and it is
+/// the shape of restart the harness can observe.
+fn commit_claude_session_source_edit(project: &Path) {
+    std::fs::write(
+        project.join("src/lib.rs"),
+        "/// Quicksilver transport probe.\n\
+         ///\n\
+         /// The retry budget is read from the pinned deadline.\n\
+         pub fn quicksilver_probe() -> u8 { 11 }\n",
+    )
+    .expect("the Claude session's own source edit");
+    git(project, &["add", "."]);
+    git(project, &["commit", "-q", "-m", "quicksilver retry budget"]);
+}
+
+/// Writes the transcript Claude Code itself writes, into the transcript home
+/// the composition pins for this isolation root. A transcript written under
+/// the ambient `$HOME` is invisible to the composed daemon.
+fn write_claude_transcript(transcript_home: &Path, project: &Path) {
+    let directory = transcript_home.join(".claude/projects/-claude-memory-journey");
+    std::fs::create_dir_all(&directory).expect("transcript directory");
+    let cwd = project.to_string_lossy().to_string();
+    let rows = [
+        json!({
+            "type": "user",
+            "cwd": cwd,
+            "sessionId": CLAUDE_SESSION,
+            "uuid": "journey-uuid-1",
+            "timestamp": "2026-02-01T00:00:00.000Z",
+            "message": {
+                "role": "user",
+                "content": format!("how does the {JOURNEY_TERM} transport probe decide its retry budget?"),
+            },
+        }),
+        json!({
+            "type": "assistant",
+            "cwd": cwd,
+            "sessionId": CLAUDE_SESSION,
+            "uuid": "journey-uuid-2",
+            "parentUuid": "journey-uuid-1",
+            "timestamp": "2026-02-01T00:00:01.000Z",
+            "message": {
+                "id": "msg_journey_2",
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [{
+                    "type": "text",
+                    "text": format!("the {JOURNEY_TERM} transport probe reads its retry budget from the pinned deadline"),
+                }],
+            },
+        }),
+    ];
+    let contents = rows
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(
+        directory.join(format!("{CLAUDE_SESSION}.jsonl")),
+        format!("{contents}\n"),
+    )
+    .expect("write Claude transcript");
+}
+
+/// The tool payload of a successful MCP `tools/call`, panicking on a protocol
+/// error so a refusal can never read as an empty answer.
+fn tool_text(response: &tracedecay_mcp::transport::JsonRpcResponse, tool_name: &str) -> String {
+    let result = response
+        .result
+        .as_ref()
+        .unwrap_or_else(|| panic!("{tool_name} JSON-RPC error: {:?}", response.error));
+    result["content"]
+        .as_array()
+        .and_then(|content| content.first())
+        .and_then(|item| item["text"].as_str())
+        .unwrap_or_else(|| panic!("{tool_name} produced no text content: {result}"))
+        .to_owned()
+}
+
+async fn current_revision(
+    harness: &ProductionProjectCompositionHarnessV1,
+    project: &Path,
+) -> ConfigurationRevisionId {
+    harness
+        .server(project)
+        .expect("project server")
+        .cg()
+        .await
+        .configuration_runtime()
+        .client()
+        .current()
+        .await
+        .expect("current configuration")
+        .revision_id
+}
+
+async fn project_identity(
+    harness: &ProductionProjectCompositionHarnessV1,
+    project: &Path,
+) -> (ProjectId, UserProfileId) {
+    let graph = harness.server(project).expect("project server").cg().await;
+    let project_id = graph
+        .configuration_runtime()
+        .configuration_target()
+        .project_id
+        .clone();
+    let profile_id = graph
+        .configuration_runtime()
+        .registered_database()
+        .binding()
+        .shard_id
+        .profile_id
+        .clone();
+    (project_id, profile_id)
+}
+
+/// Turns one canonical configuration setting on through the shipped
+/// `tracedecay_configuration_set` MCP surface — the operator path, not a
+/// direct store write.
+async fn configuration_set(
+    harness: &ProductionProjectCompositionHarnessV1,
+    project: &Path,
+    layer: ConfigurationLayerIdV1,
+    key: &str,
+    value: ConfigurationValueV1,
+    idempotency: &str,
+) {
+    let expected_revision = current_revision(harness, project).await;
+    let request = tracedecay_application::ConfigurationSetRequestV1 {
+        layer,
+        key: SettingKey::new(key).expect("canonical setting key"),
+        value,
+        expected_revision: expected_revision.clone(),
+        idempotency_key: ConfigurationIdempotencyKey::new(idempotency)
+            .expect("configuration idempotency key"),
+    };
+    // The request carries exactly the wire fields `ConfigurationSetRequestV1`
+    // declares; it rejects unknown members, so no rendering hint may ride
+    // along with it.
+    let arguments = serde_json::to_value(&request).expect("configuration set request");
+    let response = harness
+        .call_tool(project, "tracedecay_configuration_set", arguments)
+        .await
+        .expect("configuration set tool call");
+    assert!(
+        response.error.is_none(),
+        "the operator gate must reach the configuration surface: {response:?}"
+    );
+    let result = response
+        .result
+        .as_ref()
+        .expect("configuration set tool result");
+    assert_ne!(
+        result["isError"], true,
+        "the operator gate must settle as a durable configuration effect: {result}"
+    );
+    assert_ne!(
+        current_revision(harness, project).await,
+        expected_revision,
+        "committing {key} must advance the canonical configuration revision"
+    );
+}
+
+/// Every row the durable observation journal holds, as
+/// `(observation_kind, exact_scope_sha256, delivery_state, attempts)`.
+fn journal_rows(journal_path: &Path) -> Vec<(String, String, String, i64)> {
+    if !journal_path.exists() {
+        return Vec::new();
+    }
+    let connection = rusqlite::Connection::open(journal_path).expect("open observation journal");
+    let mut statement = connection
+        .prepare(
+            "SELECT observation_kind, exact_scope_sha256, delivery_state, attempts \
+             FROM tdmem_observation_journal_v1 ORDER BY rowid",
+        )
+        .expect("prepare journal read");
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .expect("query journal rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read journal rows");
+    rows
+}
+
+/// Runs the shipped project transcript import — the same
+/// `SessionSyncCommandV1::ImportTranscripts` pass the daemon's session-sync
+/// worker runs — and returns how many session messages it committed.
+async fn import_project_transcripts(
+    harness: &ProductionProjectCompositionHarnessV1,
+    project: &Path,
+) -> Value {
+    let response = harness
+        .call_tool(
+            project,
+            "tracedecay_admin_cli",
+            json!({ "action": "sessions_import", "format": "json" }),
+        )
+        .await
+        .expect("transcript import tool call");
+    let text = tool_text(&response, "tracedecay_admin_cli");
+    serde_json::from_str(&text).unwrap_or(Value::Null)
+}
+
+/// Waits, bounded, for the journal to hold at least one terminal row.
+async fn await_journal_settlement(journal_path: &Path) -> Vec<(String, String, String, i64)> {
+    let deadline = Instant::now() + SETTLEMENT_BUDGET;
+    loop {
+        let rows = journal_rows(journal_path);
+        if !rows.is_empty()
+            && rows
+                .iter()
+                .all(|(_, _, state, _)| matches!(state.as_str(), "acknowledged" | "rejected"))
+        {
+            return rows;
+        }
+        if Instant::now() >= deadline {
+            return rows;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The advisory provider-memory lane of one `tracedecay_context` answer, or
+/// `None` when the answer carries no lane at all.
+async fn context_advisory_lane(
+    harness: &ProductionProjectCompositionHarnessV1,
+    project: &Path,
+    task: &str,
+    session: Option<&str>,
+) -> (Value, Option<Value>) {
+    let mut arguments = json!({ "task": task, "format": "json" });
+    if let Some(session) = session {
+        arguments["_meta"] = json!({ "session_id": session });
+    }
+    let response = harness
+        .call_tool(project, "tracedecay_context", arguments)
+        .await
+        .expect("context tool call");
+    let text = tool_text(&response, "tracedecay_context");
+    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    let lane = parsed
+        .get("advisory_provider_memory")
+        .filter(|value| !value.is_null())
+        .cloned();
+    (parsed, lane)
+}
+
+/// Turns both memory-provider gates on for this project through the shipped
+/// `tracedecay_configuration_set` surface. Both settings are project-scoped
+/// and `DaemonRestart`: a composition that is already open keeps the mounts it
+/// opened with, so the daemon must be restarted before they take effect.
+async fn enable_memory_provider_host(
+    harness: &ProductionProjectCompositionHarnessV1,
+    project: &Path,
+) {
+    let (project_id, _) = project_identity(harness, project).await;
+    let layer = ConfigurationLayerIdV1::Project { project_id };
+    configuration_set(
+        harness,
+        project,
+        layer.clone(),
+        MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+        ConfigurationValueV1::Boolean(true),
+        "configuration.idempotency.claude-journey-host",
+    )
+    .await;
+    configuration_set(
+        harness,
+        project,
+        layer,
+        MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+        ConfigurationValueV1::Text(
+            json!({ "active_provider": tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID })
+                .to_string(),
+        ),
+        "configuration.idempotency.claude-journey-routing",
+    )
+    .await;
+}
+
+/// Restarts the daemon on this project with both provider gates committed: the
+/// dormant composition commits them, stops, and the composition that comes
+/// back has the provider host mounted.
+async fn composition_with_memory_provider_host(
+    isolation: &Path,
+    project: &Path,
+) -> ProductionProjectCompositionHarnessV1 {
+    let dormant = ProductionProjectCompositionHarnessV1::open(isolation, [project.to_path_buf()])
+        .await
+        .expect("dormant production composition");
+    enable_memory_provider_host(&dormant, project).await;
+    dormant.shutdown().await;
+    // The session's own source edit lands before the daemon comes back; see
+    // `commit_claude_session_source_edit`.
+    commit_claude_session_source_edit(project);
+
+    ProductionProjectCompositionHarnessV1::open(isolation, [project.to_path_buf()])
+        .await
+        .expect("production composition with the memory provider host mounted")
+}
+
+/// The host's own sections of one `tracedecay_context` answer: every top-level
+/// member except the advisory lane, in sorted order, paired with a shape
+/// witness that a hollowed-out section cannot forge.
+///
+/// The witness is `(JSON type, element/character count)` rather than the bare
+/// key name. That distinction is the whole point: a lane that emptied,
+/// retyped or truncated a host section would keep every key and still be
+/// caught here.
+fn host_section_shapes(answer: &Value) -> Vec<(String, &'static str, usize)> {
+    fn shape(value: &Value) -> (&'static str, usize) {
+        match value {
+            Value::Null => ("null", 0),
+            Value::Bool(_) => ("bool", 1),
+            Value::Number(_) => ("number", 1),
+            Value::String(text) => ("string", text.chars().count()),
+            Value::Array(items) => ("array", items.len()),
+            Value::Object(members) => ("object", members.len()),
+        }
+    }
+    let mut sections = answer
+        .as_object()
+        .map(|object| {
+            object
+                .iter()
+                .filter(|(key, _)| key.as_str() != "advisory_provider_memory")
+                .map(|(key, value)| {
+                    let (kind, width) = shape(value);
+                    (key.clone(), kind, width)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    sections.sort();
+    sections
+}
+
+/// Compares one answer's host sections against the control's, section by
+/// section, so a failure names the section that changed instead of dumping two
+/// whole answers.
+///
+/// Widths are compared for *emptiness*, not for equality: the control and the
+/// subject cannot share a source revision (see
+/// `commit_claude_session_source_edit` for why the restart the harness can
+/// observe requires an edit in between), so a section that summarises the
+/// checkout legitimately differs in length. What may never differ is a
+/// section changing type or collapsing to empty.
+fn assert_host_sections_survive(baseline: &Value, answer: &Value) {
+    let baseline_shapes = host_section_shapes(baseline);
+    let answer_shapes = host_section_shapes(answer);
+    let answer_by_key: std::collections::BTreeMap<&str, (&'static str, usize)> = answer_shapes
+        .iter()
+        .map(|(key, kind, width)| (key.as_str(), (*kind, *width)))
+        .collect();
+    for (key, kind, width) in &baseline_shapes {
+        let Some((answer_kind, answer_width)) = answer_by_key.get(key.as_str()) else {
+            panic!(
+                "mounting the provider host removed the host section '{key}': \
+                 control={baseline_shapes:?} answer={answer_shapes:?}"
+            );
+        };
+        assert_eq!(
+            answer_kind, kind,
+            "host section '{key}' changed JSON type once the provider host was mounted: \
+             control={kind} answer={answer_kind}"
+        );
+        if *width > 0 {
+            assert!(
+                *answer_width > 0,
+                "host section '{key}' was emptied once the provider host was mounted: \
+                 control width {width}, answer width {answer_width}"
+            );
+        }
+    }
+    assert_eq!(
+        answer_shapes.len(),
+        baseline_shapes.len(),
+        "mounting the provider host changed the host section set: \
+         control={baseline_shapes:?} answer={answer_shapes:?}"
+    );
+}
+
+/// The exact scope the journal must have bound this host session to, taken
+/// from the authoritative resolved scope rather than re-derived from a path.
+fn expected_exact_scope_sha256(
+    project: &Path,
+    project_id: &ProjectId,
+    profile_id: &UserProfileId,
+) -> String {
+    let scope = tracedecay_code_index_runtime::resolved_scope_for_project(project, project_id)
+        .expect("authoritative resolved scope");
+    exact_scope_for_session(profile_id, &scope, CLAUDE_SESSION)
+        .expect("exact scope for the Claude host session")
+        .exact_scope_sha256()
+        .to_owned()
+}
+
+/// Every Claude Code session message this project commits settles in the
+/// durable observation journal against Native exactly once, under this
+/// project's authoritative exact scope, and a later `tracedecay_context` call
+/// naming the same host session recalls it inside the advisory lane's own
+/// candidate budget, de-duplicated.
+///
+/// Real defect this catches: an observation journey that admits the same
+/// committed message twice, binds it to a scope other than the resolved
+/// worktree scope, retries an already-accepted delivery, or lets recall
+/// answer with unbounded or duplicated candidates.
+///
+/// The commit here is driven by the shipped administrative transcript import,
+/// so this test claims settlement and recall -- not hook causality. The
+/// causal proof that a real `tracedecay hook-claude-session-start`
+/// invocation is what puts the message in the journal is the subprocess
+/// journey in
+/// `crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_committed_claude_session_message_settles_once_and_a_later_context_call_recalls_it_bounded()
+ {
+    let isolation = TempDir::new().expect("journey isolation");
+    let project: PathBuf = isolation.path().join("project");
+    initialize_project(&project);
+
+    let transcript_home =
+        ProductionProjectCompositionHarnessV1::transcript_source_home(isolation.path())
+            .expect("the composition pins its own transcript source home");
+    write_claude_transcript(&transcript_home, &project);
+
+    let harness = composition_with_memory_provider_host(isolation.path(), &project).await;
+    let (project_id, profile_id) = project_identity(&harness, &project).await;
+    let data_root = harness
+        .project_data_root(&project)
+        .await
+        .expect("project data root");
+    let journal_path = data_root.join(JOURNAL_FILE_NAME);
+    assert!(
+        journal_path.exists(),
+        "an enabled composition must mount the durable observation journal at {}",
+        journal_path.display()
+    );
+
+    // 1. The shipped transcript import commits the host's session messages as
+    //    canonical observations for this project. Its own reported outcome is
+    //    the evidence, not a test-only counter: a route that refused would say
+    //    so here rather than leaving an empty store to be mistaken for one
+    //    that had nothing to import.
+    let imported = import_project_transcripts(&harness, &project).await;
+    assert_ne!(
+        imported,
+        Value::Null,
+        "the shipped transcript import must report a typed outcome"
+    );
+
+    // 2. The mounted journey admits every committed message and settles it
+    //    against Native exactly once.
+    let rows = await_journal_settlement(&journal_path).await;
+    assert!(
+        !rows.is_empty(),
+        "a committed Claude session message must reach the durable observation journal"
+    );
+    let expected_scope = expected_exact_scope_sha256(&project, &project_id, &profile_id);
+    for (kind, scope_sha256, state, attempts) in &rows {
+        assert_eq!(
+            kind, SESSION_MESSAGE_OBSERVATION_KIND,
+            "the journey admits exactly the session-message observation kind"
+        );
+        assert_eq!(
+            scope_sha256, &expected_scope,
+            "every journal row must carry this project's exact worktree-bound scope"
+        );
+        assert_eq!(
+            state, "acknowledged",
+            "Native accepts session messages, so the row settles acknowledged"
+        );
+        assert_eq!(
+            *attempts, 1,
+            "an accepted observation is delivered once, never retried"
+        );
+    }
+
+    // 3. Re-running the same import is idempotent: the journal does not grow,
+    //    because the idempotency key is content-derived.
+    let settled = rows.len();
+    let _ = import_project_transcripts(&harness, &project).await;
+    let replayed = await_journal_settlement(&journal_path).await;
+    assert_eq!(
+        replayed.len(),
+        settled,
+        "replaying the same transcript must not duplicate journal rows"
+    );
+
+    // 4. A later context call naming the same host session receives the
+    //    advisory provider-memory lane, bounded by the lane's own budget.
+    let (answer, lane) = context_advisory_lane(
+        &harness,
+        &project,
+        &format!("how does the {JOURNEY_TERM} transport probe decide its retry budget?"),
+        Some(CLAUDE_SESSION),
+    )
+    .await;
+    let lane = lane
+        .unwrap_or_else(|| panic!("an active provider must contribute an advisory lane: {answer}"));
+    assert_eq!(
+        lane["state"], "answered",
+        "the advisory lane must answer rather than report a refusal: {lane}"
+    );
+    let candidates = lane["candidates"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !candidates.is_empty(),
+        "the observed Claude session must be recallable: {lane}"
+    );
+    assert!(
+        candidates.len() <= super::super::cognitive_recall::ADVISORY_RECALL_MAXIMUM_CANDIDATES,
+        "the advisory lane is bounded by its own candidate budget: {lane}"
+    );
+    let mut provenance = candidates
+        .iter()
+        .map(|candidate| candidate["provenance"].to_string())
+        .collect::<Vec<_>>();
+    let total = provenance.len();
+    provenance.sort();
+    provenance.dedup();
+    assert_eq!(
+        provenance.len(),
+        total,
+        "recall candidates must be de-duplicated: {lane}"
+    );
+
+    harness.shutdown().await;
+}
+
+/// The advisory lane is *additive*: mounting the provider host may add the
+/// provider-memory lane to a Claude Code context answer and may never take a
+/// host section away from it, and whatever the lane terminates as, it says so
+/// in a typed state that names the provider its route pinned.
+///
+/// Both halves are exercised on one composition: first a healthy route, then
+/// the same route with the Native provider's staged-observation store dropped
+/// out from under it, which drives a genuine `ProviderUnavailable` terminal
+/// through the production recall path.
+///
+/// Real defect this catches: an advisory lane that rewrites, truncates, or
+/// replaces the canonical answer -- the failure mode that makes provider
+/// memory unsafe to turn on, because a broken or empty provider would then
+/// silently degrade the answer the agent acts on. It equally catches the
+/// quieter version of that defect: a provider failure that is reported as an
+/// ordinary empty answer, so an operator cannot tell "the provider knew
+/// nothing" from "the provider is broken". The dormant composition is the
+/// control: it answers the same task on an identical repository with no
+/// provider host at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_advisory_lane_is_additive_and_never_costs_the_claude_host_its_own_answer() {
+    let isolation = TempDir::new().expect("journey isolation");
+    let project: PathBuf = isolation.path().join("project");
+    initialize_project(&project);
+    let transcript_home =
+        ProductionProjectCompositionHarnessV1::transcript_source_home(isolation.path())
+            .expect("the composition pins its own transcript source home");
+    write_claude_transcript(&transcript_home, &project);
+    let task = format!("how does the {JOURNEY_TERM} transport probe decide its retry budget?");
+
+    // Control: this same project, answered by a dormant composition. No gate is
+    // on, so there is no advisory lane at all -- an absent lane, never an
+    // empty one.
+    let dormant = ProductionProjectCompositionHarnessV1::open(isolation.path(), [project.clone()])
+        .await
+        .expect("dormant production composition");
+    let (baseline, dormant_lane) = context_advisory_lane(&dormant, &project, &task, None).await;
+    assert!(
+        dormant_lane.is_none(),
+        "a dormant composition must contribute no advisory lane at all: {baseline}"
+    );
+    let baseline_shapes = host_section_shapes(&baseline);
+    assert!(
+        baseline_shapes.iter().any(|(_, _, width)| *width > 0),
+        "the host answer must carry populated sections to compare against: {baseline}"
+    );
+    enable_memory_provider_host(&dormant, &project).await;
+    dormant.shutdown().await;
+    commit_claude_session_source_edit(&project);
+
+    // The same task, put to a composition with the provider host mounted.
+    let harness = ProductionProjectCompositionHarnessV1::open(isolation.path(), [project.clone()])
+        .await
+        .expect("production composition with the memory provider host mounted");
+    let data_root = harness
+        .project_data_root(&project)
+        .await
+        .expect("project data root");
+    // The ordinary agent call: no structural session identity in `_meta`, which
+    // is what every real `tracedecay_context` call from an agent looks like.
+    // The lane binds it to the MCP connection the request identity was minted
+    // on, so a mounted healthy route answers -- and the whole host answer must
+    // still be there beside it.
+    let (unbound_answer, unbound_lane) =
+        context_advisory_lane(&harness, &project, &task, None).await;
+    let unbound_lane = unbound_lane.unwrap_or_else(|| {
+        panic!(
+            "a mounted route must report its refusal as a lane, never by disappearing: \
+             {unbound_answer}"
+        )
+    });
+    assert_eq!(
+        unbound_lane["state"], "answered",
+        "the MCP connection this call was minted on is itself a session identity, so the \
+         mounted route binds and answers: {unbound_lane}"
+    );
+    assert_eq!(
+        unbound_lane["provider_id"],
+        tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID,
+        "the lane must name the provider its routing policy pinned: {unbound_lane}"
+    );
+    assert_eq!(
+        unbound_lane["registration_revision"], 1,
+        "the lane must carry the registration revision the composition mounted: {unbound_lane}"
+    );
+    assert_eq!(
+        unbound_lane["degradation"],
+        Value::Null,
+        "a healthy route reports no degradation; a degraded one must say which: {unbound_lane}"
+    );
+    // Fail-open: mounting the route cost the host answer nothing at all.
+    assert_host_sections_survive(&baseline, &unbound_answer);
+
+    // Now break the provider for real, at the one place a Native recall
+    // cannot route around: its own staged-observation store. Nothing test-only
+    // is reached for -- the file is dropped out from under the *running*
+    // provider through a second sqlite connection, which is exactly what a
+    // corrupted or evicted store looks like to it. The recall path then takes
+    // `NativeReadFailure::StagedStoreUnavailable`
+    // (`native_provider.rs`, "a store that cannot be read fails the recall
+    // rather than silently answering with facts alone"), which the provider
+    // reports as `TerminalCode::ProviderUnavailable` and the recall port
+    // classifies as `CognitiveRecallDegradation::Unavailable`.
+    break_native_staged_observation_store(&data_root);
+
+    let (degraded_answer, degraded_lane) =
+        context_advisory_lane(&harness, &project, &task, None).await;
+    let degraded_lane = degraded_lane.unwrap_or_else(|| {
+        panic!(
+            "a broken provider must degrade *inside* the lane, never by removing it: \
+             {degraded_answer}"
+        )
+    });
+    // The provider was genuinely contacted: a lane that never reached it could
+    // not carry the provider's own identity and the revision it was
+    // registered under.
+    assert_eq!(
+        degraded_lane["provider_id"],
+        tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID,
+        "the degraded lane must still name the provider that failed: {degraded_lane}"
+    );
+    assert_eq!(
+        degraded_lane["registration_revision"], 1,
+        "the degraded lane must carry the registration revision the call was routed under: \
+         {degraded_lane}"
+    );
+    assert_eq!(
+        degraded_lane["state"], "answered",
+        "a provider failure is a typed degradation of the lane, not an untyped refusal: \
+         {degraded_lane}"
+    );
+    assert_eq!(
+        degraded_lane["degradation"], "unavailable",
+        "an unreadable Native staged store must surface as the typed `unavailable` \
+         degradation, never as a silently empty healthy lane: {degraded_lane}"
+    );
+    assert_eq!(
+        degraded_lane["candidates"].as_array().map(Vec::len),
+        Some(0),
+        "a failed recall must contribute no candidates: {degraded_lane}"
+    );
+    // The whole point: the host paid nothing for the provider's failure.
+    assert_host_sections_survive(&baseline, &degraded_answer);
+
+    harness.shutdown().await;
+}
+
+/// Drops the table the Native provider's staged-observation store reads,
+/// out from under the running provider.
+///
+/// This is a fault injected into the provider's *own* durable state through
+/// an ordinary second sqlite connection -- no production seam is widened and
+/// no test-only port is added. The provider holds its connection open, so the
+/// next recall re-prepares against a schema that no longer has the table and
+/// fails the read.
+fn break_native_staged_observation_store(data_root: &Path) {
+    let staged_store = super::super::native_staged_observations::staged_store_path(
+        &data_root.join(super::PROVIDER_STATE_DIR_NAME),
+    );
+    assert!(
+        staged_store.exists(),
+        "a mounted Native provider must have opened its staged store at {}",
+        staged_store.display()
+    );
+    let connection =
+        rusqlite::Connection::open(&staged_store).expect("open the staged observation store");
+    connection
+        .busy_timeout(Duration::from_secs(10))
+        .expect("staged store busy timeout");
+    connection
+        .execute_batch("DROP TABLE tdmem_native_staged_observation_v1;")
+        .expect("drop the staged observation table");
+}
+
+// ---------------------------------------------------------------------------
+// The shipped Claude Code host bundle: the hooks this journey rides are the
+// ones `tracedecay install --agent claude` deploys, and deploying them again,
+// updating them, or undoing them must never disturb operator-owned state.
+// ---------------------------------------------------------------------------
+
+/// The operator's own Claude settings, which TraceDecay's staging lane has no
+/// business touching.
+const OPERATOR_CLAUDE_SETTINGS: &str =
+    "{\n  \"model\": \"opus\",\n  \"permissions\": {\n    \"allow\": [\"Bash(ls:*)\"]\n  }\n}\n";
+
+/// The operator's own project rules, which install must append to and undo
+/// must give back.
+const OPERATOR_PROJECT_RULES: &str = "# Team rules\n\nAlways run the linter before pushing.\n";
+
+/// The heading of the TraceDecay-managed block inside a project `CLAUDE.md`.
+const MANAGED_RULES_MARKER: &str = "## MANDATORY: No Explore Agents When Tracedecay Is Available";
+
+/// Every file the deployed bundle holds, as `(relative path, bytes)`, sorted.
+fn deployed_bundle(deploy_dir: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(base: &Path, directory: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else {
+                let relative = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((relative, std::fs::read(&path).unwrap_or_default()));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(deploy_dir, deploy_dir, &mut files);
+    files.sort();
+    files
+}
+
+/// The command and arguments the deployed hook manifest binds one Claude hook
+/// event to, or `None` when the event is not declared at all.
+fn deployed_hook_invocation(hooks: &Value, event: &str) -> Option<(String, Vec<String>)> {
+    let handler = hooks
+        .pointer(&format!("/hooks/{event}"))?
+        .as_array()?
+        .iter()
+        .find_map(|entry| entry.pointer("/hooks/0"))?;
+    let command = handler.get("command")?.as_str()?.to_owned();
+    let arguments = handler
+        .get("args")?
+        .as_array()?
+        .iter()
+        .filter_map(|argument| argument.as_str().map(str::to_owned))
+        .collect();
+    Some((command, arguments))
+}
+
+/// Bundle *staging* and project-rules registration for the shipped Claude
+/// Code host: staging, re-staging, and update converge on a byte-identical
+/// deployed bundle, registration appends exactly one managed block to the
+/// operator's own rules, and undo gives those rules back -- with the
+/// operator's `settings.json` untouched throughout.
+///
+/// Scope, stated plainly: Claude Code owns its own activation, so this test
+/// stops at the deferral boundary. It never calls
+/// `activate_deployed_host_registration` or
+/// `deactivate_deployed_host_registration`, and it therefore proves nothing
+/// about the marketplace/plugin entries, the TraceDecay permission entry, or
+/// rollback. Those are proved against a real `claude` executable by
+/// `crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance.rs`
+/// (`claude_lifecycle_tracks_assets_only_after_native_activation`), which
+/// drives install, repeated install, update, injected-failure rollback,
+/// recovery, and idempotent uninstall against a real `claude` executable.
+///
+/// Real defect this catches: a memory integration that bolts its own hook or
+/// settings entry onto the Claude host, so a second install or an undo leaves
+/// the operator's `settings.json` or project rules changed behind their back.
+/// The assertion that the memory journey's hooks are exactly the shipped
+/// lifecycle hooks is what keeps that from being added later without notice.
+#[test]
+fn the_shipped_claude_bundle_stages_hooks_and_registers_project_rules_without_disturbing_operator_state()
+ {
+    use tracedecay_agent_hosts::agents::host_bundle_v2::HostBundleComponentV1;
+    use tracedecay_agent_hosts::agents::{
+        AgentIntegration, ClaudeIntegration, InstallContext, NonInteractiveInstallOutcome,
+        UpdatePluginOutcome,
+    };
+
+    let home_dir = TempDir::new().expect("claude home");
+    let project_dir = TempDir::new().expect("claude project");
+    // Canonicalize: the host lifecycle refuses a project path that does not
+    // resolve to itself, and a temp dir is a symlink on macOS.
+    let home = std::fs::canonicalize(home_dir.path()).expect("canonical home");
+    let project = std::fs::canonicalize(project_dir.path()).expect("canonical project");
+
+    let settings = home.join(".claude/settings.json");
+    std::fs::create_dir_all(settings.parent().expect("settings parent")).expect("claude dir");
+    std::fs::write(&settings, OPERATOR_CLAUDE_SETTINGS).expect("operator settings");
+    let project_rules = project.join(".claude/CLAUDE.md");
+    std::fs::create_dir_all(project_rules.parent().expect("rules parent")).expect("project dir");
+    std::fs::write(&project_rules, OPERATOR_PROJECT_RULES).expect("operator rules");
+
+    let install = InstallContext {
+        home: home.clone(),
+        tracedecay_bin: "/opt/tracedecay/bin/tracedecay".to_owned(),
+        tool_permissions: Vec::new(),
+        project_root: None,
+        dashboard: false,
+    };
+    let integration = ClaudeIntegration;
+    let components: &[HostBundleComponentV1] = &[];
+
+    // Install stages the bundle that carries the Claude lifecycle hooks.
+    let NonInteractiveInstallOutcome::DeferredUserAction(staged) = integration
+        .prepare_non_interactive_install(&install)
+        .expect("staging the Claude bundle")
+    else {
+        panic!("Claude Code owns its own activation, so a fresh install defers to its CLI");
+    };
+    let deploy_dir = staged
+        .staged_paths
+        .first()
+        .cloned()
+        .expect("the deferral must name the staged bundle root");
+    let installed = deployed_bundle(&deploy_dir);
+    assert!(
+        !installed.is_empty(),
+        "staging must deploy the bundle to {}",
+        deploy_dir.display()
+    );
+
+    // The hooks this memory journey rides are the shipped lifecycle hooks,
+    // bound to the pinned binary -- and there is no memory-specific hook
+    // beside them.
+    let hooks: Value = serde_json::from_slice(
+        &std::fs::read(deploy_dir.join("hooks/hooks.json")).expect("deployed hook manifest"),
+    )
+    .expect("the deployed hook manifest must be JSON");
+    for (event, argument) in [
+        ("SessionStart", "hook-claude-session-start"),
+        ("Stop", "hook-stop"),
+        ("PostToolUse", "hook-claude-post-tool-use"),
+    ] {
+        let (command, arguments) = deployed_hook_invocation(&hooks, event)
+            .unwrap_or_else(|| panic!("the bundle must declare the {event} hook: {hooks}"));
+        assert_eq!(
+            command, install.tracedecay_bin,
+            "the {event} hook must run the pinned binary: {hooks}"
+        );
+        assert_eq!(
+            arguments,
+            vec![argument.to_owned()],
+            "the {event} hook must invoke the shipped handler: {hooks}"
+        );
+    }
+    let declared_events: Vec<String> = hooks["hooks"]
+        .as_object()
+        .expect("hook manifest events")
+        .keys()
+        .cloned()
+        .collect();
+    assert!(
+        declared_events
+            .iter()
+            .all(|event| !event.to_ascii_lowercase().contains("memory")),
+        "the memory journey must ride the shipped lifecycle hooks, not its own: {declared_events:?}"
+    );
+
+    // Re-installing converges: not one byte of the deployed bundle changes.
+    integration
+        .prepare_non_interactive_install(&install)
+        .expect("re-staging the Claude bundle");
+    assert_eq!(
+        deployed_bundle(&deploy_dir),
+        installed,
+        "re-installing must leave the deployed bundle byte-identical"
+    );
+
+    // So does an update against the same version.
+    let UpdatePluginOutcome::DeferredUserAction(_) = integration
+        .update_plugin(&install)
+        .expect("updating the Claude bundle")
+    else {
+        panic!("Claude Code owns its own cache, so an update defers activation to its CLI");
+    };
+    assert_eq!(
+        deployed_bundle(&deploy_dir),
+        installed,
+        "an update against the same version must leave the deployed bundle byte-identical"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&settings).expect("settings after staging"),
+        OPERATOR_CLAUDE_SETTINGS,
+        "staging the bundle must not touch the operator's own Claude settings"
+    );
+
+    // Project registration appends the managed block to operator rules, and
+    // registering again converges instead of appending a second copy.
+    integration
+        .activate_project_host_component_registration(components, &install, &project)
+        .expect("registering the project host component");
+    let registered = std::fs::read_to_string(&project_rules).expect("registered rules");
+    assert!(
+        registered.starts_with(OPERATOR_PROJECT_RULES),
+        "registration must append to the operator's own rules: {registered}"
+    );
+    assert_eq!(
+        registered.matches(MANAGED_RULES_MARKER).count(),
+        1,
+        "registration must write exactly one managed block: {registered}"
+    );
+    integration
+        .activate_project_host_component_registration(components, &install, &project)
+        .expect("re-registering the project host component");
+    assert_eq!(
+        std::fs::read_to_string(&project_rules).expect("re-registered rules"),
+        registered,
+        "re-registering must converge on the same file"
+    );
+
+    // Undo gives the operator their own rules back, and is itself idempotent.
+    integration
+        .deactivate_project_host_component_registration(components, &install, &project)
+        .expect("deregistering the project host component");
+    let undone = std::fs::read_to_string(&project_rules).expect("rules after undo");
+    assert!(
+        !undone.contains(MANAGED_RULES_MARKER),
+        "undo must remove the managed block: {undone}"
+    );
+    assert!(
+        undone.contains(OPERATOR_PROJECT_RULES.trim()),
+        "undo must preserve the operator's own rules verbatim: {undone}"
+    );
+    integration
+        .deactivate_project_host_component_registration(components, &install, &project)
+        .expect("deregistering twice");
+    assert_eq!(
+        std::fs::read_to_string(&project_rules).expect("rules after second undo"),
+        undone,
+        "a second undo must change nothing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&settings).expect("settings after undo"),
+        OPERATOR_CLAUDE_SETTINGS,
+        "undo must not touch the operator's own Claude settings"
+    );
+}

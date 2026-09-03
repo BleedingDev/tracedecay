@@ -24,7 +24,8 @@ use crate::recovery::RecoveryTimeBudgetV1;
 use crate::retention::RetentionPolicyV1;
 use crate::settlement::SourceAuthorityV1;
 
-pub use schema::SCHEMA_VERSION;
+pub use row::WithheldAuditProgressV1;
+pub use schema::{OPEN_WITHHELD_AUDIT_ROWS, SCHEMA_VERSION};
 
 /// How long a write-ahead-log truncation waits for concurrent readers before
 /// reporting the log busy.
@@ -45,6 +46,26 @@ const LOCK_POLL_MICROS: u64 = 200;
 pub struct SqliteObservationJournal {
     connection: Mutex<Connection>,
     policy: RetentionPolicyV1,
+    /// Where the resumable withheld-receipt audit has reached.
+    ///
+    /// Open validates one bounded page and leaves the rest here, so opening a
+    /// store whose audit table has grown to millions of rows costs the same as
+    /// opening an empty one. The remainder is the owner's to finish through
+    /// [`Self::validate_withheld_backlog`].
+    withheld_audit: Mutex<WithheldAuditStateV1>,
+}
+
+/// The resume position of the withheld-receipt audit for one open store.
+#[derive(Debug)]
+enum WithheldAuditStateV1 {
+    /// More rows remain; the next page resumes strictly after this position.
+    Pending(Option<row::WithheldAuditCursorV1>),
+    /// Every row this store held at open has been revalidated.
+    ///
+    /// Rows appended after that point were built and validated in memory by
+    /// this process on the way in, so re-reading them would prove nothing the
+    /// write path did not already prove.
+    Complete,
 }
 
 impl SqliteObservationJournal {
@@ -61,11 +82,8 @@ impl SqliteObservationJournal {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
-        schema::initialize(&mut connection)?;
-        Ok(Self {
-            connection: Mutex::new(connection),
-            policy,
-        })
+        let resume_after = schema::initialize(&mut connection)?;
+        Ok(Self::mounted(connection, policy, resume_after))
     }
 
     /// Opens an in-memory journal. Useful for pure-logic tests; restart
@@ -73,10 +91,65 @@ impl SqliteObservationJournal {
     pub fn open_in_memory(policy: RetentionPolicyV1) -> Result<Self, ObservationJournalError> {
         policy.validate()?;
         let mut connection = Connection::open_in_memory()?;
-        schema::initialize(&mut connection)?;
-        Ok(Self {
+        let resume_after = schema::initialize(&mut connection)?;
+        Ok(Self::mounted(connection, policy, resume_after))
+    }
+
+    fn mounted(
+        connection: Connection,
+        policy: RetentionPolicyV1,
+        resume_after: Option<row::WithheldAuditCursorV1>,
+    ) -> Self {
+        Self {
             connection: Mutex::new(connection),
             policy,
+            withheld_audit: Mutex::new(match resume_after {
+                Some(cursor) => WithheldAuditStateV1::Pending(Some(cursor)),
+                None => WithheldAuditStateV1::Complete,
+            }),
+        }
+    }
+
+    /// Revalidates the next bounded page of the withheld audit this store's
+    /// open left behind, and reports whether the walk is finished.
+    ///
+    /// Open pays for one page so that project open cost does not grow with the
+    /// audit table. This is the other half of that bargain: the owner's loop
+    /// calls it until [`WithheldAuditProgressV1::complete`] is true, at which
+    /// point every row the store held at open has been checked and further
+    /// calls cost nothing at all.
+    ///
+    /// It is fail-closed in exactly the way the open-time pass was: a row whose
+    /// receipt identity no longer matches its evidence is reported as
+    /// [`ObservationJournalError::Corrupt`] and the cursor does **not** advance
+    /// past it, so the defect is met again on the next call rather than walked
+    /// over once and forgotten.
+    pub fn validate_withheld_backlog(
+        &self,
+        limit: u32,
+    ) -> Result<WithheldAuditProgressV1, ObservationJournalError> {
+        let mut state = self
+            .withheld_audit
+            .lock()
+            .map_err(|_| ObservationJournalError::LockPoisoned)?;
+        let WithheldAuditStateV1::Pending(resume_after) = &*state else {
+            return Ok(WithheldAuditProgressV1 {
+                rows_validated: 0,
+                complete: true,
+            });
+        };
+        let resume_after = resume_after.clone();
+        let page = self.with_connection(|connection| {
+            row::validate_withheld_page(connection, resume_after.as_ref(), limit)
+        })?;
+        let complete = page.resume_after.is_none();
+        *state = match page.resume_after {
+            Some(cursor) => WithheldAuditStateV1::Pending(Some(cursor)),
+            None => WithheldAuditStateV1::Complete,
+        };
+        Ok(WithheldAuditProgressV1 {
+            rows_validated: page.rows_validated,
+            complete,
         })
     }
 

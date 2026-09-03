@@ -974,6 +974,43 @@ fn claude_lifecycle_tracks_assets_only_after_native_activation() {
         fs::read(&marketplaces_path).unwrap(),
     ];
 
+    // Installing again converges. The interesting defect is not "it errored"
+    // but "it registered twice": a second managed permission entry, a second
+    // marketplace record, or a rewritten managed artifact.
+    let owned_after_install = owned_bytes(&cli, &install_receipt, &originals);
+    assert_success(
+        case.id,
+        "repeated install after native activation",
+        cli.run(&["install", "--agent", case.id]),
+    );
+    let repeated_receipt = latest_receipt(&cli, case.host);
+    assert_receipt_digests(&cli, &repeated_receipt);
+    assert_eq!(
+        owned_bytes(&cli, &repeated_receipt, &originals),
+        owned_after_install,
+        "a repeated Claude install rewrote managed artifacts"
+    );
+    assert_eq!(
+        [
+            fs::read(&settings_path).unwrap(),
+            fs::read(&marketplaces_path).unwrap(),
+        ],
+        active_native_state,
+        "a repeated Claude install disturbed the operator's own activation state"
+    );
+    let repeated_settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    assert_eq!(
+        repeated_settings["permissions"]["allow"],
+        serde_json::json!(["Read", "mcp__plugin_tracedecay_graph__*"]),
+        "a repeated Claude install duplicated the managed permission entry"
+    );
+    assert_eq!(
+        repeated_settings["enabledPlugins"]["foreign@market"],
+        settings_before_install["enabledPlugins"]["foreign@market"],
+        "a repeated Claude install disturbed a foreign plugin registration"
+    );
+
     let cache_manifest = cli
         .home
         .path()
@@ -1011,6 +1048,59 @@ fn claude_lifecycle_tracks_assets_only_after_native_activation() {
         cli.run(&["update-plugin"]),
     );
     assert_success(case.id, "catalog repair", cli.run(&["reinstall"]));
+
+    // A reinstall whose verification fails must leave nothing half-applied:
+    // the managed artifacts, the durable receipt, and the operator's own
+    // Claude activation state all come back exactly as they were.
+    let repaired_receipt = latest_receipt(&cli, case.host);
+    let pending_mutation = repaired_receipt
+        .component_receipts
+        .iter()
+        .flat_map(|component| &component.artifacts)
+        .next()
+        .expect("managed artifact for the interrupted reinstall");
+    fs::write(
+        cli.home.path().join(&pending_mutation.relative_path),
+        b"operator state that the failed reinstall must restore",
+    )
+    .unwrap();
+    let before_interruption = owned_bytes(&cli, &repaired_receipt, &originals);
+    let receipt_before_interruption = serde_json::to_vec(&latest_receipt(&cli, case.host)).unwrap();
+    let mut interrupted = cli.command(&["reinstall"]);
+    interrupted.env(VERIFY_FAILURE_ENV, "1");
+    let interrupted = interrupted.output().unwrap();
+    assert!(
+        !interrupted.status.success(),
+        "Claude injected verification failure unexpectedly succeeded:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&interrupted.stdout),
+        String::from_utf8_lossy(&interrupted.stderr)
+    );
+    assert_eq!(
+        owned_bytes(&cli, &repaired_receipt, &originals),
+        before_interruption,
+        "an interrupted Claude reinstall did not roll its managed artifacts back"
+    );
+    assert_eq!(
+        serde_json::to_vec(&latest_receipt(&cli, case.host)).unwrap(),
+        receipt_before_interruption,
+        "an interrupted Claude reinstall did not preserve its durable receipt"
+    );
+    assert_eq!(
+        [
+            fs::read(&settings_path).unwrap(),
+            fs::read(&marketplaces_path).unwrap(),
+        ],
+        active_native_state,
+        "an interrupted Claude reinstall disturbed the operator's own activation state"
+    );
+    assert_success(
+        case.id,
+        "interruption recovery",
+        cli.run(&["host-bundle", "recover", "--agent", case.id, "--yes"]),
+    );
+    assert_success(case.id, "post-recovery repair", cli.run(&["reinstall"]));
+    assert_receipt_digests(&cli, &latest_receipt(&cli, case.host));
+
     for (phase, entrypoint, fixture) in native_feedback(case) {
         assert_success(case.id, phase, cli.run_with_stdin(&[entrypoint], &fixture));
     }
@@ -1060,6 +1150,39 @@ fn claude_lifecycle_tracks_assets_only_after_native_activation() {
                     .iter()
                     .all(|artifact| !cli.home.path().join(&artifact.relative_path).exists())
             })
+    );
+
+    // Uninstalling again converges rather than reporting removal a second
+    // time: with nothing left to remove, the operator's activation state and
+    // the artifact set both stay exactly where the first uninstall left them.
+    let settled_removal = [
+        fs::read(&settings_path).unwrap(),
+        fs::read(&marketplaces_path).unwrap(),
+    ];
+    assert_success(
+        case.id,
+        "repeated stock CLI-backed uninstall",
+        cli.run(&["uninstall", "--agent", case.id]),
+    );
+    assert_eq!(
+        [
+            fs::read(&settings_path).unwrap(),
+            fs::read(&marketplaces_path).unwrap(),
+        ],
+        settled_removal,
+        "a second Claude uninstall changed already-removed activation state"
+    );
+    assert!(
+        latest_receipt(&cli, case.host)
+            .component_receipts
+            .iter()
+            .all(|component| {
+                component
+                    .artifacts
+                    .iter()
+                    .all(|artifact| !cli.home.path().join(&artifact.relative_path).exists())
+            }),
+        "a second Claude uninstall re-deployed managed artifacts"
     );
 }
 

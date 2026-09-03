@@ -168,10 +168,9 @@ impl ProjectRuntimeRegistryV1 {
     /// are joined, and process-wide semantic handles are unregistered.
     #[cfg(test)]
     pub(crate) async fn shut_down_all(&self) -> bool {
-        self.shut_down_all_until(
-            tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE,
-        )
-        .await
+        let now = tokio::time::Instant::now();
+        self.shut_down_all_until(now + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE)
+            .await
     }
 
     /// Shut every project runtime down within the caller's absolute daemon shutdown budget.
@@ -373,13 +372,10 @@ mod deadline_tests {
             .lock_runtimes()
             .insert(PathBuf::from("never-released"), ProjectRuntime::default());
 
+        let abort_deadline =
+            tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_TASK_ABORT_DEADLINE;
         assert!(
-            !registry
-                .shut_down_all_until(
-                    tokio::time::Instant::now()
-                        + tracedecay_runtime_core::DAEMON_TASK_ABORT_DEADLINE,
-                )
-                .await,
+            !registry.shut_down_all_until(abort_deadline).await,
             "an exhausted drain budget must report incomplete shutdown"
         );
         assert!(
@@ -387,13 +383,10 @@ mod deadline_tests {
             "the retained shutdown task must perform terminal teardown even if its caller is gone"
         );
         registry.lock_root_fences().request_leases.clear();
+        let retry_deadline =
+            tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_TASK_ABORT_DEADLINE;
         assert!(
-            registry
-                .shut_down_all_until(
-                    tokio::time::Instant::now()
-                        + tracedecay_runtime_core::DAEMON_TASK_ABORT_DEADLINE,
-                )
-                .await,
+            registry.shut_down_all_until(retry_deadline).await,
             "after the blocking lease settles, a retry must truthfully complete the empty closed registry"
         );
         assert!(matches!(

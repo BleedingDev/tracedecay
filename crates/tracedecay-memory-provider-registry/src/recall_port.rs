@@ -17,7 +17,12 @@
 //!   is refused, and cancellation requested *after* dispatch reaches the
 //!   provider through the token it is already holding. A request that is
 //!   already cancelled or past its deadline is answered with a typed
-//!   degradation without contacting the provider;
+//!   degradation without contacting the provider, and a recall whose
+//!   cancellation fired or whose deadline elapsed *while* the provider was
+//!   working is answered with that same typed degradation rather than with
+//!   the provider's late reply: a provider that ignored the token it was
+//!   handed cannot publish advisory content for a request its caller has
+//!   already withdrawn;
 //! * every provider reply is passed through rank-final
 //!   [`admit_recall_reply`], so a candidate that fails exact-scope, identity,
 //!   validity, or revocation checks can only reach the caller as a row in the
@@ -72,6 +77,9 @@ use tracedecay_memory_provider_api::{
 };
 
 use crate::ProjectMemoryProviderComposition;
+use crate::provider_invocation::{
+    ProviderInvocationBoundaryV1, ProviderInvocationFaultV1, ProviderInvocationRequestV1,
+};
 use crate::recall_admission::{
     AdmittedTemporalQuery, RECALL_QUERY_CAPABILITY_ID, RecallAdmissionError, RecallAdmissionReport,
     RecallBudgetsV1, RecallCandidateContent, RecallCandidateV1, RecallRequestParts,
@@ -260,9 +268,11 @@ pub enum CognitiveRecallPortError {
     /// The admitted candidates could not be expressed as application values.
     #[error("recall result violates the application contract: {0}")]
     Application(#[source] ApplicationContractError),
-    /// The blocking provider invocation did not complete.
-    #[error("recall invocation task did not complete: {0}")]
-    Invocation(#[source] tokio::task::JoinError),
+    /// The host execution boundary produced no provider outcome for a reason
+    /// that is a host fault rather than a provider reply or a deadline: the
+    /// worker could not be started, or it unwound without delivering.
+    #[error("recall invocation did not complete: {0}")]
+    Invocation(#[source] ProviderInvocationFaultV1),
     /// The live cancellation signal handed to the port is a different
     /// cancellation identity than the one the request names. An adapter may
     /// not replace the caller's cancellation identity, so the recall is
@@ -308,7 +318,7 @@ impl CognitiveRecallPortError {
             Self::Admission(_) => "recall_admission_failed",
             Self::AdmissionAudit(_) => "recall_admission_audit_failed",
             Self::Application(_) => "recall_application_contract_violation",
-            Self::Invocation(_) => "recall_invocation_incomplete",
+            Self::Invocation(fault) => fault.code(),
             Self::CancellationIdentityMismatch { .. } => "recall_cancellation_identity_mismatch",
         }
     }
@@ -335,6 +345,13 @@ pub struct CognitiveRecallPortInputsV1 {
     pub composition: Arc<ProjectMemoryProviderComposition>,
     /// Host authority that derives the exact coding scope.
     pub scope_binding: Arc<dyn ExactScopeBinding>,
+    /// The host execution boundary every synchronous provider call runs
+    /// through. It is supplied rather than created here because this crate
+    /// owns no execution capability, and it is shared across the ports minted
+    /// over one composition: a provider that stranded a worker under one
+    /// session must stay refused for every other session, since they all
+    /// contact the same registration behind the same serialized dispatch gate.
+    pub invocation_boundary: Arc<ProviderInvocationBoundaryV1>,
     /// Audit sink for admission reports.
     pub admission_observer: Arc<dyn RecallAdmissionObserver>,
     /// Host-pinned routing policy: the one provider allowed to answer, the
@@ -355,6 +372,7 @@ pub struct CognitiveRecallPortInputsV1 {
 pub struct ProjectCognitiveRecallPortV1 {
     composition: Arc<ProjectMemoryProviderComposition>,
     scope_binding: Arc<dyn ExactScopeBinding>,
+    invocation_boundary: Arc<ProviderInvocationBoundaryV1>,
     admission_observer: Arc<dyn RecallAdmissionObserver>,
     routing: ActiveRoutingPolicy,
     host_limits: ProviderLimits,
@@ -436,6 +454,7 @@ impl ProjectCognitiveRecallPortV1 {
         Ok(Self {
             composition: inputs.composition,
             scope_binding: inputs.scope_binding,
+            invocation_boundary: inputs.invocation_boundary,
             admission_observer: inputs.admission_observer,
             routing: inputs.routing,
             host_limits: inputs.host_limits,
@@ -574,9 +593,17 @@ impl ProjectCognitiveRecallPortV1 {
             .scope_binding
             .bind_exact_scope(request.scope())
             .map_err(CognitiveRecallPortError::Scope)?;
-        self.composition
+        // The shape the host execution boundary must admit this recall under,
+        // read from the composed registry's own selected registration. Routing
+        // names are deliberately not consulted: a name this registry did not
+        // register cannot be entered by `route_active` at all, so refusing it
+        // here would replace the router's typed refusal -- "that provider has
+        // no route" -- with an unavailable provider that was never asked.
+        let execution_shape = self
+            .composition
             .registry()
-            .ok_or(CognitiveRecallPortError::CompositionDisabled)?;
+            .ok_or(CognitiveRecallPortError::CompositionDisabled)?
+            .selected_execution_shape();
 
         let deadline_utc_micros = request.deadline().expires_at.0;
         let remaining_millis = u64::try_from(
@@ -607,6 +634,12 @@ impl ProjectCognitiveRecallPortV1 {
         // signal. The bridge task is aborted on every exit path by the guard,
         // so a completed recall leaves nothing waiting on the signal.
         let (cancellation_token, _cancellation_bridge) = bridge_cancellation(cancellation);
+        // The same token, kept out of the plan. When the host stops waiting it
+        // fires this itself: the bridge task dies with this call, so a
+        // cooperative provider would otherwise be left holding a token nothing
+        // will ever cancel -- turning work that would have stopped on its own
+        // into a stranded worker.
+        let provider_stop = cancellation_token.clone();
         let plan = RecallCallPlan {
             cancellation: cancellation_token,
             exact_scope,
@@ -626,24 +659,124 @@ impl ProjectCognitiveRecallPortV1 {
         // itself — pre-contact admission of the pinned provider, the fresh
         // handshake, the call, and any explicitly pinned fallback — happens
         // inside the fabric so no second selection authority exists here.
+        //
+        // The worker is host-owned rather than a shared blocking-pool task,
+        // and the boundary enforces this call's own remaining budget on it.
+        // A provider that ignores the deadline it was handed therefore cannot
+        // hold this task, the async runtime, or a pooled worker slot open: the
+        // caller is answered at its deadline with a typed degradation, the
+        // stranded worker keeps its own accounted slot until it returns, and
+        // the provider is refused before contact until then instead of being
+        // stacked behind the invocation it is already wedged inside.
         let composition = Arc::clone(&self.composition);
         let routing = self.routing.clone();
-        let routed = tokio::task::spawn_blocking(move || {
-            composition
-                .registry()
-                .ok_or(CognitiveRecallPortError::CompositionDisabled)
-                .and_then(|registry| {
-                    registry
-                        .route_active(&routing, RECALL_QUERY_CAPABILITY_ID, &plan)
-                        .map_err(routing_error)
-                })
-        })
-        .await
-        .map_err(CognitiveRecallPortError::Invocation)??;
+        let boundary = Arc::clone(&self.invocation_boundary);
+        let provider_id = self.routing.active_provider().as_str().to_owned();
+        let invocation_budget = std::time::Duration::from_micros(
+            u64::try_from(deadline_utc_micros.saturating_sub(now.0)).unwrap_or(0),
+        );
+        // Cancellation is an explicit input to the boundary, not something the
+        // provider is merely told about: a provider that ignores the token it
+        // was handed must not be able to keep the caller waiting after the
+        // caller has withdrawn.
+        let caller_cancellation = cancellation.clone();
+        let dispatched = boundary
+            .invoke(
+                ProviderInvocationRequestV1 {
+                    provider_id: &provider_id,
+                    execution_shape,
+                    budget: invocation_budget,
+                    cancelled: Box::pin(async move { caller_cancellation.cancelled().await }),
+                },
+                move || {
+                    composition
+                        .registry()
+                        .ok_or(CognitiveRecallPortError::CompositionDisabled)
+                        .and_then(|registry| {
+                            registry
+                                .route_active(&routing, RECALL_QUERY_CAPABILITY_ID, &plan)
+                                .map_err(routing_error)
+                        })
+                },
+            )
+            .await;
+        let routed = match dispatched {
+            Ok(routed) => routed?,
+            // The provider outlived the budget it was handed. This is the
+            // caller's deadline outcome, not a provider reply: nothing is
+            // admitted, and the boundary has already either stopped the worker
+            // or recorded the strand it could not stop.
+            Err(ProviderInvocationFaultV1::DeadlineExceeded { .. }) => {
+                provider_stop.cancel();
+                return degraded_outcome(
+                    &request,
+                    self.configured_identity()?,
+                    CognitiveRecallDegradation::TimedOut,
+                );
+            }
+            // The caller withdrew while the provider was working. The boundary
+            // stopped waiting the moment that happened rather than waiting out
+            // a provider that ignored its token.
+            Err(ProviderInvocationFaultV1::Cancelled { .. }) => {
+                provider_stop.cancel();
+                return degraded_outcome(
+                    &request,
+                    self.configured_identity()?,
+                    CognitiveRecallDegradation::Cancelled,
+                );
+            }
+            // Refused before contact: the provider strands more workers than
+            // the host will hold, its waited-worker budget is committed, or its
+            // code is a shape this host cannot terminate. Each is an
+            // unavailable provider, reported as such, never an empty answer and
+            // never a queue behind a wedged invocation.
+            Err(
+                ProviderInvocationFaultV1::ProviderStalled { .. }
+                | ProviderInvocationFaultV1::WorkerCapacityExhausted { .. }
+                | ProviderInvocationFaultV1::ExecutionNotIsolated { .. },
+            ) => {
+                return degraded_outcome(
+                    &request,
+                    self.configured_identity()?,
+                    CognitiveRecallDegradation::Unavailable,
+                );
+            }
+            Err(fault) => return Err(CognitiveRecallPortError::Invocation(fault)),
+        };
         let identity = attributed_identity(&routed.identity)?;
         let call = routed.call;
         let reply = routed.reply;
         let fallback = routed.fallback;
+
+        // The provider has answered, but the caller may have walked away while
+        // it was working. Cancellation and the deadline are both *live* for the
+        // whole dispatch, and a provider that ignored the token it was handed
+        // returns a reply in which neither is visible: its terminal says
+        // `success`. Admitting that reply would publish advisory content for a
+        // request that no longer exists — content the caller cannot consume,
+        // produced after it withdrew consent to produce it. The pre-dispatch
+        // guard above cannot cover this window, because the window opens after
+        // it runs.
+        //
+        // The check sits before admission on purpose: an abandoned recall
+        // decodes no provider payload, ranks nothing, writes no admission
+        // ledger, and delivers no candidate. It is a typed degradation, the
+        // same one the pre-dispatch guard produces, so a caller sees one
+        // vocabulary for "this recall did not complete" whether the budget ran
+        // out before contact or during it.
+        if cancellation.is_cancelled() || request.cancellation().is_cancelled() {
+            let mut outcome =
+                degraded_outcome(&request, identity, CognitiveRecallDegradation::Cancelled)?;
+            outcome.fallback = fallback;
+            return Ok(outcome);
+        }
+        let settled_at = try_now_micros().map_err(CognitiveRecallPortError::Clock)?;
+        if request.deadline().is_elapsed_at(settled_at) {
+            let mut outcome =
+                degraded_outcome(&request, identity, CognitiveRecallDegradation::TimedOut)?;
+            outcome.fallback = fallback;
+            return Ok(outcome);
+        }
 
         match classify_terminal(&reply) {
             TerminalDisposition::Admit => {}

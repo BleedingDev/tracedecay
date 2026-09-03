@@ -31,8 +31,14 @@ impl AdapterFailureV1 {
     }
 
     /// Borrows the captured failure.
+    ///
+    /// The trait object keeps its `'static` bound so a caller can recover its
+    /// own concrete error type with `downcast_ref`. Without that bound the
+    /// error is preserved but unusable: the caller can print it and nothing
+    /// else, which is how a typed adapter failure turns back into free text at
+    /// the one place it still matters.
     #[must_use]
-    pub fn cause(&self) -> &(dyn Error + Send + Sync) {
+    pub fn cause(&self) -> &(dyn Error + Send + Sync + 'static) {
         self.0.as_ref()
     }
 }

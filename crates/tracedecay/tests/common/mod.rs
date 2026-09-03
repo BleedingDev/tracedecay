@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 pub mod fixture;
+#[path = "../product_memory_provider/harness_binary.rs"]
+pub mod harness_binary;
 pub mod repository_layout;
 
 use std::ffi::{OsStr, OsString};
@@ -783,6 +785,8 @@ pub fn tracedecay_bin() -> PathBuf {
         "workspace tracedecay binary is missing at {}; build it with `cargo build -p tracedecay-cli --bin tracedecay` or set TRACEDECAY_TEST_BIN",
         binary.display()
     );
+    harness_binary::refuse_foreign_test_bin(&binary, &harness_binary::test_build_tree())
+        .unwrap_or_else(|refusal| panic!("{refusal}"));
 
     let output = Command::new(&binary)
         .arg("--version")

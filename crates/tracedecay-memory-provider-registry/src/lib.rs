@@ -45,6 +45,7 @@ use std::sync::Arc;
 use tracedecay_memory_fabric::MemoryFabric;
 use tracedecay_memory_provider_api::MemoryProvider;
 
+pub mod provider_invocation;
 pub mod recall_admission;
 pub mod recall_context_pack;
 pub mod recall_explain_trace;
@@ -55,6 +56,13 @@ pub mod recall_selection;
 pub mod state_capability;
 pub mod supervised_readiness;
 pub mod supervisor;
+pub use provider_invocation::{
+    ProviderCancellationWaitV1, ProviderExecutionShapeV1, ProviderInvocationBoundaryV1,
+    ProviderInvocationFaultV1, ProviderInvocationLimitsV1, ProviderInvocationRequestV1,
+    ProviderWorkV1, ProviderWorkerCensusV1, ProviderWorkerHandleV1, ProviderWorkerIsolationV1,
+    ProviderWorkerSpawnErrorV1, ProviderWorkerSpawnV1, ProviderWorkerTerminationV1,
+    WorkerDispositionV1,
+};
 pub use recall_admission::{
     AdmittedRecallCandidate, AdmittedTemporalQuery, DeniedRecallCandidate,
     RECALL_PAYLOAD_CONTRACT_ID, RECALL_QUERY_CAPABILITY_ID, RecallAdmission, RecallAdmissionError,
@@ -186,6 +194,24 @@ impl MountableProviderKindV1 {
     pub const fn declared_recall_scope_bindings(self) -> &'static [&'static str] {
         match self {
             Self::Native => NATIVE_RECALL_SCOPE_BINDINGS,
+        }
+    }
+
+    /// Returns the execution shape the host execution boundary admits this
+    /// adapter under.
+    ///
+    /// Declaring it here, on the typed kind, is what keeps the decision out of
+    /// the composition root: the boundary asks the composed registry, through
+    /// [`ProjectMemoryProviderRegistry::selected_execution_shape`], what shape
+    /// the adapter a recall route can actually enter was registered under, and
+    /// never compares a provider name to decide it.
+    #[must_use]
+    pub const fn declared_execution_shape(self) -> ProviderExecutionShapeV1 {
+        match self {
+            // The Native adapter is compiled from this workspace, is held to
+            // its cancellation contract by the conformance suite, and is the
+            // host's own code to answer for.
+            Self::Native => ProviderExecutionShapeV1::HostAuthoredInProcess,
         }
     }
 }
@@ -668,6 +694,9 @@ impl From<FabricError> for RegistryError {
 /// ```
 pub struct ProjectMemoryProviderRegistry {
     fabric: Arc<MemoryFabric>,
+    /// The execution shape of the one selected active registration, taken
+    /// from that registration's own typed kind at composition.
+    selected_execution_shape: ProviderExecutionShapeV1,
     /// Recall scope bindings the host recorded per provider at registration,
     /// from the provider's declared `recall_scope_bindings` manifest attribute.
     /// Admission reads this record through the admitted call; a provider
@@ -715,6 +744,7 @@ impl ProjectMemoryProviderRegistry {
         }
         let mut registry = Self {
             fabric,
+            selected_execution_shape: selected_kind.declared_execution_shape(),
             recall_scope_bindings: BTreeMap::new(),
         };
         registry.register_selected(selected, registration_revision, mode)?;
@@ -740,6 +770,21 @@ impl ProjectMemoryProviderRegistry {
             observer.provider,
         )?;
         Ok(())
+    }
+
+    /// Returns the execution shape of the only adapter a recall route can
+    /// enter through this registry.
+    ///
+    /// Exactly one registration is selected as active; observers are refused
+    /// by [`Self::route_active`] before contact and an identity this registry
+    /// never registered has no code here to enter at all. So the shape of the
+    /// selected registration -- read from its own typed kind, never from a
+    /// configured provider name -- is the whole answer to "what could this
+    /// host end up executing on a recall worker", which is what the host
+    /// execution boundary must decide it can isolate before it starts one.
+    #[must_use]
+    pub const fn selected_execution_shape(&self) -> ProviderExecutionShapeV1 {
+        self.selected_execution_shape
     }
 
     /// Returns the recall scope bindings the host recorded for `provider_id`

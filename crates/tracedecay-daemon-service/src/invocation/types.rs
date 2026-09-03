@@ -961,8 +961,22 @@ impl LspLeaseTaskRegistry {
         matches.then(|| state.tasks.remove(session_id)).flatten()
     }
 
+    /// Closes admission and retires every registered lease task inside the
+    /// caller's absolute `deadline`.
+    ///
+    /// Cancellation is signalled to every captured task before the first join,
+    /// so one task that outlives its own join cannot keep its successors
+    /// running uncancelled. A task still unfinished at the deadline is aborted
+    /// rather than dropped: dropping a `JoinHandle` only detaches the task,
+    /// which would let lease work continue after a shutdown that already
+    /// reported itself unclean. Abort is cooperative: a task blocking inside
+    /// its own poll still runs to its next suspension point, possibly after
+    /// this call returns, but it can never resume past that point.
     #[hotpath::skip]
-    pub async fn shutdown(&self) -> Result<(), DaemonInvocationProblem> {
+    pub async fn shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DaemonInvocationProblem> {
         let tasks = {
             let mut state = match self.state.lock() {
                 Ok(state) => state,
@@ -971,10 +985,17 @@ impl LspLeaseTaskRegistry {
             state.accepting = false;
             std::mem::take(&mut state.tasks)
         };
+        for task in tasks.values() {
+            task.cancellation.cancel();
+        }
         let mut outcome = Ok(());
-        for task in tasks.into_values() {
-            if let Err(problem) = task.stop().await {
-                outcome = Err(problem);
+        for mut task in tasks.into_values() {
+            if !matches!(
+                tokio::time::timeout_at(deadline, &mut task.handle).await,
+                Ok(Ok(()))
+            ) {
+                task.handle.abort();
+                outcome = Err(DaemonInvocationProblem::Unavailable);
             }
         }
         outcome

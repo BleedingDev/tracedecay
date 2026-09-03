@@ -153,6 +153,7 @@ macro_rules! transcript_capture_kernels {
 
 transcript_capture_kernels! {
     ClaudeProfileKernelV1 => capture_claude_profile,
+    ClaudeProjectKernelV1 => capture_claude_project,
     CodexProfileKernelV1 => capture_codex_profile,
     CursorProfileKernelV1 => capture_cursor_profile,
     HermesProfileKernelV1 => capture_hermes_profile,
@@ -200,6 +201,12 @@ const TRANSCRIPT_CAPTURE_KERNELS: &[(
         true,
         TranscriptPayloadRouteV1::SourceScan,
         &KiroProfileKernelV1,
+    ),
+    (
+        "claude",
+        false,
+        TranscriptPayloadRouteV1::SourceScan,
+        &ClaudeProjectKernelV1,
     ),
     (
         "codex",
@@ -276,6 +283,51 @@ async fn capture_claude_profile(
         .map_err(|error| map_claude_observation_ingest_error(&error))?;
     Ok(TranscriptCaptureOutcome {
         messages_upserted: stats.transcript.messages_upserted,
+        claude_observation: Some(stats),
+        ..TranscriptCaptureOutcome::default()
+    })
+}
+
+/// Project-scoped Claude catch-up: scans this project's own Claude transcript
+/// sources and commits their frames as canonical *project* observations.
+///
+/// Why this route has to exist beside [`capture_claude_profile`]: the profile
+/// kernel narrows its source with `ClaudeSource::for_user_scope`, which keeps
+/// exactly the rows that belong to **no** registered project. A Claude session
+/// running inside a registered project is therefore invisible to it. Without
+/// this kernel that session's frames reach the canonical observation store
+/// only when the daemon's own session-sync pass next runs, so anything reading
+/// the project's observations -- the advisory memory lane included -- lags a
+/// whole daemon lifetime behind the session that produced them.
+///
+/// The pass is the same one the session-sync worker runs for this provider
+/// (`ingest_source_with_observations_with_admission` under
+/// `ObservationScopeV1::Project`), bounded by the caller's byte budget, so a
+/// hook-driven catch-up and a scheduled sweep converge on identical state
+/// through content-derived idempotency rather than racing each other.
+async fn capture_claude_project(
+    ctx: TranscriptCaptureContext<'_>,
+) -> Result<TranscriptCaptureOutcome> {
+    let cg = ctx.project()?;
+    let source = tracedecay_sessions::runtime::claude::ClaudeSource::new()
+        .ok_or_else(|| config_error("Claude transcript source is unavailable"))?;
+    let project_id = project_observation_id(cg)?;
+    let stats =
+        tracedecay_sessions::runtime::claude_observation::ingest_source_with_observations_with_admission(
+            &source,
+            cg.project_root(),
+            ObservationScopeV1::Project { project_id },
+            ctx.facade,
+            Some(ctx.max_new_bytes.unwrap_or(
+                tracedecay_sessions::runtime::claude_observation::CLAUDE_HOOK_MAX_NEW_BYTES,
+            )),
+            ctx.cancellation.clone(),
+        )
+        .await
+        .map_err(|error| map_claude_observation_ingest_error(&error))?;
+    Ok(TranscriptCaptureOutcome {
+        messages_upserted: stats.transcript.messages_upserted,
+        source_deferred: stats.deferred_sources > 0,
         claude_observation: Some(stats),
         ..TranscriptCaptureOutcome::default()
     })

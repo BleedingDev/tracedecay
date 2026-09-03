@@ -21,9 +21,11 @@ use tracedecay_memory_provider_native::{
 };
 use tracedecay_memory_provider_registry::{
     AdmittedTemporalQuery, EnabledProviderMode, FabricConfig, NativeProviderActivation,
-    ProjectMemoryProviderComposition, RECALL_PAYLOAD_CONTRACT_ID, RECALL_QUERY_CAPABILITY_ID,
-    RecallBudgetsV1, RecallCandidateV1, RecallRequestParts, RecallScopeBindingsV1, ScopeBinding,
-    build_recall_request_payload,
+    ProjectMemoryProviderComposition, ProviderInvocationBoundaryV1, ProviderInvocationLimitsV1,
+    ProviderWorkV1, ProviderWorkerHandleV1, ProviderWorkerIsolationV1, ProviderWorkerSpawnErrorV1,
+    ProviderWorkerSpawnV1, ProviderWorkerTerminationV1, RECALL_PAYLOAD_CONTRACT_ID,
+    RECALL_QUERY_CAPABILITY_ID, RecallBudgetsV1, RecallCandidateV1, RecallRequestParts,
+    RecallScopeBindingsV1, ScopeBinding, build_recall_request_payload,
 };
 
 pub const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -849,4 +851,48 @@ pub fn observer_observation_call(
     })
     .expect("observation call")
     .with_sanitization(receipt)
+}
+
+/// A test host worker: the execution capability the composition root supplies
+/// in production. Detached, exactly like the production one, so a wedged
+/// provider cannot hold the test runtime open either.
+pub struct TestWorkerSpawn;
+
+/// The in-process worker this test host starts and, exactly like the daemon,
+/// cannot stop.
+struct TestThreadWorkerHandle;
+
+impl ProviderWorkerHandleV1 for TestThreadWorkerHandle {
+    fn terminate(&self) -> ProviderWorkerTerminationV1 {
+        ProviderWorkerTerminationV1::NotTerminable
+    }
+}
+
+impl ProviderWorkerSpawnV1 for TestWorkerSpawn {
+    fn isolation(&self) -> ProviderWorkerIsolationV1 {
+        ProviderWorkerIsolationV1::CooperativeOnly
+    }
+
+    fn spawn_detached(
+        &self,
+        name: &str,
+        work: ProviderWorkV1,
+    ) -> Result<Box<dyn ProviderWorkerHandleV1>, ProviderWorkerSpawnErrorV1> {
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(work)
+            .map(|_joinable| -> Box<dyn ProviderWorkerHandleV1> {
+                Box::new(TestThreadWorkerHandle)
+            })
+            .map_err(|error| ProviderWorkerSpawnErrorV1::new(error.to_string()))
+    }
+}
+
+/// One host execution boundary for a mounted test port.
+#[must_use]
+pub fn test_invocation_boundary() -> Arc<ProviderInvocationBoundaryV1> {
+    Arc::new(ProviderInvocationBoundaryV1::new(
+        ProviderInvocationLimitsV1::for_in_flight(2),
+        Arc::new(TestWorkerSpawn),
+    ))
 }

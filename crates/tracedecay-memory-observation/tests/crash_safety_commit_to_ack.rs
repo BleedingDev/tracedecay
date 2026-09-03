@@ -60,15 +60,18 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use support::{
-    Builder, DAY, LEASE, MINUTE, PROVENANCE_DIGEST, PROVIDER_RECEIPT_DIGEST, SECOND, T0,
+    Builder, DAY, LEASE, MINUTE, PROVENANCE_DIGEST, PROVIDER, PROVIDER_RECEIPT_DIGEST, SECOND, T0,
     TestIngestControl, TestResult, digest_hex, gate, journal, lane, lease_request, policy,
     stream_key,
 };
@@ -82,9 +85,10 @@ use tracedecay_memory_observation::{
     JournalInspectionPageV1, LeaseRequestV1, LeasedObservationV1, ObservationAdmissionAdapterV1,
     ObservationDeliveryReceiptV1, ObservationDispatchPortV1, ObservationIdV1,
     ObservationJournalError, ObservationJournalReaderV1, ObservationLaneKeyV1,
-    ObservationLoadClassV1, ObservationOutcomeV1, ProviderDeliveryAdapterV1, QueuePressureV1,
-    ReplayCursorV1, RetentionClassV1, RetryBackoffV1, SourceRecordV1, SourceSequenceV1,
-    SourceStreamKeyV1, SqliteObservationJournal, WithheldAdmissionV1,
+    ObservationLoadClassV1, ObservationOutcomeV1, ObservationRecoveryPortV1,
+    ProviderDeliveryAdapterV1, QueuePressureV1, RecoveryTargetKeyV1, RecoveryTimeBudgetV1,
+    ReplayCursorV1, ReplayDispositionV1, RetentionClassV1, RetryBackoffV1, SourceRecordV1,
+    SourceSequenceV1, SourceStreamKeyV1, SqliteObservationJournal, WithheldAdmissionV1,
 };
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
@@ -103,13 +107,25 @@ const MAX_RECOVERY_LIVES: usize = 8;
 /// The canonical stream every journey replays.
 const CANONICAL_STREAM: &str = "session-1";
 
+/// The registration revision every row in this suite is pinned to. It is the
+/// fixture builder's own, and the acknowledged watermark is keyed by it, so
+/// reading the watermark under a different revision would silently find
+/// nothing.
+const REGISTRATION_REVISION: u64 = 4;
+
 /// Carries one child life's whole assignment. Present exactly when this process
 /// *is* a child life.
 const CHILD_LIFE_ENV: &str = "TDMEM_0508_CHILD_LIFE";
 
-/// How long the parent waits for a child to reach its boundary before calling
-/// the hook unreachable.
+/// How long the parent blocks for the child's arrival signal before calling
+/// the hook unreachable. This is a terminal bound on a blocking read, not a
+/// poll interval: nothing in the parent wakes up before the child speaks.
 const HOOK_ARRIVAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long the parent blocks for the child to attach its signalling socket.
+/// A child that dies before attaching cannot close a connection it never
+/// opened, so this stage carries its own shorter bound and its own diagnostic.
+const CHILD_ATTACH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Signal number the parent kills a parked child with, and the only exit status
 /// a crashed life may have.
@@ -212,6 +228,45 @@ impl ProviderLedgerV1 {
     }
 }
 
+/// Canonical positions this provider refuses permanently, held in a file of
+/// its own.
+///
+/// A refusal has to be a property of the *provider*, not of the process that
+/// happens to be running it, or the "refusals stay terminal" claim would only
+/// be testing that one life refused once. Keeping it on disk beside the ledger
+/// means the child that dies and the parent that recovers refuse exactly the
+/// same positions, so a redelivery after a crash meets the same answer.
+struct ProviderRefusalPolicyV1 {
+    path: PathBuf,
+}
+
+impl ProviderRefusalPolicyV1 {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn positions(&self) -> Result<BTreeSet<u64>, Box<dyn Error>> {
+        match fs::read_to_string(&self.path) {
+            Ok(text) => text
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| line.parse::<u64>().map_err(|error| harness(error).into()))
+                .collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn write(&self, positions: &BTreeSet<u64>) -> Result<(), Box<dyn Error>> {
+        let mut file = fs::File::create(&self.path)?;
+        for position in positions {
+            writeln!(file, "{position}")?;
+        }
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
 /// A provider that deduplicates on the idempotency key against its own durable
 /// ledger, exactly as a real one must for redelivery to be safe.
 struct DurableProviderV1<'a> {
@@ -219,6 +274,9 @@ struct DurableProviderV1<'a> {
     hooks: &'a HooksV1,
     now: i64,
     received: AtomicU32,
+    /// Canonical positions this provider refuses with a permanent terminal.
+    /// No effect is ever committed for one of them.
+    refused: BTreeSet<u64>,
 }
 
 impl ProviderDeliveryAdapterV1 for DurableProviderV1<'_> {
@@ -251,6 +309,17 @@ impl ProviderDeliveryAdapterV1 for DurableProviderV1<'_> {
 
         let started = self.now;
         let finished = started.saturating_add(1_000);
+        if self.refused.contains(&sequence) {
+            // A permanent contract refusal: the provider answers before it
+            // commits anything, so no effect for this position exists in any
+            // life. The host must treat this as terminal and never redeliver.
+            let terminal = rejected_terminal(leased).map_err(harness)?;
+            return Ok(DeliveryAttemptV1::Answered {
+                terminal: Box::new(terminal),
+                started_at_unix_micros: started,
+                finished_at_unix_micros: finished,
+            });
+        }
         let already = self.ledger.effects().map_err(harness)?;
         if already.iter().any(|line| line == &key) {
             let terminal = duplicate_terminal(leased, &key).map_err(harness)?;
@@ -293,6 +362,23 @@ fn success_terminal(leased: &LeasedObservationV1) -> Result<TerminalRecord, Box<
         format!("observe-{}", leased.observation_id.as_str()),
         leased.exact_scope_sha256.clone(),
         None,
+    )?)
+}
+
+/// A permanent provider refusal: no effect, no fallback, and an outcome the
+/// journal maps to `rejected`.
+fn rejected_terminal(leased: &LeasedObservationV1) -> Result<TerminalRecord, Box<dyn Error>> {
+    Ok(TerminalRecord::new(
+        ProviderOperation::Observe,
+        leased.target.provider_id.clone(),
+        TerminalCode::ContractViolation,
+        CommittedEffectEvidence::none(None),
+        FallbackDirective::forbidden(),
+        format!("observe-{}", leased.observation_id.as_str()),
+        leased.exact_scope_sha256.clone(),
+        // Every non-success terminal must name a diagnostic, so a provider
+        // that refuses says why in a value the receipt keeps.
+        Some("observation-refused-by-contract".to_owned()),
     )?)
 }
 
@@ -393,6 +479,11 @@ struct HooksV1 {
     target_sequence: u64,
     marker: PathBuf,
     fired: AtomicBool,
+    /// The stream the parent blocks on. Attached before the life starts, so a
+    /// child that dies anywhere after attachment closes it and the parent
+    /// learns of the death from the same blocking read it waits for the
+    /// arrival on.
+    signal: Mutex<Option<UnixStream>>,
 }
 
 impl HooksV1 {
@@ -403,15 +494,22 @@ impl HooksV1 {
             target_sequence: 0,
             marker: PathBuf::new(),
             fired: AtomicBool::new(false),
+            signal: Mutex::new(None),
         }
     }
 
-    fn armed_at(point: HookPointV1, target_sequence: u64, marker: PathBuf) -> Self {
+    fn armed_at(
+        point: HookPointV1,
+        target_sequence: u64,
+        marker: PathBuf,
+        signal: UnixStream,
+    ) -> Self {
         Self {
             armed: Some(point),
             target_sequence,
             marker,
             fired: AtomicBool::new(false),
+            signal: Mutex::new(Some(signal)),
         }
     }
 
@@ -427,14 +525,33 @@ impl HooksV1 {
     }
 
     fn arrive(&self, point: HookPointV1) -> ! {
-        // The marker is the barrier the parent waits on. If it cannot be
-        // written the parent times out and reports the hook as unreached,
-        // which is the correct failure — so there is nothing to do with the
-        // error here but park and let the parent decide.
-        let _ = self.record_arrival(point);
-        loop {
-            std::thread::sleep(Duration::from_millis(20));
+        // Durable first, then the signal. The marker is fsync'd before the
+        // parent is told anything, so the arrival the parent verifies after
+        // the kill is already on disk when the kill is issued. If the marker
+        // cannot be written the signal is withheld too: the parent then times
+        // out and reports the hook as unreached, which is the correct failure.
+        if self.record_arrival(point).is_ok() {
+            self.announce_arrival();
         }
+        // Park, never sleep. The thread stops being schedulable until the
+        // parent's SIGKILL takes the whole process down; nothing here wakes on
+        // a timer, so no timing assumption can leak into the crash point.
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// Unblocks the parent's read. One byte, flushed, from a boundary that has
+    /// already reached disk.
+    fn announce_arrival(&self) {
+        let Ok(mut slot) = self.signal.lock() else {
+            return;
+        };
+        let Some(stream) = slot.as_mut() else {
+            return;
+        };
+        let _ = stream.write_all(b"1");
+        let _ = stream.flush();
     }
 
     fn record_arrival(&self, point: HookPointV1) -> Result<(), Box<dyn Error>> {
@@ -708,6 +825,9 @@ struct JourneyPathsV1 {
     ledger: PathBuf,
     canonical: PathBuf,
     marker: PathBuf,
+    /// Positions the provider refuses permanently. Absent means it refuses
+    /// nothing, which is what every non-fuzz journey here expects.
+    refusals: PathBuf,
 }
 
 impl JourneyPathsV1 {
@@ -717,6 +837,7 @@ impl JourneyPathsV1 {
             ledger: directory.join("provider-effects.log"),
             canonical: directory.join("canonical-stream.log"),
             marker: directory.join("hook-arrivals.log"),
+            refusals: directory.join("provider-refusals.log"),
         }
     }
 }
@@ -756,6 +877,7 @@ fn live(
         hooks,
         now,
         received: AtomicU32::new(0),
+        refused: ProviderRefusalPolicyV1::new(paths.refusals.clone()).positions()?,
     };
     let reader = CrashingJournalReaderV1::new(&store, hooks);
     let request = DispatchRequestV1 {
@@ -786,7 +908,10 @@ struct ChildLifeSpecV1 {
 }
 
 impl ChildLifeSpecV1 {
-    fn encode(&self) -> String {
+    /// Encodes the assignment together with the socket the parent is already
+    /// listening on. The socket is the parent's, not the plan's, which is why
+    /// it is an argument rather than a field.
+    fn encode(&self, signal: &Path) -> String {
         let settle = self
             .settle
             .iter()
@@ -794,17 +919,20 @@ impl ChildLifeSpecV1 {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{}|{}|{}|{}|{settle}",
+            "{}|{}|{}|{}|{settle}|{}",
             self.directory.display(),
             self.hook.as_wire(),
             self.target_sequence,
             self.now,
+            signal.display(),
         )
     }
 
     fn decode(value: &str) -> Result<Self, Box<dyn Error>> {
         let parts: Vec<&str> = value.split('|').collect();
-        let [directory, hook, target, now, settle] = parts.as_slice() else {
+        // The trailing field is the parent's socket path, which the child
+        // resolves separately before it decodes the rest.
+        let [directory, hook, target, now, settle, _signal] = parts.as_slice() else {
             return Err(harness(format!("malformed child life spec {value}")).into());
         };
         Ok(Self {
@@ -834,15 +962,25 @@ fn crash_child_process_entrypoint() -> TestResult {
     let Ok(spec) = std::env::var(CHILD_LIFE_ENV) else {
         return Ok(());
     };
+    let signal_path = child_signal_path(&spec)?;
     let spec = ChildLifeSpecV1::decode(&spec)?;
     let paths = JourneyPathsV1::in_directory(&spec.directory);
+    // Attach before anything else happens. From here on the parent's blocking
+    // read has two possible ends: the arrival byte, or the close this socket
+    // suffers when the process dies for any other reason.
+    let signal = UnixStream::connect(&signal_path)?;
     let canonical = CanonicalStreamV1::new(paths.canonical.clone());
     // The host's canonical authority commits first and durably. Everything
     // after this point is downstream of a settlement that already survived.
     for sequence in &spec.settle {
         canonical.commit(*sequence)?;
     }
-    let hooks = HooksV1::armed_at(spec.hook, spec.target_sequence, paths.marker.clone());
+    let hooks = HooksV1::armed_at(
+        spec.hook,
+        spec.target_sequence,
+        paths.marker.clone(),
+        signal,
+    );
     live(&paths, spec.now, &hooks)?;
     // Reaching here means the armed boundary was never traversed: the life
     // completed instead of dying. The parent sees a clean exit and fails.
@@ -853,14 +991,70 @@ fn crash_child_process_entrypoint() -> TestResult {
     .into())
 }
 
-/// Spawns one life as a child process, waits for it to reach its boundary, and
-/// kills it there.
+/// A parent-owned rendezvous point for one child life.
+///
+/// The socket lives outside the journey directory and outside the child's
+/// world entirely: it is parent state, and it is removed when the life is
+/// over — on the success path, on every failure path, and on unwind — because
+/// `Drop` owns the removal rather than any one exit.
+struct ArrivalSocketV1 {
+    path: PathBuf,
+    listener: UnixListener,
+}
+
+impl ArrivalSocketV1 {
+    /// Binds a short, unique path. Short on purpose: a Unix socket path is
+    /// capped near 100 bytes, and the journey directory is a deep temporary
+    /// one, so binding inside it would fail on some hosts for a reason that
+    /// has nothing to do with what is under test.
+    fn bind() -> Result<Self, Box<dyn Error>> {
+        static NEXT: OnceLock<AtomicU32> = OnceLock::new();
+        let ordinal = NEXT
+            .get_or_init(|| AtomicU32::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("tdmem5lc-{}-{ordinal}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)?;
+        Ok(Self { path, listener })
+    }
+}
+
+impl Drop for ArrivalSocketV1 {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// What the parent's one blocking read can end with.
+enum ChildSignalV1 {
+    /// The child attached its socket. The life is running.
+    Attached,
+    /// The child reached its armed boundary, fsync'd the marker, and parked.
+    Arrived,
+    /// The socket closed without an arrival: the child left the world by
+    /// itself, so the boundary was never traversed.
+    Departed,
+}
+
+/// Spawns one life as a child process, blocks until it reaches its boundary,
+/// and kills it there.
+///
+/// The parent never polls and never sleeps. It blocks on a socket the child
+/// attaches before it starts, and that one descriptor carries both outcomes
+/// the parent has to distinguish: a byte means the child fsync'd its arrival
+/// and parked on the boundary, and an end of stream means the child is gone
+/// without having reached it. The bounded `recv_timeout` is the terminal
+/// deadline on that block, not a retry interval.
 ///
 /// Returns only after the child is confirmed dead by `SIGKILL` and the marker
 /// file holds exactly one arrival for the armed boundary.
 fn crash_at(spec: &ChildLifeSpecV1) -> Result<(), Box<dyn Error>> {
     let paths = JourneyPathsV1::in_directory(&spec.directory);
     let arrivals_before = marker_arrivals(&paths.marker)?.len();
+    // Bound before the child exists, so there is no window in which the child
+    // could reach its boundary and find nobody listening.
+    let socket = ArrivalSocketV1::bind()?;
     let executable = std::env::current_exe()?;
     let mut child = Command::new(executable)
         .args([
@@ -869,7 +1063,7 @@ fn crash_at(spec: &ChildLifeSpecV1) -> Result<(), Box<dyn Error>> {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env(CHILD_LIFE_ENV, spec.encode())
+        .env(CHILD_LIFE_ENV, spec.encode(&socket.path))
         .stdin(Stdio::null())
         .stdout(Stdio::from(fs::File::create(
             spec.directory.join("child-stdout.log"),
@@ -879,30 +1073,16 @@ fn crash_at(spec: &ChildLifeSpecV1) -> Result<(), Box<dyn Error>> {
         )?))
         .spawn()?;
 
-    let deadline = Instant::now() + HOOK_ARRIVAL_TIMEOUT;
-    loop {
-        if marker_arrivals(&paths.marker)?.len() > arrivals_before {
-            break;
+    match await_arrival(spec, socket, &mut child) {
+        Ok(()) => {}
+        Err(error) => {
+            // The child is either gone already or wedged somewhere this test
+            // cannot name. Either way it is this function's process to clean
+            // up before it reports anything.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
         }
-        if let Some(status) = child.try_wait()? {
-            let stderr = fs::read_to_string(spec.directory.join("child-stderr.log"))
-                .unwrap_or_else(|_| String::new());
-            return Err(harness(format!(
-                "the child exited {status} before reaching {}; stderr: {stderr}",
-                spec.hook.as_wire()
-            ))
-            .into());
-        }
-        if Instant::now() >= deadline {
-            child.kill()?;
-            child.wait()?;
-            return Err(harness(format!(
-                "the child never reached {} inside {HOOK_ARRIVAL_TIMEOUT:?}",
-                spec.hook.as_wire()
-            ))
-            .into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
 
     // The boundary is reached and the process is parked on it: kill it where it
@@ -930,6 +1110,111 @@ fn crash_at(spec: &ChildLifeSpecV1) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Blocks until the child says it is parked on the armed boundary.
+///
+/// Two stages, each with its own terminal deadline and its own diagnostic: a
+/// child that never attaches has failed before the journey started, and a
+/// child that attaches and then closes the socket has died on its own instead
+/// of on the boundary.
+fn await_arrival(
+    spec: &ChildLifeSpecV1,
+    socket: ArrivalSocketV1,
+    child: &mut Child,
+) -> Result<(), Box<dyn Error>> {
+    let (signals, arrivals) = mpsc::channel::<Result<ChildSignalV1, String>>();
+    let listener = socket.listener.try_clone()?;
+    // One thread, two blocking reads, no wake-ups in between. The parent's own
+    // wait is a `recv_timeout`, which blocks on a condition variable until the
+    // thread speaks or the deadline passes.
+    let waiter = std::thread::spawn(move || {
+        (|| -> Result<(), String> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("the arrival socket could not be accepted: {error}"))?;
+            signals
+                .send(Ok(ChildSignalV1::Attached))
+                .map_err(|error| error.to_string())?;
+            let mut byte = [0_u8; 1];
+            let signal = match stream.read_exact(&mut byte) {
+                Ok(()) => ChildSignalV1::Arrived,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    ChildSignalV1::Departed
+                }
+                Err(error) => {
+                    return Err(format!("the arrival socket failed mid-life: {error}"));
+                }
+            };
+            signals
+                .send(Ok(signal))
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })()
+    });
+
+    let attached = arrivals.recv_timeout(CHILD_ATTACH_TIMEOUT);
+    stage(spec, child, attached, "attach", CHILD_ATTACH_TIMEOUT)?;
+    let arrived = arrivals.recv_timeout(HOOK_ARRIVAL_TIMEOUT);
+    let outcome = stage(spec, child, arrived, "arrival", HOOK_ARRIVAL_TIMEOUT);
+    // The waiter is joined on every path: it owns the accepted stream, and a
+    // detached thread holding a descriptor past the end of the life it belongs
+    // to is exactly the leak this suite is not allowed to have.
+    drop(socket);
+    let _ = waiter.join();
+    outcome
+}
+
+/// Interprets one stage of the blocking wait, turning a departed child or a
+/// spent deadline into the failure that names what actually happened.
+fn stage(
+    spec: &ChildLifeSpecV1,
+    child: &mut Child,
+    received: Result<Result<ChildSignalV1, String>, RecvTimeoutError>,
+    label: &str,
+    bound: Duration,
+) -> Result<(), Box<dyn Error>> {
+    match received {
+        Ok(Ok(ChildSignalV1::Attached | ChildSignalV1::Arrived)) => Ok(()),
+        Ok(Ok(ChildSignalV1::Departed)) => {
+            let status = child.wait()?;
+            Err(harness(format!(
+                "the child exited {status} before reaching {}; stderr: {}",
+                spec.hook.as_wire(),
+                child_stderr(spec)
+            ))
+            .into())
+        }
+        Ok(Err(error)) => Err(harness(format!(
+            "the {label} wait for {} failed: {error}",
+            spec.hook.as_wire()
+        ))
+        .into()),
+        Err(RecvTimeoutError::Timeout) => Err(harness(format!(
+            "the child never reached the {label} stage for {} inside {bound:?}; stderr: {}",
+            spec.hook.as_wire(),
+            child_stderr(spec)
+        ))
+        .into()),
+        Err(RecvTimeoutError::Disconnected) => Err(harness(format!(
+            "the {label} wait for {} lost its waiter",
+            spec.hook.as_wire()
+        ))
+        .into()),
+    }
+}
+
+/// The socket path the parent put on the wire, read straight from the encoded
+/// assignment so the child never has to guess where the parent is listening.
+fn child_signal_path(encoded: &str) -> Result<PathBuf, Box<dyn Error>> {
+    encoded
+        .rsplit_once('|')
+        .map(|(_, signal)| PathBuf::from(signal))
+        .ok_or_else(|| harness(format!("malformed child life spec {encoded}")).into())
+}
+
+fn child_stderr(spec: &ChildLifeSpecV1) -> String {
+    fs::read_to_string(spec.directory.join("child-stderr.log")).unwrap_or_default()
+}
+
 fn marker_arrivals(path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(text.lines().map(str::to_owned).collect()),
@@ -948,15 +1233,27 @@ fn inspect_all(path: &Path) -> Result<JournalInspectionPageV1, Box<dyn Error>> {
     })?)
 }
 
-fn all_acknowledged(path: &Path, expected_rows: usize) -> Result<bool, Box<dyn Error>> {
+/// The row reached the provider and the effect is durable.
+const fn is_acknowledged(state: DeliveryStateV1) -> bool {
+    matches!(
+        state,
+        DeliveryStateV1::Acknowledged | DeliveryStateV1::DuplicateAcknowledged
+    )
+}
+
+/// The row will never be dispatched again: either the provider acknowledged it
+/// or it refused it permanently.
+const fn is_settled(state: DeliveryStateV1) -> bool {
+    is_acknowledged(state) || matches!(state, DeliveryStateV1::Rejected)
+}
+
+fn all_rows_reached(
+    path: &Path,
+    expected_rows: usize,
+    terminal: fn(DeliveryStateV1) -> bool,
+) -> Result<bool, Box<dyn Error>> {
     let page = inspect_all(path)?;
-    Ok(page.rows.len() == expected_rows
-        && page.rows.iter().all(|row| {
-            matches!(
-                row.state,
-                DeliveryStateV1::Acknowledged | DeliveryStateV1::DuplicateAcknowledged
-            )
-        }))
+    Ok(page.rows.len() == expected_rows && page.rows.iter().all(|row| terminal(row.state)))
 }
 
 /// Restarts the host in this process — a fresh process from the crashed
@@ -966,14 +1263,30 @@ fn all_acknowledged(path: &Path, expected_rows: usize) -> Result<bool, Box<dyn E
 /// The expected stream is never passed in: the row count that has to be reached
 /// comes from the canonical store on disk.
 fn recover_until_acknowledged(paths: &JourneyPathsV1, start: i64) -> Result<(), Box<dyn Error>> {
+    recover_until(paths, start, is_acknowledged).map(|_| ())
+}
+
+/// The same convergence loop for a journey that contains a permanently refused
+/// position: a refusal is terminal, so "converged" cannot mean "acknowledged"
+/// for every row. Returns the instant the last life ran at, so a caller can
+/// keep the clock moving forward across lives.
+fn recover_until_settled(paths: &JourneyPathsV1, start: i64) -> Result<i64, Box<dyn Error>> {
+    recover_until(paths, start, is_settled)
+}
+
+fn recover_until(
+    paths: &JourneyPathsV1,
+    start: i64,
+    terminal: fn(DeliveryStateV1) -> bool,
+) -> Result<i64, Box<dyn Error>> {
     let canonical = CanonicalStreamV1::new(paths.canonical.clone());
     let expected_rows = canonical.committed()?.len();
     let mut now = start;
     for _ in 0..MAX_RECOVERY_LIVES {
         now = now.saturating_add(LEASE + MINUTE);
         live(paths, now, &HooksV1::disarmed())?;
-        if all_acknowledged(&paths.journal, expected_rows)? {
-            return Ok(());
+        if all_rows_reached(&paths.journal, expected_rows, terminal)? {
+            return Ok(now);
         }
     }
     Err(harness(format!(
@@ -1019,6 +1332,19 @@ fn assert_journey_invariants(
     paths: &JourneyPathsV1,
     label: &str,
 ) -> Result<JourneyAuditV1, Box<dyn Error>> {
+    assert_journey_invariants_with(paths, label, &BTreeSet::new())
+}
+
+/// The same four invariants for a journey where the provider refuses some
+/// positions permanently. A refused position is terminal with **no** provider
+/// effect, so it is excluded from the effect set and admitted as `rejected`
+/// where an acknowledgement would otherwise be required — nothing else about
+/// the accounting is relaxed.
+fn assert_journey_invariants_with(
+    paths: &JourneyPathsV1,
+    label: &str,
+    refused: &BTreeSet<u64>,
+) -> Result<JourneyAuditV1, Box<dyn Error>> {
     let canonical = CanonicalStreamV1::new(paths.canonical.clone());
     let mut committed = canonical.committed()?;
     committed.sort_unstable();
@@ -1044,15 +1370,21 @@ fn assert_journey_invariants(
     assert_eq!(page.total_rows as usize, committed.len(), "{label}");
 
     // AC3 — retries create no duplicate provider effects. Counted over the
-    // provider's own append-only lines, so a second effect cannot hide.
+    // provider's own append-only lines, so a second effect cannot hide. A
+    // permanently refused position must contribute no line at all.
     let effects = ledger.effects()?;
-    let keys = expected_keys(&committed)?;
+    let applied: Vec<u64> = committed
+        .iter()
+        .copied()
+        .filter(|sequence| !refused.contains(sequence))
+        .collect();
+    let keys = expected_keys(&applied)?;
     assert_eq!(
         effects.len(),
-        committed.len(),
-        "{label}: the provider committed {} effects for {} observations: {effects:?}",
+        applied.len(),
+        "{label}: the provider committed {} effects for {} deliverable observations: {effects:?}",
         effects.len(),
-        committed.len()
+        applied.len()
     );
     assert_eq!(
         effects.iter().cloned().collect::<BTreeSet<_>>(),
@@ -1066,14 +1398,17 @@ fn assert_journey_invariants(
     let mut duplicate_rows = 0_usize;
     let mut orphaned_attempts = 0_usize;
     for row in &page.rows {
-        assert!(
-            matches!(
-                row.state,
-                DeliveryStateV1::Acknowledged | DeliveryStateV1::DuplicateAcknowledged
-            ),
+        let expected_terminal = if refused.contains(&row.source_sequence.0) {
+            DeliveryStateV1::Rejected
+        } else if row.state == DeliveryStateV1::DuplicateAcknowledged {
+            DeliveryStateV1::DuplicateAcknowledged
+        } else {
+            DeliveryStateV1::Acknowledged
+        };
+        assert_eq!(
+            row.state, expected_terminal,
             "{label}: sequence {} settled {:?}",
-            row.source_sequence.0,
-            row.state
+            row.source_sequence.0, row.state
         );
         let receipts = store.receipts_for(&row.observation_id)?;
         let refusals = store.attempt_refusals_for(&row.observation_id)?;
@@ -1455,7 +1790,7 @@ fn a_lost_acknowledgement_recovers_as_a_duplicate_receipt_not_a_second_effect() 
     let ledger = ProviderLedgerV1::new(paths.ledger.clone());
     assert_eq!(ledger.effects()?.len(), 1, "the provider did commit");
     assert!(
-        !all_acknowledged(&paths.journal, 1)?,
+        !all_rows_reached(&paths.journal, 1, is_acknowledged)?,
         "the host must not believe a delivery it never heard about"
     );
 
@@ -1559,6 +1894,7 @@ fn a_rolled_back_source_is_never_journalled_delivered_or_skipped() -> TestResult
         hooks: &hooks,
         now: T0,
         received: AtomicU32::new(0),
+        refused: BTreeSet::new(),
     };
     let delivery = DeliveryRuntimeV1::new(&store, &provider, &wake);
     delivery.drain(
@@ -1665,5 +2001,614 @@ fn repeated_crashes_never_double_apply_and_never_lose_the_stream() -> TestResult
         // and every attempt number either journey spent has a durable record.
         assert_journey_invariants(&paths, &label)?;
     }
+    Ok(())
+}
+
+// ------------------------------------------------------------ seeded fuzzer --
+//
+// tdmem-5lc. The tests above kill one named boundary at a time on a fixed
+// stream. This driver picks the boundary, the position, the number of deaths,
+// and whether the provider refuses a position, from a seed — and then proves
+// the same four invariants over whatever shape it produced.
+//
+// Determinism is not decoration here: the only useful crash-fuzz failure is
+// one that reproduces. Nothing in a run consults wall-clock time, thread
+// scheduling, or the filesystem's iteration order for its decisions. The seed
+// picks from a *reachable* candidate set computed from the durable artefacts
+// on disk, so a plan can never arm a boundary this journey will not traverse —
+// and if one somehow does, `crash_at` fails with the boundary name rather than
+// degrading into a healthy run that proves nothing.
+
+/// Seeds the default run covers. Each seed spends between one and three real
+/// process kills plus in-process recovery lives; the whole window costs about
+/// fifteen seconds, which is what makes hundreds of seeds the default tier
+/// rather than an opt-in one. `TDMEM_5LC_FUZZ_SEEDS` raises it further for a
+/// soak, and lowers it — with `TDMEM_5LC_FUZZ_BASE_SEED` — to reproduce one.
+const DEFAULT_FUZZ_SEEDS: u64 = 256;
+
+/// Where the default seed window starts. Fixed forever: moving it would
+/// silently retire the coverage this tier is asserted to have.
+/// `TDMEM_5LC_FUZZ_BASE_SEED` moves it for a single reproduction.
+const FUZZ_BASE_SEED: u64 = 0x0000_5FC0_0000_0001;
+
+/// Seeds that must always run, whatever the budget is.
+///
+/// A seed lands here when it once found a defect, so the shape that found it
+/// can never fall out of the default window. It is empty while no seed has.
+const REGRESSION_SEEDS: &[u64] = &[];
+
+/// Kills at a delivery boundary this driver will spend on one journey.
+///
+/// Every lease claim consumes an attempt and the fixture policy allows three,
+/// so two lost attempts still leave one for the delivery that has to succeed.
+/// A third would terminalize the row as `exhausted`, which is the policy doing
+/// its job rather than a crash-safety defect, so the plan does not create it.
+const MAX_DELIVERY_KILLS: usize = 2;
+
+fn fuzz_seed_budget() -> Result<u64, Box<dyn Error>> {
+    match std::env::var("TDMEM_5LC_FUZZ_SEEDS") {
+        Ok(value) => Ok(value.parse::<u64>()?),
+        Err(_) => Ok(DEFAULT_FUZZ_SEEDS),
+    }
+}
+
+/// The first seed of the window. Overridable so the reproduction a failure
+/// prints is one that can actually be run.
+fn fuzz_base_seed() -> Result<u64, Box<dyn Error>> {
+    match std::env::var("TDMEM_5LC_FUZZ_BASE_SEED") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            let parsed = match trimmed.strip_prefix("0x") {
+                Some(hexadecimal) => u64::from_str_radix(hexadecimal, 16)?,
+                None => trimmed.parse::<u64>()?,
+            };
+            Ok(parsed)
+        }
+        Err(_) => Ok(FUZZ_BASE_SEED),
+    }
+}
+
+/// Deterministic 64-bit stream (splitmix64).
+///
+/// Dependency-free and identical on every platform and every run, which is the
+/// whole reason a failing seed is a reproduction rather than an anecdote.
+struct SeedStreamV1(u64);
+
+impl SeedStreamV1 {
+    const fn from_seed(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut mixed = self.0;
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        mixed ^ (mixed >> 31)
+    }
+
+    /// A value in `0..bound`. `bound` is always a small positive constant here.
+    fn below(&mut self, bound: usize) -> Result<usize, Box<dyn Error>> {
+        if bound == 0 {
+            return Err(harness("the fuzz plan asked for a choice with no options").into());
+        }
+        Ok(usize::try_from(self.next() % bound as u64)?)
+    }
+}
+
+/// One seed's whole assignment.
+struct FuzzPlanV1 {
+    /// Canonical positions the host settles before the pipeline runs.
+    committed: Vec<u64>,
+    /// Real process deaths this journey suffers before recovery is allowed to
+    /// finish.
+    lives: usize,
+    /// Positions the provider refuses permanently.
+    refused: BTreeSet<u64>,
+}
+
+impl FuzzPlanV1 {
+    fn from_seed(seed: u64) -> Result<Self, Box<dyn Error>> {
+        let mut stream = SeedStreamV1::from_seed(seed);
+        let count = 2 + stream.below(3)?;
+        let committed: Vec<u64> = (1..=u64::try_from(count)?).collect();
+        let lives = 1 + stream.below(3)?;
+        // One seed in three gives the provider a position it refuses forever.
+        let refused = if stream.below(3)? == 0 {
+            let position = stream.below(committed.len())?;
+            BTreeSet::from([committed[position]])
+        } else {
+            BTreeSet::new()
+        };
+        Ok(Self {
+            committed,
+            lives,
+            refused,
+        })
+    }
+}
+
+/// A boundary that this journey, in the durable state it is actually in, will
+/// traverse in its next life.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KillPointV1 {
+    hook: HookPointV1,
+    sequence: u64,
+}
+
+/// Every boundary the next life will really cross, derived from the three
+/// durable artefacts rather than from what the plan wishes were true.
+///
+/// This is what keeps the fuzzer honest. An append boundary only exists for a
+/// position the outbox has not written yet; a delivery boundary only for a row
+/// that is not already terminal; and the "provider committed, answer lost"
+/// boundary only where the provider has not already committed that effect,
+/// because a redelivery of an effect it holds takes the duplicate path and
+/// never reaches the hook at all.
+fn reachable_kill_points(
+    paths: &JourneyPathsV1,
+    plan: &FuzzPlanV1,
+) -> Result<Vec<KillPointV1>, Box<dyn Error>> {
+    let page = inspect_all(&paths.journal)?;
+    let rows: Vec<(u64, DeliveryStateV1)> = page
+        .rows
+        .iter()
+        .map(|row| (row.source_sequence.0, row.state))
+        .collect();
+    let effects: BTreeSet<String> = ProviderLedgerV1::new(paths.ledger.clone())
+        .effects()?
+        .into_iter()
+        .collect();
+
+    let mut points = Vec::new();
+    for sequence in &plan.committed {
+        let sequence = *sequence;
+        let state = rows
+            .iter()
+            .find(|(position, _)| *position == sequence)
+            .map(|(_, state)| *state);
+        match state {
+            None => {
+                // Not in the outbox yet, so both append boundaries are ahead.
+                points.push(KillPointV1 {
+                    hook: HookPointV1::BeforeOutboxWrite,
+                    sequence,
+                });
+                points.push(KillPointV1 {
+                    hook: HookPointV1::AfterOutboxWriteBeforeEnqueue,
+                    sequence,
+                });
+            }
+            Some(state) if is_settled(state) => continue,
+            Some(_) => {}
+        }
+        // Ingress runs before dispatch in every life, so a position that is
+        // missing from the outbox still reaches the delivery boundaries.
+        points.push(KillPointV1 {
+            hook: HookPointV1::BeforeProviderReceive,
+            sequence,
+        });
+        let key = Builder::at_sequence(sequence)
+            .build()?
+            .idempotency_key
+            .as_str()
+            .to_owned();
+        if !plan.refused.contains(&sequence) && !effects.contains(&key) {
+            points.push(KillPointV1 {
+                hook: HookPointV1::AfterProviderCommitBeforeAckReturn,
+                sequence,
+            });
+        }
+        points.push(KillPointV1 {
+            hook: HookPointV1::AfterAckReturnBeforeAckPersist,
+            sequence,
+        });
+        points.push(KillPointV1 {
+            hook: HookPointV1::AfterAckPersist,
+            sequence,
+        });
+    }
+    Ok(points)
+}
+
+/// AC2 — the durable replay watermark never runs ahead of the journal's own
+/// record of responsibility.
+///
+/// Two positions are called a watermark in this journey and only one of them is
+/// a cursor. The ingress cursor says how far the canonical stream has been
+/// *taken responsibility for*, and the outbox exists precisely so that
+/// responsibility can outlive the provider acknowledgement — so the honest
+/// claim is not "the cursor never passes an unacknowledged row" but "the cursor
+/// never passes a position with no durable record behind it". A cursor that
+/// moved without a row is the shape in which a committed observation is lost
+/// forever, because nothing will ever replay it again.
+///
+/// The provider-facing position is the row's own state, and that is what AC1,
+/// AC3 and AC4 check: no acknowledgement is ever recorded for content the
+/// provider did not answer for.
+///
+/// This runs after *every* life, crashed ones included, so it is checked in the
+/// mid-flight states where it can actually be violated.
+fn assert_watermark_holds(paths: &JourneyPathsV1, label: &str) -> Result<(), Box<dyn Error>> {
+    let store = journal(&paths.journal)?;
+    let page = inspect_all(&paths.journal)?;
+    let journalled: BTreeSet<u64> = page.rows.iter().map(|row| row.source_sequence.0).collect();
+    let mut settled = CanonicalStreamV1::new(paths.canonical.clone()).committed()?;
+    settled.sort_unstable();
+
+    let cursor: Option<ReplayCursorV1> = store.replay_cursor(&stream_key(CANONICAL_STREAM)?)?;
+    let Some(cursor) = cursor else {
+        assert!(
+            journalled.is_empty(),
+            "{label}: {} rows are journalled with no replay cursor behind them",
+            journalled.len()
+        );
+        return Ok(());
+    };
+
+    let watermark = cursor.last_admitted_sequence.0;
+    assert_eq!(
+        cursor.last_disposition,
+        ReplayDispositionV1::Admitted,
+        "{label}: nothing in this journey is withheld, so the cursor must name an admitted \
+         position"
+    );
+    assert!(
+        settled.contains(&watermark),
+        "{label}: the cursor stands at {watermark}, which the canonical store never settled"
+    );
+    assert_eq!(
+        cursor.last_source_event_id,
+        format!("event-{watermark}"),
+        "{label}: the cursor names another event at its own position"
+    );
+    // The load-bearing claim: everything at or before the watermark has a
+    // durable journal row. If the cursor could move first, the position it
+    // skipped would never be replayed again and the commit behind it would be
+    // gone with no trace anywhere.
+    for sequence in settled.iter().copied().filter(|s| *s <= watermark) {
+        assert!(
+            journalled.contains(&sequence),
+            "{label}: the cursor advanced to {watermark} past sequence {sequence}, which has no \
+             journal row: the commit is lost"
+        );
+    }
+    assert!(
+        journalled.iter().all(|sequence| *sequence <= watermark),
+        "{label}: a journal row exists past the cursor at {watermark}, so a restart would \
+         re-admit it"
+    );
+    Ok(())
+}
+
+/// AC2, provider side — the durable **acknowledgement** watermark is exactly
+/// the last sequence a provider acknowledgement was persisted for.
+///
+/// This is the position the recovery gate compares a provider's own reported
+/// replay position against, so it is the one the acceptance criterion means by
+/// "the watermark equals the last durably acknowledged sequence". It is written
+/// inside the acknowledging receipt's own transaction, which is the property
+/// under test here: after a kill there is never a watermark whose receipt is
+/// missing, and never an acknowledging receipt whose watermark did not move.
+///
+/// Two things are asserted together, both after every killed life and after
+/// recovery:
+///
+/// * the watermark **equals** the highest sequence carrying a durable
+///   acknowledging receipt — a watermark that ran ahead of receipt persistence
+///   would let a restart skip redelivery of a commit the provider never
+///   answered for, and a watermark that lagged would redeliver an effect the
+///   provider already holds;
+/// * the watermark **names** a sequence that is acknowledged, so it can never
+///   stand on a row with no receipt at all.
+///
+/// What is deliberately *not* asserted mid-flight is "no row below the
+/// watermark lacks a receipt". Delivery is per-row: a position whose attempt
+/// failed transiently goes back to `pending` behind a retry delay while a later
+/// position acknowledges, so a lower unacknowledged row below the watermark is
+/// correct behaviour, not loss. The claim that nothing below the watermark is
+/// abandoned is proved after convergence instead, by
+/// [`assert_journey_invariants_with`], which requires every settled position to
+/// end acknowledged or terminally refused.
+fn assert_acknowledged_watermark(
+    paths: &JourneyPathsV1,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    let store = journal(&paths.journal)?;
+    let page = inspect_all(&paths.journal)?;
+
+    let mut acknowledged: BTreeSet<u64> = BTreeSet::new();
+    for row in &page.rows {
+        let receipts = store.receipts_for(&row.observation_id)?;
+        let settled = receipts.iter().any(|receipt| {
+            matches!(
+                receipt.implied_state(),
+                DeliveryStateV1::Acknowledged | DeliveryStateV1::DuplicateAcknowledged
+            )
+        });
+        if settled {
+            acknowledged.insert(row.source_sequence.0);
+        }
+    }
+
+    let target = RecoveryTargetKeyV1 {
+        provider_id: PROVIDER.to_owned(),
+        registration_revision: REGISTRATION_REVISION,
+        stream: stream_key(CANONICAL_STREAM)?,
+    };
+    let watermark = store
+        .recovery_state(
+            &target,
+            RecoveryTimeBudgetV1 {
+                remaining_micros: MINUTE,
+            },
+        )?
+        .and_then(|state| state.acknowledged)
+        .map(|position| position.sequence.0);
+
+    match (watermark, acknowledged.iter().next_back().copied()) {
+        (None, None) => Ok(()),
+        (None, Some(highest)) => Err(harness(format!(
+            "{label}: sequence {highest} carries a durable acknowledgement receipt with no \
+             acknowledged watermark behind it, so a restart would redeliver an effect the \
+             provider already holds"
+        ))
+        .into()),
+        (Some(watermark), None) => Err(harness(format!(
+            "{label}: the acknowledged watermark stands at {watermark} with no acknowledging \
+             receipt anywhere, so it passed a record nothing answered for"
+        ))
+        .into()),
+        (Some(watermark), Some(highest)) => {
+            if watermark != highest {
+                return Err(harness(format!(
+                    "{label}: the acknowledged watermark is {watermark} but the highest durably \
+                     acknowledged sequence is {highest}"
+                ))
+                .into());
+            }
+            if !acknowledged.contains(&watermark) {
+                return Err(harness(format!(
+                    "{label}: the acknowledged watermark stands on sequence {watermark}, which \
+                     carries no acknowledging receipt"
+                ))
+                .into());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// AC5 — a permanent provider refusal is terminal and stays terminal.
+///
+/// The refusal is checked twice over: the durable state is what a refusal
+/// should leave behind, and then one more full life runs against the same
+/// artefacts and is required to change nothing. A row that a later life picks
+/// up again would burn attempts, and — for a provider whose refusal is a
+/// contract judgement rather than a fault — would keep asking a question that
+/// has already been answered.
+fn assert_refusals_stay_terminal(
+    paths: &JourneyPathsV1,
+    plan: &FuzzPlanV1,
+    now: i64,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    if plan.refused.is_empty() {
+        return Ok(());
+    }
+    let store = journal(&paths.journal)?;
+    let ledger = ProviderLedgerV1::new(paths.ledger.clone());
+    let before = inspect_all(&paths.journal)?;
+    let mut expected = Vec::new();
+    for row in &before.rows {
+        if !plan.refused.contains(&row.source_sequence.0) {
+            continue;
+        }
+        assert_eq!(
+            row.state,
+            DeliveryStateV1::Rejected,
+            "{label}: a permanently refused position settled {:?}",
+            row.state
+        );
+        let receipts = store.receipts_for(&row.observation_id)?;
+        let last = receipts
+            .iter()
+            .max_by_key(|receipt| receipt.attempt_number)
+            .ok_or_else(|| harness(format!("{label}: a rejected row carries no receipt")))?;
+        assert_eq!(
+            last.outcome,
+            ObservationOutcomeV1::RejectedContractViolation,
+            "{label}: the refusal was not recorded as the refusal the provider gave"
+        );
+        assert!(
+            !last.outcome.is_retryable(),
+            "{label}: a refusal recorded as retryable is not terminal"
+        );
+        let key = row.idempotency_key.as_str().to_owned();
+        assert!(
+            !ledger.effects()?.iter().any(|line| line == &key),
+            "{label}: the provider committed an effect for a position it refused"
+        );
+        expected.push((row.source_sequence.0, row.attempt_number, receipts.len()));
+    }
+    assert!(
+        !expected.is_empty(),
+        "{label}: the plan refused a position that never reached the journal"
+    );
+
+    // One more complete life over the same three artefacts.
+    live(
+        paths,
+        now.saturating_add(LEASE + MINUTE),
+        &HooksV1::disarmed(),
+    )?;
+
+    let after = inspect_all(&paths.journal)?;
+    for (sequence, attempts, receipts) in expected {
+        let row = after
+            .rows
+            .iter()
+            .find(|row| row.source_sequence.0 == sequence)
+            .ok_or_else(|| harness(format!("{label}: the refused row vanished")))?;
+        assert_eq!(
+            (row.state, row.attempt_number),
+            (DeliveryStateV1::Rejected, attempts),
+            "{label}: a later life redelivered a permanently refused position"
+        );
+        assert_eq!(
+            store.receipts_for(&row.observation_id)?.len(),
+            receipts,
+            "{label}: a later life produced another receipt for a refused position"
+        );
+    }
+    Ok(())
+}
+
+/// What one seed exercised, so the tier can prove it is not vacuous.
+#[derive(Default)]
+struct FuzzCoverageV1 {
+    hooks: BTreeSet<&'static str>,
+    kills: usize,
+    multi_life_seeds: usize,
+    refusal_seeds: usize,
+}
+
+impl FuzzCoverageV1 {
+    fn absorb(&mut self, other: &Self) {
+        self.hooks.extend(other.hooks.iter().copied());
+        self.kills += other.kills;
+        self.multi_life_seeds += other.multi_life_seeds;
+        self.refusal_seeds += other.refusal_seeds;
+    }
+}
+
+/// Runs one seed end to end and asserts every invariant it can.
+fn run_fuzz_seed(seed: u64) -> Result<FuzzCoverageV1, Box<dyn Error>> {
+    let plan = FuzzPlanV1::from_seed(seed)?;
+    let label = format!("seed-{seed:#018x}");
+    let directory = tempfile::tempdir()?;
+    let paths = JourneyPathsV1::in_directory(directory.path());
+    ProviderRefusalPolicyV1::new(paths.refusals.clone()).write(&plan.refused)?;
+
+    let mut coverage = FuzzCoverageV1 {
+        multi_life_seeds: usize::from(plan.lives > 1),
+        refusal_seeds: usize::from(!plan.refused.is_empty()),
+        ..FuzzCoverageV1::default()
+    };
+    let mut now = T0;
+    let mut delivery_kills = 0_usize;
+    let mut stream = SeedStreamV1::from_seed(seed ^ 0xA5A5_5A5A_A5A5_5A5A);
+
+    for life in 0..plan.lives {
+        let mut candidates = reachable_kill_points(&paths, &plan)?;
+        if delivery_kills >= MAX_DELIVERY_KILLS {
+            candidates.retain(|point| {
+                matches!(
+                    point.hook,
+                    HookPointV1::BeforeOutboxWrite | HookPointV1::AfterOutboxWriteBeforeEnqueue
+                )
+            });
+        }
+        if candidates.is_empty() {
+            // Every position this plan can still be killed at is spent. That is
+            // a shorter journey, not a skipped assertion: the invariants below
+            // still run over whatever the deaths so far produced.
+            break;
+        }
+        let choice = candidates[stream.below(candidates.len())?];
+        if !matches!(
+            choice.hook,
+            HookPointV1::BeforeOutboxWrite | HookPointV1::AfterOutboxWriteBeforeEnqueue
+        ) {
+            delivery_kills += 1;
+        }
+        crash_at(&ChildLifeSpecV1 {
+            directory: directory.path().to_path_buf(),
+            hook: choice.hook,
+            target_sequence: choice.sequence,
+            now,
+            settle: plan.committed.clone(),
+        })
+        .map_err(|error| {
+            harness(format!(
+                "{label} life {life} at {} sequence {}: {error}",
+                choice.hook.as_wire(),
+                choice.sequence
+            ))
+        })?;
+        coverage.hooks.insert(choice.hook.as_wire());
+        coverage.kills += 1;
+        // Both watermarks, checked in the mid-flight state where either one
+        // running ahead of its own durable evidence would still be visible.
+        assert_watermark_holds(&paths, &label)?;
+        assert_acknowledged_watermark(&paths, &label)?;
+        now = now.saturating_add(LEASE + MINUTE);
+    }
+
+    let last = recover_until_settled(&paths, now)?;
+    assert_watermark_holds(&paths, &label)?;
+    assert_acknowledged_watermark(&paths, &label)?;
+    assert_journey_invariants_with(&paths, &label, &plan.refused)?;
+    assert_refusals_stay_terminal(&paths, &plan, last, &label)?;
+    Ok(coverage)
+}
+
+/// Acceptance (tdmem-5lc): across a seeded window of randomized crash plans,
+/// no committed observation is lost, no provider effect is applied twice, the
+/// durable watermark never runs ahead of the journal, and a permanent refusal
+/// stays terminal.
+///
+/// The window is fixed and the plans are derived from it, so a failure names a
+/// seed that reproduces the whole journey exactly — process kills included.
+#[test]
+fn seeded_crash_restart_fuzzing_holds_every_invariant() -> TestResult {
+    let budget = fuzz_seed_budget()?;
+    let base = fuzz_base_seed()?;
+    let single = base != FUZZ_BASE_SEED;
+    let mut total = FuzzCoverageV1::default();
+    let seeds = REGRESSION_SEEDS
+        .iter()
+        .copied()
+        .chain((0..budget).map(|offset| base.wrapping_add(offset)));
+    let mut count = 0_usize;
+    for seed in seeds {
+        let coverage = run_fuzz_seed(seed).map_err(|error| {
+            harness(format!(
+                "seed {seed:#018x} failed; reproduce it alone with TDMEM_5LC_FUZZ_SEEDS=1 \
+                 TDMEM_5LC_FUZZ_BASE_SEED={seed:#018x}: {error}"
+            ))
+        })?;
+        total.absorb(&coverage);
+        count += 1;
+    }
+
+    // A green run over a window that never killed anything interesting would
+    // prove nothing, so the tier states what it must have covered. A single
+    // seed reproduction is exempt: it is reproducing one shape on purpose.
+    assert!(count > 0, "the seed window ran nothing");
+    if single {
+        return Ok(());
+    }
+    assert!(
+        total.kills >= count,
+        "the window spent {} kills across {count} seeds",
+        total.kills
+    );
+    let covered: Vec<&str> = total.hooks.iter().copied().collect();
+    for hook in HookPointV1::ALL {
+        assert!(
+            total.hooks.contains(hook.as_wire()),
+            "the seed window never killed at {}: covered {covered:?}",
+            hook.as_wire()
+        );
+    }
+    assert!(
+        total.multi_life_seeds > 0,
+        "the seed window never ran a journey that died more than once"
+    );
+    assert!(
+        total.refusal_seeds > 0,
+        "the seed window never gave the provider a position to refuse"
+    );
     Ok(())
 }
