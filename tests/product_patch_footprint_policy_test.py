@@ -206,9 +206,9 @@ class PatchFootprintPolicyTest(unittest.TestCase):
 
     def test_budget_cannot_be_silently_loosened(self) -> None:
         policy = copy.deepcopy(self.policy)
-        policy["initial_budget"]["max_total_upstream_changed_lines"] = 3301
+        policy["initial_budget"]["max_total_upstream_changed_lines"] = 3501
         self.assert_rejected(
-            "initial_budget.max_total_upstream_changed_lines must be 3300",
+            "initial_budget.max_total_upstream_changed_lines must be 3500",
             policy=policy,
         )
 
@@ -1750,6 +1750,153 @@ class PatchFootprintPolicyTest(unittest.TestCase):
         self.assert_rejected(
             f"duplicate convergence-map path {entry['path']!r}",
             convergence_map=convergence_map,
+        )
+
+    def touch_point(self, policy: dict[str, Any], touch_id: str) -> dict[str, Any]:
+        return next(
+            row for row in policy["allowed_touch_points"] if row["id"] == touch_id
+        )
+
+    def cap_revision_adr_errors(self, document: str) -> list[str]:
+        approval = CHECKER_MODULE.REVISED_TOUCH_POINT_CAPS["daemon_shutdown_deadline"]
+        approved = CHECKER_MODULE.EXPECTED_TOUCH_POINT_CAPS["daemon_shutdown_deadline"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            target = repo / approval["adr"]
+            target.parent.mkdir(parents=True)
+            target.write_text(document, encoding="utf-8")
+            errors: list[str] = []
+            CHECKER_MODULE.validate_cap_revision_adr(
+                repo,
+                approval["adr"],
+                "daemon_shutdown_deadline.cap_revision",
+                "daemon_shutdown_deadline",
+                approval,
+                approved,
+                {"measured_files": 6, "measured_changed_lines": 308},
+                errors,
+            )
+        return errors
+
+    def test_touch_point_cap_cannot_be_raised_in_the_policy_alone(self) -> None:
+        for cap, raised, message in (
+            ("max_files", 7, "daemon_shutdown_deadline.max_files must be 6"),
+            (
+                "max_changed_lines",
+                400,
+                "daemon_shutdown_deadline.max_changed_lines must be 320",
+            ),
+        ):
+            with self.subTest(cap=cap):
+                policy = copy.deepcopy(self.policy)
+                self.touch_point(policy, "daemon_shutdown_deadline")[cap] = raised
+                self.assert_rejected(message, policy=policy)
+
+    def test_revised_touch_point_cap_must_bind_its_approving_adr(self) -> None:
+        policy = copy.deepcopy(self.policy)
+        self.touch_point(policy, "daemon_shutdown_deadline").pop("cap_revision")
+        self.assert_rejected(
+            "daemon_shutdown_deadline.cap_revision must be an object "
+            "naming the approving ADR",
+            policy=policy,
+        )
+
+        policy = copy.deepcopy(self.policy)
+        self.touch_point(policy, "daemon_shutdown_deadline")["cap_revision"][
+            "previous_max_changed_lines"
+        ] = 320
+        self.assert_rejected(
+            "daemon_shutdown_deadline.cap_revision.previous_max_changed_lines "
+            "must be 287",
+            policy=policy,
+        )
+
+        policy = copy.deepcopy(self.policy)
+        self.touch_point(policy, "daemon_shutdown_deadline")["cap_revision"]["adr"] = (
+            "product/architecture/adr/ADR-0011-patch-footprint-revision-v2.md"
+        )
+        self.assert_rejected(
+            "ADR must contain exactly one '## Touch-point cap revision' section",
+            policy=policy,
+        )
+
+    def test_unapproved_touch_point_cannot_declare_a_cap_revision(self) -> None:
+        policy = copy.deepcopy(self.policy)
+        approved = self.touch_point(policy, "daemon_shutdown_deadline")["cap_revision"]
+        self.touch_point(policy, "workspace_wiring")["cap_revision"] = copy.deepcopy(
+            approved
+        )
+        self.assert_rejected(
+            "workspace_wiring declares a cap_revision without an "
+            "ADR-approved cap increase",
+            policy=policy,
+        )
+
+    def test_cap_headroom_stays_within_the_recorded_measurement(self) -> None:
+        policy = copy.deepcopy(self.policy)
+        self.touch_point(policy, "daemon_shutdown_deadline")["cap_revision"][
+            "measured_changed_lines"
+        ] = 200
+        self.assert_rejected(
+            "daemon_shutdown_deadline cap 320 exceeds its measurement 200 by more "
+            "than the ~15% headroom ADR-0011 allows",
+            policy=policy,
+        )
+
+    def test_cap_revision_adr_must_bind_and_grant_the_exact_numbers(self) -> None:
+        faithful = textwrap.dedent(
+            """\
+            # ADR-0013: Cap revision
+
+            ## Touch-point cap revision
+
+            - Touch point: `daemon_shutdown_deadline`
+            - Previous max files: `5`
+            - Previous max changed lines: `287`
+            - Approved max files: `6`
+            - Approved max changed lines: `320`
+            - Measured files: `6`
+            - Measured changed lines: `308`
+            - Policy revision: `patch-footprint.v3`
+
+            ## Decision
+
+            We approve the daemon_shutdown_deadline touch point at six files and
+            320 changed lines so the lease registry can retire its own tasks.
+            """
+        )
+        self.assertEqual(self.cap_revision_adr_errors(faithful), [])
+
+        overstated = faithful.replace(
+            "Approved max changed lines: `320`",
+            "Approved max changed lines: `900`",
+        )
+        self.assertIn(
+            "daemon_shutdown_deadline.cap_revision ADR approved max changed lines "
+            "binding must be exactly '320'",
+            self.cap_revision_adr_errors(overstated),
+        )
+
+        stale_measurement = faithful.replace(
+            "Measured changed lines: `308`",
+            "Measured changed lines: `120`",
+        )
+        self.assertIn(
+            "daemon_shutdown_deadline.cap_revision ADR measured changed lines "
+            "binding must be exactly '308'",
+            self.cap_revision_adr_errors(stale_measurement),
+        )
+
+        merely_discussed = faithful.replace(
+            "We approve the daemon_shutdown_deadline touch point at six files and\n"
+            "320 changed lines so the lease registry can retire its own tasks.",
+            "The daemon_shutdown_deadline touch point would need six files if the\n"
+            "lease registry were to retire its own tasks under the deadline.",
+        )
+        self.assertIn(
+            "daemon_shutdown_deadline.cap_revision ADR decision must explicitly "
+            "and affirmatively approve the daemon_shutdown_deadline cap increase",
+            self.cap_revision_adr_errors(merely_discussed),
         )
 
     def test_exception_zone_cannot_drop_adr_requirement(self) -> None:

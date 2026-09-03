@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 EXPECTED_FLOOR = "5749e4fcfe268e17bd19a0e6ef90c646f7b37289"
-EXPECTED_POLICY_REVISION = "patch-footprint.v2"
+EXPECTED_POLICY_REVISION = "patch-footprint.v3"
 EXPECTED_CONVERGENCE_SCHEMA = "product/upstream/convergence-map.schema.json"
 EXPECTED_CONVERGENCE_SCHEMA_VERSION = 2
 EXPECTED_CLASSIFICATION_PRECEDENCE = [
@@ -29,24 +29,28 @@ EXPECTED_ENTRY_RULES = [
     "Retired rows preserve history without granting current execution authority.",
 ]
 BEAD_ID_RE = re.compile(r"^tdmem-[0-9]{4}$")
-# Revision patch-footprint.v2 (ADR-0011): each cap is the M4 journey mount,
-# M5 recall port, Native configuration, and session-sync scope footprint
-# measured at that revision's tree plus at most ~15% headroom. Per-entry
-# line budgets in the convergence map remain the binding per-file limit.
+# Revision patch-footprint.v3 (ADR-0014) carries the v2 rule forward: each cap
+# is the footprint measured at the revision tree plus at most ~15% headroom.
+# v2 (ADR-0011) sized the M4 journey mount, M5 recall port, Native
+# configuration, and session-sync scope; v3 adds the Claude Code host hook
+# ingest journey, which measures 37 upstream production files and 3393 total
+# upstream changed lines. Per-entry line budgets in the convergence map remain
+# the binding per-file limit.
 EXPECTED_BUDGET = {
-    "max_upstream_existing_production_files": 34,
+    "max_upstream_existing_production_files": 37,
     "max_upstream_existing_test_or_fixture_files": 9,
-    "max_total_upstream_changed_lines": 3300,
+    "max_total_upstream_changed_lines": 3500,
     "max_changed_lines_per_upstream_file": 560,
     "max_composition_root_files": 15,
     # 15 covers the daemon composition mount once the observation journey,
     # cognitive recall, and Native configuration seams are live; every other
     # category stays tighter through its local max_files, which binds via min().
     "max_allowed_touch_point_files_per_category": 15,
-    # Revision v2 raises this from zero to exactly the two additive
-    # configuration-registry files approved by ADR-0012; the per-ADR cap of 2
-    # keeps that ADR from being stretched to a third file.
-    "default_max_exception_zone_files": 2,
+    # Revision v2 raised this from zero to exactly the two additive
+    # configuration-registry files approved by ADR-0012; revision v3 raises it
+    # to four for the two host-adapter hook files approved by ADR-0014. The
+    # per-ADR cap of 2 keeps either ADR from being stretched to a third file.
+    "default_max_exception_zone_files": 4,
     "max_exception_files_per_adr": 2,
     "max_workspace_manifest_files": 2,
     "manual_generated_file_edits": 0,
@@ -72,12 +76,15 @@ EXPECTED_PRODUCT_PATTERNS = {
     "crates/tracedecay-memory-evaluation/**",
     "crates/tracedecay/tests/product_memory_provider/**",
     "crates/tracedecay/tests/product_memory_provider_*.rs",
+    "crates/tracedecay-cli/tests/product_memory_provider_*.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs",
     "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs",
+    "crates/tracedecay/src/daemon/retained_owner/claude_host_journey_tests.rs",
+    "crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/crash_restart_fuzz.rs",
     "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs",
 }
 EXPECTED_ADMINISTRATIVE_EXCLUSIONS = {".codex/**"}
@@ -93,7 +100,54 @@ EXPECTED_TOUCH_POINTS = {
     "recall_context_mount",
     "post_settlement_feedback_mount",
     "configuration_registry_mount",
+    "host_hook_ingest",
 }
+# Touch-point-local caps are the tight per-seam limit behind the ADR-0011
+# aggregate caps, so they are pinned here too: a category cannot widen its own
+# reach by editing the policy alone. ADR-0011 invariant 2 ("a cap increase is
+# approved by ADR before the change that needs it, and is never bundled into
+# the change that exceeds the previous cap") binds these caps as well.
+EXPECTED_TOUCH_POINT_CAPS = {
+    "workspace_wiring": (2, 140),
+    "application_contract_mount": (3, 220),
+    "cognitive_recall_contract": (4, 940),
+    "daemon_composition_mount": (15, 810),
+    "daemon_shutdown_deadline": (6, 320),
+    "production_harness_shutdown": (1, 62),
+    "integration_test_runtime_isolation": (3, 240),
+    "normalized_observation_mount": (2, 160),
+    "recall_context_mount": (5, 340),
+    "post_settlement_feedback_mount": (2, 160),
+    "configuration_registry_mount": (5, 540),
+    "host_hook_ingest": (3, 200),
+}
+# Categories whose local caps were revised above the value this policy revision
+# shipped with, and the ADR that approved the exact numbers pinned above. A
+# revised category must carry a matching `cap_revision` block; a category with
+# no approved revision must not carry one.
+REVISED_TOUCH_POINT_CAPS = {
+    "daemon_shutdown_deadline": {
+        "adr": (
+            "product/architecture/adr/"
+            "ADR-0013-daemon-shutdown-touch-point-expansion.md"
+        ),
+        "previous_max_files": 5,
+        "previous_max_changed_lines": 287,
+    },
+}
+EXPECTED_CAP_REVISION_FIELDS = {
+    "adr",
+    "measured_changed_lines",
+    "measured_files",
+    "policy_revision",
+    "previous_max_changed_lines",
+    "previous_max_files",
+}
+# ADR-0011 invariant 1: a cap is the measurement it was derived from plus at
+# most roughly fifteen percent headroom, expressed as integers so the check
+# never depends on float rounding.
+CAP_HEADROOM_NUMERATOR = 115
+CAP_HEADROOM_DENOMINATOR = 100
 EXPECTED_EXCEPTION_ZONES = {
     "native_database_internals",
     "code_index_internals",
@@ -658,8 +712,187 @@ def validate_floor(
     return str(floor)
 
 
+def is_affirmative_cap_decision(value: str, touch_id: str) -> bool:
+    """Require a cap ADR to grant, rather than merely discuss, the exact category."""
+    normalized = " ".join(value.split())
+    if touch_id not in normalized:
+        return False
+    return (
+        re.search(
+            r"(?:^|[.!?;:]\s+)(?:we\s+)?(?:hereby\s+)?"
+            r"(?:approve|authorize|permit|allow)\b",
+            normalized.casefold(),
+        )
+        is not None
+    )
+
+
+def validate_cap_revision_adr(
+    repo: Path,
+    adr: str,
+    label: str,
+    touch_id: str,
+    approval: dict[str, Any],
+    approved: tuple[int, int],
+    measurements: dict[str, int],
+    errors: list[str],
+) -> None:
+    """Require the approving ADR to bind this category's exact numbers."""
+    raw_path = Path(adr)
+    repo_root = repo.resolve()
+    adr_root = (repo / "product/architecture/adr").resolve()
+    if (
+        raw_path.is_absolute()
+        or ".." in raw_path.parts
+        or raw_path.suffix != ".md"
+        or not adr.startswith("product/architecture/adr/")
+    ):
+        errors.append(
+            f"{label} ADR must be an exact path under product/architecture/adr: {adr}"
+        )
+        return
+    try:
+        adr_root.relative_to(repo_root)
+    except ValueError:
+        errors.append(f"{label} ADR directory resolves outside the repository: {adr}")
+        return
+    resolved = (repo / raw_path).resolve()
+    try:
+        resolved.relative_to(adr_root)
+    except ValueError:
+        errors.append(f"{label} ADR resolves outside product/architecture/adr: {adr}")
+        return
+    if not resolved.is_file():
+        errors.append(f"{label} ADR is missing: {adr}")
+        return
+    try:
+        document = resolved.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        errors.append(f"{label} ADR could not be read as UTF-8: {adr}: {exc}")
+        return
+
+    sections = markdown_level_two_sections(document)
+    binding_sections = sections.get("Touch-point cap revision", [])
+    if len(binding_sections) != 1:
+        errors.append(
+            f"{label} ADR must contain exactly one "
+            "'## Touch-point cap revision' section"
+        )
+    else:
+        fields: dict[str, list[str]] = {}
+        for line in binding_sections[0]:
+            match = re.match(
+                r"^\s*[-*]\s+([A-Z][A-Za-z][A-Za-z -]*):\s+`([^`]+)`\s*$",
+                line,
+            )
+            if match is not None:
+                fields.setdefault(match.group(1), []).append(match.group(2))
+        expected_fields = {
+            "Touch point": touch_id,
+            "Previous max files": str(approval["previous_max_files"]),
+            "Previous max changed lines": str(approval["previous_max_changed_lines"]),
+            "Approved max files": str(approved[0]),
+            "Approved max changed lines": str(approved[1]),
+            "Policy revision": EXPECTED_POLICY_REVISION,
+        }
+        for field, measured_key in (
+            ("Measured files", "measured_files"),
+            ("Measured changed lines", "measured_changed_lines"),
+        ):
+            if measured_key in measurements:
+                expected_fields[field] = str(measurements[measured_key])
+        for field, expected in expected_fields.items():
+            if fields.get(field, []) != [expected]:
+                errors.append(
+                    f"{label} ADR {field.lower()} binding must be exactly {expected!r}"
+                )
+
+    decision_sections = sections.get("Decision", [])
+    if len(decision_sections) != 1:
+        errors.append(f"{label} ADR must contain exactly one '## Decision' section")
+        return
+    prose = " ".join(line.strip() for line in decision_sections[0] if line.strip())
+    if not is_substantive_prose(prose):
+        errors.append(f"{label} ADR decision must be substantive prose")
+    elif not is_affirmative_cap_decision(prose, touch_id):
+        errors.append(
+            f"{label} ADR decision must explicitly and affirmatively approve "
+            f"the {touch_id} cap increase"
+        )
+
+
+def validate_touch_point_cap_revision(
+    repo: Path,
+    touch_id: str,
+    row: dict[str, Any],
+    errors: list[str],
+) -> None:
+    """Bind a revised touch-point cap to the ADR that approved its exact numbers."""
+    label = f"{touch_id}.cap_revision"
+    approval = REVISED_TOUCH_POINT_CAPS.get(touch_id)
+    revision = row.get("cap_revision")
+    if approval is None:
+        if revision is not None:
+            errors.append(
+                f"{touch_id} declares a cap_revision without an "
+                "ADR-approved cap increase"
+            )
+        return
+    approved = EXPECTED_TOUCH_POINT_CAPS[touch_id]
+    if (
+        approved[0] <= approval["previous_max_files"]
+        and approved[1] <= approval["previous_max_changed_lines"]
+    ):
+        errors.append(f"{label} records no cap increase over the previous caps")
+    if not isinstance(revision, dict):
+        errors.append(f"{label} must be an object naming the approving ADR")
+        return
+    if set(revision) != EXPECTED_CAP_REVISION_FIELDS:
+        errors.append(
+            f"{label} fields must be exactly "
+            f"{sorted(EXPECTED_CAP_REVISION_FIELDS)}"
+        )
+        return
+    if revision.get("policy_revision") != EXPECTED_POLICY_REVISION:
+        errors.append(f"{label}.policy_revision must be {EXPECTED_POLICY_REVISION}")
+    for field in ("adr", "previous_max_files", "previous_max_changed_lines"):
+        if revision.get(field) != approval[field]:
+            errors.append(f"{label}.{field} must be {approval[field]!r}")
+    measurements: dict[str, int] = {}
+    for field, cap in (
+        ("measured_files", approved[0]),
+        ("measured_changed_lines", approved[1]),
+    ):
+        value = revision.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            errors.append(f"{label}.{field} must be a positive integer")
+            continue
+        measurements[field] = value
+        if value > cap:
+            errors.append(
+                f"{label}.{field} {value} exceeds the approved cap {cap}"
+            )
+        elif cap * CAP_HEADROOM_DENOMINATOR > value * CAP_HEADROOM_NUMERATOR:
+            errors.append(
+                f"{touch_id} cap {cap} exceeds its measurement {value} by more "
+                "than the ~15% headroom ADR-0011 allows"
+            )
+    adr = revision.get("adr")
+    if isinstance(adr, str):
+        validate_cap_revision_adr(
+            repo,
+            adr,
+            label,
+            touch_id,
+            approval,
+            approved,
+            measurements,
+            errors,
+        )
+
+
 def validate_policy_structure(
-    policy: dict[str, Any], errors: list[str]
+    repo: Path, policy: dict[str, Any], errors: list[str]
 ) -> tuple[
     dict[str, dict[str, Any]],
     dict[str, dict[str, Any]],
@@ -777,10 +1010,14 @@ def validate_policy_structure(
         paths = require_list(row.get("paths"), f"{touch_id}.paths", errors)
         if not paths or any(not isinstance(value, str) for value in paths):
             errors.append(f"{touch_id}.paths must contain strings")
-        for cap in ("max_files", "max_changed_lines"):
+        expected_caps = EXPECTED_TOUCH_POINT_CAPS.get(touch_id)
+        for index, cap in enumerate(("max_files", "max_changed_lines")):
             value = row.get(cap)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 errors.append(f"{touch_id}.{cap} must be a positive integer")
+            elif expected_caps is not None and value != expected_caps[index]:
+                errors.append(f"{touch_id}.{cap} must be {expected_caps[index]}")
+        validate_touch_point_cap_revision(repo, touch_id, row, errors)
         for field in ("allowed_changes", "forbidden_changes", "required_verification"):
             values = require_list(row.get(field), f"{touch_id}.{field}", errors)
             if not values:
@@ -2164,7 +2401,7 @@ def validate_document(
 ) -> tuple[list[str], dict[str, int], int]:
     errors: list[str] = []
     touches, zones, dependency_rules, dependency_exceptions = validate_policy_structure(
-        policy, errors
+        repo, policy, errors
     )
     entries, areas = validate_convergence_structure(convergence, errors)
     floor = validate_floor(repo, policy, convergence, errors)

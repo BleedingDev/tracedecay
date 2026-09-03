@@ -122,6 +122,14 @@
         "bound blocking drain work by the caller deadline's remaining budget",
         "report Failed for incomplete shutdown while completing terminal teardown"
       ],
+      "cap_revision": {
+        "adr": "product/architecture/adr/ADR-0013-daemon-shutdown-touch-point-expansion.md",
+        "measured_changed_lines": 308,
+        "measured_files": 6,
+        "policy_revision": "patch-footprint.v3",
+        "previous_max_changed_lines": 287,
+        "previous_max_files": 5
+      },
       "category": "shutdown",
       "forbidden_changes": [
         "creating a fresh deadline budget in a nested shutdown layer",
@@ -130,13 +138,14 @@
         "adding provider or memory integration logic"
       ],
       "id": "daemon_shutdown_deadline",
-      "max_changed_lines": 287,
-      "max_files": 5,
+      "max_changed_lines": 320,
+      "max_files": 6,
       "paths": [
         "crates/tracedecay/src/daemon/bootstrap.rs",
         "crates/tracedecay/src/daemon/engine/shutdown.rs",
         "crates/tracedecay/src/daemon/invocation_state.rs",
         "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
+        "crates/tracedecay-daemon-service/src/invocation/types.rs",
         "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs"
       ],
       "required_verification": [
@@ -306,6 +315,35 @@
       "required_verification": [
         "configuration authorization and rollback tests",
         "provider selection and no-silent-fallback tests"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "call the existing host-neutral transcript ingest route from a host lifecycle event under an explicit, bounded time budget",
+        "register an additional project-scoped transcript-capture kernel for a host that already has a profile-scoped kernel, reusing the session-sync ingest pass",
+        "declare an opt-in, default-off product test target and the feature it requires in the tracedecay-cli manifest",
+        "extend the existing host lifecycle acceptance test with repeated-install idempotence and interrupted-reinstall rollback assertions"
+      ],
+      "category": "host_hook_ingest",
+      "forbidden_changes": [
+        "naming a provider, registry, or fabric type on the hook or kernel path",
+        "letting an ingest failure, timeout, or unreachable daemon change the host's own hook answer",
+        "unbounded or unbudgeted ingest work on a host lifecycle event",
+        "minting a second admission or scope-identity path instead of reusing the host-neutral one the session-sync worker uses",
+        "turning the product test target or its feature on by default"
+      ],
+      "id": "host_hook_ingest",
+      "max_changed_lines": 200,
+      "max_files": 3,
+      "paths": [
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest/kernels.rs",
+        "crates/tracedecay-cli/Cargo.toml",
+        "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance.rs"
+      ],
+      "required_verification": [
+        "cargo test --locked -p tracedecay --features memory-provider-host hook_runtime",
+        "cargo test --locked -p tracedecay-cli --features test-transport --test host_lifecycle_cli_acceptance",
+        "python3 scripts/product/check-patch-footprint-policy.py"
       ]
     }
   ],
@@ -626,25 +664,26 @@
     }
   ],
   "initial_budget": {
-    "default_max_exception_zone_files": 2,
+    "default_max_exception_zone_files": 4,
     "manual_generated_file_edits": 0,
     "max_allowed_touch_point_files_per_category": 15,
     "max_changed_lines_per_upstream_file": 560,
     "max_composition_root_files": 15,
     "max_exception_files_per_adr": 2,
-    "max_total_upstream_changed_lines": 3300,
-    "max_upstream_existing_production_files": 34,
+    "max_total_upstream_changed_lines": 3500,
+    "max_upstream_existing_production_files": 37,
     "max_upstream_existing_test_or_fixture_files": 9,
     "max_workspace_manifest_files": 2,
     "notes": [
       "Revision patch-footprint.v2 is approved by product/architecture/adr/ADR-0011-patch-footprint-revision-v2.md: every cap equals the M4 observation-journey mount, M5 cognitive-recall port, Native configuration registration, and session-sync exact-scope footprint measured at that revision's tree plus at most roughly fifteen percent headroom. Per-entry line_budget values in the convergence map remain the binding limit for an individual file.",
+      "Revision patch-footprint.v3 is approved by product/architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md: it carries every v2 cap forward unchanged except the three the Claude Code host hook ingest journey moves - upstream existing production files 34 -> 37, total upstream changed lines 3300 -> 3500, and exception-zone files 2 -> 4 - each set from the footprint measured at this revision's tree (37 production files, 3393 total changed lines, 4 exception-zone files) plus at most roughly fifteen percent headroom.",
       "Added files under product_owned_paths are excluded from the upstream footprint totals.",
       "Renaming or copying an upstream file counts as touching the destination and source.",
       "Changed lines are additions plus deletions from git numstat against the immutable upstream floor.",
       "Cargo.lock is a generated dependency-resolution output: it may change only with a workspace-manifest touch and a focused cargo metadata/build receipt; it is not a manually editable contract."
     ]
   },
-  "policy_revision": "patch-footprint.v2",
+  "policy_revision": "patch-footprint.v3",
   "principles": [
     "Add product-owned crates and tests instead of embedding provider logic in Zack-owned crates.",
     "Mount product behavior only at narrow application, daemon-composition, observation, recall, feedback, and configuration seams.",
@@ -674,16 +713,19 @@
     "crates/tracedecay-memory-evaluation/**",
     "crates/tracedecay/tests/product_memory_provider/**",
     "crates/tracedecay/tests/product_memory_provider_*.rs",
+    "crates/tracedecay-cli/tests/product_memory_provider_*.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs",
     "crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs",
     "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs",
+    "crates/tracedecay/src/daemon/retained_owner/claude_host_journey_tests.rs",
+    "crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/crash_restart_fuzz.rs",
     "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs"
   ],
   "schema_version": 1,
-  "scope": "Pluggable-memory implementation through Native parity, NCM observer admission, the mounted observation journey (M4), cognitive recall integration (M5), and evaluation baselines (M8). Revision patch-footprint.v2 (ADR-0011) replaced the v1 caps with the footprint measured at its revision tree plus bounded headroom. Later phases must either remain inside these caps or approve a new policy revision by ADR.",
+  "scope": "Pluggable-memory implementation through Native parity, NCM observer admission, the mounted observation journey (M4), cognitive recall integration (M5), and evaluation baselines (M8). Revision patch-footprint.v2 (ADR-0011) replaced the v1 caps with the footprint measured at its revision tree plus bounded headroom, and revision patch-footprint.v3 (ADR-0014) does the same for the Claude Code host hook ingest journey, which also adds the host_hook_ingest touch point and a two-file host-adapter exception. Later phases must either remain inside these caps or approve a new policy revision by ADR.",
   "title": "TraceDecay V2 provider patch-footprint policy",
   "upstream_floor": {
     "metadata": "product/upstream/tracedecay-v2-pr707.json",

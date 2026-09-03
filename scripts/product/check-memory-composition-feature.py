@@ -128,12 +128,20 @@ NATIVE_BASELINE_TESTS_FILE = Path(
 NATIVE_STAGED_OBSERVATIONS_FILE = Path(
     "crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs"
 )
+# The Claude Code host memory journey. It is a test-only file mounted from the
+# observation journey and gated on both `test` and the feature, so it names the
+# registry only for the routed provider identity it asserts against and cannot
+# exist in a feature-off or non-test build.
+CLAUDE_HOST_JOURNEY_TESTS_FILE = Path(
+    "crates/tracedecay/src/daemon/retained_owner/claude_host_journey_tests.rs"
+)
 NATIVE_ADAPTER_FILES = (
     NATIVE_PROVIDER_FILE,
     NATIVE_PROVIDER_TESTS_FILE,
     NATIVE_PROVIDER_PARITY_TESTS_FILE,
     NATIVE_BASELINE_TESTS_FILE,
     NATIVE_STAGED_OBSERVATIONS_FILE,
+    CLAUDE_HOST_JOURNEY_TESTS_FILE,
 )
 NATIVE_PROVIDER_MODULE_FILE = Path("crates/tracedecay/src/daemon/retained_owner.rs")
 NATIVE_PROVIDER_MODULE_DECLARATION = (
@@ -159,6 +167,14 @@ NATIVE_STAGED_OBSERVATIONS_MODULE_DECLARATION = (
     f'#[cfg(feature = "{FEATURE}")]\n'
     "pub(crate) mod native_staged_observations;"
 )
+CLAUDE_HOST_JOURNEY_TESTS_MODULE_FILE = Path(
+    "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs"
+)
+CLAUDE_HOST_JOURNEY_TESTS_MODULE_DECLARATION = (
+    f'#[cfg(all(test, feature = "{FEATURE}"))]\n'
+    '#[path = "claude_host_journey_tests.rs"]\n'
+    "mod claude_host_journey_tests;"
+)
 NATIVE_ADAPTER_CONSTRAINTS = {
     NATIVE_PROVIDER_FILE: (
         (NATIVE_PROVIDER_MODULE_FILE, NATIVE_PROVIDER_MODULE_DECLARATION),
@@ -181,6 +197,12 @@ NATIVE_ADAPTER_CONSTRAINTS = {
         (
             NATIVE_PROVIDER_MODULE_FILE,
             NATIVE_STAGED_OBSERVATIONS_MODULE_DECLARATION,
+        ),
+    ),
+    CLAUDE_HOST_JOURNEY_TESTS_FILE: (
+        (
+            CLAUDE_HOST_JOURNEY_TESTS_MODULE_FILE,
+            CLAUDE_HOST_JOURNEY_TESTS_MODULE_DECLARATION,
         ),
     ),
 }

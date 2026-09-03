@@ -349,6 +349,54 @@
         "ADR-0008",
         "ADR-0011"
       ]
+    },
+    {
+      "id": "ADR-0013",
+      "topic": "daemon_shutdown_touch_point_expansion",
+      "title": "Approve the daemon shutdown touch point at six files and 320 changed lines",
+      "path": "product/architecture/adr/ADR-0013-daemon-shutdown-touch-point-expansion.md",
+      "status": "accepted",
+      "decision_summary": "Approve the daemon_shutdown_deadline touch point at 6 files and 320 changed lines, admitting crates/tracedecay-daemon-service/src/invocation/types.rs as the sixth path so the LSP lease registry can retire its tasks under the caller's absolute deadline. No ADR-0011 aggregate cap changes; touch-point caps become pinned in the checker and a revised cap must be bound to this ADR.",
+      "required_rejections": [
+        "Bundle the cap increase into the implementation change",
+        "Amend ADR-0011 to exempt local touch-point caps",
+        "Raise the cap to the global per-category limit"
+      ],
+      "verification_beads": [
+        "tdmem-0105",
+        "tdmem-1204"
+      ],
+      "depends_on_adrs": [
+        "ADR-0008",
+        "ADR-0011"
+      ]
+    },
+    {
+      "id": "ADR-0014",
+      "topic": "host_hook_ingest_footprint_revision_v3",
+      "title": "Revise the patch-footprint policy to v3 for the Claude Code host hook ingest journey",
+      "path": "product/architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md",
+      "status": "accepted",
+      "decision_summary": "Adopt policy revision patch-footprint.v3: raise upstream existing production files 34 -> 37, total upstream changed lines 3300 -> 3500, and exception-zone files 2 -> 4, each set from the measured tree (37 files, 3393 lines, 4 exception-zone files) plus at most roughly fifteen percent headroom; approve the host_hook_ingest touch point at 3 files and 200 changed lines; approve a two-file host_specific_adapters exception for the Claude hook adapter; and classify crates/tracedecay-cli/tests/product_memory_provider_*.rs as product-owned. Every other v2 cap, zone, dependency rule, and per-entry line budget is unchanged.",
+      "required_rejections": [
+        "Wait for the daemon's own session-sync sweep instead of ingesting at the hook boundary",
+        "Add a product-owned hook binary or host adapter beside the upstream one",
+        "Widen the profile-scoped Claude kernel to also cover registered projects",
+        "Make the catch-up ingest blocking or unbounded so no frame can be missed",
+        "Leave the v2 caps and let the gate fail",
+        "Raise the caps far above the measurement to avoid future ADRs"
+      ],
+      "verification_beads": [
+        "tdmem-0105",
+        "tdmem-1001",
+        "tdmem-1204"
+      ],
+      "depends_on_adrs": [
+        "ADR-0007",
+        "ADR-0008",
+        "ADR-0011",
+        "ADR-0013"
+      ]
     }
   ]
 }

@@ -255,6 +255,8 @@
           "cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification",
           "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline",
           "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1",
+          "cargo test --locked -p tracedecay --features memory-provider-host --lib crash_restart_fuzz",
+          "cargo test --locked -p tracedecay --features memory-provider-host --lib -- --ignored --exact daemon::retained_owner::observation_journey::tests::crash_restart_fuzz::mounted_crash_restart_soak_holds_every_invariant_across_two_hundred_seeds --nocapture",
           "python3 tests/product_memory_fabric_disabled_mode_test.py"
         ]
       },

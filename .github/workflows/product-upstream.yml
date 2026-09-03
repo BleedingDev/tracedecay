@@ -155,7 +155,7 @@ jobs:
     name: "[tdmem-1206][required][scope_crash_security]"
     needs: provider_conformance
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 75
     steps:
       - name: Check out the exact candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -169,9 +169,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification
-          cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline
+          # Both deadline regressions live in tracedecay-daemon-service, so
+          # `-p tracedecay` selected nothing and this gate passed vacuously.
+          cargo test --locked -p tracedecay-daemon-service --lib deadline_tests
           cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1
+          cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants
+          # tdmem-5lc: the mounted crash/restart soak. Two hundred deterministic
+          # seeds and every one of them spends real process kills between the
+          # canonical commit and the provider acknowledgement, so this is the
+          # gate that keeps the hundreds-seed result reproduced rather than
+          # claimed. The short developer tier runs in the same binary and is
+          # covered by the filter above it.
+          cargo test --locked -p tracedecay --features memory-provider-host --lib crash_restart_fuzz
+          cargo test --locked -p tracedecay --features memory-provider-host --lib -- --ignored --exact daemon::retained_owner::observation_journey::tests::crash_restart_fuzz::mounted_crash_restart_soak_holds_every_invariant_across_two_hundred_seeds --nocapture
           python3 tests/product_memory_fabric_disabled_mode_test.py
       - name: Record scope and reliability ownership
         if: always()

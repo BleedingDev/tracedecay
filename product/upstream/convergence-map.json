@@ -2,7 +2,7 @@
   "$schema": "product/upstream/convergence-map.schema.json",
   "schema_version": 2,
   "bead_id": "tdmem-0308",
-  "policy_revision": "patch-footprint.v2",
+  "policy_revision": "patch-footprint.v3",
   "upstream_floor_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
   "owners": {
     "product": {
@@ -234,6 +234,7 @@
         "crates/tracedecay-memory-conformance/**",
         "crates/tracedecay/tests/product_memory_provider/**",
         "crates/tracedecay/tests/product_memory_provider_*.rs",
+        "crates/tracedecay-cli/tests/product_memory_provider_*.rs",
         "product/conformance/**"
       ],
       "touch_points": [
@@ -256,7 +257,8 @@
       "tests": [
         "cargo test -p tracedecay-memory-conformance --locked",
         "python3 tests/product_dummy_provider_conformance_test.py",
-        "cargo test -p tracedecay-memory-conformance --test baseline --locked"
+        "cargo test -p tracedecay-memory-conformance --test baseline --locked",
+        "cargo test --locked -p tracedecay-cli --features memory-provider-host,test-transport --test product_memory_provider_claude_host_journey"
       ],
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
@@ -368,7 +370,9 @@
       "ownership_class": "product_owned",
       "feature": "memory-provider-host",
       "path_patterns": [
-        "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs"
+        "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs",
+        "crates/tracedecay/src/daemon/retained_owner/claude_host_journey_tests.rs",
+        "crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/crash_restart_fuzz.rs"
       ],
       "touch_points": [
         "daemon_composition_mount"
@@ -379,7 +383,8 @@
         "tdmem-0503",
         "tdmem-0504",
         "tdmem-0505",
-        "tdmem-0506"
+        "tdmem-0506",
+        "tdmem-1001"
       ],
       "rationale": "Hold the one product-owned seam where the canonical observation store, the durable observation journal, the hygiene pipeline, the provider lifecycle supervisor, and the provider registry meet, as a single file inside the retained-owner tree that the composition root mounts only under the optional host feature.",
       "semantic_invariants": [
@@ -393,13 +398,20 @@
         "Re-proving the readiness of an already-ready incarnation spends no restart attempt, so a healthy provider answering many records can never be wedged into RestartBudgetExhausted; only a spawn consumes the crash-loop budget.",
         "The supervised owner set is bounded by a finite exact-scope ceiling and retires the coldest scope only after its instance death is confirmed, so no two owners ever exist for one provider namespace and the set never grows without bound.",
         "Every delivery attempt passes the mounted ObservationRecoveryGateV1 before the provider is contacted: the checkpoint carries the provider identity, state schema, state generation, and the typed replay position derived from validated readiness evidence, the assessment is run under the delivery attempt's own cancellation token and deadline, and a state-incompatible or budget-exhausted assessment refuses the attempt with a typed terminal so no observation reaches a provider whose durable state the host has not verified.",
-        "Every canonical admission passes the mounted BackpressureGateV1 before any journal append: the gate reads real queue pressure for the record's own provider lane, classifies the record by its retention lifetime, and refuses optional traffic at the declared shed threshold, every class at the refusal threshold or the journal ceiling, and optional traffic on backlog age or a run of over-budget foreground admissions. A refusal never advances a watermark, never deletes a canonical record, and never reports success: the replay pass stops, reports the typed refusal with its backlog measurements, and re-presents the same record once the lane drains."
+        "Every canonical admission passes the mounted BackpressureGateV1 before any journal append: the gate reads real queue pressure for the record's own provider lane, classifies the record by its retention lifetime, and refuses optional traffic at the declared shed threshold, every class at the refusal threshold or the journal ceiling, and optional traffic on backlog age or a run of over-budget foreground admissions. A refusal never advances a watermark, never deletes a canonical record, and never reports success: the replay pass stops, reports the typed refusal with its backlog measurements, and re-presents the same record once the lane drains.",
+        "The Claude Code host journey drives the shipped hook and configuration surfaces against the production composition root: it never hand-mounts the journey, never writes the canonical configuration store directly, and asserts the journal's exact-scope binding against the authoritative resolved scope rather than a re-derived one.",
+        "Crash safety between the host commit and the provider acknowledgement is proved against this mount and no substitute: a seeded driver kills a real child process at every boundary from canonical commit to acknowledgement persistence, and after every death and after recovery no committed observation is lost, no provider effect is applied twice, the durable acknowledged watermark equals the highest sequence carrying an acknowledging receipt, and a permanent provider refusal stays terminal across later lives.",
+        "The bounded provider-call boundary publishes its own borrowed-worker census and never loses a slot: a call whose caller stops waiting at its deadline or on cancellation is counted as abandoned until the borrowed worker leaves the provider, a worker that returns or unwinds releases its slot before its caller is answered, a claimed slot is released even when no worker could be started, the finite ceiling refuses a further call while the budget is committed and reports the true abandoned count, and the lane names the census in its delivery-failure and shutdown-with-parked-calls events.",
+        "Crash safety between the canonical commit and the provider acknowledgement is proved on this mount by process kills, not by inspection: a life is killed at each of the six real seams (canonical commit before the journal write; the journal row durable before the delivery preflight enters the provider; the provider entered before it touches its effects; the effect durable before its answer exists; the answer handed back while the journal is provably unable to persist the receipt; and the receipt plus acknowledged watermark durable in one transaction), each seam is re-verified from the durable files after the kill, and recovery then leaves every committed position journalled exactly once, one provider effect per delivered position, the acknowledged watermark exactly on the highest durably acknowledged sequence, and every permanent refusal terminal across a further life."
       ],
       "tests": [
         "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::observation_journey::tests",
         "python3 tests/product_upstream_ownership_registry_test.py",
         "cargo test --locked -p tracedecay --features memory-provider-host remount_sweeps_rows_that_expired_while_the_journey_was_down",
-        "cargo test -p tracedecay-memory-observation --test retention_sweep_cadence --locked"
+        "cargo test -p tracedecay-memory-observation --test retention_sweep_cadence --locked",
+        "cargo test --locked -p tracedecay --features memory-provider-host --lib claude_host_journey_tests",
+        "cargo test --locked -p tracedecay --features memory-provider-host --lib crash_restart_fuzz",
+        "cargo test --locked -p tracedecay --features memory-provider-host --lib -- --ignored --exact daemon::retained_owner::observation_journey::tests::crash_restart_fuzz::mounted_crash_restart_soak_holds_every_invariant_across_two_hundred_seeds --nocapture"
       ],
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
@@ -722,6 +734,7 @@
         "crates/tracedecay/src/daemon/invocation_state.rs",
         "crates/tracedecay/src/daemon/production_harness.rs",
         "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
+        "crates/tracedecay-daemon-service/src/invocation/types.rs",
         "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs"
       ],
       "touch_points": [
@@ -732,7 +745,7 @@
         "tdmem-0404",
         "tdmem-1204"
       ],
-      "rationale": "Constrain the six existing daemon shutdown and production-harness layers that must share one caller deadline and expose incomplete blocking drain truthfully. Two of those layers moved into the new tracedecay-daemon-service crate at floor 5749e4fc; the area follows them rather than widening its footprint.",
+      "rationale": "Constrain the seven existing daemon shutdown and production-harness layers that must share one caller deadline and expose incomplete blocking drain truthfully. Three of those layers moved into the new tracedecay-daemon-service crate at floor 5749e4fc; the area follows them rather than widening its footprint. The LSP lease-task registry joined the area under tdmem-0th because a caller-side timeout cannot bound a join the registry owns without detaching the tasks it already removed.",
       "semantic_invariants": [
         "Upstream behavior: daemon shutdown preserves lifecycle ordering and always completes terminal teardown after reporting the observed outcome.",
         "Product behavior: one caller-supplied absolute deadline bounds every nested shutdown and blocking-drain step without refresh."
@@ -924,6 +937,46 @@
       "upstreamability": {
         "kind": "product_only",
         "rationale": "The lane exists only to deliver the optional product-owned provider host's advisory output and is removed with the memory-provider-host feature."
+      }
+    },
+    {
+      "id": "host_hook_ingest_mount",
+      "status": "active",
+      "owner": "ScriptedAlchemy",
+      "ownership_class": "upstream_owned",
+      "feature": "memory-provider-host",
+      "path_patterns": [
+        "crates/tracedecay-agent-hosts/src/hooks/claude.rs",
+        "crates/tracedecay-agent-hosts/src/hooks/mod.rs",
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest/kernels.rs",
+        "crates/tracedecay-cli/Cargo.toml",
+        "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance.rs"
+      ],
+      "touch_points": [
+        "host_hook_ingest",
+        "exception"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "rationale": "Hold the Claude Code host hook boundary that turns a session running inside a registered project into canonical project observations: the two host-adapter files that trigger a bounded catch-up on SessionStart and Stop, the project-scoped transcript-capture kernel that admits it, and the tracedecay-cli surface that proves the host lifecycle around it.",
+      "semantic_invariants": [
+        "The hook boundary is fail-open: an unreachable, slow, or failing daemon costs the host a diagnostic line and never changes the hook's own answer or exit status.",
+        "Every catch-up runs under an explicit time and byte budget, so a backlog stays queued for the next hook or the daemon's own session-sync sweep instead of holding a host lifecycle event open.",
+        "Admission, scope identity, and idempotency are the host-neutral ones the session-sync worker already uses; the hook path mints no second admission and no second scope-identity derivation.",
+        "No file in this area names a provider, registry, or fabric type or branches on a provider name; the provider boundary stays behind the observation and recall mounts.",
+        "The product journey test target and the memory-provider-host feature it needs are opt-in and absent from the default feature set, so the shipped binary stays the upstream composition unless an operator asks otherwise."
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host hook_runtime",
+        "cargo test --locked -p tracedecay-cli --features test-transport --test host_lifecycle_cli_acceptance",
+        "python3 tests/product_upstream_ownership_registry_test.py"
+      ],
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "minimal_mount",
+        "rationale": "Catching a project's own transcript up at the host lifecycle boundary is provider-neutral session-evidence freshness; upstream could adopt it, which would retire this area entirely."
       }
     }
   ],
@@ -1184,10 +1237,11 @@
         "The observation journey mounts only after project_code_index_authorities and the registered project session database are open, because the exact scope and the canonical replay source exist only then; disabled activation mounts no journey, journal, worker, or replay task.",
         "The journey mount is one call into observation_journey::mount_and_replay; a mount or live-replay-start refusal is a typed TraceDecayError::Config, and a startup replay refusal is logged at error level with the journal path while the durable watermark and the live replay task carry recovery.",
         "NativeActive is selected only when memory.provider_recall_routing.v1 names the Native provider and the host boolean is on; resolve_memory_provider_activation is the sole reading of both gates and any contradiction is a typed TraceDecayError::Config at project open.",
-        "project_recall_routing_policy builds the one ActiveRoutingPolicy (Native under PROJECT_NATIVE_REGISTRATION_REVISION, fallback forbidden unless the gate pins a complete rule) and the recall route is mounted only when it exists.",
+        "project_recall_routing_policy builds the one ActiveRoutingPolicy (Native under PROJECT_NATIVE_REGISTRATION_REVISION) always with FallbackRule::Forbidden, refuses any pinned fallback at project open with a typed TraceDecayError::Config because this composition registers exactly one provider, and the recall route is mounted only when the policy exists.",
         "The daemon profile identity is threaded into the Native application port at mount (mount_project_memory_provider_host takes profile_identity.profile_id()); it is the only profile the Native adapter attests on a recall candidate, fixed at mount and never copied from a call's exact scope.",
         "The journey mount receives every worker bound (journal retention, dispatch lease/batch/attempt budget/reap budget, park, sweep cadence) as one validated ObservationJourneyPolicyV1 from the composition root; a policy that cannot bound the worker refuses the mount with a typed error, and the composition root passes the product default rather than the journey minting limits.",
-        "The mountable-adapter decision is the registry's: the composition asks tracedecay_memory_provider_registry::mountable_active_provider for a typed kind and branches only on that kind plus the build feature, never on a provider name."
+        "The mountable-adapter decision is the registry's: the composition asks tracedecay_memory_provider_registry::mountable_active_provider for a typed kind and branches only on that kind plus the build feature, never on a provider name.",
+        "The composition root supplies the host execution capability provider calls run on: one ProviderInvocationBoundaryV1 per mounted recall route, built by cognitive_recall::host_provider_invocation_boundary over host-owned detached workers and bounded by PROJECT_MEMORY_PROVIDER_MAX_IN_FLIGHT -- the same number the fabric's active permit lane is configured with, so the worker budget and the permit budget can never disagree. The provider registry spawns nothing itself; a provider that outlives its deadline strands a worker this process named and accounts for, and is refused before contact until that worker returns."
       ],
       "verification": [
         "git diff --check"
@@ -1198,7 +1252,8 @@
         "cargo test --locked -p tracedecay --features memory-provider-host remount_sweeps_rows_that_expired_while_the_journey_was_down",
         "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers daemon::project_composition::memory_provider_routing_tests",
         "cargo test -p tracedecay-memory-provider-ncm --features local-process --test ncm_local_process --locked",
-        "cargo test -p tracedecay-memory-provider-registry --test registry --locked"
+        "cargo test -p tracedecay-memory-provider-registry --test registry --locked",
+        "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::cognitive_recall::tests::a_wedged_provider_strands_one_accounted_worker_and_capacity_is_reclaimed"
       ],
       "bead_ids": [
         "tdmem-0307",
@@ -1355,7 +1410,7 @@
       "rationale": "Gate the retained Native application authority and its direct parity module at the daemon composition boundary so provider behavior is opt-in and removable.",
       "semantic_invariants": [
         "Upstream behavior: retained project and profile operations continue to resolve through the owner-bound Native memory authority when the provider host feature is absent.",
-        "Enabled product behavior: memory-provider-host gates exactly four declarations in this file and nothing else \u2014 the cognitive_recall module, the native_provider adapter module, the observation_journey module, and the cfg(all(test, feature)) native_provider_parity_tests fixture; every unconditional module and re-export stays upstream's, provider calls remain behind registry composition, and none of them can replace canonical Native ownership.",
+        "Enabled product behavior: memory-provider-host gates exactly four declarations in this file and nothing else — the cognitive_recall module, the native_provider adapter module, the observation_journey module, and the cfg(all(test, feature)) native_provider_parity_tests fixture; every unconditional module and re-export stays upstream's, provider calls remain behind registry composition, and none of them can replace canonical Native ownership.",
         "The retained owner keeps exact project scope, request admission, cancellation, deadlines, receipts, and terminal mappings independent of provider availability.",
         "Enabled product behavior: the observation_journey module declaration is the only retained-owner seam for the durable observation journal; the journal is delivery-status authority only and never a second authority for Native facts."
       ],
@@ -1559,26 +1614,68 @@
       "rationale": "Bound LSP shutdown by the remaining caller budget so process teardown cannot silently outlive the daemon's absolute deadline. Upstream moved this seam out of crates/tracedecay/src/daemon/service/invocation/lsp.rs into the new tracedecay-daemon-service crate at floor 5749e4fc; the bounded-deadline split was re-applied minimally at the new path and the deadline constant now resolves through tracedecay_runtime_core.",
       "semantic_invariants": [
         "Upstream behavior: LSP teardown retains its existing process ownership and reports the real shutdown outcome.",
-        "Product behavior: LSP shutdown consumes only the remaining shared deadline and never creates a fresh timeout."
+        "Product behavior: expire_all_until mints no deadline of its own. It hands the caller's absolute deadline to LspLeaseTaskRegistry::shutdown(deadline) and to project_runtimes.shut_down_all_until(deadline); the upstream Work attempt registry keeps its own DAEMON_TASK_ABORT_DEADLINE join budget, which the product neither re-times nor re-bounds.",
+        "Product behavior: expire_all_until never wraps the lease shutdown in a caller-side timeout. Dropping that future would detach the lease tasks the registry has already removed from itself, so the bound belongs inside the registry, which retains ownership of every handle until it has cancelled, joined, or aborted it.",
+        "Product behavior: a lease join abandoned at the deadline is reported as DaemonInvocationProblem::Unavailable through the existing lease outcome, so shutdown returns unclean and logs instead of hiding an abandoned task.",
+        "The test-only expire_all helper is the single place that turns the shared DAEMON_SHUTDOWN_DEADLINE into an absolute instant; it is compiled out of production builds."
       ],
       "verification": [
         "git diff --check",
-        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+        "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests",
+        "cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants lsp_shutdown_"
       ],
       "tests": [
-        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+        "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests",
+        "cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants lsp_shutdown_"
       ],
       "bead_ids": [
         "tdmem-0404",
         "tdmem-1204"
       ],
       "line_budget": 16,
-      "rebase_or_removal_plan": "Delete the local LSP deadline adaptation when upstream LSP shutdown consumes the caller's absolute deadline directly. The seam moved with upstream's crate split at floor 5749e4fc; re-locate it again if upstream moves the file once more.",
+      "rebase_or_removal_plan": "Delete the local LSP deadline adaptation when upstream LSP shutdown consumes the caller's absolute deadline directly, including the bounded lease join. The seam moved with upstream's crate split at floor 5749e4fc; re-locate it again if upstream moves the file once more.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Bounded LSP teardown is an upstream daemon-lifecycle correction independent of memory-provider behavior."
+      }
+    },
+    {
+      "path": "crates/tracedecay-daemon-service/src/invocation/types.rs",
+      "area_id": "shutdown_deadline",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "daemon_shutdown_deadline",
+      "rationale": "LspLeaseTaskRegistry::shutdown takes every lease task out of the registry before it joins them one at a time, so the caller cannot bound that join from outside: a timeout there drops the future holding the taken tasks, and a dropped JoinHandle detaches its task instead of aborting it. The deadline therefore has to reach the registry, which owns the handles. shutdown now accepts the caller's absolute deadline and is the last file in the shutdown call chain that still minted an unbounded wait.",
+      "semantic_invariants": [
+        "Upstream behavior: shutdown still closes admission first, retires every registered lease task, and returns the observed outcome; generation matching, the weak-registry finish path, and Drop-time abort are unchanged.",
+        "Product behavior: shutdown consumes the caller's absolute deadline and mints no budget of its own.",
+        "Product behavior: every captured task is cancelled before the first join, so one task that outlives its own join cannot leave its successors running uncancelled.",
+        "Product behavior: a task still unfinished at the deadline is aborted before the registry releases its handle, rather than merely dropped: dropping a JoinHandle detaches the task instead of stopping it.",
+        "Product behavior: the guarantee abort buys is bounded and stated as such. Tokio abort is cooperative, so a task already executing inside its own poll — a lease body blocking a worker thread, for instance — keeps running until it reaches a suspension point, and it may still run that far after shutdown has returned. What is guaranteed is that an aborted task never resumes past that suspension point, so no lease effect sequenced after an await can execute once shutdown has abandoned the join.",
+        "Product behavior: an unfinished, aborted, or panicked join is reported as DaemonInvocationProblem::Unavailable, so an incomplete lease teardown is never hidden behind a successful terminal."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants lsp_shutdown_",
+        "cargo test --locked -p tracedecay --lib lsp_lease_tests"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants lsp_shutdown_",
+        "cargo test --locked -p tracedecay --lib lsp_lease_tests"
+      ],
+      "bead_ids": [
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "line_budget": 30,
+      "rebase_or_removal_plan": "Delete the deadline parameter and restore the unbounded join when upstream's lease registry retires its tasks under a caller-supplied deadline itself. If upstream moves LspLeaseTaskRegistry out of invocation/types.rs, re-locate this entry with it rather than widening the area.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A registry that cancels, joins under the caller's deadline, and aborts what remains is a provider-neutral daemon-lifecycle correction."
       }
     },
     {
@@ -1623,21 +1720,24 @@
       "rationale": "Resolve an explicit same-checkout CLI, clear inherited daemon routing, and construct one isolated bounded test socket in the shared harness.",
       "semantic_invariants": [
         "Upstream behavior: the common harness isolates daemon socket and profile state without changing production command behavior.",
-        "Product behavior: integration tests use an explicit or Cargo-provided same-checkout CLI and fail closed instead of guessing sibling binaries."
+        "Product behavior: integration tests use an explicit or Cargo-provided same-checkout CLI and fail closed instead of guessing sibling binaries.",
+        "Product behavior: tracedecay_bin admits a CLI only when it resolves inside the Cargo target directory that produced the running test executable; a binary from another checkout, another target directory, or a system install is refused by path even though its release prefix matches. The guard itself is product-owned (crates/tracedecay/tests/product_memory_provider/harness_binary.rs); this file only mounts it."
       ],
       "verification": [
         "git diff --check",
-        "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1"
+        "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1",
+        "cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants build_tree"
       ],
       "tests": [
-        "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1"
+        "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1",
+        "cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants build_tree"
       ],
       "bead_ids": [
         "tdmem-0404",
         "tdmem-1204"
       ],
-      "line_budget": 69,
-      "rebase_or_removal_plan": "Remove the local harness resolver and isolation helpers when upstream provides equivalent fail-closed same-checkout command construction.",
+      "line_budget": 73,
+      "rebase_or_removal_plan": "Remove the local harness resolver, the product-owned same-checkout guard mount, and the isolation helpers when upstream provides equivalent fail-closed same-checkout command construction.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
@@ -1692,7 +1792,7 @@
           "Hard-code the provider composition as always-on and drop the settings",
           "Gate the provider on an environment variable or build feature only"
         ],
-        "policy_revision": "patch-footprint.v2",
+        "policy_revision": "patch-footprint.v3",
         "rollback_plan": "Delete the two setting registrations and the validated routing default from register_project_settings; the surrounding settings vector and every other key are untouched, so the file returns to its upstream shape."
       },
       "rationale": "Declare memory.provider_native_enabled.v1 (Boolean, default false) and the recall-routing setting (validated MemoryProviderRecallRoutingV1 document) beside the settings the registry already owns, both Public and DaemonRestart.",
@@ -1737,7 +1837,7 @@
           "Hard-code the provider composition as always-on and drop the settings",
           "Gate the provider on an environment variable or build feature only"
         ],
-        "policy_revision": "patch-footprint.v2",
+        "policy_revision": "patch-footprint.v3",
         "rollback_plan": "Remove the two keys from the additive-key list; the list returns to its single upstream entry and pre-existing stored values become inert rows the registry ignores."
       },
       "rationale": "Add the two memory-provider setting keys to the existing additive-key reconciliation list next to INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY so existing profiles gain them on reconciliation.",
@@ -2175,11 +2275,13 @@
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "recall_context_mount",
-      "rationale": "Admit a context-assembly call into the cognitive-recall lane before the handler arguments move, run the authoritative handler first with its full deadline, then mint this session's recall port and compile the mounted route's typed advisory result into the context answer, so the recall route has a production invocation path that can never displace canonical host output.",
+      "rationale": "Admit a context-assembly call into the cognitive-recall lane before the handler arguments move -- binding it to the caller's structural session identity or, for an ordinary agent call that carries none, to the MCP connection the host minted this request identity on -- run the authoritative handler first with its full deadline, then mint this session's recall port and compile the mounted route's typed advisory result into the context answer, so the recall route has a production invocation path that can never displace canonical host output.",
       "semantic_invariants": [
         "The authoritative tool handler runs first and keeps its whole deadline; advisory recall is invoked only after the handler answered, so a slow or blocking provider can never starve, delay, or displace canonical host output.",
         "The advisory lane runs under the dispatch control's own admitted deadline and live cancellation identity, clamped to the mount's bounded advisory sub-deadline; no replacement cancellation identity is minted.",
-        "A dormant provider host, an observer-only routing gate, a non-context tool, a call with no canonical session identity, or any advisory failure leaves the dispatched result exactly as the handler produced it.",
+        "A successful ordinary context call reaches the lane: the admission gate takes the host-minted application request identity, so a call that carries no structural session identity binds to its MCP connection scope instead of being skipped.",
+        "A dormant provider host, an observer-only routing gate, or a non-context tool leaves the dispatched result exactly as the handler produced it; every other advisory failure is a typed unavailable lane attributed to the routed provider, and the host answer is still delivered unchanged.",
+        "The advisory lane is additionally bounded by wall clock inside its sub-deadline: a provider that ignores the deadline it was handed is abandoned and terminates the lane as advisory_lane_deadline_exceeded, so it can never hold the dispatch task -- and therefore the already-produced canonical answer -- open.",
         "The lane is applied after the handler answered, so a coalesced read shared with other callers never carries this caller's advisory candidates.",
         "The dispatch path names no provider, registry, or fabric type; the provider boundary stays behind the cognitive-recall mount."
       ],
@@ -2188,6 +2290,8 @@
       ],
       "tests": [
         "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::cognitive_recall::tests",
+        "cargo test --locked -p tracedecay --features memory-provider-host an_ordinary_mcp_context_call_returns_the_routed_advisory_lane",
+        "cargo test --locked -p tracedecay --features memory-provider-host a_provider_that_ignores_its_deadline_cannot_block_the_host_answer",
         "python3 tests/product_memory_composition_feature_test.py"
       ],
       "bead_ids": [
@@ -2232,6 +2336,198 @@
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "A cross-platform test-compilation fix in an upstream-only test module belongs upstream verbatim and has no product-specific content."
+      }
+    },
+    {
+      "path": "crates/tracedecay-agent-hosts/src/hooks/claude.rs",
+      "area_id": "host_hook_ingest_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "exception",
+      "exception": {
+        "zone": "host_specific_adapters",
+        "adr": "product/architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md",
+        "why_unavoidable": "SessionStart and Stop are the only moments the Claude host tells anything in this repository that a turn boundary happened, and the handler that receives them lives in this file. The profile-scoped route these handlers already call keeps exactly the rows that belong to no registered project, so a session running inside a registered project produces nothing until the daemon's next session-sync sweep. No product-owned crate can observe a Claude lifecycle event, and no seam above the host adapter exists to attach one to.",
+        "alternatives_rejected": [
+          "Wait for the daemon's own session-sync sweep instead of ingesting at the hook boundary",
+          "Add a product-owned hook binary or host adapter beside the upstream one",
+          "Widen the profile-scoped Claude kernel to also cover registered projects",
+          "Make the catch-up ingest blocking or unbounded so no frame can be missed"
+        ],
+        "policy_revision": "patch-footprint.v3",
+        "rollback_plan": "Delete the two call sites, the ingest_claude_project_transcript helper, and the three budget constants; the handlers return to their upstream profile-scoped-only shape and nothing else in the file is touched."
+      },
+      "rationale": "Run one bounded, fail-open project-scoped Claude transcript catch-up on SessionStart (5s budget) and Stop (25s budget) through the existing super::ingest_transcript_for_event route, so a Claude session inside a registered project becomes canonical project observations at the hook boundary instead of waiting for the daemon's session-sync sweep.",
+      "semantic_invariants": [
+        "Additive only: both handlers keep their existing parse, telemetry, and dispatch sequence, and the catch-up is inserted after the hook's own telemetry record and before dispatch without altering either.",
+        "The catch-up runs only when the event resolves to a project root; a session with no registered project keeps exactly its upstream profile-scoped behavior.",
+        "The call is fail-open by construction: the outcome is reported through failure_reason on stderr and never propagates, so orientation guidance and the turn boundary are produced regardless.",
+        "Each event carries its own explicit budget - 5s on SessionStart because orientation is on the critical path of the first turn, 25s on Stop because it runs at a turn boundary inside Claude's default 60s hook guard - and a tail that does not fit stays for the next hook or the daemon's own sweep.",
+        "The byte ceiling is the existing stalled-ingest warning threshold rather than a new tunable, so the hook cannot read a larger tail than the runtime already considers healthy."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay-agent-hosts hooks::claude"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-agent-hosts hooks::claude",
+        "cargo test --locked -p tracedecay-cli --features memory-provider-host,test-transport --test product_memory_provider_claude_host_journey"
+      ],
+      "bead_ids": [
+        "tdmem-1001"
+      ],
+      "line_budget": 85,
+      "rebase_or_removal_plan": "Re-apply two call sites plus one private helper and three constants onto the upstream handlers; delete them outright if upstream's own hook path gains a project-scoped catch-up or if the daemon sweep becomes turn-synchronous.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "minimal_mount",
+        "rationale": "A bounded fail-open catch-up of the host's own transcript names no provider and is a candidate for upstream adoption, which would remove this entry."
+      }
+    },
+    {
+      "path": "crates/tracedecay-agent-hosts/src/hooks/mod.rs",
+      "area_id": "host_hook_ingest_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "exception",
+      "exception": {
+        "zone": "host_specific_adapters",
+        "adr": "product/architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md",
+        "why_unavoidable": "TranscriptIngestOutcome is private to this module, and its failed/timed_out fields are the only record of an ingest that did not complete. A fail-open caller has to be able to say what it lost; without a reader on the type it would either discard the outcome silently or duplicate the field interpretation at the call site.",
+        "alternatives_rejected": [
+          "Wait for the daemon's own session-sync sweep instead of ingesting at the hook boundary",
+          "Add a product-owned hook binary or host adapter beside the upstream one",
+          "Widen the profile-scoped Claude kernel to also cover registered projects",
+          "Make the catch-up ingest blocking or unbounded so no frame can be missed"
+        ],
+        "policy_revision": "patch-footprint.v3",
+        "rollback_plan": "Delete the failure_reason method; the struct, its fields, and every existing reader are untouched, so the file returns to its upstream shape."
+      },
+      "rationale": "Add TranscriptIngestOutcome::failure_reason(), a stable label for an ingest that did not complete, so the fail-open Claude caller can report what it lost instead of discarding the outcome.",
+      "semantic_invariants": [
+        "Additive only: no existing field, method, or caller of TranscriptIngestOutcome changes behavior.",
+        "The reader is pure and total - daemon_call_failed for a failed call, budget_exceeded for a timeout, None otherwise - and performs no ingest work of its own.",
+        "None means the daemon answered; it does not claim anything was upserted, so a caller cannot read success into an empty catch-up."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay-agent-hosts hooks::"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-agent-hosts hooks::",
+        "cargo test --locked -p tracedecay-cli --features memory-provider-host,test-transport --test product_memory_provider_claude_host_journey"
+      ],
+      "bead_ids": [
+        "tdmem-1001"
+      ],
+      "line_budget": 20,
+      "rebase_or_removal_plan": "Re-apply one private method onto the upstream impl block, or delete it with the Claude call sites it exists for.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A total reader over an existing outcome type is provider-neutral and would carry upstream with the catch-up call sites."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest/kernels.rs",
+      "area_id": "host_hook_ingest_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "host_hook_ingest",
+      "rationale": "Register ClaudeProjectKernelV1 / capture_claude_project for (\"claude\", project scope, SourceScan) beside the existing profile kernel, so a project-scoped Claude catch-up has a route: the profile kernel narrows its source with ClaudeSource::for_user_scope and therefore keeps exactly the rows that belong to no registered project.",
+      "semantic_invariants": [
+        "Additive only: the existing claude profile kernel, every other host's kernels, and the registration table's existing rows are unchanged, so no established route changes hosts, scope, or payload semantics.",
+        "The new kernel runs the same pass the session-sync worker runs for this provider - ingest_source_with_observations_with_admission under ObservationScopeV1::Project - so a hook-driven catch-up and a scheduled sweep converge on identical state through content-derived idempotency instead of racing.",
+        "The scope identity is the project's own observation id resolved from the call's project context; the kernel derives no identity of its own from the working directory.",
+        "The byte ceiling is the caller's budget, falling back to the existing CLAUDE_HOOK_MAX_NEW_BYTES constant, and the caller's cancellation token is passed through unchanged.",
+        "The kernel names no provider, registry, or fabric type; it produces canonical observations and leaves provider routing to the mounts above it."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features memory-provider-host hook_runtime"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host hook_runtime",
+        "cargo test --locked -p tracedecay-cli --features memory-provider-host,test-transport --test product_memory_provider_claude_host_journey"
+      ],
+      "bead_ids": [
+        "tdmem-1001"
+      ],
+      "line_budget": 65,
+      "rebase_or_removal_plan": "Re-apply one macro line, one registration tuple, and one async capture function onto the upstream kernel table; delete all three if upstream's profile kernel starts covering registered projects.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "minimal_mount",
+        "rationale": "A project-scoped capture route for a host that already has a profile-scoped one is provider-neutral and is the natural upstream home for this behavior."
+      }
+    },
+    {
+      "path": "crates/tracedecay-cli/Cargo.toml",
+      "area_id": "host_hook_ingest_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "host_hook_ingest",
+      "rationale": "Declare the product_memory_provider_claude_host_journey test target with required-features memory-provider-host and test-transport, and add the opt-in memory-provider-host feature that forwards to tracedecay/memory-provider-host, so the subprocess journey drives the shipped binary against a daemon that actually contains the provider mount.",
+      "semantic_invariants": [
+        "Additive only: no existing target, dependency, or feature is redefined, and no existing feature gains a new member.",
+        "memory-provider-host is absent from default, so the shipped binary stays the upstream composition unless an operator asks for the host.",
+        "The forwarded feature only mounts the dormant host; it activates no provider, which stays a per-project configuration decision.",
+        "The journey target is required-features gated, so it cannot run - and therefore cannot silently pass against a dormant composition - without the host feature."
+      ],
+      "verification": [
+        "git diff --check",
+        "python3 scripts/product/check-memory-composition-feature.py"
+      ],
+      "tests": [
+        "python3 tests/product_memory_composition_feature_test.py",
+        "cargo test --locked -p tracedecay-cli --features memory-provider-host,test-transport --test product_memory_provider_claude_host_journey"
+      ],
+      "bead_ids": [
+        "tdmem-1001"
+      ],
+      "line_budget": 20,
+      "rebase_or_removal_plan": "Re-apply one [[test]] block and one feature line onto the upstream manifest; both are deleted with the memory-provider-host feature.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "product_only",
+        "rationale": "The target and the feature exist only to exercise the optional product-owned provider host and disappear with it."
+      }
+    },
+    {
+      "path": "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance.rs",
+      "area_id": "host_hook_ingest_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "host_hook_ingest",
+      "rationale": "Extend the existing Claude lifecycle acceptance test with the two properties the hook mount depends on and the test did not yet assert: that a repeated install converges instead of registering twice, and that a reinstall whose verification fails leaves managed artifacts, the durable receipt, and the operator's own activation state exactly as they were.",
+      "semantic_invariants": [
+        "Additive only: every pre-existing phase, assertion, and ordering in the Claude lifecycle case is unchanged; the new assertions are appended at the points they describe.",
+        "Repeated install is asserted as convergence, not merely as a zero exit: managed artifact bytes, the permission allow-list, foreign plugin registrations, and operator activation state must be byte-identical afterwards.",
+        "The interrupted reinstall is driven through the existing injected-verification-failure environment switch and must roll back managed artifacts, the durable receipt, and operator activation state together, with recovery and repair proving the host is usable afterwards.",
+        "Repeated uninstall is asserted as convergence: already-removed activation state stays removed and no managed artifact is re-deployed.",
+        "The test names no provider, registry, or fabric type and needs only the pre-existing test-transport feature, so it keeps proving host lifecycle rather than provider behavior."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay-cli --features test-transport --test host_lifecycle_cli_acceptance"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-cli --features test-transport --test host_lifecycle_cli_acceptance"
+      ],
+      "bead_ids": [
+        "tdmem-1001"
+      ],
+      "line_budget": 140,
+      "rebase_or_removal_plan": "Re-apply three appended assertion blocks inside the existing Claude lifecycle case; delete them if upstream adds equivalent idempotence and rollback coverage of its own.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Install idempotence and interrupted-reinstall rollback are host-lifecycle properties upstream owns; the assertions can be upstreamed as they are."
       }
     }
   ],

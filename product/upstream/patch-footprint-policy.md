@@ -29,6 +29,25 @@ This budget covers the initial provider contract, Native parity, and NCM observe
 
 Additive files under the declared product-owned paths are excluded. Git additions plus deletions determine changed lines. Renames count at source and destination. `Cargo.lock` may change only as pinned-toolchain output accompanying a workspace-manifest change and build/metadata receipt.
 
+### Revisions to the initial budget
+
+The table above is the v1 initial budget. Two versioned ADRs have revised it since, and the machine-readable caps in [`patch-footprint-policy.json`](./patch-footprint-policy.json) — pinned in `scripts/product/check-patch-footprint-policy.py` so they cannot be loosened by editing the policy alone — are always the binding values.
+
+| Cap | v1 | v2 (ADR-0011) | v3 (ADR-0014) | Measured at v3 |
+|---|---:|---:|---:|---:|
+| Existing upstream production files | 12 | 34 | **37** | 37 |
+| Existing upstream test/fixture files | 6 | 9 | 9 | 7 |
+| Total changed lines in upstream-owned existing files | 900 | 3300 | **3500** | 3393 |
+| Changed lines per upstream-owned file | 180 | 560 | 560 | — |
+| Composition-root files | 6 | 15 | 15 | 13 |
+| Files per allowed touch-point category | 3 | 15 | 15 | — |
+| Exception-zone files without ADR/policy revision | 0 | 2 | **4** | 4 |
+| Exception files authorized by one ADR | 2 | 2 | 2 | 2 |
+| Workspace manifest/lock files | 2 | 2 | 2 | — |
+| Manual generated-file edits | 0 | 0 | 0 | 0 |
+
+Revision `patch-footprint.v2` ([ADR-0011](../architecture/adr/ADR-0011-patch-footprint-revision-v2.md)) sized every cap against the M4 observation-journey mount, the M5 cognitive-recall port, the Native configuration registration, and the session-sync exact-scope reuse. Revision `patch-footprint.v3` ([ADR-0014](../architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md)) moves only the three caps the Claude Code host hook ingest journey (`tdmem-1001`) needs, adds the `host_hook_ingest` touch point, and approves a two-file exception in the host-adapter zone. Both follow the same rule: a cap is the footprint measured at its revision's tree plus at most roughly fifteen percent headroom. The production-file cap is set exactly at the measurement, so the next upstream production file this program touches trips the gate.
+
 Administrative Codex orchestration state under `.codex/**` is measured by the
 dirty-state diff but excluded before product/upstream ownership classification.
 This exclusion is exact: it does not grant product ownership or hide source,
@@ -43,9 +62,12 @@ Primary zones:
 - `.beads/**`, `product/**`, `scripts/product/**`, `tests/product_*`;
 - product workflows (`product-*`, Beads application/materialization);
 - future additive crates under `crates/tracedecay-memory-provider-*`, `tracedecay-memory-observation`, `tracedecay-memory-context`, and `tracedecay-memory-conformance`;
-- dedicated root integration tests named `product_memory_provider*`.
+- dedicated root integration tests named `product_memory_provider*`;
+- product journey tests named `product_memory_provider_*.rs` in the `crates/tracedecay` and `crates/tracedecay-cli` test directories.
 
 These paths may evolve without consuming upstream touch budget, but they still obey repository quality, test, security, and dependency-direction rules.
+
+The `crates/tracedecay-cli/tests/product_memory_provider_*.rs` pattern was added by [ADR-0014](../architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md) so the Claude host journey test is classified where it belongs. It admits only files whose name already marks them as product journeys inside that one test directory; the crate's other tests, its manifest, and every other upstream tree stay upstream-owned, and the prohibition on broad `crates/**`, `crates/tracedecay/**`, `tests/**`, and `.github/**` patterns is unchanged.
 
 ## Allowed upstream touch points
 
@@ -88,9 +110,13 @@ Provider logic, global mutable provider singletons, unbounded workers, or author
 
 ### Daemon shutdown deadline
 
-Allowed files are the five exact daemon shutdown call-chain paths named in the machine-readable policy. They may propagate one caller-supplied absolute deadline, bound blocking drain by its remaining budget, and report an incomplete shutdown as `Failed` while still reaching terminal teardown.
+Allowed files are the six exact daemon shutdown call-chain paths named in the machine-readable policy. They may propagate one caller-supplied absolute deadline, bound blocking drain by its remaining budget, and report an incomplete shutdown as `Failed` while still reaching terminal teardown.
 
 Nested layers cannot refresh the deadline, hide incomplete shutdown, reorder unrelated lifecycle phases, or add provider behavior.
+
+This category's caps are 6 files and 320 changed lines, raised from 5 and 287 by [ADR-0013](../architecture/adr/ADR-0013-daemon-shutdown-touch-point-expansion.md), which approves the sixth path and the exact numbers before the change that needs them. Bounding the LSP lease join from the caller in `invocation/lsp.rs` was not enough: `LspLeaseTaskRegistry::shutdown` in `crates/tracedecay-daemon-service/src/invocation/types.rs` removes every lease task from the registry before it joins them one at a time, so a caller-side `timeout_at` dropped that future with the remaining tasks neither cancelled nor aborted, and a dropped `JoinHandle` detaches rather than aborts. The deadline therefore has to reach the registry itself, which is one more file in the same shutdown call chain.
+
+Touch-point caps are not free-floating data. Every category's `max_files` and `max_changed_lines` are pinned in `scripts/product/check-patch-footprint-policy.py`, so a category cannot widen its own reach by editing the policy alone, and a category whose caps were revised must carry a `cap_revision` block naming its approving ADR. The gate reads that ADR and requires it to bind the exact category, the previous caps, the approved caps, the measurement they were derived from, and an affirmative grant; it also holds the approved cap to the ADR-0011 rule of measurement plus at most roughly fifteen percent headroom (320 is 3.9% above the measured 308). No ADR-0011 aggregate cap changed and no other touch point changed.
 
 ### Integration-test runtime isolation
 
@@ -113,6 +139,16 @@ Providers cannot construct final context, override current code, reuse candidate
 ### Post-settlement feedback mount
 
 Allowed seams may emit idempotent provider outcome/feedback observations after canonical settlement. Provider failure cannot retroactively change Native feedback, trust, or the completed operation.
+
+### Host hook ingest
+
+Allowed files are the three exact paths named in the machine-readable policy: the transcript-capture kernel table (`crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest/kernels.rs`), the `tracedecay-cli` manifest, and the host lifecycle acceptance test.
+
+Allowed: call the existing host-neutral transcript ingest route from a host lifecycle event under an explicit bounded budget; register an additional project-scoped capture kernel for a host that already has a profile-scoped one, reusing the session-sync ingest pass; declare an opt-in default-off product test target and the feature it requires; extend the host lifecycle acceptance test with idempotence and rollback assertions.
+
+Forbidden: naming a provider, registry, or fabric type on that path; letting an ingest failure, timeout, or unreachable daemon change the host's own hook answer; unbounded or unbudgeted ingest work on a lifecycle event; a second admission or scope-identity derivation beside the one the session-sync worker uses; turning the product target or its feature on by default.
+
+This category's caps are 3 files and 200 changed lines (measured 188, 6.4% headroom), approved by [ADR-0014](../architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md) together with revision `patch-footprint.v3`. The two Claude host-adapter files that trigger the catch-up are not in this category: they sit inside the forbidden `host_specific_adapters` zone and carry exception evidence instead.
 
 ### Configuration registry mount
 
@@ -139,6 +175,8 @@ SDK operation descriptors, dashboard contract schema, and `Cargo.lock` are gener
 ### Host-specific adapters
 
 Agent-host, host-integration, hooks, Hermes, and Context Scout-specific adapters are not provider mounts. Observation begins after host-neutral admission so all coding-agent hosts keep one authority model.
+
+The zone default stays `forbidden`, and that reason is unchanged. [ADR-0014](../architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md) admits exactly two exact files — `crates/tracedecay-agent-hosts/src/hooks/claude.rs` and `crates/tracedecay-agent-hosts/src/hooks/mod.rs` — because a Claude `SessionStart`/`Stop` event is observable nowhere else in this repository and no seam above the host adapter exists to attach a listener to. Those two files add no provider behavior and mount nothing: they call the same host-neutral ingest route the module already uses, under an explicit budget, fail-open. This is the whole grant. The per-ADR cap of two files means a third host-adapter file needs its own ADR and its own argument, and the exception-zone total (four files, shared with ADR-0012's two configuration-registry files) is a hard cap in the machine-readable policy.
 
 ### Toolchain, build, CI, and release policy
 

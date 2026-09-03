@@ -17,6 +17,10 @@ MANIFEST = REPO / "product/architecture/adr/manifest.json"
 ISSUES = REPO / ".beads/issues.jsonl"
 CHECKER = REPO / "scripts/product/check-foundational-adrs.py"
 ADR_0009 = REPO / "product/architecture/adr/ADR-0009-ncm-isolated-local-process.md"
+ADR_0013 = (
+    REPO
+    / "product/architecture/adr/ADR-0013-daemon-shutdown-touch-point-expansion.md"
+)
 
 
 class FoundationalAdrsTest(unittest.TestCase):
@@ -94,6 +98,57 @@ class FoundationalAdrsTest(unittest.TestCase):
                 errors,
             )
         return errors
+
+    def cap_revision_document_errors(self, text: str) -> list[str]:
+        checker_module = runpy.run_path(
+            str(CHECKER), run_name="foundational_adr_checker"
+        )
+        decision = copy.deepcopy(self.decision(self.document, "ADR-0013"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            target = repo / decision["path"]
+            target.parent.mkdir(parents=True)
+            target.write_text(text, encoding="utf-8")
+            errors: list[str] = []
+            checker_module["validate_adr_files"](
+                repo,
+                {"ADR-0013": decision},
+                errors,
+            )
+        return errors
+
+    def test_daemon_shutdown_cap_adr_cannot_be_dropped(self) -> None:
+        document = copy.deepcopy(self.document)
+        document["decisions"] = [
+            row for row in document["decisions"] if row["id"] != "ADR-0013"
+        ]
+        self.assert_rejected(document, "foundational ADRs missing: ['ADR-0013']")
+
+    def test_cap_adr_must_keep_the_numbers_it_approved(self) -> None:
+        text = ADR_0013.read_text(encoding="utf-8")
+        self.assertEqual(self.cap_revision_document_errors(text), [])
+        weakened = text.replace(
+            "Approved max changed lines: `320`",
+            "Approved max changed lines: `900`",
+        )
+        self.assertNotEqual(weakened, text)
+        self.assertIn(
+            "ADR-0013 is missing required phrase 'Approved max changed lines: `320`'",
+            self.cap_revision_document_errors(weakened),
+        )
+
+    def test_cap_adr_must_keep_the_adr_0011_sequencing_rule(self) -> None:
+        text = ADR_0013.read_text(encoding="utf-8")
+        weakened = text.replace(
+            "ADR-0011 invariant 2 is upheld rather than amended",
+            "ADR-0011 invariant 2 is relaxed for touch-point-local caps",
+        )
+        self.assertNotEqual(weakened, text)
+        self.assertIn(
+            "ADR-0013 is missing required phrase "
+            "'ADR-0011 invariant 2 is upheld rather than amended'",
+            self.cap_revision_document_errors(weakened),
+        )
 
     def test_real_repository_adr_set_is_valid(self) -> None:
         result = self.run_checker()

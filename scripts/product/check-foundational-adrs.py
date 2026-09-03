@@ -23,6 +23,8 @@ EXPECTED_DECISIONS = {
     "ADR-0010": "native_provider_parity_projection",
     "ADR-0011": "patch_footprint_revision_v2",
     "ADR-0012": "configuration_registry_additive_settings",
+    "ADR-0013": "daemon_shutdown_touch_point_expansion",
+    "ADR-0014": "host_hook_ingest_footprint_revision_v3",
 }
 
 EXPECTED_PATHS = {
@@ -38,6 +40,8 @@ EXPECTED_PATHS = {
     "ADR-0010": "product/architecture/adr/ADR-0010-native-provider-parity-projection.md",
     "ADR-0011": "product/architecture/adr/ADR-0011-patch-footprint-revision-v2.md",
     "ADR-0012": "product/architecture/adr/ADR-0012-configuration-registry-additive-settings.md",
+    "ADR-0013": "product/architecture/adr/ADR-0013-daemon-shutdown-touch-point-expansion.md",
+    "ADR-0014": "product/architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md",
 }
 
 EXPECTED_STATUSES = {
@@ -53,6 +57,8 @@ EXPECTED_STATUSES = {
     "ADR-0010": "accepted",
     "ADR-0011": "accepted",
     "ADR-0012": "accepted",
+    "ADR-0013": "accepted",
+    "ADR-0014": "accepted",
 }
 
 REQUIRED_SECTIONS = [
@@ -110,6 +116,24 @@ REQUIRED_GLOBAL_PHRASES = {
         "Unmapped upstream-owned edits",
         "Every current upstream existing-file diff",
         "never force-update",
+    ],
+    "ADR-0013": [
+        "never bundled into the change that exceeds the previous cap.",
+        "ADR-0011 invariant 2 is upheld rather than amended",
+        "crates/tracedecay-daemon-service/src/invocation/types.rs",
+        "## Touch-point cap revision",
+        "Previous max changed lines: `287`",
+        "Approved max changed lines: `320`",
+    ],
+    "ADR-0014": [
+        "never bundled into the change that exceeds the previous cap",
+        "| upstream existing production files | 34 | 37 | 37 | 0% |",
+        "| total upstream changed lines | 3300 | 3500 | 3393 | 3.2% |",
+        "| exception-zone files without ADR/policy revision | 2 | 4 | 4 | 0% |",
+        "3393 total upstream changed lines",
+        "`host_hook_ingest` touch point is capped at 3 files and 200 changed",
+        "`host_specific_adapters` zone keeps its `forbidden` default",
+        "crates/tracedecay-cli/tests/product_memory_provider_*.rs",
     ],
     "ADR-0009": [
         "supervised isolated local process",

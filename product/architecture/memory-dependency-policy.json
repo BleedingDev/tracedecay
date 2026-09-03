@@ -163,7 +163,8 @@
       ],
       "allowed_dev_dependencies": [
         "tokio",
-        "tracedecay-domain"
+        "tracedecay-domain",
+        "tracedecay-memory-conformance"
       ],
       "allowed_dependency_features": {
         "chrono": [
@@ -179,7 +180,10 @@
         "thiserror": [],
         "tiktoken-rs": [],
         "tokio": [
-          "rt"
+          "macros",
+          "rt",
+          "sync",
+          "time"
         ],
         "tracedecay-application": [],
         "tracedecay-memory-fabric": [],
@@ -191,7 +195,7 @@
         "tokio",
         "tracedecay-application"
       ],
-      "reason": "The default-off composition registry is the one product-owned crate allowed to construct the Native adapter behind the provider-neutral fabric, and since the cognitive-recall route was mounted it also owns rank-final recall admission. Every production edge carries an exact reviewed feature set, so no feature arrives unreviewed: chrono is std-only with no clock feature, so the crate has no ambient clock and the host clock stays injected through tracedecay-application; serde and serde_json encode the canonical recall request and decode the provider reply at the boundary; sha2 and hex bind request and candidate digests; thiserror types the failures; getrandom draws only the per-handshake challenge nonce; and tokio is admitted at `rt` only, with its use pinned by the source contract to spawn_blocking on an explicitly invoked recall and to the per-recall cancellation bridge. tracedecay-application supplies port traits and value types only. That crate is NOT capability-free -- it mounts a gix historical-blob reader behind its optional native-git feature, and the production root enables that feature, so Cargo feature unification puts the reader in scope for every consumer in the root graph no matter what this edge requests. The manifest feature pins therefore only stop this crate from asking for a capability feature itself; the real bound is the source contract, which admits exactly the reviewed CognitiveRecall* port and value paths, the two error types, the cancellation signal, the resolved scope, and the clock helper, and refuses NativeHistoricalBlobReaderV1 and every other item. tracedecay-domain is a test-only identity-fixture edge and is never compiled into the shipped registry. The registry still constructs no store, session store, code index, host, transport, or root-crate type: the rusqlite admission ledger and the exact-scope authority are owned by the daemon composition root and injected through the RecallAdmissionObserver and ExactScopeBinding traits. tiktoken-rs is the canonical context tokenizer: the context-pack compiler measures every token budget as an exact o200k_base BPE count under the same estimator identity the coding-memory conformance baseline records admitted-context costs with, its vendored ranks are compile-time data, and it opens no file, socket, process, or store."
+      "reason": "The default-off composition registry is the one product-owned crate allowed to construct the Native adapter behind the provider-neutral fabric, and since the cognitive-recall route was mounted it also owns rank-final recall admission. Every production edge carries an exact reviewed feature set, so no feature arrives unreviewed: chrono is std-only with no clock feature, so the crate has no ambient clock and the host clock stays injected through tracedecay-application; serde and serde_json encode the canonical recall request and decode the provider reply at the boundary; sha2 and hex bind request and candidate digests; thiserror types the failures; getrandom draws only the per-handshake challenge nonce; and tokio is admitted at `macros`, `rt`, `sync`, and `time` only, with its use pinned by the source contract to the per-recall cancellation bridge (`rt`), the one-shot handoff the host execution boundary answers its caller through (`sync`), the per-invocation deadline that boundary enforces on a synchronous provider (`time`), and the one biased race that boundary settles worker completion, caller cancellation, and the deadline in (`macros`, a proc-macro feature that adds no runtime capability). No executor feature that could run provider work here is admitted: the crate spawns nothing itself, and the worker every provider call runs on is supplied by the composition root through ProviderWorkerSpawnV1. tracedecay-application supplies port traits and value types only. That crate is NOT capability-free -- it mounts a gix historical-blob reader behind its optional native-git feature, and the production root enables that feature, so Cargo feature unification puts the reader in scope for every consumer in the root graph no matter what this edge requests. The manifest feature pins therefore only stop this crate from asking for a capability feature itself; the real bound is the source contract, which admits exactly the reviewed CognitiveRecall* port and value paths, the two error types, the cancellation signal, the resolved scope, and the clock helper, and refuses NativeHistoricalBlobReaderV1 and every other item. tracedecay-domain is a test-only identity-fixture edge and is never compiled into the shipped registry. The registry still constructs no store, session store, code index, host, transport, or root-crate type: the rusqlite admission ledger and the exact-scope authority are owned by the daemon composition root and injected through the RecallAdmissionObserver and ExactScopeBinding traits. tiktoken-rs is the canonical context tokenizer: the context-pack compiler measures every token budget as an exact o200k_base BPE count under the same estimator identity the coding-memory conformance baseline records admitted-context costs with, its vendored ranks are compile-time data, and it opens no file, socket, process, or store."
     },
     {
       "package": "tracedecay-application",
@@ -317,7 +321,7 @@
   "source_contracts": [
     {
       "package": "tracedecay-memory-provider-registry",
-      "reason": "A manifest allowlist cannot bound this crate. Cargo unifies features per compiled crate instance, tracedecay-application mounts a gix historical-blob reader behind its optional native-git feature, and crates/tracedecay/Cargo.toml enables that feature in the production root graph. The registry links against that one compiled instance, so NativeHistoricalBlobReaderV1 is in scope for it whatever its own manifest requests, and `default-features = false` on its edge cannot change that. The exact import allowlist below is the enforcement that actually holds: the registry may name the CognitiveRecall port and value types, the application contract and clock error types, the cancellation signal, the resolved scope, and the clock helper, and nothing else. Every unlisted item -- the gix reader first among them -- is refused. tokio is admitted for exactly four items and its two executor entry points are pinned to the reviewed call sites, so no new task-spawning or blocking-offload site can appear anywhere in this crate without review; combined with the checker's forbidden-symbol floor (no runtime constructor, OS thread, process, filesystem, socket, embedded store, HTTP stack, or git object store may be named at all) this is what keeps a feature-on/provider-disabled host from acquiring background work.",
+      "reason": "A manifest allowlist cannot bound this crate. Cargo unifies features per compiled crate instance, tracedecay-application mounts a gix historical-blob reader behind its optional native-git feature, and crates/tracedecay/Cargo.toml enables that feature in the production root graph. The registry links against that one compiled instance, so NativeHistoricalBlobReaderV1 is in scope for it whatever its own manifest requests, and `default-features = false` on its edge cannot change that. The exact import allowlist below is the enforcement that actually holds: the registry may name the CognitiveRecall port and value types, the application contract and clock error types, the cancellation signal, the resolved scope, and the clock helper, and nothing else. Every unlisted item -- the gix reader first among them -- is refused. tokio is admitted for exactly six items and its one remaining executor entry point is pinned to the reviewed call site, so no new task-spawning or blocking-offload site can appear anywhere in this crate without review; combined with the checker's forbidden-symbol floor (no runtime constructor, OS thread, process, filesystem, socket, embedded store, HTTP stack, or git object store may be named at all) this is what keeps a feature-on/provider-disabled host from acquiring background work. Executor reach is narrower than before: the crate no longer runs provider work on a shared blocking pool, because a blocking-pool task that outlives its deadline keeps a pooled slot and holds runtime shutdown open. tokio::task::spawn_blocking and its JoinError are therefore withdrawn, and the worker each synchronous provider call runs on is supplied by the composition root through ProviderWorkerSpawnV1 -- so the OS thread capability stays in the host process, where the FORBIDDEN_SOURCE_SYMBOL_FLOOR keeps it out of this crate. tokio::sync::oneshot, tokio::time::sleep, and tokio::select are the handoff, the per-invocation deadline timer, and the one biased race that settles worker completion, caller cancellation, and that deadline against each other; none of the three can start work. tokio::time::timeout is withdrawn: a timeout wrapper can only observe the deadline, and observing the deadline alone is what let a caller that had already withdrawn keep waiting for a provider that ignores its token.",
       "allowed_imports": {
         "tracedecay_application": [
           "tracedecay_application::ApplicationContractError",
@@ -335,18 +339,17 @@
           "tracedecay_application::memory::CognitiveRecallResult"
         ],
         "tokio": [
+          "tokio::select",
           "tokio::spawn",
-          "tokio::task::JoinError",
+          "tokio::sync::oneshot::Sender",
+          "tokio::sync::oneshot::channel",
           "tokio::task::JoinHandle",
-          "tokio::task::spawn_blocking"
+          "tokio::time::sleep"
         ]
       },
       "executor_call_sites": {
         "tokio::spawn": [
           "recall_port.rs::bridge_cancellation"
-        ],
-        "tokio::task::spawn_blocking": [
-          "recall_port.rs::recall_uncounted"
         ]
       }
     }
@@ -463,9 +466,10 @@
         "tracedecay-memory-provider-native"
       ],
       "allowed_dev_dependencies": [
-        "tracedecay-domain"
+        "tracedecay-domain",
+        "tracedecay-memory-conformance"
       ],
-      "reason": "The composition registry may construct only the provider-neutral fabric and the Native adapter, and may adapt provider-neutral and application-owned contract types; it may never depend on, construct, or reach a store, session store, code index, host, transport, another concrete provider, or the root crate. Every shipped TraceDecay edge is an exact reviewed name with a stated job: tracedecay-memory-fabric and tracedecay-memory-provider-api are the provider-neutral contracts it composes, tracedecay-memory-provider-native is the one concrete adapter it is allowed to construct, and tracedecay-application contributes port traits and value types only -- bounded by the registry's source contract, because that crate carries an optional gix reader that Cargo unification makes visible in the production root regardless of this edge's feature request. tracedecay-domain is admitted as a test-only value fixture edge and is not compiled into the shipped crate. The bare root crate name and everything else under tracedecay-*, ncm*, and ocean* stays fail-closed."
+      "reason": "The composition registry may construct only the provider-neutral fabric and the Native adapter, and may adapt provider-neutral and application-owned contract types; it may never depend on, construct, or reach a store, session store, code index, host, transport, another concrete provider, or the root crate. Every shipped TraceDecay edge is an exact reviewed name with a stated job: tracedecay-memory-fabric and tracedecay-memory-provider-api are the provider-neutral contracts it composes, tracedecay-memory-provider-native is the one concrete adapter it is allowed to construct, and tracedecay-application contributes port traits and value types only -- bounded by the registry's source contract, because that crate carries an optional gix reader that Cargo unification makes visible in the production root regardless of this edge's feature request. tracedecay-domain is admitted as a test-only value fixture edge and is not compiled into the shipped crate. tracedecay-memory-conformance is admitted on the same test-only footing, and for the same reason it is admitted for the NCM adapter: it is provider-neutral, depends only on the provider API, constructs no adapter of its own, and supplies the adversarial provider double the mounted recall and observation-delivery paths are judged against, so containment is proven against one shared misbehaving provider instead of per-test stubs. It is a dev-dependency only and never reaches the shipped crate. The bare root crate name and everything else under tracedecay-*, ncm*, and ocean* stays fail-closed."
     },
     {
       "id": "application-contract-crate-capability-closure",

@@ -159,6 +159,7 @@ def base_policy() -> dict[str, Any]:
         "crates/tracedecay-memory-evaluation/**",
         "crates/tracedecay/tests/product_memory_provider/**",
         "crates/tracedecay/tests/product_memory_provider_*.rs",
+        "crates/tracedecay-cli/tests/product_memory_provider_*.rs",
         "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
         "crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs",
         "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs",
@@ -166,6 +167,8 @@ def base_policy() -> dict[str, Any]:
         "crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs",
         "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs",
         "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs",
+        "crates/tracedecay/src/daemon/retained_owner/claude_host_journey_tests.rs",
+        "crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/crash_restart_fuzz.rs",
     ]
     return {
         "schema_version": 1,
