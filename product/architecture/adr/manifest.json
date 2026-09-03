@@ -424,6 +424,29 @@
         "ADR-0013",
         "ADR-0014"
       ]
+    },
+    {
+      "id": "ADR-0016",
+      "topic": "daemon_shutdown_receipt_ordering_headroom",
+      "title": "Approve the daemon shutdown touch point at eight files and 420 changed lines",
+      "path": "product/architecture/adr/ADR-0016-daemon-shutdown-receipt-ordering-headroom.md",
+      "status": "accepted",
+      "decision_summary": "Supersede only ADR-0015 as the approving decision for daemon_shutdown_deadline, retain 8 files, and add only the exact types_tests.rs allowlist path and raise its line cap from 360 to 420 against a measured 8 files and 416 lines so the deterministic supersession receipt-ordering regression can land. Root commits this policy slice before the implementation slice; every aggregate cap and patch-footprint.v3 remain unchanged.",
+      "required_rejections": [
+        "Increase the file cap",
+        "Raise an aggregate cap or advance the policy revision",
+        "Fold authorization into the implementation commit"
+      ],
+      "verification_beads": [
+        "tdmem-0105",
+        "tdmem-0404",
+        "tdmem-1204"
+      ],
+      "depends_on_adrs": [
+        "ADR-0008",
+        "ADR-0011",
+        "ADR-0015"
+      ]
     }
   ]
 }

@@ -21,6 +21,10 @@ ADR_0013 = (
     REPO
     / "product/architecture/adr/ADR-0013-daemon-shutdown-touch-point-expansion.md"
 )
+ADR_0016 = (
+    REPO
+    / "product/architecture/adr/ADR-0016-daemon-shutdown-receipt-ordering-headroom.md"
+)
 
 
 class FoundationalAdrsTest(unittest.TestCase):
@@ -99,11 +103,13 @@ class FoundationalAdrsTest(unittest.TestCase):
             )
         return errors
 
-    def cap_revision_document_errors(self, text: str) -> list[str]:
+    def cap_revision_document_errors(
+        self, text: str, decision_id: str = "ADR-0013"
+    ) -> list[str]:
         checker_module = runpy.run_path(
             str(CHECKER), run_name="foundational_adr_checker"
         )
-        decision = copy.deepcopy(self.decision(self.document, "ADR-0013"))
+        decision = copy.deepcopy(self.decision(self.document, decision_id))
         with tempfile.TemporaryDirectory() as temp_dir:
             repo = Path(temp_dir)
             target = repo / decision["path"]
@@ -112,7 +118,7 @@ class FoundationalAdrsTest(unittest.TestCase):
             errors: list[str] = []
             checker_module["validate_adr_files"](
                 repo,
-                {"ADR-0013": decision},
+                {decision_id: decision},
                 errors,
             )
         return errors
@@ -148,6 +154,18 @@ class FoundationalAdrsTest(unittest.TestCase):
             "ADR-0013 is missing required phrase "
             "'ADR-0011 invariant 2 is upheld rather than amended'",
             self.cap_revision_document_errors(weakened),
+        )
+
+    def test_receipt_ordering_cap_adr_keeps_exact_measurement_and_order(self) -> None:
+        text = ADR_0016.read_text(encoding="utf-8")
+        self.assertEqual(self.cap_revision_document_errors(text, "ADR-0016"), [])
+        weakened = text.replace(
+            "Measured changed lines: `416`", "Measured changed lines: `400`"
+        )
+        self.assertNotEqual(weakened, text)
+        self.assertIn(
+            "ADR-0016 is missing required phrase 'Measured changed lines: `416`'",
+            self.cap_revision_document_errors(weakened, "ADR-0016"),
         )
 
     def test_real_repository_adr_set_is_valid(self) -> None:

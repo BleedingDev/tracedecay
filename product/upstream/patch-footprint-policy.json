@@ -121,15 +121,16 @@
         "propagate one caller-supplied absolute deadline through daemon shutdown layers",
         "bound blocking drain work by the caller deadline's remaining budget",
         "report Failed for incomplete shutdown while completing terminal teardown",
-        "make the shutdown call chain's own unit tests assert the fence through an observable effect of begin_shutdown instead of a fixed number of scheduler yields"
+        "make the shutdown call chain's own unit tests assert the fence through an observable effect of begin_shutdown instead of a fixed number of scheduler yields",
+        "settle superseded hook work truthfully before emitting its receipt terminal, with deterministic coverage of work that outlives the abort deadline"
       ],
       "cap_revision": {
-        "adr": "product/architecture/adr/ADR-0015-daemon-shutdown-test-fence-and-supersession-headroom.md",
-        "measured_changed_lines": 329,
-        "measured_files": 7,
+        "adr": "product/architecture/adr/ADR-0016-daemon-shutdown-receipt-ordering-headroom.md",
+        "measured_changed_lines": 416,
+        "measured_files": 8,
         "policy_revision": "patch-footprint.v3",
-        "previous_max_changed_lines": 320,
-        "previous_max_files": 6
+        "previous_max_changed_lines": 360,
+        "previous_max_files": 8
       },
       "category": "shutdown",
       "forbidden_changes": [
@@ -140,7 +141,7 @@
         "weakening a shutdown assertion, or replacing a bounded wait on an observable shutdown effect with a sleep, a yield count, or a lock-contention probe"
       ],
       "id": "daemon_shutdown_deadline",
-      "max_changed_lines": 360,
+      "max_changed_lines": 420,
       "max_files": 8,
       "paths": [
         "crates/tracedecay/src/daemon/bootstrap.rs",
@@ -149,6 +150,7 @@
         "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
         "crates/tracedecay-daemon-service/src/invocation/types.rs",
         "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/types_tests.rs",
         "crates/tracedecay/src/daemon/invocation_tests/lsp_lease_tests.rs",
         "crates/tracedecay/src/daemon/invocation_tests/lsp_tests.rs",
         "crates/tracedecay/src/daemon/invocation_tests/project_lifecycle_tests.rs"
@@ -156,7 +158,8 @@
       "required_verification": [
         "blocking drain deadline regression test",
         "exhausted runtime deadline regression test",
-        "feature ownership shutdown journey"
+        "feature ownership shutdown journey",
+        "superseded blocking hook work receipt-ordering regression test"
       ]
     },
     {
@@ -682,7 +685,7 @@
     "notes": [
       "Revision patch-footprint.v2 is approved by product/architecture/adr/ADR-0011-patch-footprint-revision-v2.md: every cap equals the M4 observation-journey mount, M5 cognitive-recall port, Native configuration registration, and session-sync exact-scope footprint measured at that revision's tree plus at most roughly fifteen percent headroom. Per-entry line_budget values in the convergence map remain the binding limit for an individual file.",
       "Revision patch-footprint.v3 is approved by product/architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md: it carries every v2 cap forward unchanged except the three the Claude Code host hook ingest journey moves - upstream existing production files 34 -> 37, total upstream changed lines 3300 -> 3500, and exception-zone files 2 -> 4 - each set from the footprint measured at this revision's tree (37 production files, 3393 total changed lines, 4 exception-zone files) plus at most roughly fifteen percent headroom.",
-      "ADR-0015 supersedes ADR-0013 as the approving decision for the daemon_shutdown_deadline touch point, raising it to 8 files and 360 changed lines against a measured 7 files and 329 lines and admitting the shutdown call chain's own invocation_tests paths. It changes no aggregate cap: max_upstream_existing_test_or_fixture_files stays 9 against a measured 8.",
+      "ADR-0016 supersedes only ADR-0015 as the approving decision for the daemon_shutdown_deadline touch point, retaining 8 files and raising only its line cap from 360 to 420 against a measured 8 files and 416 lines for the deterministic types_tests.rs supersession receipt-ordering regression. Root commits this policy slice before the implementation slice. It changes no aggregate cap and keeps patch-footprint.v3.",
       "Added files under product_owned_paths are excluded from the upstream footprint totals.",
       "Renaming or copying an upstream file counts as touching the destination and source.",
       "Changed lines are additions plus deletions from git numstat against the immutable upstream floor.",

@@ -26,6 +26,7 @@ EXPECTED_DECISIONS = {
     "ADR-0013": "daemon_shutdown_touch_point_expansion",
     "ADR-0014": "host_hook_ingest_footprint_revision_v3",
     "ADR-0015": "daemon_shutdown_test_fence_and_supersession_headroom",
+    "ADR-0016": "daemon_shutdown_receipt_ordering_headroom",
 }
 
 EXPECTED_PATHS = {
@@ -47,6 +48,10 @@ EXPECTED_PATHS = {
         "product/architecture/adr/"
         "ADR-0015-daemon-shutdown-test-fence-and-supersession-headroom.md"
     ),
+    "ADR-0016": (
+        "product/architecture/adr/"
+        "ADR-0016-daemon-shutdown-receipt-ordering-headroom.md"
+    ),
 }
 
 EXPECTED_STATUSES = {
@@ -65,6 +70,7 @@ EXPECTED_STATUSES = {
     "ADR-0013": "accepted",
     "ADR-0014": "accepted",
     "ADR-0015": "accepted",
+    "ADR-0016": "accepted",
 }
 
 REQUIRED_SECTIONS = [
@@ -150,6 +156,18 @@ REQUIRED_GLOBAL_PHRASES = {
         "Policy revision: `patch-footprint.v3`",
         "No aggregate cap changes",
         "crates/tracedecay/src/daemon/invocation_tests/lsp_lease_tests.rs",
+    ],
+    "ADR-0016": [
+        "## Touch-point cap revision",
+        "Previous max files: `8`",
+        "Previous max changed lines: `360`",
+        "Approved max files: `8`",
+        "Approved max changed lines: `420`",
+        "Measured files: `8`",
+        "Measured changed lines: `416`",
+        "Policy revision: `patch-footprint.v3`",
+        "Root will commit this policy slice before the implementation slice",
+        "Every aggregate cap",
     ],
     "ADR-0009": [
         "supervised isolated local process",

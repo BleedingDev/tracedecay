@@ -1777,7 +1777,7 @@ class PatchFootprintPolicyTest(unittest.TestCase):
                 "daemon_shutdown_deadline",
                 approval,
                 approved,
-                {"measured_files": 7, "measured_changed_lines": 329},
+                {"measured_files": 8, "measured_changed_lines": 416},
                 errors,
             )
         return errors
@@ -1787,8 +1787,8 @@ class PatchFootprintPolicyTest(unittest.TestCase):
             ("max_files", 9, "daemon_shutdown_deadline.max_files must be 8"),
             (
                 "max_changed_lines",
-                400,
-                "daemon_shutdown_deadline.max_changed_lines must be 360",
+                440,
+                "daemon_shutdown_deadline.max_changed_lines must be 420",
             ),
         ):
             with self.subTest(cap=cap):
@@ -1808,10 +1808,10 @@ class PatchFootprintPolicyTest(unittest.TestCase):
         policy = copy.deepcopy(self.policy)
         self.touch_point(policy, "daemon_shutdown_deadline")["cap_revision"][
             "previous_max_changed_lines"
-        ] = 287
+        ] = 320
         self.assert_rejected(
             "daemon_shutdown_deadline.cap_revision.previous_max_changed_lines "
-            "must be 320",
+            "must be 360",
             policy=policy,
         )
 
@@ -1842,7 +1842,7 @@ class PatchFootprintPolicyTest(unittest.TestCase):
             "measured_changed_lines"
         ] = 200
         self.assert_rejected(
-            "daemon_shutdown_deadline cap 360 exceeds its measurement 200 by more "
+            "daemon_shutdown_deadline cap 420 exceeds its measurement 200 by more "
             "than the ~15% headroom ADR-0011 allows",
             policy=policy,
         )
@@ -1850,54 +1850,54 @@ class PatchFootprintPolicyTest(unittest.TestCase):
     def test_cap_revision_adr_must_bind_and_grant_the_exact_numbers(self) -> None:
         faithful = textwrap.dedent(
             """\
-            # ADR-0015: Cap revision
+            # ADR-0016: Cap revision
 
             ## Touch-point cap revision
 
             - Touch point: `daemon_shutdown_deadline`
-            - Previous max files: `6`
-            - Previous max changed lines: `320`
+            - Previous max files: `8`
+            - Previous max changed lines: `360`
             - Approved max files: `8`
-            - Approved max changed lines: `360`
-            - Measured files: `7`
-            - Measured changed lines: `329`
+            - Approved max changed lines: `420`
+            - Measured files: `8`
+            - Measured changed lines: `416`
             - Policy revision: `patch-footprint.v3`
 
             ## Decision
 
             We approve the daemon_shutdown_deadline touch point at eight files
-            and 360 changed lines so the shutdown fence assertion can be made
-            literal.
+            and 420 changed lines so the receipt-ordering regression can land
+            after this policy authorization.
             """
         )
         self.assertEqual(self.cap_revision_adr_errors(faithful), [])
 
         overstated = faithful.replace(
-            "Approved max changed lines: `360`",
+            "Approved max changed lines: `420`",
             "Approved max changed lines: `900`",
         )
         self.assertIn(
             "daemon_shutdown_deadline.cap_revision ADR approved max changed lines "
-            "binding must be exactly '360'",
+            "binding must be exactly '420'",
             self.cap_revision_adr_errors(overstated),
         )
 
         stale_measurement = faithful.replace(
-            "Measured changed lines: `329`",
+            "Measured changed lines: `416`",
             "Measured changed lines: `120`",
         )
         self.assertIn(
             "daemon_shutdown_deadline.cap_revision ADR measured changed lines "
-            "binding must be exactly '329'",
+            "binding must be exactly '416'",
             self.cap_revision_adr_errors(stale_measurement),
         )
 
         merely_discussed = faithful.replace(
             "We approve the daemon_shutdown_deadline touch point at eight files\n"
-            "and 360 changed lines so the shutdown fence assertion can be made\n"
-            "literal.",
-            "The daemon_shutdown_deadline touch point would need eight files if\n"
-            "the shutdown fence assertion were to be made literal.",
+            "and 420 changed lines so the receipt-ordering regression can land\n"
+            "after this policy authorization.",
+            "The daemon_shutdown_deadline touch point would need 420 lines if\n"
+            "the receipt-ordering regression were to land.",
         )
         self.assertIn(
             "daemon_shutdown_deadline.cap_revision ADR decision must explicitly "
