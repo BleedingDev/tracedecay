@@ -653,6 +653,17 @@ fn candidate_wire_shape_is_closed() {
     extra["provider_private"] = json!(true);
     assert!(serde_json::from_value::<RecallCandidateV1>(extra).is_err());
 
+    let mut missing_native_score_field =
+        candidate_value("missing-score", "x", scope.clone(), current_validity());
+    missing_native_score_field
+        .as_object_mut()
+        .expect("candidate object")
+        .remove("native_score");
+    assert!(
+        serde_json::from_value::<RecallCandidateV1>(missing_native_score_field).is_err(),
+        "native_score must be present even when its value is explicitly null"
+    );
+
     let mut missing_validity_field =
         candidate_value("missing", "x", scope.clone(), current_validity());
     missing_validity_field["validity"]

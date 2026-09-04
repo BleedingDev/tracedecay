@@ -420,7 +420,8 @@ pub struct CognitiveRecallAdmittedOutcomeV1 {
     pub result: CognitiveRecallResult,
     /// The admitted candidates in the host's common candidate space: the
     /// provider's native score and explanation retained verbatim alongside a
-    /// separately labelled, deterministic host relevance. `None` when the lane
+    /// separately labelled, deterministic host relevance and explicit host
+    /// confidence evidence. `None` when the lane
     /// degraded before any provider outcome existed.
     pub normalization: Option<RecallNormalizationV1>,
     /// The host selection receipt over [`Self::normalization`]: which

@@ -94,9 +94,10 @@ pub use recall_explain_trace::{
 pub use recall_normalization::{
     HOST_NORMALIZATION_POLICY_ID, HOST_NORMALIZATION_POLICY_REVISION, HostNormalizedScoreV1,
     MAX_SCORE_COMPONENTS, NativeScoreDefect, NativeScoreV1, NormalizationUnavailableReason,
-    NormalizedRecallCandidateV1, RecallNormalizationError, RecallNormalizationPolicyV1,
-    RecallNormalizationV1, RecallRelevanceV1, ScoreCalibrationEvidence, ScoreCalibrationState,
-    ScoreDirection, ValidatedNativeScoreV1, normalize_admitted_candidates, normalize_native_score,
+    NormalizedRecallCandidateV1, RecallConfidenceUnavailableReason, RecallConfidenceV1,
+    RecallNormalizationError, RecallNormalizationPolicyV1, RecallNormalizationV1,
+    RecallRelevanceV1, ScoreCalibrationEvidence, ScoreCalibrationState, ScoreDirection,
+    ValidatedNativeScoreV1, normalize_admitted_candidates, normalize_native_score,
     validate_native_score,
 };
 pub use recall_port::{

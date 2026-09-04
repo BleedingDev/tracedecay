@@ -231,6 +231,9 @@ pub struct RecallFixturePort {
     /// outcome, so a test can exercise host normalization over the real
     /// fabric, adapter, and port path.
     pub native_score_overrides: std::collections::BTreeMap<String, Value>,
+    /// Replaces the stable provider reference of named candidates in the
+    /// mixed outcome, including with `null` to exercise explicit absence.
+    pub stable_memory_ref_overrides: std::collections::BTreeMap<String, Value>,
     /// Replaces the whole candidate list with `(candidate_id, content)` pairs,
     /// every one of them in-scope and current, so a test can drive the real
     /// fabric, adapter, and port path with a candidate stream of its own
@@ -247,6 +250,7 @@ impl RecallFixturePort {
             outcome_request_identity: None,
             terminal_code: TerminalCode::Success,
             native_score_overrides: std::collections::BTreeMap::new(),
+            stable_memory_ref_overrides: std::collections::BTreeMap::new(),
             candidate_contents: None,
         }
     }
@@ -264,6 +268,9 @@ impl RecallFixturePort {
                     .to_owned();
                 if let Some(score) = self.native_score_overrides.get(&id) {
                     candidate["native_score"] = score.clone();
+                }
+                if let Some(stable_memory_ref) = self.stable_memory_ref_overrides.get(&id) {
+                    candidate["stable_memory_ref"] = stable_memory_ref.clone();
                 }
             }
         }

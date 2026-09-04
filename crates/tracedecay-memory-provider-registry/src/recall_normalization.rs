@@ -35,7 +35,9 @@
 //! neutral value. They are denied at admission
 //! ([`crate::recall_admission::RecallDenialReason::NativeScoreMalformed`]), so
 //! a candidate whose relevance cannot be established honestly can never reach
-//! advisory content.
+//! advisory content. A provider's missing confidence is represented separately
+//! in the normalized common candidate space and never manufactured from a
+//! native score.
 
 use std::collections::BTreeMap;
 
@@ -53,7 +55,7 @@ pub const HOST_NORMALIZATION_POLICY_ID: &str =
 
 /// Revision of [`HOST_NORMALIZATION_POLICY_ID`]. Any change to the projection,
 /// rounding, ordering, or evidence rules must increment this.
-pub const HOST_NORMALIZATION_POLICY_REVISION: u64 = 1;
+pub const HOST_NORMALIZATION_POLICY_REVISION: u64 = 2;
 
 /// Decimal places of every emitted normalized value.
 const NORMALIZED_SCALE: u32 = 6;
@@ -420,12 +422,23 @@ impl Default for RecallNormalizationPolicyV1 {
 
 impl RecallNormalizationPolicyV1 {
     /// The declared-range linear policy pinned at `revision`.
-    #[must_use]
-    pub const fn declared_range_linear(revision: u64) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecallNormalizationError::UnsupportedPolicyRevision`] when
+    /// `revision` does not identify the evidence rules implemented here.
+    pub const fn declared_range_linear(revision: u64) -> Result<Self, RecallNormalizationError> {
+        if revision != HOST_NORMALIZATION_POLICY_REVISION {
+            return Err(RecallNormalizationError::UnsupportedPolicyRevision {
+                policy_id: HOST_NORMALIZATION_POLICY_ID,
+                requested_revision: revision,
+                supported_revision: HOST_NORMALIZATION_POLICY_REVISION,
+            });
+        }
+        Ok(Self {
             policy_id: HOST_NORMALIZATION_POLICY_ID,
             policy_revision: revision,
-        }
+        })
     }
 
     /// Policy identity carried on every value it produces.
@@ -441,10 +454,38 @@ impl RecallNormalizationPolicyV1 {
     }
 }
 
+/// Evidence that the host can or cannot make a confidence claim about a
+/// normalized relevance.
+///
+/// Confidence is candidate evidence, not a value inferred from score
+/// calibration or declared-range projection. The accepted provider recall
+/// contract currently carries no candidate confidence datum, so normalized
+/// candidates preserve that absence explicitly.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallConfidenceUnavailableReason {
+    /// The provider candidate carried no explicit confidence datum.
+    NotProvided,
+}
+
+/// Host confidence evidence for one normalized candidate.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RecallConfidenceV1 {
+    /// The normalized candidate has no confidence claim.
+    ///
+    /// The accepted v1 provider recall candidate has no confidence field, so
+    /// every candidate currently occupies this explicit absence state.
+    Unavailable {
+        /// Why confidence is unavailable.
+        reason: RecallConfidenceUnavailableReason,
+    },
+}
+
 /// One admitted candidate in the host's common candidate space.
 ///
 /// The native score and the provider explanation are retained verbatim
-/// alongside the separately labelled host relevance.
+/// alongside the separately labelled host relevance and confidence evidence.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NormalizedRecallCandidateV1 {
     /// Request-scoped candidate identity.
@@ -460,6 +501,9 @@ pub struct NormalizedRecallCandidateV1 {
     pub native_score: NativeScoreV1,
     /// Separately labelled host relevance.
     pub relevance: RecallRelevanceV1,
+    /// Explicit candidate confidence state. Score calibration and range span
+    /// never manufacture confidence when the provider supplied no datum.
+    pub confidence: RecallConfidenceV1,
     /// Provider explanation summary, retained as evidence. Absence is
     /// supported.
     pub explanation_summary: Option<String>,
@@ -509,6 +553,19 @@ impl RecallNormalizationV1 {
 /// Failure of normalizing one admitted recall reply.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RecallNormalizationError {
+    /// The caller requested a policy revision whose evidence rules are not
+    /// implemented by this host.
+    #[error(
+        "normalization policy {policy_id} revision {requested_revision} is unsupported; supported revision is {supported_revision}"
+    )]
+    UnsupportedPolicyRevision {
+        /// Policy whose revision was requested.
+        policy_id: &'static str,
+        /// Revision requested by the caller.
+        requested_revision: u64,
+        /// Revision whose behavior this host implements.
+        supported_revision: u64,
+    },
     /// An admitted candidate carried a native score the host cannot project.
     /// Admission rejects such candidates, so reaching this is a host-internal
     /// inconsistency rather than a provider fault; it is reported instead of
@@ -526,10 +583,11 @@ pub enum RecallNormalizationError {
 ///
 /// The returned set is ordered by host relevance, not by provider order:
 /// normalized candidates come first in descending normalized value with
-/// candidate id as the UTF-8 byte tie-breaker, and candidates whose relevance
-/// could not be normalized follow in provider order. Provider order is
-/// preserved as [`NormalizedRecallCandidateV1::provider_rank`] so the
-/// reordering is always explainable.
+/// candidate id as the UTF-8 byte tie-breaker, and candidates whose
+/// relevance could not be normalized follow in provider order. Provider order
+/// is preserved as
+/// [`NormalizedRecallCandidateV1::provider_rank`] so the reordering is always
+/// explainable.
 ///
 /// # Errors
 ///
@@ -548,12 +606,16 @@ pub fn normalize_admitted_candidates(
     for (provider_rank, entry) in admitted.iter().enumerate() {
         let candidate = entry.candidate();
         let score = entry.native_score();
+        let native_score_sha256 = entry.native_score_sha256();
         let units =
             projected_units(score).map_err(|defect| RecallNormalizationError::NativeScore {
                 candidate_id: candidate.candidate_id.clone(),
                 defect,
             })?;
-        let relevance = relevance_from_units(policy, score, entry.native_score_sha256(), units);
+        let relevance = relevance_from_units(policy, score, native_score_sha256, units);
+        let confidence = RecallConfidenceV1::Unavailable {
+            reason: RecallConfidenceUnavailableReason::NotProvided,
+        };
         let key = match units {
             Some(units) => {
                 if !ScoreCalibrationEvidence::from_state(score.calibration_state)
@@ -582,6 +644,7 @@ pub fn normalize_admitted_candidates(
                 provider_rank,
                 native_score: score.clone(),
                 relevance,
+                confidence,
                 explanation_summary: explanation_summary(&candidate.explanation),
                 scope_binding: entry.scope_binding(),
                 host_temporal_state: entry.host_temporal_state(),
@@ -607,7 +670,6 @@ pub fn normalize_admitted_candidates(
             unnormalizable_domains.join(", ")
         ));
     }
-
     Ok(RecallNormalizationV1 {
         normalization_policy_id: policy.policy_id().to_owned(),
         normalization_policy_revision: policy.policy_revision(),

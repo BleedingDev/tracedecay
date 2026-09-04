@@ -23,10 +23,12 @@ use tracedecay_memory_provider_api::{OwnedExactScope, OwnedProviderId};
 use tracedecay_memory_provider_registry::{
     ActiveRoutingPolicy, CognitiveRecallPortInputsV1, EnabledProviderMode, ExactScopeBinding,
     ExactScopeBindingError, FabricConfig, FallbackRule, HOST_NORMALIZATION_POLICY_ID,
-    NATIVE_PROVIDER_ID, NativeProviderActivation, NativeScoreDefect, NativeScoreV1,
-    NormalizationUnavailableReason, ProjectCognitiveRecallPortV1, ProjectMemoryProviderComposition,
-    ProviderLimits, RecallAdmissionAuditError, RecallAdmissionObserver, RecallAdmissionReport,
-    RecallCandidateV1, RecallDenialReason, RecallNormalizationPolicyV1, RecallRelevanceV1,
+    HOST_NORMALIZATION_POLICY_REVISION, NATIVE_PROVIDER_ID, NativeProviderActivation,
+    NativeScoreDefect, NativeScoreV1, NormalizationUnavailableReason, ProjectCognitiveRecallPortV1,
+    ProjectMemoryProviderComposition, ProviderLimits, RecallAdmissionAuditError,
+    RecallAdmissionObserver, RecallAdmissionReport, RecallCandidateV1,
+    RecallConfidenceUnavailableReason, RecallConfidenceV1, RecallDenialReason,
+    RecallNormalizationError, RecallNormalizationPolicyV1, RecallRelevanceV1,
     ScoreCalibrationEvidence, admit_recall_candidates, normalize_admitted_candidates,
 };
 
@@ -165,16 +167,36 @@ fn normalization_projects_the_declared_range_exactly_and_deterministically()
             normalized.normalization_policy_id,
             HOST_NORMALIZATION_POLICY_ID
         );
-        assert_eq!(normalized.normalization_policy_revision, 1);
+        assert_eq!(normalized.normalization_policy_revision, 2);
     }
     Ok(())
 }
 
-/// A pinned policy revision travels onto every value it produced, so a stored
-/// normalized score can always be traced to the configuration that made it.
+/// The default policy revision is pinned whenever normalization evidence rules
+/// change, including the rule that score calibration cannot create confidence.
 #[test]
-fn every_normalized_value_carries_the_policy_revision_that_produced_it()
--> Result<(), Box<dyn Error>> {
+fn default_policy_revision_pins_candidate_confidence_evidence_rules() {
+    assert_eq!(HOST_NORMALIZATION_POLICY_REVISION, 2);
+    assert_eq!(
+        RecallNormalizationPolicyV1::default().policy_revision(),
+        HOST_NORMALIZATION_POLICY_REVISION
+    );
+}
+
+/// Only the revision whose evidence rules are implemented may be mounted.
+/// In particular, revision 1 cannot falsely label output produced with the
+/// current revision 2 confidence semantics.
+#[test]
+fn unsupported_revision_cannot_label_current_evidence_rules() -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        RecallNormalizationPolicyV1::declared_range_linear(1),
+        Err(RecallNormalizationError::UnsupportedPolicyRevision {
+            policy_id: HOST_NORMALIZATION_POLICY_ID,
+            requested_revision: 1,
+            supported_revision: HOST_NORMALIZATION_POLICY_REVISION,
+        })
+    );
+
     let admission = admit_recall_candidates(
         &admitted_scope(),
         "request",
@@ -182,16 +204,21 @@ fn every_normalized_value_carries_the_policy_revision_that_produced_it()
         &authorized_exact(),
         vec![scored_candidate("only", unit_score("0.5"))],
     )?;
-    let normalization = normalize_admitted_candidates(
-        RecallNormalizationPolicyV1::declared_range_linear(7),
-        &admission.admitted,
-    )?;
-    assert_eq!(normalization.normalization_policy_revision, 7);
+    let policy =
+        RecallNormalizationPolicyV1::declared_range_linear(HOST_NORMALIZATION_POLICY_REVISION)?;
+    let normalization = normalize_admitted_candidates(policy, &admission.admitted)?;
+    assert_eq!(
+        normalization.normalization_policy_revision,
+        HOST_NORMALIZATION_POLICY_REVISION
+    );
     let normalized = normalization.candidates[0]
         .relevance
         .normalized()
         .expect("normalized relevance");
-    assert_eq!(normalized.normalization_policy_revision, 7);
+    assert_eq!(
+        normalized.normalization_policy_revision,
+        HOST_NORMALIZATION_POLICY_REVISION
+    );
     Ok(())
 }
 
@@ -229,6 +256,13 @@ fn the_native_score_and_explanation_stay_visible_beside_the_host_value()
     assert_eq!(normalized_low.native_score, declared_low);
     assert_eq!(normalized_high.native_score, declared_high);
     assert_eq!(normalized_low.native_score.raw_value, "0.25");
+    assert_eq!(
+        normalized_low.confidence,
+        RecallConfidenceV1::Unavailable {
+            reason: RecallConfidenceUnavailableReason::NotProvided,
+        },
+        "calibrated native scores must not manufacture candidate confidence"
+    );
     assert_eq!(
         normalized_low.explanation_summary.as_deref(),
         Some("fixture match")
@@ -420,9 +454,9 @@ fn non_finite_and_malformed_native_scores_are_denied_at_admission() -> Result<()
 }
 
 /// Structurally broken score records — an absent score, a missing required
-/// field, an unknown field, an unknown enum value, an over-long component
-/// map, and an over-precise decimal — are denied too, so a provider cannot
-/// smuggle an uninterpretable relevance past the host.
+/// field, an unknown field, an unknown enum value, an over-long component map,
+/// and an over-precise decimal — are denied, while an omitted candidate score
+/// field remains a wire-shape error.
 #[test]
 fn structurally_invalid_native_scores_are_denied_at_admission() -> Result<(), Box<dyn Error>> {
     let mut over_precise = unit_score("0.1234567890123");
@@ -441,6 +475,20 @@ fn structurally_invalid_native_scores_are_denied_at_admission() -> Result<(), Bo
         .remove("calibration_state");
     let mut unknown_direction = unit_score("0.5");
     unknown_direction["direction"] = json!("closest_is_better");
+    let mut omitted_native_score = candidate_value(
+        "omitted-native-score",
+        "content of omitted-native-score",
+        scope_value(&admitted_scope()),
+        current_validity(),
+    );
+    omitted_native_score
+        .as_object_mut()
+        .expect("candidate object")
+        .remove("native_score");
+    assert!(
+        serde_json::from_value::<RecallCandidateV1>(omitted_native_score).is_err(),
+        "omitting native_score must remain a wire-shape error"
+    );
     let mut blank_domain = unit_score("0.5");
     blank_domain["score_domain_id"] = json!("");
 
@@ -521,6 +569,12 @@ fn absent_stable_reference_and_absent_calibration_are_supported() -> Result<(), 
     let candidate = normalization.candidate("sparse").expect("sparse candidate");
     assert!(candidate.stable_memory_ref.is_none());
     assert!(candidate.explanation_summary.is_none());
+    assert_eq!(
+        candidate.confidence,
+        RecallConfidenceV1::Unavailable {
+            reason: RecallConfidenceUnavailableReason::NotProvided,
+        }
+    );
     let normalized = candidate
         .relevance
         .normalized()
@@ -576,6 +630,12 @@ fn a_degenerate_declared_range_retains_the_native_score_without_a_value()
     );
     let flat = normalization.candidate("flat").expect("flat candidate");
     assert_eq!(flat.native_score.raw_value, "2");
+    assert_eq!(
+        flat.confidence,
+        RecallConfidenceV1::Unavailable {
+            reason: RecallConfidenceUnavailableReason::NotProvided,
+        }
+    );
     let RecallRelevanceV1::Unavailable {
         reason, warnings, ..
     } = &flat.relevance
@@ -587,7 +647,10 @@ fn a_degenerate_declared_range_retains_the_native_score_without_a_value()
         NormalizationUnavailableReason::DegenerateDeclaredRange
     );
     assert!(!warnings.is_empty());
-    assert!(!flat.relevance.input_native_score_digest().is_empty());
+    assert!(
+        !flat.relevance.input_native_score_digest().is_empty(),
+        "a retained native score has a digest"
+    );
     assert!(!normalization.cross_provider_ordering_admissible);
     Ok(())
 }
@@ -763,6 +826,55 @@ async fn the_mounted_port_delivers_candidates_in_host_normalized_order() {
         "the provider's own score must survive the reordering"
     );
     assert_eq!(normalization.host_order().collect::<Vec<_>>(), vec![1, 0]);
+}
+
+/// The mounted path preserves an explicit absence of provider calibration and
+/// an absent stable reference. The native score remains required and visible,
+/// while host confidence is unavailable instead of being filled with a default.
+#[tokio::test]
+async fn the_mounted_port_preserves_missing_confidence_and_stable_reference() {
+    let mut provider = RecallFixturePort::new();
+    provider.native_score_overrides.insert(
+        "in-scope-1".to_owned(),
+        score("0.9", "0", "1", "lower_is_better", "uncalibrated"),
+    );
+    provider
+        .stable_memory_ref_overrides
+        .insert("in-scope-1".to_owned(), Value::Null);
+    let observer = Arc::new(LedgerObserver::default());
+    let port = mount_port(Arc::new(provider), observer);
+
+    let cancellation = cancellation_signal();
+    let outcome = port
+        .recall_admitted(port_request(), &cancellation)
+        .await
+        .expect("bridged recall");
+
+    assert_eq!(
+        delivered_ids(&outcome.result),
+        vec!["in-scope-2", "in-scope-1"]
+    );
+    let normalization = outcome.normalization.expect("normalization evidence");
+    let candidate = normalization
+        .candidate("in-scope-1")
+        .expect("candidate with missing confidence");
+    assert!(candidate.stable_memory_ref.is_none());
+    assert_eq!(candidate.native_score.raw_value, "0.9");
+    assert_eq!(
+        candidate.confidence,
+        RecallConfidenceV1::Unavailable {
+            reason: RecallConfidenceUnavailableReason::NotProvided,
+        }
+    );
+    assert_eq!(
+        candidate
+            .relevance
+            .normalized()
+            .expect("declared-range relevance")
+            .normalized_value,
+        "0.100000"
+    );
+    assert!(!normalization.cross_provider_ordering_admissible);
 }
 
 /// A non-finite provider score is denied on the mounted path: the candidate
