@@ -35,7 +35,15 @@ struct DispatchedToolCall {
 }
 
 struct RoutedToolCall {
+    /// The handler's declared business arguments: the caller's arguments with
+    /// route-only metadata removed, so a strictly decoded request schema sees
+    /// only fields it declares.
     arguments: Value,
+    /// The routing/advisory identity view of this call — the sanitized
+    /// arguments as they arrived, before route-only metadata was stripped.
+    /// `None` when nothing identity-bearing was stripped, in which case
+    /// [`Self::arguments`] is already that view.
+    route_identity_arguments: Option<Value>,
     selected_project: Option<crate::mcp::project_route::ResolvedProjectRoute>,
     selected_server: Option<Arc<McpServer>>,
 }
@@ -378,7 +386,14 @@ impl McpServer {
                 &mut connection.route_cache,
             ))
             .await;
-            return None;
+            // Ordinary JSON-RPC notifications remain response-free. The shipped
+            // host notifier sends a request id and waits for this acknowledgement
+            // so it cannot close the socket while daemon profile/project binding
+            // is still racing peer disconnect, before the private route is stored.
+            return request
+                .id
+                .clone()
+                .map(|id| JsonRpcResponse::success(id, json!({ "processed": true })));
         }
         if matches!(classify_mcp_method(&request.method), McpMethod::Cancelled) {
             self.record_request_accounting(&request.method, false);

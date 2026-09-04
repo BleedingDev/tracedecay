@@ -15,7 +15,11 @@
 //! 3. the shipped project transcript import commits those Claude messages as
 //!    canonical observations, and the mounted observation journey admits them
 //!    into the durable journal and settles them against Native exactly once;
-//! 4. a later `tracedecay_context` call carrying the same host session id
+//! 4. the host publishes that session's workspace route through the shipped
+//!    `tracedecay/hookEvent` notification -- the only writer of the daemon's
+//!    private route cache, and the precondition for any call that names an
+//!    explicit session identity;
+//! 5. a later `tracedecay_context` call carrying the same host session id
 //!    receives the advisory provider-memory lane, bounded and de-duplicated.
 //!
 //! What this module deliberately does **not** claim is hook *causality*. The
@@ -23,17 +27,18 @@
 //! proves settlement and recall, not that a hook invocation caused them. The
 //! causal proof -- an empty journal, a transcript written only after the
 //! project is mounted, and then the shipped `tracedecay
-//! hook-claude-session-start` binary invoked as a subprocess with Claude
-//! Code's own payload on stdin -- lives in
+//! hook-claude-session-start` and `tracedecay hook-stop` binaries invoked as
+//! subprocesses with Claude Code's own payloads on stdin -- lives in
 //! `crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs`,
 //! where a real daemon and a real binary are available to drive it.
 //!
 //! Two more journeys live beside it:
 //! [`the_advisory_lane_is_additive_and_never_costs_the_claude_host_its_own_answer`]
 //! holds the fail-open property -- a healthy route answers and a genuinely
-//! broken provider degrades in a typed state that names its routed provider,
-//! and in both cases the host answer keeps every section a dormant
-//! composition produced -- and
+//! failing provider degrades in a typed state that names its routed provider,
+//! with the two answers taken from one composition at one source revision so
+//! their host sections are compared for exact equality, and both still keep
+//! every section a dormant composition produced -- and
 //! [`the_shipped_claude_bundle_stages_hooks_and_registers_project_rules_without_disturbing_operator_state`]
 //! holds the bundle-staging property. Deployed *registration* through the
 //! Claude CLI -- install, re-install, update, deactivate, undo, and rollback
@@ -44,18 +49,25 @@
 //! resolved scope rather than re-derived.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-
 use tracedecay_domain::configuration::{
     ConfigurationIdempotencyKey, ConfigurationLayerIdV1, ConfigurationRevisionId,
     ConfigurationValueV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
     MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, SettingKey,
 };
 use tracedecay_domain::{ProjectId, UserProfileId};
+use tracedecay_memory_provider_registry::{
+    HandshakeRequest, HandshakeResponse, NativeMemoryApplicationPort, NativeObservation,
+    ProviderCall, ProviderDescriptor, ProviderReply, TerminalCode, TerminalRecord,
+};
 
+use super::journey_journal_inspection::{
+    ACKNOWLEDGED_DELIVERY_STATE, journal_digest, journal_row_identities, open_journal,
+};
 use super::{JOURNAL_FILE_NAME, SESSION_MESSAGE_OBSERVATION_KIND, exact_scope_for_session};
 use crate::daemon::production_harness::ProductionProjectCompositionHarnessV1;
 
@@ -68,10 +80,15 @@ const CLAUDE_SESSION: &str = "claude-memory-journey-session";
 /// all has something to answer with.
 const JOURNEY_TERM: &str = "quicksilver";
 
-/// How long the journey waits for the durable journal to settle. The journey
-/// runs a bounded background delivery worker, so this is a convergence bound,
-/// never a sleep: the loop exits as soon as the row is terminal.
-const SETTLEMENT_BUDGET: Duration = Duration::from_secs(30);
+/// The assistant message's final phrase, proving recall returns the complete
+/// committed content rather than only its matching prefix.
+const TAIL_SENTINEL: &str = "pinned deadline";
+
+/// How many deliveries this journey's transcript must produce: the observation
+/// journey admits one `session.message_committed.v1` per committed session
+/// message, and [`write_claude_transcript`] writes exactly one user record and
+/// one assistant record.
+const EXPECTED_SESSION_MESSAGE_ROWS: usize = 2;
 
 fn git(root: &Path, arguments: &[&str]) {
     let program = tracedecay_runtime_core::git::try_git_program()
@@ -284,34 +301,6 @@ async fn configuration_set(
     );
 }
 
-/// Every row the durable observation journal holds, as
-/// `(observation_kind, exact_scope_sha256, delivery_state, attempts)`.
-fn journal_rows(journal_path: &Path) -> Vec<(String, String, String, i64)> {
-    if !journal_path.exists() {
-        return Vec::new();
-    }
-    let connection = rusqlite::Connection::open(journal_path).expect("open observation journal");
-    let mut statement = connection
-        .prepare(
-            "SELECT observation_kind, exact_scope_sha256, delivery_state, attempts \
-             FROM tdmem_observation_journal_v1 ORDER BY rowid",
-        )
-        .expect("prepare journal read");
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })
-        .expect("query journal rows")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("read journal rows");
-    rows
-}
-
 /// Runs the shipped project transcript import — the same
 /// `SessionSyncCommandV1::ImportTranscripts` pass the daemon's session-sync
 /// worker runs — and returns how many session messages it committed.
@@ -331,23 +320,60 @@ async fn import_project_transcripts(
     serde_json::from_str(&text).unwrap_or(Value::Null)
 }
 
-/// Waits, bounded, for the journal to hold at least one terminal row.
-async fn await_journal_settlement(journal_path: &Path) -> Vec<(String, String, String, i64)> {
-    let deadline = Instant::now() + SETTLEMENT_BUDGET;
-    loop {
-        let rows = journal_rows(journal_path);
-        if !rows.is_empty()
-            && rows
-                .iter()
-                .all(|(_, _, state, _)| matches!(state.as_str(), "acknowledged" | "rejected"))
-        {
-            return rows;
-        }
-        if Instant::now() >= deadline {
-            return rows;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+/// Publishes this host session's workspace route the shipped way: the
+/// acknowledged `tracedecay/hookEvent` request a Claude Code lifecycle hook
+/// sends the daemon, carrying the session's structural identity and workspace.
+///
+/// This is a *precondition* of the recall below, not an extra claim. A
+/// registered-project reader whose arguments carry an explicit session or
+/// thread identity fails closed when that identity has no registered private
+/// project route (`crates/tracedecay/src/mcp/server/requests/tool_dispatch.rs`,
+/// `route_tool_arguments`) -- deliberately, so one host's session can never
+/// inherit the workspace another connection happened to open. The recall is
+/// bound to `CLAUDE_SESSION` by exactly that explicit identity
+/// (`cognitive_recall::advisory_session_binding`), so the route a real Claude
+/// Code session publishes must exist before the call, and
+/// `McpServer::update_hook_workspace_route` is the only thing that publishes
+/// one.
+///
+/// It commits nothing: a `sessionStart` event plans a branch sync
+/// (`hook_events::plan_session_start_hook_event`), so the journey's only
+/// commit driver is still the administrative transcript import above, and this
+/// module's "no hook causality" claim is untouched.
+async fn publish_claude_host_session_route(
+    harness: &ProductionProjectCompositionHarnessV1,
+    project: &Path,
+) {
+    let event = tracedecay_hooks::DaemonHookEvent::session_start(
+        tracedecay_hooks::HookAgent::Claude,
+        project.to_path_buf(),
+    )
+    .with_route(Some(tracedecay_hooks::HookRouteMetadata {
+        session_id: Some(CLAUDE_SESSION.to_owned()),
+        thread_id: None,
+        cwd: Some(project.to_path_buf()),
+        worktree: Some(project.to_path_buf()),
+        branch: tracedecay_runtime_core::branch::current_branch(project),
+    }));
+    let request_id = json!("hook-event-route-v1");
+    let request = tracedecay_mcp::JsonRpcRequest {
+        jsonrpc: "2.0".to_owned(),
+        id: Some(request_id.clone()),
+        method: tracedecay_hooks::HOOK_EVENT_METHOD.to_owned(),
+        params: Some(serde_json::to_value(event).expect("the hook event serializes")),
+    };
+    let response = harness
+        .server(project)
+        .expect("project server")
+        .handle_request(&request)
+        .await
+        .expect("the acknowledged hook request returns after route publication");
+    assert_eq!(response.id, request_id);
+    assert!(
+        response.error.is_none(),
+        "hook acknowledgement failed: {response:?}"
+    );
+    assert_eq!(response.result, Some(json!({ "processed": true })));
 }
 
 /// The advisory provider-memory lane of one `tracedecay_context` answer, or
@@ -538,9 +564,9 @@ fn expected_exact_scope_sha256(
 ///
 /// The commit here is driven by the shipped administrative transcript import,
 /// so this test claims settlement and recall -- not hook causality. The
-/// causal proof that a real `tracedecay hook-claude-session-start`
-/// invocation is what puts the message in the journal is the subprocess
-/// journey in
+/// causal proof that real `tracedecay hook-claude-session-start` and
+/// `tracedecay hook-stop` invocations are what put the messages in the journal
+/// is the subprocess journey in
 /// `crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_committed_claude_session_message_settles_once_and_a_later_context_call_recalls_it_bounded()
@@ -566,6 +592,7 @@ async fn a_committed_claude_session_message_settles_once_and_a_later_context_cal
         "an enabled composition must mount the durable observation journal at {}",
         journal_path.display()
     );
+    let journal = open_journal(&journal_path);
 
     // 1. The shipped transcript import commits the host's session messages as
     //    canonical observations for this project. Its own reported outcome is
@@ -581,43 +608,79 @@ async fn a_committed_claude_session_message_settles_once_and_a_later_context_cal
 
     // 2. The mounted journey admits every committed message and settles it
     //    against Native exactly once.
-    let rows = await_journal_settlement(&journal_path).await;
-    assert!(
-        !rows.is_empty(),
-        "a committed Claude session message must reach the durable observation journal"
+    let rows = journal
+        .await_settlement(EXPECTED_SESSION_MESSAGE_ROWS)
+        .await;
+    assert_eq!(
+        rows.len(),
+        EXPECTED_SESSION_MESSAGE_ROWS,
+        "the transcript's two committed session messages must produce exactly two deliveries: \
+         {:?}",
+        journal_digest(&rows)
     );
     let expected_scope = expected_exact_scope_sha256(&project, &project_id, &profile_id);
-    for (kind, scope_sha256, state, attempts) in &rows {
+    for row in &rows {
         assert_eq!(
-            kind, SESSION_MESSAGE_OBSERVATION_KIND,
+            row.observation_kind, SESSION_MESSAGE_OBSERVATION_KIND,
             "the journey admits exactly the session-message observation kind"
         );
         assert_eq!(
-            scope_sha256, &expected_scope,
+            row.exact_scope_sha256, expected_scope,
             "every journal row must carry this project's exact worktree-bound scope"
         );
         assert_eq!(
-            state, "acknowledged",
+            row.state, ACKNOWLEDGED_DELIVERY_STATE,
             "Native accepts session messages, so the row settles acknowledged"
         );
         assert_eq!(
-            *attempts, 1,
+            row.attempt_number, 1,
             "an accepted observation is delivered once, never retried"
         );
+        assert!(
+            row.content_present,
+            "a settled delivery still holds its content until retention takes it: {:?}",
+            journal_digest(&rows)
+        );
     }
-
-    // 3. Re-running the same import is idempotent: the journal does not grow,
-    //    because the idempotency key is content-derived.
-    let settled = rows.len();
-    let _ = import_project_transcripts(&harness, &project).await;
-    let replayed = await_journal_settlement(&journal_path).await;
+    // Two *distinct* messages, not the same one journalled twice: the source
+    // positions the journey admitted must differ.
+    let mut sequences = rows
+        .iter()
+        .map(|row| row.source_sequence)
+        .collect::<Vec<_>>();
+    sequences.sort_unstable();
+    sequences.dedup();
     assert_eq!(
-        replayed.len(),
-        settled,
-        "replaying the same transcript must not duplicate journal rows"
+        sequences.len(),
+        EXPECTED_SESSION_MESSAGE_ROWS,
+        "each committed message occupies its own source position: {:?}",
+        journal_digest(&rows)
     );
 
-    // 4. A later context call naming the same host session receives the
+    // 3. Re-running the same import is idempotent: the journal holds the same
+    //    rows, by identity, because the idempotency key is content-derived.
+    //    The import call is synchronous, so anything it admitted is already in
+    //    the journal by the time it returns.
+    let settled = journal_row_identities(&rows);
+    let _ = import_project_transcripts(&harness, &project).await;
+    let replayed = journal
+        .await_settlement(EXPECTED_SESSION_MESSAGE_ROWS)
+        .await;
+    assert_eq!(
+        journal_row_identities(&replayed),
+        settled,
+        "replaying the same transcript must reproduce exactly the same deliveries, by \
+         observation identity, payload digest and attempt count: {:?}",
+        journal_digest(&replayed)
+    );
+
+    // 4. The host publishes this session's workspace route, exactly as a
+    //    Claude Code lifecycle hook does. Without it the next call's explicit
+    //    session identity has no registered private project route and the
+    //    daemon refuses it, which is the guard working, not the journey.
+    publish_claude_host_session_route(&harness, &project).await;
+
+    // 5. A later context call naming the same host session receives the
     //    advisory provider-memory lane, bounded by the lane's own budget.
     let (answer, lane) = context_advisory_lane(
         &harness,
@@ -653,6 +716,14 @@ async fn a_committed_claude_session_message_settles_once_and_a_later_context_cal
         total,
         "recall candidates must be de-duplicated: {lane}"
     );
+    assert!(
+        candidates.iter().any(|candidate| {
+            candidate["content"].as_str().is_some_and(|content| {
+                content.contains(JOURNEY_TERM) && content.contains(TAIL_SENTINEL)
+            })
+        }),
+        "the advisory lane must recall the assistant message whole, tail included: {lane}"
+    );
 
     harness.shutdown().await;
 }
@@ -662,10 +733,14 @@ async fn a_committed_claude_session_message_settles_once_and_a_later_context_cal
 /// host section away from it, and whatever the lane terminates as, it says so
 /// in a typed state that names the provider its route pinned.
 ///
-/// Both halves are exercised on one composition: first a healthy route, then
-/// the same route with the Native provider's staged-observation store dropped
-/// out from under it, which drives a genuine `ProviderUnavailable` terminal
-/// through the production recall path.
+/// Both halves are exercised on **one** composition, at **one** source
+/// revision, and are separated by nothing but a boolean the routed provider
+/// itself reads: the composition mounts a caller-owned provider that delegates
+/// every operation to the production Native port until it is asked to fail,
+/// and then answers recall with a `ProviderUnavailable` terminal. Because the
+/// healthy and degraded answers come from the same mount and the same
+/// checkout, their host sections may be compared for *exact* equality rather
+/// than for mere survival.
 ///
 /// Real defect this catches: an advisory lane that rewrites, truncates, or
 /// replaces the canonical answer -- the failure mode that makes provider
@@ -707,14 +782,28 @@ async fn the_advisory_lane_is_additive_and_never_costs_the_claude_host_its_own_a
     dormant.shutdown().await;
     commit_claude_session_source_edit(&project);
 
-    // The same task, put to a composition with the provider host mounted.
-    let harness = ProductionProjectCompositionHarnessV1::open(isolation.path(), [project.clone()])
+    // The same task, put to a composition with the provider host mounted --
+    // and with the caller's own provider behind the real Native adapter. The
+    // configuration gates, the routing policy, the registration revision and
+    // `NativeProvider::new`'s descriptor validation are all untouched: the only
+    // substituted thing is the value of the application port this composition
+    // root already injects.
+    let recall_unavailable = Arc::new(AtomicBool::new(false));
+    let harness = {
+        let recall_unavailable = Arc::clone(&recall_unavailable);
+        ProductionProjectCompositionHarnessV1::open_with_native_application_port_interposition(
+            isolation.path(),
+            [project.clone()],
+            Arc::new(move |production_port| {
+                Arc::new(AdversarialRecallPortV1 {
+                    inner: production_port,
+                    recall_unavailable: Arc::clone(&recall_unavailable),
+                }) as Arc<dyn NativeMemoryApplicationPort>
+            }),
+        )
         .await
-        .expect("production composition with the memory provider host mounted");
-    let data_root = harness
-        .project_data_root(&project)
-        .await
-        .expect("project data root");
+        .expect("production composition with the memory provider host mounted")
+    };
     // The ordinary agent call: no structural session identity in `_meta`, which
     // is what every real `tracedecay_context` call from an agent looks like.
     // The lane binds it to the MCP connection the request identity was minted
@@ -750,17 +839,14 @@ async fn the_advisory_lane_is_additive_and_never_costs_the_claude_host_its_own_a
     // Fail-open: mounting the route cost the host answer nothing at all.
     assert_host_sections_survive(&baseline, &unbound_answer);
 
-    // Now break the provider for real, at the one place a Native recall
-    // cannot route around: its own staged-observation store. Nothing test-only
-    // is reached for -- the file is dropped out from under the *running*
-    // provider through a second sqlite connection, which is exactly what a
-    // corrupted or evicted store looks like to it. The recall path then takes
-    // `NativeReadFailure::StagedStoreUnavailable`
-    // (`native_provider.rs`, "a store that cannot be read fails the recall
-    // rather than silently answering with facts alone"), which the provider
-    // reports as `TerminalCode::ProviderUnavailable` and the recall port
-    // classifies as `CognitiveRecallDegradation::Unavailable`.
-    break_native_staged_observation_store(&data_root);
+    // Now the routed provider fails, and nothing else changes: the same
+    // composition, the same mount, the same registration revision, the same
+    // checkout, the same task, no restart and no source edit in between. The
+    // provider answers recall with `TerminalCode::ProviderUnavailable`, which
+    // the fabric carries as the reply's terminal, the Native adapter passes
+    // through, and the recall port classifies as
+    // `CognitiveRecallDegradation::Unavailable`.
+    recall_unavailable.store(true, Ordering::SeqCst);
 
     let (degraded_answer, degraded_lane) =
         context_advisory_lane(&harness, &project, &task, None).await;
@@ -790,45 +876,114 @@ async fn the_advisory_lane_is_additive_and_never_costs_the_claude_host_its_own_a
     );
     assert_eq!(
         degraded_lane["degradation"], "unavailable",
-        "an unreadable Native staged store must surface as the typed `unavailable` \
-         degradation, never as a silently empty healthy lane: {degraded_lane}"
+        "a provider that answers recall with `ProviderUnavailable` must surface as the typed \
+         `unavailable` degradation, never as a silently empty healthy lane: {degraded_lane}"
     );
     assert_eq!(
         degraded_lane["candidates"].as_array().map(Vec::len),
         Some(0),
         "a failed recall must contribute no candidates: {degraded_lane}"
     );
-    // The whole point: the host paid nothing for the provider's failure.
+    // The whole point, stated exactly. Same composition, same source revision:
+    // every host section must be identical in type *and* width between the
+    // healthy answer and the degraded one. A lane that hollowed out, retyped,
+    // shortened or dropped any host section on the provider's failure is
+    // caught here, and so is one that quietly added a section.
+    assert_eq!(
+        host_section_shapes(&degraded_answer),
+        host_section_shapes(&unbound_answer),
+        "a provider failure must cost the host answer nothing at all: healthy={unbound_answer} \
+         degraded={degraded_answer}"
+    );
+    // And both still carry everything the dormant control produced.
     assert_host_sections_survive(&baseline, &degraded_answer);
 
     harness.shutdown().await;
 }
 
-/// Drops the table the Native provider's staged-observation store reads,
-/// out from under the running provider.
+/// A caller-owned Native application port that delegates every operation to
+/// the production port the composition built, until it is told to fail recall.
 ///
-/// This is a fault injected into the provider's *own* durable state through
-/// an ordinary second sqlite connection -- no production seam is widened and
-/// no test-only port is added. The provider holds its connection open, so the
-/// next recall re-prepares against a schema that no longer has the table and
-/// fails the read.
-fn break_native_staged_observation_store(data_root: &Path) {
-    let staged_store = super::super::native_staged_observations::staged_store_path(
-        &data_root.join(super::PROVIDER_STATE_DIR_NAME),
-    );
-    assert!(
-        staged_store.exists(),
-        "a mounted Native provider must have opened its staged store at {}",
-        staged_store.display()
-    );
-    let connection =
-        rusqlite::Connection::open(&staged_store).expect("open the staged observation store");
-    connection
-        .busy_timeout(Duration::from_secs(10))
-        .expect("staged store busy timeout");
-    connection
-        .execute_batch("DROP TABLE tdmem_native_staged_observation_v1;")
-        .expect("drop the staged observation table");
+/// This is the provider boundary the fail-open contract exists for. Nothing
+/// about the mount is weakened to admit it: it declares the production
+/// descriptor, so `NativeProvider::new` validates exactly what it validates
+/// for the real port, the fabric registers it under the same revision, and the
+/// recall route reaches it through the same policy. What it can do that the
+/// real port cannot is fail *on demand*, at one operation, without touching
+/// the provider's own durable state -- which is what makes the healthy and
+/// degraded answers comparable for exact equality.
+struct AdversarialRecallPortV1 {
+    inner: Arc<dyn NativeMemoryApplicationPort>,
+    recall_unavailable: Arc<AtomicBool>,
+}
+
+impl NativeMemoryApplicationPort for AdversarialRecallPortV1 {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        self.inner.handshake(request)
+    }
+
+    fn health(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.health(call)
+    }
+
+    fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
+        self.inner.observe(observation)
+    }
+
+    fn recall(&self, call: &ProviderCall) -> ProviderReply {
+        if !self.recall_unavailable.load(Ordering::SeqCst) {
+            return self.inner.recall(call);
+        }
+        // A provider-owned terminal, built the way any provider builds one it
+        // could not dispatch: no payload, no effect, no fallback authority.
+        ProviderReply {
+            terminal: TerminalRecord::failure_before_dispatch_for_call(
+                TerminalCode::ProviderUnavailable,
+                call,
+                "journey.adversarial_recall_unavailable",
+            ),
+            payload: None,
+            warnings: Vec::new(),
+            extensions: Vec::new(),
+            state_generation: call.expected_state_generation,
+        }
+    }
+
+    fn feedback(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.feedback(call)
+    }
+
+    fn maintenance(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.maintenance(call)
+    }
+
+    fn inspection(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.inspection(call)
+    }
+
+    fn correction(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.correction(call)
+    }
+
+    fn delete_by_source(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.delete_by_source(call)
+    }
+
+    fn snapshot_export(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.snapshot_export(call)
+    }
+
+    fn snapshot_restore(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.snapshot_restore(call)
+    }
+
+    fn replay(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.replay(call)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -5998,8 +5998,13 @@ mod tests {
              content: {advisory:?}"
         );
         assert_eq!(advisory.provider_id(), NATIVE_PROVIDER_ID);
+        // The caller's slice is 120 ms and the lane's outer net is that slice
+        // plus a fixed 250 ms grace, so every honest path is back inside half a
+        // second. A ceiling of one second is therefore loose enough never to
+        // flake and tight enough that waiting the 30-second stall out -- or
+        // anything close to it -- fails here (`tdmem-sz9` acceptance).
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
+            elapsed < std::time::Duration::from_secs(1),
             "the lane returned only after {elapsed:?}, so the stalled provider was still \
              holding the host answer"
         );
@@ -6207,8 +6212,21 @@ mod tests {
         );
 
         // 5. The route is fully usable again: a real recall answers with the
-        //    seeded candidate, proving nothing the first call held was lost.
-        let third = advisory_recall_for_test(&mount, "instanceaa-c3", 5_000_000).await;
+        //    seeded candidate, proving nothing the first call held was lost --
+        //    and it answers inside its own budget, not by outlasting it.
+        const RECOVERED_BUDGET_MICROS: i64 = 5_000_000;
+        let third_started = std::time::Instant::now();
+        let third =
+            advisory_recall_for_test(&mount, "instanceaa-c3", RECOVERED_BUDGET_MICROS).await;
+        let third_elapsed = third_started.elapsed();
+        assert!(
+            third_elapsed
+                < std::time::Duration::from_micros(
+                    u64::try_from(RECOVERED_BUDGET_MICROS).expect("positive budget")
+                ),
+            "the recall after the timed-out one took {third_elapsed:?}, which is its whole \
+             budget: capacity was not really returned"
+        );
         let AdvisoryMemoryContextV1::Answered {
             degradation,
             candidates,

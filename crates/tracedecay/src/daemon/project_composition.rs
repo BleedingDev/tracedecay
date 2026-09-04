@@ -62,18 +62,67 @@ pub(super) enum ProjectMemoryProviderActivation {
     NativeActive,
 }
 
+/// A caller-owned interposition on the Native application port one project
+/// composition mounts.
+///
+/// The composition still builds the production Native port exactly as it
+/// always does; this closure is handed *that* port and returns the value the
+/// `NativeProviderActivation::Enabled { port, .. }` field receives — the field
+/// the registry already takes by injection from this composition root. Nothing
+/// else about the mount moves: `resolve_memory_provider_activation` still
+/// decides activation from the committed configuration,
+/// `project_recall_routing_policy` still derives the route,
+/// `PROJECT_NATIVE_REGISTRATION_REVISION` is unchanged, and the registry's own
+/// adapter still validates the descriptor of whatever port comes back.
+///
+/// It exists so a journey can put a genuinely adversarial provider behind the
+/// real adapter, fabric, registry, observation journey, and recall route
+/// without weakening any of them. It is `cfg(test)`, so no shipped build can
+/// name it.
+#[cfg(all(test, feature = "memory-provider-host"))]
+pub(super) type NativeApplicationPortInterpositionV1 = Arc<
+    dyn Fn(
+            Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>,
+        ) -> Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>
+        + Send
+        + Sync,
+>;
+
 /// How one project composition decides its provider activation.
 ///
 /// Normal production has exactly one answer — read the authoritative runtime
 /// configuration — and cannot express any other. That is what keeps a compiled
 /// feature from implying activation: building with `memory-provider-host` makes
 /// the code reachable, and the configuration decides whether it runs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub(super) enum ProjectMemoryProviderActivationSelector {
     /// Resolve from the authoritative runtime configuration this open already
     /// loaded. Default-false configuration yields
     /// [`ProjectMemoryProviderActivation::Disabled`].
     FromRuntimeConfiguration,
+    /// Resolve exactly as [`Self::FromRuntimeConfiguration`] does, and hand the
+    /// production Native port through the caller's own interposition before it
+    /// is injected into the registry.
+    ///
+    /// The activation itself is *not* selectable here: this variant reads the
+    /// same committed gates as the production variant, so a harness cannot use
+    /// it to mount a host the configuration did not turn on.
+    #[cfg(all(test, feature = "memory-provider-host"))]
+    FromRuntimeConfigurationWithNativePortInterposition(NativeApplicationPortInterpositionV1),
+}
+
+/// Hand-written because the interposition is a closure: an opaque name is all
+/// a log line can honestly say about it.
+impl std::fmt::Debug for ProjectMemoryProviderActivationSelector {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FromRuntimeConfiguration => formatter.write_str("FromRuntimeConfiguration"),
+            #[cfg(all(test, feature = "memory-provider-host"))]
+            Self::FromRuntimeConfigurationWithNativePortInterposition(_) => {
+                formatter.write_str("FromRuntimeConfigurationWithNativePortInterposition(..)")
+            }
+        }
+    }
 }
 
 impl ProjectMemoryProviderActivationSelector {
@@ -86,6 +135,12 @@ impl ProjectMemoryProviderActivationSelector {
     /// output. A routing gate that names a provider the host cannot mount, or
     /// names one while the host is disabled, fails project open as a typed
     /// configuration error instead of silently degrading to Observer.
+    ///
+    /// Every variant resolves the same way. The interposing variant carries a
+    /// port decorator, never an activation, so it cannot answer anything the
+    /// committed configuration did not.
+    /// It consumes the selector, so one open resolves one activation and no
+    /// later code can re-ask the same selector for a second answer.
     fn resolve(
         self,
         runtime_configuration: &tracedecay_usecases::config::PinnedRuntimeConfiguration,
@@ -93,6 +148,23 @@ impl ProjectMemoryProviderActivationSelector {
         match self {
             Self::FromRuntimeConfiguration => {
                 resolve_memory_provider_activation(&runtime_configuration.config)
+            }
+            #[cfg(all(test, feature = "memory-provider-host"))]
+            Self::FromRuntimeConfigurationWithNativePortInterposition(_) => {
+                resolve_memory_provider_activation(&runtime_configuration.config)
+            }
+        }
+    }
+
+    /// The caller's Native port interposition, when this selector carries one.
+    #[cfg(all(test, feature = "memory-provider-host"))]
+    fn native_application_port_interposition(
+        &self,
+    ) -> Option<NativeApplicationPortInterpositionV1> {
+        match self {
+            Self::FromRuntimeConfiguration => None,
+            Self::FromRuntimeConfigurationWithNativePortInterposition(interposition) => {
+                Some(Arc::clone(interposition))
             }
         }
     }
@@ -238,6 +310,7 @@ async fn mount_project_memory_provider_host(
     cg: &Arc<crate::tracedecay::TraceDecay>,
     canonical_project_path: &Path,
     profile_id: &tracedecay_domain::UserProfileId,
+    #[cfg(test)] native_port_interposition: Option<NativeApplicationPortInterpositionV1>,
 ) -> Result<crate::mcp::server::MemoryProviderHostMount> {
     // Disabled composition constructs no port, no fabric, no adapter, and no
     // registration: the concrete provider below is built only inside the
@@ -279,6 +352,14 @@ async fn mount_project_memory_provider_host(
                         "could not construct project Native application port: {error}"
                     ),
                 })?;
+            // The production port above is what a caller-owned interposition
+            // is handed; without one the injected value is that port itself,
+            // byte for byte the production mount.
+            #[cfg(test)]
+            let port = match native_port_interposition {
+                Some(interpose) => interpose(port),
+                None => port,
+            };
             tracedecay_memory_provider_registry::NativeProviderActivation::Enabled {
                 fabric_config: tracedecay_memory_provider_registry::FabricConfig {
                     max_registered_providers: 1,
@@ -509,9 +590,16 @@ pub(super) async fn production_project_server(
 /// The selector is private to the daemon and its test harness. Normal
 /// production and every open path go through [`production_project_server`],
 /// which can only pass
-/// [`ProjectMemoryProviderActivationSelector::FromRuntimeConfiguration`]; the
-/// pinned variant exists solely so the harness can exercise an activation the
-/// configuration does not yet expose.
+/// [`ProjectMemoryProviderActivationSelector::FromRuntimeConfiguration`].
+///
+/// The other variant,
+/// `FromRuntimeConfigurationWithNativePortInterposition`, is `cfg(test)` and
+/// unconstructable in any shipped build. It resolves the activation from the
+/// same committed gates and substitutes nothing but the *value* of the Native
+/// application port this composition already injects into the registry, so a
+/// journey can put a caller-owned adversarial provider behind the real
+/// adapter, fabric, observation journey, and recall route and still be
+/// exercising the production boundary chain.
 pub(super) async fn production_project_server_with_activation(
     store_administration: &StoreAdministration,
     project_open_gates: &tokio::sync::Mutex<ProjectOpenGates>,
@@ -674,6 +762,11 @@ async fn production_project_server_inner(
         ));
     }
 
+    // Taken before the selector is consumed by its own resolution, and read
+    // beside the activation rather than instead of it: the interposition can
+    // only decorate the port an already-enabled activation constructs.
+    #[cfg(all(test, feature = "memory-provider-host"))]
+    let native_port_interposition = activation.native_application_port_interposition();
     // Resolving the activation here, from the configuration this open already
     // loaded, is what keeps `memory_provider_native_enabled` the only thing
     // that turns the host on and `memory_provider_recall_routing` the only
@@ -745,6 +838,8 @@ async fn production_project_server_inner(
         &cg,
         canonical_project_path,
         profile_identity.profile_id(),
+        #[cfg(test)]
+        native_port_interposition,
     )
     .await?;
     #[cfg(not(feature = "memory-provider-host"))]

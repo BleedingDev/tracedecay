@@ -14,11 +14,12 @@ use tracedecay::agents::host_bundle_v2::{
 
 #[path = "host_lifecycle_cli_acceptance/native_plugin_fixture.rs"]
 mod native_plugin_fixture;
-use native_plugin_fixture::{
-    apply_current_codex_plugin_remediation, remediation_command, set_claude_native_activation,
-};
+use native_plugin_fixture::set_claude_native_activation;
 #[cfg(unix)]
-use native_plugin_fixture::{install_current_claude_cli, recorded_claude_invocations};
+use native_plugin_fixture::{
+    install_current_claude_cli, install_current_codex_cli, recorded_claude_invocations,
+    recorded_codex_invocations,
+};
 
 const VERIFY_FAILURE_ENV: &str = "TRACEDECAY_TEST_FAIL_HOST_REGISTRATION_VERIFY";
 
@@ -175,6 +176,23 @@ struct IsolatedCli {
     bin_dir: PathBuf,
 }
 
+#[cfg(unix)]
+fn install_fixture_python(bin_dir: &std::path::Path) {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let python = std::env::split_paths(&inherited_path)
+        .map(|dir| dir.join("python3"))
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .and_then(|candidate| fs::canonicalize(candidate).ok())
+        .expect("the native Claude fixture requires executable python3");
+    symlink(python, bin_dir.join("python3")).unwrap();
+}
+
 impl IsolatedCli {
     fn new() -> Self {
         let home = TempDir::new().unwrap();
@@ -182,6 +200,8 @@ impl IsolatedCli {
         let profile = home.path().join(".tracedecay-test-profile");
         let bin_dir = home.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
+        #[cfg(unix)]
+        install_fixture_python(&bin_dir);
         let shim = bin_dir.join(if cfg!(windows) {
             "tracedecay.exe"
         } else {
@@ -208,11 +228,6 @@ impl IsolatedCli {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tracedecay"));
-        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
-        let path = std::env::join_paths(
-            std::iter::once(self.bin_dir.clone()).chain(std::env::split_paths(&inherited_path)),
-        )
-        .unwrap();
         command
             .args(args)
             .current_dir(self.project.path())
@@ -221,7 +236,7 @@ impl IsolatedCli {
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
             .env("TRACEDECAY_DATA_DIR", &self.profile)
             .env("TRACEDECAY_GLOBAL_DB", self.profile.join("global.db"))
-            .env("PATH", path)
+            .env("PATH", &self.bin_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -845,41 +860,69 @@ fn feedback_policy_failure_precedes_apply_and_restore_mutations() {
     assert_eq!(owned_bytes(&cli, &receipt, &originals), before_apply);
 }
 
+/// Without a stock `codex` CLI on `PATH`, `install` still stages the verified
+/// plugin source and marketplace entry (that part TraceDecay owns), but must
+/// refuse with the typed unavailable-CLI diagnosis rather than pretending
+/// activation completed, and it must not publish a lifecycle receipt or
+/// disturb the operator's own Codex config.
 #[test]
-fn codex_stale_cache_remediation_executes_on_the_current_stock_cli_and_converges_update() {
+fn codex_lifecycle_stages_source_but_refuses_activation_without_a_stock_cli() {
     let cli = IsolatedCli::new();
     let case = host_case(HostKindV1::Codex);
     let originals = seed_host(case, &cli);
 
     let staged = cli.run(&["install", "--agent", case.id]);
     assert!(!staged.status.success());
+    let stderr = String::from_utf8_lossy(&staged.stderr);
+    assert!(
+        stderr.contains("Codex host CLI is unavailable"),
+        "an absent Codex CLI must surface the typed unavailable-CLI diagnosis: {stderr}"
+    );
     assert_seeded_bytes(&cli, &originals);
     assert!(
         cli.home
             .path()
             .join(".codex/plugins/tracedecay/.codex-plugin/plugin.json")
             .is_file(),
-        "Codex remediation has no staged plugin source"
+        "Codex staging has no staged plugin source"
     );
     assert!(
         cli.home
             .path()
             .join(".agents/plugins/marketplace.json")
             .is_file(),
-        "Codex remediation has no staged marketplace entry"
+        "Codex staging has no staged marketplace entry"
     );
     assert!(
         latest_host_component_set_receipt_at(&cli.lifecycle_root(), case.host)
             .unwrap()
             .is_none(),
-        "staging Codex activation published a lifecycle receipt"
+        "an absent Codex CLI must not publish a lifecycle receipt"
     );
-    apply_current_codex_plugin_remediation(cli.home.path(), remediation_command(&staged.stderr))
-        .unwrap();
+}
+
+/// Production drives Codex's own non-interactive registry directly
+/// (`require_codex_plugin_cli` + `codex plugin add ... --json`), so install
+/// and stale-cache update must both succeed end to end through a fake but
+/// deterministic current stock CLI, with the exact invocation grammar/count
+/// asserted and the operator's foreign config and native extension preserved.
+#[cfg(unix)]
+#[test]
+fn codex_lifecycle_installs_and_updates_through_the_current_stock_cli() {
+    let cli = IsolatedCli::new();
+    let invocation_log = install_current_codex_cli(cli.home.path(), &cli.bin_dir);
+    let case = host_case(HostKindV1::Codex);
+    let originals = seed_host(case, &cli);
+
     assert_success(
         case.id,
-        "receipt-backed install after native activation",
+        "install through the current stock Codex CLI",
         cli.run(&["install", "--agent", case.id]),
+    );
+    assert_eq!(
+        recorded_codex_invocations(&invocation_log),
+        vec!["plugin add tracedecay@personal --json".to_string()],
+        "install must drive Codex's own plugin registry exactly once"
     );
 
     let cache_manifest = cli
@@ -888,23 +931,66 @@ fn codex_stale_cache_remediation_executes_on_the_current_stock_cli_and_converges
         .join(".codex/plugins/cache/personal/tracedecay")
         .join(tracedecay_agent_hosts::PRODUCT_VERSION)
         .join(".codex-plugin/plugin.json");
+    assert!(
+        cache_manifest.is_file(),
+        "the current stock CLI did not materialise the versioned plugin cache"
+    );
+    let install_receipt = latest_receipt(&cli, case.host);
+    assert_receipt_digests(&cli, &install_receipt);
+
+    let config = fs::read_to_string(cli.home.path().join(".codex/config.toml")).unwrap();
+    assert!(
+        config.contains("model = \"o4-mini\""),
+        "install through the stock CLI discarded the operator's own config: {config}"
+    );
+    assert!(
+        config.contains("[mcp_servers.foreign]"),
+        "install through the stock CLI discarded a foreign MCP server: {config}"
+    );
+    assert!(
+        config.contains("[plugins.\"tracedecay@personal\"]"),
+        "install through the stock CLI did not record plugin activation: {config}"
+    );
+    assert_eq!(
+        fs::read(cli.home.path().join(".codex/plugins/foreign/manifest.json")).unwrap(),
+        originals[&PathBuf::from(".codex/plugins/foreign/manifest.json")],
+        "install disturbed a foreign native Codex extension"
+    );
+
     fs::write(
         &cache_manifest,
         br#"{"name":"tracedecay","version":"stale"}"#,
     )
     .unwrap();
 
-    let stale_update = cli.run(&["update-plugin"]);
-    assert!(!stale_update.status.success());
-    apply_current_codex_plugin_remediation(
-        cli.home.path(),
-        remediation_command(&stale_update.stderr),
-    )
-    .unwrap();
     assert_success(
         case.id,
-        "update after current stock remediation",
+        "stale-cache update through a second stock-CLI plugin add",
         cli.run(&["update-plugin"]),
+    );
+    assert_eq!(
+        recorded_codex_invocations(&invocation_log),
+        vec![
+            "plugin add tracedecay@personal --json".to_string(),
+            "plugin add tracedecay@personal --json".to_string(),
+        ],
+        "stale-cache remediation must drive exactly one more stock-CLI plugin add"
+    );
+    assert_ne!(
+        fs::read(&cache_manifest).unwrap(),
+        br#"{"name":"tracedecay","version":"stale"}"#.to_vec(),
+        "update-plugin did not refresh the stale versioned cache"
+    );
+    let config_after_update =
+        fs::read_to_string(cli.home.path().join(".codex/config.toml")).unwrap();
+    assert!(
+        config_after_update.contains("[mcp_servers.foreign]"),
+        "stale-cache remediation discarded a foreign MCP server: {config_after_update}"
+    );
+    assert_eq!(
+        fs::read(cli.home.path().join(".codex/plugins/foreign/manifest.json")).unwrap(),
+        originals[&PathBuf::from(".codex/plugins/foreign/manifest.json")],
+        "stale-cache remediation disturbed a foreign native Codex extension"
     );
 }
 

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use tracedecay_hooks::{DaemonHookEvent, HookAgent};
 
 use super::post_tool_use::is_post_tool_use_failure_event;
 use super::steering::index_status_line;
@@ -200,6 +201,12 @@ pub async fn hook_claude_session_start() -> i32 {
     0
 }
 
+fn claude_session_start_route_event(parsed: &Value, project_root: &Path) -> DaemonHookEvent {
+    DaemonHookEvent::session_start(HookAgent::Claude, project_root.to_path_buf()).with_route(Some(
+        super::hook_route_metadata_from_parsed(parsed, project_root),
+    ))
+}
+
 /// Returns the identity-resolved root alongside the response so the handler
 /// does not repeat the registry-probing resolution for output delivery.
 async fn claude_session_start_response(event: &str) -> (Option<PathBuf>, String) {
@@ -215,6 +222,12 @@ async fn claude_session_start_response(event: &str) -> (Option<PathBuf>, String)
         &parsed,
     );
     if let Some(project_root) = root.as_deref() {
+        super::notify_hook_event_with_telemetry(
+            project_root,
+            claude_session_start_route_event(&parsed, project_root),
+            &hook_telemetry,
+        )
+        .await;
         ingest_claude_project_transcript(
             "SessionStart",
             event,
@@ -597,6 +610,26 @@ mod tests {
     };
     use super::super::tool_hints::{ToolHint, is_harness_memory_path};
     use super::*;
+
+    #[test]
+    fn session_start_publishes_private_route_identity() {
+        let root = Path::new("/workspace/claude-session");
+        let event = claude_session_start_route_event(
+            &serde_json::json!({
+                "session_id": "session.claude.route",
+                "cwd": root,
+            }),
+            root,
+        );
+
+        assert_eq!(event.agent, HookAgent::Claude.as_wire());
+        assert_eq!(event.event, "sessionStart");
+        assert_eq!(event.cwd.as_deref(), Some(root));
+        let route = event.route.expect("session route metadata");
+        assert_eq!(route.session_id.as_deref(), Some("session.claude.route"));
+        assert_eq!(route.cwd.as_deref(), Some(root));
+        assert_eq!(route.worktree.as_deref(), Some(root));
+    }
 
     fn decide_post_tool_use_hint(parsed: &Value) -> Option<ToolHint> {
         let tool_name = parsed.get("tool_name").and_then(Value::as_str)?;

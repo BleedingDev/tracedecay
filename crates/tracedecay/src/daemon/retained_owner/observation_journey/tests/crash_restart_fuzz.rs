@@ -29,30 +29,24 @@
 //! | journal write → dispatch | the provider parks inside the **delivery preflight handshake**, which the host performs before it builds the observation call | the journal row is durable and this life's provider-entry log never named the row's key |
 //! | dispatch → provider effect | the provider parks on entry, after it has durably recorded that it was entered and before it touches its ledger | the entry log names the key and the ledger did not grow in this life |
 //! | provider effect → answer exists | the provider parks after its effect is fsync'd and before the terminal is built | the ledger holds the key and the sealed-answer log does not |
-//! | answer handed back → receipt persisted | the provider seals its answer, takes the journal's own write lock on a sentinel thread, hands the answer back, and is killed while the host cannot reach the journal | the sealed-answer log and the ledger hold the key and the journal holds no acknowledging receipt for it |
-//! | acknowledgement persisted | the store parks on the first replay pass after the target's acknowledging receipt is in the journal | receipt *and* acknowledged watermark are both durable |
+//! | answer handed back → receipt persisted | a debug-only journal observer parks at entry to the host's `record_attempt`, after the provider call returned and before its receipt transaction starts | the sealed-answer log and the ledger hold the key and the journal holds no acknowledging receipt for it |
+//! | acknowledgement persisted | a debug-only journal observer parks after the receipt transaction that makes the target's acknowledgement contiguous commits | receipt *and* acknowledged watermark are both durable |
 //!
-//! The fifth row is how this driver reaches the bead's "after reply before
-//! receipt persist" on the **mounted** path. Everything the host runs between
-//! the provider frame returning and `record_attempt` — the bounded-call
-//! handover, `verify_terminal`, `ObservationDeliveryReceiptV1::from_terminal` —
-//! is pure host code with no injectable port, so there is no legitimate place
-//! to park inside it. What *is* legitimate is to make the window wide and
-//! deterministic from outside: the provider takes a `BEGIN IMMEDIATE`
-//! transaction on the journal database from its own connection before it hands
-//! the answer back, so the host's receipt write cannot commit while that
-//! sentinel lives, and only then does the sentinel tell the parent to kill.
-//! The kill therefore lands with the answer already handed back and the
-//! journal provably still without it — which is exactly the window — and the
-//! parent verifies both halves from the durable files rather than trusting the
-//! ordering.
+//! The fifth row uses the journal boundary the test owns. Before this child
+//! mounts, it installs a debug-only observer on the journal that the real mount
+//! opens. `record_attempt` invokes that observer after the bounded provider call
+//! and terminal verification have returned to the host, but before the receipt
+//! transaction starts. The provider's sealed-answer file proves the answer
+//! existed; the observer proves host ownership of the seam; the parent then
+//! verifies that no acknowledging receipt crossed it before the kill.
 //!
 //! The last row is the honest form of the bead's "after receipt before
 //! watermark advance": the host writes the receipt and the acknowledged
 //! watermark in **one** transaction ([`advance_watermark_for`] runs inside the
 //! receipt's own transaction), so there is no instant between them to stand
-//! in. What can be proved instead — and is — is that a life killed after the
-//! answer returned leaves either both or neither.
+//! in. The journal observer therefore runs after commit and parks only once the
+//! target has both an acknowledging receipt and a contiguous watermark. A life
+//! killed there leaves both durable.
 //!
 //! # No sleeps, and no marker polling
 //!
@@ -74,10 +68,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write as _};
+use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -90,6 +85,9 @@ use super::*;
 /// Carries one child life's whole assignment. Present exactly when this
 /// process *is* a child life.
 const CHILD_LIFE_ENV: &str = "TDMEM_5LC_MOUNTED_CHILD_LIFE";
+
+/// Carries only a socket path for the attach-without-arrival cleanup child.
+const NON_ARRIVING_CHILD_ENV: &str = "TDMEM_5LC_MOUNTED_NON_ARRIVING_CHILD";
 
 /// Raises or lowers the developer tier's seed window. Lowering it to `1`
 /// together with [`BASE_SEED_ENV`] reproduces exactly one failure.
@@ -116,7 +114,7 @@ const BASE_SEED_ENV: &str = "TDMEM_5LC_MOUNTED_BASE_SEED";
 /// `cargo test` honest for a developer. It is *not* the gate: the soak tier
 /// below runs [`SOAK_SEEDS`] seeds against the same mounted path and is the
 /// command the convergence map registers.
-const DEFAULT_SEEDS: u64 = 12;
+const DEFAULT_SEEDS: u64 = 32;
 
 /// Seeds the soak tier covers. The bead asks for hundreds against the real
 /// mounted path, and this is that number.
@@ -172,10 +170,6 @@ const CONVERGENCE_BUDGET: Duration = Duration::from_secs(60);
 
 /// How often recovery re-reads the durable journal while it converges.
 const CONVERGENCE_REREAD: Duration = Duration::from_millis(25);
-
-/// How long the answer-handback sentinel waits for the journal's write lock
-/// before it reports the boundary unverified instead of hanging the child.
-const RECEIPT_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The only exit status a crashed life may have.
 const SIGKILL: i32 = 9;
@@ -404,16 +398,6 @@ impl ObservationAdmissionPort for FuzzCanonicalPortV1 {
             .take(request.limit())
             .cloned()
             .collect();
-        // The host has durably acknowledged the target: the receipt is in the
-        // journal. That the watermark went with it is proved rather than
-        // assumed, because the two are written in one transaction and a life
-        // that finds one without the other has found the defect this boundary
-        // exists to catch.
-        self.hooks.check_verified(
-            HookPointV1::AfterAckPersisted,
-            |target| acknowledging_receipt_exists(&self.journal, target),
-            |target| acknowledgement_is_durable(&self.journal, target),
-        );
         // The target is the next record this pass would admit, and it is still
         // only in the canonical store: dying here is dying between the host's
         // commit and the journal write.
@@ -681,10 +665,10 @@ impl NativeMemoryApplicationPort for FuzzNativePortV1 {
             extensions: call.extensions.clone(),
             state_generation: call.expected_state_generation,
         };
-        // The answer above is complete. Sealing it, holding the journal's own
-        // write lock, and only then handing it back is what makes the window
-        // between the handback and `record_attempt` a place a kill can land.
-        HooksV1::hand_back_answer(&self.hooks, sequence, &self.journal, &self.answers, &key);
+        // The answer above is complete. The provider records that fact, then
+        // returns normally. The host-owned journal observer takes the crash
+        // boundary later, at entry to `record_attempt`.
+        self.hooks.seal_answer(sequence, &self.answers, &key);
         reply
     }
 
@@ -924,74 +908,15 @@ impl HooksV1 {
         self.arrive(point.as_wire())
     }
 
-    /// Takes the "answer handed back, receipt not persisted" boundary.
+    /// Records that the provider constructed the target answer before returning.
     ///
-    /// The sentinel holds a `BEGIN IMMEDIATE` transaction on the journal for as
-    /// long as it lives, so the host's `record_attempt` cannot commit; it then
-    /// waits for this thread to say the answer is leaving the provider frame
-    /// before it tells the parent to kill. The kill therefore lands after the
-    /// handback and provably before the receipt.
-    fn hand_back_answer(
-        hooks: &Arc<Self>,
-        sequence: u64,
-        journal: &Path,
-        answers: &Path,
-        key: &str,
-    ) {
-        if hooks.armed != Some(HookPointV1::AfterReplyBeforeReceipt) || sequence != hooks.target {
-            return;
+    /// This is evidence about the answer only. The actual crash boundary is the
+    /// journal observer installed by [`install_receipt_boundaries`], which cannot
+    /// run until the provider call has returned to host code.
+    fn seal_answer(&self, sequence: u64, answers: &Path, key: &str) {
+        if self.armed == Some(HookPointV1::AfterReplyBeforeReceipt) && sequence == self.target {
+            append_line(answers, key);
         }
-        if hooks.fired.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        // Durable first: the provider's answer exists, whatever happens next.
-        append_line(answers, key);
-        let verified =
-            !acknowledging_receipt_exists(journal, sequence) && line_count(answers, key) == 1;
-        let name = if verified {
-            HookPointV1::AfterReplyBeforeReceipt.as_wire().to_owned()
-        } else {
-            format!(
-                "{}{UNVERIFIED}",
-                HookPointV1::AfterReplyBeforeReceipt.as_wire()
-            )
-        };
-
-        let (locked, lock_taken) = mpsc::channel::<()>();
-        let (handback, handed_back) = mpsc::channel::<()>();
-        let sentinel = Arc::clone(hooks);
-        let journal = journal.to_path_buf();
-        let announcement = name.clone();
-        std::thread::spawn(move || {
-            let connection = rusqlite::Connection::open(&journal).expect("receipt lock connection");
-            connection
-                .busy_timeout(RECEIPT_LOCK_TIMEOUT)
-                .expect("receipt lock busy timeout");
-            if connection.execute_batch("BEGIN IMMEDIATE").is_err() {
-                // The lock could not be taken, so this boundary cannot be
-                // guaranteed. Say so instead of killing at an unknown point.
-                sentinel.arrive(&format!(
-                    "{}{UNVERIFIED}",
-                    HookPointV1::AfterReplyBeforeReceipt.as_wire()
-                ));
-            }
-            let _ = locked.send(());
-            // Blocks on the handback itself, never on a duration.
-            let _ = handed_back.recv();
-            sentinel.arrive(&announcement)
-        });
-
-        match lock_taken.recv_timeout(RECEIPT_LOCK_TIMEOUT + Duration::from_secs(5)) {
-            Ok(()) => {}
-            Err(_) => hooks.arrive(&format!(
-                "{}{UNVERIFIED}",
-                HookPointV1::AfterReplyBeforeReceipt.as_wire()
-            )),
-        }
-        // The answer is leaving this frame now. The journal is locked against
-        // the receipt that would follow it, so the sentinel can safely tell the
-        // parent to kill.
-        let _ = handback.send(());
     }
 
     fn arrive(&self, name: &str) -> ! {
@@ -1111,6 +1036,45 @@ impl ChildLifeSpecV1 {
     }
 }
 
+/// Installs the host-owned receipt boundaries on the journal the next mount opens.
+fn install_receipt_boundaries(paths: &JourneyPathsV1, hooks: &Arc<HooksV1>) {
+    if !matches!(
+        hooks.armed,
+        Some(HookPointV1::AfterReplyBeforeReceipt | HookPointV1::AfterAckPersisted)
+    ) {
+        return;
+    }
+    let hooks = Arc::clone(hooks);
+    let journal = paths.journal.clone();
+    let answers = paths.answers.clone();
+    SqliteObservationJournal::install_debug_receipt_persist_hook_for_next_open(
+        move |receipt, persisted| match hooks.armed {
+            Some(HookPointV1::AfterReplyBeforeReceipt) if !persisted => {
+                hooks.check_verified(
+                    HookPointV1::AfterReplyBeforeReceipt,
+                    |target| {
+                        idempotency_key(&journal, target).as_deref()
+                            == Some(receipt.idempotency_key.as_str())
+                    },
+                    |target| {
+                        line_count(&answers, receipt.idempotency_key.as_str()) == 1
+                            && !acknowledging_receipt_exists(&journal, target)
+                    },
+                );
+            }
+            Some(HookPointV1::AfterAckPersisted) if persisted => {
+                // An earlier receipt may close a gap and advance the contiguous
+                // watermark through the target, so inspect the target after
+                // every committed receipt rather than matching only this one.
+                hooks.check(HookPointV1::AfterAckPersisted, |target| {
+                    acknowledgement_is_durable(&journal, target)
+                });
+            }
+            _ => {}
+        },
+    );
+}
+
 /// The child-process entry point.
 ///
 /// Under a normal `cargo test` this is a no-op: the environment carries no
@@ -1120,6 +1084,11 @@ impl ChildLifeSpecV1 {
 /// armed boundary, and parks there until the parent kills it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mounted_crash_child_process_entrypoint() {
+    if let Ok(signal_path) = std::env::var(NON_ARRIVING_CHILD_ENV) {
+        let _signal = UnixStream::connect(signal_path).expect("non-arriving child socket");
+        std::future::pending::<()>().await;
+        return;
+    }
     let Ok(encoded) = std::env::var(CHILD_LIFE_ENV) else {
         return;
     };
@@ -1143,6 +1112,7 @@ async fn mounted_crash_child_process_entrypoint() {
         paths.marker.clone(),
         signal,
     ));
+    install_receipt_boundaries(&paths, &hooks);
     let journey = mount_life(&paths, Arc::clone(&hooks), spec.entries()).await;
 
     // The armed thread parks where it stands; this task has nothing left to
@@ -1226,6 +1196,58 @@ enum ChildSignalV1 {
     Departed,
 }
 
+/// Cancellation and the crash driver share ownership of one seed's current
+/// child. The child is removed only after it has been reaped.
+#[derive(Default)]
+struct SeedControlV1 {
+    cancelled: AtomicBool,
+    child: Mutex<Option<Arc<Mutex<Child>>>>,
+}
+
+impl SeedControlV1 {
+    fn install(&self, child: Child) -> Result<Arc<Mutex<Child>>, String> {
+        let child = Arc::new(Mutex::new(child));
+        let mut slot = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.cancelled.load(Ordering::Acquire) {
+            terminate_and_reap_shared(&child)?;
+            return Err("seed cancelled before its child started".to_owned());
+        }
+        *slot = Some(Arc::clone(&child));
+        Ok(child)
+    }
+
+    fn clear(&self, child: &Arc<Mutex<Child>>) {
+        let mut slot = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, child))
+        {
+            *slot = None;
+        }
+    }
+
+    fn terminate(&self) -> Result<Option<ExitStatus>, String> {
+        let child = self
+            .child
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match child {
+            Some(child) => terminate_and_reap_shared(&child),
+            None => Ok(None),
+        }
+    }
+
+    fn cancel(&self) -> Result<(), String> {
+        self.cancelled.store(true, Ordering::Release);
+        self.terminate().map(|_| ())
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
 /// Spawns one life as a child process, blocks until it reaches its boundary,
 /// kills it there, and proves from the durable files that the boundary is where
 /// it says it is.
@@ -1233,7 +1255,7 @@ enum ChildSignalV1 {
 /// Returns only after the child is confirmed dead by `SIGKILL`, the marker file
 /// holds exactly one arrival for the armed boundary, and the seam's own durable
 /// evidence agrees.
-fn crash_at(spec: &ChildLifeSpecV1) -> Result<(), String> {
+fn crash_at(spec: &ChildLifeSpecV1, control: &SeedControlV1) -> Result<(), String> {
     let paths = JourneyPathsV1::in_directory(&spec.directory);
     let arrivals_before = read_lines(&paths.marker).len();
     let key_before = idempotency_key(&paths.journal, spec.target);
@@ -1244,7 +1266,7 @@ fn crash_at(spec: &ChildLifeSpecV1) -> Result<(), String> {
     // could reach its boundary and find nobody listening.
     let socket = ArrivalSocketV1::bind();
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let mut child = Command::new(executable)
+    let child = Command::new(executable)
         .args([
             "--exact",
             CHILD_TEST_PATH,
@@ -1269,18 +1291,24 @@ fn crash_at(spec: &ChildLifeSpecV1) -> Result<(), String> {
         ))
         .spawn()
         .map_err(|error| error.to_string())?;
+    let child = control.install(child)?;
 
-    if let Err(error) = await_arrival(spec, socket, &mut child) {
-        let _ = child.kill();
-        let _ = child.wait();
+    if let Err(error) = await_arrival(spec, socket, &child) {
+        control.clear(&child);
         return Err(error);
+    }
+    if control.is_cancelled() {
+        let _ = terminate_and_reap_shared(&child);
+        control.clear(&child);
+        return Err("seed cancelled at its wall-clock deadline".to_owned());
     }
 
     // The boundary is reached and the process is parked on it: kill it where it
     // stands. Nothing is unwound, nothing is flushed, and the SQLite connection
     // is never closed.
-    child.kill().map_err(|error| error.to_string())?;
-    let status = child.wait().map_err(|error| error.to_string())?;
+    let status = terminate_and_reap_shared(&child)?
+        .ok_or_else(|| "the crash child had already been reaped".to_owned())?;
+    control.clear(&child);
     if status.signal() != Some(SIGKILL) {
         return Err(format!(
             "the child at {} did not die on SIGKILL: {status}",
@@ -1406,64 +1434,106 @@ fn prove_boundary(
 fn await_arrival(
     spec: &ChildLifeSpecV1,
     socket: ArrivalSocketV1,
-    child: &mut Child,
+    child: &Arc<Mutex<Child>>,
 ) -> Result<(), String> {
-    let (signals, arrivals) = mpsc::channel::<Result<ChildSignalV1, String>>();
-    let listener = socket.listener.try_clone().map_err(|e| e.to_string())?;
-    let waiter = std::thread::spawn(move || {
-        (|| -> Result<(), String> {
-            let (mut stream, _) = listener
-                .accept()
-                .map_err(|error| format!("the arrival socket could not be accepted: {error}"))?;
-            signals
-                .send(Ok(ChildSignalV1::Attached))
-                .map_err(|error| error.to_string())?;
-            let mut byte = [0_u8; 1];
-            let signal = match stream.read_exact(&mut byte) {
-                Ok(()) => ChildSignalV1::Arrived,
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    ChildSignalV1::Departed
-                }
-                Err(error) => return Err(format!("the arrival socket failed mid-life: {error}")),
-            };
-            signals
-                .send(Ok(signal))
-                .map_err(|error| error.to_string())?;
-            Ok(())
-        })()
-    });
+    await_arrival_with_bounds(
+        spec,
+        socket,
+        child,
+        CHILD_ATTACH_TIMEOUT,
+        HOOK_ARRIVAL_TIMEOUT,
+    )
+}
 
-    let attached = arrivals.recv_timeout(CHILD_ATTACH_TIMEOUT);
-    let outcome = stage(spec, child, attached, "attach", CHILD_ATTACH_TIMEOUT).and_then(|()| {
-        let arrived = arrivals.recv_timeout(HOOK_ARRIVAL_TIMEOUT);
-        stage(spec, child, arrived, "arrival", HOOK_ARRIVAL_TIMEOUT)
+fn await_arrival_with_bounds(
+    spec: &ChildLifeSpecV1,
+    socket: ArrivalSocketV1,
+    child: &Arc<Mutex<Child>>,
+    attach_timeout: Duration,
+    arrival_timeout: Duration,
+) -> Result<(), String> {
+    let listener = match socket.listener.try_clone() {
+        Ok(listener) => listener,
+        Err(error) => {
+            terminate_and_reap_shared(child)?;
+            return Err(error.to_string());
+        }
+    };
+    let (signals, arrivals) = mpsc::channel::<Result<ChildSignalV1, String>>();
+    let waiter = match std::thread::Builder::new()
+        .name("tdmem-5lc-mounted-arrival".to_owned())
+        .spawn(move || {
+            (|| -> Result<(), String> {
+                let (mut stream, _) = listener.accept().map_err(|error| {
+                    format!("the arrival socket could not be accepted: {error}")
+                })?;
+                signals
+                    .send(Ok(ChildSignalV1::Attached))
+                    .map_err(|error| error.to_string())?;
+                let mut byte = [0_u8; 1];
+                let signal = match stream.read_exact(&mut byte) {
+                    Ok(()) => ChildSignalV1::Arrived,
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        ChildSignalV1::Departed
+                    }
+                    Err(error) => {
+                        return Err(format!("the arrival socket failed mid-life: {error}"));
+                    }
+                };
+                signals
+                    .send(Ok(signal))
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })()
+        }) {
+        Ok(waiter) => waiter,
+        Err(error) => {
+            terminate_and_reap_shared(child)?;
+            return Err(format!("the arrival waiter could not start: {error}"));
+        }
+    };
+
+    let attached = arrivals.recv_timeout(attach_timeout);
+    let outcome = stage(spec, attached, "attach", attach_timeout).and_then(|()| {
+        let arrived = arrivals.recv_timeout(arrival_timeout);
+        stage(spec, arrived, "arrival", arrival_timeout)
     });
-    // The waiter owns the accepted stream, so it is joined on every path: a
-    // detached thread holding a descriptor past the life it belongs to is
-    // exactly the leak this suite is not allowed to have.
+    let cleanup = if outcome.is_err() {
+        // Terminal ordering matters: the child owns the peer of a waiter that
+        // may be blocked in `read_exact`, so kill and reap it before joining.
+        // If it never attached, a parent-side connection wakes `accept`.
+        let cleanup = terminate_and_reap_shared(child).map(|_| ());
+        if let Ok(stream) = UnixStream::connect(&socket.path) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        cleanup
+    } else {
+        Ok(())
+    };
     drop(socket);
-    let _ = waiter.join();
+    let joined = waiter
+        .join()
+        .map_err(|_| "the arrival waiter panicked".to_owned())?
+        .map_err(|error| format!("the arrival waiter failed: {error}"));
+    cleanup?;
+    joined?;
     outcome
 }
 
 /// Interprets one stage of the blocking wait.
 fn stage(
     spec: &ChildLifeSpecV1,
-    child: &mut Child,
     received: Result<Result<ChildSignalV1, String>, RecvTimeoutError>,
     label: &str,
     bound: Duration,
 ) -> Result<(), String> {
     match received {
         Ok(Ok(ChildSignalV1::Attached | ChildSignalV1::Arrived)) => Ok(()),
-        Ok(Ok(ChildSignalV1::Departed)) => {
-            let status = child.wait().map_err(|error| error.to_string())?;
-            Err(format!(
-                "the child exited {status} before reaching {}; stderr: {}",
-                spec.hook.as_wire(),
-                child_stderr(spec)
-            ))
-        }
+        Ok(Ok(ChildSignalV1::Departed)) => Err(format!(
+            "the child exited before reaching {}; stderr: {}",
+            spec.hook.as_wire(),
+            child_stderr(spec)
+        )),
         Ok(Err(error)) => Err(format!(
             "the {label} wait for {} failed: {error}",
             spec.hook.as_wire()
@@ -1478,6 +1548,77 @@ fn stage(
             spec.hook.as_wire()
         )),
     }
+}
+
+fn terminate_and_reap(child: &mut Child) -> Result<Option<ExitStatus>, String> {
+    if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+        return Ok(Some(status));
+    }
+    child.kill().map_err(|error| error.to_string())?;
+    child.wait().map(Some).map_err(|error| error.to_string())
+}
+
+fn terminate_and_reap_shared(child: &Arc<Mutex<Child>>) -> Result<Option<ExitStatus>, String> {
+    let mut child = child.lock().unwrap_or_else(PoisonError::into_inner);
+    terminate_and_reap(&mut child)
+}
+
+#[test]
+fn attached_child_that_never_arrives_is_reaped_without_a_waiter_leak() {
+    let directory = tempfile::tempdir().expect("non-arrival directory");
+    let spec = ChildLifeSpecV1 {
+        directory: directory.path().to_path_buf(),
+        hook: HookPointV1::AfterReplyBeforeReceipt,
+        target: 1,
+        life: 0,
+        settle: vec![1],
+    };
+    let socket = ArrivalSocketV1::bind();
+    let executable = std::env::current_exe().expect("test executable");
+    let child = Arc::new(Mutex::new(
+        Command::new(executable)
+            .args([
+                "--exact",
+                CHILD_TEST_PATH,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(NON_ARRIVING_CHILD_ENV, &socket.path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                fs::File::create(directory.path().join("child-0-stderr.log"))
+                    .expect("child stderr"),
+            ))
+            .spawn()
+            .expect("non-arriving child"),
+    ));
+    let started = Instant::now();
+    let error = await_arrival_with_bounds(
+        &spec,
+        socket,
+        &child,
+        Duration::from_secs(2),
+        Duration::from_millis(200),
+    )
+    .expect_err("a child that never signals arrival must fail");
+    assert!(
+        error.contains("arrival stage"),
+        "unexpected failure: {error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "non-arrival cleanup exceeded its terminal bound"
+    );
+    assert!(
+        child
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .try_wait()
+            .expect("reaped child status")
+            .is_some(),
+        "the non-arriving child was not reaped"
+    );
 }
 
 fn child_stderr(spec: &ChildLifeSpecV1) -> String {
@@ -1682,20 +1823,8 @@ fn assert_no_loss_and_no_double_effect(
     );
 }
 
-/// AC2 — the durable acknowledgement watermark is exactly the last sequence a
-/// provider acknowledgement was persisted for.
-///
-/// The watermark is written inside the acknowledging receipt's own transaction,
-/// which is what this asserts after every killed life: never a watermark whose
-/// receipt is missing, and never an acknowledging receipt whose watermark did
-/// not move.
-///
-/// What is deliberately *not* claimed mid-flight is "no row below the watermark
-/// lacks a receipt". Delivery is per row: a position whose attempt failed goes
-/// back to `pending` behind a retry delay while a later position acknowledges,
-/// and a permanently refused position never acknowledges at all. That both are
-/// nevertheless finished is proved after convergence by
-/// [`assert_no_loss_and_no_double_effect`].
+/// AC2 — the durable acknowledgement watermark is exactly the highest
+/// contiguous committed position carrying an acknowledging receipt.
 fn assert_acknowledged_watermark(paths: &JourneyPathsV1, label: &str) {
     let rows = journal_rows(&paths.journal);
     let acknowledged: BTreeSet<u64> = rows
@@ -1703,37 +1832,36 @@ fn assert_acknowledged_watermark(paths: &JourneyPathsV1, label: &str) {
         .filter(|row| row.receipts.iter().any(|outcome| is_acknowledging(outcome)))
         .map(|row| row.sequence)
         .collect();
+    let mut committed = CanonicalStreamV1::new(paths.canonical.clone()).committed();
+    committed.sort_unstable();
+    let expected = committed
+        .iter()
+        .copied()
+        .take_while(|sequence| acknowledged.contains(sequence))
+        .last();
     let watermark = acknowledged_watermark(&paths.journal);
 
-    match (watermark, acknowledged.iter().next_back().copied()) {
-        (None, None) => {}
-        (None, Some(highest)) => panic!(
-            "{label}: sequence {highest} carries a durable acknowledgement receipt with no \
-             watermark behind it, so a restart would redeliver an effect the provider already \
-             holds; {}",
-            snapshot(paths)
-        ),
-        (Some(watermark), None) => panic!(
-            "{label}: the acknowledged watermark stands at {watermark} with no acknowledging \
-             receipt anywhere, so it passed a record nothing answered for; {}",
-            snapshot(paths)
-        ),
-        (Some(watermark), Some(highest)) => {
-            assert_eq!(
-                watermark,
-                highest,
-                "{label}: the acknowledged watermark is {watermark} but the highest durably \
-                 acknowledged sequence is {highest}; {}",
-                snapshot(paths)
-            );
+    if let Some(watermark) = watermark {
+        for sequence in committed
+            .iter()
+            .copied()
+            .filter(|sequence| *sequence <= watermark)
+        {
             assert!(
-                acknowledged.contains(&watermark),
-                "{label}: the acknowledged watermark stands on sequence {watermark}, which \
-                 carries no acknowledging receipt; {}",
+                acknowledged.contains(&sequence),
+                "{label}: watermark {watermark} passed committed sequence {sequence}, which has \
+                 no acknowledging receipt; {}",
                 snapshot(paths)
             );
         }
     }
+    assert_eq!(
+        watermark,
+        expected,
+        "{label}: watermark {watermark:?} is not the highest contiguous acknowledged committed \
+         sequence {expected:?}; {}",
+        snapshot(paths)
+    );
 }
 
 /// AC4 — a permanent refusal is terminal and stays terminal.
@@ -1782,11 +1910,29 @@ async fn assert_refusals_stay_terminal(
         .into_iter()
         .filter(|row| refused.contains(&row.sequence))
         .collect();
-    for (before, after) in before.iter().zip(after.iter()) {
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "{label}: the number of permanently refused rows changed; {}",
+        snapshot(paths)
+    );
+    let after_by_sequence: BTreeMap<u64, &JournalRowV1> =
+        after.iter().map(|row| (row.sequence, row)).collect();
+    assert_eq!(
+        after_by_sequence.len(),
+        after.len(),
+        "{label}: duplicate refused sequences appeared; {}",
+        snapshot(paths)
+    );
+    for before in &before {
+        let after = after_by_sequence
+            .get(&before.sequence)
+            .unwrap_or_else(|| panic!("{label}: refused sequence {} vanished", before.sequence));
         assert_eq!(
             (before.state.as_str(), before.receipts.len()),
             (after.state.as_str(), after.receipts.len()),
-            "{label}: a later life redelivered a permanently refused position; {}",
+            "{label}: a later life redelivered permanently refused sequence {}; {}",
+            before.sequence,
             snapshot(paths)
         );
     }
@@ -1932,10 +2078,10 @@ fn reachable_kill_points(paths: &JourneyPathsV1, plan: &FuzzPlanV1) -> Vec<KillP
                 sequence,
             });
         }
-        // The acknowledgement boundary is observed from the replay pass that
-        // follows it, and the live replay task runs for as long as the journey
-        // does, so it needs nothing but a position this life will acknowledge.
-        if !plan.refused.contains(&sequence) {
+        // The acknowledged watermark is contiguous. A permanent refusal at or
+        // before this position can never carry an acknowledging receipt, so the
+        // watermark can never reach through it and this boundary is unreachable.
+        if !plan.refused.iter().any(|refused| *refused <= sequence) {
             points.push(KillPointV1 {
                 hook: HookPointV1::AfterAckPersisted,
                 sequence,
@@ -2046,7 +2192,7 @@ impl FuzzCoverageV1 {
 }
 
 /// Runs one seed end to end over the mounted journey.
-async fn run_seed(seed: u64) -> FuzzCoverageV1 {
+async fn run_seed(seed: u64, control: Arc<SeedControlV1>) -> FuzzCoverageV1 {
     let plan = FuzzPlanV1::from_seed(seed);
     let label = format!("seed-{seed:#018x}");
     let directory = tempfile::tempdir().expect("seed directory");
@@ -2063,6 +2209,10 @@ async fn run_seed(seed: u64) -> FuzzCoverageV1 {
     let mut delivery_kills = 0_usize;
 
     for life in 0..plan.lives {
+        assert!(
+            !control.is_cancelled(),
+            "{label} was cancelled at the soak deadline"
+        );
         let mut candidates = reachable_kill_points(&paths, &plan);
         if delivery_kills >= MAX_DELIVERY_KILLS {
             candidates.retain(|point| !point.hook.spends_an_attempt());
@@ -2094,8 +2244,10 @@ async fn run_seed(seed: u64) -> FuzzCoverageV1 {
             settle: plan.committed.clone(),
         };
         // A child life is a blocking process, so it runs off the runtime's
-        // worker threads rather than parking one for a whole life.
-        let killed = tokio::task::spawn_blocking(move || crash_at(&spec))
+        // worker threads rather than parking one for a whole life. The shared
+        // control lets the soak deadline kill and reap this exact child.
+        let life_control = Arc::clone(&control);
+        let killed = tokio::task::spawn_blocking(move || crash_at(&spec, &life_control))
             .await
             .expect("crash driver");
         if let Err(error) = killed {
@@ -2111,6 +2263,10 @@ async fn run_seed(seed: u64) -> FuzzCoverageV1 {
         assert_acknowledged_watermark(&paths, &label);
     }
 
+    assert!(
+        !control.is_cancelled(),
+        "{label} was cancelled at the soak deadline"
+    );
     recover(&paths, &plan.committed, "final").await;
     assert_acknowledged_watermark(&paths, &label);
     assert_no_loss_and_no_double_effect(&paths, &plan.committed, &plan.refused, &label);
@@ -2167,7 +2323,7 @@ async fn seeded_crash_restart_fuzzing_holds_every_invariant_on_the_mounted_journ
     let mut total = FuzzCoverageV1::default();
     let mut count = 0_usize;
     for seed in window(base, seed_budget()) {
-        total.absorb(&run_seed(seed).await);
+        total.absorb(&run_seed(seed, Arc::new(SeedControlV1::default())).await);
         count += 1;
     }
     println!("{}", total.report("developer tier", count));
@@ -2212,35 +2368,80 @@ async fn mounted_crash_restart_soak_holds_every_invariant_across_two_hundred_see
 
     let mut pending = seeds.into_iter();
     let mut running = tokio::task::JoinSet::new();
+    let mut controls: BTreeMap<u64, Arc<SeedControlV1>> = BTreeMap::new();
     let mut total = FuzzCoverageV1::default();
     let mut finished = 0_usize;
-    let mut unreached: Vec<u64> = Vec::new();
+    let mut unfinished: Vec<u64> = Vec::new();
+    let mut cleanup_failures: Vec<String> = Vec::new();
 
     loop {
-        while running.len() < lanes {
-            if Instant::now() >= deadline {
-                unreached.extend(pending.by_ref());
-                break;
-            }
+        while running.len() < lanes && Instant::now() < deadline {
             let Some(seed) = pending.next() else {
                 break;
             };
-            running.spawn(async move { run_seed(seed).await });
+            let control = Arc::new(SeedControlV1::default());
+            controls.insert(seed, Arc::clone(&control));
+            running.spawn(async move { (seed, run_seed(seed, control).await) });
         }
-        let Some(joined) = running.join_next().await else {
+        if running.is_empty() {
+            unfinished.extend(pending.by_ref());
             break;
-        };
-        total.absorb(&joined.expect("soak seed"));
-        finished += 1;
+        }
+
+        let joined = tokio::time::timeout_at(deadline.into(), running.join_next()).await;
+        match joined {
+            Ok(Some(joined)) => {
+                let (seed, coverage) = joined.expect("soak seed");
+                controls.remove(&seed);
+                total.absorb(&coverage);
+                finished += 1;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                unfinished.extend(controls.keys().copied());
+                unfinished.extend(pending.by_ref());
+                unfinished.sort_unstable();
+                unfinished.dedup();
+                for (seed, control) in &controls {
+                    if let Err(error) = control.cancel() {
+                        cleanup_failures.push(format!("{seed:#018x}: {error}"));
+                    }
+                }
+                // Give cancelled crash drivers time to observe the flag and return
+                // after their shared child has been reaped. Tasks still inside
+                // asynchronous recovery are then aborted under a second bound.
+                let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    match tokio::time::timeout_at(cleanup_deadline, running.join_next()).await {
+                        Ok(Some(joined)) => {
+                            if let Err(error) = joined {
+                                cleanup_failures.push(format!("task drain: {error}"));
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            running.abort_all();
+                            while let Some(joined) = running.join_next().await {
+                                if let Err(error) = joined {
+                                    if !error.is_cancelled() {
+                                        cleanup_failures.push(format!("task abort: {error}"));
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+        }
     }
 
     println!("{}", total.report("soak tier", finished));
     assert!(
-        unreached.is_empty(),
+        unfinished.is_empty(),
         "the soak window spent its {budget:?} budget after {finished} of {planned} seeds; \
-         {} seeds were never run, starting at {:#018x}",
-        unreached.len(),
-        unreached.first().copied().unwrap_or_default()
+         unfinished seed ids: {unfinished:?}; cleanup failures: {cleanup_failures:?}"
     );
     assert_eq!(
         finished, planned,

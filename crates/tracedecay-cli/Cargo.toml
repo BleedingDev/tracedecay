@@ -270,6 +270,10 @@ tracedecay-global-db = { path = "../tracedecay-global-db", version = "0.1.0", fe
 # contracts directly since the lcm extraction; CLI test targets compile that
 # fixture via `#[path]` and need the extern.
 tracedecay-lcm = { path = "../tracedecay-lcm", version = "0.1.0" }
+# Dev-only: the Claude host memory journey reads the durable observation
+# journal through the journal crate's own inspection surface rather than
+# re-deriving its schema in SQL.
+tracedecay-memory-observation = { path = "../tracedecay-memory-observation", version = "0.1.0-beta.37" }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0", features = ["test-helpers"] }
 tracedecay-session-temporal-store = { path = "../tracedecay-session-temporal-store", version = "0.1.0" }
 # Dev-only: `tests/work_route_exposure_conformance.rs` still asserts against

@@ -667,7 +667,7 @@ pub(crate) fn test_provider_state_root(project_root: &Path) -> PathBuf {
 pub(crate) const fn native_provider_limits() -> ProviderLimits {
     ProviderLimits {
         request_bytes: 4_096,
-        response_bytes: 8_192,
+        response_bytes: NATIVE_RESPONSE_BYTES,
         observation_batch_items: 16,
         recall_candidates: 32,
         concurrent_operations: 4,
@@ -1878,6 +1878,24 @@ fn build_native_recall_reply(
     page: &ProjectMemoryFactSearchPageV1,
     staged_rows: &[StagedRow],
 ) -> Result<ProviderReply, NativeReadFailure> {
+    build_native_recall_reply_with_response_bytes(
+        call,
+        request,
+        profile_id,
+        page,
+        staged_rows,
+        NATIVE_RESPONSE_BYTES,
+    )
+}
+
+fn build_native_recall_reply_with_response_bytes(
+    call: &ProviderCall,
+    request: &NativeRecallRequestV1,
+    profile_id: &UserProfileId,
+    page: &ProjectMemoryFactSearchPageV1,
+    staged_rows: &[StagedRow],
+    maximum_response_bytes: u64,
+) -> Result<ProviderReply, NativeReadFailure> {
     let mapped = memory_mapping::search_page(page)
         .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
     let expected_owner = FactCommitOwnerV1::Project {
@@ -2020,82 +2038,74 @@ fn build_native_recall_reply(
     let truncated_items = u64::from(mapped.next_after.is_some());
     // The fact page cannot be trimmed here — the store cursor points after the
     // whole page, so dropping a fact would make it unreachable. A staged row
-    // has no cursor, so the response envelope is brought under the fixed byte
-    // ceiling by dropping the lowest-ranked staged rows and saying so.
-    let candidates: Vec<Value> = loop {
-        let rendered: Vec<Value> = ranked.iter().map(|entry| entry.value.clone()).collect();
-        let response = native_recall_response_value(
+    // has no cursor, so the complete provider reply is brought under the fixed
+    // byte ceiling by dropping the lowest-ranked staged rows and saying so.
+    // Measuring only the canonical payload is insufficient: the boundary also
+    // charges the terminal, payload framing, digest, warnings, and extensions.
+    loop {
+        let candidates: Vec<Value> = ranked.iter().map(|entry| entry.value.clone()).collect();
+        let terminal_code = recall_terminal_code(
+            matched_items,
+            candidates.len(),
+            excluded_items,
+            truncated_items,
+            &reasons,
+        );
+        let mut response = native_recall_response_value(
             call,
             request,
-            &rendered,
+            &candidates,
             matched_items,
             excluded_items,
             truncated_items,
             &reasons,
             mapped.next_after.as_ref(),
         );
+        response["terminal"] = serde_json::json!({
+            "terminal_code": terminal_code.as_wire(),
+            "diagnostic_id": Value::Null,
+        });
         let response_bytes = serde_json::to_vec(&response)
             .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
-        if u64::try_from(response_bytes.len()).unwrap_or(u64::MAX) <= NATIVE_RESPONSE_BYTES {
-            break rendered;
-        }
-        let Some(index) = ranked.iter().rposition(|entry| entry.staged) else {
-            return Err(NativeReadFailure::RecallBudgetExhausted);
+        let payload = CanonicalPayload::new(
+            OwnedVersionedId::new(RECALL_CONTRACT_ID)
+                .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?,
+            response_bytes.clone(),
+            sha256_hex(&response_bytes),
+        )
+        .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
+        let reply = ProviderReply {
+            terminal: terminal_for_call(call, terminal_code, None),
+            payload: Some(payload),
+            warnings: Vec::new(),
+            extensions: call.extensions.clone(),
+            state_generation: call.expected_state_generation,
         };
-        ranked.remove(index);
-        excluded_items = excluded_items.saturating_add(1);
-        push_reason(&mut reasons, "total_content_budget");
-    };
-    let terminal_code = recall_terminal_code(
-        matched_items,
-        candidates.len(),
-        excluded_items,
-        truncated_items,
-        &reasons,
-    );
-    let mut response = native_recall_response_value(
-        call,
-        request,
-        &candidates,
-        matched_items,
-        excluded_items,
-        truncated_items,
-        &reasons,
-        mapped.next_after.as_ref(),
-    );
-    response["terminal"] = serde_json::json!({
-        "terminal_code": terminal_code.as_wire(),
-        "diagnostic_id": Value::Null,
-    });
-    let response_bytes =
-        serde_json::to_vec(&response).map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
-    if u64::try_from(response_bytes.len()).unwrap_or(u64::MAX) > NATIVE_RESPONSE_BYTES {
-        return Err(NativeReadFailure::RecallBudgetExhausted);
-    }
-    let payload = CanonicalPayload::new(
-        OwnedVersionedId::new(RECALL_CONTRACT_ID)
-            .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?,
-        response_bytes.clone(),
-        sha256_hex(&response_bytes),
-    )
-    .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
-    let reply = ProviderReply {
-        terminal: terminal_for_call(call, terminal_code, None),
-        payload: Some(payload),
-        warnings: Vec::new(),
-        extensions: call.extensions.clone(),
-        state_generation: call.expected_state_generation,
-    };
-    match reply.validate(NATIVE_RESPONSE_BYTES) {
-        Ok(()) => Ok(reply),
-        Err(ApiError::BoundaryBytesExceeded { .. }) => {
-            Err(NativeReadFailure::RecallBudgetExhausted)
+        match reply.validate(maximum_response_bytes) {
+            Ok(()) => return Ok(reply),
+            Err(ApiError::BoundaryBytesExceeded { .. }) => {
+                let Some(index) = ranked.iter().rposition(|entry| entry.staged) else {
+                    return Err(NativeReadFailure::RecallBudgetExhausted);
+                };
+                ranked.remove(index);
+                excluded_items = excluded_items.saturating_add(1);
+                push_reason(&mut reasons, "response_byte_budget");
+            }
+            Err(_) => return Err(NativeReadFailure::RecallProjectionInvalid),
         }
-        Err(_) => Err(NativeReadFailure::RecallProjectionInvalid),
     }
 }
 
-const NATIVE_RESPONSE_BYTES: u64 = 8_192;
+/// Complete provider-reply ceiling, derived from the product recall shape.
+///
+/// The application asks for at most eight candidates and 8 KiB of aggregate
+/// content. Measured staged-candidate metadata is below 3 KiB per candidate,
+/// while terminal/payload framing is below 2 KiB. The old 8 KiB value predated
+/// recall and could not contain even the content budget plus mandatory framing;
+/// 64 KiB covers the measured `2 KiB + 8 * 3 KiB + 8 KiB` shape with room for
+/// JSON escaping and ordinary identity growth. Aggregate validation below still
+/// returns a truthful partial reply when an exceptional encoding exceeds it.
+const NATIVE_RESPONSE_BYTES: u64 = 65_536;
 
 fn native_recall_candidate(
     call: &ProviderCall,

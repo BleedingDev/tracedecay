@@ -13,7 +13,7 @@ pub(crate) mod row;
 mod schema;
 
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, ErrorCode, OpenFlags, Transaction, TransactionBehavior};
@@ -36,6 +36,22 @@ const CHECKPOINT_BUSY_TIMEOUT_MILLIS: u64 = 250;
 /// not a spin.
 const LOCK_POLL_MICROS: u64 = 200;
 
+#[cfg(debug_assertions)]
+struct ReceiptPersistHookV1(
+    Arc<dyn Fn(&crate::receipt::ObservationDeliveryReceiptV1, bool) + Send + Sync>,
+);
+
+#[cfg(debug_assertions)]
+impl std::fmt::Debug for ReceiptPersistHookV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReceiptPersistHookV1(..)")
+    }
+}
+
+#[cfg(debug_assertions)]
+static NEXT_RECEIPT_PERSIST_HOOK: std::sync::OnceLock<Mutex<Option<ReceiptPersistHookV1>>> =
+    std::sync::OnceLock::new();
+
 /// Durable bounded observation journal, delivery authority, and replay position.
 ///
 /// This store is deliberately *not* a content store. There is no full-text
@@ -46,6 +62,8 @@ const LOCK_POLL_MICROS: u64 = 200;
 pub struct SqliteObservationJournal {
     connection: Mutex<Connection>,
     policy: RetentionPolicyV1,
+    #[cfg(debug_assertions)]
+    receipt_persist_hook: Mutex<Option<ReceiptPersistHookV1>>,
     /// Where the resumable withheld-receipt audit has reached.
     ///
     /// Open validates one bounded page and leaves the rest here, so opening a
@@ -69,6 +87,39 @@ enum WithheldAuditStateV1 {
 }
 
 impl SqliteObservationJournal {
+    /// Installs a debug-only callback on the next journal opened in this process.
+    ///
+    /// The callback runs immediately before and after `record_attempt` persists
+    /// a provider answer; its boolean is false before and true after the commit.
+    /// It exists only in debug builds so crash harnesses can stop on exact
+    /// host-owned boundaries without changing the release artifact.
+    #[cfg(debug_assertions)]
+    pub fn install_debug_receipt_persist_hook_for_next_open(
+        hook: impl Fn(&crate::receipt::ObservationDeliveryReceiptV1, bool) + Send + Sync + 'static,
+    ) {
+        let slot = NEXT_RECEIPT_PERSIST_HOOK.get_or_init(|| Mutex::new(None));
+        let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(ReceiptPersistHookV1(Arc::new(hook)));
+    }
+
+    #[cfg(debug_assertions)]
+    fn run_debug_receipt_persist_hook(
+        &self,
+        receipt: &crate::receipt::ObservationDeliveryReceiptV1,
+        persisted: bool,
+    ) -> Result<(), ObservationJournalError> {
+        let hook = self
+            .receipt_persist_hook
+            .lock()
+            .map_err(|_| ObservationJournalError::LockPoisoned)?
+            .as_ref()
+            .map(|hook| Arc::clone(&hook.0));
+        if let Some(hook) = hook {
+            hook(receipt, persisted);
+        }
+        Ok(())
+    }
+
     /// Opens or creates a file-backed journal.
     pub fn open(
         path: impl AsRef<Path>,
@@ -103,6 +154,16 @@ impl SqliteObservationJournal {
         Self {
             connection: Mutex::new(connection),
             policy,
+            #[cfg(debug_assertions)]
+            receipt_persist_hook: Mutex::new(
+                NEXT_RECEIPT_PERSIST_HOOK
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .map_or_else(
+                        |poisoned| poisoned.into_inner().take(),
+                        |mut hook| hook.take(),
+                    ),
+            ),
             withheld_audit: Mutex::new(match resume_after {
                 Some(cursor) => WithheldAuditStateV1::Pending(Some(cursor)),
                 None => WithheldAuditStateV1::Complete,

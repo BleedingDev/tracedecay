@@ -38,7 +38,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::state_capability::ProviderStateAuthorityV1;
 use crate::supervisor::{
@@ -710,6 +710,11 @@ impl fmt::Debug for SupervisedScopeReadinessV1 {
 pub struct SupervisedProviderReadinessV1 {
     composition: Arc<ProjectMemoryProviderComposition>,
     isolation: Arc<dyn BoundedProviderCallV1>,
+    /// Serializes a readiness proof with the provider operation that consumes
+    /// it. The fabric intentionally retains only the latest ready receipt for a
+    /// registration, so another scope's handshake must not rotate that receipt
+    /// between proof and dispatch.
+    dispatch_gate: Mutex<()>,
     config: SupervisedReadinessConfigV1,
     host_limits: ProviderLimits,
     provider_id: OwnedProviderId,
@@ -741,6 +746,33 @@ struct OwnerSlotV1 {
 struct OwnerRegistryV1 {
     live: BTreeMap<String, OwnerSlotV1>,
     retired_quarantines: BTreeMap<String, QuarantineRecordV1>,
+}
+
+/// One readiness proof held exclusively until its associated provider use
+/// finishes.
+///
+/// The guard is registration-wide rather than scope-local because the fabric's
+/// current ready receipt is registration-wide. Keeping it alive prevents an
+/// admission or another scope from replacing that receipt after the handshake
+/// but before the caller reaches the registry.
+pub struct SupervisedReadinessDispatchV1<'a> {
+    _dispatch: MutexGuard<'a, ()>,
+    target: ProviderReadinessTargetV1,
+    evidence: ReadinessEvidenceV1,
+}
+
+impl SupervisedReadinessDispatchV1<'_> {
+    /// Readiness target produced by the guarded handshake.
+    #[must_use]
+    pub const fn target(&self) -> &ProviderReadinessTargetV1 {
+        &self.target
+    }
+
+    /// State evidence produced by the same guarded handshake.
+    #[must_use]
+    pub const fn evidence(&self) -> &ReadinessEvidenceV1 {
+        &self.evidence
+    }
 }
 
 impl OwnerRegistryV1 {
@@ -776,6 +808,7 @@ impl SupervisedProviderReadinessV1 {
         Ok(Self {
             composition,
             isolation,
+            dispatch_gate: Mutex::new(()),
             config,
             host_limits,
             provider_id,
@@ -1004,8 +1037,8 @@ impl SupervisedProviderReadinessV1 {
         request: &HandshakeRequest,
         now_unix_micros: i64,
     ) -> Result<ProviderReadinessTargetV1, SupervisedReadinessError> {
-        self.owner_for(request, now_unix_micros)?
-            .ready_target(request, now_unix_micros)
+        self.ready_dispatch_with_evidence(request, now_unix_micros)
+            .map(|dispatch| dispatch.target.clone())
     }
 
     /// Drives one bounded supervised readiness pass and also returns the
@@ -1016,8 +1049,34 @@ impl SupervisedProviderReadinessV1 {
         request: &HandshakeRequest,
         now_unix_micros: i64,
     ) -> Result<(ProviderReadinessTargetV1, ReadinessEvidenceV1), SupervisedReadinessError> {
-        self.owner_for(request, now_unix_micros)?
-            .ready_target_with_evidence(request, now_unix_micros)
+        self.ready_dispatch_with_evidence(request, now_unix_micros)
+            .map(|dispatch| (dispatch.target.clone(), dispatch.evidence.clone()))
+    }
+
+    /// Proves readiness and retains exclusive dispatch ownership until the
+    /// returned guard is dropped.
+    ///
+    /// Callers that immediately contact the provider must keep this guard alive
+    /// through that contact. Ordinary readiness-only callers can use
+    /// [`Self::ready_target`] or [`Self::ready_target_with_evidence`], which
+    /// release ownership as soon as their evidence is copied out.
+    pub fn ready_dispatch_with_evidence(
+        &self,
+        request: &HandshakeRequest,
+        now_unix_micros: i64,
+    ) -> Result<SupervisedReadinessDispatchV1<'_>, SupervisedReadinessError> {
+        let dispatch = self
+            .dispatch_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (target, evidence) = self
+            .owner_for(request, now_unix_micros)?
+            .ready_target_with_evidence(request, now_unix_micros)?;
+        Ok(SupervisedReadinessDispatchV1 {
+            _dispatch: dispatch,
+            target,
+            evidence,
+        })
     }
 
     /// Every exact scope whose provider is currently quarantined, with the

@@ -15,6 +15,15 @@ use super::bootstrap::set_owner_only_permissions;
 // directly under the same gate the harness itself is compiled behind.
 #[cfg(any(test, feature = "test-transport"))]
 use super::project_composition::daemon_transcript_source_home;
+// The interposing open path is the only caller of the explicit-selector
+// composition entry, so both are imported under exactly its gate. A build
+// without them keeps `production_project_server` as the harness's only entry,
+// the same one the daemon runtime uses.
+#[cfg(all(test, feature = "memory-provider-host"))]
+use super::project_composition::{
+    NativeApplicationPortInterpositionV1, ProjectMemoryProviderActivationSelector,
+    production_project_server_with_activation,
+};
 #[cfg(any(test, feature = "test-transport"))]
 use super::project_server_lifecycle::{detach_project_servers, shutdown_detached_project_servers};
 #[cfg(any(test, feature = "test-transport"))]
@@ -301,6 +310,9 @@ async fn mount_production_composition_projects(
     project_roots: Vec<PathBuf>,
     profile_root: &Path,
     scope_prefix: Option<String>,
+    #[cfg(all(test, feature = "memory-provider-host"))] native_port_interposition: Option<
+        NativeApplicationPortInterpositionV1,
+    >,
 ) -> Result<(HashMap<PathBuf, Arc<crate::mcp::McpServer>>, bool)> {
     let client_identity = DaemonClientIdentity {
         profile_root: profile_root.to_path_buf(),
@@ -316,6 +328,8 @@ async fn mount_production_composition_projects(
                 &client_identity,
                 scope_prefix.as_deref(),
                 index,
+                #[cfg(all(test, feature = "memory-provider-host"))]
+                native_port_interposition.clone(),
             ))
             .await?;
         semantic_auto_download_enabled |= project_semantic;
@@ -331,6 +345,9 @@ async fn mount_one_production_composition_project(
     client_identity: &DaemonClientIdentity,
     scope_prefix: Option<&str>,
     index: usize,
+    #[cfg(all(test, feature = "memory-provider-host"))] native_port_interposition: Option<
+        NativeApplicationPortInterpositionV1,
+    >,
 ) -> Result<(PathBuf, Arc<crate::mcp::McpServer>, bool)> {
     let handshake = DaemonHandshake {
         client_version: binary_version()?.to_owned(),
@@ -355,8 +372,33 @@ async fn mount_one_production_composition_project(
             let http_application_registry = &stores.http_application_registry;
             let canonical_project_path = &canonical_project_path;
             let handshake = &handshake;
+            #[cfg(all(test, feature = "memory-provider-host"))]
+            let native_port_interposition = native_port_interposition.clone();
             Box::pin(async move {
                 let cancellation = CancellationToken::new();
+                // An interposing open is the only reason this harness ever
+                // leaves `production_project_server`; every other open uses
+                // exactly the entry the daemon runtime uses.
+                #[cfg(all(test, feature = "memory-provider-host"))]
+                if let Some(interposition) = native_port_interposition {
+                    return production_project_server_with_activation(
+                        store_administration,
+                        project_open_gates,
+                        invocation,
+                        http_application_registry,
+                        canonical_project_path,
+                        handshake,
+                        ProductionProjectCompositionRuntime::Portable {
+                            semantic_auto_download: false,
+                            startup_catch_up: false,
+                        },
+                        &cancellation,
+                        ProjectMemoryProviderActivationSelector::
+                            FromRuntimeConfigurationWithNativePortInterposition(interposition),
+                        None,
+                    )
+                    .await;
+                }
                 production_project_server(
                     store_administration,
                     project_open_gates,
@@ -432,6 +474,34 @@ impl ProductionProjectCompositionHarnessV1 {
             live_profile_root,
             None,
             false,
+            #[cfg(all(test, feature = "memory-provider-host"))]
+            None,
+        )
+    }
+
+    /// Opens the same production composition as [`Self::open`], with the
+    /// caller's own interposition on the application port the enabled mount
+    /// injects into the registry.
+    ///
+    /// Everything else is the production path: the configuration gates decide
+    /// whether a host is mounted at all, the routing gate decides the recall
+    /// route, and the registry's own adapter validates the descriptor the
+    /// returned port declares. A composition whose gates are off still mounts
+    /// nothing and never calls the interposition.
+    #[cfg(all(test, feature = "memory-provider-host"))]
+    pub(super) fn open_with_native_application_port_interposition(
+        isolation_root: impl AsRef<Path>,
+        project_roots: impl IntoIterator<Item = PathBuf>,
+        interposition: NativeApplicationPortInterpositionV1,
+    ) -> ProductionHarnessOpenFuture {
+        let live_profile_root = crate::config::user_data_dir().filter(|path| path.exists());
+        Self::open_with_live_profile_root(
+            isolation_root.as_ref().to_path_buf(),
+            project_roots.into_iter().collect(),
+            live_profile_root,
+            None,
+            false,
+            Some(interposition),
         )
     }
 
@@ -447,6 +517,8 @@ impl ProductionProjectCompositionHarnessV1 {
             live_profile_root,
             Some(scope_prefix.into()),
             false,
+            #[cfg(all(test, feature = "memory-provider-host"))]
+            None,
         )
     }
 
@@ -456,6 +528,9 @@ impl ProductionProjectCompositionHarnessV1 {
         live_profile_root: Option<PathBuf>,
         scope_prefix: Option<String>,
         long_lived_session_maintenance_for_test: bool,
+        #[cfg(all(test, feature = "memory-provider-host"))] native_port_interposition: Option<
+            NativeApplicationPortInterpositionV1,
+        >,
     ) -> ProductionHarnessOpenFuture {
         // Embedded test compositions never pass through the binary's
         // product-runtime registration, so the canonical fixture is this
@@ -481,6 +556,8 @@ impl ProductionProjectCompositionHarnessV1 {
                     isolated.project_roots,
                     &isolated.profile_root,
                     scope_prefix,
+                    #[cfg(all(test, feature = "memory-provider-host"))]
+                    native_port_interposition,
                 ))
                 .await?;
             Ok(Self {
@@ -512,6 +589,8 @@ impl ProductionProjectCompositionHarnessV1 {
             Some(live_profile_root),
             None,
             false,
+            #[cfg(all(test, feature = "memory-provider-host"))]
+            None,
         )
     }
 
@@ -526,6 +605,8 @@ impl ProductionProjectCompositionHarnessV1 {
             None,
             None,
             true,
+            #[cfg(all(test, feature = "memory-provider-host"))]
+            None,
         )
     }
 

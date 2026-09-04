@@ -112,7 +112,7 @@ WHERE idempotency_key = ?2 AND state = 'leased'
 
 const SELECT_JOURNAL_ROW: &str = r#"
 SELECT payload_sha256, extensions_digest, provider_id, registration_revision,
-       source_authority, exact_scope_sha256, source_stream, source_sequence
+       source_authority, exact_scope_sha256, source_stream
 FROM tdmem_observation_journal_v1
 WHERE observation_id = ?1
 "#;
@@ -314,7 +314,6 @@ struct JournalFactsV1 {
     source_authority: String,
     exact_scope_sha256: String,
     source_stream: String,
-    source_sequence: i64,
 }
 
 /// Terminalizes every row one bounded selection returns.
@@ -474,8 +473,6 @@ fn advance_watermark_for(
             source_authority: &journal.source_authority,
             exact_scope_sha256: &journal.exact_scope_sha256,
             source_stream: &journal.source_stream,
-            source_sequence: journal.source_sequence,
-            observation_id: receipt.observation_id.as_str(),
             acknowledged_at_unix_micros: receipt.finished_at_unix_micros,
         },
     )
@@ -495,7 +492,6 @@ fn read_journal_row(
                 source_authority: row.get(4)?,
                 exact_scope_sha256: row.get(5)?,
                 source_stream: row.get(6)?,
-                source_sequence: row.get(7)?,
             })
         })
         .optional()?
@@ -682,8 +678,10 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
         receipt: &ObservationDeliveryReceiptV1,
     ) -> Result<AttemptOutcomeV1, ObservationJournalError> {
         receipt.validate()?;
+        #[cfg(debug_assertions)]
+        self.run_debug_receipt_persist_hook(receipt, false)?;
         let policy = *self.policy();
-        self.with_transaction(|transaction| {
+        let outcome = self.with_transaction(|transaction| {
             let journal = read_journal_row(transaction, receipt.observation_id.as_str())?;
             // Delivered bytes are journal bytes, so a receipt describing other
             // content cannot be attributed to this observation.
@@ -786,7 +784,10 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
                 next_attempt_at_unix_micros: (!settled.state.is_terminal())
                     .then_some(settled.next_attempt_at_unix_micros),
             })
-        })
+        })?;
+        #[cfg(debug_assertions)]
+        self.run_debug_receipt_persist_hook(receipt, true)?;
+        Ok(outcome)
     }
 
     fn release_lease(

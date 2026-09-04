@@ -35,6 +35,7 @@ mod lifecycle;
 mod logging;
 mod multi_root_journey;
 mod ownership;
+mod projectless;
 mod remote_project_deletion;
 mod remote_project_recovery;
 mod replay;

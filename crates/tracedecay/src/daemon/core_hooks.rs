@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Duration, timeout};
 
 pub use tracedecay_hooks::core_events::*;
@@ -71,9 +71,14 @@ async fn notify_hook_event_to_connection(
     let Ok(params) = serde_json::to_value(event) else {
         return HookEventNotifyOutcomeV1::Malformed;
     };
+    // Route publication is causally required by later session-bound tool calls.
+    // Carry an id and wait for the daemon's post-processing acknowledgement;
+    // closing a notification-only socket immediately after flush lets the
+    // broker's peer-disconnect branch win before project binding and route store.
+    let request_id = serde_json::json!("hook-event-route-v1");
     let request = JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
-        id: None,
+        id: Some(request_id.clone()),
         method: HOOK_EVENT_METHOD.to_string(),
         params: Some(params),
     };
@@ -83,7 +88,7 @@ async fn notify_hook_event_to_connection(
     let Ok(stream) = BrokerStream::connect(&connection.endpoint).await else {
         return HookEventNotifyOutcomeV1::Unavailable;
     };
-    let (_reader, mut writer) = stream.into_owned_split();
+    let (reader, mut writer) = stream.into_owned_split();
     if write_daemon_preamble(&mut writer, &connection, &handshake)
         .await
         .is_err()
@@ -93,10 +98,25 @@ async fn notify_hook_event_to_connection(
     if writer.write_all(line.as_bytes()).await.is_err() {
         return HookEventNotifyOutcomeV1::Unavailable;
     }
-    if writer.write_all(b"\n").await.is_err() {
+    if writer.write_all(b"\n").await.is_err() || writer.flush().await.is_err() {
         return HookEventNotifyOutcomeV1::Unavailable;
     }
-    if writer.flush().await.is_err() || writer.shutdown().await.is_err() {
+
+    let mut reader = BufReader::new(reader);
+    let mut response_line = String::new();
+    if reader.read_line(&mut response_line).await.is_err() || response_line.is_empty() {
+        return HookEventNotifyOutcomeV1::Unavailable;
+    }
+    let Ok(response) = serde_json::from_str::<serde_json::Value>(&response_line) else {
+        return HookEventNotifyOutcomeV1::Malformed;
+    };
+    if response.get("id") != Some(&request_id)
+        || response.get("error").is_some()
+        || response["result"]["processed"] != serde_json::json!(true)
+    {
+        return HookEventNotifyOutcomeV1::Malformed;
+    }
+    if writer.shutdown().await.is_err() {
         return HookEventNotifyOutcomeV1::Unavailable;
     }
     HookEventNotifyOutcomeV1::Delivered

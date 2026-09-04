@@ -530,3 +530,54 @@ pub(super) fn projectless_user_session_request(request_line: &str) -> bool {
             .and_then(serde_json::Value::as_str)
             == Some("user")
 }
+
+/// Selects the retained project server named by route-only session/thread
+/// metadata on a projectless registered-project reader request.
+///
+/// The daemon transport chooses its serving MCP server before that server can
+/// run the ordinary per-request private-route dispatch. Without this bridge, a
+/// hook can publish a valid daemon-wide route while the next projectless socket
+/// still falls into the profile-only dispatcher and rejects every code reader
+/// as requiring an initialized project.
+pub(super) fn projectless_registered_project_reader_server(
+    request_line: &str,
+    client_identity: &DaemonClientIdentity,
+    store_administration: &StoreAdministration,
+) -> Result<Option<std::sync::Arc<crate::mcp::McpServer>>> {
+    let Ok(request) = serde_json::from_str::<JsonRpcRequest>(request_line.trim()) else {
+        return Ok(None);
+    };
+    if request.method != "tools/call" {
+        return Ok(None);
+    }
+    let Ok((tool_name, arguments)) = projectless_tool_call(request.params.as_ref()) else {
+        return Ok(None);
+    };
+    if !crate::mcp::tools::tool_dispatches_registered_project_reader(tool_name)
+        || !crate::mcp::project_route::arguments_have_structural_route_identity(&arguments)
+    {
+        return Ok(None);
+    }
+    // Same admission the profile-only dispatcher applies: a private route is
+    // never handed to a socket authenticated for another profile.
+    if store_administration.profile_identity()?.profile_root() != client_identity.profile_root {
+        return Err(TraceDecayError::Config {
+            message: "projectless connection profile does not match its authenticated identity"
+                .to_owned(),
+        });
+    }
+    let routes = store_administration.project_routes().snapshot()?;
+    match routes.workspace_route_for_arguments(&arguments) {
+        Some(crate::mcp::project_route::WorkspaceProjectRoute::Resolved(route)) => {
+            route.retained_server().map(Some)
+        }
+        Some(crate::mcp::project_route::WorkspaceProjectRoute::Failed(failure)) => {
+            Err(failure.clone().into_error())
+        }
+        None => Err(TraceDecayError::project_route(
+            "project_route_not_found",
+            false,
+            "explicit session or thread identity has no registered private project route",
+        )),
+    }
+}

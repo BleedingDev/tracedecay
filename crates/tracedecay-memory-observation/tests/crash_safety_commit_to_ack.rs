@@ -61,6 +61,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -68,7 +69,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use support::{
     Builder, DAY, LEASE, MINUTE, PROVENANCE_DIGEST, PROVIDER, PROVIDER_RECEIPT_DIGEST, SECOND, T0,
@@ -116,6 +117,9 @@ const REGISTRATION_REVISION: u64 = 4;
 /// Carries one child life's whole assignment. Present exactly when this process
 /// *is* a child life.
 const CHILD_LIFE_ENV: &str = "TDMEM_0508_CHILD_LIFE";
+
+/// Carries only a socket path for the attach-without-arrival cleanup child.
+const NON_ARRIVING_CHILD_ENV: &str = "TDMEM_0508_NON_ARRIVING_CHILD";
 
 /// How long the parent blocks for the child's arrival signal before calling
 /// the hook unreachable. This is a terminal bound on a blocking read, not a
@@ -959,6 +963,12 @@ impl ChildLifeSpecV1 {
 /// parent kills it.
 #[test]
 fn crash_child_process_entrypoint() -> TestResult {
+    if let Ok(signal_path) = std::env::var(NON_ARRIVING_CHILD_ENV) {
+        let _signal = UnixStream::connect(signal_path)?;
+        loop {
+            std::thread::park();
+        }
+    }
     let Ok(spec) = std::env::var(CHILD_LIFE_ENV) else {
         return Ok(());
     };
@@ -1073,17 +1083,7 @@ fn crash_at(spec: &ChildLifeSpecV1) -> Result<(), Box<dyn Error>> {
         )?))
         .spawn()?;
 
-    match await_arrival(spec, socket, &mut child) {
-        Ok(()) => {}
-        Err(error) => {
-            // The child is either gone already or wedged somewhere this test
-            // cannot name. Either way it is this function's process to clean
-            // up before it reports anything.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-    }
+    await_arrival(spec, socket, &mut child)?;
 
     // The boundary is reached and the process is parked on it: kill it where it
     // stands. Nothing is unwound, nothing is flushed, and the SQLite connection
@@ -1121,45 +1121,90 @@ fn await_arrival(
     socket: ArrivalSocketV1,
     child: &mut Child,
 ) -> Result<(), Box<dyn Error>> {
+    await_arrival_with_bounds(
+        spec,
+        socket,
+        child,
+        CHILD_ATTACH_TIMEOUT,
+        HOOK_ARRIVAL_TIMEOUT,
+    )
+}
+
+fn await_arrival_with_bounds(
+    spec: &ChildLifeSpecV1,
+    socket: ArrivalSocketV1,
+    child: &mut Child,
+    attach_timeout: Duration,
+    arrival_timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let listener = match socket.listener.try_clone() {
+        Ok(listener) => listener,
+        Err(error) => {
+            terminate_and_reap(child)?;
+            return Err(error.into());
+        }
+    };
     let (signals, arrivals) = mpsc::channel::<Result<ChildSignalV1, String>>();
-    let listener = socket.listener.try_clone()?;
     // One thread, two blocking reads, no wake-ups in between. The parent's own
     // wait is a `recv_timeout`, which blocks on a condition variable until the
     // thread speaks or the deadline passes.
-    let waiter = std::thread::spawn(move || {
-        (|| -> Result<(), String> {
-            let (mut stream, _) = listener
-                .accept()
-                .map_err(|error| format!("the arrival socket could not be accepted: {error}"))?;
-            signals
-                .send(Ok(ChildSignalV1::Attached))
-                .map_err(|error| error.to_string())?;
-            let mut byte = [0_u8; 1];
-            let signal = match stream.read_exact(&mut byte) {
-                Ok(()) => ChildSignalV1::Arrived,
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    ChildSignalV1::Departed
-                }
-                Err(error) => {
-                    return Err(format!("the arrival socket failed mid-life: {error}"));
-                }
-            };
-            signals
-                .send(Ok(signal))
-                .map_err(|error| error.to_string())?;
-            Ok(())
-        })()
-    });
+    let waiter = match std::thread::Builder::new()
+        .name("tdmem-5lc-observation-arrival".to_owned())
+        .spawn(move || {
+            (|| -> Result<(), String> {
+                let (mut stream, _) = listener.accept().map_err(|error| {
+                    format!("the arrival socket could not be accepted: {error}")
+                })?;
+                signals
+                    .send(Ok(ChildSignalV1::Attached))
+                    .map_err(|error| error.to_string())?;
+                let mut byte = [0_u8; 1];
+                let signal = match stream.read_exact(&mut byte) {
+                    Ok(()) => ChildSignalV1::Arrived,
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        ChildSignalV1::Departed
+                    }
+                    Err(error) => {
+                        return Err(format!("the arrival socket failed mid-life: {error}"));
+                    }
+                };
+                signals
+                    .send(Ok(signal))
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })()
+        }) {
+        Ok(waiter) => waiter,
+        Err(error) => {
+            terminate_and_reap(child)?;
+            return Err(harness(format!("the arrival waiter could not start: {error}")).into());
+        }
+    };
 
-    let attached = arrivals.recv_timeout(CHILD_ATTACH_TIMEOUT);
-    stage(spec, child, attached, "attach", CHILD_ATTACH_TIMEOUT)?;
-    let arrived = arrivals.recv_timeout(HOOK_ARRIVAL_TIMEOUT);
-    let outcome = stage(spec, child, arrived, "arrival", HOOK_ARRIVAL_TIMEOUT);
-    // The waiter is joined on every path: it owns the accepted stream, and a
-    // detached thread holding a descriptor past the end of the life it belongs
-    // to is exactly the leak this suite is not allowed to have.
+    let attached = arrivals.recv_timeout(attach_timeout);
+    let outcome = stage(spec, attached, "attach", attach_timeout).and_then(|()| {
+        let arrived = arrivals.recv_timeout(arrival_timeout);
+        stage(spec, arrived, "arrival", arrival_timeout)
+    });
+    let cleanup = if outcome.is_err() {
+        // The child owns the peer that may have the waiter blocked in
+        // `read_exact`: kill and reap it first. A parent-side connection wakes
+        // `accept` when the child never attached.
+        let cleanup = terminate_and_reap(child);
+        if let Ok(stream) = UnixStream::connect(&socket.path) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        cleanup
+    } else {
+        Ok(())
+    };
     drop(socket);
-    let _ = waiter.join();
+    let joined = waiter
+        .join()
+        .map_err(|_| harness("the arrival waiter panicked"))?
+        .map_err(harness);
+    cleanup?;
+    joined?;
     outcome
 }
 
@@ -1167,22 +1212,18 @@ fn await_arrival(
 /// spent deadline into the failure that names what actually happened.
 fn stage(
     spec: &ChildLifeSpecV1,
-    child: &mut Child,
     received: Result<Result<ChildSignalV1, String>, RecvTimeoutError>,
     label: &str,
     bound: Duration,
 ) -> Result<(), Box<dyn Error>> {
     match received {
         Ok(Ok(ChildSignalV1::Attached | ChildSignalV1::Arrived)) => Ok(()),
-        Ok(Ok(ChildSignalV1::Departed)) => {
-            let status = child.wait()?;
-            Err(harness(format!(
-                "the child exited {status} before reaching {}; stderr: {}",
-                spec.hook.as_wire(),
-                child_stderr(spec)
-            ))
-            .into())
-        }
+        Ok(Ok(ChildSignalV1::Departed)) => Err(harness(format!(
+            "the child exited before reaching {}; stderr: {}",
+            spec.hook.as_wire(),
+            child_stderr(spec)
+        ))
+        .into()),
         Ok(Err(error)) => Err(harness(format!(
             "the {label} wait for {} failed: {error}",
             spec.hook.as_wire()
@@ -1200,6 +1241,64 @@ fn stage(
         ))
         .into()),
     }
+}
+
+fn terminate_and_reap(child: &mut Child) -> Result<(), Box<dyn Error>> {
+    if child.try_wait()?.is_none() {
+        child.kill()?;
+    }
+    child.wait()?;
+    Ok(())
+}
+
+#[test]
+fn attached_child_that_never_arrives_is_reaped_without_a_waiter_leak() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let spec = ChildLifeSpecV1 {
+        directory: directory.path().to_path_buf(),
+        hook: HookPointV1::AfterAckReturnBeforeAckPersist,
+        target_sequence: 1,
+        now: T0,
+        settle: vec![1],
+    };
+    let socket = ArrivalSocketV1::bind()?;
+    let executable = std::env::current_exe()?;
+    let mut child = Command::new(executable)
+        .args([
+            "--exact",
+            "crash_child_process_entrypoint",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(NON_ARRIVING_CHILD_ENV, &socket.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(fs::File::create(
+            directory.path().join("child-stderr.log"),
+        )?))
+        .spawn()?;
+    let started = Instant::now();
+    let error = await_arrival_with_bounds(
+        &spec,
+        socket,
+        &mut child,
+        Duration::from_secs(2),
+        Duration::from_millis(200),
+    )
+    .expect_err("a child that never signals arrival must fail");
+    assert!(
+        error.to_string().contains("arrival stage"),
+        "unexpected failure: {error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "non-arrival cleanup exceeded its terminal bound"
+    );
+    assert!(
+        child.try_wait()?.is_some(),
+        "the non-arriving child was not reaped"
+    );
+    Ok(())
 }
 
 /// The socket path the parent put on the wire, read straight from the encoded
@@ -2281,35 +2380,14 @@ fn assert_watermark_holds(paths: &JourneyPathsV1, label: &str) -> Result<(), Box
     Ok(())
 }
 
-/// AC2, provider side — the durable **acknowledgement** watermark is exactly
-/// the last sequence a provider acknowledgement was persisted for.
+/// AC2, provider side — the durable acknowledgement watermark is exactly the
+/// highest contiguous committed sequence carrying an acknowledging receipt.
 ///
-/// This is the position the recovery gate compares a provider's own reported
-/// replay position against, so it is the one the acceptance criterion means by
-/// "the watermark equals the last durably acknowledged sequence". It is written
-/// inside the acknowledging receipt's own transaction, which is the property
-/// under test here: after a kill there is never a watermark whose receipt is
-/// missing, and never an acknowledging receipt whose watermark did not move.
-///
-/// Two things are asserted together, both after every killed life and after
-/// recovery:
-///
-/// * the watermark **equals** the highest sequence carrying a durable
-///   acknowledging receipt — a watermark that ran ahead of receipt persistence
-///   would let a restart skip redelivery of a commit the provider never
-///   answered for, and a watermark that lagged would redeliver an effect the
-///   provider already holds;
-/// * the watermark **names** a sequence that is acknowledged, so it can never
-///   stand on a row with no receipt at all.
-///
-/// What is deliberately *not* asserted mid-flight is "no row below the
-/// watermark lacks a receipt". Delivery is per-row: a position whose attempt
-/// failed transiently goes back to `pending` behind a retry delay while a later
-/// position acknowledges, so a lower unacknowledged row below the watermark is
-/// correct behaviour, not loss. The claim that nothing below the watermark is
-/// abandoned is proved after convergence instead, by
-/// [`assert_journey_invariants_with`], which requires every settled position to
-/// end acknowledged or terminally refused.
+/// This is the position the recovery gate uses to decide what a restart may
+/// skip. Therefore every committed sequence at or below it must have its own
+/// durable acknowledging receipt: one later acknowledgement cannot authorize
+/// the host to skip an earlier unacknowledged commit. The exact comparison also
+/// catches a watermark that lags behind a fully acknowledged contiguous prefix.
 fn assert_acknowledged_watermark(
     paths: &JourneyPathsV1,
     label: &str,
@@ -2331,6 +2409,15 @@ fn assert_acknowledged_watermark(
         }
     }
 
+    let mut committed = CanonicalStreamV1::new(paths.canonical.clone()).committed()?;
+    committed.sort_unstable();
+    committed.dedup();
+    let expected = committed
+        .iter()
+        .copied()
+        .take_while(|sequence| acknowledged.contains(sequence))
+        .last();
+
     let target = RecoveryTargetKeyV1 {
         provider_id: PROVIDER.to_owned(),
         registration_revision: REGISTRATION_REVISION,
@@ -2346,37 +2433,29 @@ fn assert_acknowledged_watermark(
         .and_then(|state| state.acknowledged)
         .map(|position| position.sequence.0);
 
-    match (watermark, acknowledged.iter().next_back().copied()) {
-        (None, None) => Ok(()),
-        (None, Some(highest)) => Err(harness(format!(
-            "{label}: sequence {highest} carries a durable acknowledgement receipt with no \
-             acknowledged watermark behind it, so a restart would redeliver an effect the \
-             provider already holds"
-        ))
-        .into()),
-        (Some(watermark), None) => Err(harness(format!(
-            "{label}: the acknowledged watermark stands at {watermark} with no acknowledging \
-             receipt anywhere, so it passed a record nothing answered for"
-        ))
-        .into()),
-        (Some(watermark), Some(highest)) => {
-            if watermark != highest {
+    if let Some(watermark) = watermark {
+        for sequence in committed
+            .iter()
+            .copied()
+            .filter(|sequence| *sequence <= watermark)
+        {
+            if !acknowledged.contains(&sequence) {
                 return Err(harness(format!(
-                    "{label}: the acknowledged watermark is {watermark} but the highest durably \
-                     acknowledged sequence is {highest}"
+                    "{label}: acknowledged watermark {watermark} passed committed sequence \
+                     {sequence}, which carries no acknowledging receipt"
                 ))
                 .into());
             }
-            if !acknowledged.contains(&watermark) {
-                return Err(harness(format!(
-                    "{label}: the acknowledged watermark stands on sequence {watermark}, which \
-                     carries no acknowledging receipt"
-                ))
-                .into());
-            }
-            Ok(())
         }
     }
+    if watermark != expected {
+        return Err(harness(format!(
+            "{label}: acknowledged watermark {watermark:?} is not the highest contiguous \
+             acknowledged committed sequence {expected:?}"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// AC5 — a permanent provider refusal is terminal and stays terminal.

@@ -304,14 +304,25 @@ pub(super) fn parse_invocation_with_stdin(
 /// by the dispatch layer (or the generated client itself) rather than being
 /// declared per-tool in the schemas:
 ///
+/// - `_meta` and the top-level session/thread spellings carry private hook-route
+///   identity. The daemon strips route-only forms before semantic dispatch.
 /// - `response_handle_project_root` — LCM response-handle storage root when
 ///   the live project differs from the profile store.
 /// - `cwd` — read client-side by the generated Hermes plugin for project
 ///   resolution and may be left in the payload it forwards.
 ///
-/// The validation gate skips these so schema-exact integrations keep working;
-/// everything else unknown is a hard error.
-const DISPATCH_ROUTING_KEYS: &[&str] = &["response_handle_project_root", "cwd"];
+/// A key declared by the selected tool is still validated against its schema
+/// before this allowlist is consulted, so semantic `session_id` remains strict.
+/// Everything else unknown is a hard error.
+const DISPATCH_ROUTING_KEYS: &[&str] = &[
+    "_meta",
+    "session_id",
+    "sessionId",
+    "thread_id",
+    "threadId",
+    "response_handle_project_root",
+    "cwd",
+];
 
 /// One schema-driven validation pass over the *final* arguments object,
 /// shared by the `--args` and per-key paths. Turns the silent divergences —

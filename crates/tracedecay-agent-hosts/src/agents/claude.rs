@@ -281,22 +281,22 @@ fn claude_non_interactive_install_state(
     tracedecay_bin: &str,
     staged_paths: Vec<PathBuf>,
 ) -> Result<NonInteractiveInstallOutcome> {
-    if claude_plugin_is_natively_active(home, Some(tracedecay_bin))? {
-        Ok(NonInteractiveInstallOutcome::Ready)
-    } else if claude_plugin_registration_is_active(home)? {
-        Ok(NonInteractiveInstallOutcome::DeferredUserAction(
-            DeferredUserAction {
-                remediation: format!(
-                    "Claude Code's loaded TraceDecay cache is stale. Run `claude plugin update {PLUGIN_IDENTIFIER}`, restart Claude Code, then retry the TraceDecay lifecycle."
-                ),
-                staged_paths,
-            },
-        ))
-    } else {
-        Ok(NonInteractiveInstallOutcome::DeferredUserAction(
+    if !claude_plugin_registration_is_active(home)? {
+        return Ok(NonInteractiveInstallOutcome::DeferredUserAction(
             claude_native_install_action(staged_paths.first().map(PathBuf::as_path)),
-        ))
+        ));
     }
+    if claude_loaded_cache_matches_expected_bundle(home, tracedecay_bin)? {
+        return Ok(NonInteractiveInstallOutcome::Ready);
+    }
+    Ok(NonInteractiveInstallOutcome::DeferredUserAction(
+        DeferredUserAction {
+            remediation: format!(
+                "Claude Code's loaded TraceDecay cache is stale. Run `claude plugin update {PLUGIN_IDENTIFIER}`, restart Claude Code, then retry the TraceDecay lifecycle."
+            ),
+            staged_paths,
+        },
+    ))
 }
 
 fn claude_plugin_is_natively_active(home: &Path, tracedecay_bin: Option<&str>) -> Result<bool> {
@@ -353,6 +353,29 @@ fn claude_current_cached_plugin_manifest_path(home: &Path) -> PathBuf {
 fn claude_current_cached_plugin_root(home: &Path) -> PathBuf {
     home.join(".claude/plugins/cache/tracedecay/tracedecay")
         .join(crate::PRODUCT_VERSION)
+}
+
+/// Check Claude's host-owned loaded cache without consulting the deployed
+/// marketplace source. Source drift is repaired by the receipt-backed component
+/// transaction, which must observe and back up the pre-transaction bytes first.
+fn claude_loaded_cache_matches_expected_bundle(home: &Path, tracedecay_bin: &str) -> Result<bool> {
+    let cache_root = claude_current_cached_plugin_root(home);
+    let rendered = rendered_plugin_files(tracedecay_bin)?;
+    let (expected, relatives) = super::rendered_bundle_content_digest(&rendered)?;
+    let Some(cache) = super::observed_bundle_content_digest(&cache_root, &relatives)? else {
+        return Ok(false);
+    };
+    if cache != expected {
+        return Ok(false);
+    }
+    // A self-comparison reuses the discovery validator to reject unexpected
+    // auto-discovered entrypoints without making readiness depend on source.
+    super::observed_bundle_discovery_matches(
+        &cache_root,
+        &cache_root,
+        &relatives,
+        &[".claude-plugin", "agents", "commands", "hooks", "skills"],
+    )
 }
 
 fn claude_loaded_cache_matches_rendered_bundle(

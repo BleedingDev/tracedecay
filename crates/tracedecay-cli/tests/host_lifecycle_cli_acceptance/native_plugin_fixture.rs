@@ -71,37 +71,78 @@ pub fn set_claude_native_activation(home: &Path, active: bool) {
     }
 }
 
-pub fn apply_current_codex_plugin_remediation(home: &Path, command: &str) -> Result<(), String> {
-    let ["codex", "plugin", "add", "tracedecay@personal"] =
-        command.split_whitespace().collect::<Vec<_>>().as_slice()
-    else {
-        return Err(format!(
-            "Codex 0.147.0 cannot execute lifecycle remediation `{command}`"
-        ));
-    };
+/// Install a deterministic, executable fake Codex CLI into `bin_dir` that
+/// models Codex 0.147+'s exact non-interactive plugin grammar:
+/// `plugin add tracedecay@personal --json`. Production drives this binary
+/// itself (see `require_codex_plugin_cli`/`codex_plugin_add_with`); this
+/// fixture stands in for it under the deterministic `PATH=bin_dir` isolation
+/// `IsolatedCli` runs every command under, so it is written in python3 (the
+/// only interpreter `IsolatedCli` provisions on that isolated `PATH`) rather
+/// than a shell script that would need external utilities resolved off it.
+///
+/// Returns the invocation log path (`recorded_codex_invocations` reads it).
+#[cfg(unix)]
+pub fn install_current_codex_cli(home: &Path, bin_dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
 
-    let config_path = home.join(".codex/config.toml");
-    let mut config = fs::read_to_string(&config_path).unwrap_or_default();
-    if !config.contains("[plugins.\"tracedecay@personal\"]") {
-        config.push_str("\n[plugins.\"tracedecay@personal\"]\nenabled = true\n");
-        fs::write(&config_path, config).unwrap();
-    }
+    let cli = bin_dir.join("codex");
+    let version = tracedecay_agent_hosts::PRODUCT_VERSION;
+    fs::write(
+        &cli,
+        format!(
+            r##"#!/usr/bin/env python3
+import os
+import pathlib
+import shutil
+import sys
 
-    let source = home.join(".codex/plugins/tracedecay");
-    let cache = home
-        .join(".codex/plugins/cache/personal/tracedecay")
-        .join(tracedecay_agent_hosts::PRODUCT_VERSION);
-    fs::create_dir_all(&cache).unwrap();
-    copy_test_bundle(&source, &cache);
-    Ok(())
+home = pathlib.Path(os.environ["HOME"])
+args = sys.argv[1:]
+with (home / ".codex-test-invocations").open("a") as log:
+    log.write(" ".join(args) + "\n")
+
+if args == ["plugin", "add", "tracedecay@personal", "--json"]:
+    config_path = home / ".codex/config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config = config_path.read_text() if config_path.exists() else ""
+    marker = '[plugins."tracedecay@personal"]'
+    if marker not in config:
+        if config and not config.endswith("\n"):
+            config += "\n"
+        config += "\n" + marker + "\nenabled = true\n"
+        config_path.write_text(config)
+
+    source = home / ".codex/plugins/tracedecay"
+    cache = home / ".codex/plugins/cache/personal/tracedecay" / {version:?}
+    if cache.exists():
+        shutil.rmtree(cache)
+    cache.mkdir(parents=True, exist_ok=True)
+    if source.exists():
+        shutil.copytree(source, cache, dirs_exist_ok=True)
+
+    print('{{"pluginId":"tracedecay@personal","enabled":true}}')
+    sys.exit(0)
+else:
+    print("unsupported fake Codex lifecycle command: " + " ".join(args), file=sys.stderr)
+    sys.exit(2)
+"##,
+            version = version,
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&cli).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&cli, permissions).unwrap();
+    home.join(".codex-test-invocations")
 }
 
-pub fn remediation_command(stderr: &[u8]) -> &str {
-    std::str::from_utf8(stderr)
-        .unwrap()
-        .split('`')
-        .nth(1)
-        .expect("lifecycle failure must provide one executable remediation command")
+#[cfg(unix)]
+pub fn recorded_codex_invocations(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(unix)]

@@ -13,8 +13,11 @@
 //! to produce it.
 #![allow(clippy::panic)]
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use tracedecay_memory_provider_registry::{
@@ -583,6 +586,103 @@ async fn a_cancelled_non_terminable_worker_holds_the_route_only_until_it_returns
     assert_eq!(recovered.ok(), Some("answered"));
 }
 
+/// A caller whose consent was **already** withdrawn when the invocation
+/// arrived is refused before contact: no worker is borrowed, the provider is
+/// never called, and the finite worker budget is untouched.
+///
+/// Real defect this catches: learning about cancellation only from the race
+/// that waits on the worker. Under that shape an already-cancelled call still
+/// spends one unit of the provider's worker budget, still hands the provider
+/// work the host has withdrawn — and, because completion is polled first in
+/// that race, a provider quick enough to answer inside the same poll has its
+/// answer accepted for a caller that no longer exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_already_withdrawn_caller_is_refused_before_the_provider_is_contacted() {
+    let boundary = boundary();
+    let contacted = Arc::new(AtomicUsize::new(0));
+
+    let reached = Arc::clone(&contacted);
+    let refused = boundary
+        .invoke(
+            ProviderInvocationRequestV1 {
+                provider_id: PROVIDER,
+                execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
+                budget: Duration::from_secs(30),
+                // Already resolved: the caller withdrew before the boundary saw
+                // the invocation at all.
+                cancelled: Box::pin(std::future::ready(())),
+            },
+            move || {
+                reached.fetch_add(1, Ordering::AcqRel);
+                "an answer nobody asked for"
+            },
+        )
+        .await;
+
+    match refused {
+        Err(ProviderInvocationFaultV1::Cancelled {
+            provider_id,
+            waited_millis,
+            disposition,
+        }) => {
+            assert_eq!(provider_id, PROVIDER);
+            assert_eq!(waited_millis, 0, "nothing was waited for");
+            assert_eq!(
+                disposition,
+                WorkerDispositionV1::Terminated,
+                "no worker was borrowed, so nothing of this invocation can be running"
+            );
+        }
+        other => panic!("an already-withdrawn caller must be refused as cancelled: {other:?}"),
+    }
+    assert_eq!(
+        contacted.load(Ordering::Acquire),
+        0,
+        "the boundary handed work to the provider after its caller had already withdrawn"
+    );
+    assert_eq!(
+        boundary.worker_census(PROVIDER),
+        ProviderWorkerCensusV1::default(),
+        "a call that never happened must not spend a worker"
+    );
+
+    // The budget really is untouched: both waited workers are still available.
+    let gate = Arc::new(ReleaseGate::default());
+    let mut running = Vec::new();
+    for _ in 0..2 {
+        let boundary = Arc::clone(&boundary);
+        let held = Arc::clone(&gate);
+        running.push(tokio::spawn(async move {
+            boundary
+                .invoke(uncancelled(Duration::from_secs(30)), move || {
+                    held.enter();
+                    7_usize
+                })
+                .await
+                .map_err(|fault| fault.to_string())
+        }));
+    }
+    settle_until(&boundary, Duration::from_secs(10), |census| {
+        census.live == 2
+    })
+    .await;
+    gate.release();
+    for task in running {
+        assert_eq!(
+            task.await.expect("invocation task"),
+            Ok(7),
+            "the untouched budget must admit both workers"
+        );
+    }
+    assert_eq!(
+        settle_until(&boundary, Duration::from_secs(10), |census| census
+            .occupied()
+            == 0)
+        .await,
+        ProviderWorkerCensusV1::default()
+    );
+}
+
 /// Cancellation ends the caller's wait when it happens, not when the provider
 /// finally returns.
 ///
@@ -818,5 +918,341 @@ async fn a_host_that_cannot_start_a_worker_reports_it_and_keeps_no_slot() {
         boundary.worker_census(PROVIDER),
         ProviderWorkerCensusV1::default(),
         "an unstarted worker must not hold a slot"
+    );
+}
+
+#[derive(Default)]
+struct CancellationGate {
+    open: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl CancellationGate {
+    fn wait(&self) {
+        let mut open = self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*open {
+            open = self
+                .changed
+                .wait(open)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn open(&self) {
+        *self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.changed.notify_all();
+    }
+}
+
+/// Pending at the pre-contact observation boundary, then ready forever.
+struct ReadyAfterFirstPoll {
+    polled: bool,
+}
+
+impl Future for ReadyAfterFirstPoll {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.polled {
+            Poll::Ready(())
+        } else {
+            self.polled = true;
+            Poll::Pending
+        }
+    }
+}
+
+/// On its in-race poll, withdraws consent before releasing the provider, then
+/// waits until the provider has settled its slot. This deterministically
+/// exercises the settle-before-`stop()` interleaving.
+struct CancelThenAllowSettlement {
+    first_poll: bool,
+    withdrawn: Arc<AtomicBool>,
+    provider_release: Arc<CancellationGate>,
+    provider_settled: Arc<CancellationGate>,
+}
+
+impl Future for CancelThenAllowSettlement {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.first_poll {
+            self.first_poll = false;
+            return Poll::Pending;
+        }
+        self.withdrawn.store(true, Ordering::Release);
+        self.provider_release.open();
+        self.provider_settled.wait();
+        Poll::Ready(())
+    }
+}
+
+struct SettlementSignallingWorkers {
+    settled: Arc<CancellationGate>,
+}
+
+impl ProviderWorkerSpawnV1 for SettlementSignallingWorkers {
+    fn isolation(&self) -> ProviderWorkerIsolationV1 {
+        ProviderWorkerIsolationV1::CooperativeOnly
+    }
+
+    fn spawn_detached(
+        &self,
+        name: &str,
+        work: ProviderWorkV1,
+    ) -> Result<Box<dyn ProviderWorkerHandleV1>, ProviderWorkerSpawnErrorV1> {
+        let settled = Arc::clone(&self.settled);
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                work();
+                settled.open();
+            })
+            .map_err(|error| ProviderWorkerSpawnErrorV1::new(error.to_string()))?;
+        Ok(Box::new(HostThreadHandle))
+    }
+}
+
+struct InlineWorkers;
+
+impl ProviderWorkerSpawnV1 for InlineWorkers {
+    fn isolation(&self) -> ProviderWorkerIsolationV1 {
+        ProviderWorkerIsolationV1::CooperativeOnly
+    }
+
+    fn spawn_detached(
+        &self,
+        _name: &str,
+        work: ProviderWorkV1,
+    ) -> Result<Box<dyn ProviderWorkerHandleV1>, ProviderWorkerSpawnErrorV1> {
+        work();
+        Ok(Box::new(HostThreadHandle))
+    }
+}
+
+fn cancellation_boundary(spawn: Arc<dyn ProviderWorkerSpawnV1>) -> ProviderInvocationBoundaryV1 {
+    ProviderInvocationBoundaryV1::new(ProviderInvocationLimitsV1::for_in_flight(1), spawn)
+}
+
+fn cancelled_before_contact() -> ProviderInvocationFaultV1 {
+    ProviderInvocationFaultV1::Cancelled {
+        provider_id: PROVIDER.to_owned(),
+        waited_millis: 0,
+        disposition: WorkerDispositionV1::Terminated,
+    }
+}
+
+async fn assert_cancellation_preempts_pre_contact_refusal(
+    boundary: &ProviderInvocationBoundaryV1,
+    execution_shape: ProviderExecutionShapeV1,
+    refusal: &str,
+) {
+    let contacts = Arc::new(AtomicUsize::new(0));
+    let contacted = Arc::clone(&contacts);
+    let outcome = boundary
+        .invoke(
+            ProviderInvocationRequestV1 {
+                provider_id: PROVIDER,
+                execution_shape,
+                budget: Duration::from_secs(30),
+                cancelled: Box::pin(ReadyAfterFirstPoll { polled: false }),
+            },
+            move || contacted.fetch_add(1, Ordering::AcqRel),
+        )
+        .await;
+
+    assert_eq!(
+        outcome,
+        Err(cancelled_before_contact()),
+        "cancellation must preempt the {refusal} refusal"
+    );
+    assert_eq!(
+        contacts.load(Ordering::Acquire),
+        0,
+        "the {refusal} path contacted provider code"
+    );
+    assert_eq!(
+        boundary.worker_census(PROVIDER),
+        ProviderWorkerCensusV1::default(),
+        "the {refusal} path changed the worker census"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_cancelled_is_terminal_before_execution_shape_or_capacity_decisions() {
+    let boundary = boundary();
+
+    for execution_shape in [
+        ProviderExecutionShapeV1::HostAuthoredInProcess,
+        ProviderExecutionShapeV1::Foreign,
+    ] {
+        let contacts = Arc::new(AtomicUsize::new(0));
+        let contacted = Arc::clone(&contacts);
+        let outcome = boundary
+            .invoke(
+                ProviderInvocationRequestV1 {
+                    provider_id: PROVIDER,
+                    execution_shape,
+                    budget: Duration::from_secs(30),
+                    cancelled: Box::pin(std::future::ready(())),
+                },
+                move || contacted.fetch_add(1, Ordering::AcqRel),
+            )
+            .await;
+
+        assert_eq!(
+            outcome,
+            Err(cancelled_before_contact()),
+            "an already-withdrawn {execution_shape:?} call must end as cancellation"
+        );
+        assert_eq!(contacts.load(Ordering::Acquire), 0);
+        assert_eq!(
+            boundary.worker_census(PROVIDER),
+            ProviderWorkerCensusV1::default()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_preempts_every_pre_contact_refusal() {
+    let isolated = cancellation_boundary(Arc::new(HostWorkers));
+    assert_cancellation_preempts_pre_contact_refusal(
+        &isolated,
+        ProviderExecutionShapeV1::Foreign,
+        "foreign-isolation",
+    )
+    .await;
+
+    let stalled = ProviderInvocationBoundaryV1::new(
+        ProviderInvocationLimitsV1 {
+            max_workers: 1,
+            max_stranded_workers: 0,
+        },
+        Arc::new(HostWorkers),
+    );
+    assert_cancellation_preempts_pre_contact_refusal(
+        &stalled,
+        ProviderExecutionShapeV1::HostAuthoredInProcess,
+        "stalled-provider",
+    )
+    .await;
+
+    let exhausted = ProviderInvocationBoundaryV1::new(
+        ProviderInvocationLimitsV1 {
+            max_workers: 0,
+            max_stranded_workers: 1,
+        },
+        Arc::new(HostWorkers),
+    );
+    assert_cancellation_preempts_pre_contact_refusal(
+        &exhausted,
+        ProviderExecutionShapeV1::HostAuthoredInProcess,
+        "worker-capacity",
+    )
+    .await;
+
+    let unavailable = cancellation_boundary(Arc::new(RefusingWorkers));
+    assert_cancellation_preempts_pre_contact_refusal(
+        &unavailable,
+        ProviderExecutionShapeV1::HostAuthoredInProcess,
+        "worker-unavailable",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_ready_with_delivery_is_repolled_before_acceptance() {
+    let boundary = cancellation_boundary(Arc::new(InlineWorkers));
+    let contacts = Arc::new(AtomicUsize::new(0));
+    let contacted = Arc::clone(&contacts);
+
+    let outcome = boundary
+        .invoke(
+            ProviderInvocationRequestV1 {
+                provider_id: PROVIDER,
+                execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
+                budget: Duration::from_secs(30),
+                cancelled: Box::pin(ReadyAfterFirstPoll { polled: false }),
+            },
+            move || {
+                contacted.fetch_add(1, Ordering::AcqRel);
+                "withdrawn answer"
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(
+            outcome,
+            Err(ProviderInvocationFaultV1::Cancelled {
+                ref provider_id,
+                disposition: WorkerDispositionV1::Terminated,
+                ..
+            }) if provider_id == PROVIDER
+        ),
+        "a delivered answer cannot bypass cancellation that is already ready: {outcome:?}"
+    );
+    assert_eq!(contacts.load(Ordering::Acquire), 1);
+    assert_eq!(
+        boundary.worker_census(PROVIDER),
+        ProviderWorkerCensusV1::default()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_stays_terminal_when_worker_settles_before_stop_takes_the_slot() {
+    let withdrawn = Arc::new(AtomicBool::new(false));
+    let provider_release = Arc::new(CancellationGate::default());
+    let provider_settled = Arc::new(CancellationGate::default());
+    let boundary = cancellation_boundary(Arc::new(SettlementSignallingWorkers {
+        settled: Arc::clone(&provider_settled),
+    }));
+
+    let release = Arc::clone(&provider_release);
+    let saw_withdrawal = Arc::clone(&withdrawn);
+    let outcome = boundary
+        .invoke(
+            ProviderInvocationRequestV1 {
+                provider_id: PROVIDER,
+                execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
+                budget: Duration::from_secs(30),
+                cancelled: Box::pin(CancelThenAllowSettlement {
+                    first_poll: true,
+                    withdrawn: Arc::clone(&withdrawn),
+                    provider_release: Arc::clone(&provider_release),
+                    provider_settled: Arc::clone(&provider_settled),
+                }),
+            },
+            move || {
+                release.wait();
+                assert!(
+                    saw_withdrawal.load(Ordering::Acquire),
+                    "the provider was allowed to answer before cancellation was ready"
+                );
+                "late answer"
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(
+            outcome,
+            Err(ProviderInvocationFaultV1::Cancelled {
+                ref provider_id,
+                disposition: WorkerDispositionV1::Terminated,
+                ..
+            }) if provider_id == PROVIDER
+        ),
+        "settlement before stop acquired the slot recovered a withdrawn answer: {outcome:?}"
+    );
+    assert_eq!(
+        boundary.worker_census(PROVIDER),
+        ProviderWorkerCensusV1::default()
     );
 }

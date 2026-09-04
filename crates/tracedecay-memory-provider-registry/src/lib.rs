@@ -128,8 +128,8 @@ pub use state_capability::{
 pub use supervised_readiness::{
     BoundedCallRefusalV1, BoundedProviderCallV1, CompositionLifecycleAdapterV1,
     CompositionLifecycleError, ProviderHandshakeWorkV1, QuarantinedScopeV1,
-    SupervisedProviderReadinessV1, SupervisedReadinessConfigV1, SupervisedReadinessError,
-    SupervisedScopeReadinessV1,
+    SupervisedProviderReadinessV1, SupervisedReadinessConfigV1, SupervisedReadinessDispatchV1,
+    SupervisedReadinessError, SupervisedScopeReadinessV1,
 };
 pub use supervisor::{
     AdapterOperationV1, DegradationCauseV1, DegradationKindV1, DegradationRecordV1,

@@ -28,6 +28,44 @@ use super::row::{read_u32, read_u64, sql_i64};
 /// delivered again.
 const DELIVERABLE_STATES: &str = "'pending', 'leased', 'effect_unknown'";
 
+const SELECT_CONTIGUOUS_ACKNOWLEDGED: &str = r#"
+SELECT candidate.source_sequence, candidate.observation_id,
+       MAX(candidate_receipt.finished_at_micros)
+FROM tdmem_observation_journal_v1 candidate
+JOIN tdmem_observation_delivery_v1 candidate_delivery
+  ON candidate_delivery.idempotency_key = candidate.idempotency_key
+JOIN tdmem_observation_receipt_v1 candidate_receipt
+  ON candidate_receipt.observation_id = candidate.observation_id
+ AND candidate_receipt.outcome IN ('applied', 'partial_effect', 'duplicate_acknowledged')
+WHERE candidate_delivery.provider_id = ?1
+  AND candidate_delivery.registration_revision = ?2
+  AND candidate.source_authority = ?3
+  AND candidate.exact_scope_sha256 = ?4
+  AND candidate.source_stream = ?5
+  AND NOT EXISTS (
+      SELECT 1
+      FROM tdmem_observation_journal_v1 prior
+      JOIN tdmem_observation_delivery_v1 prior_delivery
+        ON prior_delivery.idempotency_key = prior.idempotency_key
+      WHERE prior_delivery.provider_id = ?1
+        AND prior_delivery.registration_revision = ?2
+        AND prior.source_authority = ?3
+        AND prior.exact_scope_sha256 = ?4
+        AND prior.source_stream = ?5
+        AND prior.source_sequence < candidate.source_sequence
+        AND NOT EXISTS (
+            SELECT 1
+            FROM tdmem_observation_receipt_v1 prior_receipt
+            WHERE prior_receipt.observation_id = prior.observation_id
+              AND prior_receipt.outcome IN
+                  ('applied', 'partial_effect', 'duplicate_acknowledged')
+        )
+  )
+GROUP BY candidate.source_sequence, candidate.observation_id
+ORDER BY candidate.source_sequence DESC
+LIMIT 1
+"#;
+
 const ADVANCE_ACKNOWLEDGED: &str = r#"
 INSERT INTO tdmem_observation_recovery_v1 (
     provider_id, registration_revision, source_authority, exact_scope_sha256, source_stream,
@@ -41,8 +79,16 @@ DO UPDATE SET
     acknowledged_observation_id = excluded.acknowledged_observation_id,
     acknowledged_at_micros = excluded.acknowledged_at_micros,
     updated_at_micros = excluded.updated_at_micros
-WHERE tdmem_observation_recovery_v1.acknowledged_sequence IS NULL
-   OR excluded.acknowledged_sequence > tdmem_observation_recovery_v1.acknowledged_sequence
+"#;
+
+const CLEAR_ACKNOWLEDGED: &str = r#"
+UPDATE tdmem_observation_recovery_v1
+SET acknowledged_sequence = NULL,
+    acknowledged_observation_id = NULL,
+    acknowledged_at_micros = NULL,
+    updated_at_micros = ?6
+WHERE provider_id = ?1 AND registration_revision = ?2 AND source_authority = ?3
+  AND exact_scope_sha256 = ?4 AND source_stream = ?5
 "#;
 
 const SELECT_RECOVERY_STATE: &str = r#"
@@ -123,35 +169,63 @@ pub(super) struct AcknowledgedWriteV1<'a> {
     pub(super) exact_scope_sha256: &'a str,
     /// Stream the sequence is ordered in.
     pub(super) source_stream: &'a str,
-    /// Position the provider acknowledged.
-    pub(super) source_sequence: i64,
-    /// Observation the acknowledgement settled.
-    pub(super) observation_id: &'a str,
     /// Instant the acknowledging attempt finished.
     pub(super) acknowledged_at_unix_micros: i64,
 }
 
-/// Advances the acknowledged watermark for the target one receipt settled.
+/// Recomputes the acknowledged watermark after one receipt settles.
 ///
 /// Called inside the acknowledging receipt's own transaction, so a crash cannot
-/// leave a receipt without its watermark or a watermark without its receipt.
+/// leave a receipt without its watermark or a watermark without its receipt. A
+/// later row may answer before an earlier one; only the highest row whose every
+/// journalled predecessor also carries an acknowledging receipt is published.
 pub(super) fn advance_acknowledged_watermark(
     transaction: &Transaction<'_>,
     write: &AcknowledgedWriteV1<'_>,
 ) -> Result<(), ObservationJournalError> {
-    transaction.execute(
-        ADVANCE_ACKNOWLEDGED,
-        params![
-            write.provider_id,
-            write.registration_revision,
-            write.source_authority,
-            write.exact_scope_sha256,
-            write.source_stream,
-            write.source_sequence,
-            write.observation_id,
-            write.acknowledged_at_unix_micros,
-        ],
-    )?;
+    let target = params![
+        write.provider_id,
+        write.registration_revision,
+        write.source_authority,
+        write.exact_scope_sha256,
+        write.source_stream,
+    ];
+    let acknowledged = transaction
+        .query_row(SELECT_CONTIGUOUS_ACKNOWLEDGED, target, |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .optional()?;
+    if let Some((sequence, observation_id, acknowledged_at)) = acknowledged {
+        transaction.execute(
+            ADVANCE_ACKNOWLEDGED,
+            params![
+                write.provider_id,
+                write.registration_revision,
+                write.source_authority,
+                write.exact_scope_sha256,
+                write.source_stream,
+                sequence,
+                observation_id,
+                acknowledged_at,
+            ],
+        )?;
+    } else {
+        transaction.execute(
+            CLEAR_ACKNOWLEDGED,
+            params![
+                write.provider_id,
+                write.registration_revision,
+                write.source_authority,
+                write.exact_scope_sha256,
+                write.source_stream,
+                write.acknowledged_at_unix_micros,
+            ],
+        )?;
+    }
     Ok(())
 }
 

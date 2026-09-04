@@ -69,6 +69,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::Poll;
 use std::time::Duration;
 
 /// One unit of provider work the host runs on a worker it owns.
@@ -258,9 +259,11 @@ impl ProviderWorkerCensusV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerDispositionV1 {
     /// Nothing of this invocation is still running -- the host stopped the
-    /// worker, or the worker left while the host was stopping it -- and its
-    /// capacity is fully reclaimed. Only a host with a real kill primitive can
-    /// produce this against work that would never have returned.
+    /// worker, the worker left while the host was stopping it, or no worker
+    /// was ever borrowed because the caller had already withdrawn before
+    /// contact -- and its capacity is fully reclaimed. Only a host with a real
+    /// kill primitive can produce this against work that would never have
+    /// returned.
     Terminated,
     /// The host could not stop the worker. It is still running, still counted
     /// against its provider, and the provider is refused before contact until
@@ -526,18 +529,48 @@ impl ProviderInvocationBoundaryV1 {
             budget,
             mut cancelled,
         } = request;
+        // Consent that is already withdrawn is read *before* every other
+        // pre-contact decision. Cancellation is the caller's terminal, not an
+        // execution-shape or capacity refusal, and learning it requires no
+        // worker and no provider contact.
+        //
+        // It is also read before a worker slot is
+        // claimed and before any worker exists, so a call the caller no longer
+        // wants costs the provider nothing and costs the finite worker budget
+        // nothing. Learning it only from the race below meant an
+        // already-cancelled call still admitted a worker against the ceiling,
+        // still handed the provider work the host had withdrawn, and -- if the
+        // provider was quick enough to win the biased completion arm -- still
+        // had that answer accepted.
+        if withdrawn_already(&mut cancelled).await {
+            return Err(cancelled_before_contact(provider_id));
+        }
         // Refused before contact, before any worker exists: foreign code the
         // host cannot terminate is not a deadline problem, it is a shape this
-        // boundary does not admit.
+        // boundary does not admit. Re-poll consent at the refusal edge: it may
+        // have been withdrawn since the invocation's initial observation, and
+        // cancellation is the caller's terminal even when this shape would
+        // otherwise be refused too.
         if execution_shape == ProviderExecutionShapeV1::Foreign
             && self.spawn.isolation() == ProviderWorkerIsolationV1::CooperativeOnly
         {
+            if withdrawn_already(&mut cancelled).await {
+                return Err(cancelled_before_contact(provider_id));
+            }
             return Err(ProviderInvocationFaultV1::ExecutionNotIsolated {
                 provider_id: provider_id.to_owned(),
             });
         }
         let ledger = self.ledger(provider_id);
-        ledger.admit(provider_id, self.limits)?;
+        if let Err(refusal) = ledger.admit(provider_id, self.limits) {
+            // Admission refusals are still pre-contact. Cancellation that
+            // became visible while the ledger was inspected takes precedence,
+            // and the failed admission changed no census state.
+            if withdrawn_already(&mut cancelled).await {
+                return Err(cancelled_before_contact(provider_id));
+            }
+            return Err(refusal);
+        }
         let slot = Arc::new(InvocationSlotV1 {
             state: Mutex::new(SlotStateV1::Running),
             ledger: Arc::clone(&ledger),
@@ -564,6 +597,12 @@ impl ProviderInvocationBoundaryV1 {
             Ok(handle) => handle,
             Err(error) => {
                 slot.release();
+                // The worker never started, so this is another pre-contact
+                // refusal. Observe consent after releasing the provisional slot
+                // and let cancellation win without leaving census state behind.
+                if withdrawn_already(&mut cancelled).await {
+                    return Err(cancelled_before_contact(provider_id));
+                }
                 return Err(ProviderInvocationFaultV1::WorkerUnavailable {
                     provider_id: provider_id.to_owned(),
                     detail: error.to_string(),
@@ -571,8 +610,10 @@ impl ProviderInvocationBoundaryV1 {
             }
         };
         let started = std::time::Instant::now();
-        // Three outcomes, one race. Completion is polled first so a worker that
-        // answered in the same instant the caller withdrew is still an answer.
+        // Three outcomes, one race. Completion is polled first, but accepting
+        // it has a second consent boundary: cancellation may have become ready
+        // before the delivered branch was chosen. Once withdrawal is observed,
+        // no later provider outcome can be recovered from the stop race.
         let ended = tokio::select! {
             biased;
             delivered = &mut receiver => Ok(delivered),
@@ -580,7 +621,13 @@ impl ProviderInvocationBoundaryV1 {
             () = tokio::time::sleep(budget) => Err(WaitEndV1::DeadlineExceeded),
         };
         let stop = match ended {
-            Ok(Ok(outcome)) => return Ok(outcome),
+            Ok(Ok(outcome)) => {
+                if !withdrawn_already(&mut cancelled).await {
+                    return Ok(outcome);
+                }
+                drop(outcome);
+                WaitEndV1::Cancelled
+            }
             Ok(Err(_)) => {
                 return Err(ProviderInvocationFaultV1::WorkerLost {
                     provider_id: provider_id.to_owned(),
@@ -591,15 +638,21 @@ impl ProviderInvocationBoundaryV1 {
         // The caller is done waiting. Ask the host to stop the worker; only a
         // host that owns a kill primitive can answer `Terminated`, and only
         // then is the work provably over.
-        let Some(disposition) = slot.stop(handle.as_ref()) else {
-            // The worker delivered inside the same critical section the stop
-            // attempt took: answer with the outcome the provider in fact
-            // produced rather than a deadline it in fact met.
-            return receiver
-                .try_recv()
-                .map_err(|_| ProviderInvocationFaultV1::WorkerLost {
-                    provider_id: provider_id.to_owned(),
-                });
+        let disposition = match slot.stop(handle.as_ref()) {
+            Some(disposition) => disposition,
+            // Cancellation is fail-closed. The worker may have settled after
+            // withdrawal became ready but before `stop` acquired its slot; its
+            // outcome is still withdrawn and must never become `Ok`.
+            None if matches!(stop, WaitEndV1::Cancelled) => WorkerDispositionV1::Terminated,
+            None => {
+                // A deadline racing with a worker that had already settled is
+                // different: the provider met the bound, so keep its outcome.
+                return receiver
+                    .try_recv()
+                    .map_err(|_| ProviderInvocationFaultV1::WorkerLost {
+                        provider_id: provider_id.to_owned(),
+                    });
+            }
         };
         Err(match stop {
             WaitEndV1::Cancelled => ProviderInvocationFaultV1::Cancelled {
@@ -631,6 +684,25 @@ impl ProviderInvocationBoundaryV1 {
     fn guard<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
         lock.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Reads a caller's cancellation input without waiting on it.
+///
+/// The future is polled exactly once and never again if it was ready, so this
+/// answers "had the caller already withdrawn when the invocation arrived?"
+/// without borrowing a worker to find out. A pending future is left untouched
+/// for the race in [`ProviderInvocationBoundaryV1::invoke`] to own.
+async fn withdrawn_already(cancelled: &mut ProviderCancellationWaitV1) -> bool {
+    std::future::poll_fn(|context| Poll::Ready(cancelled.as_mut().poll(context).is_ready())).await
+}
+
+/// The exact terminal for consent observed before provider contact.
+fn cancelled_before_contact(provider_id: &str) -> ProviderInvocationFaultV1 {
+    ProviderInvocationFaultV1::Cancelled {
+        provider_id: provider_id.to_owned(),
+        waited_millis: 0,
+        disposition: WorkerDispositionV1::Terminated,
     }
 }
 

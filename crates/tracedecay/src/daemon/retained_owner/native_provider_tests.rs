@@ -1632,6 +1632,177 @@ async fn staged_session_observation_round_trips_into_an_advisory_recall_candidat
     );
 }
 
+/// Response budgeting applies to the complete provider reply, not only to the
+/// canonical JSON payload inside it.
+///
+/// Four whole staged messages intentionally overfill a synthetic 8 KiB
+/// response boundary. The provider must remove lower-ranked staged rows until
+/// the terminal, payload framing, digest, and retained candidate all fit; it
+/// must not discover the framing overhead after selection and collapse the
+/// whole recall into `capacity_exceeded`. The synthetic limit keeps this
+/// aggregate-accounting regression independent of the production descriptor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staged_recall_trims_to_a_valid_partial_reply_without_losing_the_top_whole_message() {
+    const QUERY_TERM: &str = "quicksilver-budget-boundary";
+    const TAIL: &str = "obsidian-tail-sentinel";
+    const TEST_RESPONSE_BYTES: u64 = 8_192;
+
+    let (_temporary, project_root, graph, owner, project_id) = real_project_fixture().await;
+    let provider_state_root = test_provider_state_root(&project_root);
+    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
+    let port = ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        project_root.clone(),
+        test_profile_id(),
+        &provider_state_root,
+    )
+    .expect("construct project Native application port");
+
+    for index in 0..4_u8 {
+        let content = if index == 3 {
+            format!(
+                "{QUERY_TERM} records the complete provider response boundary with {} {TAIL}",
+                "whole-evidence ".repeat(34)
+            )
+        } else {
+            format!(
+                "staged response boundary fixture {index} {}",
+                "lower-ranked-evidence ".repeat(24)
+            )
+        };
+        let canonical_payload = session_message_payload(
+            &format!("record.native-response-boundary-{index}"),
+            "session.native-response-boundary",
+            &content,
+        );
+        let call = staged_session_call(
+            project_id.as_str(),
+            &canonical_payload,
+            &format!("idempotency.native-response-boundary-{index}"),
+            &format!("operation.native-response-boundary-{index}"),
+        );
+        let observed = port.observe(staged_observation_for(&call, canonical_payload));
+        assert_eq!(observed.terminal.terminal_code(), TerminalCode::Success);
+    }
+
+    let mut request = recall_request_value(project_id.as_str());
+    request["query"] = json!(QUERY_TERM);
+    let call = valid_recall_call(project_id.as_str(), request);
+    let production_reply = port.recall(&call);
+    assert_eq!(
+        production_reply.terminal.terminal_code(),
+        TerminalCode::Success,
+        "the measured production envelope must carry the nominal four-message reply"
+    );
+    assert!(
+        production_reply
+            .validate(native_provider_limits().response_bytes)
+            .is_ok(),
+        "the nominal reply must fit the advertised complete-response boundary"
+    );
+    assert_eq!(
+        recall_payload(&production_reply)["candidates"]
+            .as_array()
+            .map(Vec::len),
+        Some(4),
+        "the production envelope must not omit nominal candidates"
+    );
+
+    let parsed = parse_native_recall_request(&call).expect("parse recall request");
+    let memory = graph
+        .project_memory_application()
+        .await
+        .expect("project memory application");
+    let search = ProjectMemoryFactSearchQuery::new(
+        owner,
+        ProjectMemoryFactSearchKindV1::Search,
+        Some(QUERY_TERM.to_owned()),
+        None,
+        recall_candidate_ceiling(&parsed),
+    )
+    .expect("direct search query");
+    let page = memory
+        .search_project_memory_facts(search, &FactReadControl::new(Arc::new(|| false)))
+        .await
+        .expect("direct project-memory search");
+    let staged_rows = port
+        .staged
+        .recall(
+            &call.exact_scope,
+            QUERY_TERM,
+            recall_candidate_ceiling(&parsed),
+        )
+        .expect("read staged rows");
+    let two_candidate_reply = build_native_recall_reply_with_response_bytes(
+        &call,
+        &parsed,
+        &test_profile_id(),
+        &page,
+        &staged_rows[..2],
+        u64::MAX,
+    )
+    .expect("build the unbounded two-candidate fixture");
+    let payload_bytes = two_candidate_reply
+        .payload
+        .as_ref()
+        .expect("recall reply carries a payload")
+        .bytes
+        .len();
+    assert!(
+        u64::try_from(payload_bytes).unwrap_or(u64::MAX) < TEST_RESPONSE_BYTES,
+        "the payload-only check must fit the synthetic boundary"
+    );
+    assert!(
+        matches!(
+            two_candidate_reply.validate(TEST_RESPONSE_BYTES),
+            Err(ApiError::BoundaryBytesExceeded {
+                field: "response",
+                ..
+            })
+        ),
+        "complete reply framing must exceed the boundary even though its payload fits"
+    );
+
+    let reply = build_native_recall_reply_with_response_bytes(
+        &call,
+        &parsed,
+        &test_profile_id(),
+        &page,
+        &staged_rows,
+        TEST_RESPONSE_BYTES,
+    )
+    .expect("build bounded partial reply");
+
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Partial);
+    assert!(
+        reply.validate(TEST_RESPONSE_BYTES).is_ok(),
+        "the reply must fit the synthetic aggregate byte boundary"
+    );
+    let body = recall_payload(&reply);
+    let candidates = body["candidates"]
+        .as_array()
+        .expect("partial recall still carries candidates");
+    assert!(
+        !candidates.is_empty(),
+        "budgeting must retain the top candidate"
+    );
+    assert!(
+        candidates.iter().any(|candidate| {
+            candidate["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(QUERY_TERM) && content.ends_with(TAIL))
+        }),
+        "the highest-ranked message must remain whole, tail included: {body}"
+    );
+    assert_eq!(body["coverage"]["state"], json!("partial"));
+    assert!(
+        body["coverage"]["reasons"]
+            .as_array()
+            .is_some_and(|reasons| reasons.contains(&json!("response_byte_budget"))),
+        "the reply must disclose why lower-ranked rows were omitted: {body}"
+    );
+}
+
 /// The unchanged paths stay unchanged: a settled fact promotion still verifies
 /// against the retained authority and stages nothing, and a contract-known
 /// kind Native does not accept is still refused with `capability_unsupported`
@@ -1832,6 +2003,56 @@ async fn a_commit_fault_stages_no_row_and_answers_the_retryable_terminal() {
         .filter_map(|candidate| candidate["content"].as_str())
         .collect();
     assert_eq!(contents, vec![MESSAGE]);
+}
+
+/// A staged store that cannot be read must fail the recall rather than
+/// silently answering with canonical facts alone.
+///
+/// This measures the same boundary as
+/// `a_commit_fault_stages_no_row_and_answers_the_retryable_terminal` but on
+/// the read side: `fail_next_recall` faults exactly the next
+/// `StagedObservationStore::recall`, and the port must answer
+/// `provider_unavailable` with the staged-store diagnostic rather than a
+/// partial or fabricated reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_staged_recall_fault_answers_the_retryable_terminal() {
+    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
+    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
+    let port = ProjectNativeMemoryApplicationPort::new(
+        graph_cell,
+        project_root.clone(),
+        test_profile_id(),
+        &test_provider_state_root(&project_root),
+    )
+    .expect("construct project Native application port");
+
+    port.staged_store().fail_next_recall();
+    let call = valid_recall_call(
+        project_id.as_str(),
+        recall_request_value(project_id.as_str()),
+    );
+    let failed = port.recall(&call);
+
+    assert_eq!(
+        failed.terminal.terminal_code(),
+        TerminalCode::ProviderUnavailable
+    );
+    assert_eq!(
+        failed.terminal.diagnostic_id(),
+        Some("native.staged_observation_store_unavailable")
+    );
+    assert_eq!(
+        failed.terminal.committed_effect().state(),
+        CommittedEffectState::None
+    );
+
+    // The fault is one-shot: the very next recall on the same empty store
+    // reaches the ordinary zero-results terminal.
+    let retried = port.recall(&call);
+    assert_eq!(
+        retried.terminal.terminal_code(),
+        TerminalCode::SuccessZeroResults
+    );
 }
 
 /// Combined budgeting: canonical facts and staged observations are merged into

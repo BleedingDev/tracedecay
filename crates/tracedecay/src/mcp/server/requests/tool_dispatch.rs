@@ -54,6 +54,16 @@ impl McpServer {
             }
             None => None,
         };
+        // Route metadata is not a tool argument. Routing above and the
+        // advisory recall lane below both bind on the caller identity a host
+        // publishes in `_meta`, while the semantic request schemas decode
+        // strictly and reject any field they do not declare. Keep the identity
+        // view those lanes bind on, and hand the handler only its declared
+        // business arguments.
+        let route_identity_arguments = crate::mcp::project_route::take_route_only_metadata(
+            tool_name,
+            &mut handler_arguments,
+        );
         if tracedecay_automation::analytics::is_skill_view_tool(tool_name)
             && let Some(request_id) = json_rpc_request_id_string(id)
             && let Some(map) = handler_arguments.as_object_mut()
@@ -90,6 +100,7 @@ impl McpServer {
             .transpose()?;
         Ok(RoutedToolCall {
             arguments: handler_arguments,
+            route_identity_arguments,
             selected_project,
             selected_server,
         })
@@ -129,6 +140,7 @@ impl McpServer {
                 cg.as_ref(),
                 tool_name,
                 routed.arguments,
+                routed.route_identity_arguments,
                 routed.selected_project.as_ref(),
                 None,
                 application_invocation_executor,
@@ -205,6 +217,7 @@ impl McpServer {
                 &cg,
                 tool_name,
                 routed.arguments,
+                routed.route_identity_arguments,
                 routed.selected_project.as_ref(),
                 server_stats,
                 application_invocation_executor,
@@ -231,6 +244,10 @@ impl McpServer {
         cg: &TraceDecay,
         tool_name: &str,
         handler_arguments: Value,
+        // The caller's routing/advisory identity view when route-only
+        // metadata was stripped out of `handler_arguments`; `None` when the
+        // handler arguments already carry that identity.
+        route_identity_arguments: Option<Value>,
         resolved_project_route: Option<&crate::mcp::project_route::ResolvedProjectRoute>,
         server_stats: Option<Value>,
         application_invocation_executor: Option<
@@ -241,6 +258,9 @@ impl McpServer {
         application_deadline: Option<tracedecay_application::Deadline>,
         application_cancellation: Option<tracedecay_application::CancellationSignal>,
     ) -> Result<ToolResult> {
+        // Only the advisory recall lane consults the preserved identity view.
+        #[cfg(not(feature = "memory-provider-host"))]
+        let _ = &route_identity_arguments;
         let engine_identity = cg.db_path();
         let read_flight = tool_allows_identical_read_coalescing(tool_name).then(|| {
             self.identical_read_coalescer.claim(
@@ -259,7 +279,12 @@ impl McpServer {
         #[cfg(feature = "memory-provider-host")]
         let advisory_call = crate::daemon::retained_owner::cognitive_recall::advisory_context_call(
             tool_name,
-            &handler_arguments,
+            // The lane binds to the exact caller session the host routed this
+            // call under, which lives in the preserved identity view whenever
+            // route-only metadata carried it out of the handler arguments.
+            route_identity_arguments
+                .as_ref()
+                .unwrap_or(&handler_arguments),
             // An ordinary agent call carries no session id in its arguments,
             // so the lane binds to the connection this request identity was
             // minted on instead of skipping the call.

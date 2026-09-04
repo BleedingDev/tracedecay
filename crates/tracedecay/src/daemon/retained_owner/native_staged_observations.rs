@@ -430,6 +430,10 @@ pub(crate) enum StagedStoreError {
     #[cfg(test)]
     #[error("staged observation store commit fault injected")]
     InjectedCommitFault,
+    /// Test-only fault injected at the start of a recall attempt.
+    #[cfg(test)]
+    #[error("staged observation store recall fault injected")]
+    InjectedRecallFault,
 }
 
 /// Thread each [`StagedObservationStore::open`] ran on, keyed by the store
@@ -491,6 +495,8 @@ pub(crate) struct StagedObservationStore {
     retention: StagedRetentionPolicyV1,
     #[cfg(test)]
     fail_next_commit: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_recall: std::sync::atomic::AtomicBool,
 }
 
 impl StagedObservationStore {
@@ -548,6 +554,8 @@ impl StagedObservationStore {
             },
             #[cfg(test)]
             fail_next_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_recall: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -777,6 +785,15 @@ impl StagedObservationStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<StagedRow>, StagedStoreError> {
+        #[cfg(test)]
+        {
+            if self
+                .fail_next_recall
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(StagedStoreError::InjectedRecallFault);
+            }
+        }
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -878,6 +895,15 @@ impl StagedObservationStore {
     #[cfg(test)]
     pub(crate) fn fail_next_commit(&self) {
         self.fail_next_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: makes the next [`Self::recall`] fail before it reads any
+    /// row, proving the port answers `provider_unavailable` when the staged
+    /// store cannot be read.
+    #[cfg(test)]
+    pub(crate) fn fail_next_recall(&self) {
+        self.fail_next_recall
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 

@@ -19,6 +19,7 @@ use tracedecay_hooks::core_events::{
 use tracedecay_host_admission::{
     HostAdmissionBroker, HostAdmissionRuntime, SharedHostAdmissionBroker, SpoolBounds,
 };
+use tracedecay_mcp::JsonRpcRequest;
 use tracedecay_sessions::admission::{
     HostAdmissionOutcome, HostAdmissionScope, HostAdmissionStatus,
 };
@@ -1090,6 +1091,110 @@ async fn server_with_broker_and_runtime(
 }
 
 #[tokio::test]
+async fn hook_request_acknowledges_only_after_processing_and_publishes_route() {
+    let (cg, project, authority) = init_indexed_repo().await;
+    let test_runtime = registered_runtime(&authority);
+    let spool = TempDir::new().unwrap();
+    let runtime = HostAdmissionRuntime::open(spool.path(), SpoolBounds::default())
+        .unwrap()
+        .0;
+    let broker = Arc::new(HostAdmissionBroker::new(runtime));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let reconcile_sink: CodeIndexReconcileSink = {
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        Arc::new(move |_request| {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                true
+            })
+        })
+    };
+    let server =
+        server_with_broker_and_runtime(cg, Arc::clone(&broker), reconcile_sink, test_runtime).await;
+    let request_id = json!("hook-request-ack");
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".to_owned(),
+        id: Some(request_id.clone()),
+        method: tracedecay_hooks::HOOK_EVENT_METHOD.to_owned(),
+        params: Some(session_start_with_route(project.path().to_path_buf())),
+    };
+    let request_server = Arc::clone(&server);
+    let request_task = tokio::spawn(async move { request_server.handle_request(&request).await });
+
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("hook processing must enter the canonical effect");
+    assert!(
+        !request_task.is_finished(),
+        "the acknowledgement must wait for hook processing to finish"
+    );
+    release.notify_one();
+    let response = tokio::time::timeout(Duration::from_secs(2), request_task)
+        .await
+        .expect("hook request must finish after the effect is released")
+        .expect("hook request task must not panic")
+        .expect("a request id must receive an acknowledgement");
+    assert_eq!(response.id, request_id);
+    assert!(
+        response.error.is_none(),
+        "hook acknowledgement failed: {response:?}"
+    );
+    assert_eq!(response.result, Some(json!({ "processed": true })));
+
+    let mut arguments = json!({"session_id": "session-admission-test"});
+    crate::mcp::project_route::protect_tool_structural_ids(&mut arguments)
+        .expect("protect route identity");
+    let routes = server
+        .hook_project_routes
+        .snapshot()
+        .expect("shared route cache snapshot");
+    assert!(
+        matches!(
+            routes.workspace_route_for_arguments(&arguments),
+            Some(crate::mcp::project_route::WorkspaceProjectRoute::Resolved(
+                _
+            ))
+        ),
+        "the acknowledgement must leave the exact session route published"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn hook_notification_remains_response_free() {
+    let (cg, project, authority) = init_indexed_repo().await;
+    let spool = TempDir::new().unwrap();
+    let runtime = HostAdmissionRuntime::open(spool.path(), SpoolBounds::default())
+        .unwrap()
+        .0;
+    let broker = Arc::new(HostAdmissionBroker::new(runtime));
+    let server = server_with_broker(
+        cg,
+        &authority,
+        Arc::clone(&broker),
+        success_reconcile_sink(),
+    )
+    .await;
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".to_owned(),
+        id: None,
+        method: tracedecay_hooks::HOOK_EVENT_METHOD.to_owned(),
+        params: Some(session_start_with_route(project.path().to_path_buf())),
+    };
+
+    assert!(
+        server.handle_request(&request).await.is_none(),
+        "ordinary JSON-RPC hook notifications must remain response-free"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn failed_admission_does_not_emit_hook_route_analytics() {
     let (cg, project, authority) = init_indexed_repo().await;
     let test_runtime = registered_runtime(&authority);
@@ -1644,7 +1749,10 @@ async fn owned_project_replay_worker_is_cancelled_and_joined_on_shutdown() {
             let entered = Arc::clone(&entered);
             let release = Arc::clone(&release);
             Box::pin(async move {
-                entered.notify_waiters();
+                // `notify_one` stores a permit: the worker can enter the
+                // attempt before the test registers as a waiter (server
+                // construction yields after the worker is spawned).
+                entered.notify_one();
                 release.notified().await;
                 true
             })

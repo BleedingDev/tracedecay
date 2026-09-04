@@ -5,6 +5,7 @@
 //! and connection teardown for exactly one client.
 
 use super::profile_host_admission_replay::ProfileHostAdmissionBootstrapStatus;
+use super::projectless::projectless_registered_project_reader_server;
 use super::*;
 use tracedecay_daemon_protocol::DaemonInvocationPayload;
 use tracedecay_daemon_service::{DaemonInvocationService, Lease, cancel, register};
@@ -1259,7 +1260,24 @@ cancel(cancellation.target_request_id());
                 }
             }
         } else {
-            Ok::<_, TraceDecayError>(Some((None, VecDeque::new())))
+            match projectless_registered_project_reader_server(
+                &first_request_line,
+                &handshake.client_identity,
+                &engine.store_administration,
+            ) {
+                Ok(Some(server)) => Ok(Some((Some(server), VecDeque::new()))),
+                Ok(None) => Ok(Some((None, VecDeque::new()))),
+                Err(error) => {
+                    write_project_open_error(
+                        &mut transport,
+                        &first_request_line,
+                        &handshake.client_instance_id,
+                        &error,
+                    )
+                    .await?;
+                    Ok(None)
+                }
+            }
         }
         })
         .await?;

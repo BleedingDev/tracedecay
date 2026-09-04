@@ -545,22 +545,44 @@ fn args_payload_optional_null_is_absent() {
 
 #[test]
 fn dispatch_routing_keys_bypass_unknown_key_gate() {
-    // LCM response handles can target a separate live project, and Hermes
-    // may forward cwd; these must keep flowing through the gate.
+    // Private hook-route identity, LCM response-handle roots, and generated
+    // client cwd are transport metadata. Preserve them byte-for-byte for the
+    // daemon; it removes route-only identity before semantic dispatch.
     let d = def("fact_store_list");
+    let expected = json!({
+        "_meta": {"session_id": "nested-session"},
+        "session_id": "snake-session",
+        "sessionId": "camel-session",
+        "thread_id": "snake-thread",
+        "threadId": "camel-thread",
+        "response_handle_project_root": "/tmp/r",
+        "cwd": "/tmp"
+    });
     let parsed = parse_invocation(
+        &d,
+        &["--args".to_string(), expected.to_string()],
+    )
+    .unwrap();
+    assert_eq!(parsed.tool_args, expected);
+}
+
+#[test]
+fn semantic_structural_identity_remains_schema_validated() {
+    let d = def("lcm_status");
+    let error = parse_invocation(
         &d,
         &[
             "--args".to_string(),
-            r#"{"response_handle_project_root":"/tmp/r","cwd":"/tmp"}"#.to_string(),
+            r#"{"provider":"cursor","session_id":["not","a","string"]}"#.to_string(),
         ],
     )
-    .unwrap();
-    assert_eq!(
-        parsed.tool_args["response_handle_project_root"],
-        json!("/tmp/r")
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("--session-id expects a JSON string"),
+        "semantic session_id must retain its tool-schema contract: {error}"
     );
-    assert_eq!(parsed.tool_args["cwd"], json!("/tmp"));
 }
 
 #[test]

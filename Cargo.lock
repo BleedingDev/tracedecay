@@ -6203,6 +6203,7 @@ dependencies = [
  "tracedecay-lsp",
  "tracedecay-maintenance",
  "tracedecay-mcp",
+ "tracedecay-memory-observation",
  "tracedecay-private-fs",
  "tracedecay-runtime-core",
  "tracedecay-sdk",

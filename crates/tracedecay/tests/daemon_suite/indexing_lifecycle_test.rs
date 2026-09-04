@@ -8,15 +8,15 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracedecay::daemon::{
-    DaemonHandshake, DaemonHookEvent, HookAgent, HookEventNotifyOutcomeV1, call_tool,
-    notify_hook_event,
+    DaemonHandshake, DaemonHookEvent, HookAgent, HookEventNotifyOutcomeV1, HookRouteMetadata,
+    HookTerminalReceipt, call_tool, notify_hook_event,
 };
 use tracedecay_code_index::production::CodeIndexPublishedGenerationV1;
 use tracedecay_code_index_retention::code_index_generations::{
@@ -40,6 +40,21 @@ fn daemon_log_for_failure() -> String {
             Path::new(&path).display()
         )
     })
+}
+
+fn find_file(root: &Path, file_name: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_file(&path, file_name) {
+                return Some(found);
+            }
+        } else if path.file_name().and_then(|name| name.to_str()) == Some(file_name) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,6 +271,31 @@ async fn status(socket: &Path, handshake: &DaemonHandshake) -> Value {
     .await
 }
 
+async fn grep_for_hook_session(
+    socket: &Path,
+    projectless_handshake: &DaemonHandshake,
+    session_id: &str,
+) -> Value {
+    let result = tokio::time::timeout(
+        RECEIPT_TIMEOUT,
+        call_tool(
+            socket,
+            projectless_handshake,
+            "tracedecay_grep",
+            json!({
+                "pattern": "lifecycle_main_symbol",
+                "fixed_strings": true,
+                "format": "json",
+                "_meta": {"session_id": session_id},
+            }),
+        ),
+    )
+    .await
+    .expect("session-routed grep timed out")
+    .unwrap_or_else(|error| panic!("session-routed grep failed: {error}"));
+    tool_payload(result, "tracedecay_grep")
+}
+
 async fn project_context(socket: &Path, handshake: &DaemonHandshake, project: &Path) -> Value {
     tool(
         socket,
@@ -339,7 +379,11 @@ fn result_paths(search: &Value) -> Vec<&str> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|result| result["display"]["path"].as_str())
+        .filter_map(|result| {
+            result["display"]["path"]
+                .as_str()
+                .or_else(|| result["file"].as_str())
+        })
         .collect()
 }
 
@@ -677,6 +721,93 @@ fn assert_exact_ignored_dependency_roster(generation: &CodeIndexPublishedGenerat
     assert!(generation.symbols().symbols.iter().all(|symbol| {
         symbol.simple_name != "BroadPackageLeak" && symbol.simple_name != "UnrelatedDependency"
     }));
+}
+
+#[tokio::test]
+async fn cold_registered_project_hook_ack_preserves_route_and_terminal_receipt() {
+    // Split credential-shaped canaries so the source itself never contains a
+    // contiguous token. The journey proves route matching remains stable after
+    // protection and the durable receipt never writes the raw identities.
+    let session_id = ["AKIA", "SYNTHETIC", "CANARY", "5"].concat();
+    let tool_call_id = ["AKIA", "SYNTHETIC", "CANARY", "6"].concat();
+    let turn_id = ["AKIA", "SYNTHETIC", "CANARY", "7"].concat();
+    let watermark = ["AKIA", "SYNTHETIC", "CANARY", "2"].concat();
+
+    let (environment, project) = IsolatedEnv::acquire().await;
+    let project = project.canonicalize().expect("canonical fixture project");
+    let _ = initialize_repository(&project);
+    let socket = daemon_socket_path(environment.home());
+    let mut daemon = spawn_tracedecay_daemon_with(environment.home(), |_| {});
+    initialize_tracedecay(environment.home(), &project);
+    tracedecay::product_runtime::register_fixture_product_runtime();
+    let warm_handshake =
+        tracedecay::daemon::handshake_for_current_client(Some(project.clone()), None, false, false)
+            .expect("warm project handshake");
+    let _ = status(&socket, &warm_handshake).await;
+
+    let first_pid = daemon.id();
+    let stopped = daemon
+        .kill_and_wait()
+        .expect("force-stop and reap the warm daemon");
+    assert!(!stopped.success(), "forced daemon stop exited cleanly");
+    daemon = spawn_tracedecay_daemon_with(environment.home(), |_| {});
+    assert_ne!(daemon.id(), first_pid, "restart reused the daemon process");
+
+    let event = DaemonHookEvent {
+        agent: HookAgent::Hermes.as_wire().to_owned(),
+        event: "terminalReceipt".to_owned(),
+        rel_paths: Vec::new(),
+        command: None,
+        cwd: Some(project.clone()),
+        route: Some(HookRouteMetadata {
+            session_id: Some(session_id.clone()),
+            thread_id: None,
+            cwd: Some(project.clone()),
+            worktree: Some(project.clone()),
+            branch: Some("main".to_owned()),
+        }),
+        receipt: Some(HookTerminalReceipt {
+            tool_call_id: Some(tool_call_id.clone()),
+            turn_id: Some(turn_id.clone()),
+            status: Some("success".to_owned()),
+            duration_ms: Some(1),
+            transcript_watermark: Some(watermark.clone()),
+        }),
+    };
+    let started = Instant::now();
+    let outcome = notify_hook_event(&project, event).await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        outcome,
+        HookEventNotifyOutcomeV1::Delivered,
+        "a cold registered project must publish its private route and durable effect within the hook acknowledgement budget; elapsed={elapsed:?}; daemon_log={}",
+        daemon_log_for_failure()
+    );
+
+    let projectless_handshake =
+        tracedecay::daemon::handshake_for_current_client(None, None, false, false)
+            .expect("projectless route-verification handshake");
+    let routed = grep_for_hook_session(&socket, &projectless_handshake, &session_id).await;
+    assert!(
+        result_paths(&routed).contains(&"src/lib.rs"),
+        "the acknowledged structural session must select source from the exact cold-opened project: {routed}"
+    );
+
+    let receipt_path = find_file(environment.home(), "host_receipts.json")
+        .expect("acknowledged terminal receipt must reach durable project state");
+    let receipt_state = fs::read_to_string(&receipt_path).expect("read durable host receipt state");
+    for raw in [&session_id, &tool_call_id, &turn_id, &watermark] {
+        let protected = tracedecay_runtime_core::privacy::protect_sensitive_structural_id(raw)
+            .expect("protect expected receipt identity");
+        assert!(
+            receipt_state.contains(&protected),
+            "durable host receipt omitted protected identity for {raw}: {receipt_state}"
+        );
+        assert!(
+            !receipt_state.contains(raw),
+            "durable host receipt leaked raw structural identity {raw}: {receipt_state}"
+        );
+    }
 }
 
 #[tokio::test]

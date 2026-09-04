@@ -60,9 +60,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -1584,6 +1584,7 @@ pub(crate) struct DeliveryRefusalV1 {
 struct DeliveryRefusalWindowV1 {
     recent: Mutex<std::collections::VecDeque<DeliveryRefusalV1>>,
     total: std::sync::atomic::AtomicU64,
+    changed: CensusTransitionV1,
 }
 
 impl DeliveryRefusalWindowV1 {
@@ -1597,6 +1598,8 @@ impl DeliveryRefusalWindowV1 {
             recent.pop_front();
         }
         recent.push_back(refusal);
+        drop(recent);
+        self.changed.publish();
     }
 
     fn recent(&self) -> Vec<DeliveryRefusalV1> {
@@ -1608,6 +1611,17 @@ impl DeliveryRefusalWindowV1 {
 
     fn total(&self) -> u64 {
         self.total.load(Ordering::Acquire)
+    }
+
+    async fn wait_for(
+        &self,
+        within: Duration,
+        mut admits: impl FnMut(&DeliveryRefusalV1) -> bool,
+    ) -> Result<DeliveryRefusalV1, Vec<DeliveryRefusalV1>> {
+        self.changed
+            .wait_until_async(within, || self.recent().into_iter().find(&mut admits))
+            .await
+            .map_err(|()| self.recent())
     }
 }
 
@@ -1788,8 +1802,7 @@ impl ProviderDeliveryAdapterV1 for RegistryObservationDeliveryAdapterV1 {
                 control.cancellation(),
             )
         };
-        let (readiness, evidence) = readiness_target_and_evidence_for_scope(
-            &self.readiness,
+        let readiness_request = readiness_handshake_request(
             &leased.exact_scope,
             self.registration_revision,
             self.limits,
@@ -1797,12 +1810,23 @@ impl ProviderDeliveryAdapterV1 for RegistryObservationDeliveryAdapterV1 {
             operation_control(started_at_unix_micros),
         )
         .map_err(DeliveryAdapterError::Readiness)?;
+        // Keep registration-wide dispatch ownership from this handshake through
+        // the observation call. Admission also obtains readiness through this
+        // owner, so it cannot rotate the fabric's current receipt in the gap.
+        let readiness_dispatch = self
+            .readiness
+            .ready_dispatch_with_evidence(
+                &readiness_request,
+                tracedecay_application::now_micros().0,
+            )
+            .map_err(ObservationJourneyError::SupervisedReadiness)
+            .map_err(DeliveryAdapterError::Readiness)?;
         // The recovery gate runs on the evidence of the very handshake above,
         // before one byte reaches the provider. A refusal is typed, produces no
         // receipt, and leaves the row exactly as deliverable as it was.
         let expected_state_generation = match self.recovery.admit_delivery(
             &leased.exact_scope_sha256,
-            &evidence,
+            readiness_dispatch.evidence(),
             control,
             tracedecay_application::now_micros().0,
         ) {
@@ -1826,9 +1850,12 @@ impl ProviderDeliveryAdapterV1 for RegistryObservationDeliveryAdapterV1 {
             .map_err(DeliveryAdapterError::Sanitization)?;
         let call = ProviderCall::new(ProviderCallParts {
             operation: ProviderOperation::Observe,
-            provider_id: readiness.provider_id.clone(),
-            registration_revision: readiness.registration_revision,
-            ready_receipt_sha256: readiness.ready_receipt_digest.clone(),
+            provider_id: readiness_dispatch.target().provider_id().clone(),
+            registration_revision: readiness_dispatch.target().registration_revision(),
+            ready_receipt_sha256: readiness_dispatch
+                .target()
+                .ready_receipt_sha256()
+                .to_owned(),
             exact_scope: leased.exact_scope.clone(),
             request_id: leased.observation_id.as_str().to_owned(),
             operation_id: format!(
@@ -1885,6 +1912,9 @@ impl ProviderDeliveryAdapterV1 for RegistryObservationDeliveryAdapterV1 {
                             .map_err(DeliveryAdapterError::Fabric)
                     })
             });
+        // Explicitly release only after the isolated provider contact has
+        // answered or the host has stopped waiting for it.
+        drop(readiness_dispatch);
         match answered {
             Ok(Ok(receipt)) => Ok(DeliveryAttemptV1::Answered {
                 terminal: Box::new(receipt.terminal),
@@ -2025,7 +2055,88 @@ struct ThreadBoundedProviderCallV1 {
     /// nobody. This is the number an operator needs: it is what a runaway
     /// provider costs the host right now.
     abandoned_workers: Arc<AtomicUsize>,
+    /// Published after every census mutation. Tests and diagnostics can wait on
+    /// the real transition instead of sampling the atomics on a timer.
+    census_changed: Arc<CensusTransitionV1>,
     max_abandoned: usize,
+}
+
+/// A condition variable tied to borrowed-worker accounting transitions.
+#[derive(Debug, Default)]
+struct CensusTransitionV1 {
+    generation: Mutex<u64>,
+    changed: Condvar,
+    async_changed: tokio::sync::Notify,
+}
+
+impl CensusTransitionV1 {
+    fn publish(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *generation = generation.saturating_add(1);
+        self.changed.notify_all();
+        self.async_changed.notify_waiters();
+    }
+
+    fn wait_until<T>(
+        &self,
+        within: Duration,
+        mut observe: impl FnMut() -> Option<T>,
+    ) -> Result<T, ()> {
+        let deadline = Instant::now() + within;
+        let mut observed_generation = *self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(observed) = observe() {
+                return Ok(observed);
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(());
+            };
+            let generation = self
+                .generation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *generation != observed_generation {
+                observed_generation = *generation;
+                continue;
+            }
+            let (generation, timed) = self
+                .changed
+                .wait_timeout(generation, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            observed_generation = *generation;
+            drop(generation);
+            if timed.timed_out() {
+                return observe().ok_or(());
+            }
+        }
+    }
+
+    async fn wait_until_async<T>(
+        &self,
+        within: Duration,
+        mut observe: impl FnMut() -> Option<T>,
+    ) -> Result<T, ()> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let mut changed = Box::pin(self.async_changed.notified());
+            changed.as_mut().enable();
+            if let Some(observed) = observe() {
+                return Ok(observed);
+            }
+            if tokio::time::timeout_at(deadline, &mut changed)
+                .await
+                .is_err()
+            {
+                return observe().ok_or(());
+            }
+        }
+    }
 }
 
 /// What the host's borrowed provider workers are doing right now.
@@ -2065,6 +2176,7 @@ const BORROWED_WORKER_ABANDONED: u8 = 2;
 struct BorrowedWorkerAccountingV1 {
     owned: Arc<AtomicUsize>,
     abandoned: Arc<AtomicUsize>,
+    census_changed: Arc<CensusTransitionV1>,
     state: AtomicU8,
 }
 
@@ -2096,6 +2208,7 @@ impl BorrowedWorkerAccountingV1 {
             // reservation's behalf: it is given back here instead.
             release_borrowed_worker_count(&self.abandoned, "abandoned");
         }
+        self.census_changed.publish();
     }
 
     /// The worker left the provider, whatever its caller did in the meantime.
@@ -2115,6 +2228,7 @@ impl BorrowedWorkerAccountingV1 {
             release_borrowed_worker_count(&self.abandoned, "abandoned");
         }
         release_borrowed_worker_count(&self.owned, "owned");
+        self.census_changed.publish();
     }
 }
 
@@ -2158,6 +2272,7 @@ impl ThreadBoundedProviderCallV1 {
         Self {
             owned_workers: Arc::new(AtomicUsize::new(0)),
             abandoned_workers: Arc::new(AtomicUsize::new(0)),
+            census_changed: Arc::new(CensusTransitionV1::default()),
             max_abandoned,
         }
     }
@@ -2174,6 +2289,23 @@ impl ThreadBoundedProviderCallV1 {
             live: owned.saturating_sub(abandoned),
             abandoned,
         }
+    }
+
+    /// Waits for a real accounting transition until `admits` accepts the
+    /// resulting census. The condition is checked before waiting and again at
+    /// the terminal deadline, so neither an early transition nor the final one
+    /// can be missed.
+    fn wait_for_census(
+        &self,
+        within: Duration,
+        admits: impl Fn(BoundedCallCensusV1) -> bool,
+    ) -> Result<BoundedCallCensusV1, BoundedCallCensusV1> {
+        self.census_changed
+            .wait_until(within, || {
+                let census = self.census();
+                admits(census).then_some(census)
+            })
+            .map_err(|()| self.census())
     }
 
     /// Runs `work` on a borrowed worker, waiting at most `budget_millis` for
@@ -2215,9 +2347,11 @@ impl ThreadBoundedProviderCallV1 {
             });
         };
         debug_assert!(previously_owned < maximum);
+        self.census_changed.publish();
         let accounting = Arc::new(BorrowedWorkerAccountingV1 {
             owned: Arc::clone(&self.owned_workers),
             abandoned: Arc::clone(&self.abandoned_workers),
+            census_changed: Arc::clone(&self.census_changed),
             state: AtomicU8::new(BORROWED_WORKER_RUNNING),
         });
         let slot = BorrowedWorkerSlotV1(Arc::clone(&accounting));
@@ -2562,6 +2696,9 @@ pub(crate) struct ProjectObservationJourneyV1 {
     /// The lane's bounded window onto deliveries that produced no receipt,
     /// with the exact classification the host produced for each one.
     delivery_refusals: Arc<DeliveryRefusalWindowV1>,
+    /// Published after each delivery drain mutates or observes the journal, so
+    /// acceptance tests can read the resulting durable row without polling.
+    delivery_changed: Arc<CensusTransitionV1>,
     provider_id: String,
     provider_instance_id: String,
     registration_revision: u64,
@@ -3373,6 +3510,7 @@ impl ProjectObservationJourneyV1 {
         let delivery = Arc::clone(&self.delivery);
         let isolation = Arc::clone(&self.provider_isolation);
         let refusals = Arc::clone(&self.delivery_refusals);
+        let delivery_changed = Arc::clone(&self.delivery_changed);
         let wake = Arc::clone(&self.wake);
         let stopping = self.stopping.clone();
         let provider_id = self.provider_id.clone();
@@ -3524,6 +3662,11 @@ impl ProjectObservationJourneyV1 {
                             );
                         }
                     }
+                    // `drain` owns the attempt/state/refusal transitions the
+                    // mounted acceptance suite observes. Publish only after the
+                    // whole report, including its refusal classifications, is
+                    // visible so a waiter reads one coherent result.
+                    delivery_changed.publish();
                     if let Err(error) = runtime.reap(
                         tracedecay_application::now_micros().0,
                         dispatch_policy.reap_budget,
@@ -3790,6 +3933,7 @@ pub(crate) fn mount_project_observation_journey(
         adapter,
         provider_isolation,
         delivery_refusals: Arc::new(DeliveryRefusalWindowV1::default()),
+        delivery_changed: Arc::new(CensusTransitionV1::default()),
         provider_id: NATIVE_PROVIDER_ID.to_owned(),
         provider_instance_id: super::native_provider::PROVIDER_INSTANCE_ID.to_owned(),
         registration_revision: inputs.registration_revision,
@@ -3878,6 +4022,209 @@ where
         journey.record_halt(halt);
     }
     Ok(pass)
+}
+
+/// Journal inspection for the host journeys mounted beside this module.
+///
+/// The durable journal is *this* mount's dependency, never a journey's: a
+/// journey asks what settled through the opaque view below instead of naming
+/// the journal crate itself, so ownership of the journal — and of the store
+/// handle a second reader opens on it — stays with the module that mounts it.
+///
+/// The indirection softens nothing. Every field a journey compares is carried
+/// across verbatim from the journal crate's own inspection row — observation
+/// and idempotency identity, payload digest, exact scope, source position,
+/// attempt count, content presence, and the delivery state in the enum's own
+/// canonical wire spelling — and a refused inspection, or a page that did not
+/// fit, still fails loudly rather than reading as an empty journal.
+#[cfg(all(test, feature = "memory-provider-host"))]
+mod journey_journal_inspection {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use tracedecay_memory_observation::{
+        DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
+        ObservationJournalReaderV1, SqliteObservationJournal,
+    };
+
+    use super::ObservationJourneyPolicyV1;
+
+    /// One page of inspection is more than a host journey can ever produce, so
+    /// a full page means the reader, not the journey, is what changed.
+    const INSPECTION_PAGE_LIMIT: u32 = 100;
+
+    /// How long [`JourneyJournalV1::await_settlement`] waits. A journey runs a
+    /// bounded background delivery worker, so this is a convergence bound and
+    /// never a sleep: the wait ends as soon as every row is terminal.
+    const SETTLEMENT_BUDGET: Duration = Duration::from_secs(30);
+
+    /// How often the settlement wait re-reads the journal. It only bounds how
+    /// promptly a *satisfied* condition is noticed; the condition itself, never
+    /// this interval, is what a journey's assertions rest on.
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// The canonical wire spelling of the state an accepted delivery settles
+    /// in, taken from the journal crate's own enum. A renamed or re-encoded
+    /// state fails to compile here instead of silently never matching.
+    pub(super) const ACKNOWLEDGED_DELIVERY_STATE: &str = DeliveryStateV1::Acknowledged.as_wire();
+
+    /// A second, read-only handle on the journal a mounted journey owns.
+    pub(super) struct JourneyJournalV1(SqliteObservationJournal);
+
+    /// One journalled delivery, as a host journey sees it.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(super) struct JourneyJournalRowV1 {
+        /// Observation identity.
+        pub(super) observation_id: String,
+        /// Content-derived idempotency key.
+        pub(super) idempotency_key: String,
+        /// Digest of the sanitized canonical payload.
+        pub(super) payload_sha256: String,
+        /// Digest of the exact coding scope this delivery is bound to.
+        pub(super) exact_scope_sha256: String,
+        /// Observation kind identity.
+        pub(super) observation_kind: String,
+        /// Position in the source stream.
+        pub(super) source_sequence: u64,
+        /// Attempts recorded so far.
+        pub(super) attempt_number: u32,
+        /// Whether the row's content bytes are still present.
+        pub(super) content_present: bool,
+        /// Delivery state, in its canonical wire spelling.
+        pub(super) state: &'static str,
+        /// Whether that state ends delivery.
+        pub(super) terminal: bool,
+    }
+
+    impl JourneyJournalRowV1 {
+        fn of(row: &JournalInspectionRowV1) -> Self {
+            Self {
+                observation_id: row.observation_id.as_str().to_owned(),
+                idempotency_key: row.idempotency_key.as_str().to_owned(),
+                payload_sha256: row.payload_sha256.clone(),
+                exact_scope_sha256: row.exact_scope_sha256.clone(),
+                observation_kind: row.observation_kind.clone(),
+                source_sequence: row.source_sequence.0,
+                attempt_number: row.attempt_number,
+                content_present: row.content_present,
+                state: row.state.as_wire(),
+                terminal: row.state.is_terminal(),
+            }
+        }
+    }
+
+    /// Opens a second, read-only handle on the journal at `journal_path`.
+    ///
+    /// Once per journey, not once per poll: opening the store re-applies its
+    /// schema inside a write transaction, and a reader that did that every
+    /// hundred milliseconds would contend with the delivery worker it is meant
+    /// to be observing. One handle in WAL mode still sees every later commit.
+    pub(super) fn open_journal(journal_path: &Path) -> JourneyJournalV1 {
+        JourneyJournalV1(
+            SqliteObservationJournal::open(
+                journal_path,
+                ObservationJourneyPolicyV1::project_default().retention,
+            )
+            .expect("the durable observation journal must open through its own store API"),
+        )
+    }
+
+    impl JourneyJournalV1 {
+        /// Every delivery the journal holds, read through the journal crate's
+        /// own inspection surface.
+        ///
+        /// The journal's schema is that crate's business: nothing here names a
+        /// table or a column, so a schema change cannot leave a journey
+        /// silently reading nothing.
+        pub(super) fn rows(&self) -> Vec<JourneyJournalRowV1> {
+            let page = self
+                .0
+                .inspect(&JournalInspectionFilterV1 {
+                    limit: INSPECTION_PAGE_LIMIT,
+                    ..JournalInspectionFilterV1::default()
+                })
+                .expect("the durable observation journal must answer an inspection");
+            assert!(
+                page.next_cursor.is_none(),
+                "a host journey cannot produce more than {INSPECTION_PAGE_LIMIT} deliveries; \
+                 {} rows were reported",
+                page.total_rows
+            );
+            page.rows.iter().map(JourneyJournalRowV1::of).collect()
+        }
+
+        /// Waits, bounded, until the journal holds at least `minimum_rows`
+        /// deliveries and every one of them is terminal, and returns them the
+        /// moment it does.
+        ///
+        /// The deadline is a failure, never a result: a wait that runs out
+        /// reports the rows it last observed instead of handing a caller a
+        /// half-settled journal to assert against.
+        pub(super) async fn await_settlement(
+            &self,
+            minimum_rows: usize,
+        ) -> Vec<JourneyJournalRowV1> {
+            let deadline = Instant::now() + SETTLEMENT_BUDGET;
+            loop {
+                let rows = self.rows();
+                if rows.len() >= minimum_rows && rows.iter().all(|row| row.terminal) {
+                    return rows;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the durable observation journal never settled {minimum_rows} deliveries \
+                     within {SETTLEMENT_BUDGET:?}; last observed {:?}",
+                    journal_digest(&rows)
+                );
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        }
+    }
+
+    /// The row identity a replayed source must reproduce exactly: who the
+    /// observation is, what content it carries, and how many attempts it cost.
+    ///
+    /// Comparing this set — not a length — is what makes the idempotency claim
+    /// real: a journal that dropped one row and admitted a different one has
+    /// the same length and a different set.
+    pub(super) fn journal_row_identities(
+        rows: &[JourneyJournalRowV1],
+    ) -> Vec<(String, String, String, u32)> {
+        let mut identities = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.idempotency_key.clone(),
+                    row.observation_id.clone(),
+                    row.payload_sha256.clone(),
+                    row.attempt_number,
+                )
+            })
+            .collect::<Vec<_>>();
+        identities.sort();
+        identities
+    }
+
+    /// A compact, sorted description of the journal for a failed assertion, so
+    /// a deadline failure names what it actually saw.
+    pub(super) fn journal_digest(rows: &[JourneyJournalRowV1]) -> Vec<String> {
+        let mut digest = rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "{}|{}|{}|attempt={}|seq={}|content_present={}",
+                    row.observation_kind,
+                    row.exact_scope_sha256,
+                    row.state,
+                    row.attempt_number,
+                    row.source_sequence,
+                    row.content_present,
+                )
+            })
+            .collect::<Vec<_>>();
+        digest.sort();
+        digest
+    }
 }
 
 /// The Claude Code host memory journey. It lives beside this mount because it
@@ -4093,18 +4440,16 @@ mod tests {
 
         use super::*;
 
-        /// Polls `census` until it reaches `expected`, so a reclamation assertion
-        /// waits on the boundary rather than on a sleep.
+        /// Waits on the accounting transition that reaches `expected`.
         fn settle(boundary: &ThreadBoundedProviderCallV1, expected: BoundedCallCensusV1) {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while boundary.census() != expected {
-                assert!(
-                    Instant::now() < deadline,
-                    "the boundary never reached {expected:?}; it still reports {:?}",
-                    boundary.census()
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            let observed =
+                boundary.wait_for_census(Duration::from_secs(5), |census| census == expected);
+            assert_eq!(
+                observed,
+                Ok(expected),
+                "the boundary never reached {expected:?}; it still reports {:?}",
+                boundary.census()
+            );
         }
 
         /// A call whose worker is still running when its caller gives up is counted
@@ -4355,6 +4700,7 @@ mod tests {
                 let accounting = Arc::new(BorrowedWorkerAccountingV1 {
                     owned: Arc::clone(&boundary.owned_workers),
                     abandoned: Arc::clone(&boundary.abandoned_workers),
+                    census_changed: Arc::clone(&boundary.census_changed),
                     state: AtomicU8::new(BORROWED_WORKER_RUNNING),
                 });
                 let start = Arc::new(std::sync::Barrier::new(2));
@@ -4826,6 +5172,30 @@ mod tests {
             rows.map(|row| row.expect("refusal row")).collect()
         }
 
+        /// Waits for a delivery drain to publish a row satisfying `admits`.
+        /// Interest is registered before each read, so a transition between the
+        /// read and the await cannot be lost.
+        async fn wait_for_delivery_row(
+            fixture: &AdversarialJourneyFixture,
+            mut admits: impl FnMut(&(String, i64, Option<String>)) -> bool,
+            expectation: &str,
+        ) -> (String, i64, Option<String>) {
+            match fixture
+                .journey
+                .delivery_changed
+                .wait_until_async(SETTLEMENT_BUDGET, || {
+                    delivery_row(fixture.journal_path()).filter(&mut admits)
+                })
+                .await
+            {
+                Ok(row) => row,
+                Err(()) => panic!(
+                    "{expectation}; {}",
+                    journal_snapshot(fixture.journal_path())
+                ),
+            }
+        }
+
         /// Waits until the journal records at least `attempts` attempts against the
         /// single delivery row, and returns it.
         ///
@@ -4833,69 +5203,63 @@ mod tests {
         /// question "did the host get to try again?" — which a host still parked in
         /// its first call can never answer.
         async fn wait_for_attempts(
-            journal_path: &Path,
+            fixture: &AdversarialJourneyFixture,
             attempts: i64,
         ) -> (String, i64, Option<String>) {
-            let observed = tokio::time::timeout(SETTLEMENT_BUDGET, async {
-                loop {
-                    if let Some(row) = delivery_row(journal_path) {
-                        if row.1 >= attempts {
-                            return row;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await;
-            match observed {
-                Ok(row) => row,
-                Err(_) => panic!(
-                    "the journal never recorded {attempts} attempt(s); {}",
-                    journal_snapshot(journal_path)
-                ),
-            }
+            wait_for_delivery_row(
+                fixture,
+                |row| row.1 >= attempts,
+                &format!("the journal never recorded {attempts} attempt(s)"),
+            )
+            .await
         }
 
         /// Waits until the single delivery row reaches `state`.
-        async fn wait_for_state(journal_path: &Path, state: &str) -> (String, i64, Option<String>) {
-            let observed = tokio::time::timeout(SETTLEMENT_BUDGET, async {
-                loop {
-                    if let Some(row) = delivery_row(journal_path) {
-                        if row.0 == state {
-                            return row;
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await;
-            match observed {
-                Ok(row) => row,
-                Err(_) => panic!(
-                    "the delivery row never reached `{state}`; {}",
-                    journal_snapshot(journal_path)
-                ),
-            }
+        async fn wait_for_state(
+            fixture: &AdversarialJourneyFixture,
+            state: &str,
+        ) -> (String, i64, Option<String>) {
+            wait_for_delivery_row(
+                fixture,
+                |row| row.0 == state,
+                &format!("the delivery row never reached `{state}`"),
+            )
+            .await
         }
 
-        /// Polls until `condition` holds, or reports `explanation` together with
-        /// the journal snapshot. Every wait here is a convergence bound on a
-        /// condition, never a sleep on a guess.
-        async fn wait_until(
-            journal_path: &Path,
-            mut condition: impl FnMut() -> bool,
-            explanation: &str,
+        /// Waits on the adversarial provider's own in-flight transition.
+        async fn wait_for_provider_in_flight(
+            provider: &Arc<AdversarialProviderV1>,
+            calls: u64,
+            fixture: &AdversarialJourneyFixture,
         ) {
-            let settled = tokio::time::timeout(SETTLEMENT_BUDGET, async {
-                while !condition() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
+            let provider = Arc::clone(provider);
+            let reached = tokio::task::spawn_blocking(move || {
+                provider.wait_until_in_flight(calls, SETTLEMENT_BUDGET)
             })
-            .await;
+            .await
+            .expect("provider in-flight waiter");
             assert!(
-                settled.is_ok(),
-                "{explanation}; {}",
-                journal_snapshot(journal_path)
+                reached,
+                "the mounted journey never reached {calls} provider call(s); {}",
+                journal_snapshot(fixture.journal_path())
+            );
+        }
+
+        /// Waits on the adversarial provider's own transition back to idle.
+        async fn wait_for_provider_idle(
+            provider: &Arc<AdversarialProviderV1>,
+            fixture: &AdversarialJourneyFixture,
+        ) {
+            let provider = Arc::clone(provider);
+            let idle =
+                tokio::task::spawn_blocking(move || provider.wait_until_idle(SETTLEMENT_BUDGET))
+                    .await
+                    .expect("provider idle waiter");
+            assert!(
+                idle,
+                "the provider never returned to idle; {}",
+                journal_snapshot(fixture.journal_path())
             );
         }
 
@@ -4919,14 +5283,18 @@ mod tests {
             fixture: &AdversarialJourneyFixture,
             baseline: BoundedCallCensusV1,
         ) {
-            let settled = tokio::time::timeout(SETTLEMENT_BUDGET, async {
-                while fixture.journey.provider_call_census() != baseline {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await;
-            assert!(
-                settled.is_ok(),
+            let settled = fixture
+                .journey
+                .provider_isolation
+                .census_changed
+                .wait_until_async(SETTLEMENT_BUDGET, || {
+                    let census = fixture.journey.provider_call_census();
+                    (census == baseline).then_some(census)
+                })
+                .await;
+            assert_eq!(
+                settled,
+                Ok(baseline),
                 "the host never returned its borrowed workers to the baseline census \
                  {baseline:?}; it still reports {:?}; {}",
                 fixture.journey.provider_call_census(),
@@ -4964,26 +5332,16 @@ mod tests {
             mut admits: impl FnMut(&DeliveryRefusalClassV1) -> bool,
             expectation: &str,
         ) -> DeliveryRefusalV1 {
-            let observed = tokio::time::timeout(SETTLEMENT_BUDGET, async {
-                loop {
-                    if let Some(found) = fixture
-                        .journey
-                        .recent_delivery_refusals()
-                        .into_iter()
-                        .find(|refusal| admits(&refusal.class))
-                    {
-                        return found;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await;
-            match observed {
+            match fixture
+                .journey
+                .delivery_refusals
+                .wait_for(SETTLEMENT_BUDGET, |refusal| admits(&refusal.class))
+                .await
+            {
                 Ok(refusal) => refusal,
-                Err(_) => panic!(
+                Err(published) => panic!(
                     "the lane never classified a delivery refusal as {expectation}; it \
-                     published {:?}; {}",
-                    fixture.journey.recent_delivery_refusals(),
+                     published {published:?}; {}",
                     journal_snapshot(fixture.journal_path())
                 ),
             }
@@ -5047,7 +5405,7 @@ mod tests {
                 .await;
             fixture.journey.wake_delivery();
 
-            let (state, attempts, outcome) = wait_for_attempts(fixture.journal_path(), 2).await;
+            let (state, attempts, outcome) = wait_for_attempts(&fixture, 2).await;
             assert_ne!(
                 state, "acknowledged",
                 "a provider that never replied must not settle an acknowledgement"
@@ -5153,12 +5511,12 @@ mod tests {
             // Wait until the provider really is holding the host's call. Every
             // assertion below is about a *live* hang, not about a provider that
             // happened to answer early.
-            wait_until(
-                fixture.journal_path(),
-                || provider.invocation_count() >= 1 && provider.in_flight() >= 1,
-                "the mounted journey never reached the provider at all",
-            )
-            .await;
+            wait_for_provider_in_flight(&provider, 1, &fixture).await;
+            assert_eq!(
+                provider.invocation_count(),
+                1,
+                "the in-flight transition must describe the first provider contact"
+            );
 
             // The discriminator is not wall-clock: it is that the host got on
             // with its work while its first call was still inside the provider.
@@ -5168,23 +5526,17 @@ mod tests {
             // host that followed its provider down could not show a second
             // attempt without a second contact, because its only delivery
             // thread would still be inside the first one.
-            let peak = std::sync::atomic::AtomicUsize::new(0);
-            wait_until(
-                fixture.journal_path(),
-                || {
-                    peak.fetch_max(
-                        fixture.journey.provider_call_census().owned(),
-                        Ordering::AcqRel,
-                    );
-                    delivery_row(fixture.journal_path())
-                        .is_some_and(|(_, attempts, _)| attempts >= 2)
-                        && provider.invocation_count() == 1
-                        && provider.in_flight() >= 1
-                },
-                "the delivery worker never started a second attempt while its first call was \
-                 still inside the provider",
-            )
-            .await;
+            let (_, attempts, _) = wait_for_attempts(&fixture, 2).await;
+            assert!(attempts >= 2);
+            assert_eq!(
+                provider.invocation_count(),
+                1,
+                "the retry must be refused before a second provider contact"
+            );
+            assert!(
+                provider.in_flight() >= 1,
+                "the first call returned before the journal recorded the retry"
+            );
 
             // The host's own count of the thread it walked away from, not the
             // provider's: the call it stopped waiting for is still owned and
@@ -5195,9 +5547,7 @@ mod tests {
                 "the host stopped waiting for a call that is still inside the provider but \
                  reported no abandoned worker: {hung_census:?}"
             );
-            let parked_at_peak = peak
-                .load(Ordering::Acquire)
-                .max(fixture.journey.provider_call_census().owned());
+            let parked_at_peak = fixture.journey.provider_call_census().owned();
 
             // The exact typed terminal for a hang: the host stopped waiting at
             // its own bound and said so, rather than reporting an unreachable
@@ -5258,13 +5608,7 @@ mod tests {
                 "the host parked {parked_at_peak} threads in the provider, past its own \
                  ceiling of {MAX_ABANDONED_PROVIDER_CALLS}"
             );
-            wait_until(
-                fixture.journal_path(),
-                || provider.in_flight() == 0,
-                "a host thread was still parked in the provider after the provider itself \
-                 had finished",
-            )
-            .await;
+            wait_for_provider_idle(&provider, &fixture).await;
             wait_for_census(&fixture, baseline).await;
         }
 
@@ -5297,7 +5641,7 @@ mod tests {
                 .await;
             fixture.journey.wake_delivery();
 
-            let (state, attempts, _) = wait_for_state(fixture.journal_path(), "acknowledged").await;
+            let (state, attempts, _) = wait_for_state(&fixture, "acknowledged").await;
             assert_eq!(state, "acknowledged");
             assert!(
                 attempts >= 2,
@@ -5359,7 +5703,7 @@ mod tests {
                 .await;
             fixture.journey.wake_delivery();
 
-            let (_, attempts, _) = wait_for_state(fixture.journal_path(), "acknowledged").await;
+            let (_, attempts, _) = wait_for_state(&fixture, "acknowledged").await;
             assert!(
                 attempts >= 2,
                 "the oversized reply must have been refused rather than settled: {}",
@@ -5416,7 +5760,7 @@ mod tests {
                 .await;
             fixture.journey.wake_delivery();
 
-            let (_, attempts, _) = wait_for_state(fixture.journal_path(), "acknowledged").await;
+            let (_, attempts, _) = wait_for_state(&fixture, "acknowledged").await;
             assert!(
                 attempts >= 2,
                 "corrupted effect evidence must not settle: {}",
@@ -5471,7 +5815,7 @@ mod tests {
                 .await;
             fixture.journey.wake_delivery();
 
-            let (state, _, outcome) = wait_for_attempts(fixture.journal_path(), 2).await;
+            let (state, _, outcome) = wait_for_attempts(&fixture, 2).await;
             assert_ne!(state, "acknowledged", "outcome={outcome:?}");
             assert_eq!(receipt_count(fixture.journal_path()), 0);
             assert_eq!(provider.in_flight(), 0);
@@ -5541,7 +5885,7 @@ mod tests {
                 .await;
             fixture.journey.wake_delivery();
 
-            let (_, attempts, _) = wait_for_state(fixture.journal_path(), "acknowledged").await;
+            let (_, attempts, _) = wait_for_state(&fixture, "acknowledged").await;
             assert!(
                 attempts >= 2,
                 "a failing terminal carrying a payload must have cost an attempt rather \
@@ -5638,43 +5982,40 @@ mod tests {
             fixture.journey.wake_delivery();
 
             // The provider really is holding a call, and only this test can end it.
-            wait_until(
-                fixture.journal_path(),
-                || latch.parked() >= 1 && provider.in_flight() >= 1,
-                "the mounted journey never reached the provider at all",
-            )
-            .await;
+            wait_for_provider_in_flight(&provider, 1, &fixture).await;
 
             // The host answered itself at its own bound with the call still inside
             // the provider, and says so: the worker it walked away from is counted
             // as abandoned rather than dropped from the books.
-            wait_until(
-                fixture.journal_path(),
-                || fixture.journey.provider_call_census().abandoned >= 1,
-                "the host never published the borrowed worker it stopped waiting for",
-            )
-            .await;
+            let abandoned = fixture
+                .journey
+                .provider_isolation
+                .census_changed
+                .wait_until_async(SETTLEMENT_BUDGET, || {
+                    let census = fixture.journey.provider_call_census();
+                    (census.abandoned >= 1).then_some(census)
+                })
+                .await
+                .unwrap_or_else(|()| {
+                    panic!(
+                        "the host never published the borrowed worker it stopped waiting for; {}",
+                        journal_snapshot(fixture.journal_path())
+                    )
+                });
+            assert!(abandoned.abandoned >= 1);
+            assert!(
+                latch.parked() >= 1,
+                "the call was not still parked on the provider's release latch"
+            );
 
             // The lane got on with its work while the first call was still parked,
             // and the cost of doing so stayed inside the host's own ceiling.
-            let peak = std::sync::atomic::AtomicUsize::new(0);
-            wait_until(
-                fixture.journal_path(),
-                || {
-                    peak.fetch_max(
-                        fixture.journey.provider_call_census().owned(),
-                        Ordering::AcqRel,
-                    );
-                    delivery_row(fixture.journal_path())
-                        .is_some_and(|(_, attempts, _)| attempts >= 2)
-                },
-                "the delivery worker never started a second attempt, so it followed its \
-                 provider down",
-            )
-            .await;
-            let parked_at_peak = peak
-                .load(Ordering::Acquire)
-                .max(fixture.journey.provider_call_census().owned());
+            let (_, attempts, _) = wait_for_attempts(&fixture, 2).await;
+            assert!(
+                attempts >= 2,
+                "the delivery worker never started a second attempt"
+            );
+            let parked_at_peak = fixture.journey.provider_call_census().owned();
             assert!(
                 parked_at_peak <= MAX_ABANDONED_PROVIDER_CALLS,
                 "the host parked {parked_at_peak} borrowed workers in a provider that never \
@@ -5740,12 +6081,12 @@ mod tests {
             // borrowed worker back rather than leaking them for the process's life.
             latch.release();
             wait_for_census(&fixture, baseline).await;
-            wait_until(
-                fixture.journal_path(),
-                || provider.in_flight() == 0 && latch.parked() == 0,
-                "the released provider never let go of its calls",
-            )
-            .await;
+            wait_for_provider_idle(&provider, &fixture).await;
+            assert_eq!(
+                latch.parked(),
+                0,
+                "the released provider never let go of its calls"
+            );
         }
 
         // ---------------------------------------------------------------------------
@@ -5784,12 +6125,7 @@ mod tests {
                 .await;
             fixture.journey.wake_delivery();
 
-            wait_until(
-                fixture.journal_path(),
-                || provider.in_flight() >= 1,
-                "the mounted journey never reached the provider at all",
-            )
-            .await;
+            wait_for_provider_in_flight(&provider, 1, &fixture).await;
 
             // Withdraw the host's consent while the provider is working. Shutdown
             // cancels the wake edge's token, which is the token the call carries.
@@ -5800,12 +6136,7 @@ mod tests {
             );
 
             // Let the provider finish on its own schedule and answer success anyway.
-            wait_until(
-                fixture.journal_path(),
-                || provider.in_flight() == 0,
-                "the provider never finished the work the host had already cancelled",
-            )
-            .await;
+            wait_for_provider_idle(&provider, &fixture).await;
             assert!(
                 provider.ledger().answered_after_cancellation(),
                 "the double never answered while the token was cancelled, so this proves \
@@ -5895,7 +6226,7 @@ mod tests {
                 .await;
             fixture.journey.wake_delivery();
 
-            let (_, attempts, _) = wait_for_state(fixture.journal_path(), "acknowledged").await;
+            let (_, attempts, _) = wait_for_state(&fixture, "acknowledged").await;
             assert!(
                 attempts >= 3,
                 "a reply that does not answer the dispatched call must cost an attempt \
@@ -5986,7 +6317,7 @@ mod tests {
             let host_scope = delivery_scope(fixture.journal_path()).expect("delivery scope");
             fixture.journey.wake_delivery();
 
-            let (_, attempts, _) = wait_for_state(fixture.journal_path(), "acknowledged").await;
+            let (_, attempts, _) = wait_for_state(&fixture, "acknowledged").await;
             assert!(
                 attempts >= 2,
                 "a terminal bound to another checkout must have been refused rather than \
@@ -7309,21 +7640,19 @@ mod tests {
             .expect("beta commit");
 
         let deliveries = wait_for_deliveries(journey.journal_path(), 2).await;
-        for (_, state, _) in &deliveries {
+        for (_, state, attempts) in &deliveries {
             assert_eq!(
-                state.as_str(),
-                "acknowledged",
+                (state.as_str(), *attempts),
+                ("acknowledged", 1),
                 "{}",
                 journal_snapshot(journey.journal_path())
             );
         }
-        // The attempt count is deliberately not pinned here: two interleaved
-        // session scopes share one registration and therefore one readiness
-        // slot, so a delivery may legitimately spend an attempt on a readiness
-        // the other scope displaced. What this test fixes is that both settle
-        // as acknowledgements, each bound to its own exact scope, and that the
-        // provider was asked exactly once per record — a retry that loses the
-        // readiness race never reaches the provider at all.
+        // Interleaved scopes share one registration-wide readiness slot, but a
+        // readiness proof now retains dispatch ownership through its provider
+        // call. Another scope may re-prove immediately afterward; it can no
+        // longer consume this row's first attempt by rotating the receipt in
+        // the proof-to-dispatch gap.
         assert_eq!(first_port.observe_calls.load(Ordering::Relaxed), 2);
         {
             let connection = rusqlite::Connection::open(journey.journal_path()).unwrap();
