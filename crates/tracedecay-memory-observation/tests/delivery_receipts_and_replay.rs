@@ -505,3 +505,42 @@ fn an_invalid_retention_policy_is_rejected_at_open() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn a_stale_cancellation_cannot_write_a_receipt_or_release_another_lease() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = journal(&directory.path().join("journal.sqlite3"))?;
+    let admitted = Builder::at_sequence(1).build()?;
+    store.append_admitted(&admitted)?;
+    let leased = store.lease_pending(&lease_request(T0, 1))?;
+    assert_eq!(leased.len(), 1);
+
+    let receipt = ObservationDeliveryReceiptV1::from_cancelled(&leased[0], T0, T0 + 1_000)?;
+    let stale_lease = tracedecay_memory_observation::DispatchLeaseIdV1::derive(
+        &leased[0].idempotency_key,
+        "stale-dispatcher",
+        T0,
+        leased[0].attempt_number,
+    );
+    match store.record_unsettled_attempt(&receipt, &stale_lease, T0)? {
+        AttemptOutcomeV1::LeaseLost { receipt_id } => {
+            assert_eq!(receipt_id, receipt.receipt_id);
+        }
+        other => return Err(format!("unexpected cancellation outcome: {other:?}").into()),
+    }
+
+    assert!(
+        store.receipts_for(&admitted.observation_id)?.is_empty(),
+        "lease loss and receipt insertion must be one atomic decision"
+    );
+    assert!(
+        store.lease_pending(&lease_request(T0, 1))?.is_empty(),
+        "the stale cancellation must not release the live lease"
+    );
+    store.release_lease(&leased[0].lease_id, T0 + SECOND)?;
+    assert_eq!(
+        store.lease_pending(&lease_request(T0 + SECOND, 1))?.len(),
+        1
+    );
+    Ok(())
+}

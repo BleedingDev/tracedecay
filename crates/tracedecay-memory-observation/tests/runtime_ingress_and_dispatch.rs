@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use support::{
-    Builder, LEASE, MINUTE, PROVENANCE_DIGEST, PROVIDER, PROVIDER_RECEIPT_DIGEST, SECOND, T0,
-    TestResult, ingest_control, journal, lane, lease_request, policy, stream_key, withheld_at,
+    Builder, INSTANCE, LEASE, MINUTE, PROVENANCE_DIGEST, PROVIDER, PROVIDER_RECEIPT_DIGEST, SECOND,
+    T0, TestResult, ingest_control, journal, lane, lease_request, policy, stream_key, withheld_at,
 };
 
 use tracedecay_memory_observation::{
@@ -28,11 +28,12 @@ use tracedecay_memory_observation::{
     BackpressureStateV1, DeliveryAttemptV1, DeliveryControlV1, DeliveryRuntimeV1, DeliveryStateV1,
     DeliveryWakeV1, DispatchPolicyV1, DispatchRequestV1, IngressControlV1, IngressResumeV1,
     IngressRuntimeV1, JournalInspectionFilterV1, LeasedObservationV1,
-    ObservationAdmissionAdapterV1, ObservationDispatchPortV1, ObservationJournalError,
-    ObservationJournalReaderV1, ObservationLaneKeyV1, ObservationLoadClassV1,
-    ObservationRuntimeError, ProviderDeliveryAdapterV1, ReplayDispositionV1, RetentionClassV1,
-    RetentionPolicyV1, RetryBackoffV1, ShutdownRequestV1, SourceRecordV1, SourceSequenceV1,
-    SqliteObservationJournal, WakeOutcomeV1,
+    ObservationAdmissionAdapterV1, ObservationCommittedEffectV1, ObservationDispatchPortV1,
+    ObservationJournalError, ObservationJournalReaderV1, ObservationLaneKeyV1,
+    ObservationLoadClassV1, ObservationOutcomeV1, ObservationRuntimeError,
+    ProviderDeliveryAdapterV1, ReplayDispositionV1, RetentionClassV1, RetentionPolicyV1,
+    RetryBackoffV1, ShutdownRequestV1, SourceRecordV1, SourceSequenceV1, SqliteObservationJournal,
+    WakeOutcomeV1,
 };
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
@@ -366,7 +367,10 @@ impl ProviderDeliveryAdapterV1 for BlockingProvider {
             // The control really is cancelled, so the row goes back
             // eligible at once rather than serving a backoff for a shutdown
             // it did not cause.
-            return Ok(DeliveryAttemptV1::CancelledByShutdown);
+            return Ok(DeliveryAttemptV1::CancelledByShutdown {
+                started_at_unix_micros: self.now,
+                finished_at_unix_micros: self.now,
+            });
         }
         Err(AdapterError(format!(
             "provider ran past its hard stop with {} micros of budget left",
@@ -402,7 +406,10 @@ impl ProviderDeliveryAdapterV1 for ShutdownDuringBatchProvider<'_> {
             control.is_cancelled(),
             "the control handed to an attempt must be the wake edge's own token"
         );
-        Ok(DeliveryAttemptV1::CancelledByShutdown)
+        Ok(DeliveryAttemptV1::CancelledByShutdown {
+            started_at_unix_micros: control.deadline_unix_micros(),
+            finished_at_unix_micros: control.deadline_unix_micros(),
+        })
     }
 }
 
@@ -836,7 +843,7 @@ fn an_adapter_failure_releases_the_lease_and_reports_the_cause() -> TestResult {
 }
 
 #[test]
-fn a_terminal_about_another_scope_never_becomes_a_receipt() -> TestResult {
+fn a_terminal_about_another_scope_becomes_only_unknown_effect_evidence() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = journal(&directory.path().join("journal.sqlite3"))?;
     let wake = DeliveryWakeV1::new();
@@ -851,7 +858,7 @@ fn a_terminal_about_another_scope_never_becomes_a_receipt() -> TestResult {
     let delivery = DeliveryRuntimeV1::new(&store, &provider, &wake);
     let report = delivery.dispatch_batch(&dispatch_at(T0))?;
 
-    assert_eq!(report.receipts_recorded, 0);
+    assert_eq!(report.receipts_recorded, 1);
     assert_eq!(report.failures.len(), 1);
     let failure = report.failures.first().ok_or("expected one failure")?;
     assert!(
@@ -861,12 +868,17 @@ fn a_terminal_about_another_scope_never_becomes_a_receipt() -> TestResult {
     );
 
     let observation = Builder::at_sequence(1).build()?;
-    assert!(store.receipts_for(&observation.observation_id)?.is_empty());
+    let receipts = store.receipts_for(&observation.observation_id)?;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].outcome, ObservationOutcomeV1::EffectUnknown);
+    assert_eq!(
+        receipts[0].committed_effect,
+        ObservationCommittedEffectV1::Unknown
+    );
     assert_eq!(state_of(&store, 1)?, DeliveryStateV1::Pending);
 
-    // No receipt — and no amnesia either. The attempt number the claim consumed
-    // is gone, so the refusal it was spent on is durable evidence in its own
-    // right, keyed by the same (observation, attempt) pair a receipt would use.
+    // The host-owned receipt records the terminal attempt without accepting
+    // its effect claim; the refusal retains why the answer was inadmissible.
     assert_eq!(report.refusals_recorded, 1);
     let refusals = store.attempt_refusals_for(&observation.observation_id)?;
     assert_eq!(refusals.len(), 1);
@@ -959,9 +971,10 @@ fn the_wake_edge_times_out_and_lets_shutdown_outrank_pending_work() -> TestResul
 // ------------------------------------------------------- cancellation bound --
 
 #[test]
-fn shutdown_cancels_an_in_flight_attempt_within_the_bound_and_invents_no_receipt() -> TestResult {
+fn shutdown_cancels_an_in_flight_attempt_within_the_bound_and_records_receipt() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let store = journal(&directory.path().join("journal.sqlite3"))?;
+    let path = directory.path().join("journal.sqlite3");
+    let store = journal(&path)?;
     store.append_admitted(&Builder::at_sequence(1).build()?)?;
     let wake = DeliveryWakeV1::new();
     // The provider's own hard stop is far past the bound under test, so a pass
@@ -1007,14 +1020,25 @@ fn shutdown_cancels_an_in_flight_attempt_within_the_bound_and_invents_no_receipt
     assert_eq!(report.cancelled_in_flight, 1);
     assert_eq!(report.cancelled_before_dispatch, 0);
     assert_eq!(report.leases_released, 1);
-    assert_eq!(report.receipts_recorded, 0);
+    assert_eq!(report.receipts_recorded, 1);
     assert!(report.failures.is_empty());
     assert_eq!(state_of(&store, 1)?, DeliveryStateV1::Pending);
+
+    let observation = Builder::at_sequence(1).build()?;
+    let receipts = store.receipts_for(&observation.observation_id)?;
+    assert_eq!(receipts.len(), 1);
+    let cancelled = &receipts[0];
+    assert_eq!(cancelled.provider_id.as_str(), PROVIDER);
+    assert_eq!(cancelled.provider_instance_id.as_deref(), Some(INSTANCE));
+    assert_eq!(cancelled.attempt_number, 1);
+    assert_eq!(cancelled.outcome, ObservationOutcomeV1::Cancelled);
     assert_eq!(
-        receipts_for_sequence(&store, 1)?,
-        0,
-        "an attempt the provider never answered must not grow a receipt"
+        cancelled.committed_effect,
+        ObservationCommittedEffectV1::Unknown,
+        "shutdown cannot prove whether an isolated provider committed late"
     );
+    assert_eq!(cancelled.started_at_unix_micros, T0);
+    assert_eq!(cancelled.finished_at_unix_micros, T0);
 
     // The runtime then quiesces on its first pass: nothing is stranded.
     let shutdown = delivery.shutdown(&ShutdownRequestV1 {
@@ -1029,6 +1053,69 @@ fn shutdown_cancels_an_in_flight_attempt_within_the_bound_and_invents_no_receipt
     let after = delivery.dispatch_batch(&dispatch_at(T0 + 2 * SECOND))?;
     assert_eq!(after.leased, 0);
     assert_eq!(state_of(&store, 1)?, DeliveryStateV1::Pending);
+
+    drop(delivery);
+    drop(provider);
+    drop(wake);
+    drop(store);
+
+    // Restart preserves the cancelled-attempt evidence while the observation
+    // remains immediately redeliverable under its stable identity.
+    let restarted = journal(&path)?;
+    let receipts = restarted.receipts_for(&observation.observation_id)?;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].outcome, ObservationOutcomeV1::Cancelled);
+    let redelivery = restarted.lease_pending(&lease_request(T0, 8))?;
+    assert_eq!(redelivery.len(), 1);
+    assert_eq!(redelivery[0].observation_id, observation.observation_id);
+    assert_eq!(redelivery[0].idempotency_key, observation.idempotency_key);
+    assert_eq!(redelivery[0].attempt_number, 2);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ErrorAfterShutdown<'a> {
+    wake: &'a DeliveryWakeV1,
+}
+
+impl ProviderDeliveryAdapterV1 for ErrorAfterShutdown<'_> {
+    type Error = AdapterError;
+
+    fn deliver(
+        &self,
+        _leased: &LeasedObservationV1,
+        _control: &DeliveryControlV1,
+    ) -> Result<DeliveryAttemptV1, Self::Error> {
+        self.wake.request_shutdown();
+        Err(AdapterError("readiness cancelled".to_owned()))
+    }
+}
+
+#[test]
+fn adapter_error_racing_with_shared_shutdown_retains_the_failure() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = journal(&directory.path().join("journal.sqlite3"))?;
+    let observation = Builder::at_sequence(1).build()?;
+    store.append_admitted(&observation)?;
+    let wake = DeliveryWakeV1::new();
+    let provider = ErrorAfterShutdown { wake: &wake };
+    let delivery = DeliveryRuntimeV1::new(&store, &provider, &wake);
+
+    let report = delivery.dispatch_batch(&dispatch_at(T0))?;
+    assert_eq!(report.cancelled_in_flight, 0);
+    assert_eq!(report.receipts_recorded, 0);
+    assert_eq!(report.leases_released, 1);
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].cause.to_string(), "readiness cancelled");
+    assert_eq!(state_of(&store, 1)?, DeliveryStateV1::Pending);
+    assert!(
+        store.receipts_for(&observation.observation_id)?.is_empty(),
+        "an adapter error cannot manufacture cancellation evidence"
+    );
+    assert!(
+        store.lease_pending(&lease_request(T0, 8))?.is_empty(),
+        "an adapter failure keeps the ordinary retry backoff"
+    );
     Ok(())
 }
 
@@ -1056,11 +1143,14 @@ fn shutdown_between_items_releases_the_rest_of_the_batch_without_an_attempt() ->
     assert_eq!(report.cancelled_in_flight, 1);
     assert_eq!(report.cancelled_before_dispatch, 2);
     assert_eq!(report.leases_released, 3);
-    assert_eq!(report.receipts_recorded, 0);
+    assert_eq!(report.receipts_recorded, 1);
     assert!(report.failures.is_empty());
     for sequence in 1..=3 {
         assert_eq!(state_of(&store, sequence)?, DeliveryStateV1::Pending);
-        assert_eq!(receipts_for_sequence(&store, sequence)?, 0);
+        assert_eq!(
+            receipts_for_sequence(&store, sequence)?,
+            usize::from(sequence == 1)
+        );
     }
     // The rows released without an attempt are eligible again at once: a
     // later dispatcher (or the next life of this one) leases them immediately.

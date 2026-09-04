@@ -16,17 +16,17 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use support::{
-    Builder, LEASE, MINUTE, PROVENANCE_DIGEST, PROVIDER_RECEIPT_DIGEST, SECOND, T0, TestResult,
-    journal, lease_request, policy,
+    Builder, INSTANCE, LEASE, MINUTE, PROVENANCE_DIGEST, PROVIDER, PROVIDER_RECEIPT_DIGEST, SECOND,
+    T0, TestResult, journal, lease_request, policy,
 };
 
 use tracedecay_memory_observation::{
     AttemptRefusalCategoryV1, DeliveryAttemptV1, DeliveryControlV1, DeliveryRuntimeV1,
     DeliveryStateV1, DeliveryWakeV1, DispatchPolicyV1, DispatchRequestV1, DrainStopV1,
     JournalInspectionFilterV1, JournalInspectionRowV1, LeasedObservationV1,
-    ObservationDispatchPortV1, ObservationJournalError, ObservationJournalReaderV1,
-    ProviderDeliveryAdapterV1, RetentionPolicyV1, RetryBackoffV1, SourceSequenceV1,
-    SqliteObservationJournal,
+    ObservationCommittedEffectV1, ObservationDispatchPortV1, ObservationJournalError,
+    ObservationJournalReaderV1, ObservationOutcomeV1, ProviderDeliveryAdapterV1, RetentionPolicyV1,
+    RetryBackoffV1, SourceSequenceV1, SqliteObservationJournal,
 };
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
@@ -405,11 +405,11 @@ fn a_drain_stops_between_rounds_once_its_wall_budget_elapsed() -> TestResult {
     Ok(())
 }
 
-/// Shutdown requested from inside an attempt stops the drain at the end of that
-/// round: the in-flight attempt keeps its own control, no further round starts,
-/// and everything not yet delivered stays `Pending` with no receipt.
+/// Shutdown requested from inside an attempt owns that attempt even if the
+/// adapter returns a success afterwards. The late provider terminal is ignored,
+/// one host-owned cancellation receipt is recorded, and no later round starts.
 #[test]
-fn a_drain_starts_no_round_after_shutdown_and_strands_nothing() -> TestResult {
+fn a_late_success_after_shutdown_is_discarded_for_cancellation() -> TestResult {
     let directory = tempfile::tempdir()?;
     let store = journal(&directory.path().join("journal.sqlite3"))?;
     seed(&store, 24)?;
@@ -432,23 +432,37 @@ fn a_drain_starts_no_round_after_shutdown_and_strands_nothing() -> TestResult {
         report.totals.leased, BATCH,
         "the interrupted round still leased its batch"
     );
-    assert_eq!(
-        report.totals.receipts_recorded, 1,
-        "only the attempt already in flight may produce a receipt"
-    );
+    assert_eq!(report.totals.receipts_recorded, 1);
+    assert_eq!(report.totals.cancelled_in_flight, 1);
     assert_eq!(report.totals.cancelled_before_dispatch, BATCH - 1);
-    assert_eq!(report.totals.leases_released, BATCH - 1);
+    assert_eq!(report.totals.leases_released, BATCH);
+    assert_eq!(report.totals.settled_terminal, 0);
 
-    // Rows the round never attempted carry no receipt and are eligible again.
-    let mut pending = 0_u32;
-    for row in rows(&store)? {
-        if row.state == DeliveryStateV1::Pending {
-            pending = pending.saturating_add(1);
-            assert_eq!(store.receipts_for(&row.observation_id)?.len(), 0);
-        }
+    // The first row has cancellation evidence, not the success terminal the
+    // adapter produced after withdrawing consent. Every row remains pending.
+    let all_rows = rows(&store)?;
+    assert_eq!(
+        all_rows
+            .iter()
+            .filter(|row| row.state == DeliveryStateV1::Pending)
+            .count(),
+        24
+    );
+    let first = row_at(&store, 1)?;
+    let receipts = store.receipts_for(&first.observation_id)?;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].outcome, ObservationOutcomeV1::Cancelled);
+    assert_eq!(
+        receipts[0].committed_effect,
+        ObservationCommittedEffectV1::Unknown
+    );
+    for row in all_rows
+        .iter()
+        .filter(|row| row.source_sequence != SourceSequenceV1(1))
+    {
+        assert_eq!(store.receipts_for(&row.observation_id)?.len(), 0);
     }
-    assert_eq!(pending, 23);
-    assert_eq!(store.lease_pending(&lease_request(T0, 64))?.len(), 23);
+    assert_eq!(store.lease_pending(&lease_request(T0, 64))?.len(), 24);
     Ok(())
 }
 
@@ -685,10 +699,13 @@ impl ProviderDeliveryAdapterV1 for ForgedCancellationProvider {
     fn deliver(
         &self,
         _leased: &LeasedObservationV1,
-        _control: &DeliveryControlV1,
+        control: &DeliveryControlV1,
     ) -> Result<DeliveryAttemptV1, Self::Error> {
         self.attempts.set(self.attempts.get().saturating_add(1));
-        Ok(DeliveryAttemptV1::CancelledByShutdown)
+        Ok(DeliveryAttemptV1::CancelledByShutdown {
+            started_at_unix_micros: control.deadline_unix_micros(),
+            finished_at_unix_micros: control.deadline_unix_micros(),
+        })
     }
 }
 
@@ -833,8 +850,8 @@ fn a_refused_provider_terminal_is_recorded_durably_and_never_rewritten() -> Test
 
         assert_eq!(report.leased, 1);
         assert_eq!(
-            report.receipts_recorded, 0,
-            "a refused terminal is no receipt"
+            report.receipts_recorded, 1,
+            "a refused terminal has host-owned unknown-effect evidence"
         );
         assert_eq!(report.refusals_recorded, 1);
         assert_eq!(report.failures.len(), 1);
@@ -843,20 +860,35 @@ fn a_refused_provider_terminal_is_recorded_durably_and_never_rewritten() -> Test
         row.observation_id
     };
 
-    // Restart: the refusal is durable, the receipt still does not exist.
+    // Restart: both the refusal and its unknown-effect receipt are durable.
     let store = journal(&path)?;
-    assert!(
-        store.receipts_for(&observation_id)?.is_empty(),
-        "a refused terminal must never become provider-effect evidence"
+    let receipts = store.receipts_for(&observation_id)?;
+    assert_eq!(receipts.len(), 1, "the refused terminal lost its receipt");
+    assert_eq!(receipts[0].outcome, ObservationOutcomeV1::EffectUnknown);
+    assert_eq!(receipts[0].provider_id.as_str(), PROVIDER);
+    assert_eq!(receipts[0].provider_instance_id.as_deref(), Some(INSTANCE));
+    assert_eq!(receipts[0].attempt_number, 1);
+    assert_eq!(receipts[0].started_at_unix_micros, T0);
+    assert_eq!(receipts[0].finished_at_unix_micros, T0 + 1_000);
+    assert_eq!(
+        receipts[0].committed_effect,
+        ObservationCommittedEffectV1::Unknown,
+        "a refused terminal must never become accepted provider-effect evidence"
     );
     let refusals = store.attempt_refusals_for(&observation_id)?;
     assert_eq!(refusals.len(), 1, "the refusal did not survive restart");
     let refusal = refusals.first().ok_or("expected one refusal")?;
+    assert_eq!(refusal.provider_id, PROVIDER);
+    assert_eq!(refusal.provider_instance_id, INSTANCE);
+    assert_eq!(refusal.registration_revision, 4);
     assert_eq!(refusal.attempt_number, 1);
     assert_eq!(
         refusal.category,
         AttemptRefusalCategoryV1::TerminalIdentityMismatch
     );
+    assert_eq!(refusal.started_at_unix_micros, T0);
+    assert_eq!(refusal.finished_at_unix_micros, T0 + 1_000);
+    assert_eq!(refusal.recorded_at_unix_micros, T0 + 1_000);
     assert_eq!(refusal.refused_field, "exact_scope_sha256");
     assert_eq!(refusal.provided.as_deref(), Some(PROVENANCE_DIGEST));
     assert_eq!(refusal.terminal_code, "success");

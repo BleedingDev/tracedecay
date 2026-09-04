@@ -690,6 +690,16 @@ impl ObservationJournalReaderV1 for CrashingJournalReaderV1<'_> {
         self.inner.record_attempt_refusal(refusal)
     }
 
+    fn record_unsettled_attempt(
+        &self,
+        receipt: &ObservationDeliveryReceiptV1,
+        lease: &DispatchLeaseIdV1,
+        retry_after_unix_micros: i64,
+    ) -> Result<AttemptOutcomeV1, ObservationJournalError> {
+        self.inner
+            .record_unsettled_attempt(receipt, lease, retry_after_unix_micros)
+    }
+
     fn release_lease(
         &self,
         lease: &DispatchLeaseIdV1,
@@ -2387,7 +2397,7 @@ fn assert_watermark_holds(paths: &JourneyPathsV1, label: &str) -> Result<(), Box
 /// skip. Therefore every committed sequence at or below it must have its own
 /// durable acknowledging receipt: one later acknowledgement cannot authorize
 /// the host to skip an earlier unacknowledged commit. The exact comparison also
-/// catches a watermark that lags behind a fully acknowledged contiguous prefix.
+/// catches a watermark that differs from the highest acknowledged sequence.
 fn assert_acknowledged_watermark(
     paths: &JourneyPathsV1,
     label: &str,
@@ -2437,12 +2447,12 @@ fn assert_acknowledged_watermark(
         for sequence in committed
             .iter()
             .copied()
-            .filter(|sequence| *sequence <= watermark)
+            .take_while(|sequence| *sequence <= watermark)
         {
             if !acknowledged.contains(&sequence) {
                 return Err(harness(format!(
-                    "{label}: acknowledged watermark {watermark} passed committed sequence \
-                     {sequence}, which carries no acknowledging receipt"
+                    "{label}: watermark {watermark} passed committed sequence {sequence}, \
+                     which has no acknowledging receipt"
                 ))
                 .into());
             }
@@ -2450,8 +2460,8 @@ fn assert_acknowledged_watermark(
     }
     if watermark != expected {
         return Err(harness(format!(
-            "{label}: acknowledged watermark {watermark:?} is not the highest contiguous \
-             acknowledged committed sequence {expected:?}"
+            "{label}: acknowledged watermark {watermark:?} is not the highest \
+             contiguous acknowledged committed prefix {expected:?}"
         ))
         .into());
     }

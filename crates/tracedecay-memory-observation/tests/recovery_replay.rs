@@ -211,11 +211,10 @@ fn restart_mid_delivery_converges_without_duplicate_effects() -> TestResult {
     Ok(())
 }
 
-/// AC2. The watermark is a durable maximum, not a derived one: a later
-/// acknowledgement of an earlier sequence does not pull it back, and neither
-/// does deleting the acknowledged rows it was derived from.
+/// AC2. The watermark advances only across the contiguous acknowledged prefix
+/// and remains monotonic after acknowledged rows are deleted.
 #[test]
-fn acknowledged_sequence_is_monotonic_across_out_of_order_acks_and_deletion() -> TestResult {
+fn acknowledged_sequence_closes_gaps_and_is_monotonic_across_deletion() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("observation-journal.sqlite3");
     let store = journal(&path)?;
@@ -224,32 +223,40 @@ fn acknowledged_sequence_is_monotonic_across_out_of_order_acks_and_deletion() ->
     }
     let leased = store.lease_pending(&lease_request(T0, 3))?;
 
-    // Acknowledge the highest sequence first, then the lowest.
+    // Sequence three cannot authorize skipping the still-unacknowledged prefix.
     store.record_attempt(&applied_receipt(&leased[2], T0))?;
-    let after_high = store
-        .recovery_state(&target()?, open_budget())?
-        .ok_or("recovery state missing after the first acknowledgement")?;
     assert_eq!(
-        after_high.acknowledged.map(|position| position.sequence),
+        store
+            .recovery_state(&target()?, open_budget())?
+            .and_then(|state| state.acknowledged),
+        None
+    );
+
+    // Acknowledging one advances only through one; acknowledging two then
+    // closes the gap and incorporates the already-durable receipt for three.
+    store.record_attempt(&applied_receipt(&leased[0], T0 + SECOND))?;
+    let after_one = store
+        .recovery_state(&target()?, open_budget())?
+        .ok_or("recovery state missing after acknowledging the prefix")?;
+    assert_eq!(
+        after_one.acknowledged.map(|position| position.sequence),
+        Some(SourceSequenceV1(1))
+    );
+    store.record_attempt(&applied_receipt(&leased[1], T0 + 2 * SECOND))?;
+    let closed = store
+        .recovery_state(&target()?, open_budget())?
+        .ok_or("recovery state missing after closing the gap")?;
+    assert_eq!(
+        closed.acknowledged.map(|position| position.sequence),
         Some(SourceSequenceV1(3))
     );
 
-    store.record_attempt(&applied_receipt(&leased[0], T0 + SECOND))?;
-    let after_low = store
-        .recovery_state(&target()?, open_budget())?
-        .ok_or("recovery state missing after the second acknowledgement")?;
-    assert_eq!(
-        after_low.acknowledged.map(|position| position.sequence),
-        Some(SourceSequenceV1(3)),
-        "an acknowledgement of an earlier sequence must not lower the watermark"
-    );
-
-    // Privacy deletion removes the acknowledged rows. A watermark derived from
-    // surviving rows would move backwards here and re-propose delivered work.
+    // Privacy deletion removes the acknowledged rows, but cannot lower the
+    // already-proved durable prefix and re-propose provider effects.
     let receipt = store.forget_source(&ForgetSourceRequestV1 {
         forget_source_key: ForgetSourceKeyV1::new("forget:session-1")?,
         reason: "operator deletion request".to_owned(),
-        requested_at_unix_micros: T0 + 2 * SECOND,
+        requested_at_unix_micros: T0 + 3 * SECOND,
     })?;
     assert!(receipt.journal_rows_matched > 0);
 

@@ -157,6 +157,16 @@ pub trait ObservationJournalReaderV1: Send + Sync {
         receipt: &ObservationDeliveryReceiptV1,
     ) -> Result<AttemptOutcomeV1, ObservationJournalError>;
 
+    /// Records host-owned evidence for a cancelled or refused terminal attempt
+    /// and returns the matching lease to `Pending` in the same transaction.
+    /// Unsettled evidence never terminalizes delivery because effect is unknown.
+    fn record_unsettled_attempt(
+        &self,
+        receipt: &ObservationDeliveryReceiptV1,
+        lease: &DispatchLeaseIdV1,
+        retry_after_unix_micros: i64,
+    ) -> Result<AttemptOutcomeV1, ObservationJournalError>;
+
     /// Records one immutable refusal of a provider terminal that the host
     /// answered but could not accept as delivery evidence.
     ///

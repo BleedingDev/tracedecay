@@ -222,7 +222,9 @@ struct VirtualClock {
 
 impl VirtualClock {
     const fn at(now: i64) -> Self {
-        Self { now: Cell::new(now) }
+        Self {
+            now: Cell::new(now),
+        }
     }
 
     fn now(&self) -> i64 {
@@ -450,7 +452,10 @@ impl SoakMetrics {
         let mut sorted = self.foreground_micros.clone();
         sorted.sort_unstable();
         let index = usize::try_from(
-            (sorted.len() as u64).saturating_sub(1).saturating_mul(permille) / 1_000,
+            (sorted.len() as u64)
+                .saturating_sub(1)
+                .saturating_mul(permille)
+                / 1_000,
         )
         .unwrap_or(0);
         sorted.get(index).copied().unwrap_or(0)

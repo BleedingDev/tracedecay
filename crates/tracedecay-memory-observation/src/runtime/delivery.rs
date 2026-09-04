@@ -3,13 +3,14 @@
 //!
 //! # The one thing this runtime refuses to do
 //!
-//! It never invents an outcome. A provider that answered produces a receipt
-//! derived from its own terminal record; a provider that did not answer
-//! produces no receipt at all, only a released lease. That asymmetry is the
-//! whole at-least-once story: an attempt whose acknowledgement was lost between
-//! the provider's commit and this process's write is *not* recorded as failed —
-//! it is redelivered, and the provider recognises the content-derived
-//! idempotency key and answers `duplicate_acknowledged`.
+//! It never invents a provider outcome. A provider that answered produces a
+//! receipt derived from its own terminal record; an unanswered attempt is
+//! released without a receipt, while a shutdown-cancelled attempt receives
+//! host-owned cancellation evidence whose effect remains unknown. The
+//! at-least-once story is unchanged: an acknowledgement lost between the
+//! provider's commit and this process's write is redelivered, and the provider
+//! recognises the content-derived idempotency key and answers
+//! `duplicate_acknowledged`.
 //!
 //! Releasing a lease does not give the attempt number back — the claim consumed
 //! it — so redelivery still walks towards the policy's `max_attempts` instead of
@@ -23,8 +24,8 @@
 //! token. [`DeliveryWakeV1::request_shutdown`] cancels that token, so a provider
 //! blocked inside a call sees shutdown through the same control the fabric
 //! already preflights, and the round checks it again before each further item.
-//! A cancelled attempt is never recorded as an outcome: the provider did not
-//! answer, so the lease is released and the row stays redeliverable.
+//! A cancelled attempt is recorded as host-owned evidence with an unknown
+//! provider effect, then its lease is released and the row stays redeliverable.
 
 use tracedecay_memory_provider_api::{CancellationToken, ProviderOperation, TerminalRecord};
 
@@ -75,7 +76,12 @@ pub enum DeliveryAttemptV1 {
     /// that claims cancellation without it is treated as
     /// [`DeliveryAttemptV1::Unanswered`], so immediate eligibility cannot be
     /// bought by lying.
-    CancelledByShutdown,
+    CancelledByShutdown {
+        /// Instant the cancelled attempt started.
+        started_at_unix_micros: i64,
+        /// Instant the host stopped waiting for the attempt.
+        finished_at_unix_micros: i64,
+    },
 }
 
 /// The bound one delivery attempt runs under.
@@ -195,18 +201,16 @@ pub struct DeliveryBatchReportV1 {
     /// was requested between items. Their leases were released with immediate
     /// eligibility; no attempt was made and no receipt exists.
     pub cancelled_before_dispatch: u32,
-    /// Attempts that came back without a receipt after shutdown had cancelled
-    /// their control. The provider did not answer, so nothing is recorded and
-    /// the lease was released.
+    /// Attempts stopped after shutdown cancelled their control. Each has a
+    /// host-owned cancellation receipt and its lease is released for replay.
     pub cancelled_in_flight: u32,
-    /// Answered attempts whose provider terminal the host refused, recorded as
-    /// durable refusal evidence keyed by `(observation, attempt)`. They are not
-    /// receipts and attribute no provider effect.
+    /// Answered attempts whose terminal the host refused, recorded as durable
+    /// refusal evidence beside an unknown-effect receipt for the attempt.
     pub refusals_recorded: u32,
     /// Answered attempts whose refusal was already durably recorded, so the
     /// standing record stands.
     pub duplicate_refusals: u32,
-    /// Attempts that produced no receipt because an adapter failed.
+    /// Attempts that produced an adapter or terminal-validation failure.
     pub failures: Vec<DeliveryFailureV1>,
 }
 
@@ -448,9 +452,10 @@ where
             let attempt = match self.adapter.deliver(&item, &control) {
                 Ok(attempt) => attempt,
                 Err(cause) => {
-                    if control.is_cancelled() {
-                        report.cancelled_in_flight = report.cancelled_in_flight.saturating_add(1);
-                    }
+                    // Cancellation is an explicit adapter outcome. A shared
+                    // token may race with an unrelated transport or readiness
+                    // error, so it cannot erase the typed cause or manufacture
+                    // cancellation evidence for an attempt that returned Err.
                     self.fail_attempt(
                         &mut report,
                         &item,
@@ -464,27 +469,43 @@ where
             };
 
             match attempt {
-                DeliveryAttemptV1::Unanswered | DeliveryAttemptV1::CancelledByShutdown => {
-                    let cancelled = control.is_cancelled();
-                    if cancelled {
-                        report.cancelled_in_flight = report.cancelled_in_flight.saturating_add(1);
-                    }
-                    // Immediate eligibility is reserved for a real shutdown:
-                    // an adapter that returns `CancelledByShutdown` without a
-                    // cancelled control serves the ordinary retry curve, so no
-                    // adapter can buy itself a same-drain retry.
-                    let retry_after_unix_micros =
-                        if cancelled && matches!(attempt, DeliveryAttemptV1::CancelledByShutdown) {
-                            request.lease.now_unix_micros
-                        } else {
-                            request
-                                .retry_backoff
-                                .next_attempt_at(request.lease.now_unix_micros, item.attempt_number)
-                        };
+                DeliveryAttemptV1::Unanswered => {
+                    let retry_after_unix_micros = request
+                        .retry_backoff
+                        .next_attempt_at(request.lease.now_unix_micros, item.attempt_number);
                     if self.release(&item.lease_id, retry_after_unix_micros)? {
                         report.leases_released = report.leases_released.saturating_add(1);
                     } else {
                         report.leases_lost = report.leases_lost.saturating_add(1);
+                    }
+                }
+                DeliveryAttemptV1::CancelledByShutdown {
+                    started_at_unix_micros,
+                    finished_at_unix_micros,
+                } => {
+                    // Immediate eligibility and cancellation evidence are
+                    // reserved for a real shutdown. An adapter that claims
+                    // cancellation without a cancelled control serves the
+                    // ordinary retry curve, so no adapter can buy itself a
+                    // same-drain retry or mint a false receipt.
+                    if control.is_cancelled() {
+                        report.cancelled_in_flight = report.cancelled_in_flight.saturating_add(1);
+                        self.record_cancelled(
+                            &mut report,
+                            &item,
+                            started_at_unix_micros,
+                            finished_at_unix_micros,
+                            request.lease.now_unix_micros,
+                        )?;
+                    } else {
+                        let retry_after_unix_micros = request
+                            .retry_backoff
+                            .next_attempt_at(request.lease.now_unix_micros, item.attempt_number);
+                        if self.release(&item.lease_id, retry_after_unix_micros)? {
+                            report.leases_released = report.leases_released.saturating_add(1);
+                        } else {
+                            report.leases_lost = report.leases_lost.saturating_add(1);
+                        }
                     }
                 }
                 DeliveryAttemptV1::Answered {
@@ -492,6 +513,22 @@ where
                     started_at_unix_micros,
                     finished_at_unix_micros,
                 } => {
+                    // Shutdown owns an attempt as soon as its shared token is
+                    // cancelled. An adapter may answer after that edge, but the
+                    // answer is late evidence and must never become a second
+                    // terminal outcome. Atomically release the lease with the
+                    // host-owned cancellation receipt instead.
+                    if control.is_cancelled() {
+                        report.cancelled_in_flight = report.cancelled_in_flight.saturating_add(1);
+                        self.record_cancelled(
+                            &mut report,
+                            &item,
+                            started_at_unix_micros,
+                            finished_at_unix_micros,
+                            request.lease.now_unix_micros,
+                        )?;
+                        continue;
+                    }
                     if let Err(mismatch) = verify_terminal(&item, &terminal) {
                         // The terminal is refused as delivery evidence, but the
                         // attempt number it consumed is gone. Record the refusal
@@ -509,15 +546,26 @@ where
                             started_at_unix_micros,
                             finished_at_unix_micros,
                         )?;
-                        self.fail_attempt(
+                        let receipt = ObservationDeliveryReceiptV1::from_refused_terminal(
+                            &item,
+                            started_at_unix_micros,
+                            finished_at_unix_micros,
+                        )?;
+                        let lease_released = self.record_unsettled(
                             &mut report,
                             &item,
-                            AdapterFailureV1::new(mismatch),
+                            &receipt,
                             request.retry_backoff.next_attempt_at(
                                 request.lease.now_unix_micros,
                                 item.attempt_number,
                             ),
                         )?;
+                        report.failures.push(DeliveryFailureV1 {
+                            observation_id: item.observation_id.clone(),
+                            attempt_number: item.attempt_number,
+                            lease_released,
+                            cause: AdapterFailureV1::new(mismatch),
+                        });
                         continue;
                     }
                     let receipt = match ObservationDeliveryReceiptV1::from_terminal(
@@ -540,15 +588,26 @@ where
                                 started_at_unix_micros,
                                 finished_at_unix_micros,
                             )?;
-                            self.fail_attempt(
+                            let receipt = ObservationDeliveryReceiptV1::from_refused_terminal(
+                                &item,
+                                started_at_unix_micros,
+                                finished_at_unix_micros,
+                            )?;
+                            let lease_released = self.record_unsettled(
                                 &mut report,
                                 &item,
-                                AdapterFailureV1::new(cause),
+                                &receipt,
                                 request.retry_backoff.next_attempt_at(
                                     request.lease.now_unix_micros,
                                     item.attempt_number,
                                 ),
                             )?;
+                            report.failures.push(DeliveryFailureV1 {
+                                observation_id: item.observation_id.clone(),
+                                attempt_number: item.attempt_number,
+                                lease_released,
+                                cause: AdapterFailureV1::new(cause),
+                            });
                             continue;
                         }
                     };
@@ -707,9 +766,9 @@ where
     /// Writes durable evidence that a provider answered this attempt and the
     /// host refused the answer.
     ///
-    /// This is not a receipt and never becomes one: no provider effect is
-    /// attributed, the delivery row is not advanced, and the row still goes
-    /// back on the retry curve. What it preserves is the thing the in-memory
+    /// This is the detailed companion to the attempt's host-owned
+    /// unknown-effect receipt: no provider effect is attributed, and the row
+    /// still goes back on the retry curve. It preserves the thing the in-memory
     /// batch report cannot — that attempt number `n` of this observation was
     /// spent on a terminal the host rejected, and why. Without it a crash
     /// right after the refusal leaves a consumed attempt with no trace of what
@@ -768,6 +827,62 @@ where
             }
         }
         Ok(())
+    }
+
+    fn record_cancelled(
+        &self,
+        report: &mut DeliveryBatchReportV1,
+        item: &LeasedObservationV1,
+        started_at_unix_micros: i64,
+        finished_at_unix_micros: i64,
+        retry_after_unix_micros: i64,
+    ) -> Result<(), ObservationRuntimeError> {
+        let receipt = ObservationDeliveryReceiptV1::from_cancelled(
+            item,
+            started_at_unix_micros,
+            finished_at_unix_micros,
+        )?;
+        self.record_unsettled(report, item, &receipt, retry_after_unix_micros)?;
+        Ok(())
+    }
+
+    fn record_unsettled(
+        &self,
+        report: &mut DeliveryBatchReportV1,
+        item: &LeasedObservationV1,
+        receipt: &ObservationDeliveryReceiptV1,
+        retry_after_unix_micros: i64,
+    ) -> Result<bool, ObservationRuntimeError> {
+        match self.reader.record_unsettled_attempt(
+            receipt,
+            &item.lease_id,
+            retry_after_unix_micros,
+        )? {
+            AttemptOutcomeV1::Recorded {
+                state,
+                next_attempt_at_unix_micros,
+            } => {
+                report.receipts_recorded = report.receipts_recorded.saturating_add(1);
+                report.leases_released = report.leases_released.saturating_add(1);
+                if state.is_terminal() {
+                    report.settled_terminal = report.settled_terminal.saturating_add(1);
+                }
+                if next_attempt_at_unix_micros.is_some() {
+                    report.retry_scheduled = report.retry_scheduled.saturating_add(1);
+                }
+                return Ok(true);
+            }
+            AttemptOutcomeV1::DuplicateReceipt { state } => {
+                report.duplicate_receipts = report.duplicate_receipts.saturating_add(1);
+                if state.is_terminal() {
+                    report.settled_terminal = report.settled_terminal.saturating_add(1);
+                }
+            }
+            AttemptOutcomeV1::LeaseLost { .. } => {
+                report.leases_lost = report.leases_lost.saturating_add(1);
+            }
+        }
+        Ok(false)
     }
 
     fn fail_attempt(

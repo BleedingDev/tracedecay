@@ -161,6 +161,20 @@ SET state = 'pending', lease_id = NULL, lease_owner = NULL, lease_expires_at_mic
 WHERE lease_id = ?2 AND state = 'leased'
 "#;
 
+/// Records host-owned cancellation evidence while releasing exactly the lease
+/// that produced it. The receipt and this update must commit together: a
+/// receipt with a still-held lease can be redelivered forever, while a released
+/// lease without its evidence creates an unexplained consumed attempt.
+const RECORD_UNSETTLED_ATTEMPT: &str = r#"
+UPDATE tdmem_observation_delivery_v1
+SET state = 'pending', next_attempt_at_micros = ?1, last_outcome = ?2,
+    last_committed_effect = ?3, last_receipt_id = ?4,
+    last_provider_instance_id = ?5, lease_owner = NULL, lease_id = NULL,
+    lease_expires_at_micros = NULL, updated_at_micros = ?6
+WHERE observation_id = ?7 AND idempotency_key = ?8 AND state = 'leased'
+  AND lease_id = ?9 AND attempt_number = ?10 AND last_provider_instance_id = ?11
+"#;
+
 const EXPIRE_PAST_DEADLINE: &str = r#"
 SELECT d.idempotency_key, d.observation_id, d.attempt_number, d.state
 FROM tdmem_observation_delivery_v1 d
@@ -473,7 +487,6 @@ fn advance_watermark_for(
             source_authority: &journal.source_authority,
             exact_scope_sha256: &journal.exact_scope_sha256,
             source_stream: &journal.source_stream,
-            acknowledged_at_unix_micros: receipt.finished_at_unix_micros,
         },
     )
 }
@@ -788,6 +801,144 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
         #[cfg(debug_assertions)]
         self.run_debug_receipt_persist_hook(receipt, true)?;
         Ok(outcome)
+    }
+
+    /// Persists host-owned unsettled-attempt evidence and releases its matching
+    /// lease in one transaction. Unlike `record_attempt`, this deliberately
+    /// leaves the delivery `Pending`: cancellation or a refused terminal proves
+    /// neither a provider effect nor its absence, so the stable key is retried.
+    fn record_unsettled_attempt(
+        &self,
+        receipt: &ObservationDeliveryReceiptV1,
+        lease: &DispatchLeaseIdV1,
+        retry_after_unix_micros: i64,
+    ) -> Result<AttemptOutcomeV1, ObservationJournalError> {
+        receipt.validate()?;
+        if !matches!(
+            receipt.outcome,
+            ObservationOutcomeV1::Cancelled | ObservationOutcomeV1::EffectUnknown
+        ) || receipt.committed_effect != ObservationCommittedEffectV1::Unknown
+            || receipt.provider_instance_id.is_none()
+            || receipt.state_generation_before.is_some()
+            || receipt.state_generation_after.is_some()
+            || receipt.provider_receipt_digest.is_some()
+            || receipt.provider_effect_summary != ProviderEffectSummaryV1::default()
+            || !receipt.warnings.is_empty()
+        {
+            return Err(ObservationJournalError::Corrupt {
+                table: "tdmem_observation_receipt_v1",
+                field: "unsettled_attempt_evidence",
+            });
+        }
+        self.with_transaction(|transaction| {
+            let journal = read_journal_row(transaction, receipt.observation_id.as_str())?;
+            if journal.payload_sha256 != receipt.payload_sha256 {
+                return Err(ObservationJournalError::ReceiptDigestMismatch {
+                    field: "payload_sha256",
+                });
+            }
+            if journal.extensions_digest != receipt.extensions_digest {
+                return Err(ObservationJournalError::ReceiptDigestMismatch {
+                    field: "extensions_digest",
+                });
+            }
+            if journal.provider_id != receipt.provider_id.as_str() {
+                return Err(ObservationJournalError::ReceiptDigestMismatch {
+                    field: "provider_id",
+                });
+            }
+            if journal.registration_revision
+                != sql_i64(receipt.registration_revision, "registration_revision")?
+            {
+                return Err(ObservationJournalError::ReceiptDigestMismatch {
+                    field: "registration_revision",
+                });
+            }
+            let stored_key: Option<String> = transaction
+                .query_row(
+                    "SELECT idempotency_key FROM tdmem_observation_delivery_v1 \
+                     WHERE observation_id = ?1",
+                    params![receipt.observation_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if stored_key.as_deref() != Some(receipt.idempotency_key.as_str()) {
+                return Err(ObservationJournalError::ReceiptDigestMismatch {
+                    field: "idempotency_key",
+                });
+            }
+
+            // Release only the exact lease that produced this evidence. Do
+            // this before insertion so a stale dispatcher cannot commit a
+            // cancellation receipt after its lease was reaped or replaced;
+            // any later insertion failure rolls this update back.
+            let changed = transaction.execute(
+                RECORD_UNSETTLED_ATTEMPT,
+                params![
+                    retry_after_unix_micros,
+                    receipt.outcome.as_wire(),
+                    receipt.committed_effect.as_wire(),
+                    receipt.receipt_id.as_str(),
+                    receipt.provider_instance_id.as_deref(),
+                    receipt.finished_at_unix_micros,
+                    receipt.observation_id.as_str(),
+                    receipt.idempotency_key.as_str(),
+                    lease.as_str(),
+                    i64::from(receipt.attempt_number),
+                    receipt.provider_instance_id.as_deref(),
+                ],
+            )?;
+            if changed != 1 {
+                return Ok(AttemptOutcomeV1::LeaseLost {
+                    receipt_id: receipt.receipt_id.clone(),
+                });
+            }
+
+            let summary_json = encode_json(
+                &receipt.provider_effect_summary,
+                "provider_effect_summary_json",
+            )?;
+            let inserted = insert_receipt_row(
+                transaction,
+                receipt.observation_id.as_str(),
+                receipt.attempt_number,
+                receipt.receipt_id.as_str(),
+                receipt.idempotency_key.as_str(),
+                &receipt.payload_sha256,
+                &receipt.extensions_digest,
+                receipt.provider_id.as_str(),
+                receipt.provider_instance_id.as_deref(),
+                sql_i64(receipt.registration_revision, "registration_revision")?,
+                receipt
+                    .state_generation_before
+                    .map(|value| sql_i64(value, "state_generation_before"))
+                    .transpose()?,
+                receipt
+                    .state_generation_after
+                    .map(|value| sql_i64(value, "state_generation_after"))
+                    .transpose()?,
+                receipt.outcome,
+                receipt.committed_effect,
+                &summary_json,
+                receipt.provider_receipt_digest.as_deref(),
+                receipt.started_at_unix_micros,
+                receipt.finished_at_unix_micros,
+            )?;
+            if !inserted {
+                // A matching live lease cannot already have a receipt: normal
+                // settlement and cancellation both write receipt plus lease
+                // transition atomically. Fail closed so the preceding release
+                // is rolled back rather than binding it to unrelated evidence.
+                return Err(ObservationJournalError::Corrupt {
+                    table: "tdmem_observation_receipt_v1",
+                    field: "attempt_number",
+                });
+            }
+            Ok(AttemptOutcomeV1::Recorded {
+                state: DeliveryStateV1::Pending,
+                next_attempt_at_unix_micros: Some(retry_after_unix_micros),
+            })
+        })
     }
 
     fn release_lease(

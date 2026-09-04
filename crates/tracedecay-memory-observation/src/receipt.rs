@@ -313,6 +313,79 @@ pub struct ObservationDeliveryReceiptV1 {
 }
 
 impl ObservationDeliveryReceiptV1 {
+    /// Builds host-owned evidence for an attempt stopped by shutdown.
+    ///
+    /// Cancellation is not proof that the provider had no effect: an isolated
+    /// provider call may commit after the host stops waiting. The receipt
+    /// therefore records an unknown committed effect, keeps the provider
+    /// identity that held the lease, and deliberately carries no provider
+    /// acknowledgement digest. The delivery row is returned to `Pending` by
+    /// the journal, so a later attempt can reconcile the stable idempotency key.
+    pub fn from_cancelled(
+        leased: &LeasedObservationV1,
+        started_at_unix_micros: i64,
+        finished_at_unix_micros: i64,
+    ) -> Result<Self, ObservationJournalError> {
+        let receipt = Self {
+            receipt_id: DeliveryReceiptIdV1::derive(&leased.observation_id, leased.attempt_number),
+            observation_id: leased.observation_id.clone(),
+            idempotency_key: leased.idempotency_key.clone(),
+            payload_sha256: leased.payload.sha256.clone(),
+            extensions_digest: leased.extensions_digest.clone(),
+            provider_id: leased.target.provider_id.clone(),
+            provider_instance_id: Some(leased.target.provider_instance_id.clone()),
+            registration_revision: leased.target.registration_revision,
+            state_generation_before: None,
+            state_generation_after: None,
+            attempt_number: leased.attempt_number,
+            outcome: ObservationOutcomeV1::Cancelled,
+            committed_effect: ObservationCommittedEffectV1::Unknown,
+            provider_effect_summary: ProviderEffectSummaryV1::default(),
+            provider_receipt_digest: None,
+            started_at_unix_micros,
+            finished_at_unix_micros: finished_at_unix_micros.max(started_at_unix_micros),
+            warnings: Vec::new(),
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    /// Builds host-owned evidence for a provider terminal the host refused.
+    ///
+    /// The provider answered, so the attempt is terminal and must be recorded,
+    /// but a terminal that fails identity or receipt validation cannot be
+    /// trusted as effect evidence. The companion refusal record retains the
+    /// rejected terminal metadata; this receipt binds the consumed attempt to
+    /// the leased identity and records the effect as unknown for redelivery.
+    pub fn from_refused_terminal(
+        leased: &LeasedObservationV1,
+        started_at_unix_micros: i64,
+        finished_at_unix_micros: i64,
+    ) -> Result<Self, ObservationJournalError> {
+        let receipt = Self {
+            receipt_id: DeliveryReceiptIdV1::derive(&leased.observation_id, leased.attempt_number),
+            observation_id: leased.observation_id.clone(),
+            idempotency_key: leased.idempotency_key.clone(),
+            payload_sha256: leased.payload.sha256.clone(),
+            extensions_digest: leased.extensions_digest.clone(),
+            provider_id: leased.target.provider_id.clone(),
+            provider_instance_id: Some(leased.target.provider_instance_id.clone()),
+            registration_revision: leased.target.registration_revision,
+            state_generation_before: None,
+            state_generation_after: None,
+            attempt_number: leased.attempt_number,
+            outcome: ObservationOutcomeV1::EffectUnknown,
+            committed_effect: ObservationCommittedEffectV1::Unknown,
+            provider_effect_summary: ProviderEffectSummaryV1::default(),
+            provider_receipt_digest: None,
+            started_at_unix_micros,
+            finished_at_unix_micros: finished_at_unix_micros.max(started_at_unix_micros),
+            warnings: Vec::new(),
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
     /// Builds a receipt from what the provider actually returned.
     ///
     /// Terminal semantics are read from the generated summary rather than

@@ -1413,6 +1413,7 @@ fn absorb(digest: &mut Sha256, value: &[u8]) {
 /// store at delivery time: the provider must see exactly the bytes the journal
 /// committed, or its `payload_sha256` comparison would not match the receipt
 /// the journal stores.
+#[derive(Clone)]
 struct RegistryObservationDeliveryAdapterV1 {
     composition: Arc<ProjectMemoryProviderComposition>,
     readiness: Arc<SupervisedProviderReadinessV1>,
@@ -1680,6 +1681,7 @@ impl RecoveryRefusalV1 {
 /// declare. Nothing else may supply it: a hardcoded expectation would make the
 /// fabric's own `ready.state_generation == call.expected_state_generation`
 /// check vacuous.
+#[derive(Clone)]
 struct ObservationRecoveryGateV1 {
     journal: Arc<SqliteObservationJournal>,
     provider_id: String,
@@ -1788,6 +1790,49 @@ impl ProviderDeliveryAdapterV1 for RegistryObservationDeliveryAdapterV1 {
         leased: &LeasedObservationV1,
         control: &DeliveryControlV1,
     ) -> Result<DeliveryAttemptV1, Self::Error> {
+        // Readiness owns registry and supervisor mutexes in addition to the
+        // provider handshake it performs. Put the whole proof-to-dispatch
+        // critical section behind the attempt's hard boundary so neither a
+        // non-cooperative handshake nor a contended readiness owner can hold
+        // the journey's single delivery thread past shutdown. The borrowed
+        // worker rechecks the same cancellation token before every provider
+        // effect; if it answers after cancellation, `call_within` discards the
+        // answer and this method records only host-owned cancellation evidence.
+        let started_at_unix_micros = tracedecay_application::now_micros().0;
+        let budget_millis = u64::try_from(control.remaining_micros(started_at_unix_micros) / 1_000)
+            .unwrap_or(u64::MAX);
+        let cancellation = control.cancellation();
+        if budget_millis == 0 {
+            return Err(DeliveryAdapterError::Isolation(
+                BoundedCallRefusalV1::Abandoned { waited_millis: 0 },
+            ));
+        }
+        let adapter = self.clone();
+        let leased = leased.clone();
+        let isolated_control = control.clone();
+        match self
+            .isolation
+            .call_within(budget_millis, &cancellation, move || {
+                adapter.deliver_after_readiness(&leased, &isolated_control)
+            }) {
+            Ok(answer) => answer,
+            Err(BoundedCallRefusalV1::Cancelled) if cancellation.is_cancelled() => {
+                Ok(DeliveryAttemptV1::CancelledByShutdown {
+                    started_at_unix_micros,
+                    finished_at_unix_micros: tracedecay_application::now_micros().0,
+                })
+            }
+            Err(refusal) => Err(DeliveryAdapterError::Isolation(refusal)),
+        }
+    }
+}
+
+impl RegistryObservationDeliveryAdapterV1 {
+    fn deliver_after_readiness(
+        &self,
+        leased: &LeasedObservationV1,
+        control: &DeliveryControlV1,
+    ) -> Result<DeliveryAttemptV1, DeliveryAdapterError> {
         // The attempt's bound is the runtime's, never minted here: its
         // deadline is already the tightest of the dispatch budget, the lease
         // expiry, and the row's own delivery deadline, and its token is the
@@ -1813,17 +1858,37 @@ impl ProviderDeliveryAdapterV1 for RegistryObservationDeliveryAdapterV1 {
         // Keep registration-wide dispatch ownership from this handshake through
         // the observation call. Admission also obtains readiness through this
         // owner, so it cannot rotate the fabric's current receipt in the gap.
-        let readiness_dispatch = self
-            .readiness
-            .ready_dispatch_with_evidence(
-                &readiness_request,
-                tracedecay_application::now_micros().0,
-            )
-            .map_err(ObservationJourneyError::SupervisedReadiness)
-            .map_err(DeliveryAdapterError::Readiness)?;
+        let readiness_dispatch = match self.readiness.ready_dispatch_with_evidence(
+            &readiness_request,
+            tracedecay_application::now_micros().0,
+        ) {
+            Ok(dispatch) => dispatch,
+            // Classify this result at the instant readiness answers. A
+            // shutdown already visible here owns the attempt and must leave
+            // cancellation evidence; otherwise preserve readiness's exact
+            // typed refusal.
+            Err(_cause) if control.is_cancelled() => {
+                return Ok(DeliveryAttemptV1::CancelledByShutdown {
+                    started_at_unix_micros,
+                    finished_at_unix_micros: tracedecay_application::now_micros().0,
+                });
+            }
+            Err(cause) => {
+                return Err(DeliveryAdapterError::Readiness(
+                    ObservationJourneyError::SupervisedReadiness(cause),
+                ));
+            }
+        };
+        if control.is_cancelled() {
+            return Ok(DeliveryAttemptV1::CancelledByShutdown {
+                started_at_unix_micros,
+                finished_at_unix_micros: tracedecay_application::now_micros().0,
+            });
+        }
         // The recovery gate runs on the evidence of the very handshake above,
-        // before one byte reaches the provider. A refusal is typed, produces no
-        // receipt, and leaves the row exactly as deliverable as it was.
+        // before one byte reaches the provider. A refusal is typed and leaves
+        // the row exactly as deliverable as it was; shutdown cancellation is
+        // additionally recorded as host-owned attempt evidence.
         let expected_state_generation = match self.recovery.admit_delivery(
             &leased.exact_scope_sha256,
             readiness_dispatch.evidence(),
@@ -1836,7 +1901,10 @@ impl ProviderDeliveryAdapterV1 for RegistryObservationDeliveryAdapterV1 {
             // is handed straight back to the next life of the dispatcher
             // instead of serving a backoff for a shutdown it did not cause.
             Err(RecoveryRefusalV1::Cancelled(_)) if control.is_cancelled() => {
-                return Ok(DeliveryAttemptV1::CancelledByShutdown);
+                return Ok(DeliveryAttemptV1::CancelledByShutdown {
+                    started_at_unix_micros,
+                    finished_at_unix_micros: tracedecay_application::now_micros().0,
+                });
             }
             Err(refusal) => return Err(DeliveryAdapterError::Recovery(refusal)),
         };
@@ -1880,56 +1948,21 @@ impl ProviderDeliveryAdapterV1 for RegistryObservationDeliveryAdapterV1 {
         call.validate_request_bytes(self.limits.request_bytes)
             .map_err(DeliveryAdapterError::Call)?;
 
-        // The provider call runs on a borrowed worker, never on the journey's
-        // single dedicated delivery thread. Both halves of the attempt's own
-        // bound are honoured by the host itself: a provider that holds the
-        // call past the remaining budget is abandoned with a typed refusal
-        // rather than parking the lane, and a provider that panics inside
-        // `observe` is contained on the borrowed worker instead of unwinding
-        // the delivery thread and ending the lane for the life of the process
-        // (`tdmem-sz9`). Either way no receipt is produced, so the row stays
-        // exactly as deliverable as it was.
-        // Exactly the bound the call itself declares to the provider: the host
-        // waits as long as it said it would, watches the very token it handed
-        // over, and not one slice longer or wider.
-        let budget_millis = call.control.remaining_millis();
-        let cancellation = call.control.cancellation();
-        if budget_millis == 0 {
-            return Err(DeliveryAdapterError::Isolation(
-                BoundedCallRefusalV1::Abandoned { waited_millis: 0 },
-            ));
-        }
-        let composition = Arc::clone(&self.composition);
+        // This helper itself runs on the attempt's borrowed worker. Keep the
+        // readiness guard alive through the direct registry call so no other
+        // scope can rotate the ready receipt in between; the outer boundary
+        // contains a provider that hangs or panics and discards any answer that
+        // arrives after cancellation.
         let answered = self
-            .isolation
-            .call_within(budget_millis, &cancellation, move || {
-                composition
-                    .registry()
-                    .ok_or(DeliveryAdapterError::Disabled)
-                    .and_then(|registry| {
-                        registry
-                            .deliver_observation(&call)
-                            .map_err(DeliveryAdapterError::Fabric)
-                    })
-            });
-        // Explicitly release only after the isolated provider contact has
-        // answered or the host has stopped waiting for it.
+            .registry()?
+            .deliver_observation(&call)
+            .map_err(DeliveryAdapterError::Fabric);
         drop(readiness_dispatch);
-        match answered {
-            Ok(Ok(receipt)) => Ok(DeliveryAttemptV1::Answered {
-                terminal: Box::new(receipt.terminal),
-                started_at_unix_micros,
-                finished_at_unix_micros: tracedecay_application::now_micros().0,
-            }),
-            Ok(Err(error)) => Err(error),
-            // Shutdown stopped the attempt: no provider answer was refused, so
-            // the row is handed back to the next life of the dispatcher rather
-            // than serving a backoff for a shutdown it did not cause.
-            Err(BoundedCallRefusalV1::Cancelled) if cancellation.is_cancelled() => {
-                Ok(DeliveryAttemptV1::CancelledByShutdown)
-            }
-            Err(refusal) => Err(DeliveryAdapterError::Isolation(refusal)),
-        }
+        answered.map(|receipt| DeliveryAttemptV1::Answered {
+            terminal: Box::new(receipt.terminal),
+            started_at_unix_micros,
+            finished_at_unix_micros: tracedecay_application::now_micros().0,
+        })
     }
 }
 
@@ -5137,6 +5170,22 @@ mod tests {
                 .expect("receipt count")
         }
 
+        /// Durable receipt outcomes, in attempt order.
+        fn receipt_outcomes(journal_path: &Path) -> Vec<(String, String)> {
+            let connection = rusqlite::Connection::open(journal_path).expect("journal");
+            let mut statement = connection
+                .prepare(
+                    "SELECT outcome, committed_effect FROM tdmem_observation_receipt_v1 \
+                     ORDER BY attempt_number",
+                )
+                .expect("receipt outcome query");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("receipt outcome rows")
+                .map(|row| row.expect("receipt outcome row"))
+                .collect()
+        }
+
         /// The exact scope the delivery row is bound to. A provider's terminal may
         /// never move it: the host owns which checkout a row belongs to.
         fn delivery_scope(journal_path: &Path) -> Option<String> {
@@ -6101,7 +6150,8 @@ mod tests {
         /// success — and the ledger proves it answered while the token was already
         /// cancelled, so this is a test of a provider ignoring cancellation rather
         /// than of a host that pre-empted it. The late success reaches nobody: the
-        /// row is unsettled, no receipt exists, and the borrowed worker comes back.
+        /// row is unsettled, one cancellation receipt exists, and the borrowed
+        /// worker comes back.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_late_success_from_a_provider_that_ignored_cancellation_settles_nothing() {
             let provider = journey_double(AdversarialScriptV1::always(
@@ -6152,9 +6202,14 @@ mod tests {
             );
             assert_eq!(
                 receipt_count(fixture.journal_path()),
-                0,
-                "a cancelled attempt must leave no receipt: {}",
+                1,
+                "a cancelled attempt must leave one host-owned receipt: {}",
                 journal_snapshot(fixture.journal_path())
+            );
+            assert_eq!(
+                receipt_outcomes(fixture.journal_path()),
+                vec![("cancelled".to_owned(), "unknown".to_owned())],
+                "shutdown must be the only durable terminal outcome"
             );
             assert_eq!(
                 attempt_refusals(fixture.journal_path()),
@@ -7070,6 +7125,110 @@ mod tests {
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
             .await;
         assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// Shutdown that becomes visible while supervised readiness is still
+    /// waiting owns the attempt. It leaves one cancellation receipt, never
+    /// reaches `observe`, and keeps the row deliverable for the next process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_during_delivery_readiness_records_cancellation_receipt() {
+        use tracedecay_memory_conformance::ReleaseLatchV1;
+
+        let temp = TempDir::new().expect("temporary journey root");
+        let port = Arc::new(JourneyNativePort::new());
+        let fixture = mount_journey_over_port(
+            &temp,
+            "project.observation-readiness-cancellation",
+            "profile.observation-readiness-cancellation",
+            Arc::clone(&port),
+        )
+        .await;
+        let session_id =
+            SessionId::new("session.observation-readiness-cancellation").expect("session id");
+        fixture
+            .store
+            .persist_observation(anchored_write(canonical_observation(
+                &fixture.project_id,
+                &session_id,
+                "cancel readiness",
+            )))
+            .await
+            .expect("canonical observation commit");
+        // Admission and delivery share the same port hook. Install the gate
+        // before replay so the worker cannot win the gap between the admission
+        // handshake and a later hook installation: the first call is admission
+        // and passes; the second is delivery readiness and is held.
+        let held = ReleaseLatchV1::new();
+        let entered = ReleaseLatchV1::new();
+        let handshake_calls = Arc::new(AtomicUsize::new(0));
+        let blocked = held.clone();
+        let announced = entered.clone();
+        let calls = Arc::clone(&handshake_calls);
+        port.on_handshake(move || {
+            if calls.fetch_add(1, Ordering::AcqRel) > 0 {
+                announced.release();
+                blocked.wait();
+            }
+        });
+        fixture
+            .journey
+            .replay_canonical_observations(&fixture.store, REPLAY_LIVE_PAGES, open_bounds())
+            .await
+            .expect("canonical replay");
+        fixture.journey.wake_delivery();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || entered.wait()),
+        )
+        .await
+        .expect("delivery never entered readiness")
+        .expect("readiness entry waiter");
+
+        // Let the non-cooperative handshake answer only after shutdown has
+        // become visible. The bounded readiness boundary must discard that
+        // late answer and return cancellation to the delivery runtime.
+        let release_after_shutdown = held.clone();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            release_after_shutdown.release();
+        });
+        let failures = fixture
+            .journey
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        release.join().expect("readiness release thread");
+        assert!(failures.is_empty(), "{failures:?}");
+        let (receipts, state) = journal_counts(fixture.journey.journal_path());
+        assert_eq!(
+            receipts,
+            1,
+            "{}",
+            journal_snapshot(fixture.journey.journal_path())
+        );
+        assert_eq!(
+            state,
+            "pending",
+            "{}",
+            journal_snapshot(fixture.journey.journal_path())
+        );
+        let receipt_outcome: (String, String) =
+            rusqlite::Connection::open(fixture.journey.journal_path())
+                .expect("journal")
+                .query_row(
+                    "SELECT outcome, committed_effect FROM tdmem_observation_receipt_v1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("cancellation receipt");
+        assert_eq!(
+            receipt_outcome,
+            ("cancelled".to_owned(), "unknown".to_owned())
+        );
+        assert_eq!(
+            port.observe_calls.load(Ordering::Relaxed),
+            0,
+            "shutdown during readiness reached the provider observation call"
+        );
     }
 
     /// tdmem-0506, mounted. A durable recovery record naming a different
