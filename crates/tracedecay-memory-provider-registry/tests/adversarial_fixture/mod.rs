@@ -40,14 +40,15 @@ use tracedecay_memory_provider_native::{
     NATIVE_PROVIDER_ID, NativeMemoryApplicationPort, NativeObservation,
 };
 use tracedecay_memory_provider_registry::{
-    ActiveRoutingPolicy, CognitiveRecallPortError, CognitiveRecallPortInputsV1,
-    EnabledProviderMode, ExactScopeBinding, ExactScopeBindingError, FabricConfig, FallbackRule,
-    NativeProviderActivation, ObserverProviderRegistration, OwnedExactScope,
-    ProjectCognitiveRecallPortV1, ProjectMemoryProviderComposition, ProviderInvocationBoundaryV1,
-    ProviderInvocationLimitsV1, ProviderWorkV1, ProviderWorkerHandleV1, ProviderWorkerIsolationV1,
-    ProviderWorkerSpawnErrorV1, ProviderWorkerSpawnV1, ProviderWorkerTerminationV1,
-    RECALL_PAYLOAD_CONTRACT_ID, RECALL_QUERY_CAPABILITY_ID, RecallAdmissionAuditError,
-    RecallAdmissionObserver, RecallAdmissionReport, RecallBudgetsV1,
+    ActiveRoutingPolicy, CognitiveRecallPortError, CognitiveRecallPortInputsV1, DegradationCause,
+    DegradationRule, EnabledProviderMode, ExactScopeBinding, ExactScopeBindingError, FabricConfig,
+    FallbackRule, NativeProviderActivation, ObserverProviderRegistration, OwnedExactScope,
+    PinnedDegradationPolicy, ProjectCognitiveRecallPortV1, ProjectMemoryProviderComposition,
+    ProviderInvocationBoundaryV1, ProviderInvocationLimitsV1, ProviderWorkV1,
+    ProviderWorkerHandleV1, ProviderWorkerIsolationV1, ProviderWorkerSpawnErrorV1,
+    ProviderWorkerSpawnV1, ProviderWorkerTerminationV1, RECALL_PAYLOAD_CONTRACT_ID,
+    RECALL_QUERY_CAPABILITY_ID, RecallAdmissionAuditError, RecallAdmissionObserver,
+    RecallAdmissionReport, RecallBudgetsV1,
 };
 
 /// Registration revision every composition in these tests is pinned to.
@@ -752,10 +753,18 @@ pub fn mount_with_boundary(
         composition,
         scope_binding: Arc::new(TestScopeBinding),
         admission_observer: observer,
-        routing: ActiveRoutingPolicy::new(
+        routing: ActiveRoutingPolicy::new_with_degradation(
             OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
             REGISTRATION_REVISION,
             FallbackRule::Forbidden,
+            DegradationRule::ExplicitPinned(
+                PinnedDegradationPolicy::new(
+                    "policy.adversarial.degradation",
+                    1,
+                    DegradationCause::ALL.iter().copied(),
+                )
+                .expect("degradation policy"),
+            ),
         )
         .expect("routing policy"),
         host_limits: limits(),

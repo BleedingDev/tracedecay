@@ -23,6 +23,7 @@
 //! Empty successful results are never a fallback signal, and nothing here
 //! routes to a different provider than the two the policy names.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
@@ -46,6 +47,198 @@ pub enum FallbackRule {
     ExplicitPinned(PinnedFallbackPolicy),
 }
 
+/// Typed causes that a host may explicitly permit as a recall degradation.
+///
+/// The routing layer uses this closed vocabulary rather than string flags, so
+/// a caller cannot silently add a new degradation lane without changing the
+/// policy type and its validation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum DegradationCause {
+    /// The provider does not support the requested recall capability.
+    Unsupported,
+    /// The provider or its host execution lane is unavailable.
+    Unavailable,
+    /// The caller withdrew the recall before it completed.
+    Cancelled,
+    /// The recall exceeded its caller-owned deadline.
+    TimedOut,
+    /// The provider returned useful content but not a complete result.
+    Partial,
+    /// Admission found that the provider's evidence is stale or unresolved.
+    Stale,
+    /// The provider exhausted an explicit recall budget.
+    BudgetExhausted,
+}
+
+impl DegradationCause {
+    /// Every supported degradation cause, in canonical policy order.
+    pub const ALL: &[Self] = &[
+        Self::Unsupported,
+        Self::Unavailable,
+        Self::Cancelled,
+        Self::TimedOut,
+        Self::Partial,
+        Self::Stale,
+        Self::BudgetExhausted,
+    ];
+
+    /// Returns the stable wire label for this cause.
+    #[must_use]
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Unavailable => "unavailable",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Partial => "partial",
+            Self::Stale => "stale",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
+}
+
+impl fmt::Display for DegradationCause {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_wire())
+    }
+}
+
+/// Complete host policy identity and allowlist for recall degradations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PinnedDegradationPolicy {
+    policy_id: String,
+    policy_revision: u64,
+    allowed_causes: BTreeSet<DegradationCause>,
+}
+
+impl PinnedDegradationPolicy {
+    /// Creates a validated immutable degradation policy.
+    pub fn new(
+        policy_id: impl Into<String>,
+        policy_revision: u64,
+        allowed_causes: impl IntoIterator<Item = DegradationCause>,
+    ) -> Result<Self, RoutingPolicyError> {
+        let policy_id = policy_id.into();
+        if policy_id.is_empty()
+            || policy_id.trim() != policy_id
+            || policy_id.chars().any(char::is_control)
+            || policy_id.len() > 512
+        {
+            return Err(RoutingPolicyError::DegradationPolicyIdInvalid);
+        }
+        if policy_revision == 0 {
+            return Err(RoutingPolicyError::DegradationPolicyRevisionZero);
+        }
+        let mut causes = BTreeSet::new();
+        for cause in allowed_causes {
+            if !causes.insert(cause) {
+                return Err(RoutingPolicyError::DuplicateDegradationCause(cause));
+            }
+        }
+        if causes.is_empty() {
+            return Err(RoutingPolicyError::DegradationPolicyCausesEmpty);
+        }
+        Ok(Self {
+            policy_id,
+            policy_revision,
+            allowed_causes: causes,
+        })
+    }
+
+    /// Returns the stable host policy identity.
+    #[must_use]
+    pub fn policy_id(&self) -> &str {
+        &self.policy_id
+    }
+
+    /// Returns the positive host policy revision.
+    #[must_use]
+    pub const fn policy_revision(&self) -> u64 {
+        self.policy_revision
+    }
+
+    /// Returns the typed causes this policy allows.
+    #[must_use]
+    pub fn allowed_causes(&self) -> &BTreeSet<DegradationCause> {
+        &self.allowed_causes
+    }
+
+    /// Returns whether this policy explicitly permits `cause`.
+    #[must_use]
+    pub fn allows(&self, cause: DegradationCause) -> bool {
+        self.allowed_causes.contains(&cause)
+    }
+}
+
+/// Host-configured rule for whether a recall degradation may be returned.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DegradationRule {
+    /// No degraded recall result is permitted. This is the fail-closed
+    /// product default.
+    Forbidden,
+    /// Only causes in this host-pinned policy may become recall results.
+    ExplicitPinned(PinnedDegradationPolicy),
+}
+
+impl DegradationRule {
+    /// Returns whether this rule explicitly permits `cause`.
+    #[must_use]
+    pub fn allows(&self, cause: DegradationCause) -> bool {
+        match self {
+            Self::Forbidden => false,
+            Self::ExplicitPinned(policy) => policy.allows(cause),
+        }
+    }
+}
+
+/// Why a host degradation rule declined a typed cause.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DegradationDeclinedReason {
+    /// No degradation rule was configured.
+    HostRuleForbidden,
+    /// The configured rule exists but does not include this cause.
+    CauseNotAllowed {
+        /// Cause the caller attempted to return.
+        cause: DegradationCause,
+        /// Policy whose allowlist was checked.
+        policy: PinnedDegradationPolicy,
+    },
+}
+
+impl fmt::Display for DegradationDeclinedReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HostRuleForbidden => formatter.write_str("host degradation rule is forbidden"),
+            Self::CauseNotAllowed { cause, policy } => write!(
+                formatter,
+                "degradation cause {cause} is not allowed by policy {}@{}",
+                policy.policy_id(),
+                policy.policy_revision(),
+            ),
+        }
+    }
+}
+
+/// Typed result of checking whether one degradation cause is configured.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DegradationDecision {
+    /// The cause is allowed by this exact host policy.
+    Allowed {
+        /// Policy identity that authorized the cause.
+        policy: PinnedDegradationPolicy,
+    },
+    /// The cause must not be returned as a degraded product result.
+    Declined(DegradationDeclinedReason),
+}
+
+impl DegradationDecision {
+    /// Returns true only for an explicitly allowed cause.
+    #[must_use]
+    pub const fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allowed { .. })
+    }
+}
+
 /// Failure constructing an [`ActiveRoutingPolicy`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RoutingPolicyError {
@@ -53,6 +246,15 @@ pub enum RoutingPolicyError {
     RegistrationRevisionZero,
     /// The pinned fallback target names the active provider itself.
     FallbackTargetMatchesActiveProvider,
+    /// The degradation policy identity was blank, trimmed differently, or
+    /// otherwise outside the bounded canonical text shape.
+    DegradationPolicyIdInvalid,
+    /// A degradation policy revision of zero can never identify a policy.
+    DegradationPolicyRevisionZero,
+    /// A degradation allowlist repeated a typed cause.
+    DuplicateDegradationCause(DegradationCause),
+    /// A degradation policy did not explicitly allow any cause.
+    DegradationPolicyCausesEmpty,
 }
 
 impl fmt::Display for RoutingPolicyError {
@@ -64,6 +266,21 @@ impl fmt::Display for RoutingPolicyError {
             Self::FallbackTargetMatchesActiveProvider => {
                 formatter.write_str("routing policy fallback target equals the active provider")
             }
+            Self::DegradationPolicyIdInvalid => {
+                formatter.write_str("routing policy degradation policy id is invalid")
+            }
+            Self::DegradationPolicyRevisionZero => {
+                formatter.write_str("routing policy degradation policy revision must be positive")
+            }
+            Self::DuplicateDegradationCause(cause) => {
+                write!(
+                    formatter,
+                    "routing policy degradation cause {cause} is duplicated"
+                )
+            }
+            Self::DegradationPolicyCausesEmpty => {
+                formatter.write_str("routing policy degradation allowlist must not be empty")
+            }
         }
     }
 }
@@ -71,21 +288,38 @@ impl fmt::Display for RoutingPolicyError {
 impl Error for RoutingPolicyError {}
 
 /// Pinned host configuration naming the one provider allowed to answer an
-/// active call and the only fallback rule that may extend it.
+/// active call, the only fallback rule that may extend it, and the only
+/// degradation rule that may produce a degraded recall result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveRoutingPolicy {
     active_provider: OwnedProviderId,
     registration_revision: u64,
     fallback: FallbackRule,
+    degradation: DegradationRule,
 }
 
 impl ActiveRoutingPolicy {
-    /// Creates a validated policy: a positive registration revision and a
-    /// fallback target that differs from the active provider.
+    /// Creates a validated policy with fallback and degradation both
+    /// fail-closed.
     pub fn new(
         active_provider: OwnedProviderId,
         registration_revision: u64,
         fallback: FallbackRule,
+    ) -> Result<Self, RoutingPolicyError> {
+        Self::new_with_degradation(
+            active_provider,
+            registration_revision,
+            fallback,
+            DegradationRule::Forbidden,
+        )
+    }
+
+    /// Creates a validated policy with an explicit degradation rule.
+    pub fn new_with_degradation(
+        active_provider: OwnedProviderId,
+        registration_revision: u64,
+        fallback: FallbackRule,
+        degradation: DegradationRule,
     ) -> Result<Self, RoutingPolicyError> {
         if registration_revision == 0 {
             return Err(RoutingPolicyError::RegistrationRevisionZero);
@@ -99,7 +333,15 @@ impl ActiveRoutingPolicy {
             active_provider,
             registration_revision,
             fallback,
+            degradation,
         })
+    }
+
+    /// Returns a copy of this policy with the supplied degradation rule.
+    #[must_use]
+    pub fn with_degradation_rule(mut self, degradation: DegradationRule) -> Self {
+        self.degradation = degradation;
+        self
     }
 
     /// Returns the configured active provider identity.
@@ -119,6 +361,39 @@ impl ActiveRoutingPolicy {
     #[must_use]
     pub const fn fallback(&self) -> &FallbackRule {
         &self.fallback
+    }
+
+    /// Returns the host degradation rule.
+    #[must_use]
+    pub const fn degradation(&self) -> &DegradationRule {
+        &self.degradation
+    }
+
+    /// Returns the typed decision for one degradation cause.
+    #[must_use]
+    pub fn decide_degradation(&self, cause: DegradationCause) -> DegradationDecision {
+        match &self.degradation {
+            DegradationRule::Forbidden => {
+                DegradationDecision::Declined(DegradationDeclinedReason::HostRuleForbidden)
+            }
+            DegradationRule::ExplicitPinned(policy) if policy.allows(cause) => {
+                DegradationDecision::Allowed {
+                    policy: policy.clone(),
+                }
+            }
+            DegradationRule::ExplicitPinned(policy) => {
+                DegradationDecision::Declined(DegradationDeclinedReason::CauseNotAllowed {
+                    cause,
+                    policy: policy.clone(),
+                })
+            }
+        }
+    }
+
+    /// Returns whether a typed degradation is explicitly allowed.
+    #[must_use]
+    pub fn allows_degradation(&self, cause: DegradationCause) -> bool {
+        self.degradation.allows(cause)
     }
 }
 

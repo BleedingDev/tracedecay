@@ -224,12 +224,49 @@ fn is_mountable_active_provider(_provider: &str) -> bool {
     false
 }
 
+/// Converts the domain routing document's typed degradation allowlist into
+/// the fabric's immutable policy. The two enums stay separate so a provider
+/// crate cannot smuggle a new wire value into the host routing policy.
+#[cfg(feature = "memory-provider-host")]
+fn project_recall_degradation_rule(
+    config: &tracedecay_configuration::TraceDecayConfig,
+) -> Result<tracedecay_memory_provider_registry::DegradationRule> {
+    use tracedecay_memory_provider_registry::{
+        DegradationCause, DegradationRule, PinnedDegradationPolicy,
+    };
+    let Some(configured) = &config.memory_provider_recall_routing.degradation else {
+        return Ok(DegradationRule::Forbidden);
+    };
+    let policy = PinnedDegradationPolicy::new(
+        configured.policy_id.clone(),
+        configured.policy_revision,
+        configured
+            .allowed_causes
+            .iter()
+            .copied()
+            .map(|cause| match cause {
+                tracedecay_domain::configuration::MemoryProviderRecallDegradationCauseV1::Unsupported => DegradationCause::Unsupported,
+                tracedecay_domain::configuration::MemoryProviderRecallDegradationCauseV1::Unavailable => DegradationCause::Unavailable,
+                tracedecay_domain::configuration::MemoryProviderRecallDegradationCauseV1::Cancelled => DegradationCause::Cancelled,
+                tracedecay_domain::configuration::MemoryProviderRecallDegradationCauseV1::TimedOut => DegradationCause::TimedOut,
+                tracedecay_domain::configuration::MemoryProviderRecallDegradationCauseV1::Partial => DegradationCause::Partial,
+                tracedecay_domain::configuration::MemoryProviderRecallDegradationCauseV1::Stale => DegradationCause::Stale,
+                tracedecay_domain::configuration::MemoryProviderRecallDegradationCauseV1::BudgetExhausted => DegradationCause::BudgetExhausted,
+            }),
+    )
+    .map_err(|error| TraceDecayError::Config {
+        message: format!("memory provider recall degradation policy is invalid: {error}"),
+    })?;
+    Ok(DegradationRule::ExplicitPinned(policy))
+}
+
 /// Builds the recall routing policy for an active composition from the
 /// pinned routing gate: the Native provider under the product registration
-/// revision, always with `FallbackRule::Forbidden`. This composition
-/// registers exactly one provider, so any pinned fallback is refused at
-/// project open instead of being carried into the policy.
-/// Observer and disabled activations have no recall route and yield `None`.
+/// revision, the configured degradation rule, and always
+/// `FallbackRule::Forbidden`. This composition registers exactly one provider,
+/// so any pinned fallback is refused at project open instead of being carried
+/// into the policy. Observer and disabled activations have no recall route and
+/// yield `None`.
 #[cfg(feature = "memory-provider-host")]
 fn project_recall_routing_policy(
     activation: ProjectMemoryProviderActivation,
@@ -266,10 +303,12 @@ fn project_recall_routing_policy(
             )));
         }
     };
-    ActiveRoutingPolicy::new(
+    let degradation = project_recall_degradation_rule(config)?;
+    ActiveRoutingPolicy::new_with_degradation(
         active_provider,
         PROJECT_NATIVE_REGISTRATION_REVISION,
         fallback,
+        degradation,
     )
     .map(Some)
     .map_err(|error| {
@@ -2103,6 +2142,10 @@ mod memory_provider_routing_tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use tracedecay_configuration::TraceDecayConfig;
+    #[cfg(feature = "memory-provider-host")]
+    use tracedecay_domain::configuration::{
+        MemoryProviderRecallDegradationCauseV1, MemoryProviderRecallDegradationV1,
+    };
     use tracedecay_domain::configuration::{
         MemoryProviderRecallFallbackV1, MemoryProviderRecallRoutingV1,
     };
@@ -2115,6 +2158,7 @@ mod memory_provider_routing_tests {
         config.memory_provider_recall_routing = MemoryProviderRecallRoutingV1 {
             active_provider: active_provider.map(str::to_owned),
             fallback: None,
+            degradation: None,
         };
         config
     }
@@ -2145,7 +2189,10 @@ mod memory_provider_routing_tests {
     #[cfg(feature = "memory-provider-host")]
     #[test]
     fn routing_gate_naming_native_selects_active_and_builds_the_pinned_policy() {
-        use tracedecay_memory_provider_registry::{FallbackRule, NATIVE_PROVIDER_ID};
+        use tracedecay_memory_provider_registry::{
+            DegradationCause, DegradationDecision, DegradationDeclinedReason, DegradationRule,
+            FallbackRule, NATIVE_PROVIDER_ID,
+        };
 
         use super::{PROJECT_NATIVE_REGISTRATION_REVISION, project_recall_routing_policy};
 
@@ -2161,6 +2208,31 @@ mod memory_provider_routing_tests {
             PROJECT_NATIVE_REGISTRATION_REVISION
         );
         assert_eq!(policy.fallback(), &FallbackRule::Forbidden);
+        assert_eq!(policy.degradation(), &DegradationRule::Forbidden);
+
+        config.memory_provider_recall_routing.degradation =
+            Some(MemoryProviderRecallDegradationV1 {
+                policy_id: "policy.product-recall.degradation".to_owned(),
+                policy_revision: 5,
+                allowed_causes: vec![MemoryProviderRecallDegradationCauseV1::Unavailable],
+            });
+        let configured = project_recall_routing_policy(activation, &config)
+            .unwrap()
+            .expect("active composition carries explicit degradation policy");
+        assert!(matches!(
+            configured.decide_degradation(DegradationCause::Unavailable),
+            DegradationDecision::Allowed { policy }
+                if policy.policy_id() == "policy.product-recall.degradation"
+                    && policy.policy_revision() == 5
+        ));
+        assert!(matches!(
+            configured.decide_degradation(DegradationCause::TimedOut),
+            DegradationDecision::Declined(DegradationDeclinedReason::CauseNotAllowed {
+                cause: DegradationCause::TimedOut,
+                policy,
+            }) if policy.policy_id() == "policy.product-recall.degradation"
+                && policy.policy_revision() == 5
+        ));
 
         // Observer and disabled activations have no route at all.
         assert!(

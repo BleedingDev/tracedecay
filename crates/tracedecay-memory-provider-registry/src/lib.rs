@@ -139,10 +139,12 @@ pub use supervisor::{
     ShutdownReportV1, SupervisedScopeV1, SupervisorConfigError, SupervisorOutcomeV1,
 };
 pub use tracedecay_memory_fabric::{
-    ActiveCallPlan, ActiveRoutingPolicy, FabricConfig, FabricError, FallbackDecision,
-    FallbackDeclinedReason, FallbackRule, ObserverReceipt, ProviderCapabilityAvailability,
-    ProviderMode, ProviderReadiness, ProviderStatus, ReadyRouteTarget, RouteTarget,
-    RoutedActiveReply, RoutedProviderIdentity, RoutingError, RoutingPolicyError,
+    ActiveCallPlan, ActiveRoutingPolicy, DegradationCause, DegradationDecision,
+    DegradationDeclinedReason, DegradationRule, FabricConfig, FabricError, FallbackDecision,
+    FallbackDeclinedReason, FallbackRule, ObserverReceipt, PinnedDegradationPolicy,
+    ProviderCapabilityAvailability, ProviderMode, ProviderReadiness, ProviderStatus,
+    ReadyRouteTarget, RouteTarget, RoutedActiveReply, RoutedProviderIdentity, RoutingError,
+    RoutingPolicyError,
 };
 // Re-export the narrow provider-neutral surface that product composition needs
 // to implement an application port. The product crate deliberately depends on

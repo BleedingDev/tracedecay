@@ -3921,9 +3921,10 @@ mod tests {
     };
     use tracedecay_memory_provider_registry::{
         ActiveRoutingPolicy, CognitiveRecallAdmittedOutcomeV1, ContextItemProvenanceV1,
-        DeniedRecallCandidate, EnabledProviderMode, FabricConfig, FallbackRule, NATIVE_PROVIDER_ID,
-        NativeProviderActivation, OwnedProviderId, ProviderMode, RecallDenialReason,
-        RecallScopeBindingsV1, ScopeBinding, ScopeField, UnknownValidityPolicy,
+        DegradationCause, DegradationRule, DeniedRecallCandidate, EnabledProviderMode,
+        FabricConfig, FallbackRule, NATIVE_PROVIDER_ID, NativeProviderActivation, OwnedProviderId,
+        PinnedDegradationPolicy, ProviderMode, RecallDenialReason, RecallScopeBindingsV1,
+        ScopeBinding, ScopeField, UnknownValidityPolicy,
     };
     use tracedecay_session_memory::memory::{
         ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
@@ -3953,6 +3954,23 @@ mod tests {
 
     const PROJECT_ID: &str = "project.cognitive-recall";
     const SEEDED_CONTENT: &str = "cognitive recall ledger durable retrieval";
+
+    fn test_recall_routing() -> ActiveRoutingPolicy {
+        ActiveRoutingPolicy::new_with_degradation(
+            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider id"),
+            1,
+            FallbackRule::Forbidden,
+            DegradationRule::ExplicitPinned(
+                PinnedDegradationPolicy::new(
+                    "policy.cognitive-recall.degradation",
+                    1,
+                    DegradationCause::ALL.iter().copied(),
+                )
+                .expect("degradation policy"),
+            ),
+        )
+        .expect("routing policy")
+    }
 
     struct StoreFixture {
         _temporary: tempfile::TempDir,
@@ -4149,12 +4167,7 @@ mod tests {
             store_data_root: ledger_root,
             canonical_project_path: fixture.project_root.clone(),
             graph: Arc::clone(&fixture.graph),
-            routing: ActiveRoutingPolicy::new(
-                OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider id"),
-                1,
-                FallbackRule::Forbidden,
-            )
-            .expect("routing policy"),
+            routing: test_recall_routing(),
             host_limits: super::super::native_provider::native_provider_limits(),
             invocation_boundary: Arc::clone(&invocation_boundary),
         })
@@ -4509,12 +4522,7 @@ mod tests {
             store_data_root: ledger_root,
             canonical_project_path: fixture.project_root.clone(),
             graph: Arc::clone(&fixture.graph),
-            routing: ActiveRoutingPolicy::new(
-                OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider id"),
-                1,
-                FallbackRule::Forbidden,
-            )
-            .expect("routing policy"),
+            routing: test_recall_routing(),
             host_limits: super::super::native_provider::native_provider_limits(),
             invocation_boundary: Arc::clone(&invocation_boundary),
         })
@@ -4570,12 +4578,7 @@ mod tests {
             store_data_root: ledger_root,
             canonical_project_path: evidence_host.project_root.clone(),
             graph: Arc::clone(&evidence_host.graph),
-            routing: ActiveRoutingPolicy::new(
-                OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider id"),
-                1,
-                FallbackRule::Forbidden,
-            )
-            .expect("routing policy"),
+            routing: test_recall_routing(),
             host_limits: super::super::native_provider::native_provider_limits(),
             invocation_boundary: Arc::clone(&invocation_boundary),
         })

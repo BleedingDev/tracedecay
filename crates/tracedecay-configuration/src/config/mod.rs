@@ -11,6 +11,7 @@ pub mod topology;
 pub mod work_executable_binding;
 
 pub use tracedecay_domain::configuration::{
+    MemoryProviderRecallDegradationCauseV1, MemoryProviderRecallDegradationV1,
     MemoryProviderRecallFallbackV1, MemoryProviderRecallRoutingV1, SEMANTIC_RUNTIME_SETTING_KEY,
 };
 pub use tracedecay_global_db::configuration::{registry, resolver};
@@ -387,7 +388,10 @@ mod memory_provider_snapshot_tests {
 
     /// Rebuild the default snapshot with one setting replaced (`Some`) or
     /// removed from both the value and provenance maps (`None`).
-    fn snapshot_with(raw_key: &str, value: Option<ConfigurationValueV1>) -> ConfigurationSnapshotV1 {
+    fn snapshot_with(
+        raw_key: &str,
+        value: Option<ConfigurationValueV1>,
+    ) -> ConfigurationSnapshotV1 {
         let base = default_snapshot();
         let mut effective_values: BTreeMap<_, _> = base.effective_values.clone();
         let mut provenance: BTreeMap<_, _> = base.provenance.clone();
@@ -434,6 +438,14 @@ mod memory_provider_snapshot_tests {
                 policy_id: "policy.recall.fallback".to_owned(),
                 policy_revision: 3,
                 target_provider: "ncm".to_owned(),
+            }),
+            degradation: Some(MemoryProviderRecallDegradationV1 {
+                policy_id: "policy.recall.degradation".to_owned(),
+                policy_revision: 4,
+                allowed_causes: vec![
+                    MemoryProviderRecallDegradationCauseV1::Unavailable,
+                    MemoryProviderRecallDegradationCauseV1::TimedOut,
+                ],
             }),
         };
         let routed = runtime_config_from_snapshot(&snapshot_with(
@@ -516,6 +528,7 @@ mod memory_provider_snapshot_tests {
                 policy_revision: 1,
                 target_provider: "ncm".to_owned(),
             }),
+            degradation: None,
         };
         let zero_revision = MemoryProviderRecallRoutingV1 {
             active_provider: Some("native".to_owned()),
@@ -524,6 +537,7 @@ mod memory_provider_snapshot_tests {
                 policy_revision: 0,
                 target_provider: "ncm".to_owned(),
             }),
+            degradation: None,
         };
         let fallback_targets_active = MemoryProviderRecallRoutingV1 {
             active_provider: Some("native".to_owned()),
@@ -532,10 +546,12 @@ mod memory_provider_snapshot_tests {
                 policy_revision: 2,
                 target_provider: "native".to_owned(),
             }),
+            degradation: None,
         };
         let blank_active = MemoryProviderRecallRoutingV1 {
             active_provider: Some(" ".to_owned()),
             fallback: None,
+            degradation: None,
         };
 
         for routing in [

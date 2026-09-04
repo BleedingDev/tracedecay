@@ -29,9 +29,10 @@ use tracedecay_memory_provider_api::{
 use tracedecay_memory_provider_native::{NativeMemoryApplicationPort, NativeObservation};
 use tracedecay_memory_provider_registry::{
     ActiveRoutingPolicy, BudgetExclusionReason, CognitiveRecallPortError,
-    CognitiveRecallPortInputsV1, DuplicateReason, EnabledProviderMode, ExactScopeBinding,
-    ExactScopeBindingError, FabricConfig, FallbackDecision, FallbackDeclinedReason, FallbackRule,
-    NATIVE_PROVIDER_ID, NativeProviderActivation, ObserverProviderRegistration,
+    CognitiveRecallPortInputsV1, DegradationCause, DegradationDeclinedReason, DegradationRule,
+    DuplicateReason, EnabledProviderMode, ExactScopeBinding, ExactScopeBindingError, FabricConfig,
+    FallbackDecision, FallbackDeclinedReason, FallbackRule, NATIVE_PROVIDER_ID,
+    NativeProviderActivation, ObserverProviderRegistration, PinnedDegradationPolicy,
     ProjectCognitiveRecallPortV1, ProjectMemoryProviderComposition, ProviderMode,
     ProviderReadiness, RecallAdmissionAuditError, RecallAdmissionError, RecallAdmissionObserver,
     RecallAdmissionReport, RecallBudgetsV1, RecallDenialReason, RecallScopeBindingsV1,
@@ -188,10 +189,17 @@ fn mount_routed(
 }
 
 fn routing(provider: &str, revision: u64, fallback: FallbackRule) -> ActiveRoutingPolicy {
-    ActiveRoutingPolicy::new(
+    let degradation = PinnedDegradationPolicy::new(
+        "policy.recall.degradation",
+        1,
+        DegradationCause::ALL.iter().copied(),
+    )
+    .expect("degradation policy");
+    ActiveRoutingPolicy::new_with_degradation(
         OwnedProviderId::new(provider).expect("provider id"),
         revision,
         fallback,
+        DegradationRule::ExplicitPinned(degradation),
     )
     .expect("routing policy")
 }
@@ -814,6 +822,133 @@ async fn observer_only_and_disabled_compositions_are_typed() {
     assert!(matches!(
         mount(disabled, observer).err(),
         Some(CognitiveRecallPortError::CompositionDisabled)
+    ));
+}
+
+#[tokio::test]
+async fn forbidden_degradation_rule_rejects_unavailable_without_empty_success() {
+    let mut provider = RecallFixturePort::new();
+    provider.terminal_code = TerminalCode::ProviderUnavailable;
+    let provider = Arc::new(provider);
+    let port = mount_routed(
+        compose_mode(provider.clone(), EnabledProviderMode::Active),
+        Arc::new(LedgerObserver::default()),
+        budgets(),
+        ActiveRoutingPolicy::new(
+            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+            31,
+            FallbackRule::Forbidden,
+        )
+        .expect("forbidden routing policy"),
+    )
+    .expect("mounted port");
+
+    let error = port
+        .recall_admitted(
+            request(
+                resolved_scope(Some("refs/heads/recall-port")),
+                60_000_000,
+                false,
+            ),
+            &live_signal(),
+        )
+        .await
+        .expect_err("provider unavailability needs an explicit degradation rule");
+    match error {
+        CognitiveRecallPortError::DegradationNotAllowed {
+            provider,
+            degradation,
+            reason,
+        } => {
+            assert_eq!(provider.provider_id(), NATIVE_PROVIDER_ID);
+            assert_eq!(provider.registration_revision(), 31);
+            assert_eq!(
+                provider.provider_instance_id(),
+                Some("native.recall-fixture")
+            );
+            assert_eq!(degradation, CognitiveRecallDegradation::Unavailable);
+            assert_eq!(reason, DegradationDeclinedReason::HostRuleForbidden);
+        }
+        other => panic!("expected typed degradation refusal, got {other:?}"),
+    }
+    assert_eq!(provider.handshake_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(provider.recall_calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn pinned_degradation_policy_allows_only_its_named_causes() {
+    fn policy(causes: impl IntoIterator<Item = DegradationCause>) -> ActiveRoutingPolicy {
+        ActiveRoutingPolicy::new_with_degradation(
+            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+            31,
+            FallbackRule::Forbidden,
+            DegradationRule::ExplicitPinned(
+                PinnedDegradationPolicy::new("policy.recall.subset", 9, causes)
+                    .expect("degradation policy"),
+            ),
+        )
+        .expect("routing policy")
+    }
+
+    let mut allowed_provider = RecallFixturePort::new();
+    allowed_provider.terminal_code = TerminalCode::ProviderUnavailable;
+    let allowed = mount_routed(
+        compose_mode(Arc::new(allowed_provider), EnabledProviderMode::Active),
+        Arc::new(LedgerObserver::default()),
+        budgets(),
+        policy([DegradationCause::Unavailable]),
+    )
+    .expect("mounted allowed port")
+    .recall_admitted(
+        request(
+            resolved_scope(Some("refs/heads/recall-port")),
+            60_000_000,
+            false,
+        ),
+        &live_signal(),
+    )
+    .await
+    .expect("explicitly allowed unavailability degrades");
+    assert_eq!(
+        allowed.result.degradation(),
+        Some(CognitiveRecallDegradation::Unavailable)
+    );
+    assert_eq!(allowed.result.provider().provider_id(), NATIVE_PROVIDER_ID);
+    assert_eq!(allowed.result.provider().registration_revision(), 31);
+    assert_eq!(
+        allowed.result.provider().provider_instance_id(),
+        Some("native.recall-fixture")
+    );
+
+    let mut denied_provider = RecallFixturePort::new();
+    denied_provider.terminal_code = TerminalCode::ProviderUnavailable;
+    let denied = mount_routed(
+        compose_mode(Arc::new(denied_provider), EnabledProviderMode::Active),
+        Arc::new(LedgerObserver::default()),
+        budgets(),
+        policy([DegradationCause::TimedOut]),
+    )
+    .expect("mounted denied port")
+    .recall_admitted(
+        request(
+            resolved_scope(Some("refs/heads/recall-port")),
+            60_000_000,
+            false,
+        ),
+        &live_signal(),
+    )
+    .await
+    .expect_err("an unnamed degradation cause is refused");
+    assert!(matches!(
+        denied,
+        CognitiveRecallPortError::DegradationNotAllowed {
+            degradation: CognitiveRecallDegradation::Unavailable,
+            reason: DegradationDeclinedReason::CauseNotAllowed {
+                cause: DegradationCause::Unavailable,
+                policy,
+            },
+            ..
+        } if policy.policy_id() == "policy.recall.subset" && policy.policy_revision() == 9
     ));
 }
 

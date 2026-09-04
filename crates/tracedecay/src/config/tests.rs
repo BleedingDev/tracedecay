@@ -471,6 +471,7 @@ fn memory_provider_native_enabled_round_trips_and_defaults_off() {
 #[test]
 fn memory_provider_recall_routing_defaults_to_no_active_provider_and_validates() {
     use tracedecay_domain::configuration::{
+        MemoryProviderRecallDegradationCauseV1, MemoryProviderRecallDegradationV1,
         MemoryProviderRecallFallbackV1, MemoryProviderRecallRoutingV1,
     };
 
@@ -482,6 +483,7 @@ fn memory_provider_recall_routing_defaults_to_no_active_provider_and_validates()
     );
     assert_eq!(config.memory_provider_recall_routing.active_provider, None);
     assert_eq!(config.memory_provider_recall_routing.fallback, None);
+    assert_eq!(config.memory_provider_recall_routing.degradation, None);
 
     // Legacy configs without the key default to the closed gate.
     let legacy = r#"{
@@ -506,6 +508,14 @@ fn memory_provider_recall_routing_defaults_to_no_active_provider_and_validates()
             policy_revision: 7,
             target_provider: "provider.other".to_owned(),
         }),
+        degradation: Some(MemoryProviderRecallDegradationV1 {
+            policy_id: "policy.memory-degradation".to_owned(),
+            policy_revision: 4,
+            allowed_causes: vec![
+                MemoryProviderRecallDegradationCauseV1::Unavailable,
+                MemoryProviderRecallDegradationCauseV1::TimedOut,
+            ],
+        }),
     };
     pinned.memory_provider_recall_routing.validate().unwrap();
     let parsed: TraceDecayConfig =
@@ -523,6 +533,7 @@ fn memory_provider_recall_routing_defaults_to_no_active_provider_and_validates()
             policy_revision: 7,
             target_provider: "tracedecay.native".to_owned(),
         }),
+        degradation: None,
     };
     assert!(self_target.validate().is_err());
     let fallback_without_active = MemoryProviderRecallRoutingV1 {
@@ -532,6 +543,7 @@ fn memory_provider_recall_routing_defaults_to_no_active_provider_and_validates()
             policy_revision: 7,
             target_provider: "provider.other".to_owned(),
         }),
+        degradation: None,
     };
     assert!(fallback_without_active.validate().is_err());
     let zero_revision = MemoryProviderRecallRoutingV1 {
@@ -541,8 +553,50 @@ fn memory_provider_recall_routing_defaults_to_no_active_provider_and_validates()
             policy_revision: 0,
             target_provider: "provider.other".to_owned(),
         }),
+        degradation: None,
     };
     assert!(zero_revision.validate().is_err());
+
+    let valid_degradation = MemoryProviderRecallDegradationV1 {
+        policy_id: "policy.memory-degradation".to_owned(),
+        policy_revision: 4,
+        allowed_causes: vec![MemoryProviderRecallDegradationCauseV1::Unavailable],
+    };
+    let degradation_without_active = MemoryProviderRecallRoutingV1 {
+        active_provider: None,
+        fallback: None,
+        degradation: Some(valid_degradation.clone()),
+    };
+    assert!(degradation_without_active.validate().is_err());
+
+    for degradation in [
+        MemoryProviderRecallDegradationV1 {
+            policy_id: " ".to_owned(),
+            ..valid_degradation.clone()
+        },
+        MemoryProviderRecallDegradationV1 {
+            policy_revision: 0,
+            ..valid_degradation.clone()
+        },
+        MemoryProviderRecallDegradationV1 {
+            allowed_causes: Vec::new(),
+            ..valid_degradation.clone()
+        },
+        MemoryProviderRecallDegradationV1 {
+            allowed_causes: vec![
+                MemoryProviderRecallDegradationCauseV1::Unavailable,
+                MemoryProviderRecallDegradationCauseV1::Unavailable,
+            ],
+            ..valid_degradation
+        },
+    ] {
+        let routing = MemoryProviderRecallRoutingV1 {
+            active_provider: Some("tracedecay.native".to_owned()),
+            fallback: None,
+            degradation: Some(degradation),
+        };
+        assert!(routing.validate().is_err());
+    }
 }
 
 #[test]

@@ -6,8 +6,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use tracedecay_memory_fabric::{
-    ActiveCallPlan, ActiveRoutingPolicy, FabricConfig, FabricError, FallbackDecision,
-    FallbackDeclinedReason, FallbackRule, MemoryFabric, ObserverReceipt,
+    ActiveCallPlan, ActiveRoutingPolicy, DegradationCause, DegradationDecision,
+    DegradationDeclinedReason, DegradationRule, FabricConfig, FabricError, FallbackDecision,
+    FallbackDeclinedReason, FallbackRule, MemoryFabric, ObserverReceipt, PinnedDegradationPolicy,
     ProviderCapabilityAvailability, ProviderMode, ProviderReadiness, ReadyRouteTarget, RouteTarget,
     RoutedProviderIdentity, RoutingError,
 };
@@ -2119,6 +2120,53 @@ fn routing_policy_rejects_zero_revision_and_self_targeting_fallback() -> Result<
             FallbackRule::ExplicitPinned(self_target)
         ),
         Err(tracedecay_memory_fabric::RoutingPolicyError::FallbackTargetMatchesActiveProvider)
+    ));
+    Ok(())
+}
+
+#[test]
+fn degradation_requires_an_explicit_pinned_allowlist() -> Result<(), Box<dyn Error>> {
+    let forbidden = routing_policy("provider.active", 1, FallbackRule::Forbidden)?;
+    assert_eq!(
+        forbidden.decide_degradation(DegradationCause::Unavailable),
+        DegradationDecision::Declined(DegradationDeclinedReason::HostRuleForbidden)
+    );
+
+    let pinned = PinnedDegradationPolicy::new(
+        "policy.recall.degradation",
+        7,
+        [DegradationCause::Unavailable],
+    )?;
+    let configured = ActiveRoutingPolicy::new_with_degradation(
+        provider_id("provider.active")?,
+        1,
+        FallbackRule::Forbidden,
+        DegradationRule::ExplicitPinned(pinned.clone()),
+    )?;
+    assert_eq!(
+        configured.decide_degradation(DegradationCause::Unavailable),
+        DegradationDecision::Allowed {
+            policy: pinned.clone(),
+        }
+    );
+    assert_eq!(
+        configured.decide_degradation(DegradationCause::TimedOut),
+        DegradationDecision::Declined(DegradationDeclinedReason::CauseNotAllowed {
+            cause: DegradationCause::TimedOut,
+            policy: pinned,
+        })
+    );
+    assert!(matches!(
+        PinnedDegradationPolicy::new(
+            "policy.recall.degradation",
+            7,
+            [DegradationCause::Unavailable, DegradationCause::Unavailable],
+        ),
+        Err(
+            tracedecay_memory_fabric::RoutingPolicyError::DuplicateDegradationCause(
+                DegradationCause::Unavailable
+            )
+        )
     ));
     Ok(())
 }

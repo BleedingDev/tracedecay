@@ -948,6 +948,74 @@ pub struct MemoryProviderRecallFallbackV1 {
     pub target_provider: String,
 }
 
+/// Typed causes that an explicit cognitive-recall degradation rule may allow.
+///
+/// A cause is not a string flag: unknown JSON values are rejected by serde and
+/// duplicate entries are rejected by [`MemoryProviderRecallDegradationV1::validate`].
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryProviderRecallDegradationCauseV1 {
+    /// The provider does not support the requested recall capability.
+    Unsupported,
+    /// The provider or its host execution lane is unavailable.
+    Unavailable,
+    /// The caller withdrew the recall before it completed.
+    Cancelled,
+    /// The recall exceeded its caller-owned deadline.
+    TimedOut,
+    /// The provider returned useful content but not a complete result.
+    Partial,
+    /// Admission found that the provider's evidence is stale or unresolved.
+    Stale,
+    /// The provider exhausted an explicit recall budget.
+    BudgetExhausted,
+}
+
+/// Explicit host policy for which typed cognitive-recall degradations may be
+/// returned. Omission is fail-closed: no degraded result is allowed unless an
+/// operator pins this policy under the routing document.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryProviderRecallDegradationV1 {
+    /// Stable host policy identity.
+    pub policy_id: String,
+    /// Positive revision of the host policy.
+    pub policy_revision: u64,
+    /// Set-like allowlist of typed degradation causes.
+    pub allowed_causes: Vec<MemoryProviderRecallDegradationCauseV1>,
+}
+
+impl MemoryProviderRecallDegradationV1 {
+    /// Rejects blank policy identities, zero revisions, and duplicate causes.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        validate_canonical_label(
+            &self.policy_id,
+            "memory provider recall degradation policy id",
+        )?;
+        if self.policy_revision == 0 {
+            return Err(DomainError::NonCanonical {
+                field: "memory provider recall degradation policy revision",
+            });
+        }
+        if self.allowed_causes.is_empty() {
+            return Err(DomainError::NonCanonical {
+                field: "memory provider recall degradation allowed causes",
+            });
+        }
+        let mut causes = BTreeSet::new();
+        for cause in &self.allowed_causes {
+            if !causes.insert(*cause) {
+                return Err(DomainError::NonCanonical {
+                    field: "memory provider recall degradation duplicate cause",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Explicit routing gate for cognitive recall.
 ///
 /// `active_provider` names the one provider allowed to answer product recall;
@@ -955,8 +1023,9 @@ pub struct MemoryProviderRecallFallbackV1 {
 /// the provider host on never promotes a provider to active output on its
 /// own. `fallback` is `None` (no fallback, whatever a provider suggests)
 /// unless an operator pins a complete rule whose target differs from the
-/// active provider. The value is stored as canonical JSON text under
-/// [`MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY`].
+/// active provider. `degradation` is also fail-closed: omitted means that no
+/// typed degraded result may be returned. The value is stored as canonical
+/// JSON text under [`MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryProviderRecallRoutingV1 {
@@ -964,12 +1033,14 @@ pub struct MemoryProviderRecallRoutingV1 {
     pub active_provider: Option<String>,
     #[serde(default)]
     pub fallback: Option<MemoryProviderRecallFallbackV1>,
+    #[serde(default)]
+    pub degradation: Option<MemoryProviderRecallDegradationV1>,
 }
 
 impl MemoryProviderRecallRoutingV1 {
-    /// Rejects blank identities, a zero fallback revision, a fallback pinned
-    /// without an active provider, and a fallback that targets the active
-    /// provider itself.
+    /// Rejects blank identities, zero policy revisions, duplicate degradation
+    /// causes, a fallback or degradation rule without an active provider, and
+    /// a fallback that targets the active provider itself.
     pub fn validate(&self) -> Result<(), DomainError> {
         if let Some(active) = &self.active_provider {
             validate_canonical_label(active, "memory provider recall active provider")?;
@@ -998,6 +1069,14 @@ impl MemoryProviderRecallRoutingV1 {
                     field: "memory provider recall fallback target equals active provider",
                 });
             }
+        }
+        if let Some(degradation) = &self.degradation {
+            if self.active_provider.is_none() {
+                return Err(DomainError::NonCanonical {
+                    field: "memory provider recall degradation without active provider",
+                });
+            }
+            degradation.validate()?;
         }
         Ok(())
     }

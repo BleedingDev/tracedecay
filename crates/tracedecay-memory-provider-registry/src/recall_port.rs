@@ -66,8 +66,9 @@ use tracedecay_application::{
     ApplicationContractError, CancellationSignal, ClockError, ResolvedScope, try_now_micros,
 };
 use tracedecay_memory_fabric::{
-    ActiveCallPlan, ActiveRoutingPolicy, FabricError, FallbackDecision, ProviderMode,
-    ReadyRouteTarget, RouteTarget, RoutedProviderIdentity, RoutingError,
+    ActiveCallPlan, ActiveRoutingPolicy, DegradationCause, DegradationDecision,
+    DegradationDeclinedReason, FabricError, FallbackDecision, ProviderMode, ReadyRouteTarget,
+    RouteTarget, RoutedProviderIdentity, RoutingError,
 };
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
@@ -273,6 +274,21 @@ pub enum CognitiveRecallPortError {
     /// worker could not be started, or it unwound without delivering.
     #[error("recall invocation did not complete: {0}")]
     Invocation(#[source] ProviderInvocationFaultV1),
+    /// The requested degraded outcome was not authorized by the host's
+    /// explicit routing policy. The provider identity is retained so a caller
+    /// cannot mistake a policy refusal for an empty successful recall or for
+    /// another provider's result.
+    #[error(
+        "recall degradation {degradation:?} is not explicitly allowed for provider {provider:?}: {reason}"
+    )]
+    DegradationNotAllowed {
+        /// Provider identity the host selected or that actually answered.
+        provider: CognitiveRecallProviderIdentity,
+        /// Typed degradation the port would otherwise have returned.
+        degradation: CognitiveRecallDegradation,
+        /// Exact configured rule decision that refused the degradation.
+        reason: DegradationDeclinedReason,
+    },
     /// The live cancellation signal handed to the port is a different
     /// cancellation identity than the one the request names. An adapter may
     /// not replace the caller's cancellation identity, so the recall is
@@ -319,6 +335,7 @@ impl CognitiveRecallPortError {
             Self::AdmissionAudit(_) => "recall_admission_audit_failed",
             Self::Application(_) => "recall_application_contract_violation",
             Self::Invocation(fault) => fault.code(),
+            Self::DegradationNotAllowed { .. } => "recall_degradation_not_allowed",
             Self::CancellationIdentityMismatch { .. } => "recall_cancellation_identity_mismatch",
         }
     }
@@ -575,14 +592,14 @@ impl ProjectCognitiveRecallPortV1 {
         }
         let now = try_now_micros().map_err(CognitiveRecallPortError::Clock)?;
         if request.cancellation().is_cancelled() || cancellation.is_cancelled() {
-            return degraded_outcome(
+            return self.degraded_outcome(
                 &request,
                 self.configured_identity()?,
                 CognitiveRecallDegradation::Cancelled,
             );
         }
         if request.deadline().is_elapsed_at(now) {
-            return degraded_outcome(
+            return self.degraded_outcome(
                 &request,
                 self.configured_identity()?,
                 CognitiveRecallDegradation::TimedOut,
@@ -708,7 +725,7 @@ impl ProjectCognitiveRecallPortV1 {
             // or recorded the strand it could not stop.
             Err(ProviderInvocationFaultV1::DeadlineExceeded { .. }) => {
                 provider_stop.cancel();
-                return degraded_outcome(
+                return self.degraded_outcome(
                     &request,
                     self.configured_identity()?,
                     CognitiveRecallDegradation::TimedOut,
@@ -719,7 +736,7 @@ impl ProjectCognitiveRecallPortV1 {
             // a provider that ignored its token.
             Err(ProviderInvocationFaultV1::Cancelled { .. }) => {
                 provider_stop.cancel();
-                return degraded_outcome(
+                return self.degraded_outcome(
                     &request,
                     self.configured_identity()?,
                     CognitiveRecallDegradation::Cancelled,
@@ -735,7 +752,7 @@ impl ProjectCognitiveRecallPortV1 {
                 | ProviderInvocationFaultV1::WorkerCapacityExhausted { .. }
                 | ProviderInvocationFaultV1::ExecutionNotIsolated { .. },
             ) => {
-                return degraded_outcome(
+                return self.degraded_outcome(
                     &request,
                     self.configured_identity()?,
                     CognitiveRecallDegradation::Unavailable,
@@ -766,14 +783,14 @@ impl ProjectCognitiveRecallPortV1 {
         // out before contact or during it.
         if cancellation.is_cancelled() || request.cancellation().is_cancelled() {
             let mut outcome =
-                degraded_outcome(&request, identity, CognitiveRecallDegradation::Cancelled)?;
+                self.degraded_outcome(&request, identity, CognitiveRecallDegradation::Cancelled)?;
             outcome.fallback = fallback;
             return Ok(outcome);
         }
         let settled_at = try_now_micros().map_err(CognitiveRecallPortError::Clock)?;
         if request.deadline().is_elapsed_at(settled_at) {
             let mut outcome =
-                degraded_outcome(&request, identity, CognitiveRecallDegradation::TimedOut)?;
+                self.degraded_outcome(&request, identity, CognitiveRecallDegradation::TimedOut)?;
             outcome.fallback = fallback;
             return Ok(outcome);
         }
@@ -781,7 +798,7 @@ impl ProjectCognitiveRecallPortV1 {
         match classify_terminal(&reply) {
             TerminalDisposition::Admit => {}
             TerminalDisposition::Degrade(degradation) => {
-                let mut outcome = degraded_outcome(&request, identity, degradation)?;
+                let mut outcome = self.degraded_outcome(&request, identity, degradation)?;
                 outcome.fallback = fallback;
                 return Ok(outcome);
             }
@@ -888,6 +905,9 @@ impl ProjectCognitiveRecallPortV1 {
         } else {
             None
         };
+        if let Some(degradation) = degradation {
+            self.ensure_degradation_allowed(&identity, degradation)?;
+        }
         let result = CognitiveRecallResult::new(
             request.scope().clone(),
             request.request_id().clone(),
@@ -1160,27 +1180,69 @@ fn classify_terminal(reply: &ProviderReply) -> TerminalDisposition {
     }
 }
 
-fn degraded_outcome(
-    request: &CognitiveRecallRequest,
-    provider: CognitiveRecallProviderIdentity,
-    degradation: CognitiveRecallDegradation,
-) -> Result<CognitiveRecallAdmittedOutcomeV1, CognitiveRecallPortError> {
-    let result = CognitiveRecallResult::degraded(
-        request.scope().clone(),
-        request.request_id().clone(),
-        provider,
-        Vec::new(),
-        degradation,
-    )
-    .map_err(CognitiveRecallPortError::Application)?;
-    Ok(CognitiveRecallAdmittedOutcomeV1 {
-        result,
-        normalization: None,
-        selection: None,
-        report: None,
-        unhydrated_reference_candidate_ids: Vec::new(),
-        fallback: FallbackDecision::NotApplicable,
-    })
+impl ProjectCognitiveRecallPortV1 {
+    /// Refuses a degraded product result unless the host routing policy
+    /// explicitly allows its typed cause.
+    fn ensure_degradation_allowed(
+        &self,
+        provider: &CognitiveRecallProviderIdentity,
+        degradation: CognitiveRecallDegradation,
+    ) -> Result<(), CognitiveRecallPortError> {
+        match self
+            .routing
+            .decide_degradation(degradation_cause(degradation))
+        {
+            DegradationDecision::Allowed { .. } => Ok(()),
+            DegradationDecision::Declined(reason) => {
+                Err(CognitiveRecallPortError::DegradationNotAllowed {
+                    provider: provider.clone(),
+                    degradation,
+                    reason,
+                })
+            }
+        }
+    }
+
+    /// Builds an empty degraded result after the host policy has authorized
+    /// the typed cause.
+    fn degraded_outcome(
+        &self,
+        request: &CognitiveRecallRequest,
+        provider: CognitiveRecallProviderIdentity,
+        degradation: CognitiveRecallDegradation,
+    ) -> Result<CognitiveRecallAdmittedOutcomeV1, CognitiveRecallPortError> {
+        self.ensure_degradation_allowed(&provider, degradation)?;
+        let result = CognitiveRecallResult::degraded(
+            request.scope().clone(),
+            request.request_id().clone(),
+            provider,
+            Vec::new(),
+            degradation,
+        )
+        .map_err(CognitiveRecallPortError::Application)?;
+        Ok(CognitiveRecallAdmittedOutcomeV1 {
+            result,
+            normalization: None,
+            selection: None,
+            report: None,
+            unhydrated_reference_candidate_ids: Vec::new(),
+            fallback: FallbackDecision::NotApplicable,
+        })
+    }
+}
+
+/// Maps the application result vocabulary onto the routing layer's closed
+/// degradation vocabulary without using provider-supplied strings.
+fn degradation_cause(degradation: CognitiveRecallDegradation) -> DegradationCause {
+    match degradation {
+        CognitiveRecallDegradation::Unsupported => DegradationCause::Unsupported,
+        CognitiveRecallDegradation::Unavailable => DegradationCause::Unavailable,
+        CognitiveRecallDegradation::Cancelled => DegradationCause::Cancelled,
+        CognitiveRecallDegradation::TimedOut => DegradationCause::TimedOut,
+        CognitiveRecallDegradation::Partial => DegradationCause::Partial,
+        CognitiveRecallDegradation::Stale => DegradationCause::Stale,
+        CognitiveRecallDegradation::BudgetExhausted => DegradationCause::BudgetExhausted,
+    }
 }
 
 /// Projects the provider provenance record onto the application's explicit

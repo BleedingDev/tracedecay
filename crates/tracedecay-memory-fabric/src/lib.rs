@@ -31,9 +31,10 @@ use tracedecay_memory_provider_api::{
 
 pub mod routing;
 pub use routing::{
-    ActiveCallPlan, ActiveRoutingPolicy, FallbackDecision, FallbackDeclinedReason, FallbackRule,
-    ReadyRouteTarget, RouteTarget, RoutedActiveReply, RoutedProviderIdentity, RoutingError,
-    RoutingPolicyError,
+    ActiveCallPlan, ActiveRoutingPolicy, DegradationCause, DegradationDecision,
+    DegradationDeclinedReason, DegradationRule, FallbackDecision, FallbackDeclinedReason,
+    FallbackRule, PinnedDegradationPolicy, ReadyRouteTarget, RouteTarget, RoutedActiveReply,
+    RoutedProviderIdentity, RoutingError, RoutingPolicyError,
 };
 
 /// Provider participation mode selected by TraceDecay configuration.
