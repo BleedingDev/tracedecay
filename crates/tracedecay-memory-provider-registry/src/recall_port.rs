@@ -33,7 +33,7 @@
 //!   [`CognitiveRecallDegradation`], and a provider that rejects the host's
 //!   own scope is an error, never an empty success;
 //! * admitted candidates are normalized and then *selected* before anything
-//!   becomes advisory content: host-owned deduplication and diversity
+//!   becomes advisory content: host-owned exact deduplication and budget
 //!   selection ([`select_recall_candidates`]) run on every mounted recall, so
 //!   the same memory returned twice can never consume the result budget
 //!   twice, and the complete selection receipt — including why each dropped
@@ -500,11 +500,10 @@ impl ProjectCognitiveRecallPortV1 {
         self
     }
 
-    /// Pins a different host selection policy: the advisory-context budget
-    /// and the similarity bars deduplication and diversity run at.
+    /// Pins the host selection policy's advisory-context budget.
     ///
-    /// The mounted default carries the host's own candidate budget and the
-    /// pinned default thresholds. Every recall narrows the budget again to
+    /// The mounted default carries the host's own candidate budget. Every
+    /// recall narrows the budget again to
     /// the candidate budget that recall dispatched, so this setter can only
     /// tighten what a recall selects, never widen it.
     #[must_use]

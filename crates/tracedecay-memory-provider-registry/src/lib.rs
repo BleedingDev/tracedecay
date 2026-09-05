@@ -116,11 +116,9 @@ pub use recall_provenance_hydration::{
     ProvenanceHydrationPassV1, ProvenanceHydrationPolicyError, ProvenanceHydrationPolicyV1,
 };
 pub use recall_selection::{
-    BudgetExcludedCandidateV1, BudgetExclusionReason, DEFAULT_DIVERSITY_SIMILARITY_THRESHOLD_PPM,
-    DEFAULT_DUPLICATE_SIMILARITY_THRESHOLD_PPM, DeduplicatedCandidateV1,
-    DiversityExcludedCandidateV1, DuplicateReason, HOST_SELECTION_POLICY_ID,
-    HOST_SELECTION_POLICY_REVISION, NEGATION_MARKERS, RecallSelectionError,
-    RecallSelectionPolicyError, RecallSelectionPolicyV1, RecallSelectionV1, SIMILARITY_UNIT,
+    BudgetExcludedCandidateV1, BudgetExclusionReason, DeduplicatedCandidateV1, DuplicateReason,
+    HOST_SELECTION_POLICY_ID, HOST_SELECTION_POLICY_REVISION, RecallSelectionError,
+    RecallSelectionPolicyError, RecallSelectionPolicyV1, RecallSelectionV1,
     select_recall_candidates,
 };
 pub use state_capability::{
