@@ -1603,9 +1603,11 @@ pub(crate) async fn advisory_memory_context_for_call(
     // Every outcome below names the provider this project's routing policy
     // pinned, including the ones that never reach a provider at all.
     let routed_provider = mount.routing().active_provider();
+    let routed_registration_revision = mount.routing().registration_revision();
     let unavailable = |outcome: AdvisoryRecallUnavailableV1, detail: &str| {
         Some(AdvisoryMemoryContextV1::unavailable(
             routed_provider.clone(),
+            routed_registration_revision,
             outcome,
             detail,
         ))
@@ -1770,12 +1772,14 @@ pub(crate) async fn advisory_context_recall(
     // provider is still attributed to the provider that was configured to
     // answer it, so a caller can tell *whose* lane failed.
     let routed_provider = mount.routing().active_provider();
+    let routed_registration_revision = mount.routing().registration_revision();
 
     let now = match try_now_micros() {
         Ok(now) => now,
         Err(error) => {
             return AdvisoryMemoryContextV1::unavailable(
                 routed_provider.clone(),
+                routed_registration_revision,
                 AdvisoryRecallUnavailableV1::HostClockUnavailable,
                 format!("host clock unavailable for advisory recall: {error}"),
             );
@@ -1791,6 +1795,7 @@ pub(crate) async fn advisory_context_recall(
         Err(error) => {
             return AdvisoryMemoryContextV1::unavailable(
                 routed_provider.clone(),
+                routed_registration_revision,
                 AdvisoryRecallUnavailableV1::RequestIdentityInvalid,
                 format!("advisory recall request identity is invalid: {error}"),
             );
@@ -1810,6 +1815,7 @@ pub(crate) async fn advisory_context_recall(
         Err(error) => {
             return AdvisoryMemoryContextV1::unavailable(
                 routed_provider.clone(),
+                routed_registration_revision,
                 AdvisoryRecallUnavailableV1::RequestInvalid,
                 format!("advisory recall request is invalid: {error}"),
             );
@@ -1820,6 +1826,7 @@ pub(crate) async fn advisory_context_recall(
         Err(error) => {
             return AdvisoryMemoryContextV1::unavailable(
                 routed_provider.clone(),
+                routed_registration_revision,
                 AdvisoryRecallUnavailableV1::RecallRefused {
                     port_code: error.code(),
                 },
@@ -1891,6 +1898,7 @@ pub(crate) async fn advisory_context_recall(
     let Some(hydration_scope) = mount.host_evidence_scope(inputs.canonical_session_id) else {
         return AdvisoryMemoryContextV1::unavailable(
             routed_provider.clone(),
+            routed_registration_revision,
             AdvisoryRecallUnavailableV1::LaneInputsMissing,
             "advisory recall cannot mint an authoritative provenance scope for this mount",
         );
@@ -1910,6 +1918,7 @@ pub(crate) async fn advisory_context_recall(
         Err(error) => {
             return AdvisoryMemoryContextV1::unavailable(
                 routed_provider.clone(),
+                routed_registration_revision,
                 AdvisoryRecallUnavailableV1::HostClockUnavailable,
                 format!("host clock unavailable for provenance hydration: {error}"),
             );
@@ -1933,6 +1942,7 @@ pub(crate) async fn advisory_context_recall(
         Err(fault) => {
             return AdvisoryMemoryContextV1::unavailable(
                 routed_provider.clone(),
+                routed_registration_revision,
                 AdvisoryRecallUnavailableV1::UntrustedGateUnavailable,
                 format!("untrusted-memory gate could not be built: {fault}"),
             );
@@ -1954,7 +1964,13 @@ pub(crate) async fn advisory_context_recall(
                 .harden_metadata(UntrustedRecallMetadataFieldV1::ProviderExplanation, summary)
             {
                 Ok(hardened) => hardened,
-                Err(fault) => return untrusted_gate_faulted(routed_provider, &fault),
+                Err(fault) => {
+                    return untrusted_gate_faulted(
+                        routed_provider,
+                        routed_registration_revision,
+                        &fault,
+                    );
+                }
             };
             let state = match hardened.admitted() {
                 Some(text) => RecallExplainProviderExplanationV1::Retained {
@@ -2014,11 +2030,23 @@ pub(crate) async fn advisory_context_recall(
         // with.
         let provenance = match harden_provenance(&untrusted_gate, provenance) {
             Ok(provenance) => provenance,
-            Err(fault) => return untrusted_gate_faulted(routed_provider, &fault),
+            Err(fault) => {
+                return untrusted_gate_faulted(
+                    routed_provider,
+                    routed_registration_revision,
+                    &fault,
+                );
+            }
         };
         let identity = match harden_candidate_identity(&untrusted_gate, candidate.candidate_id()) {
             Ok(identity) => identity,
-            Err(fault) => return untrusted_gate_faulted(routed_provider, &fault),
+            Err(fault) => {
+                return untrusted_gate_faulted(
+                    routed_provider,
+                    routed_registration_revision,
+                    &fault,
+                );
+            }
         };
         if identity != candidate.candidate_id() {
             // The pack will record the host-minted stand-in, not the
@@ -2036,7 +2064,13 @@ pub(crate) async fn advisory_context_recall(
             // so it is never flattened into a per-item withholding that would
             // still let the lane report itself answered. The whole lane
             // terminates as typed-unavailable instead.
-            Err(fault) => return untrusted_gate_faulted(routed_provider, &fault),
+            Err(fault) => {
+                return untrusted_gate_faulted(
+                    routed_provider,
+                    routed_registration_revision,
+                    &fault,
+                );
+            }
         };
         candidates.push(AdvisoryMemoryCandidateV1 {
             candidate_id: identity,
@@ -2127,10 +2161,12 @@ fn advisory_trust_tier(provenance: &ProviderItemProvenanceV1) -> UntrustedRecall
 /// lane terminates instead, and the caller keeps its own answer.
 fn untrusted_gate_faulted(
     routed_provider: &OwnedProviderId,
+    registration_revision: u64,
     fault: &UntrustedRecallGateFaultV1,
 ) -> AdvisoryMemoryContextV1 {
     AdvisoryMemoryContextV1::unavailable(
         routed_provider.clone(),
+        registration_revision,
         AdvisoryRecallUnavailableV1::UntrustedGateFaulted,
         format!("untrusted-memory gate faulted while classifying provider text: {fault}"),
     )
@@ -2905,6 +2941,8 @@ pub enum AdvisoryMemoryContextV1 {
         /// path could reach, so the one thing an operator needs from a broken
         /// lane -- whose lane broke -- could silently go missing.
         provider_id: OwnedProviderId,
+        /// Registration revision the unavailable call was routed under.
+        registration_revision: u64,
         /// Typed terminal outcome.
         outcome: AdvisoryRecallUnavailableV1,
         /// Bounded human-readable detail beside the code.
@@ -2919,11 +2957,13 @@ impl AdvisoryMemoryContextV1 {
     /// policy pinned, so a lane cannot be built without naming whose it is.
     pub fn unavailable(
         provider_id: OwnedProviderId,
+        registration_revision: u64,
         outcome: AdvisoryRecallUnavailableV1,
         detail: impl AsRef<str>,
     ) -> Self {
         Self::Unavailable {
             provider_id,
+            registration_revision,
             outcome,
             detail: bounded_detail(detail.as_ref()),
         }
@@ -2943,9 +2983,12 @@ impl AdvisoryMemoryContextV1 {
         match self {
             Self::Unavailable {
                 provider_id,
+                registration_revision,
                 outcome,
                 detail,
             } => AdvisoryLaneV1::Notice {
+                provider_id: provider_id.as_str().to_owned(),
+                registration_revision: *registration_revision,
                 notice: format!(
                     "provider {}: {} ({detail})",
                     provider_id.as_str(),
@@ -3063,7 +3106,9 @@ impl AdvisoryMemoryContextV1 {
         };
         let (render_form, host_items) = host_evidence(&text);
         let rendered = match self.context_pack(render_form, &host_items) {
-            AdvisoryContextPackV1::Compiled(pack) => pack.rendered,
+            AdvisoryContextPackV1::Compiled(pack) => {
+                merge_compiled_advisory(render_form, &text, &pack.rendered)
+            }
             AdvisoryContextPackV1::Refused(failure) => {
                 withheld_rendering(render_form, &text, self.provider_id(), &failure)
             }
@@ -3073,6 +3118,37 @@ impl AdvisoryMemoryContextV1 {
         }
         result
     }
+}
+
+/// Adds only the compiled advisory member to a completed JSON host answer.
+///
+/// The context-pack compiler accounts for the whole rendered answer, but the
+/// augmentation seam treats the host object as authoritative: it takes the
+/// advisory member from the compiled object and inserts that one member into
+/// the original object. No pre-existing host member is rebuilt or selected
+/// through the provider lane. Markdown remains an append-only rendering.
+fn merge_compiled_advisory(
+    render_form: ContextPackRenderFormV1,
+    host_text: &str,
+    compiled_text: &str,
+) -> String {
+    if render_form != ContextPackRenderFormV1::Json {
+        return compiled_text.to_owned();
+    }
+    let (Ok(Value::Object(mut host)), Ok(Value::Object(mut compiled))) = (
+        serde_json::from_str::<Value>(host_text),
+        serde_json::from_str::<Value>(compiled_text),
+    ) else {
+        return compiled_text.to_owned();
+    };
+    if host.contains_key(ADVISORY_CONTEXT_PACK_JSON_KEY) {
+        return host_text.to_owned();
+    }
+    let Some(advisory) = compiled.remove(ADVISORY_CONTEXT_PACK_JSON_KEY) else {
+        return host_text.to_owned();
+    };
+    host.insert(ADVISORY_CONTEXT_PACK_JSON_KEY.to_owned(), advisory);
+    Value::Object(host).to_string()
 }
 
 /// The host answer, unchanged, plus a bounded typed notice that the advisory
@@ -3095,6 +3171,9 @@ fn withheld_rendering(
     match render_form {
         ContextPackRenderFormV1::Json => match serde_json::from_str::<Value>(text) {
             Ok(Value::Object(mut object)) => {
+                if object.contains_key(ADVISORY_CONTEXT_PACK_JSON_KEY) {
+                    return text.to_owned();
+                }
                 object.insert(
                     ADVISORY_CONTEXT_PACK_JSON_KEY.to_owned(),
                     json!({
@@ -3494,10 +3573,27 @@ mod advisory_rendering_tests {
     }
 
     #[test]
-    fn a_json_answer_gains_a_structured_advisory_key_and_stays_valid_json() {
-        let text = rendered_text(&answered().appended_to(tool_result("{\"answer\":true}")));
+    fn a_json_answer_gains_only_the_advisory_key_and_preserves_host_sections() {
+        let host = json!({
+            "answer": true,
+            "code_generation": {
+                "language": "rust",
+                "snippets": ["fn main() {}"],
+            },
+            "warnings": ["host-owned warning"],
+        });
+        let text = rendered_text(&answered().appended_to(tool_result(&host.to_string())));
         let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        assert_eq!(parsed["answer"], json!(true), "{text}");
+        assert_eq!(parsed["answer"], host["answer"], "{text}");
+        assert_eq!(parsed["code_generation"], host["code_generation"], "{text}");
+        assert_eq!(parsed["warnings"], host["warnings"], "{text}");
+        assert_eq!(
+            parsed.as_object().map(serde_json::Map::len),
+            host.as_object()
+                .map(serde_json::Map::len)
+                .map(|len| len + 1),
+            "augmentation must add exactly one top-level advisory key: {text}"
+        );
         assert_eq!(parsed["advisory_provider_memory"]["state"], "answered");
         assert_eq!(
             parsed["advisory_provider_memory"]["candidates"][0]["provenance"],
@@ -3520,6 +3616,35 @@ mod advisory_rendering_tests {
         );
     }
 
+    #[test]
+    fn a_reserved_json_advisory_member_is_never_overwritten() {
+        let host = json!({
+            "answer": true,
+            "advisory_provider_memory": {
+                "state": "host-owned",
+                "code_generation": {"language": "rust"},
+            },
+        });
+        let host_text = host.to_string();
+
+        let compiled = rendered_text(&answered().appended_to(tool_result(&host_text)));
+        assert_eq!(
+            compiled, host_text,
+            "compiled augmentation must preserve collisions"
+        );
+
+        let withheld = withheld_rendering(
+            ContextPackRenderFormV1::Json,
+            &host_text,
+            NATIVE_PROVIDER_ID,
+            &AdvisoryContextPackFailureV1::Policy(ContextPackPolicyError::ZeroTotalBudget),
+        );
+        assert_eq!(
+            withheld, host_text,
+            "withheld augmentation must preserve collisions"
+        );
+    }
+
     /// An unavailable lane reports its typed code, and the code survives into
     /// the rendered answer.
     ///
@@ -3530,6 +3655,7 @@ mod advisory_rendering_tests {
     fn an_unavailable_lane_reports_its_typed_outcome() {
         let lane = AdvisoryMemoryContextV1::unavailable(
             OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider id"),
+            1,
             AdvisoryRecallUnavailableV1::DeadlineElapsed,
             "recall deadline exceeded before provider contact",
         );
@@ -3551,6 +3677,13 @@ mod advisory_rendering_tests {
             text.contains("recall deadline exceeded before provider contact"),
             "{text}"
         );
+        let json_text = rendered_text(&lane.appended_to(tool_result("{\"answer\":true}")));
+        let parsed: Value = serde_json::from_str(&json_text).unwrap_or(Value::Null);
+        let notice = &parsed["advisory_provider_memory"];
+        assert_eq!(notice["state"], "unavailable", "{json_text}");
+        assert_eq!(notice["provider_id"], NATIVE_PROVIDER_ID, "{json_text}");
+        assert_eq!(notice["registration_revision"], 1, "{json_text}");
+        assert_eq!(parsed["answer"], true, "{json_text}");
     }
 
     /// One provider candidate assembled through the *same* helpers the mounted
@@ -3875,6 +4008,7 @@ mod advisory_rendering_tests {
         let fault = UntrustedRecallGateFaultV1::TransientCorpusUnavailable;
         let lane = untrusted_gate_faulted(
             &OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider id"),
+            1,
             &fault,
         );
 

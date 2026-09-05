@@ -37,6 +37,7 @@ use tracedecay_memory_provider_registry::{
     ProviderReadiness, RecallAdmissionAuditError, RecallAdmissionError, RecallAdmissionObserver,
     RecallAdmissionReport, RecallBudgetsV1, RecallDenialReason, RecallScopeBindingsV1,
     RecallSelectionPolicyV1, RegistryError, RoutingError, ScopeBinding, ScopeField,
+    UnknownValidityPolicy,
 };
 
 /// Host-side scope binding standing in for the composition root: profile and
@@ -826,24 +827,46 @@ async fn observer_only_and_disabled_compositions_are_typed() {
 }
 
 #[tokio::test]
-async fn forbidden_degradation_rule_rejects_unavailable_without_empty_success() {
-    let mut provider = RecallFixturePort::new();
-    provider.terminal_code = TerminalCode::ProviderUnavailable;
-    let provider = Arc::new(provider);
-    let port = mount_routed(
-        compose_mode(provider.clone(), EnabledProviderMode::Active),
-        Arc::new(LedgerObserver::default()),
-        budgets(),
-        ActiveRoutingPolicy::new(
-            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
-            31,
-            FallbackRule::Forbidden,
-        )
-        .expect("forbidden routing policy"),
-    )
-    .expect("mounted port");
+async fn default_degradation_rule_returns_every_content_free_outcome_with_provider_identity() {
+    let cases = [
+        (
+            TerminalCode::ProviderUnavailable,
+            CognitiveRecallDegradation::Unavailable,
+        ),
+        (
+            TerminalCode::Cancelled,
+            CognitiveRecallDegradation::Cancelled,
+        ),
+        (
+            TerminalCode::DeadlineExceeded,
+            CognitiveRecallDegradation::TimedOut,
+        ),
+        (
+            TerminalCode::CapabilityUnsupported,
+            CognitiveRecallDegradation::Unsupported,
+        ),
+        (
+            TerminalCode::CapacityExceeded,
+            CognitiveRecallDegradation::BudgetExhausted,
+        ),
+    ];
 
-    let error = port
+    for (terminal_code, expected) in cases {
+        let mut fixture = RecallFixturePort::new();
+        fixture.terminal_code = terminal_code;
+        let provider = Arc::new(fixture);
+        let outcome = mount_routed(
+            compose_mode(provider.clone(), EnabledProviderMode::Active),
+            Arc::new(LedgerObserver::default()),
+            budgets(),
+            ActiveRoutingPolicy::new(
+                OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+                31,
+                FallbackRule::Forbidden,
+            )
+            .expect("default routing policy"),
+        )
+        .expect("mounted port")
         .recall_admitted(
             request(
                 resolved_scope(Some("refs/heads/recall-port")),
@@ -853,26 +876,149 @@ async fn forbidden_degradation_rule_rejects_unavailable_without_empty_success() 
             &live_signal(),
         )
         .await
-        .expect_err("provider unavailability needs an explicit degradation rule");
-    match error {
-        CognitiveRecallPortError::DegradationNotAllowed {
-            provider,
-            degradation,
-            reason,
-        } => {
-            assert_eq!(provider.provider_id(), NATIVE_PROVIDER_ID);
-            assert_eq!(provider.registration_revision(), 31);
-            assert_eq!(
-                provider.provider_instance_id(),
-                Some("native.recall-fixture")
-            );
-            assert_eq!(degradation, CognitiveRecallDegradation::Unavailable);
-            assert_eq!(reason, DegradationDeclinedReason::HostRuleForbidden);
-        }
-        other => panic!("expected typed degradation refusal, got {other:?}"),
+        .unwrap_or_else(|error| panic!("{terminal_code:?} must degrade by default: {error:?}"));
+
+        assert_eq!(outcome.result.degradation(), Some(expected));
+        assert_eq!(outcome.result.provider().provider_id(), NATIVE_PROVIDER_ID);
+        assert_eq!(outcome.result.provider().registration_revision(), 31);
+        assert_eq!(
+            outcome.result.provider().provider_instance_id(),
+            Some("native.recall-fixture")
+        );
+        assert!(outcome.result.candidates().is_empty());
+        assert_eq!(provider.handshake_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.recall_calls.load(Ordering::Relaxed), 1);
     }
-    assert_eq!(provider.handshake_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(provider.recall_calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn content_bearing_degradations_require_and_obey_an_explicit_policy() {
+    fn default_policy() -> ActiveRoutingPolicy {
+        ActiveRoutingPolicy::new(
+            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+            31,
+            FallbackRule::Forbidden,
+        )
+        .expect("default routing policy")
+    }
+
+    fn explicit_policy(cause: DegradationCause) -> ActiveRoutingPolicy {
+        ActiveRoutingPolicy::new_with_degradation(
+            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+            31,
+            FallbackRule::Forbidden,
+            DegradationRule::ExplicitPinned(
+                PinnedDegradationPolicy::new("policy.recall.content-bearing", 3, [cause])
+                    .expect("degradation policy"),
+            ),
+        )
+        .expect("explicit routing policy")
+    }
+
+    let partial_port = |routing| {
+        let mut fixture = RecallFixturePort::new();
+        fixture.terminal_code = TerminalCode::Partial;
+        mount_routed(
+            compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+            Arc::new(LedgerObserver::default()),
+            budgets(),
+            routing,
+        )
+        .expect("mounted partial port")
+    };
+    let error = partial_port(default_policy())
+        .recall_admitted(
+            request(
+                resolved_scope(Some("refs/heads/recall-port")),
+                60_000_000,
+                false,
+            ),
+            &live_signal(),
+        )
+        .await
+        .expect_err("partial content requires an explicit policy");
+    assert!(matches!(
+        error,
+        CognitiveRecallPortError::DegradationNotAllowed {
+            degradation: CognitiveRecallDegradation::Partial,
+            reason: DegradationDeclinedReason::ContentBearingRequiresExplicitPolicy {
+                cause: DegradationCause::Partial,
+            },
+            ..
+        }
+    ));
+    let partial = partial_port(explicit_policy(DegradationCause::Partial))
+        .recall_admitted(
+            request(
+                resolved_scope(Some("refs/heads/recall-port")),
+                60_000_000,
+                false,
+            ),
+            &live_signal(),
+        )
+        .await
+        .expect("explicit partial policy admits the result");
+    assert_eq!(
+        partial.result.degradation(),
+        Some(CognitiveRecallDegradation::Partial)
+    );
+    assert!(!partial.result.candidates().is_empty());
+    assert_eq!(partial.result.provider().provider_id(), NATIVE_PROVIDER_ID);
+    assert_eq!(partial.result.provider().registration_revision(), 31);
+
+    let stale_port = |routing| {
+        let mut fixture = RecallFixturePort::new();
+        fixture
+            .validity_overrides
+            .insert("in-scope-1".to_owned(), validity_with("unknown", &[]));
+        mount_routed(
+            compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+            Arc::new(LedgerObserver::default()),
+            budgets(),
+            routing,
+        )
+        .expect("mounted stale port")
+        .with_unknown_validity_policy(UnknownValidityPolicy::Degrade)
+    };
+    let error = stale_port(default_policy())
+        .recall_admitted(
+            request(
+                resolved_scope(Some("refs/heads/recall-port")),
+                60_000_000,
+                false,
+            ),
+            &live_signal(),
+        )
+        .await
+        .expect_err("stale content requires an explicit policy");
+    assert!(matches!(
+        error,
+        CognitiveRecallPortError::DegradationNotAllowed {
+            degradation: CognitiveRecallDegradation::Stale,
+            reason: DegradationDeclinedReason::ContentBearingRequiresExplicitPolicy {
+                cause: DegradationCause::Stale,
+            },
+            ..
+        }
+    ));
+    let stale = stale_port(explicit_policy(DegradationCause::Stale))
+        .recall_admitted(
+            request(
+                resolved_scope(Some("refs/heads/recall-port")),
+                60_000_000,
+                false,
+            ),
+            &live_signal(),
+        )
+        .await
+        .expect("explicit stale policy admits the result");
+    assert_eq!(
+        stale.result.degradation(),
+        Some(CognitiveRecallDegradation::Stale)
+    );
+    assert!(!stale.result.candidates().is_empty());
+    assert_eq!(stale.result.provider().provider_id(), NATIVE_PROVIDER_ID);
+    assert_eq!(stale.result.provider().registration_revision(), 31);
 }
 
 #[tokio::test]

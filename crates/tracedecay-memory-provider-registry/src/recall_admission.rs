@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, SecondsFormat};
 use serde::de::{Deserializer, Error as _};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Number, Value};
 use sha2::{Digest, Sha256};
 use tracedecay_memory_provider_api::contract::{TemporalMode, TerminalCode};
 
@@ -330,6 +330,12 @@ pub enum RecallDenialReason {
         /// The first defect found in contract field order.
         defect: NativeScoreDefect,
     },
+    /// The provider confidence datum is not a finite JSON number in the
+    /// inclusive unit interval.
+    ConfidenceMalformed {
+        /// The defect found in the provider confidence datum.
+        defect: RecallConfidenceDefect,
+    },
 }
 
 impl RecallDenialReason {
@@ -352,6 +358,31 @@ impl RecallDenialReason {
             Self::ContentDigestMismatch => "content_digest_mismatch",
             Self::ContentSelectionInvalid => "content_selection_invalid",
             Self::NativeScoreMalformed { .. } => "native_score_malformed",
+            Self::ConfidenceMalformed { .. } => "confidence_malformed",
+        }
+    }
+}
+
+/// Why a supplied provider confidence datum cannot be admitted.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallConfidenceDefect {
+    /// The non-null datum is not a JSON number.
+    NotNumber,
+    /// The number cannot be represented as a finite host value.
+    NotFinite,
+    /// The number lies outside the inclusive `0.0..=1.0` interval.
+    OutOfRange,
+}
+
+impl RecallConfidenceDefect {
+    /// Stable snake_case label for metrics and log fields.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotNumber => "not_number",
+            Self::NotFinite => "not_finite",
+            Self::OutOfRange => "out_of_range",
         }
     }
 }
@@ -953,6 +984,10 @@ pub struct RecallCandidateV1 {
     pub content_sha256: String,
     /// Provider-native score, retained opaque for host normalization.
     pub native_score: Value,
+    /// Optional provider-supplied confidence. The key is required on the wire;
+    /// `null` means the provider made no confidence claim.
+    #[serde(deserialize_with = "required_nullable")]
+    pub confidence: Option<Value>,
     /// Claimed exact scope.
     pub exact_scope_identity: RecallScopeIdentityV1,
     /// Claimed validity.
@@ -1060,6 +1095,16 @@ impl AdmittedRecallCandidate {
     #[must_use]
     pub fn native_score_sha256(&self) -> &str {
         self.native_score.native_score_sha256()
+    }
+
+    /// Returns the provider-supplied confidence, when present. Admission
+    /// established that the number is finite and within `0.0..=1.0`.
+    #[must_use]
+    pub fn confidence(&self) -> Option<&Number> {
+        self.candidate
+            .confidence
+            .as_ref()
+            .and_then(Value::as_number)
     }
 
     /// Returns the verified content selection.
@@ -1351,6 +1396,25 @@ struct AdmitDecision {
     degrades_lane: bool,
 }
 
+fn validate_recall_confidence(value: Option<&Value>) -> Result<(), RecallConfidenceDefect> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Value::Number(number) = value else {
+        return Err(RecallConfidenceDefect::NotNumber);
+    };
+    let Some(value) = number.as_f64() else {
+        return Err(RecallConfidenceDefect::NotFinite);
+    };
+    if !value.is_finite() {
+        return Err(RecallConfidenceDefect::NotFinite);
+    }
+    if !(0.0..=1.0).contains(&value) {
+        return Err(RecallConfidenceDefect::OutOfRange);
+    }
+    Ok(())
+}
+
 fn admit_one(
     admitted_scope: &OwnedExactScope,
     temporal: &AdmittedTemporalQuery,
@@ -1369,6 +1433,8 @@ fn admit_one(
     // normalization as a neutral value.
     let native_score = validate_native_score(&candidate.native_score)
         .map_err(|defect| RecallDenialReason::NativeScoreMalformed { defect })?;
+    validate_recall_confidence(candidate.confidence.as_ref())
+        .map_err(|defect| RecallDenialReason::ConfidenceMalformed { defect })?;
     Ok((decision, native_score))
 }
 

@@ -82,6 +82,24 @@ impl DegradationCause {
         Self::BudgetExhausted,
     ];
 
+    /// Returns whether this degradation carries no provider content.
+    ///
+    /// Content-free outcomes are safe to surface by default because they can
+    /// only report that recall did not produce content. Partial and stale
+    /// outcomes carry provider material and therefore require an explicit
+    /// operator-pinned policy.
+    #[must_use]
+    pub const fn is_content_free(self) -> bool {
+        matches!(
+            self,
+            Self::Unsupported
+                | Self::Unavailable
+                | Self::Cancelled
+                | Self::TimedOut
+                | Self::BudgetExhausted
+        )
+    }
+
     /// Returns the stable wire label for this cause.
     #[must_use]
     pub const fn as_wire(self) -> &'static str {
@@ -173,8 +191,10 @@ impl PinnedDegradationPolicy {
 /// Host-configured rule for whether a recall degradation may be returned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DegradationRule {
-    /// No degraded recall result is permitted. This is the fail-closed
-    /// product default.
+    /// Content-free terminal outcomes are permitted without operator policy;
+    /// content-bearing partial or stale results remain forbidden.
+    DefaultContentFree,
+    /// No degraded recall result is permitted.
     Forbidden,
     /// Only causes in this host-pinned policy may become recall results.
     ExplicitPinned(PinnedDegradationPolicy),
@@ -185,6 +205,7 @@ impl DegradationRule {
     #[must_use]
     pub fn allows(&self, cause: DegradationCause) -> bool {
         match self {
+            Self::DefaultContentFree => cause.is_content_free(),
             Self::Forbidden => false,
             Self::ExplicitPinned(policy) => policy.allows(cause),
         }
@@ -194,7 +215,13 @@ impl DegradationRule {
 /// Why a host degradation rule declined a typed cause.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DegradationDeclinedReason {
-    /// No degradation rule was configured.
+    /// The default rule refuses a content-bearing cause until an operator
+    /// pins a policy that names it.
+    ContentBearingRequiresExplicitPolicy {
+        /// Content-bearing cause that required an explicit policy.
+        cause: DegradationCause,
+    },
+    /// The host explicitly forbade every degradation.
     HostRuleForbidden,
     /// The configured rule exists but does not include this cause.
     CauseNotAllowed {
@@ -208,6 +235,10 @@ pub enum DegradationDeclinedReason {
 impl fmt::Display for DegradationDeclinedReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ContentBearingRequiresExplicitPolicy { cause } => write!(
+                formatter,
+                "content-bearing degradation cause {cause} requires an explicit pinned policy"
+            ),
             Self::HostRuleForbidden => formatter.write_str("host degradation rule is forbidden"),
             Self::CauseNotAllowed { cause, policy } => write!(
                 formatter,
@@ -222,6 +253,11 @@ impl fmt::Display for DegradationDeclinedReason {
 /// Typed result of checking whether one degradation cause is configured.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DegradationDecision {
+    /// A content-free cause is allowed by the typed product default.
+    AllowedByDefault {
+        /// Content-free cause authorized without operator policy.
+        cause: DegradationCause,
+    },
     /// The cause is allowed by this exact host policy.
     Allowed {
         /// Policy identity that authorized the cause.
@@ -232,10 +268,10 @@ pub enum DegradationDecision {
 }
 
 impl DegradationDecision {
-    /// Returns true only for an explicitly allowed cause.
+    /// Returns true for either a content-free default or an explicitly allowed cause.
     #[must_use]
     pub const fn is_allowed(&self) -> bool {
-        matches!(self, Self::Allowed { .. })
+        matches!(self, Self::AllowedByDefault { .. } | Self::Allowed { .. })
     }
 }
 
@@ -299,8 +335,8 @@ pub struct ActiveRoutingPolicy {
 }
 
 impl ActiveRoutingPolicy {
-    /// Creates a validated policy with fallback and degradation both
-    /// fail-closed.
+    /// Creates a validated policy with fallback fail-closed and the typed
+    /// content-free degradation default.
     pub fn new(
         active_provider: OwnedProviderId,
         registration_revision: u64,
@@ -310,7 +346,7 @@ impl ActiveRoutingPolicy {
             active_provider,
             registration_revision,
             fallback,
-            DegradationRule::Forbidden,
+            DegradationRule::DefaultContentFree,
         )
     }
 
@@ -373,6 +409,12 @@ impl ActiveRoutingPolicy {
     #[must_use]
     pub fn decide_degradation(&self, cause: DegradationCause) -> DegradationDecision {
         match &self.degradation {
+            DegradationRule::DefaultContentFree if cause.is_content_free() => {
+                DegradationDecision::AllowedByDefault { cause }
+            }
+            DegradationRule::DefaultContentFree => DegradationDecision::Declined(
+                DegradationDeclinedReason::ContentBearingRequiresExplicitPolicy { cause },
+            ),
             DegradationRule::Forbidden => {
                 DegradationDecision::Declined(DegradationDeclinedReason::HostRuleForbidden)
             }

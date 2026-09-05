@@ -26,7 +26,7 @@ use tracedecay_memory_provider_registry::{
     HOST_NORMALIZATION_POLICY_REVISION, NATIVE_PROVIDER_ID, NativeProviderActivation,
     NativeScoreDefect, NativeScoreV1, NormalizationUnavailableReason, ProjectCognitiveRecallPortV1,
     ProjectMemoryProviderComposition, ProviderLimits, RecallAdmissionAuditError,
-    RecallAdmissionObserver, RecallAdmissionReport, RecallCandidateV1,
+    RecallAdmissionObserver, RecallAdmissionReport, RecallCandidateV1, RecallConfidenceDefect,
     RecallConfidenceUnavailableReason, RecallConfidenceV1, RecallDenialReason,
     RecallNormalizationError, RecallNormalizationPolicyV1, RecallRelevanceV1,
     ScoreCalibrationEvidence, admit_recall_candidates, normalize_admitted_candidates,
@@ -167,7 +167,7 @@ fn normalization_projects_the_declared_range_exactly_and_deterministically()
             normalized.normalization_policy_id,
             HOST_NORMALIZATION_POLICY_ID
         );
-        assert_eq!(normalized.normalization_policy_revision, 2);
+        assert_eq!(normalized.normalization_policy_revision, 3);
     }
     Ok(())
 }
@@ -176,7 +176,7 @@ fn normalization_projects_the_declared_range_exactly_and_deterministically()
 /// change, including the rule that score calibration cannot create confidence.
 #[test]
 fn default_policy_revision_pins_candidate_confidence_evidence_rules() {
-    assert_eq!(HOST_NORMALIZATION_POLICY_REVISION, 2);
+    assert_eq!(HOST_NORMALIZATION_POLICY_REVISION, 3);
     assert_eq!(
         RecallNormalizationPolicyV1::default().policy_revision(),
         HOST_NORMALIZATION_POLICY_REVISION
@@ -185,7 +185,7 @@ fn default_policy_revision_pins_candidate_confidence_evidence_rules() {
 
 /// Only the revision whose evidence rules are implemented may be mounted.
 /// In particular, revision 1 cannot falsely label output produced with the
-/// current revision 2 confidence semantics.
+/// current revision 3 confidence semantics.
 #[test]
 fn unsupported_revision_cannot_label_current_evidence_rules() -> Result<(), Box<dyn Error>> {
     assert_eq!(
@@ -219,6 +219,121 @@ fn unsupported_revision_cannot_label_current_evidence_rules() -> Result<(), Box<
         normalized.normalization_policy_revision,
         HOST_NORMALIZATION_POLICY_REVISION
     );
+    Ok(())
+}
+
+// --- provider-supplied confidence ----------------------------------------
+
+#[test]
+fn supplied_confidence_is_preserved_without_score_inference() -> Result<(), Box<dyn Error>> {
+    let mut value = candidate_value(
+        "supplied-confidence",
+        "content of supplied-confidence",
+        scope_value(&admitted_scope()),
+        current_validity(),
+    );
+    value["confidence"] = json!(0.625);
+    value["native_score"] = score("0.9", "0", "1", "higher_is_better", "uncalibrated");
+
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &current_query(),
+        &authorized_exact(),
+        vec![decode(value)],
+    )?;
+    assert_eq!(admission.admitted.len(), 1);
+    let normalization =
+        normalize_admitted_candidates(RecallNormalizationPolicyV1::default(), &admission.admitted)?;
+
+    let candidate = normalization
+        .candidate("supplied-confidence")
+        .expect("normalized candidate");
+    let RecallConfidenceV1::Available { value } = &candidate.confidence else {
+        panic!("supplied confidence must remain available");
+    };
+    assert_eq!(Value::Number(value.clone()), json!(0.625));
+    assert_eq!(
+        candidate
+            .relevance
+            .normalized()
+            .expect("declared-range relevance")
+            .normalized_value,
+        "0.900000",
+        "confidence must preserve the supplied value, not mirror normalized relevance"
+    );
+    Ok(())
+}
+
+#[test]
+fn absent_confidence_remains_explicitly_unavailable() -> Result<(), Box<dyn Error>> {
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &current_query(),
+        &authorized_exact(),
+        vec![scored_candidate("absent-confidence", unit_score("0.875"))],
+    )?;
+    let normalization =
+        normalize_admitted_candidates(RecallNormalizationPolicyV1::default(), &admission.admitted)?;
+
+    assert_eq!(
+        normalization
+            .candidate("absent-confidence")
+            .expect("normalized candidate")
+            .confidence,
+        RecallConfidenceV1::Unavailable {
+            reason: RecallConfidenceUnavailableReason::NotProvided,
+        },
+        "calibrated relevance must not manufacture confidence"
+    );
+    Ok(())
+}
+
+#[test]
+fn malformed_confidence_is_denied_with_a_typed_defect() -> Result<(), Box<dyn Error>> {
+    let cases = [
+        ("string", json!("0.5"), RecallConfidenceDefect::NotNumber),
+        ("nan-token", json!("NaN"), RecallConfidenceDefect::NotNumber),
+        (
+            "below-range",
+            json!(-0.001),
+            RecallConfidenceDefect::OutOfRange,
+        ),
+        (
+            "above-range",
+            json!(1.001),
+            RecallConfidenceDefect::OutOfRange,
+        ),
+    ];
+
+    for (id, confidence, expected) in cases {
+        let mut value = candidate_value(
+            id,
+            &format!("content of {id}"),
+            scope_value(&admitted_scope()),
+            current_validity(),
+        );
+        value["confidence"] = confidence;
+        let admission = admit_recall_candidates(
+            &admitted_scope(),
+            "request",
+            &current_query(),
+            &authorized_exact(),
+            vec![decode(value)],
+        )?;
+        assert!(admission.admitted.is_empty(), "{id}");
+        assert_eq!(admission.report.denied.len(), 1, "{id}");
+        assert_eq!(
+            admission.report.denied[0].reason,
+            RecallDenialReason::ConfidenceMalformed { defect: expected },
+            "{id}"
+        );
+        assert_eq!(
+            admission.report.denied[0].reason.label(),
+            "confidence_malformed"
+        );
+    }
     Ok(())
 }
 

@@ -344,6 +344,7 @@ fn denial_reason_detail(reason: &RecallDenialReason) -> Option<String> {
         | RecallDenialReason::ForbiddenIdentity { field } => Some(format!("field={field:?}")),
         RecallDenialReason::InvalidValidityRecord { detail } => Some(detail.clone()),
         RecallDenialReason::NativeScoreMalformed { defect } => Some(format!("{defect:?}")),
+        RecallDenialReason::ConfidenceMalformed { defect } => Some(format!("{defect:?}")),
         RecallDenialReason::StaleIdentity
         | RecallDenialReason::NotYetValid
         | RecallDenialReason::Expired

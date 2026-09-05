@@ -359,6 +359,7 @@ fn candidate_value(
             "semantics": "adversarial fixture",
             "components": {},
         },
+        "confidence": Value::Null,
         "exact_scope_identity": scope,
         "validity": current_validity(),
         "provenance": {

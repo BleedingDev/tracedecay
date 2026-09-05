@@ -1000,6 +1000,10 @@ pub enum AdvisoryLaneV1 {
     /// framing is charged to the advisory quota exactly like content would
     /// be.
     Notice {
+        /// Provider the routing policy selected for this unavailable lane.
+        provider_id: String,
+        /// Registration revision the unavailable call was routed under.
+        registration_revision: u64,
         /// Bounded, host-authored reason the lane could not answer.
         notice: String,
     },
@@ -1528,6 +1532,13 @@ fn contain_advisory_lane(
     lane: &AdvisoryLaneV1,
     excluded: &mut Vec<ExcludedProviderItemV1>,
 ) -> Result<AdvisoryLaneV1, ContextPackError> {
+    if let AdvisoryLaneV1::Notice { provider_id, .. } = lane
+        && !is_contained_provider_label(provider_id)
+    {
+        return Err(ContextPackError::ProviderAttributionInvalid {
+            field: "provider_id",
+        });
+    }
     let Some(contribution) = lane.contribution() else {
         return Ok(lane.clone());
     };
@@ -1670,9 +1681,17 @@ fn json_candidate(
 fn lane_framing_text(form: ContextPackRenderFormV1, lane: &AdvisoryLaneV1) -> String {
     match (form, lane) {
         (_, AdvisoryLaneV1::Absent) => String::new(),
-        (ContextPackRenderFormV1::Markdown, AdvisoryLaneV1::Notice { notice }) => {
-            format!("{ADVISORY_MARKDOWN_HEADING}Unavailable: {notice}\n")
-        }
+        (
+            ContextPackRenderFormV1::Markdown,
+            AdvisoryLaneV1::Notice {
+                provider_id,
+                registration_revision,
+                notice,
+            },
+        ) => format!(
+            "{ADVISORY_MARKDOWN_HEADING}Provider {provider_id} (registration revision \
+             {registration_revision}), unavailable: {notice}\n"
+        ),
         (ContextPackRenderFormV1::Markdown, AdvisoryLaneV1::Contribution(contribution)) => {
             let mut framing = format!(
                 "{ADVISORY_MARKDOWN_HEADING}Provider {} (registration revision {})",
@@ -1696,9 +1715,16 @@ fn lane_framing_text(form: ContextPackRenderFormV1, lane: &AdvisoryLaneV1) -> St
 fn json_lane_head(lane: &AdvisoryLaneV1) -> String {
     match lane {
         AdvisoryLaneV1::Absent => String::new(),
-        AdvisoryLaneV1::Notice { notice } => {
+        AdvisoryLaneV1::Notice {
+            provider_id,
+            registration_revision,
+            notice,
+        } => {
+            let provider = serde_json::to_string(provider_id).unwrap_or_else(|_| "\"\"".to_owned());
             let reason = serde_json::to_string(notice).unwrap_or_else(|_| "\"\"".to_owned());
-            format!("\"state\":\"unavailable\",\"reason\":{reason},")
+            format!(
+                "\"state\":\"unavailable\",\"provider_id\":{provider},\"registration_revision\":{registration_revision},\"reason\":{reason},"
+            )
         }
         AdvisoryLaneV1::Contribution(contribution) => {
             let provider = serde_json::to_string(&contribution.provider_id)
@@ -1850,9 +1876,14 @@ fn render_pack(
 fn lane_head_markdown(lane: &AdvisoryLaneV1) -> String {
     match lane {
         AdvisoryLaneV1::Absent => String::new(),
-        AdvisoryLaneV1::Notice { notice } => {
-            format!("{ADVISORY_MARKDOWN_HEADING}Unavailable: {notice}\n")
-        }
+        AdvisoryLaneV1::Notice {
+            provider_id,
+            registration_revision,
+            notice,
+        } => format!(
+            "{ADVISORY_MARKDOWN_HEADING}Provider {provider_id} (registration revision \
+             {registration_revision}), unavailable: {notice}\n"
+        ),
         AdvisoryLaneV1::Contribution(contribution) => {
             let mut head = format!(
                 "{ADVISORY_MARKDOWN_HEADING}Provider {} (registration revision {})",

@@ -2125,12 +2125,28 @@ fn routing_policy_rejects_zero_revision_and_self_targeting_fallback() -> Result<
 }
 
 #[test]
-fn degradation_requires_an_explicit_pinned_allowlist() -> Result<(), Box<dyn Error>> {
-    let forbidden = routing_policy("provider.active", 1, FallbackRule::Forbidden)?;
-    assert_eq!(
-        forbidden.decide_degradation(DegradationCause::Unavailable),
-        DegradationDecision::Declined(DegradationDeclinedReason::HostRuleForbidden)
-    );
+fn degradation_default_allows_only_content_free_causes() -> Result<(), Box<dyn Error>> {
+    let defaulted = routing_policy("provider.active", 1, FallbackRule::Forbidden)?;
+    for cause in [
+        DegradationCause::Unavailable,
+        DegradationCause::Cancelled,
+        DegradationCause::TimedOut,
+        DegradationCause::Unsupported,
+        DegradationCause::BudgetExhausted,
+    ] {
+        assert_eq!(
+            defaulted.decide_degradation(cause),
+            DegradationDecision::AllowedByDefault { cause }
+        );
+    }
+    for cause in [DegradationCause::Partial, DegradationCause::Stale] {
+        assert_eq!(
+            defaulted.decide_degradation(cause),
+            DegradationDecision::Declined(
+                DegradationDeclinedReason::ContentBearingRequiresExplicitPolicy { cause }
+            )
+        );
+    }
 
     let pinned = PinnedDegradationPolicy::new(
         "policy.recall.degradation",

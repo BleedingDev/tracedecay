@@ -84,7 +84,7 @@ use crate::provider_invocation::{
 use crate::recall_admission::{
     AdmittedTemporalQuery, RECALL_QUERY_CAPABILITY_ID, RecallAdmissionError, RecallAdmissionReport,
     RecallBudgetsV1, RecallCandidateContent, RecallCandidateV1, RecallRequestParts,
-    admit_recall_reply, build_recall_request_payload, rfc3339_utc_micros,
+    UnknownValidityPolicy, admit_recall_reply, build_recall_request_payload, rfc3339_utc_micros,
 };
 use crate::recall_normalization::{
     RecallNormalizationError, RecallNormalizationPolicyV1, RecallNormalizationV1,
@@ -397,6 +397,7 @@ pub struct ProjectCognitiveRecallPortV1 {
     budgets: RecallBudgetsV1,
     normalization: RecallNormalizationPolicyV1,
     selection: RecallSelectionPolicyV1,
+    unknown_validity_policy: UnknownValidityPolicy,
 }
 
 impl fmt::Debug for ProjectCognitiveRecallPortV1 {
@@ -408,6 +409,7 @@ impl fmt::Debug for ProjectCognitiveRecallPortV1 {
             .field("budgets", &self.budgets)
             .field("normalization", &self.normalization)
             .field("selection", &self.selection)
+            .field("unknown_validity_policy", &self.unknown_validity_policy)
             .finish_non_exhaustive()
     }
 }
@@ -480,6 +482,7 @@ impl ProjectCognitiveRecallPortV1 {
             budgets: inputs.budgets,
             normalization: RecallNormalizationPolicyV1::default(),
             selection,
+            unknown_validity_policy: UnknownValidityPolicy::Exclude,
         })
     }
 
@@ -507,6 +510,16 @@ impl ProjectCognitiveRecallPortV1 {
     #[must_use]
     pub const fn with_selection_policy(mut self, selection: RecallSelectionPolicyV1) -> Self {
         self.selection = selection;
+        self
+    }
+
+    /// Pins the host policy for provider records whose validity is unknown.
+    ///
+    /// The production default remains `Exclude`; callers that deliberately
+    /// admit unknown-validity content must opt into a typed stale degradation.
+    #[must_use]
+    pub const fn with_unknown_validity_policy(mut self, policy: UnknownValidityPolicy) -> Self {
+        self.unknown_validity_policy = policy;
         self
     }
 
@@ -635,7 +648,8 @@ impl ProjectCognitiveRecallPortV1 {
             ClockError::OverflowsI64Micros,
         ))?;
         let temporal = AdmittedTemporalQuery::current(&evaluation_time)
-            .map_err(CognitiveRecallPortError::Admission)?;
+            .map_err(CognitiveRecallPortError::Admission)?
+            .with_unknown_validity_policy(self.unknown_validity_policy);
         // The candidate budget the provider is told about is the smaller of
         // the application request and the host-owned budget; admission below
         // enforces exactly that dispatched value, never the unclamped request.
@@ -1193,7 +1207,9 @@ impl ProjectCognitiveRecallPortV1 {
             .routing
             .decide_degradation(degradation_cause(degradation))
         {
-            DegradationDecision::Allowed { .. } => Ok(()),
+            DegradationDecision::AllowedByDefault { .. } | DegradationDecision::Allowed { .. } => {
+                Ok(())
+            }
             DegradationDecision::Declined(reason) => {
                 Err(CognitiveRecallPortError::DegradationNotAllowed {
                     provider: provider.clone(),

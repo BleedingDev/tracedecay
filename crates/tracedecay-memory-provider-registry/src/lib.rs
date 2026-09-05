@@ -67,10 +67,11 @@ pub use recall_admission::{
     AdmittedRecallCandidate, AdmittedTemporalQuery, DeniedRecallCandidate,
     RECALL_PAYLOAD_CONTRACT_ID, RECALL_QUERY_CAPABILITY_ID, RecallAdmission, RecallAdmissionError,
     RecallAdmissionReport, RecallBudgetsV1, RecallCandidateContent, RecallCandidateV1,
-    RecallDenialReason, RecallOutcomeScopeV1, RecallOutcomeV1, RecallRequestParts,
-    RecallScopeBindingsV1, RecallScopeIdentityV1, RecallValidityV1, ScopeBinding, ScopeField,
-    TemporalState, UnknownValidityPolicy, admit_recall_candidates, admit_recall_reply,
-    build_recall_request_payload, decode_recall_outcome, parse_rfc3339_nanos, rfc3339_utc_micros,
+    RecallConfidenceDefect, RecallDenialReason, RecallOutcomeScopeV1, RecallOutcomeV1,
+    RecallRequestParts, RecallScopeBindingsV1, RecallScopeIdentityV1, RecallValidityV1,
+    ScopeBinding, ScopeField, TemporalState, UnknownValidityPolicy, admit_recall_candidates,
+    admit_recall_reply, build_recall_request_payload, decode_recall_outcome, parse_rfc3339_nanos,
+    rfc3339_utc_micros,
 };
 pub use recall_context_pack::{
     ADVISORY_CONTEXT_PACK_JSON_KEY, AdvisoryLaneV1, CANONICAL_CONTEXT_TOKENIZER_ID,

@@ -42,7 +42,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Number, Value};
 use sha2::{Digest, Sha256};
 
 use crate::recall_admission::{AdmittedRecallCandidate, ScopeBinding, TemporalState};
@@ -55,7 +55,7 @@ pub const HOST_NORMALIZATION_POLICY_ID: &str =
 
 /// Revision of [`HOST_NORMALIZATION_POLICY_ID`]. Any change to the projection,
 /// rounding, ordering, or evidence rules must increment this.
-pub const HOST_NORMALIZATION_POLICY_REVISION: u64 = 2;
+pub const HOST_NORMALIZATION_POLICY_REVISION: u64 = 3;
 
 /// Decimal places of every emitted normalized value.
 const NORMALIZED_SCALE: u32 = 6;
@@ -458,9 +458,8 @@ impl RecallNormalizationPolicyV1 {
 /// normalized relevance.
 ///
 /// Confidence is candidate evidence, not a value inferred from score
-/// calibration or declared-range projection. The accepted provider recall
-/// contract currently carries no candidate confidence datum, so normalized
-/// candidates preserve that absence explicitly.
+/// calibration or declared-range projection. A supplied provider value is
+/// preserved exactly; an explicit `null` remains explicit absence.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecallConfidenceUnavailableReason {
@@ -469,13 +468,15 @@ pub enum RecallConfidenceUnavailableReason {
 }
 
 /// Host confidence evidence for one normalized candidate.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RecallConfidenceV1 {
+    /// The provider supplied an admitted confidence value.
+    Available {
+        /// The exact finite value supplied by the provider in `0.0..=1.0`.
+        value: Number,
+    },
     /// The normalized candidate has no confidence claim.
-    ///
-    /// The accepted v1 provider recall candidate has no confidence field, so
-    /// every candidate currently occupies this explicit absence state.
     Unavailable {
         /// Why confidence is unavailable.
         reason: RecallConfidenceUnavailableReason,
@@ -613,8 +614,13 @@ pub fn normalize_admitted_candidates(
                 defect,
             })?;
         let relevance = relevance_from_units(policy, score, native_score_sha256, units);
-        let confidence = RecallConfidenceV1::Unavailable {
-            reason: RecallConfidenceUnavailableReason::NotProvided,
+        let confidence = match entry.confidence() {
+            Some(value) => RecallConfidenceV1::Available {
+                value: value.clone(),
+            },
+            None => RecallConfidenceV1::Unavailable {
+                reason: RecallConfidenceUnavailableReason::NotProvided,
+            },
         };
         let key = match units {
             Some(units) => {

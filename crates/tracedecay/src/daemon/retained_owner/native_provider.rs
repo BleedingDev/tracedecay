@@ -2172,6 +2172,7 @@ fn native_recall_candidate(
             "semantics": "project-memory combined score; fixed-point millionths",
             "components": score_components,
         },
+        "confidence": Value::Null,
         "exact_scope_identity": native_fact_scope_attestation(fact, profile_id),
         // The contract fixes validity instants as utc_rfc3339_nanos; the
         // host admission authority denies any other representation as an
@@ -2305,6 +2306,7 @@ fn native_staged_recall_candidate(
                 "admitted_sequence": row.admitted_sequence,
             },
         },
+        "confidence": Value::Null,
         "exact_scope_identity": staged_scope_attestation(row),
         "validity": {
             "observed_at": observed_at,

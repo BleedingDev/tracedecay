@@ -235,7 +235,7 @@ fn project_recall_degradation_rule(
         DegradationCause, DegradationRule, PinnedDegradationPolicy,
     };
     let Some(configured) = &config.memory_provider_recall_routing.degradation else {
-        return Ok(DegradationRule::Forbidden);
+        return Ok(DegradationRule::DefaultContentFree);
     };
     let policy = PinnedDegradationPolicy::new(
         configured.policy_id.clone(),
@@ -2208,7 +2208,27 @@ mod memory_provider_routing_tests {
             PROJECT_NATIVE_REGISTRATION_REVISION
         );
         assert_eq!(policy.fallback(), &FallbackRule::Forbidden);
-        assert_eq!(policy.degradation(), &DegradationRule::Forbidden);
+        assert_eq!(policy.degradation(), &DegradationRule::DefaultContentFree);
+        for cause in [
+            DegradationCause::Unavailable,
+            DegradationCause::Cancelled,
+            DegradationCause::TimedOut,
+            DegradationCause::Unsupported,
+            DegradationCause::BudgetExhausted,
+        ] {
+            assert_eq!(
+                policy.decide_degradation(cause),
+                DegradationDecision::AllowedByDefault { cause }
+            );
+        }
+        for cause in [DegradationCause::Partial, DegradationCause::Stale] {
+            assert_eq!(
+                policy.decide_degradation(cause),
+                DegradationDecision::Declined(
+                    DegradationDeclinedReason::ContentBearingRequiresExplicitPolicy { cause }
+                )
+            );
+        }
 
         config.memory_provider_recall_routing.degradation =
             Some(MemoryProviderRecallDegradationV1 {

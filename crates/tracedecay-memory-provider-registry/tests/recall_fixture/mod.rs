@@ -145,6 +145,7 @@ pub fn candidate_value(candidate_id: &str, content: &str, scope: Value, validity
             "semantics": "fixture",
             "components": {},
         },
+        "confidence": Value::Null,
         "exact_scope_identity": scope,
         "validity": validity,
         "provenance": {
@@ -234,6 +235,8 @@ pub struct RecallFixturePort {
     /// Replaces the stable provider reference of named candidates in the
     /// mixed outcome, including with `null` to exercise explicit absence.
     pub stable_memory_ref_overrides: std::collections::BTreeMap<String, Value>,
+    /// Replaces the validity object of named candidates.
+    pub validity_overrides: std::collections::BTreeMap<String, Value>,
     /// Replaces the whole candidate list with `(candidate_id, content)` pairs,
     /// every one of them in-scope and current, so a test can drive the real
     /// fabric, adapter, and port path with a candidate stream of its own
@@ -251,6 +254,7 @@ impl RecallFixturePort {
             terminal_code: TerminalCode::Success,
             native_score_overrides: std::collections::BTreeMap::new(),
             stable_memory_ref_overrides: std::collections::BTreeMap::new(),
+            validity_overrides: std::collections::BTreeMap::new(),
             candidate_contents: None,
         }
     }
@@ -272,6 +276,9 @@ impl RecallFixturePort {
                 if let Some(stable_memory_ref) = self.stable_memory_ref_overrides.get(&id) {
                     candidate["stable_memory_ref"] = stable_memory_ref.clone();
                 }
+                if let Some(validity) = self.validity_overrides.get(&id) {
+                    candidate["validity"] = validity.clone();
+                }
             }
         }
         if self.terminal_code == TerminalCode::SuccessZeroResults {
@@ -281,6 +288,8 @@ impl RecallFixturePort {
                 outcome["coverage"][counter] = json!(0);
             }
             outcome["terminal"]["terminal_code"] = json!("success_zero_results");
+        } else if self.terminal_code == TerminalCode::Partial {
+            outcome["terminal"]["terminal_code"] = json!("partial");
         }
         outcome
     }
@@ -459,7 +468,7 @@ impl NativeMemoryApplicationPort for RecallFixturePort {
         self.recall_calls.fetch_add(1, Ordering::Relaxed);
         let payload = if matches!(
             self.terminal_code,
-            TerminalCode::Success | TerminalCode::SuccessZeroResults
+            TerminalCode::Success | TerminalCode::SuccessZeroResults | TerminalCode::Partial
         ) {
             let bytes = serde_json::to_vec(&self.outcome_value(call)).expect("outcome bytes");
             let sha256 = sha256_hex(&bytes);
