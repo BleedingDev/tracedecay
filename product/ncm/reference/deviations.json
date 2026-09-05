@@ -3,16 +3,144 @@
   "profile": "ncm-biomem-rs.v1",
   "reference_commit": "500847ff65b5d9548b3826fa29bf3ccf8d221147",
   "entries": [
-    {"id": "D01", "component": "terrain.blur", "observed_reference": "Terrain3D.blur builds a 1-D Gaussian kernel then returns H.clone(), E.clone() without convolving.", "v1_behavior": "Real separable Gaussian blur (kernel_size=max(3,int(6*sigma)|1), normalized, replicate boundary) applied to H and E before pour.", "rationale": "The reference intent (docstring, kernel construction, consolidation §7.4) is a blur; the no-op is a defect.", "discriminating_test": "core tests/terrain.rs: asymmetric impulse spreads under blur; constant field unchanged; no-op implementation fails.", "status": "corrected"},
-    {"id": "D02", "component": "centers.write sigma", "observed_reference": "MemoryCenters.write calls compute_rbf_weights without sigma, so sigma_read is used for write candidates; sigma_write is never used.", "v1_behavior": "Executed reference behavior kept: write candidates use sigma_read. sigma_write retained in config and documented unused.", "rationale": "new_center_threshold values were tuned against the executed width; switching widths changes admission rates without evidence.", "discriminating_test": "core tests/center_write.rs asserts the write path uses sigma_read (a sigma_write mutant changes the created/reinforced decision on a fixture).", "status": "reference_compatible_documented"},
-    {"id": "D03", "component": "text recall terrain", "observed_reference": "_recall_impl calls read_compound_records without terrain_queries; terrain part is zeros.", "v1_behavior": "Same: terrain part contributes 0 to text recall; profile exposes terrain_read_influence=none.", "rationale": "No tested terrain-aware read policy exists; do not advertise one.", "discriminating_test": "core tests/center_read.rs: compound read with terrain None equals semantic+context only.", "status": "reference_compatible_documented"},
-    {"id": "D04", "component": "recall dedup", "observed_reference": "TextMemory.recall merges LTM/STM matches by key_text keeping the higher weight.", "v1_behavior": "Distinct records stay distinct; merge across layers only by RecordId; both layers reported.", "rationale": "Key-text dedup hides contradictory records and provenance.", "discriminating_test": "core tests/record_recall.rs: two records with the same key text and different values both appear.", "status": "corrected"},
-    {"id": "D05", "component": "read side effects", "observed_reference": "read/read_compound increment usage by default; recall increments read_count.", "v1_behavior": "Reads never mutate. Feedback is the only usage/learning-from-use path.", "rationale": "Host Recall/Search/Inspect must be side-effect free and idempotent.", "discriminating_test": "core tests/center_read.rs: repeated reads leave state digest unchanged; runtime engine tests: commit seq unchanged after recall.", "status": "corrected"},
-    {"id": "D06", "component": "load failure", "observed_reference": "_load_impl catches exceptions and logs; memory continues empty.", "v1_behavior": "Corrupt/incompatible state fails closed; fresh-empty only via explicit create.", "rationale": "Silent empty state is data loss presented as health.", "discriminating_test": "runtime tests/store.rs corrupt-open returns Corrupt, never Ready.", "status": "corrected"},
-    {"id": "D07", "component": "scheduler persistence", "observed_reference": "State records fatigue but not steps_since_consolidation.", "v1_behavior": "Full scheduler state persisted (fatigue, steps_since_consolidation, tick, epoch, seq).", "rationale": "Restart must not shift sleep boundaries.", "discriminating_test": "core tests/dynamics.rs split-run equals uninterrupted run; runtime store round-trip.", "status": "corrected"},
-    {"id": "D08", "component": "STM→LTM key alignment", "observed_reference": "to_ltm_key (384→64) and stm_to_ltm U (16→64) are independently initialized; consolidated LTM keys are not aligned with direct LTM query projections.", "v1_behavior": "Each record/center retains its canonical LTM key computed at observe time; consolidation writes that key. U kept for reference fixtures only.", "rationale": "Without alignment LTM-only recall of consolidated memories is chance-level.", "discriminating_test": "core tests/consolidation.rs: store→consolidate→mask STM→recall finds the record; the U-based mutant fails.", "status": "corrected_pending_alignment_measurement"},
-    {"id": "D09", "component": "terrain axis order", "observed_reference": "splat indexes H[x,y,z] with position[0]→dim0 while grid_sample reads position[0] along the last tensor dim.", "v1_behavior": "One convention: position component i ↔ grid axis i for splat and sample; index (x*G+y)*G+z.", "rationale": "Coherent write/read geometry.", "discriminating_test": "core tests/terrain.rs: sample after asymmetric splat peaks at the splat position; swapped-axis mutant fails.", "status": "corrected_hypothesis_confirmed_by_static_read"},
-    {"id": "D10", "component": "tick schedule", "observed_reference": "store() updates fatigue with 0.1*intensity and may auto-consolidate; homeostasis step() is caller-driven and separate.", "v1_behavior": "One learning tick per unique committed Observe: write → splat → fatigue/scheduler → homeostasis (both layers, both terrains). Reads/duplicates advance nothing. Maintenance{advance:n≤10000}.", "rationale": "The host has no separate step caller; an explicit frozen schedule is required.", "discriminating_test": "core tests/dynamics.rs; runtime engine tests: duplicate observe leaves tick/fatigue unchanged.", "status": "corrected_schedule_frozen"},
-    {"id": "D11", "component": "namespace", "observed_reference": "Adapter namespace hashes agent_session_id and resolved_scope_digest.", "v1_behavior": "Unchanged. Cross-session reuse only through host-authorized replay/share (task 024).", "rationale": "Authorization boundary.", "discriminating_test": "existing provider-ncm tests namespace_isolates_worktree_branch_and_session.", "status": "reference_compatible"}
+    {
+      "id": "D01",
+      "component": "terrain.blur",
+      "observed_reference": "Terrain3D.blur builds a 1-D Gaussian kernel then returns H.clone(), E.clone() without convolving.",
+      "v1_behavior": "Real separable Gaussian blur (kernel_size=max(3,int(6*sigma)|1), normalized, replicate boundary) applied to H and E before pour.",
+      "rationale": "The reference intent (docstring, kernel construction, consolidation \u00a77.4) is a blur; the no-op is a defect.",
+      "discriminating_test": "core tests/terrain.rs: asymmetric impulse spreads under blur; constant field unchanged; no-op implementation fails.",
+      "status": "corrected"
+    },
+    {
+      "id": "D02",
+      "component": "centers.write sigma",
+      "observed_reference": "MemoryCenters.write calls compute_rbf_weights without sigma, so sigma_read is used for write candidates; sigma_write is never used.",
+      "v1_behavior": "Executed reference behavior kept: write candidates use sigma_read. sigma_write retained in config and documented unused.",
+      "rationale": "new_center_threshold values were tuned against the executed width; switching widths changes admission rates without evidence.",
+      "discriminating_test": "core tests/center_write.rs asserts the write path uses sigma_read (a sigma_write mutant changes the created/reinforced decision on a fixture).",
+      "status": "reference_compatible_documented"
+    },
+    {
+      "id": "D03",
+      "component": "text recall terrain",
+      "observed_reference": "_recall_impl calls read_compound_records without terrain_queries; terrain part is zeros.",
+      "v1_behavior": "Same: terrain part contributes 0 to text recall; profile exposes terrain_read_influence=none.",
+      "rationale": "No tested terrain-aware read policy exists; do not advertise one.",
+      "discriminating_test": "core tests/center_read.rs: compound read with terrain None equals semantic+context only.",
+      "status": "reference_compatible_documented"
+    },
+    {
+      "id": "D04",
+      "component": "recall dedup",
+      "observed_reference": "TextMemory.recall merges LTM/STM matches by key_text keeping the higher weight.",
+      "v1_behavior": "Distinct records stay distinct; merge across layers only by RecordId; both layers reported.",
+      "rationale": "Key-text dedup hides contradictory records and provenance.",
+      "discriminating_test": "core tests/record_recall.rs: two records with the same key text and different values both appear.",
+      "status": "corrected"
+    },
+    {
+      "id": "D05",
+      "component": "read side effects",
+      "observed_reference": "read/read_compound increment usage by default; recall increments read_count.",
+      "v1_behavior": "Reads never mutate. Feedback is the only usage/learning-from-use path.",
+      "rationale": "Host Recall/Search/Inspect must be side-effect free and idempotent.",
+      "discriminating_test": "core tests/center_read.rs: repeated reads leave state digest unchanged; runtime engine tests: commit seq unchanged after recall.",
+      "status": "corrected"
+    },
+    {
+      "id": "D06",
+      "component": "load failure",
+      "observed_reference": "_load_impl catches exceptions and logs; memory continues empty.",
+      "v1_behavior": "Corrupt/incompatible state fails closed; fresh-empty only via explicit create.",
+      "rationale": "Silent empty state is data loss presented as health.",
+      "discriminating_test": "runtime tests/store.rs corrupt-open returns Corrupt, never Ready.",
+      "status": "corrected"
+    },
+    {
+      "id": "D07",
+      "component": "scheduler persistence",
+      "observed_reference": "State records fatigue but not steps_since_consolidation.",
+      "v1_behavior": "Full scheduler state persisted (fatigue, steps_since_consolidation, tick, epoch, seq).",
+      "rationale": "Restart must not shift sleep boundaries.",
+      "discriminating_test": "core tests/dynamics.rs split-run equals uninterrupted run; runtime store round-trip.",
+      "status": "corrected"
+    },
+    {
+      "id": "D08",
+      "component": "STM\u2192LTM key alignment",
+      "observed_reference": "to_ltm_key (384\u219264) and stm_to_ltm U (16\u219264) are independently initialized; consolidated LTM keys are not aligned with direct LTM query projections.",
+      "v1_behavior": "Each record/center retains its canonical LTM key computed at observe time; consolidation writes that key. U kept for reference fixtures only.",
+      "rationale": "Without alignment LTM-only recall of consolidated memories is chance-level.",
+      "discriminating_test": "core tests/consolidation.rs: store\u2192consolidate\u2192mask STM\u2192recall finds the record; the U-based mutant fails.",
+      "status": "corrected_pending_alignment_measurement"
+    },
+    {
+      "id": "D09",
+      "component": "terrain axis order",
+      "observed_reference": "splat indexes H[x,y,z] with position[0]\u2192dim0 while grid_sample reads position[0] along the last tensor dim.",
+      "v1_behavior": "One convention: position component i \u2194 grid axis i for splat and sample; index (x*G+y)*G+z.",
+      "rationale": "Coherent write/read geometry.",
+      "discriminating_test": "core tests/terrain.rs: sample after asymmetric splat peaks at the splat position; swapped-axis mutant fails.",
+      "status": "corrected_confirmed_by_executable_oracle",
+      "execution_evidence": {
+        "fixture": "oracle/terrain.json",
+        "field": "axis_probe",
+        "grid_peak_index_xyz": [
+          3,
+          6,
+          12
+        ],
+        "splat_position": [
+          -0.6,
+          -0.2,
+          0.6
+        ],
+        "sample_at_xyz": 0.0,
+        "sample_at_zyx": 0.9999998807907104,
+        "conclusion": "Splat position[i] indexes tensor axis i; grid_sample position[0] reads the last tensor axis. Reference sample returns H[z,y,x]."
+      }
+    },
+    {
+      "id": "D10",
+      "component": "tick schedule",
+      "observed_reference": "store() updates fatigue with 0.1*intensity and may auto-consolidate; homeostasis step() is caller-driven and separate.",
+      "v1_behavior": "One learning tick per unique committed Observe: write \u2192 splat \u2192 fatigue/scheduler \u2192 homeostasis (both layers, both terrains). Reads/duplicates advance nothing. Maintenance{advance:n\u226410000}.",
+      "rationale": "The host has no separate step caller; an explicit frozen schedule is required.",
+      "discriminating_test": "core tests/dynamics.rs; runtime engine tests: duplicate observe leaves tick/fatigue unchanged.",
+      "status": "corrected_schedule_frozen"
+    },
+    {
+      "id": "D11",
+      "component": "namespace",
+      "observed_reference": "Adapter namespace hashes agent_session_id and resolved_scope_digest.",
+      "v1_behavior": "Unchanged. Cross-session reuse only through host-authorized replay/share (task 024).",
+      "rationale": "Authorization boundary.",
+      "discriminating_test": "existing provider-ncm tests namespace_isolates_worktree_branch_and_session.",
+      "status": "reference_compatible"
+    },
+    {
+      "id": "D12",
+      "component": "centers.merge tensor aliasing",
+      "observed_reference": "merge_similar binds h_i and h_j as tensor views, then assigns total_h to self.h[idx_i] before computing weighted K/V/e. h_i therefore becomes total_h in subsequent arithmetic. For h_i=2,h_j=3,V_i=1,V_j=4, the executed V_i is 3.4000000953674316 rather than the nonaliased weighted average 2.8.",
+      "v1_behavior": "Corrected: merge uses the PRE-merge intensities h_i, h_j for the weighted K/V/e/ltm_key average, i.e. V_i' = (h_i\u00b7V_i + h_j\u00b7V_j)/(h_i+h_j+1e-8); the executed reference value (aliased h_i = total_h) is preserved only in the oracle fixture as expected-difference data.",
+      "rationale": "The aliasing is a Python view side effect, not an intended rule; the docstring and spec describe an intensity-weighted average.",
+      "discriminating_test": "core tests/consolidation.rs: explicit h=[2,3], V=[1,4] merge yields 2.8 (aliased mutant would yield 3.4).",
+      "evidence": {
+        "source": "src/memory_module/memory_centers.py",
+        "symbol": "MemoryCenters.merge_similar",
+        "reference_commit": "500847ff65b5d9548b3826fa29bf3ccf8d221147"
+      },
+      "status": "corrected"
+    },
+    {
+      "id": "D13",
+      "component": "top-k tie order",
+      "observed_reference": "torch.topk returns ties in an unspecified, non-ascending index order.",
+      "v1_behavior": "Rust top-k resolves exact ties by ascending center index (contract \u00a74). Oracle comparisons treat tied candidates as an equivalence group: indices must match as sets within each tie group and weights must match elementwise after sorting by index.",
+      "rationale": "Deterministic, documented tie policy; reference order is not reproducible.",
+      "discriminating_test": "core tests/numeric.rs tie stability; fixture loaders compare tie groups.",
+      "status": "corrected_tie_policy"
+    }
   ]
 }
