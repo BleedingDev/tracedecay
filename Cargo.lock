@@ -6799,6 +6799,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracedecay-memory-ncm-core"
+version = "0.1.0-beta.37"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "tracedecay-memory-ncm-runtime"
+version = "0.1.0-beta.37"
+dependencies = [
+ "fastembed",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tracedecay-memory-ncm-core",
+]
+
+[[package]]
 name = "tracedecay-memory-observation"
 version = "0.1.0-beta.37"
 dependencies = [

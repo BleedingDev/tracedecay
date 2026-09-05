@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "coordinator_owned": [
+    "Cargo.toml", "Cargo.lock",
+    "crates/tracedecay-memory-ncm-core/Cargo.toml", "crates/tracedecay-memory-ncm-core/src/lib.rs", "crates/tracedecay-memory-ncm-core/src/types.rs", "crates/tracedecay-memory-ncm-core/src/centers/mod.rs",
+    "crates/tracedecay-memory-ncm-runtime/Cargo.toml", "crates/tracedecay-memory-ncm-runtime/src/lib.rs", "crates/tracedecay-memory-ncm-runtime/src/ports.rs",
+    "product/ncm/spec/", "product/ncm/reference/source-manifest.json", "product/ncm/reference/NOTICE.md", "product/ncm/plan/", "product/ncm/bootstrap/"
+  ],
+  "predeclared_module_files": [
+    "crates/tracedecay-memory-ncm-core/src/{numeric,projections,signals,terrain,dynamics,consolidation,records,recall,kernel}/mod.rs",
+    "crates/tracedecay-memory-ncm-core/src/centers/{read,write,allocation}.rs",
+    "crates/tracedecay-memory-ncm-runtime/src/{embedding,store,engine,privacy,maintenance,snapshot,worker,wire,client}/mod.rs",
+    "crates/tracedecay-memory-ncm-runtime/src/bin/tracedecay-ncm-worker.rs"
+  ],
+  "task_ownership_additions": {
+    "ncm-rs-010": ["crates/tracedecay-memory-ncm-core/src/kernel/"],
+    "note": "kernel/ composes centers+terrain+projections+scheduler into the pure NcmKernel (observe/recall/advance/consolidate/serialize); owned by the consolidation task because it is the first task that needs the whole composition."
+  }
+}

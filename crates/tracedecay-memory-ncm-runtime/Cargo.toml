@@ -1,0 +1,45 @@
+[package]
+name = "tracedecay-memory-ncm-runtime"
+version.workspace = true
+edition.workspace = true
+publish = false
+license = "MIT"
+description = "NCM runtime: real text encoder, durable provider-owned store, transactional engine, deletion/recovery, supervised worker and wire transport"
+repository = "https://github.com/BleedingDev/tracedecay"
+
+[[bin]]
+name = "tracedecay-ncm-worker"
+path = "src/bin/tracedecay-ncm-worker.rs"
+
+[dependencies]
+tracedecay-memory-ncm-core = { path = "../tracedecay-memory-ncm-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+# Real native inference (contract §9). Same pinned fork/features as tracedecay-semantic.
+fastembed = { version = "=5.17.3", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
+
+[features]
+# Production shape. Lanes that do not touch inference build with `--no-default-features`
+# to skip the ORT toolchain; the worker refuses Observe/Recall without a real encoder.
+default = ["real-encoder"]
+real-encoder = ["dep:fastembed"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+warnings = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"

@@ -1,0 +1,1204 @@
+{
+  "schema_version": 1,
+  "title": "Biomem-based Rust NCM implementation DAG",
+  "prepared_on": "2026-09-05",
+  "status": "proposal_not_imported_or_executed",
+  "target": {
+    "repository": "BleedingDev/tracedecay",
+    "base_branch": "feat/pluggable-memory-providers-v2",
+    "base_commit": "25778c7443cd0cfe257da363da01a56ea1d45d3f",
+    "suggested_work_branch": "feat/ncm-biomem-rust-v1",
+    "reference_repository": "BleedingDev/biomem",
+    "reference_commit": "500847ff65b5d9548b3826fa29bf3ccf8d221147"
+  },
+  "instruction_precedence": "This request supersedes the earlier decision to defer the Rust NCM port. It does not waive host stabilization or active-mode safety gates.",
+  "sources": {
+    "S01": {
+      "title": "Biomem pinned implementation",
+      "repository": "BleedingDev/biomem",
+      "commit": "500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "url": "https://github.com/BleedingDev/biomem/tree/500847ff65b5d9548b3826fa29bf3ccf8d221147",
+      "review": "README, config, projection, center read/write excerpts, terrain, consolidation, text store/recall/state, embedder, and LICENSE inspected; not executed."
+    },
+    "S02": {
+      "title": "Biomem configuration",
+      "url": "https://github.com/BleedingDev/biomem/blob/500847ff65b5d9548b3826fa29bf3ccf8d221147/src/memory_module/config.py",
+      "git_blob": "9b317cd8523991805993cc03fb84f22611840ea3"
+    },
+    "S03": {
+      "title": "Biomem center algorithms",
+      "url": "https://github.com/BleedingDev/biomem/blob/500847ff65b5d9548b3826fa29bf3ccf8d221147/src/memory_module/memory_centers.py",
+      "git_blob": "ed1fc3e6df41a0fe3e6c508928fc2b6385456ef6"
+    },
+    "S04": {
+      "title": "Biomem terrain",
+      "url": "https://github.com/BleedingDev/biomem/blob/500847ff65b5d9548b3826fa29bf3ccf8d221147/src/memory_module/terrain_3d.py",
+      "git_blob": "f4b3a936e2b316dc08826e6fe5794d0e42242c22"
+    },
+    "S05": {
+      "title": "Biomem consolidation",
+      "url": "https://github.com/BleedingDev/biomem/blob/500847ff65b5d9548b3826fa29bf3ccf8d221147/src/memory_module/consolidation.py",
+      "git_blob": "968b4a2669181a190888ccff50eb9644e2adcbaa"
+    },
+    "S06": {
+      "title": "Biomem projections",
+      "url": "https://github.com/BleedingDev/biomem/blob/500847ff65b5d9548b3826fa29bf3ccf8d221147/src/memory_module/projections.py",
+      "git_blob": "433267fa3ab98bf0b9f3e06490c558320897a63d"
+    },
+    "S07": {
+      "title": "Biomem text-memory orchestration",
+      "url": "https://github.com/BleedingDev/biomem/blob/500847ff65b5d9548b3826fa29bf3ccf8d221147/src/memory_module/text_memory.py",
+      "git_blob": "feeec785d0d5ad0b4416ed29e3512de941d9f49a"
+    },
+    "S08": {
+      "title": "Biomem real text embedding and emotion extraction",
+      "url": "https://github.com/BleedingDev/biomem/blob/500847ff65b5d9548b3826fa29bf3ccf8d221147/src/memory_module/embedder.py",
+      "git_blob": "1a0784bf58030ea36c01e0639b15bef65f8d9994"
+    },
+    "S09": {
+      "title": "Biomem MIT notice",
+      "url": "https://github.com/BleedingDev/biomem/blob/500847ff65b5d9548b3826fa29bf3ccf8d221147/LICENSE",
+      "git_blob": "eba479bc5df694b05f9adb8ee248ae1243b876eb"
+    },
+    "S10": {
+      "title": "Persistent Memory for Decoder-Only Transformers: Latent Terrain, Diffusion, Homeostasis, and Emotional Stabilization",
+      "author": "Michal Seidl",
+      "doi": "10.5281/zenodo.18198327",
+      "url": "https://zenodo.org/records/18198327",
+      "version": "v1, 2026-01-09",
+      "review": "Primary record and abstract inspected; original PDF retrieval failed. Full-text verification and file checksums remain N01 work."
+    },
+    "S11": {
+      "title": "Implementation of Persistent Latent Memory for Decoder Transformers",
+      "author": "Michal Seidl",
+      "doi": "10.5281/zenodo.18267378",
+      "url": "https://zenodo.org/records/18267378",
+      "review": "Identified by the primary OpenTechLab publication page. Record rate-limited; PDF retrieval failed on size. No full-text or figure verification claimed."
+    },
+    "S12": {
+      "title": "OpenTechLab primary publication catalog",
+      "url": "https://www.opentechlab.cz/publikace.html",
+      "review": "Lists both memory publications and their downloadable paper filenames."
+    },
+    "S13": {
+      "title": "BioCortexAI supplementary scientific documentation",
+      "url": "https://zenodo.org/records/18198327/files/BioCortexAI_Documentation_EN.md?download=1",
+      "review": "Primary supplementary text inspected; its header states CC BY-NC 4.0. It is not a blanket commercial code license."
+    },
+    "S14": {
+      "title": "Existing NCM adapter boundary",
+      "url": "https://github.com/BleedingDev/tracedecay/blob/25778c7443cd0cfe257da363da01a56ea1d45d3f/crates/tracedecay-memory-provider-ncm/src/lib.rs",
+      "git_blob": "708f30b5c8f6a2f2350567b189a0aa487e648c50",
+      "review": "NcmNamespace includes agent_session_id and resolved_scope_digest; NcmCognitiveSurface is synchronous; adapter owns scope/readiness checks."
+    },
+    "S15": {
+      "title": "Versioned Beads plan at checkpoint",
+      "url": "https://github.com/BleedingDev/tracedecay/blob/25778c7443cd0cfe257da363da01a56ea1d45d3f/.beads/issues.jsonl",
+      "git_blob": "9c27c2f0a3375bd2255e341c6696fe257e34afd8",
+      "review": "tdmem-0700 and 0702 onward were descoped; 0701 audit was completed. 0606/0608/0609 remain open in inspected records."
+    },
+    "S16": {
+      "title": "Existing host journey",
+      "url": "https://github.com/BleedingDev/tracedecay/blob/25778c7443cd0cfe257da363da01a56ea1d45d3f/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs"
+    },
+    "S17": {
+      "title": "Existing provider-neutral evaluation",
+      "url": "https://github.com/BleedingDev/tracedecay/blob/25778c7443cd0cfe257da363da01a56ea1d45d3f/product/evaluation/README.md"
+    },
+    "S18": {
+      "title": "MiniLM primary model card",
+      "url": "https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+      "review": "384-dimensional output; masked mean pooling; SentenceTransformer max_seq_length 128; Apache-2.0 metadata. Exact model revision/artifact hashes still must be pinned."
+    },
+    "S19": {
+      "title": "Existing upstream convergence procedure",
+      "url": "https://github.com/BleedingDev/tracedecay/blob/25778c7443cd0cfe257da363da01a56ea1d45d3f/product/upstream/README.md"
+    }
+  },
+  "external_gates": [
+    {
+      "id": "HOST-STABLE",
+      "owner_role": "Existing stabilization agent",
+      "satisfied": false,
+      "required_evidence": [
+        "Accepted host commit/tree with retention live-source safety and eventual convergence demonstrated, including offline/unseated coverage.",
+        "Architecture policy tests and real dependency graph checked; ownership/upstream convergence reconciled.",
+        "Relevant cc-482/cc-483 groups, correctly selected pointer-history regression, workspace/features and follow-up performance checks executed; no empty test selections."
+      ]
+    },
+    {
+      "id": "HOST-OBSERVE",
+      "owner_role": "Host observation/integration owner",
+      "satisfied": false,
+      "required_evidence": [
+        "Current joined host genuinely ingests source observations and supports durable idempotent dispatch.",
+        "Native real-process host journey passes, including negative controls against startup import.",
+        "Approved authority for bounded historical-session replay/share; no raw session/worktree identity bypass."
+      ]
+    },
+    {
+      "id": "HOST-RECALL",
+      "owner_role": "Host recall/provenance owner",
+      "satisfied": false,
+      "required_evidence": [
+        "Actual read path propagates deadlines/cancellation through provenance lookup and retained trace persistence.",
+        "Current equivalents of tdmem-0606, 0608 and 0609 are accepted by executed evidence; historical status alone is insufficient.",
+        "Required host evidence survives packing; provider identity/fallback and typed failures are preserved."
+      ]
+    },
+    {
+      "id": "HOST-RELEASE",
+      "owner_role": "Release/integration owner",
+      "satisfied": false,
+      "required_evidence": [
+        "Accepted combined-tree host production/feature/workspace gates from N25, with an existing packaging procedure and identified release owner.",
+        "Required target runners, model-artifact access, signing/publishing permissions when required, and the supported OS/architecture claim are available or explicitly narrowed before release work.",
+        "Attribution and artifact-specific rights are resolved; active rollout remains opt-in. NCM packaging/install verification is N26 output, not a prerequisite of this external gate."
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "ncm-rs-001",
+      "title": "Pin reference, research provenance, and new work authorization",
+      "status": "planned",
+      "depends_on": [],
+      "external_gates": [],
+      "owner_role": "Coordinator / reference reviewer",
+      "write_paths": [
+        "product/ncm/reference/source-manifest.json",
+        "product/ncm/reference/NOTICE.md",
+        "product/ncm/plan/"
+      ],
+      "objective": "Establish exactly what is being reimplemented, without treating prior descoping or the Python README as delivery evidence.",
+      "implementation": [
+        "Pin product base 25778c7443cd0cfe257da363da01a56ea1d45d3f and Biomem 500847ff65b5d9548b3826fa29bf3ccf8d221147; record tree/blob identities for every source file used. Do not follow moving branch names during implementation.",
+        "Record this request as authorization for a new Rust-backend work package. Preserve historic tdmem-0700/0702–0711 descoped closures; link new tasks rather than rewriting them as delivered. Reuse the 0701 audit only after checking its pinned source and evidence.",
+        "Acquire both original papers, verify title/author/version and file hashes, and map relevant sections. Record discrepancies between papers, supplementary documentation, README and executable code. Do not fabricate equation numbers or experimental results when full text is unavailable.",
+        "Preserve the Biomem MIT notice for reused substantial material. Audit provenance of any copied assets/code and model license. Do not copy CC BY-NC supplementary code into commercial artifacts on the assumption that the repository MIT notice relicenses it. Escalate unresolved rights for the specific artifact, not as a vague blocker to all independent work."
+      ],
+      "acceptance": [
+        "A machine-readable manifest identifies immutable code and model inputs; unresolved artifact hashes are explicitly blocked, never placeholder digests.",
+        "All production implementation sources are categorized: MIT reference code, paper concepts, or original product work.",
+        "Full-paper-derived requirements are approved only after actual full-text review; otherwise that portion remains blocked and no paper-conformance claim is made.",
+        "The new task package is staged on the independent branch only; shared .beads/issues.jsonl is not edited by parallel workers."
+      ],
+      "test_targets": [
+        "reference_manifest_test (planned stdlib validator)"
+      ],
+      "sources": [
+        "S01",
+        "S09",
+        "S10",
+        "S11",
+        "S12",
+        "S13",
+        "S15"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-002",
+      "title": "Build an executable Python oracle and defect-disposition matrix",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-001"
+      ],
+      "external_gates": [],
+      "owner_role": "Reference / numerical verifier",
+      "write_paths": [
+        "scripts/product/ncm/reference/",
+        "product/ncm/reference/oracle/",
+        "product/ncm/reference/deviations.json"
+      ],
+      "objective": "Provide an independent numerical oracle without reproducing known no-ops or accepting untested claims.",
+      "implementation": [
+        "Run the pinned Python core in an isolated CPU environment. Pin Python, torch, sentence-transformers, tokenizer/model artifacts, thread count, dtype, and initial state. Classify tests using fake embeddings separately from real-model tests.",
+        "Export actual initialized projection matrices, tensors, masks, counters and ordered operations to a non-executable, bounded fixture format. A shared seed is insufficient for cross-language RNG parity. Export per-operation intermediate states, not just final answer strings.",
+        "Create red controls for blur returning unchanged grids, write sigma using read sigma, load errors being swallowed, missing consolidation cadence in snapshots, potential terrain axis mismatch, and STM→LTM key-space alignment. Each entry needs observed reference behavior, intended v1 behavior, rationale and a discriminating test.",
+        "Maintain one production algorithm profile. Preserve original behavior only in reference fixtures, not in a second shipped legacy engine. Mark deliberate corrections as expected differences, not tolerance exceptions.",
+        "Record exact _sanitize_emotion/preset/dictionary/keyword semantics, including neutral-on-None and Czech dictionary keys. Fixtures must distinguish caller-supplied affect from optional text heuristics; no inferred mental-state or decoder-surprise claims."
+      ],
+      "acceptance": [
+        "Oracle fixtures regenerate deterministically after canonicalizing independently generated identities/timestamps with explicit harness inputs.",
+        "Wrong/no-op blur, constant-output recall, disabled consolidation and random projection substitutions are detected by negative controls.",
+        "Every intentional divergence has an approved expected result and independent oracle/analytic justification.",
+        "Fixtures include empty, singleton, >64-center hybrid selection, near-threshold, asymmetric terrain, merge, consolidation, and long sequential traces."
+      ],
+      "test_targets": [
+        "reference_oracle_test",
+        "reference_negative_controls_test"
+      ],
+      "sources": [
+        "S02",
+        "S03",
+        "S04",
+        "S05",
+        "S06",
+        "S07"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-003",
+      "title": "Freeze backend contracts, scope policy, effects and resource budgets",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-001"
+      ],
+      "external_gates": [],
+      "owner_role": "Backend architect / integration liaison",
+      "write_paths": [
+        "product/ncm/spec/"
+      ],
+      "objective": "Give independent workers a stable internal contract and prevent scope or durability redesign late in implementation.",
+      "implementation": [
+        "Specify typed opaque NamespaceId, SourceId, RecordId, CenterSlot+incarnation, AlgorithmIdentity, StateEpoch, CommitSequence, LogicalTick and operation receipts. Public record identity must not be a reusable array index.",
+        "Keep the current full exact-scope namespace in the first adapter. Cross-session reuse must come from an explicitly host-authorized replay/share bridge, preserving original-source provenance; never drop agent_session_id or resolved_scope_digest silently. Core math sees only opaque namespaces and input records, never Git or host stores.",
+        "Define Observe, read-only Recall/Search/Inspect, explicit Feedback/Correction, Advance/Maintain, Delete, Export/Restore and Close behavior, and map these to the actual existing ProviderOperation variants and payload schemas. Unsupported host operations return typed unsupported; do not invent a parallel public provider API.",
+        "Audit state_generation semantics against AcceptedReadiness. Separate compatibility/reset epoch from ordinary commit sequence so each observation neither invalidates readiness accidentally nor permits stale expected generations.",
+        "Choose supervised local Rust worker for production, pure Rust core for numerical testing, Python only as the offline reference. Reuse host supervision and admission. Specify crash-safe commit/publish order, deadline/kill behavior, cancellation effect states and bounded mailbox frames.",
+        "Freeze source-deletion reconstruction and quota policy before storage work. v1 uses bounded replay-complete source capsules/event history and a privacy epoch outside restorable snapshots; incomplete lineage means refuse serving until a truthful repair/reset, never claim exact deletion from metadata alone.",
+        "Freeze the real-encoder library/artifact-loading approach and dependency inventory before N04 updates Cargo manifests. Do not silently reinterpret public expected_state_generation: prove its actual contract with sequential mutations and readiness checks; keep internal epoch and commit sequence distinct."
+      ],
+      "acceptance": [
+        "Schema examples for success, empty, rejected, busy, cancelled, effect-unknown, incompatible and corrupt are reviewed against existing contracts.",
+        "Budgets are finite for centers, record bytes, lineage, event log, namespace count, resident views, snapshots, queued bytes, compute operations, and privacy reserve; authoritative acknowledgements never rely on auto-save.",
+        "Read-only operations do not change h, usage, age, fatigue, centers, terrain or persistence sequence. Any learning-from-use is a separately admitted idempotent feedback effect.",
+        "Late host write paths and required external evidence are specified as proposals; final host-owner approval is deferred to N23, not a prerequisite for independent backend work. Production NCM remains default-off."
+      ],
+      "test_targets": [
+        "contract_schema_test",
+        "operation_contract_examples_test"
+      ],
+      "sources": [
+        "S14",
+        "S15",
+        "S17",
+        "S18"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-004",
+      "title": "Create isolated Rust packages and compile-time interfaces",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-003"
+      ],
+      "external_gates": [],
+      "owner_role": "NCM branch coordinator",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-core/Cargo.toml",
+        "crates/tracedecay-memory-ncm-core/src/lib.rs",
+        "crates/tracedecay-memory-ncm-core/src/types.rs",
+        "crates/tracedecay-memory-ncm-runtime/Cargo.toml",
+        "crates/tracedecay-memory-ncm-runtime/src/lib.rs",
+        "crates/tracedecay-memory-ncm-runtime/src/ports.rs",
+        "Cargo.toml",
+        "Cargo.lock",
+        "product/ncm/bootstrap/"
+      ],
+      "objective": "Make backend-only development possible without touching retention, host CI policy or current recall composition.",
+      "implementation": [
+        "Add exactly two product-owned packages: core for numerical state and opaque record support; runtime for state I/O, actual embedding execution, worker and protocol. Retain the existing provider-ncm adapter.",
+        "Coordinator alone edits this branch’s workspace member list and lockfile. Predeclare module paths with empty private module files where needed; those files contain no implemented public capability or fake success. Their exact initial paths must be added to this task’s ownership manifest before creation. Later central manifest/interface adjustments are coordinator-owned integration commits, not concurrent worker edits. No temporary second workspace or duplicate lockfile.",
+        "Core has no Tokio, filesystem, process, network, host-store or concrete-provider dependency. Runtime must not depend on provider-ncm or registry, avoiding a dependency cycle when the adapter depends on its client/wire library.",
+        "Pin required numeric/serialization/inference dependencies to reviewed versions compatible with the repository toolchain. Reuse a matching existing Rust inference backend where feasible; do not silently choose a different embedding model."
+      ],
+      "acceptance": [
+        "Both packages compile independently under the pinned workspace toolchain with warnings denied and owned unsafe code forbidden.",
+        "No NCM registration, active route, background process or state directory exists when the feature is off.",
+        "Backend branch diff contains only declared product-owned work plus the isolated manifest/lock patch.",
+        "Later workers have compile-time contracts and module paths; any newly discovered shared manifest/interface change is serialized through the coordinator and recorded as an explicit dependency change rather than edited concurrently."
+      ],
+      "test_targets": [
+        "cargo check -p tracedecay-memory-ncm-core -p tracedecay-memory-ncm-runtime --locked",
+        "dependency_boundary_test"
+      ],
+      "sources": [
+        "S14",
+        "S19"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-005",
+      "title": "Implement numerical primitives and persisted projection bundle",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-002",
+        "ncm-rs-004"
+      ],
+      "external_gates": [],
+      "owner_role": "Core / projections",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-core/src/numeric/",
+        "crates/tracedecay-memory-ncm-core/src/projections/",
+        "crates/tracedecay-memory-ncm-core/tests/numeric.rs",
+        "crates/tracedecay-memory-ncm-core/tests/projections.rs"
+      ],
+      "objective": "Reproduce the real vector transformations with explicit numerical identity.",
+      "implementation": [
+        "Implement validated f32 operations, normalization, stable log-softmax, cosine distance, hybrid p=0.5 dissimilarity and deterministic top-k. Reject non-finite values and dimension mismatches before state mutation.",
+        "Load the oracle’s explicit projection matrices: 384→64 LTM, 384→16 STM/context, 384→128 values, key→3D tanh and 16→64 consolidation. Persist matrices and hashes; never reinitialize them on open/reset/replay without an explicit new epoch.",
+        "Define zero-vector handling, epsilon placement and tie groups. p=0.5 is not a mathematical metric; do not use triangle-inequality indexing assumptions.",
+        "Implement shared projected-record structures that preserve a canonical LTM-basis key when required by the approved alignment disposition."
+      ],
+      "acceptance": [
+        "Reference-compatible primitive outputs satisfy the frozen float tolerances; shape/mask/identity values match exactly.",
+        "Exact ties are stable in Rust; reference nondeterministic ties are compared as predefined equivalence groups, not hidden by fuzzy ranking.",
+        "NaN, infinity, degenerate inputs and malformed matrix files produce typed errors without partial state.",
+        "Open and restore reuse identical projection identity."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-ncm-core --test numeric --test projections --locked"
+      ],
+      "sources": [
+        "S03",
+        "S06"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-006",
+      "title": "Implement center reads: RBF, hybrid selection and compound keys",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-005"
+      ],
+      "external_gates": [],
+      "owner_role": "Core / center reads",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-core/src/centers/read.rs",
+        "crates/tracedecay-memory-ncm-core/tests/center_read.rs"
+      ],
+      "objective": "Implement associative reading, not a renamed key-value lookup or flat cosine-only search.",
+      "implementation": [
+        "Reproduce active-mask filtering, cosine candidate preselection, hybrid reranking above the 64-candidate boundary, selected-center intensity weighting and weighted value/emotion reads.",
+        "Implement compound semantic/context/terrain scoring separately from the plain RBF path. The Python TextMemory recall uses compound reads; do not assume it uses the plain hybrid path.",
+        "Expose score components and selected source-support handles without labeling normalized weights as calibrated confidence.",
+        "Accept immutable read views and operation budgets. All read statistics are output metadata, not implicit learning effects."
+      ],
+      "acceptance": [
+        "Empty, singleton, 64/65-center transitions, distant queries, intensity imbalance and context/terrain perturbation fixtures pass.",
+        "A caller can inspect actual contributions; a one-item softmax weight of 1 is not reported as certainty of relevance.",
+        "Batch decomposition behavior is specified; reference batch-global Minkowski normalization is recorded if corrected to per-query normalization.",
+        "Repeated reads leave the learning-state digest and commit sequence unchanged."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-ncm-core --test center_read --locked"
+      ],
+      "sources": [
+        "S03",
+        "S07"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-007",
+      "title": "Implement center writes, allocation and bounded source support",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-006"
+      ],
+      "external_gates": [],
+      "owner_role": "Core / center writes",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-core/src/centers/write.rs",
+        "crates/tracedecay-memory-ncm-core/src/centers/allocation.rs",
+        "crates/tracedecay-memory-ncm-core/tests/center_write.rs",
+        "crates/tracedecay-memory-ncm-core/src/signals/",
+        "crates/tracedecay-memory-ncm-core/tests/signals.rs"
+      ],
+      "objective": "Implement genuine stateful learning with stable identities and complete mutation attribution.",
+      "implementation": [
+        "Implement novelty, surprise and salience weighting, STM admission, local updates of intensity/value/emotion/context/terrain position and fixed-capacity allocation.",
+        "Use the explicitly approved sigma-write behavior; the pinned reference write calls compute_rbf_weights without passing sigma_write. A corrected width needs a versioned divergence test.",
+        "Track every source that influences every updated center, not just the top center’s displayed text. Resolve capacity with a documented deterministic rule and a receipt; never silently overwrite a public record identity.",
+        "Distinguish same logical record from duplicate operation. Stable memory_id alone is not an exactly-once guard; durable request deduplication is N14.",
+        "Implement four-channel affect/salience handling: explicit neutral default [1,1,1,1], validated finite vectors, pinned named presets and dictionary spelling/alias policy. Port the reference Czech/English keyword extractor as an explicit optional signal source, not an implicit measurement of human emotion. Retain input source and policy identity. Surprise is an admitted signal; do not invent decoder prediction error."
+      ],
+      "acceptance": [
+        "Reference-compatible mutation fixtures pass and approved corrections have negative controls.",
+        "Zero strength, malformed batches, exhausted record/lineage budgets and full capacity return explicit effects and do not leave partial mutations.",
+        "A reused center slot receives a new incarnation; prior source links cannot resolve to unrelated content.",
+        "All supporting-record and content allocations obey byte/count bounds.",
+        "Neutral, named, explicit-vector, dictionary-alias and optional Czech/English keyword paths are tested. Malformed/nonfinite affect is rejected rather than silently replaced. Keyword substrings/negation are characterized as heuristic limitations; affect cannot override scope, provenance or current-code authority."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-ncm-core --test center_write --locked",
+        "cargo test -p tracedecay-memory-ncm-core --test signals --locked"
+      ],
+      "sources": [
+        "S02",
+        "S03",
+        "S07",
+        "S08"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-008",
+      "title": "Implement actual 3D terrain, diffusion, sampling and Gaussian blur",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-002",
+        "ncm-rs-004"
+      ],
+      "external_gates": [],
+      "owner_role": "Core / terrain",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-core/src/terrain/",
+        "crates/tracedecay-memory-ncm-core/tests/terrain.rs"
+      ],
+      "objective": "Provide the spatial dynamics that the reference describes, including a real blur implementation.",
+      "implementation": [
+        "Implement two 48³ fields with scalar H and four E channels, six-neighbor Laplacian, replicated boundaries, Gaussian splat, trilinear sampling and homeostasis.",
+        "Implement a real separable Gaussian blur with documented radius, normalization and boundary policy. Do not port Terrain3D.blur’s unchanged clones.",
+        "Audit torch grid_sample coordinate ordering against tensor layout and splat indexing. Choose one coherent v1 axis convention and record any reference deviation.",
+        "Use double buffers or immutable generations for diffusion; in-place neighbor sweeps must not introduce order-dependent math. Validate combined leak/diffusion coefficients and bounded work."
+      ],
+      "acceptance": [
+        "An off-center asymmetric impulse spreads under blur; a constant field remains constant under normalized blur; interior impulse mass and symmetry match the chosen kernel.",
+        "Sampling a splatted asymmetric point catches x/z or stride swaps; test corners, faces and fractional positions.",
+        "H decays toward 0 and E toward 1 without NaN/negative excursions beyond the declared clamp policy. For the explicit combined update, require a sufficient stability bound such as lambda+6*alpha<=1.",
+        "Corrected blur fails against the original no-op output for the intended reason; all unchanged operations meet oracle tolerances."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-ncm-core --test terrain --locked"
+      ],
+      "sources": [
+        "S04"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-009",
+      "title": "Implement explicit logical time, homeostasis and fatigue",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-007",
+        "ncm-rs-008"
+      ],
+      "external_gates": [],
+      "owner_role": "Core / dynamics",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-core/src/dynamics/",
+        "crates/tracedecay-memory-ncm-core/tests/dynamics.rs"
+      ],
+      "objective": "Make forgetting and sleep scheduling reproducible across retries, idle periods and restart.",
+      "implementation": [
+        "Expose explicit logical Advance operations. Freeze the v1 Observe schedule as one learning tick per unique committed observation; any departure from the Python caller’s separate store/step schedule is recorded.",
+        "Implement separate center intensity/value/emotion leak rates, age counters, terrain evolution, fatigue leak/accumulation and consolidation eligibility.",
+        "Resolve the reference differences: documentation describes omega-based fatigue, TextMemory passes input intensity, and AutomaticConsolidator has a 100-step minimum interval. Pin actual selected behavior; do not infer wall-clock years from step-based coefficients.",
+        "Persist fatigue, tick, steps_since_consolidation, and last maintenance identity. Bound large Advance requests; never execute an unbounded per-microsecond loop."
+      ],
+      "acceptance": [
+        "Duplicate observations and read-only calls do not advance time or fatigue.",
+        "Closed-form decay checks agree with explicit updates in their valid domain; no claim of calendar half-life exists without a documented clock mapping.",
+        "Split-run and uninterrupted runs have the same sleep boundaries and state under the same explicit schedule.",
+        "Threshold crossings and the 99/100/101 interval boundary are covered."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-ncm-core --test dynamics --locked"
+      ],
+      "sources": [
+        "S02",
+        "S05",
+        "S07"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-010",
+      "title": "Implement consolidation, merge/prune and LTM-only survival",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-009"
+      ],
+      "external_gates": [],
+      "owner_role": "Core / consolidation",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-core/src/consolidation/",
+        "crates/tracedecay-memory-ncm-core/tests/consolidation.rs"
+      ],
+      "objective": "Prove memories survive transfer to LTM rather than being answered indefinitely from STM.",
+      "implementation": [
+        "Implement top-M STM selection, approved intensity floor, kappa transfer, source lineage propagation, both-layer normalization, terrain pour using actual blur and fatigue reduction.",
+        "Reproduce merge/prune mechanics where safe; preserve immutable source records and conflict lineage even when latent centers merge. Bound pairwise work or page it deterministically.",
+        "Run the projection alignment test before choosing the production transfer rule: independently initialized direct LTM projection and U*STM projection are not guaranteed to align. If it fails, use retained canonical LTM-basis keys or another explicitly reviewed mapping; no STM/Native fallback may make the test pass.",
+        "Specify resumable maintenance as build-then-publish state, not partially visible center/terrain updates. Runtime durability is provided by N14."
+      ],
+      "acceptance": [
+        "Store→consolidate→exclude STM at a test seam→recall succeeds for intended associations with the real encoder later in N21.",
+        "Merge/prune preserve source-support closure and do not merge contradictory textual assertions into an unlabeled fact.",
+        "Sleep boundaries, terrain pour, normalization and fatigue reduction match reference or approved difference fixtures.",
+        "Interruptions between maintenance stages never expose mixed generations."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-ncm-core --test consolidation --locked"
+      ],
+      "sources": [
+        "S03",
+        "S05",
+        "S06",
+        "S07"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-011",
+      "title": "Implement record-aware recall, correction and provenance output",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-007",
+        "ncm-rs-003"
+      ],
+      "external_gates": [],
+      "owner_role": "Core / record policy",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-core/src/records/",
+        "crates/tracedecay-memory-ncm-core/src/recall/",
+        "crates/tracedecay-memory-ncm-core/tests/record_recall.rs"
+      ],
+      "objective": "Turn learned state into admissible advisory candidates without losing evidence or chronology.",
+      "implementation": [
+        "Keep RecordId/SourceId and explicit valid/superseded/deleted state separate from center slots. Returned text must come from supported records, not decoding arbitrary 128D values into invented text.",
+        "Combine STM/LTM candidates by stable record/source identity. Do not copy Python’s key-text-only deduplication, which can hide distinct contradictory records or provenance.",
+        "Return layer, raw activation, distance components, support handles, exact validity metadata and explicit uncalibrated confidence. Define no-match admission using a predeclared relevance policy, not merely softmax rank.",
+        "Corrections use admitted host evidence and preserve supersession lineage. Provider recency/activation never overrides current code authority; ambiguous conflicts remain visible."
+      ],
+      "acceptance": [
+        "Same key/different assertions remain distinct until an explicit valid correction links them.",
+        "Unrelated singleton queries do not become high-confidence facts; empty and unavailable are different.",
+        "Source absence is explicit; tests detect fabricated citations, stale ID reuse and missing support after merge.",
+        "Record budgets apply before hydration and serialization; no metadata or token overflow bypass."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-ncm-core --test record_recall --locked"
+      ],
+      "sources": [
+        "S03",
+        "S07",
+        "S14",
+        "S17"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-012",
+      "title": "Implement the real native multilingual text encoder",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-002",
+        "ncm-rs-004"
+      ],
+      "external_gates": [],
+      "owner_role": "Runtime / embedding",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-runtime/src/embedding/",
+        "crates/tracedecay-memory-ncm-runtime/tests/real_embeddings.rs",
+        "product/ncm/reference/embedding-manifest.json"
+      ],
+      "objective": "Ensure production uses actual model inference and the same input representation as the reference.",
+      "implementation": [
+        "Pin sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 model revision, tokenizer, weights/export, pooling, normalization and truncation. Use real native Rust inference through the reviewed backend; Python must not be launched by production.",
+        "Compare token IDs, attention mask, masked mean pooling and normalized 384D outputs against Python. The primary model card describes max_seq_length=128; do not substitute 512 based on unrelated host settings.",
+        "Load only verified local artifacts during operations. Explicit installation may fetch approved artifacts, but handshake/recall cannot download models or silently fall back online.",
+        "Port the inspected EmotionExtractor behavior only as a versioned heuristic; preserve explicit four-channel inputs and neutral defaults. Never call heuristic salience a measurement of a human emotional state."
+      ],
+      "acceptance": [
+        "English/Czech, code identifiers, Unicode, empty input and truncation-boundary fixtures pass with real weights.",
+        "Missing model, corrupt tokenizer, dimension mismatch and incompatible projection identity return typed not-ready/incompatible outcomes.",
+        "Hash/random/token-count stand-ins are confined to named unit-test doubles and cannot satisfy real-model or release gates.",
+        "Warm/cold inference, cancellation/kill response, model memory and artifact identity are measured."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-ncm-runtime --test real_embeddings --locked"
+      ],
+      "sources": [
+        "S02",
+        "S06",
+        "S08",
+        "S18"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-013",
+      "title": "Implement provider-owned durable store and source capsules",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-004"
+      ],
+      "external_gates": [],
+      "owner_role": "Runtime / storage",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-runtime/src/store/",
+        "crates/tracedecay-memory-ncm-runtime/tests/store.rs"
+      ],
+      "objective": "Provide an atomic, replayable ownership boundary independent of TraceDecay’s stores.",
+      "implementation": [
+        "Use an admitted provider state root and the repository’s approved private-filesystem/SQLite primitives where compatible. No paths are derived directly from request text, and no host database is opened.",
+        "Implement transactional storage for namespace metadata, source capsules, committed events, idempotency rows, compatibility identity, privacy epochs and state generation/checkpoint metadata.",
+        "Snapshots/checkpoints must contain all relevant tensors, matrices, masks, IDs, source support, record validity, counters, fatigue and consolidation scheduling. Choose one canonical durable authority and a precise fsync/commit point.",
+        "Bound snapshot bytes, journal growth, replay work and resident views. Never discard replay information still needed to remove a retained source’s influence. Reserved capacity must permit privacy and recovery operations under ingestion pressure."
+      ],
+      "acceptance": [
+        "Fault injection around durable writes/reopen yields a complete prior state or complete committed state, never partial Ready.",
+        "Corrupt/incompatible state fails closed; fresh-empty is allowed only through an explicit new-store path, not a catch-all load exception.",
+        "Opening a second writer is refused or serialized; namespace paths cannot escape the admitted root.",
+        "Storage-accounting tests include WAL, temporary files, checkpoints, source capsules, tombstones and cached embeddings."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-ncm-runtime --test store --locked"
+      ],
+      "sources": [
+        "S07",
+        "S14"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-014",
+      "title": "Implement end-to-end engine transactions and exactly-once effects",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-010",
+        "ncm-rs-011",
+        "ncm-rs-012",
+        "ncm-rs-013"
+      ],
+      "external_gates": [],
+      "owner_role": "Runtime / engine",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-runtime/src/engine/",
+        "crates/tracedecay-memory-ncm-runtime/tests/engine_transactions.rs"
+      ],
+      "objective": "Connect real text input to learning, durable commit and read-only recall with correct retry semantics.",
+      "implementation": [
+        "Translate admitted normalized observations into typed source capsules, key/value inputs, explicit signals, real embeddings and core transitions. Do not call the browser/PAM protocol or an LLM to manufacture source truth.",
+        "Bind namespace+idempotency key to a canonical payload digest. Same key/same payload replays the original receipt with no second effect; same key/different payload is a conflict.",
+        "Validate and compute a bounded candidate transition before commit; atomically persist effect/receipt/source mapping and publish the committed state. Cancellation before commit has no effect; loss of response after commit does not undo the commit.",
+        "Implement explicit feedback and correction effects separately from recall. Advance logical time only once per eligible committed event. Restart recovery must reconcile commit-to-ack ambiguity.",
+        "Keep durable publication coherent with live reads: after a successful mutation acknowledgement, new reads observe at least that commit; a crash or publication failure after commit yields truthful committed/effect-unknown handling and recovery, never a false no-effect retry that learns twice."
+      ],
+      "acceptance": [
+        "A real-text observe→recall journey returns supported content with nonzero learned state and no Python subprocess.",
+        "Duplicate delivery changes neither intensity nor source count nor terrain/fatigue/tick a second time.",
+        "Crash before commit, after commit and before ack, after publication and during checkpoint all have exact effect outcomes.",
+        "A failed embed/readiness step never produces a successful observation receipt."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-ncm-runtime --test engine_transactions --locked"
+      ],
+      "sources": [
+        "S03",
+        "S05",
+        "S07",
+        "S14"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-015",
+      "title": "Implement deletion through mixed state and bounded maintenance",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-014"
+      ],
+      "external_gates": [],
+      "owner_role": "Runtime / privacy and retention",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-runtime/src/privacy/",
+        "crates/tracedecay-memory-ncm-runtime/src/maintenance/",
+        "crates/tracedecay-memory-ncm-runtime/tests/deletion.rs",
+        "crates/tracedecay-memory-ncm-runtime/tests/maintenance.rs"
+      ],
+      "objective": "Remove a source’s recoverable and learned influence, not just its visible text row.",
+      "implementation": [
+        "Map deletion to all provider-owned copies, embeddings, center-support links, merged records, terrain influence, feedback and source capsules, including replicas created by authorized session replay.",
+        "For nonlinear mixed state, v1 atomically fences the affected namespace, rebuilds from authorized retained inputs excluding revoked sources, and publishes only the sanitized generation. Do not attempt unproven subtraction of a source from nonlinear normalization/diffusion.",
+        "Keep privacy epoch/revocation authority outside restorable checkpoints. Reapply it during every restore/replay and prevent stale journal events from resurrecting content. Bound rebuild work and report maintenance continuation.",
+        "Define deletion granularity and supported physical-erasure scope explicitly. Quarantine/unlink controlled old snapshots and caches as required; never claim to erase independent exported files or guarantee SSD-level secure erasure."
+      ],
+      "acceptance": [
+        "Delete a source after consolidation and merge; LTM-only recall, explain, export, restart and allowed replay cannot expose it.",
+        "Deletion racing with observe/recall/checkpoint is linearized: after acknowledged logical deletion no new result contains revoked evidence.",
+        "Interrupted rebuild stays unavailable/maintenance-pending until safe; it does not serve stale state as healthy.",
+        "Privacy/reconstruction quota exhaustion is visible, preserves safety and never yields a false deletion-complete receipt."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-ncm-runtime --test deletion --test maintenance --locked"
+      ],
+      "sources": [
+        "S03",
+        "S04",
+        "S05",
+        "S07",
+        "S14"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-016",
+      "title": "Implement versioned export/restore with non-resurrection",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-015"
+      ],
+      "external_gates": [],
+      "owner_role": "Runtime / snapshot compatibility",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-runtime/src/snapshot/",
+        "crates/tracedecay-memory-ncm-runtime/tests/snapshot.rs"
+      ],
+      "objective": "Make restart and portable state transfer truthful and bounded.",
+      "implementation": [
+        "Implement the new Rust snapshot format with explicit schema, algorithm/config/model/projection identity, lengths, checksums, namespace and privacy epoch.",
+        "Validate every section and quota into a staging location, then atomically publish. Check newer revocations before serving; imported state cannot supply its own trusted revocation authority.",
+        "Restore all scheduling and projection state, especially steps_since_consolidation and STM→LTM mapping. Cold restart must not silently instantiate new projection weights.",
+        "Do not support arbitrary .pt/pickle or claim .bdbm compatibility in v1. An eventual legacy importer needs a separately reviewed, isolated conversion path; own-format export/restore is mandatory now."
+      ],
+      "acceptance": [
+        "Uninterrupted and restart/snapshot-split traces have equivalent next mutation, recall and consolidation timing.",
+        "Truncated, oversized, malicious-length, wrong-model, wrong-namespace and checksum-corrupt snapshots are refused without changing current state.",
+        "A pre-deletion snapshot restored after deletion cannot resurrect revoked sources.",
+        "Restoring into a fresh profile with no trusted deletion lineage is refused or requires explicitly authorized sanitized transfer; no blanket privacy claim."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-ncm-runtime --test snapshot --locked"
+      ],
+      "sources": [
+        "S05",
+        "S06",
+        "S07",
+        "S14"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-017",
+      "title": "Implement the supervised Rust worker and bounded wire transport",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-014"
+      ],
+      "external_gates": [],
+      "owner_role": "Runtime / lifecycle",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-runtime/src/worker/",
+        "crates/tracedecay-memory-ncm-runtime/src/wire/",
+        "crates/tracedecay-memory-ncm-runtime/src/client/",
+        "crates/tracedecay-memory-ncm-runtime/src/bin/tracedecay-ncm-worker.rs",
+        "crates/tracedecay-memory-ncm-runtime/tests/worker.rs"
+      ],
+      "objective": "Isolate native inference/storage failures while fitting the existing host supervision contract.",
+      "implementation": [
+        "Provide a real Rust worker executable with a versioned length-delimited local pipe protocol. Wire payloads contain opaque namespace/source handles and typed engine requests, not raw host scope or caller filesystem paths.",
+        "Use one bounded owner/mailbox and explicit state-root admission. Reuse host launch/cancellation/restart facilities through a narrow client contract; do not build a second general supervisor.",
+        "Bound process count, queued frames/bytes, stdout framing, stderr diagnostics, readers, loaded namespaces and model residency. Reject oversized frames before allocation.",
+        "On deadline/cancellation, stop cooperative work or terminate the worker within a fixed escalation budget. Return unknown effect if commit cannot be determined; reconcile by idempotency receipt after restart."
+      ],
+      "acceptance": [
+        "Real process death, hangs, malformed replies, full pipe/backpressure, deadline expiry and restart budget exhaustion are exercised.",
+        "No orphan worker or unbounded detached task survives shutdown; native inference cannot monopolize a Tokio host thread.",
+        "The worker refuses wrong protocol/epoch/model identities and cannot launch when the provider is Disabled.",
+        "Process-alive is distinct from loaded-state and observe/recall readiness."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-ncm-runtime --test worker --locked"
+      ],
+      "sources": [
+        "S14"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-018",
+      "title": "Implement the real NcmCognitiveSurface adapter",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-016",
+        "ncm-rs-017"
+      ],
+      "external_gates": [],
+      "owner_role": "Provider adapter owner",
+      "write_paths": [
+        "crates/tracedecay-memory-provider-ncm/src/lib.rs",
+        "crates/tracedecay-memory-provider-ncm/src/rust_backend/",
+        "crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs",
+        "crates/tracedecay-memory-provider-ncm/Cargo.toml",
+        "crates/tracedecay-memory-provider-ncm/README.md"
+      ],
+      "objective": "Replace an absent production implementation behind the existing surface, not the conformance doubles.",
+      "implementation": [
+        "Implement RustNcmSurface against the worker client and retain NcmProviderAdapter’s scope projection, challenge proof, readiness epoch, capability, byte-budget and effect validation.",
+        "Keep runtime→core and adapter→runtime dependencies acyclic. Registry construction and host mounting remain N24/N25; backend tests instantiate the existing adapter directly.",
+        "Map each actually supported ProviderOperation to the real worker. Return truthful build/config/model/state identity; advertise capabilities only when their implementation and negotiated requirements are ready.",
+        "Preserve opaque extension handling and host-owned provenance hydration. No fallback to Native or a canned result. Keep fake providers in tests and reject their artifact identities from production readiness."
+      ],
+      "acceptance": [
+        "Observe, recall, feedback/correction, maintenance, inspect, delete and own-format snapshot paths are exercised through NcmProviderAdapter with real durable state.",
+        "Readiness replacement invalidates old epochs; normal commits obey the frozen state-generation semantics.",
+        "Malformed post-dispatch mutation replies preserve effect_unknown and a reconciliation path, not false no-effect.",
+        "Adapter-only implementation is not counted as shipped host integration."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-provider-ncm --features rust-backend --test rust_backend --locked"
+      ],
+      "sources": [
+        "S14"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-019",
+      "title": "Run real-provider conformance and adversarial scope/privacy tests",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-018"
+      ],
+      "external_gates": [],
+      "owner_role": "Independent verification owner",
+      "write_paths": [
+        "crates/tracedecay-memory-provider-ncm/tests/rust_backend_conformance.rs",
+        "product/ncm/conformance/"
+      ],
+      "objective": "Earn conformance on the actual Rust process and stores.",
+      "implementation": [
+        "Reuse tracedecay-memory-conformance and existing adversarial fixtures with the real backend. Do not write a friendlier parallel conformance definition.",
+        "Test every supported operation under wrong profile/project/worktree/session/branch, stale epoch, replay, cancellation, corruption and contradictory inputs.",
+        "Exercise deletion through merged centers/terrain plus stale snapshot restore, real worker termination after commit-before-ack and bounded resource saturation.",
+        "Separate deterministic kernel doubles from real encoder/process evidence; unsupported required capabilities block readiness rather than produce skipped green tests."
+      ],
+      "acceptance": [
+        "Every mandatory capability has executed test IDs and exact pass/fail/skip accounting on the built artifact.",
+        "Scope leaks, fabricated provenance, duplicate committed effects and deleted-source recall are zero observed violations in the declared test population.",
+        "A deliberately faulty backend is rejected by the same tests.",
+        "Conformance receipts name source tree, worker binary, algorithm, model and state schema identities."
+      ],
+      "test_targets": [
+        "cargo test -p tracedecay-memory-provider-ncm --features rust-backend --test rust_backend_conformance --locked"
+      ],
+      "sources": [
+        "S14",
+        "S17"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-020",
+      "title": "Measure bounded resource use, latency and saturation behavior",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-018"
+      ],
+      "external_gates": [],
+      "owner_role": "Performance / reliability verifier",
+      "write_paths": [
+        "crates/tracedecay-memory-ncm-runtime/benches/ncm_scale.rs",
+        "scripts/product/ncm/benchmark/",
+        "product/ncm/performance/"
+      ],
+      "objective": "Prove the fixed-capacity kernel does not hide unbounded logs, text, namespaces or worker memory.",
+      "implementation": [
+        "Benchmark empty, sparse, full 512/4096 center state; 1/4 resident namespaces; 10k/100k operation traces; varied record sizes and adversarial repeated unique IDs.",
+        "Measure pre-embedded kernels, real encoding, IPC, durable commit, end-to-end recall and maintenance separately. Include p50/p95/p99, peak RSS, allocated bytes, disk including WAL/snapshots, queue occupancy and cancellation completion.",
+        "Run mixed observe/recall/consolidate/delete/restart workloads under the frozen hardware/profile/feature set. Missing hardware/model is blocked environment, not a waived test.",
+        "Compare to the pinned Python reference and a simple flat-vector baseline only where workloads/representation/semantics match. Do not claim microsecond full-text recall from kernel-only results."
+      ],
+      "acceptance": [
+        "Hard quotas hold or operations reject before exceeding them; state retention/replay obligations survive journal compaction.",
+        "The N03 budget manifest’s predeclared limits are met; any proposed limit change is a reviewed versioned decision before rerunning acceptance.",
+        "No warm read or maintenance job can starve host deadlines or create an unlimited backlog.",
+        "Long-lived tests include fixed kernel capacity and separately bounded ancillary storage; no infinite lossless-memory claim."
+      ],
+      "test_targets": [
+        "cargo bench -p tracedecay-memory-ncm-runtime --bench ncm_scale --locked",
+        "ncm_saturation_journey (planned)"
+      ],
+      "sources": [
+        "S02",
+        "S17"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-021",
+      "title": "Evaluate scientific fidelity and actual coding-memory usefulness",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-018",
+        "ncm-rs-002"
+      ],
+      "external_gates": [],
+      "owner_role": "Evaluation owner independent of implementation",
+      "write_paths": [
+        "product/ncm/evaluation/",
+        "scripts/product/ncm/evaluate/"
+      ],
+      "objective": "Distinguish a faithful implementation from a useful product and from unsupported scientific claims.",
+      "implementation": [
+        "Run matched numerical/behavioral fixtures against pinned Biomem, accounting for approved corrections. Add real-text store/recall, paraphrase, full-capacity interference, stale correction and LTM-only retention cases.",
+        "Reuse the existing nine-scenario corpus and metric definitions. Compare Rust NCM with Python Biomem, Native, no memory and explicit documentation under matched inputs; unavailable host baselines are pending until the joined host evaluation.",
+        "Predeclare dataset split, scoring rubric, minimum acceptable relevance, safety ceilings, task outcomes, latency and token budgets. Keep a held-out set; do not tune on final evaluation answers.",
+        "Ablate terrain contribution, corrected blur and consolidation. Test that the feature is actually invoked; lack of measured benefit is reported, never relabeled as proof of value. External prompt integration is not decoder-internal attention gating."
+      ],
+      "acceptance": [
+        "Real-encoder LTM-only recall passes without STM, Native, keyword-only or source-file fallback.",
+        "Stale/cross-scope/deleted/corrupt content fails admission with visible reasons; indeterminate labels do not count as safety passes.",
+        "Kernel fidelity, algorithm corrections, provider behavior and task benefit have separate results.",
+        "Observer evaluation cannot claim improved agent outcomes; joined active-mode benefit is measured only in N25."
+      ],
+      "test_targets": [
+        "ncm_reference_comparison (planned)",
+        "ncm_coding_memory_evaluation (planned)"
+      ],
+      "sources": [
+        "S10",
+        "S11",
+        "S17",
+        "S18"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-022",
+      "title": "Accept the independently usable backend and package its evidence",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-019",
+        "ncm-rs-020",
+        "ncm-rs-021"
+      ],
+      "external_gates": [],
+      "owner_role": "NCM branch coordinator / reviewer",
+      "write_paths": [
+        ".github/workflows/product-ncm-backend.yml",
+        "scripts/product/ncm/check-backend.py",
+        "product/ncm/receipts/backend/",
+        "product/ncm/README.md"
+      ],
+      "objective": "Deliver a real standalone backend without waiting for or pretending to complete host stabilization.",
+      "implementation": [
+        "Create a backend-only validation entrypoint and pinned CI lane for the two new packages and existing adapter. Run independent diagnostics without changing the host’s failing policy tests or weakening promotion requirements.",
+        "Verify the actual worker artifact includes the real encoder/backend and excludes Python-runtime/test-double substitutions. Document artifact installation and local model acquisition with hashes.",
+        "Assemble source/model/projection identities, numerical differences, conformance, crash/deletion, latency/storage and isolated text journey receipts.",
+        "Review the allowed-path diff. Leave registry registration, default features, accepted upstream floor and shared Beads updates untouched until N23."
+      ],
+      "acceptance": [
+        "A fresh isolated state root supports real observe→consolidate→restart→recall→delete through the worker/adapter.",
+        "Backend gates execute nonempty expected tests and pass; missing real-model evidence is a blocker.",
+        "Status is explicitly backend-accepted, host-not-yet-integrated; no claim that the product checkpoint is demo-ready.",
+        "The integration owner receives a small manifest/lock patch, adapter patch, exact API requirements and all artifact identities."
+      ],
+      "test_targets": [
+        "python3 scripts/product/ncm/check-backend.py (planned entrypoint)",
+        "backend_artifact_identity_test"
+      ],
+      "sources": [
+        "S14",
+        "S19"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-023",
+      "title": "Join the stabilized host and reconcile shared ownership",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-022"
+      ],
+      "external_gates": [
+        "HOST-STABLE"
+      ],
+      "owner_role": "Shared integration owner",
+      "write_paths": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "product/upstream/convergence-map.json",
+        "product/upstream/patch-footprint-policy.json",
+        "product/architecture/memory-dependency-policy.json",
+        ".beads/issues.jsonl",
+        "product/ncm/receipts/integration/"
+      ],
+      "objective": "Merge independent work without undoing the other agent’s fixes or claiming their evidence applies automatically.",
+      "implementation": [
+        "Consume a specific accepted host commit/tree from HOST-STABLE. Keep the new backend commits reviewable; do not pull a moving upstream head or rewrite shared history.",
+        "Reconcile workspace/dependency and ownership changes by semantic role. Preserve new deadline, retention and policy-test fixes from the stabilization branch.",
+        "Import the new task work package through the existing Beads process, linking older descoped records as superseded intent. Do not double count old closures or modify unrelated tasks.",
+        "Rerun backend gates and the relevant host feature/dependency/ownership/generated checks on the actual combined tree."
+      ],
+      "acceptance": [
+        "All conflicts have owner, rationale and invariant-preservation evidence.",
+        "Current ownership and dependency checks pass without blanket allowlists.",
+        "The joined tree is recorded separately from backend-accepted and host-accepted source trees.",
+        "No obsolete result is reused solely because a branch name is unchanged."
+      ],
+      "test_targets": [
+        "existing ownership and dependency gates",
+        "combined backend gate"
+      ],
+      "sources": [
+        "S15",
+        "S19"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-024",
+      "title": "Mount NCM in Observer mode and prove authorized session reuse",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-023"
+      ],
+      "external_gates": [
+        "HOST-OBSERVE"
+      ],
+      "owner_role": "Host composition / observation owner",
+      "write_paths": [
+        "crates/tracedecay-memory-provider-registry/Cargo.toml",
+        "crates/tracedecay-memory-provider-registry/src/ncm_mount/",
+        "crates/tracedecay-memory-provider-registry/src/lib.rs",
+        "crates/tracedecay/src/daemon/product_memory_provider/",
+        "crates/tracedecay-cli/tests/product_memory_provider_ncm_observer_journey.rs",
+        "product/ncm/receipts/observer/",
+        "Cargo.toml",
+        "Cargo.lock",
+        "product/upstream/convergence-map.json",
+        "product/upstream/patch-footprint-policy.json",
+        "product/architecture/memory-dependency-policy.json"
+      ],
+      "objective": "Exercise real host event delivery while proving Observer output cannot affect the agent.",
+      "implementation": [
+        "Mount the real adapter/worker only through the provider registry and existing supervision. Add the smallest opt-in feature/configuration change; exact production composition paths must be discovered on the stabilized tree rather than assumed from the proposed new module name.",
+        "Drive real CLI/daemon hook ingestion after startup has quiesced, with a negative control against startup import. Inspect real NCM durable receipts, not a mock dispatcher counter.",
+        "Implement the N03 authorized-history replay/share bridge for same-worktree later-session use. Preserve the requesting session’s exact scope and original-source attribution; deny sibling/unrelated worktrees unless explicitly authorized by existing host policy.",
+        "Compare final prompt/native-fact/action outputs with NCM Observer enabled and disabled under deterministic inputs. Run shadow recall read-only, and account for resource consumption without letting it alter active selection.",
+        "The integration coordinator updates the exact ownership/feature/lock entries for this mount on this task’s tree. Shared policy metadata remains an ordered change, not a blanket permission or a waiver of failing checks."
+      ],
+      "acceptance": [
+        "Each accepted observation has exactly one NCM effect across retries and daemon/worker restart.",
+        "Observer mode changes no prompt bytes, Native facts or externally visible agent actions; provider outputs cannot be selected through fallback.",
+        "A later authorized session recalls/replays legitimate source knowledge; forbidden sessions/worktrees do not. No silent namespace broadening.",
+        "If current host authority cannot express safe sharing/replay, active release is blocked pending a narrow owner-reviewed contract change, not faked by skipping session fields."
+      ],
+      "test_targets": [
+        "product_memory_provider_ncm_observer_journey (planned real-process target)"
+      ],
+      "sources": [
+        "S14",
+        "S16",
+        "S17"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-025",
+      "title": "Enable guarded active NCM and run joined comparative evaluation",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-024"
+      ],
+      "external_gates": [
+        "HOST-RECALL"
+      ],
+      "owner_role": "Host recall owner / evaluation owner",
+      "write_paths": [
+        "crates/tracedecay-memory-provider-registry/src/ncm_mount/",
+        "crates/tracedecay/src/daemon/product_memory_provider/",
+        "crates/tracedecay-cli/tests/product_memory_provider_ncm_active_journey.rs",
+        "product/ncm/receipts/active/",
+        "Cargo.toml",
+        "Cargo.lock",
+        "product/upstream/convergence-map.json",
+        "product/upstream/patch-footprint-policy.json",
+        "product/architecture/memory-dependency-policy.json"
+      ],
+      "objective": "Prove NCM output is admitted safely and earns its cost before offering active mode.",
+      "implementation": [
+        "Use explicit opt-in provider selection. Preserve configured provider identity; Native canonical facts remain separate, never an undeclared fallback for failed NCM recall.",
+        "Exercise real host admission, provenance hydration, selection, tokenizer and pack/trace persistence with NCM results. Test cancellation/budget exhaustion at actual reachable host lookup paths.",
+        "Complete the matched Native/no-memory/documentation/Python/Rust coding evaluation on the joined tree, with held-out tasks and predeclared thresholds. Measure task benefit, harmful stale recall, scope/deletion safety, repeated discovery, latency and context cost.",
+        "Implement a tested disable/quarantine rollback that leaves Native authoritative and does not destroy valid NCM state. Do not change the default mode.",
+        "The integration coordinator updates the exact ownership/feature/lock entries for this mount on this task’s tree. Shared policy metadata remains an ordered change, not a blanket permission or a waiver of failing checks."
+      ],
+      "acceptance": [
+        "Current code and required host evidence cannot be displaced by NCM volume, activation or unsupported provenance.",
+        "Stale correction, restart, provider corruption/failure, timeout, deletion and cross-worktree journeys pass with nonempty selections.",
+        "All safety criteria pass and usefulness meets the predeclared release threshold; inconclusive benefit leaves NCM experimental/Observer rather than falsely complete.",
+        "The active artifact, runtime mode, model and source identities match its evidence."
+      ],
+      "test_targets": [
+        "product_memory_provider_ncm_active_journey (planned real-process target)",
+        "joined coding-memory comparison"
+      ],
+      "sources": [
+        "S14",
+        "S16",
+        "S17"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    },
+    {
+      "id": "ncm-rs-026",
+      "title": "Verify installed artifacts, platform support and release decision",
+      "status": "planned",
+      "depends_on": [
+        "ncm-rs-025"
+      ],
+      "external_gates": [
+        "HOST-RELEASE"
+      ],
+      "owner_role": "Release owner / independent reviewer",
+      "write_paths": [
+        "product/ncm/release/",
+        "docs/product/ncm-rust.md",
+        "scripts/product/ncm/verify-installed.py"
+      ],
+      "objective": "Finish with an installable, honestly labeled product capability rather than a green development harness.",
+      "implementation": [
+        "Use the repository’s existing packaging path to include the pinned Rust worker and model acquisition manifest. Do not start unrelated browser, desktop UI or packaging-system work.",
+        "Verify clean install, existing-profile upgrade, process restart, disabled rollback and artifact identity on every platform advertised as supported. Backend algorithm portability alone is not packaging proof.",
+        "Confirm test-transport and fake-provider artifacts cannot satisfy production readiness. Record actual binary paths/hashes, features and worker protocol compatibility.",
+        "Issue a go/no-go with separate numerical fidelity, backend conformance, host safety, platform, and usefulness verdicts. Keep failed or blocked gates visible.",
+        "At the host join, identify the existing packaging files that actually need worker inclusion and add their exact paths to this node after release-owner approval. The external HOST-RELEASE gate covers prerequisites and authority; new NCM packaging and installed-artifact results are outputs of this task, not circular prerequisites."
+      ],
+      "acceptance": [
+        "The installed CLI and real Rust worker reproduce the accepted active journey on the declared supported platform matrix.",
+        "Disablement returns to Native-only behavior without accidental NCM fallback or state deletion.",
+        "Documentation describes a Biomem-based independent Rust implementation, not an official OpenTechLab product or a proven decoder-internal integration.",
+        "Every completed task is backed by evidence on the final joined tree or an explicitly justified unchanged-tree reuse."
+      ],
+      "test_targets": [
+        "installed_ncm_journey (planned)",
+        "python3 scripts/product/ncm/verify-installed.py (planned entrypoint)"
+      ],
+      "sources": [
+        "S09",
+        "S14",
+        "S19"
+      ],
+      "handoff": "Commit one reviewable slice; attach the common completion receipt; do not change shared host paths outside the ownership agreement."
+    }
+  ],
+  "completion_receipt_fields": [
+    "task_id",
+    "source_commit",
+    "source_tree",
+    "allowed_path_diff",
+    "implementation_summary",
+    "algorithm_config_identity",
+    "model_projection_identity",
+    "exact_commands",
+    "selected_test_ids",
+    "pass_fail_skip_ignored_counts",
+    "negative_controls",
+    "binary_identity_when_applicable",
+    "environment_and_resources",
+    "limitations",
+    "reviewer_verdict"
+  ]
+}

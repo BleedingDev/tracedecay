@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "work_package": "ncm-biomem-rs.v1",
+  "authorization": "User instruction of 2026-09-06 supersedes the earlier deferral of the Rust NCM port (tdmem-0700, 0702-0711 remain closed as descoped; this package links to them and does not rewrite them).",
+  "product_base": {
+    "repository": "BleedingDev/tracedecay",
+    "commit": "25778c7443cd0cfe257da363da01a56ea1d45d3f",
+    "branch": "feat/ncm-biomem-rust-v1"
+  },
+  "reference": {
+    "repository": "BleedingDev/biomem",
+    "commit": "500847ff65b5d9548b3826fa29bf3ccf8d221147",
+    "tree": "767fe0c270ccdccd121a73ab46e7862db0c468c7",
+    "license": "MIT (LICENSE blob eba479bc5df694b05f9adb8ee248ae1243b876eb)",
+    "local_checkout": "~/workspace/bleedingdev/projects/biomem/code/biomem",
+    "files": [
+      {"path": "LICENSE", "blob": "eba479bc5df694b05f9adb8ee248ae1243b876eb", "sha256": "cffd26323086a0dcdd0c07901b5880917fad381bdfa50b08a018fa5be3ac6c2a", "category": "mit_notice"},
+      {"path": "README.md", "blob": "3f3cf071f8826ddbce0af37d5bb412a77948438b", "sha256": "2986df2c27066907711aef19957a6a3cf34994e6db402e93a786fa86411bc5e8", "category": "description_only_not_delivery_evidence"},
+      {"path": "src/memory_module/config.py", "blob": "9b317cd8523991805993cc03fb84f22611840ea3", "sha256": "e7496def3d53bb995c9070acfac4cae6e373d238c95588a032daf26a9db43460", "category": "mit_reference_code", "used_for": "NcmConfig defaults"},
+      {"path": "src/memory_module/projections.py", "blob": "433267fa3ab98bf0b9f3e06490c558320897a63d", "sha256": "6b5e052cbea77250cbe30ef37bb1c0d61b0a7db7fb254cb32cbf6c3fb940f2e5", "category": "mit_reference_code", "used_for": "projection bundle shapes/init/normalization"},
+      {"path": "src/memory_module/memory_centers.py", "blob": "ed1fc3e6df41a0fe3e6c508928fc2b6385456ef6", "sha256": "e4a3fb4ac6916b66fbbbd5da480eb39cce7b0e84c2cea7c08793bd0cd543c62e", "category": "mit_reference_code", "used_for": "rbf/hybrid/compound reads, write, merge, prune, normalization, homeostasis"},
+      {"path": "src/memory_module/terrain_3d.py", "blob": "f4b3a936e2b316dc08826e6fe5794d0e42242c22", "sha256": "9b6692e8101aaae629d915631b3752d86cd223f93af794573e4b5cf6d0f768af", "category": "mit_reference_code", "used_for": "terrain step/sample/splat; blur is a confirmed no-op (D01)"},
+      {"path": "src/memory_module/consolidation.py", "blob": "968b4a2669181a190888ccff50eb9644e2adcbaa", "sha256": "57adc788aaa971c2911b62890c405a2cc2c29b72fe32a64c02097579c01de5ab", "category": "mit_reference_code", "used_for": "fatigue, sleep consolidation, automatic scheduler"},
+      {"path": "src/memory_module/text_memory.py", "blob": "feeec785d0d5ad0b4416ed29e3512de941d9f49a", "sha256": "7b66d05c4cc3acf53fdbbb731dcb9f2fcc84edc9e8afc7450545f877a02815c0", "category": "mit_reference_code", "used_for": "store/recall orchestration, write strength, affect sanitization"},
+      {"path": "src/memory_module/embedder.py", "blob": "1a0784bf58030ea36c01e0639b15bef65f8d9994", "sha256": "c7c7db38b6a501867a29857acd56bbd954cbe2f3e64a8d397bba6e17c69fa99f", "category": "mit_reference_code", "used_for": "model pin, EmotionExtractor heuristic"}
+    ]
+  },
+  "research": [
+    {"id": "S10", "title": "Persistent Memory for Decoder-Only Transformers: Latent Terrain, Diffusion, Homeostasis, and Emotional Stabilization", "url": "https://zenodo.org/records/18198327", "status": "blocked_full_text_not_verified", "note": "Not retrieved in this session. No paper-conformance claim is made; the executable reference defines v1 behavior."},
+    {"id": "S11", "title": "Implementation of Persistent Latent Memory for Decoder Transformers", "url": "https://zenodo.org/records/18267378", "status": "blocked_full_text_not_verified"}
+  ],
+  "model": {
+    "name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "rust_artifact_source": "Xenova/paraphrase-multilingual-MiniLM-L12-v2 (onnx/model.onnx) via fastembed EmbeddingModel::ParaphraseMLMiniLML12V2",
+    "dim": 384, "max_seq_length": 128, "pooling": "mean", "normalize": true,
+    "artifact_sha256": "blocked_until_ncm-rs-012_downloads_and_pins (see embedding-manifest.json)"
+  },
+  "source_categories": {
+    "mit_reference_code": "Biomem files above; ported algorithm structure, MIT notice preserved in NOTICE.md",
+    "paper_concepts": "terrain/diffusion/homeostasis/sleep vocabulary only; equations not verified from full text",
+    "original_product_work": "Rust crates tracedecay-memory-ncm-core / -runtime, provider adapter extension, storage, transactions, deletion-by-rebuild, worker transport"
+  }
+}
