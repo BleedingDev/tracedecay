@@ -313,6 +313,30 @@ class ProviderRecallContractTest(unittest.TestCase):
             contract, "candidate ID must not be stable across requests"
         )
 
+    def test_candidate_confidence_contract_is_required_nullable(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        contract["provider_candidate"]["required_fields"].remove("confidence")
+        self.assert_rejected(contract, "provider candidate fields drifted")
+
+        cases = [
+            ("confidence_required_nullable", False, "must be required-nullable"),
+            (
+                "confidence_null_semantics",
+                "missing_is_zero",
+                "confidence null semantics drifted",
+            ),
+            (
+                "confidence_number_semantics",
+                "any_number",
+                "confidence number semantics drifted",
+            ),
+        ]
+        for key, value, marker in cases:
+            with self.subTest(key=key):
+                contract = copy.deepcopy(self.contract)
+                contract["provider_candidate"][key] = value
+                self.assert_rejected(contract, marker)
+
     def test_candidate_requires_exactly_one_content_form(self) -> None:
         contract = copy.deepcopy(self.contract)
         contract["provider_candidate"]["content_selection_rule"] = "both_allowed"

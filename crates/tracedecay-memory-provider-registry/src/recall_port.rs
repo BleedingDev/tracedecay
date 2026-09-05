@@ -733,7 +733,14 @@ impl ProjectCognitiveRecallPortV1 {
             )
             .await;
         let routed = match dispatched {
-            Ok(routed) => routed?,
+            Ok(Ok(routed)) => routed,
+            Ok(Err(CognitiveRecallPortError::HandshakeNotReady { terminal_code })) => {
+                let Some(degradation) = readiness_degradation(terminal_code) else {
+                    return Err(CognitiveRecallPortError::HandshakeNotReady { terminal_code });
+                };
+                return self.degraded_outcome(&request, self.configured_identity()?, degradation);
+            }
+            Ok(Err(error)) => return Err(error),
             // The provider outlived the budget it was handed. This is the
             // caller's deadline outcome, not a provider reply: nothing is
             // admitted, and the boundary has already either stopped the worker
@@ -1115,6 +1122,21 @@ fn challenge_nonce() -> Result<[u8; 32], RecallRoutePlanError> {
     let mut nonce = [0u8; 32];
     getrandom::getrandom(&mut nonce).map_err(|_| RecallRoutePlanError::EntropyUnavailable)?;
     Ok(nonce)
+}
+
+/// Maps content-free readiness terminals onto the same degradation vocabulary
+/// used for content-free recall terminals. A readiness refusal has no runtime
+/// instance receipt yet, so the caller attributes it to the pinned provider
+/// and registration revision.
+fn readiness_degradation(terminal_code: TerminalCode) -> Option<CognitiveRecallDegradation> {
+    match terminal_code {
+        TerminalCode::ProviderUnavailable => Some(CognitiveRecallDegradation::Unavailable),
+        TerminalCode::Cancelled => Some(CognitiveRecallDegradation::Cancelled),
+        TerminalCode::DeadlineExceeded => Some(CognitiveRecallDegradation::TimedOut),
+        TerminalCode::CapabilityUnsupported => Some(CognitiveRecallDegradation::Unsupported),
+        TerminalCode::CapacityExceeded => Some(CognitiveRecallDegradation::BudgetExhausted),
+        _ => None,
+    }
 }
 
 /// Maps a routing refusal onto the port's typed terminal failures without

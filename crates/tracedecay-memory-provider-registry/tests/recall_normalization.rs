@@ -291,18 +291,61 @@ fn absent_confidence_remains_explicitly_unavailable() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn confidence_unit_interval_boundaries_are_admitted() -> Result<(), Box<dyn Error>> {
+    for (id, confidence) in [
+        ("zero-confidence", json!(0.0)),
+        ("full-confidence", json!(1.0)),
+    ] {
+        let mut value = candidate_value(
+            id,
+            &format!("content of {id}"),
+            scope_value(&admitted_scope()),
+            current_validity(),
+        );
+        value["confidence"] = confidence.clone();
+        let admission = admit_recall_candidates(
+            &admitted_scope(),
+            "request",
+            &current_query(),
+            &authorized_exact(),
+            vec![decode(value)],
+        )?;
+        assert_eq!(admission.admitted.len(), 1, "{id}");
+        assert!(admission.report.denied.is_empty(), "{id}");
+        assert_eq!(
+            admission.admitted[0]
+                .confidence()
+                .map(|number| Value::Number(number.clone())),
+            Some(confidence),
+            "{id}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn malformed_confidence_is_denied_with_a_typed_defect() -> Result<(), Box<dyn Error>> {
     let cases = [
         ("string", json!("0.5"), RecallConfidenceDefect::NotNumber),
-        ("nan-token", json!("NaN"), RecallConfidenceDefect::NotNumber),
+        (
+            "nan-string",
+            json!("NaN"),
+            RecallConfidenceDefect::NotNumber,
+        ),
+        (
+            "infinity-string",
+            json!("Infinity"),
+            RecallConfidenceDefect::NotNumber,
+        ),
+        ("boolean", json!(true), RecallConfidenceDefect::NotNumber),
         (
             "below-range",
-            json!(-0.001),
+            json!(-0.0001),
             RecallConfidenceDefect::OutOfRange,
         ),
         (
             "above-range",
-            json!(1.001),
+            json!(1.0001),
             RecallConfidenceDefect::OutOfRange,
         ),
     ];

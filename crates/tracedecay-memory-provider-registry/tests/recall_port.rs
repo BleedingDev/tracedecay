@@ -892,6 +892,70 @@ async fn default_degradation_rule_returns_every_content_free_outcome_with_provid
 }
 
 #[tokio::test]
+async fn content_free_readiness_outcomes_degrade_with_pinned_provider_identity() {
+    let cases = [
+        (
+            TerminalCode::ProviderUnavailable,
+            CognitiveRecallDegradation::Unavailable,
+        ),
+        (
+            TerminalCode::Cancelled,
+            CognitiveRecallDegradation::Cancelled,
+        ),
+        (
+            TerminalCode::DeadlineExceeded,
+            CognitiveRecallDegradation::TimedOut,
+        ),
+        (
+            TerminalCode::CapabilityUnsupported,
+            CognitiveRecallDegradation::Unsupported,
+        ),
+        (
+            TerminalCode::CapacityExceeded,
+            CognitiveRecallDegradation::BudgetExhausted,
+        ),
+    ];
+
+    for (terminal_code, expected) in cases {
+        let mut fixture = RecallFixturePort::new();
+        fixture.handshake_terminal_code = terminal_code;
+        let provider = Arc::new(fixture);
+        let outcome = mount_routed(
+            compose_mode(provider.clone(), EnabledProviderMode::Active),
+            Arc::new(LedgerObserver::default()),
+            budgets(),
+            ActiveRoutingPolicy::new(
+                OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+                31,
+                FallbackRule::Forbidden,
+            )
+            .expect("default routing policy"),
+        )
+        .expect("mounted port")
+        .recall_admitted(
+            request(
+                resolved_scope(Some("refs/heads/recall-port")),
+                60_000_000,
+                false,
+            ),
+            &live_signal(),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("readiness {terminal_code:?} must degrade by default: {error:?}")
+        });
+
+        assert_eq!(outcome.result.degradation(), Some(expected));
+        assert_eq!(outcome.result.provider().provider_id(), NATIVE_PROVIDER_ID);
+        assert_eq!(outcome.result.provider().registration_revision(), 31);
+        assert_eq!(outcome.result.provider().provider_instance_id(), None);
+        assert!(outcome.result.candidates().is_empty());
+        assert_eq!(provider.handshake_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.recall_calls.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[tokio::test]
 async fn content_bearing_degradations_require_and_obey_an_explicit_policy() {
     fn default_policy() -> ActiveRoutingPolicy {
         ActiveRoutingPolicy::new(
@@ -1019,6 +1083,48 @@ async fn content_bearing_degradations_require_and_obey_an_explicit_policy() {
     assert!(!stale.result.candidates().is_empty());
     assert_eq!(stale.result.provider().provider_id(), NATIVE_PROVIDER_ID);
     assert_eq!(stale.result.provider().registration_revision(), 31);
+}
+
+#[tokio::test]
+async fn allow_with_warning_still_requires_the_explicit_stale_policy_gate() {
+    let mut fixture = RecallFixturePort::new();
+    fixture
+        .validity_overrides
+        .insert("in-scope-1".to_owned(), validity_with("unknown", &[]));
+    let error = mount_routed(
+        compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+        Arc::new(LedgerObserver::default()),
+        budgets(),
+        ActiveRoutingPolicy::new(
+            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+            31,
+            FallbackRule::Forbidden,
+        )
+        .expect("default routing policy"),
+    )
+    .expect("mounted port")
+    .with_unknown_validity_policy(UnknownValidityPolicy::AllowWithWarning)
+    .recall_admitted(
+        request(
+            resolved_scope(Some("refs/heads/recall-port")),
+            60_000_000,
+            false,
+        ),
+        &live_signal(),
+    )
+    .await
+    .expect_err("unknown-validity content must pass the stale policy gate");
+
+    assert!(matches!(
+        error,
+        CognitiveRecallPortError::DegradationNotAllowed {
+            degradation: CognitiveRecallDegradation::Stale,
+            reason: DegradationDeclinedReason::ContentBearingRequiresExplicitPolicy {
+                cause: DegradationCause::Stale,
+            },
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

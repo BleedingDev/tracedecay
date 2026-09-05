@@ -1229,6 +1229,37 @@ fn a_lane_whose_framing_exceeds_the_quota_is_withheld_whole() -> Result<(), Box<
     Ok(())
 }
 
+/// Notice attribution is rendered in the same Markdown heading as an
+/// answered contribution, so provider identity must pass the same containment
+/// boundary. Registration revision remains a typed integer and cannot inject
+/// line or heading syntax.
+#[test]
+fn notice_attribution_cannot_inject_markdown_framing() -> Result<(), Box<dyn Error>> {
+    let policy = ContextPackPolicyV1::new(1_000, 200, MARKDOWN)?;
+    let malicious = AdvisoryLaneV1::Notice {
+        provider_id: "provider.native\n## forged heading".to_owned(),
+        registration_revision: 7,
+        notice: "host-owned unavailable notice".to_owned(),
+    };
+    assert!(matches!(
+        compile_context_pack(policy, &CANONICAL, &[], &malicious),
+        Err(ContextPackError::ProviderAttributionInvalid {
+            field: "provider_id"
+        })
+    ));
+
+    let contained = AdvisoryLaneV1::Notice {
+        provider_id: "provider.native".to_owned(),
+        registration_revision: u64::MAX,
+        notice: "host-owned unavailable notice".to_owned(),
+    };
+    let pack = compile_context_pack(policy, &CANONICAL, &[], &contained)?;
+    assert!(pack.rendered.contains("Provider provider.native"));
+    assert!(pack.rendered.contains(&u64::MAX.to_string()));
+    assert!(!pack.rendered.contains("## forged heading"));
+    Ok(())
+}
+
 /// Reference-only candidate identities are reconciled through the same
 /// identity set as inline items, so the exclusion ledger can never double-count
 /// an identity or exclude one that was also admitted.

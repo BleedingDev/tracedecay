@@ -12,7 +12,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 getrandom = "0.2"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.11"
 thiserror = "2"
 # Canonical context tokenizer. The context-pack compiler measures every token

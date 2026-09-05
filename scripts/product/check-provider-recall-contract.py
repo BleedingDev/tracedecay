@@ -106,6 +106,7 @@ CANDIDATE_FIELDS = [
     "content_ref",
     "content_sha256",
     "native_score",
+    "confidence",
     "exact_scope_identity",
     "validity",
     "provenance",
@@ -672,6 +673,9 @@ def validate_candidate_scores(contract: dict[str, Any], errors: list[str]) -> No
         "candidate_id_stable_across_requests",
         "stable_memory_ref_required",
         "stable_memory_ref_null_allowed",
+        "confidence_required_nullable",
+        "confidence_null_semantics",
+        "confidence_number_semantics",
         "content_selection_rule",
         "content_digest_required",
         "maximum_candidate_bytes_source",
@@ -694,6 +698,16 @@ def validate_candidate_scores(contract: dict[str, Any], errors: list[str]) -> No
         errors.append("stable memory references must be optional")
     if candidate.get("stable_memory_ref_null_allowed") is not True:
         errors.append("stable memory reference null must be allowed")
+    if candidate.get("confidence_required_nullable") is not True:
+        errors.append("candidate confidence must be required-nullable")
+    if candidate.get("confidence_null_semantics") != (
+        "provider_did_not_supply_confidence"
+    ):
+        errors.append("candidate confidence null semantics drifted")
+    if candidate.get("confidence_number_semantics") != (
+        "finite_number_inclusive_0_0_to_1_0"
+    ):
+        errors.append("candidate confidence number semantics drifted")
     if candidate.get("content_selection_rule") != "exactly_one_of_content_or_content_ref":
         errors.append("candidate must contain exactly one content form")
     if candidate.get("content_digest_required") is not True:

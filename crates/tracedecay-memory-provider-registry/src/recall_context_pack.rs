@@ -1532,15 +1532,25 @@ fn contain_advisory_lane(
     lane: &AdvisoryLaneV1,
     excluded: &mut Vec<ExcludedProviderItemV1>,
 ) -> Result<AdvisoryLaneV1, ContextPackError> {
-    if let AdvisoryLaneV1::Notice { provider_id, .. } = lane
-        && !is_contained_provider_label(provider_id)
-    {
-        return Err(ContextPackError::ProviderAttributionInvalid {
-            field: "provider_id",
-        });
-    }
-    let Some(contribution) = lane.contribution() else {
-        return Ok(lane.clone());
+    let contribution = match lane {
+        AdvisoryLaneV1::Absent => return Ok(AdvisoryLaneV1::Absent),
+        AdvisoryLaneV1::Notice {
+            provider_id,
+            registration_revision,
+            notice,
+        } => {
+            if !is_contained_provider_label(provider_id) {
+                return Err(ContextPackError::ProviderAttributionInvalid {
+                    field: "provider_id",
+                });
+            }
+            return Ok(AdvisoryLaneV1::Notice {
+                provider_id: provider_id.clone(),
+                registration_revision: *registration_revision,
+                notice: notice.clone(),
+            });
+        }
+        AdvisoryLaneV1::Contribution(contribution) => contribution,
     };
     if !is_contained_provider_label(&contribution.provider_id) {
         return Err(ContextPackError::ProviderAttributionInvalid {

@@ -224,6 +224,8 @@ pub struct RecallFixturePort {
     pub handshake_calls: AtomicUsize,
     pub recall_calls: AtomicUsize,
     pub outcome_request_identity: Option<String>,
+    /// Terminal returned by the readiness handshake.
+    pub handshake_terminal_code: TerminalCode,
     /// `Success` returns the mixed candidate outcome; `SuccessZeroResults`
     /// returns a complete outcome with an empty candidate list; every other
     /// code returns a payload-less failure terminal.
@@ -251,6 +253,7 @@ impl RecallFixturePort {
             handshake_calls: AtomicUsize::new(0),
             recall_calls: AtomicUsize::new(0),
             outcome_request_identity: None,
+            handshake_terminal_code: TerminalCode::Success,
             terminal_code: TerminalCode::Success,
             native_score_overrides: std::collections::BTreeMap::new(),
             stable_memory_ref_overrides: std::collections::BTreeMap::new(),
@@ -434,24 +437,26 @@ impl NativeMemoryApplicationPort for RecallFixturePort {
 
     fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
         self.handshake_calls.fetch_add(1, Ordering::Relaxed);
+        let ready = self.handshake_terminal_code == TerminalCode::Success;
         HandshakeResponse {
             terminal: TerminalRecord::new(
                 ProviderOperation::Handshake,
                 OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
-                TerminalCode::Success,
+                self.handshake_terminal_code,
                 CommittedEffectEvidence::none(Some(self.descriptor.state_generation)),
                 FallbackDirective::forbidden(),
                 request.request_id.clone(),
                 request.exact_scope.exact_scope_sha256(),
-                None,
+                (self.handshake_terminal_code != TerminalCode::Success)
+                    .then(|| "native.recall-fixture.handshake".to_owned()),
             )
             .expect("handshake terminal"),
-            descriptor: Some(self.descriptor.clone()),
-            provider_instance_id: Some("native.recall-fixture".to_owned()),
-            state_namespace: Some("native.recall-scope".to_owned()),
-            accepted_scope: Some(request.exact_scope.clone()),
-            effective_limits: Some(request.host_limits.minimum(self.descriptor.limits)),
-            ready_receipt_sha256: Some(ONE_SHA.to_owned()),
+            descriptor: ready.then(|| self.descriptor.clone()),
+            provider_instance_id: ready.then(|| "native.recall-fixture".to_owned()),
+            state_namespace: ready.then(|| "native.recall-scope".to_owned()),
+            accepted_scope: ready.then(|| request.exact_scope.clone()),
+            effective_limits: ready.then(|| request.host_limits.minimum(self.descriptor.limits)),
+            ready_receipt_sha256: ready.then(|| ONE_SHA.to_owned()),
             warnings: Vec::new(),
         }
     }

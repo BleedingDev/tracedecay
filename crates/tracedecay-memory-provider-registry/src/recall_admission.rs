@@ -31,6 +31,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, SecondsFormat};
 use serde::de::{Deserializer, Error as _};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{Number, Value};
 use sha2::{Digest, Sha256};
 use tracedecay_memory_provider_api::contract::{TemporalMode, TerminalCode};
@@ -965,6 +966,36 @@ pub struct RecallValidityV1 {
     pub temporal_state: String,
 }
 
+/// One raw provider confidence datum, retained until admission classifies it.
+#[derive(Clone, Debug)]
+pub struct RecallConfidenceWire(Box<RawValue>);
+
+impl PartialEq for RecallConfidenceWire {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.get() == other.0.get()
+    }
+}
+
+impl Eq for RecallConfidenceWire {}
+
+impl Serialize for RecallConfidenceWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RecallConfidenceWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Box::<RawValue>::deserialize(deserializer).map(Self)
+    }
+}
+
 /// One candidate exactly as the provider returned it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -987,7 +1018,7 @@ pub struct RecallCandidateV1 {
     /// Optional provider-supplied confidence. The key is required on the wire;
     /// `null` means the provider made no confidence claim.
     #[serde(deserialize_with = "required_nullable")]
-    pub confidence: Option<Value>,
+    pub confidence: Option<RecallConfidenceWire>,
     /// Claimed exact scope.
     pub exact_scope_identity: RecallScopeIdentityV1,
     /// Claimed validity.
@@ -1056,6 +1087,7 @@ pub struct AdmittedRecallCandidate {
     host_temporal_state: TemporalState,
     warnings: Vec<String>,
     native_score: ValidatedNativeScoreV1,
+    confidence: Option<Number>,
 }
 
 impl AdmittedRecallCandidate {
@@ -1101,10 +1133,7 @@ impl AdmittedRecallCandidate {
     /// established that the number is finite and within `0.0..=1.0`.
     #[must_use]
     pub fn confidence(&self) -> Option<&Number> {
-        self.candidate
-            .confidence
-            .as_ref()
-            .and_then(Value::as_number)
+        self.confidence.as_ref()
     }
 
     /// Returns the verified content selection.
@@ -1343,12 +1372,13 @@ pub fn admit_recall_candidates(
     let mut degraded = false;
     for candidate in candidates {
         match admit_one(admitted_scope, temporal, authorized, &candidate) {
-            Ok((decision, native_score)) => {
+            Ok((decision, native_score, confidence)) => {
                 degraded |= decision.degrades_lane;
                 admitted.push(AdmittedRecallCandidate {
                     host_temporal_state: decision.host_temporal_state,
                     warnings: decision.warnings,
                     native_score,
+                    confidence,
                     candidate,
                 });
             }
@@ -1396,23 +1426,26 @@ struct AdmitDecision {
     degrades_lane: bool,
 }
 
-fn validate_recall_confidence(value: Option<&Value>) -> Result<(), RecallConfidenceDefect> {
+fn validate_recall_confidence(
+    value: Option<&RecallConfidenceWire>,
+) -> Result<Option<Number>, RecallConfidenceDefect> {
     let Some(value) = value else {
-        return Ok(());
+        return Ok(None);
     };
-    let Value::Number(number) = value else {
+    let raw = value.0.get();
+    if !matches!(raw.as_bytes().first(), Some(b'-' | b'0'..=b'9')) {
         return Err(RecallConfidenceDefect::NotNumber);
-    };
-    let Some(value) = number.as_f64() else {
-        return Err(RecallConfidenceDefect::NotFinite);
-    };
-    if !value.is_finite() {
+    }
+    let number =
+        serde_json::from_str::<Number>(raw).map_err(|_| RecallConfidenceDefect::NotFinite)?;
+    let parsed = number.as_f64().ok_or(RecallConfidenceDefect::NotFinite)?;
+    if !parsed.is_finite() {
         return Err(RecallConfidenceDefect::NotFinite);
     }
-    if !(0.0..=1.0).contains(&value) {
+    if !(0.0..=1.0).contains(&parsed) {
         return Err(RecallConfidenceDefect::OutOfRange);
     }
-    Ok(())
+    Ok(Some(number))
 }
 
 fn admit_one(
@@ -1420,7 +1453,7 @@ fn admit_one(
     temporal: &AdmittedTemporalQuery,
     authorized: &RecallScopeBindingsV1,
     candidate: &RecallCandidateV1,
-) -> Result<(AdmitDecision, ValidatedNativeScoreV1), RecallDenialReason> {
+) -> Result<(AdmitDecision, ValidatedNativeScoreV1, Option<Number>), RecallDenialReason> {
     check_class_binding(
         &candidate.memory_class,
         candidate.exact_scope_identity.scope_binding,
@@ -1433,9 +1466,9 @@ fn admit_one(
     // normalization as a neutral value.
     let native_score = validate_native_score(&candidate.native_score)
         .map_err(|defect| RecallDenialReason::NativeScoreMalformed { defect })?;
-    validate_recall_confidence(candidate.confidence.as_ref())
+    let confidence = validate_recall_confidence(candidate.confidence.as_ref())
         .map_err(|defect| RecallDenialReason::ConfidenceMalformed { defect })?;
-    Ok((decision, native_score))
+    Ok((decision, native_score, confidence))
 }
 
 /// Memory class of one provider-local staged session observation.
@@ -1623,7 +1656,10 @@ fn check_validity(
                 warnings: vec![
                     "validity unknown; admitted under allow_with_warning policy".to_owned(),
                 ],
-                degrades_lane: false,
+                // Unknown validity is still stale content. The warning policy
+                // changes the candidate annotation, not the lane's validity,
+                // so the routing policy's explicit Stale gate must still run.
+                degrades_lane: true,
             }),
         };
     }

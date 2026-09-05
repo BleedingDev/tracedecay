@@ -2746,6 +2746,45 @@ impl AdvisoryContextPackFailureV1 {
     }
 }
 
+/// Why an advisory lane was withheld from the final host answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AdvisoryDeliveryWithheldReasonV1 {
+    /// Context-pack policy or compilation refused the lane.
+    ContextPack(AdvisoryContextPackFailureV1),
+    /// The host already owns the reserved augmentation member.
+    HostMemberCollision { member: &'static str },
+    /// JSON augmentation could not recover the compiled advisory member.
+    JsonMergeInvalid,
+    /// The compiled pack omitted the reserved advisory member.
+    CompiledAdvisoryMissing { member: &'static str },
+}
+
+impl AdvisoryDeliveryWithheldReasonV1 {
+    const fn code(&self) -> &'static str {
+        match self {
+            Self::ContextPack(failure) => failure.code(),
+            Self::HostMemberCollision { .. } => "advisory_host_member_collision",
+            Self::JsonMergeInvalid => "advisory_json_merge_invalid",
+            Self::CompiledAdvisoryMissing { .. } => "advisory_compiled_member_missing",
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::ContextPack(failure) => failure.detail(),
+            Self::HostMemberCollision { member } => {
+                format!("host answer already owns reserved member {member}")
+            }
+            Self::JsonMergeInvalid => {
+                "host or compiled advisory answer was not a JSON object".to_owned()
+            }
+            Self::CompiledAdvisoryMissing { member } => {
+                format!("compiled advisory answer omitted reserved member {member}")
+            }
+        }
+    }
+}
+
 /// The token-budgeted context pack one advisory lane compiled, or the typed
 /// reason it could not be compiled.
 ///
@@ -2863,7 +2902,27 @@ impl AdvisoryRecallExplainV1 {
     /// write that fails is likewise reported rather than escalated: the agent
     /// answer is already compiled, and an audit write is never allowed to
     /// become the reason a tool call fails.
-    fn retain(&self, pack: Option<&ContextPackV1>) {
+    fn retain(
+        &self,
+        pack: Option<&ContextPackV1>,
+        final_withholding: Option<&AdvisoryDeliveryWithheldReasonV1>,
+    ) {
+        let mut host_withheld = self.host_withheld.clone();
+        if let (Some(reason), Some(selection)) = (final_withholding, self.selection.as_ref()) {
+            for candidate_id in selection.selected_candidate_ids() {
+                if host_withheld
+                    .iter()
+                    .any(|withholding| withholding.candidate_id == candidate_id)
+                {
+                    continue;
+                }
+                host_withheld.push(RecallExplainHostWithholdingV1 {
+                    candidate_id: candidate_id.to_owned(),
+                    reason_code: reason.code().to_owned(),
+                    detail: Some(reason.detail()),
+                });
+            }
+        }
         let trace = match build_recall_explain_trace(RecallExplainTraceInputsV1 {
             provider_id: &self.attributed_provider,
             registration_revision: self.registration_revision,
@@ -2871,7 +2930,7 @@ impl AdvisoryRecallExplainV1 {
             normalization: self.normalization.as_ref(),
             selection: self.selection.as_ref(),
             pack,
-            host_withheld: &self.host_withheld,
+            host_withheld: &host_withheld,
             pack_identity_aliases: &self.pack_identity_aliases,
             redactor: self,
         }) {
@@ -3042,7 +3101,6 @@ impl AdvisoryMemoryContextV1 {
         ) {
             Ok(policy) => policy,
             Err(error) => {
-                self.retain_explain_trace(None);
                 return AdvisoryContextPackV1::Refused(AdvisoryContextPackFailureV1::Policy(error));
             }
         };
@@ -3052,19 +3110,8 @@ impl AdvisoryMemoryContextV1 {
             host_items,
             &self.advisory_lane(),
         ) {
-            Ok(pack) => {
-                // The trace is reconciled against the pack the agent actually
-                // received, so a token or section decision in the trace is the
-                // decision that was really made rather than one re-derived
-                // from the budgets afterwards.
-                self.retain_explain_trace(Some(&pack));
-                AdvisoryContextPackV1::Compiled(pack)
-            }
+            Ok(pack) => AdvisoryContextPackV1::Compiled(pack),
             Err(error) => {
-                // A refused pack still explains the recall: every selected
-                // candidate stops at the selection stage instead of silently
-                // disappearing from the account.
-                self.retain_explain_trace(None);
                 AdvisoryContextPackV1::Refused(AdvisoryContextPackFailureV1::Compile(error))
             }
         }
@@ -3072,13 +3119,17 @@ impl AdvisoryMemoryContextV1 {
 
     /// Retains this recall's explain trace against whatever the pack stage
     /// produced. A lane with no admission has nothing to explain.
-    fn retain_explain_trace(&self, pack: Option<&ContextPackV1>) {
+    fn retain_explain_trace(
+        &self,
+        pack: Option<&ContextPackV1>,
+        final_withholding: Option<&AdvisoryDeliveryWithheldReasonV1>,
+    ) {
         if let Self::Answered {
             explain: Some(explain),
             ..
         } = self
         {
-            explain.retain(pack);
+            explain.retain(pack, final_withholding);
         }
     }
 
@@ -3105,18 +3156,52 @@ impl AdvisoryMemoryContextV1 {
             return result;
         };
         let (render_form, host_items) = host_evidence(&text);
-        let rendered = match self.context_pack(render_form, &host_items) {
+        let delivery = match self.context_pack(render_form, &host_items) {
             AdvisoryContextPackV1::Compiled(pack) => {
-                merge_compiled_advisory(render_form, &text, &pack.rendered)
+                let delivery = merge_compiled_advisory(render_form, &text, &pack.rendered);
+                match &delivery {
+                    AdvisoryDeliveryV1::Delivered(_) => {
+                        // Only now is the compiled receipt truthful: the merge
+                        // decision established that the agent received it.
+                        self.retain_explain_trace(Some(&pack), None);
+                    }
+                    AdvisoryDeliveryV1::Withheld { reason, .. } => {
+                        self.retain_explain_trace(None, Some(reason));
+                    }
+                }
+                delivery
             }
             AdvisoryContextPackV1::Refused(failure) => {
-                withheld_rendering(render_form, &text, self.provider_id(), &failure)
+                let delivery = withheld_rendering(render_form, &text, self.provider_id(), &failure);
+                let AdvisoryDeliveryV1::Withheld { reason, .. } = &delivery else {
+                    return result;
+                };
+                self.retain_explain_trace(None, Some(reason));
+                delivery
             }
         };
         if let Some(slot) = result.value.pointer_mut("/content/0/text") {
-            *slot = Value::String(rendered);
+            *slot = Value::String(delivery.into_rendered());
         }
         result
+    }
+}
+
+/// Final disposition of advisory augmentation after the host-owned answer has
+/// made its merge decision.
+enum AdvisoryDeliveryV1 {
+    Delivered(String),
+    Withheld {
+        rendered: String,
+        reason: AdvisoryDeliveryWithheldReasonV1,
+    },
+}
+
+impl AdvisoryDeliveryV1 {
+    fn into_rendered(self) -> String {
+        match self {
+            Self::Delivered(rendered) | Self::Withheld { rendered, .. } => rendered,
+        }
     }
 }
 
@@ -3131,24 +3216,37 @@ fn merge_compiled_advisory(
     render_form: ContextPackRenderFormV1,
     host_text: &str,
     compiled_text: &str,
-) -> String {
+) -> AdvisoryDeliveryV1 {
     if render_form != ContextPackRenderFormV1::Json {
-        return compiled_text.to_owned();
+        return AdvisoryDeliveryV1::Delivered(compiled_text.to_owned());
     }
     let (Ok(Value::Object(mut host)), Ok(Value::Object(mut compiled))) = (
         serde_json::from_str::<Value>(host_text),
         serde_json::from_str::<Value>(compiled_text),
     ) else {
-        return compiled_text.to_owned();
+        return AdvisoryDeliveryV1::Withheld {
+            rendered: host_text.to_owned(),
+            reason: AdvisoryDeliveryWithheldReasonV1::JsonMergeInvalid,
+        };
     };
     if host.contains_key(ADVISORY_CONTEXT_PACK_JSON_KEY) {
-        return host_text.to_owned();
+        return AdvisoryDeliveryV1::Withheld {
+            rendered: host_text.to_owned(),
+            reason: AdvisoryDeliveryWithheldReasonV1::HostMemberCollision {
+                member: ADVISORY_CONTEXT_PACK_JSON_KEY,
+            },
+        };
     }
     let Some(advisory) = compiled.remove(ADVISORY_CONTEXT_PACK_JSON_KEY) else {
-        return host_text.to_owned();
+        return AdvisoryDeliveryV1::Withheld {
+            rendered: host_text.to_owned(),
+            reason: AdvisoryDeliveryWithheldReasonV1::CompiledAdvisoryMissing {
+                member: ADVISORY_CONTEXT_PACK_JSON_KEY,
+            },
+        };
     };
     host.insert(ADVISORY_CONTEXT_PACK_JSON_KEY.to_owned(), advisory);
-    Value::Object(host).to_string()
+    AdvisoryDeliveryV1::Delivered(Value::Object(host).to_string())
 }
 
 /// The host answer, unchanged, plus a bounded typed notice that the advisory
@@ -3162,17 +3260,18 @@ fn withheld_rendering(
     text: &str,
     provider_id: &str,
     failure: &AdvisoryContextPackFailureV1,
-) -> String {
-    // The lane still names the provider it was routed to. A withheld lane a
-    // reader cannot attribute is indistinguishable from a lane that was never
-    // configured at all -- and every lane, answered or not, now carries that
-    // identity, so there is no identity-less rendering to fall back to.
+) -> AdvisoryDeliveryV1 {
     let attribution = provider_id;
     match render_form {
         ContextPackRenderFormV1::Json => match serde_json::from_str::<Value>(text) {
             Ok(Value::Object(mut object)) => {
                 if object.contains_key(ADVISORY_CONTEXT_PACK_JSON_KEY) {
-                    return text.to_owned();
+                    return AdvisoryDeliveryV1::Withheld {
+                        rendered: text.to_owned(),
+                        reason: AdvisoryDeliveryWithheldReasonV1::HostMemberCollision {
+                            member: ADVISORY_CONTEXT_PACK_JSON_KEY,
+                        },
+                    };
                 }
                 object.insert(
                     ADVISORY_CONTEXT_PACK_JSON_KEY.to_owned(),
@@ -3185,9 +3284,15 @@ fn withheld_rendering(
                         },
                     }),
                 );
-                Value::Object(object).to_string()
+                AdvisoryDeliveryV1::Withheld {
+                    rendered: Value::Object(object).to_string(),
+                    reason: AdvisoryDeliveryWithheldReasonV1::ContextPack(failure.clone()),
+                }
             }
-            _ => text.to_owned(),
+            _ => AdvisoryDeliveryV1::Withheld {
+                rendered: text.to_owned(),
+                reason: AdvisoryDeliveryWithheldReasonV1::JsonMergeInvalid,
+            },
         },
         ContextPackRenderFormV1::Markdown => {
             let mut rendered = text.to_owned();
@@ -3198,7 +3303,10 @@ fn withheld_rendering(
                 failure.code(),
                 failure.detail()
             );
-            rendered
+            AdvisoryDeliveryV1::Withheld {
+                rendered,
+                reason: AdvisoryDeliveryWithheldReasonV1::ContextPack(failure.clone()),
+            }
         }
     }
 }
@@ -3627,11 +3735,25 @@ mod advisory_rendering_tests {
         });
         let host_text = host.to_string();
 
-        let compiled = rendered_text(&answered().appended_to(tool_result(&host_text)));
+        let lane = answered();
+        let compiled = rendered_text(&lane.appended_to(tool_result(&host_text)));
         assert_eq!(
             compiled, host_text,
             "compiled augmentation must preserve collisions"
         );
+        let (form, host_items) = host_evidence(&host_text);
+        let AdvisoryContextPackV1::Compiled(pack) = lane.context_pack(form, &host_items) else {
+            panic!("collision fixture must still compile before merge");
+        };
+        assert!(matches!(
+            merge_compiled_advisory(form, &host_text, &pack.rendered),
+            AdvisoryDeliveryV1::Withheld {
+                reason: AdvisoryDeliveryWithheldReasonV1::HostMemberCollision {
+                    member: ADVISORY_CONTEXT_PACK_JSON_KEY,
+                },
+                ..
+            }
+        ));
 
         let withheld = withheld_rendering(
             ContextPackRenderFormV1::Json,
@@ -3639,10 +3761,15 @@ mod advisory_rendering_tests {
             NATIVE_PROVIDER_ID,
             &AdvisoryContextPackFailureV1::Policy(ContextPackPolicyError::ZeroTotalBudget),
         );
-        assert_eq!(
-            withheld, host_text,
-            "withheld augmentation must preserve collisions"
-        );
+        assert!(matches!(
+            &withheld,
+            AdvisoryDeliveryV1::Withheld {
+                rendered,
+                reason: AdvisoryDeliveryWithheldReasonV1::HostMemberCollision {
+                    member: ADVISORY_CONTEXT_PACK_JSON_KEY,
+                },
+            } if rendered == &host_text
+        ));
     }
 
     /// An unavailable lane reports its typed code, and the code survives into
@@ -5093,6 +5220,88 @@ mod tests {
                 .expect("retained trace identities")
                 .len(),
             1
+        );
+    }
+
+    /// A host-owned reserved JSON member wins the merge and the retained
+    /// explain trace records the advisory candidates as withheld rather than
+    /// claiming that the discarded compiled pack was injected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_json_collision_retains_withholding_not_a_delivery_receipt() {
+        let fixture = project_fixture().await;
+        seed_fixture(&fixture).await;
+        let mount = production_mount(&fixture, EnabledProviderMode::Active, MOUNTED_WORKTREE);
+        let canonical_session_id = "session.cognitive-recall.collision";
+        let port = mount
+            .port_for_session(canonical_session_id)
+            .expect("session port");
+        let now = now_micros();
+        let advisory = advisory_context_recall(
+            &port,
+            &mount,
+            AdvisoryRecallInputsV1 {
+                canonical_session_id,
+                query: "cognitive recall ledger",
+                maximum_candidates: 5,
+                deadline: Deadline::new(UtcMicros(now.0.saturating_add(60_000_000)))
+                    .expect("deadline"),
+                cancellation: live_signal(),
+            },
+        )
+        .await;
+        let AdvisoryMemoryContextV1::Answered {
+            explain: Some(explain),
+            ..
+        } = &advisory
+        else {
+            panic!("mounted active route must answer: {advisory:?}");
+        };
+        let request_id = explain.report.request_id.clone();
+        let host = json!({
+            "answer": true,
+            (ADVISORY_CONTEXT_PACK_JSON_KEY): {
+                "state": "host-owned",
+                "code_generation": {"language": "rust"},
+            },
+        });
+        let host_text = host.to_string();
+        let rendered =
+            rendered_text_for_test(&advisory.appended_to(tool_result_for_test(&host_text)));
+        assert_eq!(rendered, host_text, "host-owned member must be unchanged");
+
+        let trace_id = mount
+            .explain_trace_ids_for_request(&request_id)
+            .expect("retained trace identities")
+            .into_iter()
+            .next()
+            .expect("collision must retain a trace");
+        let retained = mount
+            .explain_trace(&trace_id)
+            .expect("retained trace read")
+            .expect("collision trace");
+        assert!(retained.trace.token_summary.is_none());
+        let selected: Vec<_> = retained
+            .trace
+            .items
+            .iter()
+            .filter(|item| item.host_reason_code == "advisory_host_member_collision")
+            .collect();
+        assert!(
+            !selected.is_empty(),
+            "selected advisory items must be withheld"
+        );
+        assert!(selected.iter().all(|item| {
+            item.stage == RecallExplainStageV1::HostWithheld
+                && item.section.is_none()
+                && item.tokens.is_none()
+        }));
+        assert!(
+            retained
+                .trace
+                .items
+                .iter()
+                .all(|item| item.stage != RecallExplainStageV1::Injected),
+            "no discarded pack may claim delivery"
         );
     }
 

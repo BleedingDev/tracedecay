@@ -14,9 +14,9 @@ use tracedecay_memory_provider_native::NATIVE_PROVIDER_ID;
 use tracedecay_memory_provider_registry::{
     AdmittedTemporalQuery, RECALL_PAYLOAD_CONTRACT_ID, RECALL_QUERY_CAPABILITY_ID,
     RecallAdmissionError, RecallBudgetsV1, RecallCandidateContent, RecallCandidateV1,
-    RecallDenialReason, RecallRequestParts, RecallScopeBindingsV1, ScopeBinding, ScopeField,
-    TemporalState, UnknownValidityPolicy, admit_recall_candidates, admit_recall_reply,
-    build_recall_request_payload, decode_recall_outcome,
+    RecallConfidenceDefect, RecallDenialReason, RecallRequestParts, RecallScopeBindingsV1,
+    ScopeBinding, ScopeField, TemporalState, UnknownValidityPolicy, admit_recall_candidates,
+    admit_recall_reply, build_recall_request_payload, decode_recall_outcome,
 };
 
 mod recall_fixture;
@@ -328,7 +328,10 @@ fn unknown_validity_policy_is_host_owned() -> Result<(), Box<dyn Error>> {
         vec![unknown()],
     )?;
     assert_eq!(warned.admitted.len(), 1);
-    assert!(!warned.report.degraded);
+    assert!(
+        warned.report.degraded,
+        "warning-only annotation must not bypass the stale lane gate"
+    );
     assert!(!warned.admitted[0].warnings().is_empty());
     Ok(())
 }
@@ -643,6 +646,169 @@ fn admission_preserves_provider_order_and_is_deterministic() -> Result<(), Box<d
         duplicate.err(),
         Some(RecallAdmissionError::DuplicateCandidateId("dup".to_owned()))
     );
+    Ok(())
+}
+
+#[test]
+fn overflowing_confidence_number_decodes_to_typed_candidate_denial() -> Result<(), Box<dyn Error>> {
+    let port = Arc::new(RecallFixturePort::new());
+    let composition = compose(port.clone());
+    let registry = composition.registry().expect("enabled registry");
+    let response = registry.handshake(&handshake())?;
+    let temporal = current_query();
+    let call = recall_call(&response, &temporal);
+
+    let id = "overflow-confidence";
+    let literal = "1e400";
+    let mut outcome = port.outcome_value(&call);
+    outcome["candidates"] = json!([candidate_value(
+        id,
+        &format!("content of {id}"),
+        scope_value(&admitted_scope()),
+        current_validity(),
+    )]);
+    let json = serde_json::to_string(&outcome)?;
+    let json = json.replacen(
+        "\"confidence\":null",
+        &format!("\"confidence\":{literal}"),
+        1,
+    );
+    let bytes = json.into_bytes();
+    let payload = CanonicalPayload::new(
+        OwnedVersionedId::new(RECALL_PAYLOAD_CONTRACT_ID)?,
+        bytes.clone(),
+        sha256_hex(&bytes),
+    )?;
+
+    let mut reply = registry.invoke_active(&call)?;
+    reply.payload = Some(payload);
+    let admission = admit_recall_reply(&call, &temporal, 8, &authorized_exact(), &reply)?;
+    assert!(admission.admitted.is_empty(), "{literal}");
+    assert_eq!(admission.report.denied.len(), 1, "{literal}");
+    assert_eq!(
+        admission.report.denied[0].reason,
+        RecallDenialReason::ConfidenceMalformed {
+            defect: RecallConfidenceDefect::NotFinite,
+        },
+        "{literal}"
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_confidence_literals_are_payload_decode_errors() -> Result<(), Box<dyn Error>> {
+    let port = Arc::new(RecallFixturePort::new());
+    let composition = compose(port.clone());
+    let registry = composition.registry().expect("enabled registry");
+    let response = registry.handshake(&handshake())?;
+    let temporal = current_query();
+    let call = recall_call(&response, &temporal);
+    let mut outcome = port.outcome_value(&call);
+    outcome["candidates"] = json!([candidate_value(
+        "invalid-confidence",
+        "content of invalid-confidence",
+        scope_value(&admitted_scope()),
+        current_validity(),
+    )]);
+    let json = serde_json::to_string(&outcome)?;
+
+    for literal in ["NaN", "Infinity", "-Infinity"] {
+        for leading_whitespace in ["", " \t\r\n"] {
+            let invalid_json = json.replacen(
+                "\"confidence\":null",
+                &format!("\"confidence\":{literal}"),
+                1,
+            );
+            let bytes = format!("{leading_whitespace}{invalid_json}").into_bytes();
+            let payload = CanonicalPayload::new(
+                OwnedVersionedId::new(RECALL_PAYLOAD_CONTRACT_ID)?,
+                bytes.clone(),
+                sha256_hex(&bytes),
+            )?;
+            let mut reply = registry.invoke_active(&call)?;
+            reply.payload = Some(payload);
+
+            assert!(
+                matches!(
+                    admit_recall_reply(&call, &temporal, 8, &authorized_exact(), &reply),
+                    Err(RecallAdmissionError::PayloadDecode { .. })
+                ),
+                "literal={literal}, leading_whitespace={leading_whitespace:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn confidence_f64_rounding_at_the_upper_boundary_is_admitted() -> Result<(), Box<dyn Error>> {
+    let port = Arc::new(RecallFixturePort::new());
+    let composition = compose(port.clone());
+    let registry = composition.registry().expect("enabled registry");
+    let response = registry.handshake(&handshake())?;
+    let temporal = current_query();
+    let call = recall_call(&response, &temporal);
+    let mut outcome = port.outcome_value(&call);
+    outcome["candidates"] = json!([candidate_value(
+        "rounded-confidence",
+        "content of rounded-confidence",
+        scope_value(&admitted_scope()),
+        current_validity(),
+    )]);
+    let json = serde_json::to_string(&outcome)?.replacen(
+        "\"confidence\":null",
+        "\"confidence\":1.0000000000000001",
+        1,
+    );
+    let bytes = json.into_bytes();
+    let payload = CanonicalPayload::new(
+        OwnedVersionedId::new(RECALL_PAYLOAD_CONTRACT_ID)?,
+        bytes.clone(),
+        sha256_hex(&bytes),
+    )?;
+    let mut reply = registry.invoke_active(&call)?;
+    reply.payload = Some(payload);
+
+    let admission = admit_recall_reply(&call, &temporal, 8, &authorized_exact(), &reply)?;
+    assert_eq!(admission.admitted.len(), 1);
+    assert!(admission.report.denied.is_empty());
+    assert_eq!(
+        admission.admitted[0]
+            .confidence()
+            .and_then(serde_json::Number::as_f64),
+        Some(1.0)
+    );
+    Ok(())
+}
+
+#[test]
+fn nonfinite_literals_outside_candidate_confidence_remain_payload_decode_errors()
+-> Result<(), Box<dyn Error>> {
+    let port = Arc::new(RecallFixturePort::new());
+    let composition = compose(port.clone());
+    let registry = composition.registry().expect("enabled registry");
+    let response = registry.handshake(&handshake())?;
+    let call = recall_call(&response, &current_query());
+    let mut outcome = port.outcome_value(&call);
+    outcome["candidates"] = json!([candidate_value(
+        "nested-nan",
+        "content of nested-nan",
+        scope_value(&admitted_scope()),
+        current_validity(),
+    )]);
+    let json = serde_json::to_string(&outcome)?;
+    let json = json.replacen("\"provenance\":{", "\"provenance\":{\"confidence\":NaN,", 1);
+    let bytes = json.into_bytes();
+    let payload = CanonicalPayload::new(
+        OwnedVersionedId::new(RECALL_PAYLOAD_CONTRACT_ID)?,
+        bytes.clone(),
+        sha256_hex(&bytes),
+    )?;
+
+    assert!(matches!(
+        decode_recall_outcome(&payload),
+        Err(RecallAdmissionError::PayloadDecode { .. })
+    ));
     Ok(())
 }
 
