@@ -7,7 +7,7 @@ use tracedecay_domain::{
 };
 use tracedecay_graph_db::{
     GraphCancellation, GraphDbError, GraphGenerationDependency, GraphMutation, GraphWatermark,
-    GraphWriteBatch, NeverCancelled, SourceGeneration,
+    GraphWriteBatch, NeverCancelled, SourceGeneration, VerifiedGenerationBeginV1,
 };
 use tracedecay_store::{
     GraphGenerationIdV1, GraphNamespaceV1, GraphProjectionIdV1, GraphProjectionIdentityV1,
@@ -44,7 +44,8 @@ use super::native_records::{
 use super::persistence::{map_graph_error, storage_error};
 use super::stage_identity::next_stage_attempt;
 use super::{
-    GRAPH_OPERATION_DEADLINE, GraphVectorGenerationStoreV1, VectorGenerationBeginOutcomeV1,
+    GRAPH_BACKGROUND_OPERATION_BUDGET, GRAPH_OPERATION_DEADLINE, GraphVectorGenerationStoreV1,
+    VectorGenerationBeginOutcomeV1,
 };
 use crate::semantic_runtime::SemanticGraphExecutionAuthorityV1;
 
@@ -227,9 +228,12 @@ impl GraphVectorGenerationStoreV1 {
                     )
                 })?;
             let mut attempt = result.clone();
+            let mut superseded_stage = false;
+            let mut completion_authority = None;
             let (stage, published) = loop {
+                let operation_authority = completion_authority.as_ref().unwrap_or(&authority);
                 let stage_plan =
-                    self.semantic_stage_plan(&plan, &attempt, &descriptor, &authority)?;
+                    self.semantic_stage_plan(&plan, &attempt, &descriptor, operation_authority)?;
                 let published_key = SemanticVectorPublishedGenerationKey {
                     projection: stage_plan.key.projection.clone(),
                     semantic_generation_id: stage_plan.semantic_generation_id.clone(),
@@ -239,24 +243,145 @@ impl GraphVectorGenerationStoreV1 {
                     verified_head,
                 } = self
                     .runtime
-                    .published_semantic_generation(&published_key, &authority)
+                    .published_semantic_generation(&published_key, operation_authority)
                     .map_err(map_graph_error)?
                 {
                     require_same_semantic_plan(&record, &stage_plan)?;
-                    let publication =
-                        self.recover_published_generation(&plan, &verified_head, &authority)?;
+                    let publication = self.recover_published_generation(
+                        &plan,
+                        &verified_head,
+                        operation_authority,
+                    )?;
                     break (*record, Some(publication));
                 }
                 match self
                     .runtime
-                    .resume_stage(&stage_plan.key, &authority)
+                    .resume_stage(&stage_plan.key, operation_authority)
                     .map_err(map_graph_error)?
                 {
                     SemanticVectorStageResumeOutcome::Missing => {
-                        let stage = self
+                        let stage = match self
                             .runtime
-                            .begin_stage(&stage_plan, &authority)
-                            .map_err(map_graph_error)?;
+                            .begin_stage(&stage_plan, operation_authority)
+                            .map_err(map_graph_error)?
+                        {
+                            VerifiedGenerationBeginV1::Begun(stage)
+                            | VerifiedGenerationBeginV1::Recovered(stage) => stage,
+                            VerifiedGenerationBeginV1::Occupied { existing } => {
+                                let is_superseded = existing.state
+                                    == SemanticVectorStageState::Pending
+                                    && (existing.plan.key.build_id != stage_plan.key.build_id
+                                        || existing.plan.key.plan_digest
+                                            != stage_plan.key.plan_digest);
+                                if superseded_stage || !is_superseded {
+                                    return Err(map_graph_error(GraphDbError::conflict_observed(
+                                        "usecases.store.begin_generation.occupied_stage",
+                                        format!("stage={:?}", stage_plan.key),
+                                        format!("stage={:?}", existing.plan.key),
+                                    )));
+                                }
+                                if existing.plan.writer_fence.binding
+                                    == stage_plan.writer_fence.binding
+                                {
+                                    return Err(map_graph_error(GraphDbError::conflict_observed(
+                                        "usecases.store.begin_generation.occupied_stage_active_writer",
+                                        format!("writer_fence={:?}", stage_plan.writer_fence),
+                                        format!("writer_fence={:?}", existing.plan.writer_fence),
+                                    )));
+                                }
+                                let adoption_authority = completion_authority.insert(
+                                    SemanticGraphExecutionAuthorityV1::new(
+                                        Arc::new(NeverCancelled),
+                                        Instant::now() + GRAPH_BACKGROUND_OPERATION_BUDGET,
+                                    ),
+                                );
+                                let adopted = match self
+                                    .runtime
+                                    .resume_stage(&existing.plan.key, adoption_authority)
+                                    .map_err(map_graph_error)?
+                                {
+                                    SemanticVectorStageResumeOutcome::Pending(record) => record,
+                                    SemanticVectorStageResumeOutcome::Ready(record)
+                                    | SemanticVectorStageResumeOutcome::Cancelled(record) => {
+                                        return Err(map_graph_error(
+                                            GraphDbError::conflict_observed(
+                                                "usecases.store.begin_generation.adopt_superseded",
+                                                "state=Pending",
+                                                format!("state={:?}", record.state),
+                                            ),
+                                        ));
+                                    }
+                                    SemanticVectorStageResumeOutcome::Published {
+                                        record, ..
+                                    } => {
+                                        return Err(map_graph_error(
+                                            GraphDbError::conflict_observed(
+                                                "usecases.store.begin_generation.adopt_superseded",
+                                                "state=Pending",
+                                                format!("state={:?}", record.state),
+                                            ),
+                                        ));
+                                    }
+                                    SemanticVectorStageResumeOutcome::Missing => {
+                                        return Err(map_graph_error(GraphDbError::conflict(
+                                            "usecases.store.begin_generation.adopt_superseded_missing",
+                                        )));
+                                    }
+                                };
+                                require_resumed_plan(&adopted, &existing.plan)?;
+                                if adopted.plan.writer_fence != stage_plan.writer_fence {
+                                    return Err(map_graph_error(GraphDbError::conflict_observed(
+                                        "usecases.store.begin_generation.adopt_superseded_fence",
+                                        format!("writer_fence={:?}", stage_plan.writer_fence),
+                                        format!("writer_fence={:?}", adopted.plan.writer_fence),
+                                    )));
+                                }
+                                match self
+                                    .runtime
+                                    .cancel_stage(&adopted.plan.key, adoption_authority)
+                                    .map_err(map_graph_error)?
+                                {
+                                    SemanticVectorStageCancelOutcome::Cancelled(record)
+                                    | SemanticVectorStageCancelOutcome::ExactReplay(record)
+                                        if record.plan == adopted.plan =>
+                                    {
+                                        superseded_stage = true;
+                                        continue;
+                                    }
+                                    SemanticVectorStageCancelOutcome::Cancelled(record)
+                                    | SemanticVectorStageCancelOutcome::ExactReplay(record)
+                                    | SemanticVectorStageCancelOutcome::ReadyToPublish(record) => {
+                                        return Err(map_graph_error(
+                                            GraphDbError::conflict_observed(
+                                                "usecases.store.begin_generation.cancel_superseded",
+                                                format!("stage={:?}", existing.plan.key),
+                                                format!(
+                                                    "stage={:?}, state={:?}",
+                                                    record.plan.key, record.state
+                                                ),
+                                            ),
+                                        ));
+                                    }
+                                    SemanticVectorStageCancelOutcome::MissingStage => {
+                                        return Err(map_graph_error(GraphDbError::conflict(
+                                            "usecases.store.begin_generation.cancel_superseded_missing",
+                                        )));
+                                    }
+                                    SemanticVectorStageCancelOutcome::StaleFence { actual } => {
+                                        return Err(map_graph_error(
+                                            GraphDbError::conflict_observed(
+                                                "usecases.store.begin_generation.cancel_superseded_fence",
+                                                format!(
+                                                    "writer_fence={:?}",
+                                                    existing.plan.writer_fence
+                                                ),
+                                                format!("writer_fence={actual:?}"),
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
+                        };
                         match stage.state {
                             SemanticVectorStageState::Pending
                             | SemanticVectorStageState::ReadyToPublish => break (stage, None),
@@ -289,7 +414,7 @@ impl GraphVectorGenerationStoreV1 {
                         require_resumed_plan(&stage, &stage_plan)?;
                         match self
                             .runtime
-                            .cancel_stage(&stage.plan.key, &authority)
+                            .cancel_stage(&stage.plan.key, operation_authority)
                             .map_err(map_graph_error)?
                         {
                             SemanticVectorStageCancelOutcome::Cancelled(record)
@@ -309,7 +434,7 @@ impl GraphVectorGenerationStoreV1 {
                                 require_resumed_plan(&record, &stage_plan)?;
                                 match self
                                     .runtime
-                                    .resume_stage(&stage_plan.key, &authority)
+                                    .resume_stage(&stage_plan.key, operation_authority)
                                     .map_err(map_graph_error)?
                                 {
                                     SemanticVectorStageResumeOutcome::Published {
@@ -320,27 +445,29 @@ impl GraphVectorGenerationStoreV1 {
                                         let publication = self.recover_published_generation(
                                             &plan,
                                             &verified_head,
-                                            &authority,
+                                            operation_authority,
                                         )?;
                                         break (*record, Some(publication));
                                     }
                                     SemanticVectorStageResumeOutcome::Ready(_) => {
-                                        return Err(
-                                            VectorGenerationStoreErrorV1::ConcurrentMutation,
-                                        );
+                                        return Err(map_graph_error(GraphDbError::conflict(
+                                            "usecases.store.rebuild.ready_stage",
+                                        )));
                                     }
                                     SemanticVectorStageResumeOutcome::Pending(_)
                                     | SemanticVectorStageResumeOutcome::Missing
                                     | SemanticVectorStageResumeOutcome::Cancelled(_) => {
-                                        return Err(
-                                            VectorGenerationStoreErrorV1::ConcurrentMutation,
-                                        );
+                                        return Err(map_graph_error(GraphDbError::conflict(
+                                            "usecases.store.rebuild.cancelled_stage",
+                                        )));
                                     }
                                 }
                             }
                             SemanticVectorStageCancelOutcome::MissingStage
                             | SemanticVectorStageCancelOutcome::StaleFence { .. } => {
-                                return Err(VectorGenerationStoreErrorV1::ConcurrentMutation);
+                                return Err(map_graph_error(GraphDbError::conflict(
+                                    "usecases.store.rebuild.cancel_stage",
+                                )));
                             }
                         }
                     }
@@ -349,8 +476,11 @@ impl GraphVectorGenerationStoreV1 {
                         verified_head,
                     } => {
                         require_resumed_plan(&record, &stage_plan)?;
-                        let publication =
-                            self.recover_published_generation(&plan, &verified_head, &authority)?;
+                        let publication = self.recover_published_generation(
+                            &plan,
+                            &verified_head,
+                            operation_authority,
+                        )?;
                         break (*record, Some(publication));
                     }
                     SemanticVectorStageResumeOutcome::Cancelled(record) => {
@@ -405,7 +535,11 @@ impl GraphVectorGenerationStoreV1 {
             .recover_verified_generation(&verified_head.key, authority)
             .map_err(map_graph_error)?;
         if snapshot.verified_head() != verified_head {
-            return Err(VectorGenerationStoreErrorV1::ConcurrentMutation);
+            return Err(map_graph_error(GraphDbError::conflict_observed(
+                "usecases.store.recover_published_generation.verified_head",
+                format!("verified_head={verified_head:?}"),
+                format!("verified_head={:?}", snapshot.verified_head()),
+            )));
         }
         let generation_id = VectorGenerationIdV1::new(generation_identity_digest(plan)?);
         let read = super::snapshot::SemanticVectorVerifiedReadV1::new(snapshot.clone());
@@ -468,9 +602,9 @@ impl GraphVectorGenerationStoreV1 {
                 ))
             }
             SemanticVectorStageCancelOutcome::ReadyToPublish(_)
-            | SemanticVectorStageCancelOutcome::StaleFence { .. } => {
-                Err(VectorGenerationStoreErrorV1::ConcurrentMutation)
-            }
+            | SemanticVectorStageCancelOutcome::StaleFence { .. } => Err(map_graph_error(
+                GraphDbError::conflict("usecases.store.cancel_generation.stage_state"),
+            )),
         }
     }
 
@@ -573,7 +707,9 @@ impl GraphVectorGenerationStoreV1 {
             }
             SemanticVectorStageResumeOutcome::Published { .. }
             | SemanticVectorStageResumeOutcome::Cancelled(_) => {
-                return Err(VectorGenerationStoreErrorV1::ConcurrentMutation);
+                return Err(map_graph_error(GraphDbError::conflict(
+                    "usecases.store.commit_batch.stage_state",
+                )));
             }
         };
         let checkpoint = pending.state.apply_batch(build_id, staged_commit)?;
@@ -620,9 +756,13 @@ impl GraphVectorGenerationStoreV1 {
                     .ok_or(VectorGenerationStoreErrorV1::IncompleteGeneration)?,
             )
         };
+        let prepare_authority = SemanticGraphExecutionAuthorityV1::new(
+            Arc::clone(&cancellation),
+            Instant::now() + GRAPH_BACKGROUND_OPERATION_BUDGET,
+        );
         match self
             .runtime
-            .prepare_publication_from_staged_native(&stage.plan.key, &authority)
+            .prepare_publication_from_staged_native(&stage.plan.key, &prepare_authority)
             .map_err(map_graph_error)?
         {
             SemanticVectorStagePublicationPrepareOutcome::ReadyToPublish(_)
@@ -639,12 +779,18 @@ impl GraphVectorGenerationStoreV1 {
             | SemanticVectorStagePublicationPrepareOutcome::PublicationConflict
             | SemanticVectorStagePublicationPrepareOutcome::SemanticGenerationConflict { .. }
             | SemanticVectorStagePublicationPrepareOutcome::ChunkManifestConflict { .. } => {
-                return Err(VectorGenerationStoreErrorV1::ConcurrentMutation);
+                return Err(map_graph_error(GraphDbError::conflict(
+                    "usecases.store.publish_generation.prepare",
+                )));
             }
         }
+        let publish_authority = SemanticGraphExecutionAuthorityV1::new(
+            Arc::clone(&cancellation),
+            Instant::now() + GRAPH_BACKGROUND_OPERATION_BUDGET,
+        );
         let snapshot = self
             .runtime
-            .publish_ready_stage(&stage.plan.key, &authority)
+            .publish_ready_stage(&stage.plan.key, &publish_authority)
             .map_err(map_graph_error)?;
         let verified_head = snapshot.verified_head().clone();
         if verified_head.key != stage.plan.publication_key {
@@ -678,7 +824,9 @@ impl GraphVectorGenerationStoreV1 {
                 | SemanticVectorStagePublishOutcome::NotReady(_)
                 | SemanticVectorStagePublishOutcome::StaleFence { .. },
             ) => {
-                return Err(VectorGenerationStoreErrorV1::ConcurrentMutation);
+                return Err(map_graph_error(GraphDbError::conflict(
+                    "usecases.store.publish_generation.settle",
+                )));
             }
             Ok(SemanticVectorStagePublishOutcome::MissingStage) => {
                 return Err(VectorGenerationStoreErrorV1::ResetRequired(
@@ -761,7 +909,11 @@ fn require_resumed_plan(
     if adopted == *expected {
         Ok(())
     } else {
-        Err(VectorGenerationStoreErrorV1::ConcurrentMutation)
+        Err(map_graph_error(GraphDbError::conflict_observed(
+            "usecases.store.require_resumed_plan",
+            format!("plan={expected:?}"),
+            format!("plan={adopted:?}"),
+        )))
     }
 }
 
@@ -780,7 +932,11 @@ fn require_same_semantic_plan(
     {
         Ok(())
     } else {
-        Err(VectorGenerationStoreErrorV1::ConcurrentMutation)
+        Err(map_graph_error(GraphDbError::conflict_observed(
+            "usecases.store.require_same_semantic_plan",
+            format!("plan={expected:?}"),
+            format!("plan={actual:?}"),
+        )))
     }
 }
 

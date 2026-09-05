@@ -51,6 +51,42 @@ const CODEX_CONFIGS: &[(&str, &[u8])] = &[(
     ".codex/config.toml",
     b"# operator comment\nmodel = \"o4-mini\" # keep inline\napproval_policy = \"on-failure\"\n\n[mcp_servers.foreign]\ncommand = \"foreign-bin\"\nargs = [\"--stdio\"]\n",
 )];
+const DEVIN_CONFIGS: &[(&str, &[u8])] = &[(
+    ".config/devin/mcp_config.json",
+    br#"{"mcpServers":{"foreign":{"command":"foreign-bin","args":["serve"]}},"ui":{"theme":"dark"}}
+"#,
+)];
+const ZED_CONFIGS: &[(&str, &[u8])] = &[(
+    ".config/zed/settings.json",
+    br#"{
+  // preserve through the byte-exact uninstall snapshot
+  "context_servers": {"foreign": {"command": "foreign-bin"}},
+  "theme": "dark"
+}
+"#,
+)];
+const ANTIGRAVITY_CONFIGS: &[(&str, &[u8])] = &[
+    (
+        ".gemini/antigravity/mcp_config.json",
+        br#"{"mcpServers":{"foreign":{"command":"foreign-bin"}},"ui":{"theme":"dark"}}
+"#,
+    ),
+    (
+        ".gemini/antigravity-cli/plugins/tracedecay.json",
+        br#"{"mcpServers":{"foreign":{"command":"foreign-bin"}},"ui":{"theme":"dark"}}
+"#,
+    ),
+];
+const VIBE_CONFIGS: &[(&str, &[u8])] = &[
+    (
+        ".vibe/config.toml",
+        b"# operator comment\n[[mcp_servers]]\nname = \"foreign\"\ntransport = \"stdio\"\ncommand = \"foreign-bin\"\nargs = [\"serve\"]\n",
+    ),
+    (
+        ".vibe/prompts/cli.md",
+        b"# Operator instructions\n\nKeep this text.\n",
+    ),
+];
 const HERMES_CONFIGS: &[(&str, &[u8])] = &[
     (
         ".hermes/config.yaml",
@@ -151,6 +187,10 @@ fn host_case(host: HostKindV1) -> HostCase {
         HostKindV1::ClaudeCode => CLAUDE_CONFIGS,
         HostKindV1::CursorDesktop => CURSOR_CONFIGS,
         HostKindV1::Codex => CODEX_CONFIGS,
+        HostKindV1::Devin => DEVIN_CONFIGS,
+        HostKindV1::Zed => ZED_CONFIGS,
+        HostKindV1::Antigravity => ANTIGRAVITY_CONFIGS,
+        HostKindV1::Vibe => VIBE_CONFIGS,
         HostKindV1::Hermes => HERMES_CONFIGS,
         HostKindV1::Kiro => KIRO_CONFIGS,
         HostKindV1::KimiCode => &[],
@@ -275,8 +315,35 @@ fn assert_success(host: &str, phase: &str, output: Output) {
 }
 
 fn assert_documented_mcp_registration(case: HostCase, cli: &IsolatedCli) {
+    if case.host == HostKindV1::Vibe {
+        let config = fs::read_to_string(cli.home.path().join(".vibe/config.toml")).unwrap();
+        let config: toml::Value = toml::from_str(&config).unwrap();
+        let servers = config["mcp_servers"].as_array().unwrap();
+        assert!(
+            servers
+                .iter()
+                .any(|server| server["name"].as_str() == Some("foreign"))
+        );
+        let entry = servers
+            .iter()
+            .find(|server| server["name"].as_str() == Some("tracedecay"))
+            .unwrap();
+        assert_eq!(
+            entry["command"].as_str(),
+            cli.bin_dir.join("tracedecay").to_str()
+        );
+        assert_eq!(entry["transport"].as_str(), Some("stdio"));
+        assert_eq!(entry["args"].as_array().unwrap()[0].as_str(), Some("serve"));
+        let prompt = fs::read_to_string(cli.home.path().join(".vibe/prompts/cli.md")).unwrap();
+        assert!(prompt.contains("Keep this text."));
+        assert!(prompt.contains("## Prefer tracedecay MCP tools"));
+        return;
+    }
     let (relative, root) = match case.host {
         HostKindV1::Cline => (".cline/mcp.json", "mcpServers"),
+        HostKindV1::Devin => (".config/devin/mcp_config.json", "mcpServers"),
+        HostKindV1::Zed => (".config/zed/settings.json", "context_servers"),
+        HostKindV1::Antigravity => (".gemini/antigravity/mcp_config.json", "mcpServers"),
         HostKindV1::RooCode => (
             ".config/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/cline_mcp_settings.json",
             "mcpServers",
@@ -292,7 +359,10 @@ fn assert_documented_mcp_registration(case: HostCase, cli: &IsolatedCli) {
         case.id
     );
     let theme = match case.host {
-        HostKindV1::Cline | HostKindV1::RooCode => &config["ui"]["theme"],
+        HostKindV1::Zed => &config["theme"],
+        HostKindV1::Cline | HostKindV1::Devin | HostKindV1::Antigravity | HostKindV1::RooCode => {
+            &config["ui"]["theme"]
+        }
         HostKindV1::Kilo => &config["theme"],
         _ => unreachable!(),
     };
@@ -307,6 +377,46 @@ fn assert_documented_mcp_registration(case: HostCase, cli: &IsolatedCli) {
             assert_eq!(entry["args"], serde_json::json!(["serve"]));
             assert_eq!(entry["disabled"], false);
             assert_eq!(entry["autoApprove"], serde_json::json!([]));
+        }
+        HostKindV1::Devin | HostKindV1::Antigravity => {
+            assert_eq!(
+                entry["command"],
+                serde_json::json!(cli.bin_dir.join("tracedecay"))
+            );
+            assert_eq!(entry["args"], serde_json::json!(["serve"]));
+            assert_eq!(entry["env"], serde_json::json!({}));
+            assert_eq!(entry["transport"], "stdio");
+            if case.host == HostKindV1::Antigravity {
+                let cli_plugin: serde_json::Value = serde_json::from_slice(
+                    &fs::read(
+                        cli.home
+                            .path()
+                            .join(".gemini/antigravity-cli/plugins/tracedecay.json"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    cli_plugin["mcpServers"]["foreign"]["command"],
+                    "foreign-bin"
+                );
+                assert_eq!(cli_plugin["ui"]["theme"], "dark");
+                assert_eq!(
+                    cli_plugin["mcpServers"]["tracedecay"]["command"],
+                    serde_json::json!(cli.bin_dir.join("tracedecay"))
+                );
+                assert_eq!(
+                    cli_plugin["mcpServers"]["tracedecay"]["args"],
+                    serde_json::json!(["serve"])
+                );
+            }
+        }
+        HostKindV1::Zed => {
+            assert_eq!(
+                entry["command"],
+                serde_json::json!(cli.bin_dir.join("tracedecay"))
+            );
+            assert_eq!(entry["args"], serde_json::json!(["serve"]));
         }
         HostKindV1::RooCode => {
             assert_eq!(
@@ -534,6 +644,10 @@ fn native_feedback(case: HostCase) -> Vec<(&'static str, &'static str, Vec<u8>)>
             ]
         }
         HostKindV1::Kiro
+        | HostKindV1::Devin
+        | HostKindV1::Zed
+        | HostKindV1::Antigravity
+        | HostKindV1::Vibe
         | HostKindV1::Gemini
         | HostKindV1::Copilot
         | HostKindV1::Cline
@@ -570,7 +684,15 @@ fn production_cli_completes_deterministic_lifecycle_for_config_native_hosts() {
     // keeps one representative for each distinct lifecycle shape: OpenCode's
     // config-native bundle, Cline's MCP-only bundle, and Hermes' standalone
     // core integration.
-    for host in [HostKindV1::OpenCode, HostKindV1::Cline, HostKindV1::Hermes] {
+    for host in [
+        HostKindV1::OpenCode,
+        HostKindV1::Cline,
+        HostKindV1::Devin,
+        HostKindV1::Zed,
+        HostKindV1::Antigravity,
+        HostKindV1::Vibe,
+        HostKindV1::Hermes,
+    ] {
         let case = host_case(host);
         assert!(!lifecycle_requires_absent_host_binary(case.host));
         let cli = IsolatedCli::new();
@@ -739,6 +861,109 @@ fn production_cli_completes_deterministic_lifecycle_for_config_native_hosts() {
                 })
         );
     }
+}
+
+#[test]
+fn production_cli_installs_devin_project_mcp_without_touching_siblings() {
+    let cli = IsolatedCli::new();
+    let config = cli.project.path().join(".devin/mcp_config.json");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        br#"{"mcpServers":{"foreign":{"command":"foreign-bin"}},"ui":{"theme":"dark"}}"#,
+    )
+    .unwrap();
+
+    assert_success(
+        "devin",
+        "project install",
+        cli.run(&["install", "--agent", "devin", "--local"]),
+    );
+
+    let config: serde_json::Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(config["ui"]["theme"], "dark");
+    assert_eq!(config["mcpServers"]["foreign"]["command"], "foreign-bin");
+    assert_eq!(
+        config["mcpServers"]["tracedecay"]["command"],
+        serde_json::json!(cli.bin_dir.join("tracedecay"))
+    );
+    assert_eq!(
+        config["mcpServers"]["tracedecay"]["args"],
+        serde_json::json!(["serve"])
+    );
+    assert_eq!(
+        config["mcpServers"]["tracedecay"]["env"],
+        serde_json::json!({})
+    );
+}
+
+#[test]
+fn production_cli_installs_zed_project_mcp_without_touching_siblings() {
+    let cli = IsolatedCli::new();
+    let config = cli.project.path().join(".zed/settings.json");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        br#"{"context_servers":{"foreign":{"command":"foreign-bin"}},"theme":"dark"}"#,
+    )
+    .unwrap();
+
+    assert_success(
+        "zed",
+        "project install",
+        cli.run(&["install", "--agent", "zed", "--local"]),
+    );
+
+    let config: serde_json::Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(config["theme"], "dark");
+    assert_eq!(
+        config["context_servers"]["foreign"]["command"],
+        "foreign-bin"
+    );
+    assert_eq!(
+        config["context_servers"]["tracedecay"]["command"],
+        serde_json::json!(cli.bin_dir.join("tracedecay"))
+    );
+    assert_eq!(
+        config["context_servers"]["tracedecay"]["args"],
+        serde_json::json!(["serve"])
+    );
+}
+
+#[test]
+fn production_cli_installs_vibe_project_components_without_touching_siblings() {
+    let cli = IsolatedCli::new();
+    let config = cli.project.path().join(".vibe/config.toml");
+    let prompt = cli.project.path().join(".vibe/prompts/cli.md");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::create_dir_all(prompt.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        b"[[mcp_servers]]\nname = \"foreign\"\ncommand = \"foreign-bin\"\n",
+    )
+    .unwrap();
+    fs::write(&prompt, b"# Project instructions\n\nKeep this text.\n").unwrap();
+
+    assert_success(
+        "vibe",
+        "project install",
+        cli.run(&["install", "--agent", "vibe", "--local"]),
+    );
+
+    let config = fs::read_to_string(&config).unwrap();
+    assert!(config.contains("name = \"foreign\"\ncommand = \"foreign-bin\""));
+    assert!(config.contains("name = \"tracedecay\""));
+    assert!(
+        config.contains(
+            cli.bin_dir
+                .join("tracedecay")
+                .to_str()
+                .expect("UTF-8 test path")
+        )
+    );
+    let prompt = fs::read_to_string(&prompt).unwrap();
+    assert!(prompt.contains("Keep this text."));
+    assert!(prompt.contains("## Prefer tracedecay MCP tools"));
 }
 
 #[test]

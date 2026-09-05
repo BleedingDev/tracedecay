@@ -21,6 +21,7 @@ pub(super) const fn initial_reflog_content_chain() -> &'static str {
     INITIAL_REFLOG_CONTENT_CHAIN
 }
 
+#[hotpath::measure(label = "sessions.git_correlation.history_schema", future = true)]
 pub(in super::super) async fn install_final_schema(
     conn: &(impl Executor + ?Sized),
 ) -> Result<(), GitCorrelationError> {
@@ -357,6 +358,7 @@ pub(super) async fn insert_progress(
 }
 
 /// Advances only mutable cursor fields when both generation and source seal match.
+#[hotpath::measure(label = "sessions.git_correlation.history_progress_cas", future = true)]
 pub(super) async fn compare_and_swap_progress(
     conn: &(impl Executor + ?Sized),
     expected_generation: u64,
@@ -581,6 +583,7 @@ pub(super) async fn upsert_segment(
     Ok(changed == 1)
 }
 
+#[hotpath::measure(label = "sessions.git_correlation.history_pending_page", future = true)]
 pub(super) async fn read_pending_page(
     conn: &(impl QueryExecutor + ?Sized),
     key: GitHistoryProgressKey,

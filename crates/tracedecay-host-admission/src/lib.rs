@@ -209,6 +209,7 @@ pub(crate) const fn admission_outcome(
         retryable,
         reason_code,
         recovery: None,
+        storage_cause: None,
     }
 }
 
@@ -465,6 +466,87 @@ impl tracedecay_sessions::admission::HostAdmission for HostAdmissionFacade<'_> {
         Box::pin(HostAdmissionFacade::has_session_message(
             self, scope, provider, message_id,
         ))
+    }
+
+    fn existing_session_message_ids<'a>(
+        &'a self,
+        scope: &'a ObservationScopeV1,
+        provider: &'a str,
+        message_ids: Vec<String>,
+    ) -> tracedecay_sessions::admission::AdmissionFuture<'a, Vec<String>> {
+        Box::pin(HostAdmissionFacade::existing_session_message_ids(
+            self,
+            scope,
+            provider,
+            message_ids,
+        ))
+    }
+
+    fn read_session_backfill_state<'a>(
+        &'a self,
+        scope: &'a ObservationScopeV1,
+        key: &'a str,
+    ) -> tracedecay_sessions::admission::AdmissionFuture<'a, Option<String>> {
+        Box::pin(HostAdmissionFacade::read_session_backfill_state(
+            self, scope, key,
+        ))
+    }
+
+    fn list_session_backfill_state_page<'a>(
+        &'a self,
+        scope: &'a ObservationScopeV1,
+        key_prefix: &'a str,
+        after_key: Option<&'a str>,
+        through_key: &'a str,
+    ) -> tracedecay_sessions::admission::AdmissionFuture<'a, Vec<(String, String)>> {
+        Box::pin(HostAdmissionFacade::list_session_backfill_state_page(
+            self,
+            scope,
+            key_prefix,
+            after_key,
+            through_key,
+        ))
+    }
+
+    fn session_backfill_state_high_water<'a>(
+        &'a self,
+        scope: &'a ObservationScopeV1,
+        key_prefix: &'a str,
+    ) -> tracedecay_sessions::admission::AdmissionFuture<'a, Option<String>> {
+        Box::pin(HostAdmissionFacade::session_backfill_state_high_water(
+            self, scope, key_prefix,
+        ))
+    }
+
+    fn compare_and_swap_session_backfill_state<'a>(
+        &'a self,
+        scope: &'a ObservationScopeV1,
+        key: &'a str,
+        expected: Option<&'a str>,
+        replacement: &'a str,
+    ) -> tracedecay_sessions::admission::AdmissionFuture<'a, bool> {
+        Box::pin(
+            HostAdmissionFacade::compare_and_swap_session_backfill_state(
+                self,
+                scope,
+                key,
+                expected,
+                replacement,
+            ),
+        )
+    }
+
+    fn compare_and_delete_session_backfill_state<'a>(
+        &'a self,
+        scope: &'a ObservationScopeV1,
+        key: &'a str,
+        expected: &'a str,
+    ) -> tracedecay_sessions::admission::AdmissionFuture<'a, bool> {
+        Box::pin(
+            HostAdmissionFacade::compare_and_delete_session_backfill_state(
+                self, scope, key, expected,
+            ),
+        )
     }
 
     fn get_parse_offset<'a>(
@@ -1176,6 +1258,9 @@ fn classify_store_error(error: &ObservationStoreError) -> HostAdmissionOutcome {
         ObservationStoreError::CursorObservationMismatch => "observation_cursor_mismatch",
         ObservationStoreError::CursorCoverageMismatch => "observation_cursor_coverage_mismatch",
         ObservationStoreError::CursorAdvanceCollision => "observation_cursor_advance_collision",
+        ObservationStoreError::CursorAdvanceLedgerDisagreement { .. } => {
+            "observation_cursor_advance_ledger_disagreement"
+        }
         ObservationStoreError::CursorSanitizationReceiptMismatch => {
             "observation_cursor_sanitization_receipt_mismatch"
         }
@@ -1250,12 +1335,23 @@ fn classify_error(error: &ObservationApplicationError) -> HostAdmissionOutcome {
                 Some("cursor_conflict"),
             )
         }
-        ObservationApplicationError::Store(ObservationStoreError::Storage { .. }) => {
-            admission_outcome(
+        ObservationApplicationError::Store(ObservationStoreError::Storage {
+            operation,
+            source,
+        }) => {
+            tracing::warn!(
+                operation,
+                error = %source,
+                reason_code = "authority_write_failed",
+                "observation store storage failure classified as authority_write_failed"
+            );
+            let mut outcome = admission_outcome(
                 HostAdmissionStatus::Unavailable,
                 true,
                 Some("authority_write_failed"),
-            )
+            );
+            outcome.storage_cause = Some(format!("{operation}: {source}"));
+            outcome
         }
         ObservationApplicationError::Contract(_) => {
             HostAdmissionOutcome::deterministic_content_refusal("invalid_observation_contract")

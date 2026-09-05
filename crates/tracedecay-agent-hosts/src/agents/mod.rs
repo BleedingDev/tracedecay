@@ -16,6 +16,7 @@ pub mod context_scout_v2;
 pub mod copilot;
 pub mod cursor;
 pub(crate) mod cursor_diagnostics;
+pub mod devin;
 /// Legacy Cursor `serve` log marker; the root crate's `src/serve.rs`
 /// re-exports this instead of declaring its own copy.
 pub use cursor_diagnostics::DEGRADED_SERVE_STDERR_MARKER;
@@ -34,6 +35,7 @@ pub mod prompt_rules;
 mod text_file_transaction;
 pub(crate) use text_file_transaction::{
     TextFileMutation, update_config_file_transactionally, update_text_file_transactionally,
+    update_two_config_files_transactionally,
 };
 pub(crate) mod retired_memory_digest;
 pub mod roo_code;
@@ -63,6 +65,7 @@ pub use cline::ClineIntegration;
 pub use codex::CodexIntegration;
 pub use copilot::CopilotIntegration;
 pub use cursor::CursorIntegration;
+pub use devin::DevinIntegration;
 pub use gemini::GeminiIntegration;
 pub use hermes::HermesIntegration;
 pub use kilo::KiloIntegration;
@@ -608,6 +611,7 @@ pub fn get_integration(id: &str) -> Result<Box<dyn AgentIntegration>> {
         "gemini" => Ok(Box::new(GeminiIntegration)),
         "copilot" => Ok(Box::new(CopilotIntegration)),
         "cursor" => Ok(Box::new(CursorIntegration)),
+        "devin" => Ok(Box::new(DevinIntegration)),
         "hermes" => Ok(Box::new(HermesIntegration)),
         "zed" => Ok(Box::new(ZedIntegration)),
         "cline" => Ok(Box::new(ClineIntegration)),
@@ -635,6 +639,7 @@ pub fn all_integrations() -> Vec<Box<dyn AgentIntegration>> {
         Box::new(GeminiIntegration),
         Box::new(CopilotIntegration),
         Box::new(CursorIntegration),
+        Box::new(DevinIntegration),
         Box::new(HermesIntegration),
         Box::new(ZedIntegration),
         Box::new(ClineIntegration),
@@ -656,6 +661,7 @@ pub fn available_integrations() -> Vec<&'static str> {
         "gemini",
         "copilot",
         "cursor",
+        "devin",
         "hermes",
         "zed",
         "cline",
@@ -668,6 +674,14 @@ pub fn available_integrations() -> Vec<&'static str> {
     ]
 }
 
+#[cfg(test)]
+#[test]
+fn devin_is_a_registered_independent_agent() {
+    let integration = get_integration("devin").expect("Devin integration is registered");
+    assert_eq!(integration.name(), "Devin");
+    assert!(available_integrations().contains(&"devin"));
+}
+
 pub fn integration_id_for_host(host: host_bundle_v2::HostKindV1) -> &'static str {
     match host {
         host_bundle_v2::HostKindV1::ClaudeCode => "claude",
@@ -675,6 +689,10 @@ pub fn integration_id_for_host(host: host_bundle_v2::HostKindV1) -> &'static str
             "cursor"
         }
         host_bundle_v2::HostKindV1::Codex => "codex",
+        host_bundle_v2::HostKindV1::Devin => "devin",
+        host_bundle_v2::HostKindV1::Zed => "zed",
+        host_bundle_v2::HostKindV1::Antigravity => "antigravity",
+        host_bundle_v2::HostKindV1::Vibe => "vibe",
         host_bundle_v2::HostKindV1::Hermes => "hermes",
         host_bundle_v2::HostKindV1::Kiro => "kiro",
         host_bundle_v2::HostKindV1::ClineFamily => "cline",
@@ -3367,12 +3385,41 @@ mod safe_config_tests {
 mod path_normalize_tests {
     use super::*;
 
+    /// Report whether `directory`'s filesystem accepts a name that is not
+    /// valid UTF-8.
+    ///
+    /// `cfg(unix)` is a compile gate, not a filesystem capability: APFS
+    /// refuses such a name outright with `EILSEQ`, so a macOS run failed at
+    /// the fixture instead of exercising the lookup. Probing keeps the
+    /// coverage everywhere the bytes are really accepted and makes the skip
+    /// visible where they are not.
+    #[cfg(unix)]
+    fn non_utf8_file_names_supported(directory: &Path) -> bool {
+        use std::os::unix::ffi::OsStringExt;
+
+        let probe = directory.join(std::ffi::OsString::from_vec(vec![b'p', 0xff]));
+        match std::fs::write(&probe, b"") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn path_lookup_preserves_non_unicode_parent_components() {
         use std::os::unix::ffi::OsStringExt;
 
         let dir = tempfile::tempdir().unwrap();
+        if !non_utf8_file_names_supported(dir.path()) {
+            println!(
+                "skipping path_lookup_preserves_non_unicode_parent_components: \
+                 this filesystem refuses non-UTF-8 file names"
+            );
+            return;
+        }
         let invalid_parent = dir
             .path()
             .join(std::ffi::OsString::from_vec(vec![b'n', b'o', b'n', 0xff]));

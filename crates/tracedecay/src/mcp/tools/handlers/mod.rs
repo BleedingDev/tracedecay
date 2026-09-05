@@ -274,6 +274,8 @@ pub struct ToolCallRegistryOptions<'a> {
     pub feedback_status_reader:
         Option<tracedecay_dashboard_api::feedback_api::FeedbackStatusReader>,
     pub diagnostics_cache: Option<&'a tracedecay_lsp::compile_diagnostics::DiagnosticsCache>,
+    pub(crate) diagnostics_change_generation:
+        Option<crate::mcp::server::DiagnosticsChangeGenerationResolver>,
     pub diagnostics_lsp:
         Option<Arc<tokio::sync::Mutex<tracedecay_lsp::analyzer::broker::DiagnosticBroker>>>,
     pub application_invocation_executor:
@@ -353,6 +355,7 @@ impl Default for ToolCallRegistryOptions<'_> {
             explorer_semantic_reader: None,
             feedback_status_reader: None,
             diagnostics_cache: None,
+            diagnostics_change_generation: None,
             diagnostics_lsp: None,
             application_invocation_executor: None,
             dashboard_application_invocation_executor: None,
@@ -426,6 +429,7 @@ pub fn handle_tool_call_with_registry_options<'a>(
                         | RetainedSurfaceOperation::FactStoreGet
                         | RetainedSurfaceOperation::FactStoreUpdate
                         | RetainedSurfaceOperation::FactStoreRemove
+                        | RetainedSurfaceOperation::FactStoreSupersede
                         | RetainedSurfaceOperation::FactStoreList
                         | RetainedSurfaceOperation::FactFeedback
                         | RetainedSurfaceOperation::MemoryStatus
@@ -763,8 +767,7 @@ pub fn handle_tool_call_with_registry_options<'a>(
 fn seated_generation_age_label(sealed_at: tracedecay_domain::UtcMicros) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_micros() as i64)
-        .unwrap_or(sealed_at.0);
+        .map_or(sealed_at.0, |elapsed| elapsed.as_micros() as i64);
     let seconds = now.saturating_sub(sealed_at.0).max(0) / 1_000_000;
     if seconds < 60 {
         format!("{seconds}s")

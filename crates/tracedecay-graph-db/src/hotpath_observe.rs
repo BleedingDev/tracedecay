@@ -247,7 +247,11 @@ pub(crate) fn record_hydration_source(source: HydrationSource) {
 /// builds and never on graph query paths.
 #[inline(always)]
 #[cfg(feature = "hotpath")]
-pub(crate) fn record_grafeo_memory(database: &grafeo_engine::GrafeoDB, phase: GrafeoMemoryPhase) {
+pub(crate) fn record_grafeo_memory(
+    database: &grafeo_engine::GrafeoDB,
+    phase: GrafeoMemoryPhase,
+    container: &str,
+) {
     let usage = hotpath::measure_block!("graph_db.memory.census", database.memory_usage());
     hotpath::val!("graph_db.memory.phase").set(&phase.as_str());
     hotpath::gauge!("graph_db.memory.total_bytes").set(usage.total_bytes as f64);
@@ -260,6 +264,22 @@ pub(crate) fn record_grafeo_memory(database: &grafeo_engine::GrafeoDB, phase: Gr
         .set(usage.buffer_manager.budget_bytes as f64);
     hotpath::gauge!("graph_db.memory.buffer_allocated_bytes")
         .set(usage.buffer_manager.allocated_bytes as f64);
+    // Measurement-build only: gauges keep the last census, so a daemon with
+    // several resident engines needs each census on the operator log to
+    // attribute retained bytes per container.
+    tracing::info!(
+        event = "graph_engine_memory_census",
+        phase = phase.as_str(),
+        container,
+        total_bytes = usage.total_bytes,
+        store_bytes = usage.store.total_bytes,
+        index_bytes = usage.indexes.total_bytes,
+        mvcc_bytes = usage.mvcc.total_bytes,
+        cache_bytes = usage.caches.total_bytes,
+        string_pool_bytes = usage.string_pool.total_bytes,
+        buffer_allocated_bytes = usage.buffer_manager.allocated_bytes,
+        "grafeo memory census"
+    );
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -434,4 +454,116 @@ pub(crate) fn take_hydration_counters() -> crate::GraphDbHydrationCounters {
 #[cfg(any(test, feature = "test-helpers"))]
 pub(crate) fn take_verification_counters() -> crate::GraphDbVerificationCounters {
     counters::take_verification()
+}
+
+#[inline(always)]
+pub(crate) fn record_property_decode() {
+    #[cfg(any(test, feature = "test-helpers"))]
+    traversal_counters::record_property_decode();
+}
+
+#[inline(always)]
+pub(crate) fn record_relation_identity_decode() {
+    #[cfg(any(test, feature = "test-helpers"))]
+    traversal_counters::record_relation_identity_decode();
+}
+
+#[inline(always)]
+pub(crate) fn record_quarantine_lock() {
+    #[cfg(any(test, feature = "test-helpers"))]
+    traversal_counters::record_quarantine_lock();
+}
+
+#[inline(always)]
+pub(crate) fn record_label_universe_scan() {
+    #[cfg(any(test, feature = "test-helpers"))]
+    traversal_counters::record_label_universe_scan();
+}
+
+#[inline(always)]
+pub(crate) fn record_adjacency_index_build() {
+    #[cfg(any(test, feature = "test-helpers"))]
+    traversal_counters::record_adjacency_index_build();
+}
+
+#[inline(always)]
+pub(crate) fn record_adjacency_index_hit() {
+    #[cfg(any(test, feature = "test-helpers"))]
+    traversal_counters::record_adjacency_index_hit();
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub(crate) fn take_traversal_counters() -> crate::GraphDbTraversalCounters {
+    traversal_counters::take()
+}
+
+/// Operation counts for ID-only fan-out, quarantine snapshots, and label/adjacency
+/// caches. Thread-local for the same reason as hydration counters: a parallel
+/// test must not observe another test's decode or lock work.
+#[cfg(any(test, feature = "test-helpers"))]
+mod traversal_counters {
+    #[derive(Clone, Copy, Default)]
+    struct Counts {
+        property_decodes: u64,
+        relation_identity_decodes: u64,
+        quarantine_lock_acquisitions: u64,
+        label_universe_scans: u64,
+        adjacency_index_builds: u64,
+        adjacency_index_hits: u64,
+    }
+
+    thread_local! {
+        static COUNTS: std::cell::Cell<Counts> = const { std::cell::Cell::new(Counts {
+            property_decodes: 0,
+            relation_identity_decodes: 0,
+            quarantine_lock_acquisitions: 0,
+            label_universe_scans: 0,
+            adjacency_index_builds: 0,
+            adjacency_index_hits: 0,
+        }) };
+    }
+
+    fn bump(update: impl FnOnce(&mut Counts)) {
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            update(&mut counts);
+            cell.set(counts);
+        });
+    }
+
+    pub(super) fn record_property_decode() {
+        bump(|counts| counts.property_decodes += 1);
+    }
+
+    pub(super) fn record_relation_identity_decode() {
+        bump(|counts| counts.relation_identity_decodes += 1);
+    }
+
+    pub(super) fn record_quarantine_lock() {
+        bump(|counts| counts.quarantine_lock_acquisitions += 1);
+    }
+
+    pub(super) fn record_label_universe_scan() {
+        bump(|counts| counts.label_universe_scans += 1);
+    }
+
+    pub(super) fn record_adjacency_index_build() {
+        bump(|counts| counts.adjacency_index_builds += 1);
+    }
+
+    pub(super) fn record_adjacency_index_hit() {
+        bump(|counts| counts.adjacency_index_hits += 1);
+    }
+
+    pub(crate) fn take() -> crate::GraphDbTraversalCounters {
+        let counts = COUNTS.with(|cell| cell.replace(Counts::default()));
+        crate::GraphDbTraversalCounters {
+            property_decodes: counts.property_decodes,
+            relation_identity_decodes: counts.relation_identity_decodes,
+            quarantine_lock_acquisitions: counts.quarantine_lock_acquisitions,
+            label_universe_scans: counts.label_universe_scans,
+            adjacency_index_builds: counts.adjacency_index_builds,
+            adjacency_index_hits: counts.adjacency_index_hits,
+        }
+    }
 }

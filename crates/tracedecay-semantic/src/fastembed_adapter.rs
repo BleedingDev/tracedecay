@@ -58,20 +58,24 @@ use std::thread;
 use std::time::Duration;
 
 #[cfg(any(test, feature = "semantic-fastembed"))]
+use tracedecay_domain::EmbeddingPrecisionV1;
+#[cfg(any(test, feature = "semantic-fastembed", feature = "semantic-model2vec"))]
 use tracedecay_domain::canonical_text::sha256_hex;
 use tracedecay_domain::{
-    AdmittedEmbeddingProjectionKeyV1, ChunkerRevision, EmbeddingDeviceClassV1, EmbeddingMetricV1,
-    EmbeddingNormalizationV1, EmbeddingPoolingV1, EmbeddingPrecisionV1, EmbeddingProjectionKeyV1,
-    EmbeddingTruncationSideV1, ManifestDigest, PrivacyDomainId,
+    AdmittedEmbeddingProjectionKeyV1, ChunkerRevision, EmbeddingDeviceClassV1,
+    EmbeddingDocumentCompositionV1, EmbeddingMetricV1, EmbeddingNormalizationV1,
+    EmbeddingPoolingV1, EmbeddingProjectionKeyV1, EmbeddingTruncationSideV1, ManifestDigest,
+    PrivacyDomainId,
 };
 use tracedecay_semantic_contracts::{
     ArtifactMemberRoleV1, ArtifactProfileKindV1, SemanticResourceCeilings, Sha256DigestHex,
 };
 
-use super::artifact_store::{
-    AdmittedArtifactV1, FASTEMBED_RUNTIME_BUILD_REVISION_V1, FASTEMBED_RUNTIME_FAMILY_V1,
+use super::artifact_store::AdmittedArtifactV1;
+use super::embedding_backend::EmbeddingRuntimeFamilyV1;
+use super::model_catalog::{
+    CatalogMemberPinV1, CatalogedFastEmbedModelV1, catalog_member_role, catalog_package_digest,
 };
-use super::model_catalog::{CatalogMemberPinV1, CatalogedFastEmbedModelV1, catalog_package_digest};
 
 mod pins;
 pub use pins::ProjectionArtifactPinV1;
@@ -178,8 +182,11 @@ impl fmt::Display for RuntimeFailureV1 {
 /// admission. It carries the admitted domain projection directly rather than
 /// re-declaring vector-affecting pins in adapter-local types.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct VerifiedEmbeddingArtifactV1 {
+pub(crate) struct VerifiedEmbeddingArtifactV1 {
     projection: AdmittedEmbeddingProjectionKeyV1,
+    /// Typed form of the projection's `runtime_backend`, fixed at admission
+    /// so the production dispatcher never re-parses identity strings.
+    backend: EmbeddingRuntimeFamilyV1,
     model_file: String,
     tokenizer_file: String,
     config_file: String,
@@ -233,23 +240,23 @@ struct LifecycleInstallArtifactV1 {
 }
 
 impl VerifiedEmbeddingArtifactV1 {
-    #[cfg(any(test, feature = "semantic-fastembed"))]
-    fn embedding_key(&self) -> &tracedecay_domain::EmbeddingProjectionKeyV1 {
+    #[cfg(any(test, feature = "semantic-fastembed", feature = "semantic-model2vec"))]
+    pub(crate) fn embedding_key(&self) -> &EmbeddingProjectionKeyV1 {
         self.projection.embedding_key()
     }
 
-    #[cfg(any(test, feature = "semantic-fastembed"))]
-    fn dimensions(&self) -> u32 {
+    #[cfg(any(test, feature = "semantic-fastembed", feature = "semantic-model2vec"))]
+    pub(crate) fn dimensions(&self) -> u32 {
         self.embedding_key().dimensions
     }
 
-    #[cfg(any(test, feature = "semantic-fastembed"))]
-    fn metric(&self) -> EmbeddingMetricV1 {
+    #[cfg(any(test, feature = "semantic-fastembed", feature = "semantic-model2vec"))]
+    pub(crate) fn metric(&self) -> EmbeddingMetricV1 {
         self.embedding_key().metric
     }
 
-    #[cfg(any(test, feature = "semantic-fastembed"))]
-    fn normalization(&self) -> EmbeddingNormalizationV1 {
+    #[cfg(any(test, feature = "semantic-fastembed", feature = "semantic-model2vec"))]
+    pub(crate) fn normalization(&self) -> EmbeddingNormalizationV1 {
         self.embedding_key().normalization
     }
 
@@ -276,8 +283,8 @@ impl VerifiedEmbeddingArtifactV1 {
         self.max_batch_bytes
     }
 
-    #[cfg(feature = "semantic-fastembed")]
-    fn declares_member(&self, role: ArtifactMemberRoleV1) -> bool {
+    #[cfg(any(feature = "semantic-fastembed", feature = "semantic-model2vec"))]
+    pub(crate) fn declares_member(&self, role: ArtifactMemberRoleV1) -> bool {
         self.artifact
             .as_ref()
             .is_some_and(|artifact| artifact.manifest().package_member(role).is_some())
@@ -317,10 +324,13 @@ impl VerifiedEmbeddingArtifactV1 {
         self.load_deadline_ms
     }
 
-    // Feature-independent implementation, but only the compiled FastEmbed
+    // Feature-independent implementation, but only a compiled embedding
     // runtime and descriptor tests need direct member bytes.
-    #[cfg(any(test, feature = "semantic-fastembed"))]
-    fn required_member_bytes(&self, role: ArtifactMemberRoleV1) -> Result<Vec<u8>, EmbedError> {
+    #[cfg(any(test, feature = "semantic-fastembed", feature = "semantic-model2vec"))]
+    pub(crate) fn required_member_bytes(
+        &self,
+        role: ArtifactMemberRoleV1,
+    ) -> Result<Vec<u8>, EmbedError> {
         if let Some(artifact) = self.artifact.as_ref() {
             return artifact.read_member_bytes(role).map_err(|_| {
                 fastembed_failure(
@@ -439,6 +449,8 @@ impl AdmittedProjectionArtifactV1 {
             key.runtime_backend == payload.runtime.runtime,
             ProjectionArtifactPinV1::RuntimeBackend,
         )?;
+        let backend = EmbeddingRuntimeFamilyV1::from_runtime_family(&payload.runtime.runtime)
+            .ok_or(ProjectionArtifactPinV1::RuntimeBackend)?;
         require_pin(
             key.runtime_build_revision == payload.runtime.build_revision,
             ProjectionArtifactPinV1::RuntimeBuildRevision,
@@ -474,6 +486,7 @@ impl AdmittedProjectionArtifactV1 {
         Ok(Self {
             runtime_artifact: VerifiedEmbeddingArtifactV1 {
                 projection: projection.clone(),
+                backend,
                 model_file,
                 tokenizer_file,
                 config_file,
@@ -508,6 +521,7 @@ impl AdmittedProjectionArtifactV1 {
         privacy_domain: PrivacyDomainId,
         privacy_key_epoch: u64,
         resources: SemanticResourceCeilings,
+        document_composition: EmbeddingDocumentCompositionV1,
     ) -> Result<Self, EmbedError> {
         let projection = Self::lifecycle_projection(
             model,
@@ -515,6 +529,7 @@ impl AdmittedProjectionArtifactV1 {
             privacy_domain,
             privacy_key_epoch,
             resources,
+            document_composition,
         )?;
         let member = |role: &str| {
             model.members.get(role).ok_or_else(|| {
@@ -527,15 +542,13 @@ impl AdmittedProjectionArtifactV1 {
         let model_member = member("model")?;
         let tokenizer = member("tokenizer")?;
         let config = member("config")?;
-        member("special_tokens_map")?;
-        member("tokenizer_config")?;
         let lifecycle_install = LifecycleInstallArtifactV1 {
             root: install_path.to_path_buf(),
             members: model.members.clone(),
         };
-        // Check every required member's structural pin (declared entry,
-        // normalized path, regular non-symlink file, exact length) without
-        // reading its bytes. Byte digests are verified by
+        // Check every backend-required member's structural pin (declared
+        // entry, normalized path, regular non-symlink file, exact length)
+        // without reading its bytes. Byte digests are verified by
         // `read_member_bytes` at every session open — the only place member
         // bytes are consumed — matching the artifact-store authority, whose
         // admission also defers digest checks to reads. Reading and hashing
@@ -543,18 +556,19 @@ impl AdmittedProjectionArtifactV1 {
         // (each scheduled projection's artifact load and each serving
         // restore attempt) a full model read that session open then
         // repeated.
-        for role in [
-            ArtifactMemberRoleV1::Model,
-            ArtifactMemberRoleV1::Tokenizer,
-            ArtifactMemberRoleV1::Config,
-            ArtifactMemberRoleV1::SpecialTokensMap,
-            ArtifactMemberRoleV1::TokenizerConfig,
-        ] {
+        for role_name in model.backend.required_member_roles() {
+            let role = catalog_member_role(role_name).ok_or_else(|| {
+                fastembed_failure(
+                    RuntimeFailureKindV1::CorruptArtifact,
+                    "cataloged backend requires a member role the manifest vocabulary lacks",
+                )
+            })?;
             lifecycle_install.member_pin_path(role)?;
         }
         Ok(Self {
             runtime_artifact: VerifiedEmbeddingArtifactV1 {
                 projection,
+                backend: model.backend.runtime_family(),
                 model_file: model_member.path.clone(),
                 tokenizer_file: tokenizer.path.clone(),
                 config_file: config.path.clone(),
@@ -583,6 +597,7 @@ impl AdmittedProjectionArtifactV1 {
         privacy_domain: PrivacyDomainId,
         privacy_key_epoch: u64,
         resources: SemanticResourceCeilings,
+        document_composition: EmbeddingDocumentCompositionV1,
     ) -> Result<AdmittedEmbeddingProjectionKeyV1, EmbedError> {
         let member = |role: &str| {
             model.members.get(role).ok_or_else(|| {
@@ -612,12 +627,17 @@ impl AdmittedProjectionArtifactV1 {
                 )
             })
         };
+        // The catalog's declared backend is the only source of the
+        // runtime/precision pins, so two backends serving the same upstream
+        // package still produce distinct projection identities.
+        let backend = model.backend.runtime_family();
         let projection = EmbeddingProjectionKeyV1 {
             model_artifact_digest: manifest_digest(&catalog_package_digest(model))?,
             tokenizer_digest: manifest_digest(&tokenizer.sha256)?,
             config_digest: manifest_digest(&config.sha256)?,
             query_instruction_digest: None,
             document_instruction_digest: None,
+            document_composition,
             pooling: EmbeddingPoolingV1::Mean,
             truncation_side: EmbeddingTruncationSideV1::Right,
             truncation_length: model.max_length.min(resources.max_sequence_length),
@@ -626,13 +646,13 @@ impl AdmittedProjectionArtifactV1 {
                 resources.max_batch_size,
                 resources.max_sequence_length,
             ),
-            runtime_backend: FASTEMBED_RUNTIME_FAMILY_V1.to_owned(),
-            runtime_build_revision: FASTEMBED_RUNTIME_BUILD_REVISION_V1.to_owned(),
+            runtime_backend: backend.runtime_family().to_owned(),
+            runtime_build_revision: backend.build_revision().to_owned(),
             device_class: EmbeddingDeviceClassV1::Cpu,
             dimensions: model.expected_dimensions,
             metric: EmbeddingMetricV1::Cosine,
             normalization: EmbeddingNormalizationV1::L2,
-            precision: EmbeddingPrecisionV1::Fp32,
+            precision: model.backend.precision(),
             chunk_schema_revision: "code-search-chunk.v1".to_owned(),
             chunker_revision,
             privacy_domain,
@@ -652,6 +672,12 @@ impl AdmittedProjectionArtifactV1 {
         &self.runtime_artifact.projection
     }
 
+    /// The backend family this authority was admitted for; the production
+    /// dispatcher routes every port operation on it.
+    pub fn runtime_family(&self) -> EmbeddingRuntimeFamilyV1 {
+        self.runtime_artifact.backend
+    }
+
     /// Maximum intra-op width admitted with the artifact. The process CPU
     /// authority may narrow the native runtime below this ceiling.
     #[cfg(test)]
@@ -669,8 +695,8 @@ impl AdmittedProjectionArtifactV1 {
         )
     }
 
-    #[cfg(any(test, feature = "semantic-fastembed"))]
-    fn runtime_artifact(&self) -> &VerifiedEmbeddingArtifactV1 {
+    #[cfg(any(test, feature = "semantic-fastembed", feature = "semantic-model2vec"))]
+    pub(crate) fn runtime_artifact(&self) -> &VerifiedEmbeddingArtifactV1 {
         &self.runtime_artifact
     }
 
@@ -702,7 +728,7 @@ impl AdmittedProjectionArtifactV1 {
 }
 
 impl LifecycleInstallArtifactV1 {
-    #[cfg(feature = "semantic-fastembed")]
+    #[cfg(any(feature = "semantic-fastembed", feature = "semantic-model2vec"))]
     fn declares_member(&self, role: ArtifactMemberRoleV1) -> bool {
         let key = match role {
             ArtifactMemberRoleV1::Model => "model",
@@ -777,7 +803,7 @@ impl LifecycleInstallArtifactV1 {
 
     // Byte reads exist only where a runtime consumes member bytes, matching
     // the [`VerifiedEmbeddingArtifactV1::required_member_bytes`] gate.
-    #[cfg(any(test, feature = "semantic-fastembed"))]
+    #[cfg(any(test, feature = "semantic-fastembed", feature = "semantic-model2vec"))]
     fn read_member_bytes(&self, role: ArtifactMemberRoleV1) -> Result<Vec<u8>, EmbedError> {
         let (path, pin) = self.member_pin_path(role)?;
         let bytes = std::fs::read(path).map_err(|_| {
@@ -927,8 +953,10 @@ pub trait SemanticExecutionAuthority: Send + Sync {
     fn interruption(&self) -> Option<SemanticExecutionInterruptionV1>;
 }
 
-#[cfg(any(test, feature = "semantic-fastembed"))]
-fn check_execution_authority(authority: &dyn SemanticExecutionAuthority) -> Result<(), EmbedError> {
+#[cfg(any(test, feature = "semantic-fastembed", feature = "semantic-model2vec"))]
+pub(crate) fn check_execution_authority(
+    authority: &dyn SemanticExecutionAuthority,
+) -> Result<(), EmbedError> {
     match authority.interruption() {
         None => Ok(()),
         Some(SemanticExecutionInterruptionV1::Cancelled) => Err(EmbedError::Cancelled),
@@ -1008,6 +1036,13 @@ impl ScriptedCancellation {
             cancel_after,
         }
     }
+
+    /// How many times the authority has been consulted so far. Only the
+    /// Model2Vec load tests count boundaries this way.
+    #[cfg(feature = "semantic-model2vec")]
+    pub fn polls(&self) -> usize {
+        self.checks.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
@@ -1039,9 +1074,11 @@ pub trait EmbeddingSession: Send {
 }
 
 /// The root-private embedding runtime port (Plan 31: load verified artifact
-/// → create session → embed bounded sanitized batches). The only production
-/// implementation will be the `FastEmbed` adapter in this module; every other
-/// crate depends on this trait surface, never on `FastEmbed` runtime types.
+/// → create session → embed bounded sanitized batches). Production
+/// implementations are the `FastEmbed` adapter in this module and the
+/// Model2Vec adapter in `model2vec_adapter`, selected per authority by
+/// `embedding_backend::ProductionEmbeddingRuntime`; every other crate depends
+/// on this trait surface, never on a backend's runtime types.
 pub trait EmbeddingRuntime {
     type Session: EmbeddingSession;
 
@@ -1075,8 +1112,8 @@ pub trait EmbeddingRuntime {
     ) -> Result<Self::Session, EmbedError>;
 }
 
-#[cfg(any(test, feature = "semantic-fastembed"))]
-fn validate_batch_limits(
+#[cfg(any(test, feature = "semantic-fastembed", feature = "semantic-model2vec"))]
+pub(crate) fn validate_batch_limits(
     batch: &BoundedSanitizedTextBatchV1,
     artifact: &VerifiedEmbeddingArtifactV1,
 ) -> Result<(), EmbedError> {
@@ -1179,7 +1216,7 @@ impl EmbeddingRuntime for FastEmbedEmbeddingRuntime {
         authority: &AdmittedProjectionArtifactV1,
     ) -> Result<(), EmbedError> {
         let artifact = authority.runtime_artifact();
-        if artifact.embedding_key().runtime_backend != "fastembed-ort" {
+        if authority.runtime_family() != EmbeddingRuntimeFamilyV1::FastEmbedOrt {
             return Err(fastembed_failure(
                 RuntimeFailureKindV1::IncompatibleRuntime,
                 "the projection does not select the FastEmbed ORT backend",
@@ -1708,11 +1745,13 @@ pub(crate) mod lifecycle_test_support {
     use std::collections::BTreeMap;
 
     use sha2::{Digest, Sha256};
-    use tracedecay_domain::{ChunkerRevision, PrivacyDomainId};
+    use tracedecay_domain::{
+        ChunkerRevision, EmbeddingDocumentCompositionV1, EmbeddingPrecisionV1, PrivacyDomainId,
+    };
     use tracedecay_semantic_contracts::SemanticResourceCeilings;
 
     use super::super::model_catalog::{
-        CatalogMemberPinV1, CatalogSourceV1, CatalogedFastEmbedModelV1,
+        CatalogMemberPinV1, CatalogSourceV1, CatalogedEmbeddingBackendV1, CatalogedFastEmbedModelV1,
     };
     use super::AdmittedProjectionArtifactV1;
     use super::EmbedError;
@@ -1722,39 +1761,168 @@ pub(crate) mod lifecycle_test_support {
         pub(crate) model: CatalogedFastEmbedModelV1,
     }
 
-    pub(crate) fn lifecycle_install_fixture(model_bytes: &[u8]) -> LifecycleInstallFixtureV1 {
-        let install = tempfile::tempdir().expect("lifecycle install");
-        let members = [
-            ("model", "model.onnx", model_bytes),
-            ("tokenizer", "tokenizer.json", b"tokenizer".as_slice()),
-            ("config", "config.json", b"config".as_slice()),
-            (
-                "special_tokens_map",
-                "special_tokens_map.json",
-                b"special".as_slice(),
-            ),
-            (
-                "tokenizer_config",
-                "tokenizer_config.json",
-                b"tokenizer-config".as_slice(),
-            ),
-        ];
+    fn write_members(
+        install: &tempfile::TempDir,
+        members: &[(&str, &str, &[u8])],
+    ) -> BTreeMap<String, CatalogMemberPinV1> {
         let mut pins = BTreeMap::new();
         for (role, path, bytes) in members {
             std::fs::write(install.path().join(path), bytes).expect("fixture member");
             pins.insert(
-                role.to_owned(),
+                (*role).to_owned(),
                 CatalogMemberPinV1 {
-                    path: path.to_owned(),
-                    upstream_path: path.to_owned(),
+                    path: (*path).to_owned(),
+                    upstream_path: (*path).to_owned(),
                     length: bytes.len() as u64,
                     sha256: hex::encode(Sha256::digest(bytes)),
                 },
             );
         }
+        pins
+    }
+
+    /// Synthetic Model2Vec package: a 4-row × 3-column `embeddings` table and
+    /// a `WordLevel` tokenizer whose vocabulary is `[UNK]`=0, `hello`=1,
+    /// `world`=2, `code`=3, plus `ghost`=4 which deliberately has no table
+    /// row. Row values are exactly representable in fp16 so the known
+    /// answers are precision-independent:
+    ///
+    /// | row | token   | vector          |
+    /// |-----|---------|-----------------|
+    /// | 0   | `[UNK]` | `[100,100,100]` |
+    /// | 1   | `hello` | `[1, 0, 0]`     |
+    /// | 2   | `world` | `[0, 2, 0]`     |
+    /// | 3   | `code`  | `[0, 0, 4]`     |
+    ///
+    /// The serialized tokenizer carries `truncation.max_length = 2` and a
+    /// padding block; the runtime must disable both so the projection's
+    /// `truncation_length` is the only truncation authority.
+    pub(crate) const MODEL2VEC_FIXTURE_DIMENSION: u32 = 3;
+
+    pub(crate) fn model2vec_fixture_table_bytes(precision: EmbeddingPrecisionV1) -> Vec<u8> {
+        const ROWS: [[f32; 3]; 4] = [
+            [100.0, 100.0, 100.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [0.0, 0.0, 4.0],
+        ];
+        // IEEE binary16 bit patterns; every fixture value is a small power
+        // of two or 100.0, all exactly representable.
+        fn f16_bits(value: f32) -> u16 {
+            match value {
+                0.0 => 0x0000,
+                1.0 => 0x3C00,
+                2.0 => 0x4000,
+                4.0 => 0x4400,
+                100.0 => 0x5640,
+                other => panic!("fixture value {other} has no tabulated fp16 encoding"),
+            }
+        }
+        let (dtype, data): (&str, Vec<u8>) = match precision {
+            EmbeddingPrecisionV1::Fp16 => (
+                "F16",
+                ROWS.iter()
+                    .flatten()
+                    .flat_map(|value| f16_bits(*value).to_le_bytes())
+                    .collect(),
+            ),
+            EmbeddingPrecisionV1::Fp32 => (
+                "F32",
+                ROWS.iter()
+                    .flatten()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+            ),
+            EmbeddingPrecisionV1::Bf16 | EmbeddingPrecisionV1::Int8 => {
+                panic!("fixture tables exist only for fp16 and fp32")
+            }
+        };
+        let header = format!(
+            r#"{{"embeddings":{{"dtype":"{dtype}","shape":[4,{MODEL2VEC_FIXTURE_DIMENSION}],"data_offsets":[0,{}]}}}}"#,
+            data.len()
+        );
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&data);
+        bytes
+    }
+
+    pub(crate) const MODEL2VEC_FIXTURE_TOKENIZER_JSON: &str = r#"{
+  "version": "1.0",
+  "truncation": {"direction": "Right", "max_length": 2, "strategy": "LongestFirst", "stride": 0},
+  "padding": {"strategy": "BatchLongest", "direction": "Right", "pad_to_multiple_of": null, "pad_id": 0, "pad_type_id": 0, "pad_token": "[UNK]"},
+  "added_tokens": [],
+  "normalizer": {"type": "Lowercase"},
+  "pre_tokenizer": {"type": "Whitespace"},
+  "post_processor": null,
+  "decoder": null,
+  "model": {"type": "WordLevel", "vocab": {"[UNK]": 0, "hello": 1, "world": 2, "code": 3, "ghost": 4}, "unk_token": "[UNK]"}
+}"#;
+
+    pub(crate) fn model2vec_lifecycle_install_fixture(
+        precision: EmbeddingPrecisionV1,
+        config_json: &str,
+        max_length: u32,
+    ) -> LifecycleInstallFixtureV1 {
+        let install = tempfile::tempdir().expect("lifecycle install");
+        let table = model2vec_fixture_table_bytes(precision);
+        let pins = write_members(
+            &install,
+            &[
+                ("model", "model.safetensors", table.as_slice()),
+                (
+                    "tokenizer",
+                    "tokenizer.json",
+                    MODEL2VEC_FIXTURE_TOKENIZER_JSON.as_bytes(),
+                ),
+                ("config", "config.json", config_json.as_bytes()),
+            ],
+        );
+        let model = CatalogedFastEmbedModelV1 {
+            model_id: "potion-fixture".to_owned(),
+            backend: CatalogedEmbeddingBackendV1::Model2VecStatic {
+                table_precision: precision,
+            },
+            model_code: "fixture/potion-fixture".to_owned(),
+            source: CatalogSourceV1 {
+                upstream: "https://example.invalid".to_owned(),
+                revision: "fixture-revision".to_owned(),
+                license: "MIT".to_owned(),
+                license_url: "https://opensource.org/license/mit".to_owned(),
+                provenance: "fixture".to_owned(),
+            },
+            expected_dimensions: MODEL2VEC_FIXTURE_DIMENSION,
+            max_length,
+            members: pins,
+        };
+        LifecycleInstallFixtureV1 { install, model }
+    }
+
+    pub(crate) fn lifecycle_install_fixture(model_bytes: &[u8]) -> LifecycleInstallFixtureV1 {
+        let install = tempfile::tempdir().expect("lifecycle install");
+        let pins = write_members(
+            &install,
+            &[
+                ("model", "model.onnx", model_bytes),
+                ("tokenizer", "tokenizer.json", b"tokenizer".as_slice()),
+                ("config", "config.json", b"config".as_slice()),
+                (
+                    "special_tokens_map",
+                    "special_tokens_map.json",
+                    b"special".as_slice(),
+                ),
+                (
+                    "tokenizer_config",
+                    "tokenizer_config.json",
+                    b"tokenizer-config".as_slice(),
+                ),
+            ],
+        );
         let model = CatalogedFastEmbedModelV1 {
             model_id: "jina-embeddings-v2-base-code".to_owned(),
-            fastembed_enum: "JinaEmbeddingsV2BaseCode".to_owned(),
+            backend: CatalogedEmbeddingBackendV1::FastEmbedOrt {
+                fastembed_enum: "JinaEmbeddingsV2BaseCode".to_owned(),
+            },
             model_code: "jinaai/jina-embeddings-v2-base-code".to_owned(),
             source: CatalogSourceV1 {
                 upstream: "https://example.invalid".to_owned(),
@@ -1811,6 +1979,7 @@ pub(crate) mod lifecycle_test_support {
                 max_sequence_length: 128,
                 load_deadline_ms: 1_000,
             },
+            EmbeddingDocumentCompositionV1::SanitizedText,
         )
     }
 }
@@ -1938,6 +2107,7 @@ mod tests {
             config_digest: digest('c'),
             query_instruction_digest: Some(digest('d')),
             document_instruction_digest: Some(digest('e')),
+            document_composition: EmbeddingDocumentCompositionV1::SanitizedText,
             pooling: EmbeddingPoolingV1::Mean,
             truncation_side: EmbeddingTruncationSideV1::Right,
             truncation_length: 512,
@@ -1960,6 +2130,7 @@ mod tests {
         AdmittedProjectionArtifactV1 {
             runtime_artifact: VerifiedEmbeddingArtifactV1 {
                 projection,
+                backend: EmbeddingRuntimeFamilyV1::FastEmbedOrt,
                 model_file: "model.onnx".to_string(),
                 tokenizer_file: "tokenizer.json".to_string(),
                 config_file: "config.json".to_string(),

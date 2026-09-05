@@ -503,6 +503,7 @@ fn dispatch_graph_tools_inner<'a>(
                     options.code_index_search_executor.as_ref(),
                     options.code_index_search_authority.as_ref(),
                     options.code_index_ignored_dependency_admission.as_deref(),
+                    options.code_index_freshness_reader.as_ref(),
                     options.application_deadline.clone(),
                     options.application_cancellation.clone(),
                 )
@@ -539,6 +540,7 @@ fn dispatch_graph_tools_inner<'a>(
                     selected_scope_prefix,
                     options.code_index_search_executor.as_ref(),
                     options.code_index_search_authority.as_ref(),
+                    options.code_index_freshness_reader.as_ref(),
                     options.application_deadline.clone(),
                     options.application_cancellation.clone(),
                 )
@@ -1007,6 +1009,7 @@ fn dispatch_analysis_tools_inner<'a>(
                     &graph,
                     args,
                     options.diagnostics_cache,
+                    options.diagnostics_change_generation.as_ref(),
                     options.diagnostics_lsp.as_deref(),
                     active_project_session_db.map(RegisteredGlobalDbLeaseV1::as_ref),
                 )
@@ -1242,6 +1245,11 @@ fn dispatch_retained_application_tools_inner<'a>(
         {
             arguments.remove("action");
         }
+        // Normalization strips `project_selector`, so the selected project is
+        // read here: a selector-bound retained route is served by the calling
+        // session's own runtime, and only the selector names the project the
+        // retained owner actually opened.
+        let selected_project_id = super::tool_call_support::selected_project_id_argument(&args);
         let normalized = crate::application_surface::normalize_application_tool_args(
             tool_name, args,
         )
@@ -1269,6 +1277,8 @@ fn dispatch_retained_application_tools_inner<'a>(
             None => application_surface::request_id()?,
         };
         let result_contract = ResultContractRef::from_schema(&binding.result_schema);
+        let selected_scope_contract = result_contract.clone();
+        let selected_scope_request_id = request_id.clone();
         let result = match options.application_invocation_executor {
             Some(executor) => {
                 let (deadline, cancellation) =
@@ -1344,17 +1354,95 @@ fn dispatch_retained_application_tools_inner<'a>(
                 )?),
             )?),
         };
+        let result = match selected_project_id {
+            Some(selected_project_id) => {
+                restate_selected_project_scope(
+                    result,
+                    &selected_project_id,
+                    options.global_db.map(RegisteredGlobalDbLeaseV1::as_ref),
+                    selected_scope_contract,
+                    selected_scope_request_id,
+                )
+                .await?
+            }
+            None => result,
+        };
         hotpath::measure_block!(
             "mcp.retained.render",
             application_surface::render_retained_result(
                 Some(cg.project_root()),
                 retained_operation,
-                binding.binding_id,
+                &binding.binding_id,
                 result,
                 requested_format,
             )
         )
     })
+}
+
+/// Report the exact project a selector-bound retained route was served from.
+///
+/// A selector-bound route stays on the calling session's admitted runtime, so
+/// the daemon resolves the response scope from that session — the admitted
+/// project — even when the retained owner opened the selected project's store
+/// instead. Restating the scope here keeps the envelope truthful about which
+/// project answered.
+///
+/// Only an evidence (read) outcome can be restated: an effect's receipt is
+/// signed over the admitted scope, so a committed effect that somehow named
+/// another project is refused rather than reported under either scope. Any
+/// selector that cannot be resolved to an exact registered scope is refused
+/// the same way, with the indistinguishable disclosure the retained surface
+/// already uses for a foreign selector.
+async fn restate_selected_project_scope(
+    result: tracedecay_application::ApplicationResult<
+        tracedecay_application::retained_surfaces::RetainedSurfaceResultV1,
+    >,
+    selected_project_id: &str,
+    global_db: Option<&tracedecay_global_db::RegisteredGlobalDb>,
+    contract: ResultContractRef,
+    request_id: tracedecay_application::RequestId,
+) -> Result<
+    tracedecay_application::ApplicationResult<
+        tracedecay_application::retained_surfaces::RetainedSurfaceResultV1,
+    >,
+> {
+    use super::tool_call_support::SelectedProjectScopeV1;
+
+    let mut envelope = match result {
+        Ok(envelope) => envelope,
+        Err(problem) => return Ok(Err(problem)),
+    };
+    let refused = || {
+        retained_problem_envelope(
+            contract.clone(),
+            request_id.clone(),
+            ApplicationProblem::not_found_or_not_authorized(
+                tracedecay_application::RetryDirective::Never,
+            ),
+        )
+    };
+    match super::tool_call_support::selected_project_scope(
+        selected_project_id,
+        &envelope.scope,
+        global_db,
+    )
+    .await
+    {
+        SelectedProjectScopeV1::Unchanged => Ok(Ok(envelope)),
+        SelectedProjectScopeV1::Restated(scope) => {
+            if matches!(
+                envelope.outcome,
+                tracedecay_application::ApplicationOutcome::Evidence(_)
+            ) {
+                envelope.scope = *scope;
+                Ok(Ok(envelope))
+            } else {
+                Ok(Err(refused()?))
+            }
+        }
+        SelectedProjectScopeV1::Refused => Ok(Err(refused()?)),
+    }
 }
 
 /// Dispatch memory, skill, and analytics tools (`tracedecay_fact_store_add`,

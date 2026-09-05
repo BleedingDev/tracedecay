@@ -3,7 +3,8 @@
 //! The seam has exactly two dispositions for an admitted frame that fails:
 //!
 //! 1. A deterministic content refusal covers past the frame with a durable
-//!    `AdmissionRefused` coverage row so the stream converges.
+//!    typed reason (`ObservationIdentityCollision` for that exact refusal,
+//!    otherwise `AdmissionRefused`) so the stream converges.
 //! 2. Everything else — store commit/read-back failures, unbound authorities,
 //!    retryable races — is a typed [`TranscriptIngestError::HostAdmission`]
 //!    block: the frontier does not advance and no coverage is written over a
@@ -19,11 +20,14 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 use tracedecay_domain::{
-    ObservationScopeV1, ObservationSourceCursorV1, ObservationSourceIdentityV1, ProjectId,
-    ProviderId, SessionId,
+    CanonicalMessageRoleV1, CanonicalObservationEnvelopeV1, CanonicalObservationEvidenceV1,
+    CanonicalObservationFactV1, CanonicalObservationRelationsV1, ObservationId,
+    ObservationOrderingDomainV1, ObservationScopeV1, ObservationSourceCursorV1,
+    ObservationSourceIdentityV1, ProjectId, ProviderId, RetentionClass, SessionId,
 };
 use tracedecay_store::observation::{
     CursorAdvanceOutcome, ObservationCoverageReason, ObservationCursorAdvance,
+    ObservationIdentityCollisionDispositionV1,
 };
 use tracedecay_store::{ObservationBatchFallbackCause, ParseOffset};
 
@@ -47,9 +51,11 @@ use crate::runtime::source::{JsonlResumeState, TranscriptIngestError};
 struct SeamSpyAdmission {
     inner: MemoryHostAdmission,
     scripted_capture_error: Mutex<Option<HostAdmissionOutcome>>,
+    scripted_capture_error_once: Mutex<Option<HostAdmissionOutcome>>,
     scripted_batch_error: Mutex<Option<HostAdmissionOutcome>>,
     report_no_cursor: AtomicBool,
     capture_calls: AtomicU64,
+    capture_collision_dispositions: Mutex<Vec<ObservationIdentityCollisionDispositionV1>>,
     cover_past_advances: Mutex<Vec<ObservationCursorAdvance>>,
 }
 
@@ -767,12 +773,20 @@ impl SeamSpyAdmission {
         *self.scripted_batch_error.lock().unwrap() = Some(outcome);
     }
 
+    fn script_capture_error_once(&self, outcome: HostAdmissionOutcome) {
+        *self.scripted_capture_error_once.lock().unwrap() = Some(outcome);
+    }
+
     fn cover_past_advances(&self) -> Vec<ObservationCursorAdvance> {
         self.cover_past_advances.lock().unwrap().clone()
     }
 
     fn capture_count(&self) -> u64 {
         self.capture_calls.load(Ordering::Relaxed)
+    }
+
+    fn capture_collision_dispositions(&self) -> Vec<ObservationIdentityCollisionDispositionV1> {
+        self.capture_collision_dispositions.lock().unwrap().clone()
     }
 }
 
@@ -783,7 +797,14 @@ impl HostAdmission for SeamSpyAdmission {
     ) -> AdmissionFuture<'a, CaptureObservationOutcome> {
         Box::pin(async move {
             self.capture_calls.fetch_add(1, Ordering::Relaxed);
-            if let Some(outcome) = *self.scripted_capture_error.lock().unwrap() {
+            self.capture_collision_dispositions
+                .lock()
+                .unwrap()
+                .push(request.identity_collision_disposition());
+            if let Some(outcome) = self.scripted_capture_error_once.lock().unwrap().take() {
+                return Err(outcome);
+            }
+            if let Some(outcome) = self.scripted_capture_error.lock().unwrap().clone() {
                 return Err(outcome);
             }
             self.inner.capture_observation(request).await
@@ -795,10 +816,15 @@ impl HostAdmission for SeamSpyAdmission {
         requests: Vec<CaptureObservationRequest>,
     ) -> AdmissionFuture<'a, Vec<CaptureObservationOutcome>> {
         Box::pin(async move {
+            self.capture_collision_dispositions.lock().unwrap().extend(
+                requests
+                    .iter()
+                    .map(CaptureObservationRequest::identity_collision_disposition),
+            );
             if let Some(outcome) = self.scripted_batch_error.lock().unwrap().take() {
                 return Err(outcome);
             }
-            if let Some(outcome) = *self.scripted_capture_error.lock().unwrap() {
+            if let Some(outcome) = self.scripted_capture_error.lock().unwrap().clone() {
                 // Fail the window without counting here so sequential
                 // fallback still visits each frame exactly once.
                 return Err(outcome);
@@ -949,6 +975,7 @@ async fn commit_failures_block_typed_and_never_cover_past() {
                 provider: "codex",
                 reason: surfaced,
                 retryable: false,
+                ..
             } => assert_eq!(surfaced, reason),
             other => panic!("commit failure must stay a typed admission block, got {other:?}"),
         }
@@ -984,12 +1011,237 @@ async fn retryable_admission_failures_keep_their_own_verdict() {
                 provider: "codex",
                 reason: "cursor_conflict",
                 retryable: true,
+                ..
             }
         ),
         "retryable races must not be laundered into a terminal record verdict: {error:?}"
     );
     assert!(spy.cover_past_advances().is_empty());
     assert!(stored_cursor(&spy).await.is_none());
+}
+
+#[tokio::test]
+async fn eligible_identity_collision_retries_once_with_normalizer_fallback() {
+    super::install_test_shared_jsonl_preparation_authority();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("cursor-repeated-no-id.jsonl");
+    let bytes = b"{\"role\":\"user\",\"content\":\"repeated\"}\n";
+    std::fs::write(&path, bytes).unwrap();
+    let spy = SeamSpyAdmission::default();
+    spy.script_batch_error(HostAdmissionOutcome::batch_requires_scalar_fallback(
+        ObservationBatchFallbackCause::IntraBatchIdentityCollision,
+    ));
+    spy.script_capture_error_once(HostAdmissionOutcome::deterministic_content_refusal(
+        "observation_identity_collision",
+    ));
+    let normalized_ids = Arc::new(Mutex::new(Vec::new()));
+    let observed_ids = Arc::clone(&normalized_ids);
+    let source = ObservationSourceIdentityV1::for_provider(
+        ProviderId::new("cursor").unwrap(),
+        SessionId::new("session.cursor-repeated-no-id").unwrap(),
+    )
+    .unwrap();
+    let request = super::JsonlObservationAdmissionRequest::new(
+        "cursor",
+        &path,
+        &spy,
+        source,
+        ObservationScopeV1::Profile,
+        RetentionClass::new("test").unwrap(),
+    );
+
+    let progress = super::admit_jsonl_observations(
+        request,
+        |_| (),
+        move |_, bytes, range, _, _, hints| {
+            let id = if hints.identity_collision_retry {
+                "record.positional-fallback"
+            } else {
+                "record.legacy-content-hash"
+            };
+            observed_ids.lock().unwrap().push(id);
+            let native_record_id = ObservationId::new(id).unwrap();
+            let parsed = tracedecay_runtime_core::privacy::parse_normalized_observation_record_v1(
+                bytes,
+                range,
+                ObservationOrderingDomainV1::FileBytes,
+                |native| {
+                    CanonicalObservationEnvelopeV1::new(
+                        ProviderId::new("cursor").unwrap(),
+                        "message",
+                        native_record_id.clone(),
+                        CanonicalObservationRelationsV1::new(
+                            SessionId::new("session.cursor-repeated-no-id").unwrap(),
+                        )
+                        .with_message_id(native_record_id.clone()),
+                        vec![CanonicalObservationFactV1::Message {
+                            role: CanonicalMessageRoleV1::User,
+                            content: native,
+                            model: None,
+                            timestamp: None,
+                        }],
+                        CanonicalObservationEvidenceV1::new(
+                            ObservationOrderingDomainV1::FileBytes,
+                            range,
+                        ),
+                    )
+                    .map_err(|_| {
+                        tracedecay_runtime_core::privacy::ObservationRecordParseErrorV1::NormalizationFailed
+                    })
+                },
+            )
+            .map_err(|_| TranscriptIngestError::InvalidFrameState { provider: "cursor" })?;
+            if hints.identity_collision_retry {
+                Ok(super::JsonlFrameAdmission::durable(
+                    parsed,
+                    native_record_id,
+                ))
+            } else {
+                Ok(
+                    super::JsonlFrameAdmission::durable_with_identity_collision_retry(
+                        parsed,
+                        native_record_id,
+                    ),
+                )
+            }
+        },
+    )
+    .await
+    .expect("a validated no-ID collision must retry with positional identity");
+
+    assert_eq!(progress.frames_persisted, 1);
+    assert_eq!(progress.frames_refused, 0);
+    assert_eq!(
+        spy.capture_count(),
+        2,
+        "one primary plus one fallback write"
+    );
+    assert_eq!(
+        spy.capture_collision_dispositions(),
+        [
+            ObservationIdentityCollisionDispositionV1::RetryWithAlternateIdentity,
+            ObservationIdentityCollisionDispositionV1::RetryWithAlternateIdentity,
+            ObservationIdentityCollisionDispositionV1::SettleTerminal,
+        ],
+        "the batch and scalar primary may probe, while the alternate is terminal"
+    );
+    assert_eq!(
+        normalized_ids.lock().unwrap().as_slice(),
+        [
+            "record.legacy-content-hash",
+            "record.legacy-content-hash",
+            "record.positional-fallback"
+        ],
+        "the batch parse, scalar primary, and one positional retry are the only normalizations"
+    );
+    assert!(spy.cover_past_advances().is_empty());
+    assert_eq!(spy.inner.observations().len(), 1);
+}
+
+#[tokio::test]
+async fn exhausted_identity_collision_retry_uses_its_exact_terminal_coverage_reason() {
+    super::install_test_shared_jsonl_preparation_authority();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("cursor-repeated-no-id-terminal.jsonl");
+    let bytes = b"{\"role\":\"user\",\"content\":\"repeated\"}\n";
+    std::fs::write(&path, bytes).unwrap();
+    let spy = SeamSpyAdmission::default();
+    spy.script_batch_error(HostAdmissionOutcome::batch_requires_scalar_fallback(
+        ObservationBatchFallbackCause::IntraBatchIdentityCollision,
+    ));
+    spy.script_capture_error(HostAdmissionOutcome::deterministic_content_refusal(
+        "observation_identity_collision",
+    ));
+    let source = ObservationSourceIdentityV1::for_provider(
+        ProviderId::new("cursor").unwrap(),
+        SessionId::new("session.cursor-repeated-no-id-terminal").unwrap(),
+    )
+    .unwrap();
+    let request = super::JsonlObservationAdmissionRequest::new(
+        "cursor",
+        &path,
+        &spy,
+        source,
+        ObservationScopeV1::Profile,
+        RetentionClass::new("test").unwrap(),
+    );
+
+    let progress = super::admit_jsonl_observations(
+        request,
+        |_| (),
+        move |_, bytes, range, _, _, hints| {
+            let native_record_id = ObservationId::new(if hints.identity_collision_retry {
+                "record.positional-fallback-terminal"
+            } else {
+                "record.legacy-content-hash-terminal"
+            })
+            .unwrap();
+            let parsed = tracedecay_runtime_core::privacy::parse_normalized_observation_record_v1(
+                bytes,
+                range,
+                ObservationOrderingDomainV1::FileBytes,
+                |native| {
+                    CanonicalObservationEnvelopeV1::new(
+                        ProviderId::new("cursor").unwrap(),
+                        "message",
+                        native_record_id.clone(),
+                        CanonicalObservationRelationsV1::new(
+                            SessionId::new("session.cursor-repeated-no-id-terminal").unwrap(),
+                        )
+                        .with_message_id(native_record_id.clone()),
+                        vec![CanonicalObservationFactV1::Message {
+                            role: CanonicalMessageRoleV1::User,
+                            content: native,
+                            model: None,
+                            timestamp: None,
+                        }],
+                        CanonicalObservationEvidenceV1::new(
+                            ObservationOrderingDomainV1::FileBytes,
+                            range,
+                        ),
+                    )
+                    .map_err(|_| {
+                        tracedecay_runtime_core::privacy::ObservationRecordParseErrorV1::NormalizationFailed
+                    })
+                },
+            )
+            .map_err(|_| TranscriptIngestError::InvalidFrameState { provider: "cursor" })?;
+            if hints.identity_collision_retry {
+                Ok(super::JsonlFrameAdmission::durable(
+                    parsed,
+                    native_record_id,
+                ))
+            } else {
+                Ok(
+                    super::JsonlFrameAdmission::durable_with_identity_collision_retry(
+                        parsed,
+                        native_record_id,
+                    ),
+                )
+            }
+        },
+    )
+    .await
+    .expect("the exhausted deterministic collision must settle terminal coverage");
+
+    assert_eq!(progress.frames_persisted, 0);
+    assert_eq!(progress.frames_refused, 1);
+    assert_eq!(spy.capture_count(), 2, "primary plus one fallback only");
+    assert_eq!(
+        spy.capture_collision_dispositions(),
+        [
+            ObservationIdentityCollisionDispositionV1::RetryWithAlternateIdentity,
+            ObservationIdentityCollisionDispositionV1::RetryWithAlternateIdentity,
+            ObservationIdentityCollisionDispositionV1::SettleTerminal,
+        ],
+        "the exhausted alternate must restore terminal collision semantics"
+    );
+    let advances = spy.cover_past_advances();
+    assert_eq!(advances.len(), 1);
+    assert_eq!(
+        advances[0].reason(),
+        ObservationCoverageReason::ObservationIdentityCollision
+    );
 }
 
 #[tokio::test]
@@ -1124,7 +1376,7 @@ async fn batch_refusal_reuses_pre_context_switch_frames() {
         .expect("the A-scoped message must receive a durable disposition");
     assert_eq!(
         a_message_advance.reason(),
-        ObservationCoverageReason::AdmissionRefused,
+        ObservationCoverageReason::ObservationIdentityCollision,
         "the A-scoped frame must keep its pre-window disposition after the B context switch"
     );
 }

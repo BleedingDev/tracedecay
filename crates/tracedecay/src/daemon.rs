@@ -22,8 +22,7 @@ use crate::mcp::server::{
     classify_mcp_method, initialize_result,
 };
 use crate::mcp::tools::{
-    default_catalog_discovery_authority, get_catalog_filtered_tool_definitions_with_budget,
-    get_catalog_filtered_tool_definitions_with_warming_budget,
+    catalog_discovery_tools_list_payload, default_catalog_discovery_authority,
 };
 use branch_add::{branch_add_response, parse_branch_add_request};
 use branch_admin::{StoreAdministration, parse_branch_admin_request, write_branch_admin_response};
@@ -71,6 +70,50 @@ const PROJECT_OPEN_RESOURCE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const PROJECT_OPEN_UNREPAIRABLE_RETRY_BACKOFF: Duration = Duration::from_mins(5);
 const PROJECT_OPEN_FAILURE_RETRY_HINT: &str =
     "project route open is backed off after an invariant rejection";
+
+/// One authenticated connection's bounded first request.
+///
+/// Routing shares the parsed JSON-RPC view, while the selected transport
+/// consumes the byte-exact raw line and performs its own authoritative decode.
+pub(super) struct AuthenticatedFirstRequest {
+    raw: String,
+    parsed: Option<JsonRpcRequest>,
+}
+
+impl AuthenticatedFirstRequest {
+    pub(super) fn new(raw: String) -> Self {
+        hotpath::gauge!("daemon.engine.first_request.decode").inc(1_u64);
+        #[cfg(test)]
+        FIRST_REQUEST_DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let parsed = serde_json::from_str(raw.trim()).ok();
+        Self { raw, parsed }
+    }
+
+    pub(super) fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    pub(super) fn parsed(&self) -> Option<&JsonRpcRequest> {
+        self.parsed.as_ref()
+    }
+
+    pub(super) fn into_raw(self) -> String {
+        self.raw
+    }
+}
+
+#[cfg(test)]
+static FIRST_REQUEST_DECODE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(super) fn reset_first_request_decode_count_for_test() {
+    FIRST_REQUEST_DECODE_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(super) fn first_request_decode_count_for_test() -> usize {
+    FIRST_REQUEST_DECODE_COUNT.load(Ordering::Relaxed)
+}
 
 /// How long a client rides out a project open that has not finished yet.
 ///
@@ -167,6 +210,9 @@ use tracedecay_code_index_runtime::code_index_task_support::{
     code_index_scope_unavailable, code_index_search_hydration_budget,
 };
 mod connection_serving;
+#[cfg(feature = "rmcp-benchmark")]
+#[doc(hidden)]
+pub use connection_serving::rmcp_benchmark;
 #[cfg(unix)]
 use connection_serving::serve_authenticated_socket_client_with_class;
 #[cfg(all(unix, test))]

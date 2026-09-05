@@ -7,7 +7,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};
 
-use tracedecay_code_index_runtime::CodeGraphSeatRuntimePortV1;
 use tracedecay_daemon_identity::profile_identity::LocalProfileIdentityAuthorityV1;
 use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_domain::{
@@ -18,7 +17,7 @@ use tracedecay_graph_db::{
     GraphDbError, GraphGenerationId, GraphGenerationManifest, GraphIdempotencyKey, GraphNamespace,
     GraphProjectionId, GraphProjectionIdentity, GraphWatermark, SourceGeneration,
 };
-use tracedecay_runtime_core::db::engine::TestConnection;
+use tracedecay_runtime_core::db::engine::{QueryExecutor, TestConnection};
 use tracedecay_runtime_core::db::{DatabaseAccessMode, DatabaseAuthority};
 use tracedecay_runtime_core::store_runtime::registry::StoreRuntimeRegistryFailure;
 use tracedecay_rusqlite_runtime::remote::{
@@ -167,7 +166,11 @@ async fn wait_for_schema_convergence(
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             if let Some(status) = registry.registered_schema_convergence_status(shard_id)
-                && !matches!(status, RegisteredSchemaConvergenceStatus::Pending)
+                && !matches!(
+                    status,
+                    RegisteredSchemaConvergenceStatus::Pending
+                        | RegisteredSchemaConvergenceStatus::Running
+                )
             {
                 return status;
             }
@@ -176,6 +179,81 @@ async fn wait_for_schema_convergence(
     })
     .await
     .expect("registered schema convergence must reach a terminal state")
+}
+
+const LCM_STATUS_PERFORMANCE_INDEX_NAMES: [&str; 4] = [
+    "idx_lcm_raw_legacy_truncated",
+    "idx_lcm_raw_lossy_ingest",
+    "idx_lcm_summary_nodes_depth_tokens",
+    "idx_lcm_external_payloads_owner_bytes",
+];
+const SUPERSEDED_LCM_PAYLOAD_OWNER_INDEX: &str = "idx_lcm_external_payloads_owner";
+
+async fn installed_lcm_status_index_names(
+    connection: &(impl QueryExecutor + ?Sized),
+) -> Vec<String> {
+    let mut rows = connection
+        .query(
+            "SELECT name
+             FROM sqlite_master
+             WHERE type = 'index'
+               AND name IN (
+                   'idx_lcm_raw_legacy_truncated',
+                   'idx_lcm_raw_lossy_ingest',
+                   'idx_lcm_summary_nodes_depth_tokens',
+                   'idx_lcm_external_payloads_owner_bytes',
+                   'idx_lcm_external_payloads_owner'
+               )
+             ORDER BY name",
+            (),
+        )
+        .await
+        .expect("read LCM status index names");
+    let mut names = Vec::new();
+    while let Some(row) = rows.next().await.expect("read LCM status index name") {
+        names.push(row.get::<String>(0).expect("decode LCM status index name"));
+    }
+    names
+}
+
+async fn deferred_lcm_fixture_row_count(connection: &(impl QueryExecutor + ?Sized)) -> i64 {
+    let mut rows = connection
+        .query(
+            "SELECT COUNT(*)
+             FROM sessions AS session
+             JOIN lcm_raw_messages AS message
+               ON message.provider = session.provider
+              AND message.session_id = session.session_id
+             WHERE session.session_id = 'deferred-index-session'
+               AND message.message_id = 'deferred-index-message'",
+            (),
+        )
+        .await
+        .expect("read seeded session and LCM row");
+    rows.next()
+        .await
+        .expect("read seeded session and LCM count")
+        .expect("seeded session and LCM count row")
+        .get::<i64>(0)
+        .expect("decode seeded session and LCM count")
+}
+
+async fn lcm_migration_applied_at(connection: &(impl QueryExecutor + ?Sized)) -> i64 {
+    let mut rows = connection
+        .query(
+            "SELECT applied_at
+             FROM session_schema_migrations
+             WHERE name = 'lcm'",
+            (),
+        )
+        .await
+        .expect("read LCM migration applied_at");
+    rows.next()
+        .await
+        .expect("read LCM migration row")
+        .expect("LCM migration row")
+        .get::<i64>(0)
+        .expect("decode LCM migration applied_at")
 }
 
 fn accepting_memory_write_control() -> FactWriteControl {
@@ -466,6 +544,7 @@ async fn concurrent_profile_sessions_mounts_singleflight_schema_admission() {
     let registry = DaemonSessionRuntimeRegistryV1::open_with_session_maintenance(identity, true)
         .await
         .expect("session runtime registry");
+    let convergence_gate = registry.block_registered_schema_convergence_for_test();
 
     let (first, second, third, fourth) = tokio::join!(
         registry.profile_sessions(),
@@ -479,11 +558,18 @@ async fn concurrent_profile_sessions_mounts_singleflight_schema_admission() {
         assert!(!first.shares_client_with(&mounted));
         assert_eq!(first.binding(), mounted.binding());
     }
+    convergence_gate.wait_until_blocked().await;
     assert_eq!(
         registry.registered_schema_convergence_schedule_count_for_test(),
         1,
         "one retained mount must schedule schema convergence exactly once"
     );
+    assert_eq!(
+        registry.registered_schema_convergence_execution_count_for_test(),
+        1,
+        "concurrent equivalent requests must execute convergence exactly once"
+    );
+    convergence_gate.release();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -676,9 +762,34 @@ async fn project_sessions_mount_uses_typed_enrollment_and_is_idempotent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_admission_returns_while_historical_convergence_is_blocked() {
-    let (_temporary, identity, project_id, project_root, _sessions_path, _database_scope) =
+async fn daemon_admission_remains_ready_while_lcm_indexes_converge_in_background() {
+    let (_temporary, identity, project_id, project_root, sessions_path, _database_scope) =
         project_sessions_pending_convergence("project.schema-admission").await;
+    let seed = TestConnection::open(&sessions_path);
+    seed.execute_batch(
+        r"INSERT INTO sessions(provider, session_id, project_key, project_path)
+           VALUES ('cursor', 'deferred-index-session', 'project.schema-admission', '/deferred');
+           INSERT INTO lcm_raw_messages (
+               provider, message_id, session_id, role, ordinal, content,
+               content_hash, storage_kind, snippet_text, index_text,
+               legacy_truncated, metadata_json
+           ) VALUES (
+               'cursor', 'deferred-index-message', 'deferred-index-session', 'assistant', 1,
+               'deferred body', 'deferred-hash', 'inline', 'deferred', 'deferred', 1, NULL
+           );
+           UPDATE session_schema_migrations
+               SET applied_at = 123
+               WHERE name = 'lcm';
+           DROP INDEX idx_lcm_raw_legacy_truncated;
+           DROP INDEX idx_lcm_raw_lossy_ingest;
+           DROP INDEX idx_lcm_summary_nodes_depth_tokens;
+           DROP INDEX idx_lcm_external_payloads_owner_bytes;
+           CREATE INDEX idx_lcm_external_payloads_owner
+               ON lcm_external_payloads(provider, session_id);",
+    )
+    .await
+    .expect("seed an already-current store without the LCM status indexes");
+    drop(seed);
     let shard_id = StoreShardIdV1::project_sessions(
         identity.brain_id().clone(),
         identity.profile_id().clone(),
@@ -693,42 +804,81 @@ async fn daemon_admission_returns_while_historical_convergence_is_blocked() {
     tokio::pin!(admission);
     let convergence_blocked = convergence_gate.wait_until_blocked();
     tokio::pin!(convergence_blocked);
-    let database = tokio::select! {
-        result = &mut admission => {
-            let database = result.expect("registered project sessions");
-            convergence_blocked.await;
-            database
+    let database = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            result = &mut admission => {
+                let database = result.expect("registered project sessions");
+                convergence_blocked.await;
+                database
+            }
+            () = &mut convergence_blocked => {
+                admission.await.expect("registered project sessions")
+            }
         }
-        () = &mut convergence_blocked => {
-            tokio::time::timeout(std::time::Duration::from_secs(1), admission)
-                .await
-                .expect("daemon admission must not wait for blocked historical convergence")
-                .expect("registered project sessions")
-        }
-    };
+    })
+    .await
+    .expect("daemon admission and convergence scheduling must not stall");
 
     assert_eq!(
         registry.registered_schema_convergence_status(&shard_id),
-        Some(RegisteredSchemaConvergenceStatus::Pending)
+        Some(RegisteredSchemaConvergenceStatus::Running)
+    );
+    {
+        let snapshot = database
+            .read_snapshot()
+            .await
+            .expect("ordinary read snapshot while convergence is pending");
+        let indexes = installed_lcm_status_index_names(&snapshot).await;
+        for index in LCM_STATUS_PERFORMANCE_INDEX_NAMES {
+            assert!(
+                !indexes.iter().any(|installed| installed == index),
+                "daemon admission synchronously built {index}: {indexes:?}"
+            );
+        }
+        assert!(
+            indexes
+                .iter()
+                .any(|index| index == SUPERSEDED_LCM_PAYLOAD_OWNER_INDEX),
+            "daemon admission retired the old payload index before convergence: {indexes:?}"
+        );
+        assert_eq!(
+            deferred_lcm_fixture_row_count(&snapshot).await,
+            1,
+            "ordinary session and LCM reads must remain available while convergence is pending"
+        );
+    }
+    convergence_gate.release();
+    assert_eq!(
+        wait_for_schema_convergence(&registry, &shard_id).await,
+        RegisteredSchemaConvergenceStatus::Complete
     );
     let snapshot = database
         .read_snapshot()
         .await
-        .expect("ordinary read snapshot while convergence is pending");
-    let mut rows = snapshot
-        .query("SELECT COUNT(*) FROM sessions", ())
-        .await
-        .expect("ordinary read while convergence is pending");
-    assert_eq!(
-        rows.next()
-            .await
-            .expect("read session count")
-            .expect("session count row")
-            .get::<i64>(0)
-            .expect("decode session count"),
-        0
+        .expect("ordinary read snapshot after convergence");
+    let indexes = installed_lcm_status_index_names(&snapshot).await;
+    for index in LCM_STATUS_PERFORMANCE_INDEX_NAMES {
+        assert!(
+            indexes.iter().any(|installed| installed == index),
+            "background convergence did not build {index}: {indexes:?}"
+        );
+    }
+    assert!(
+        !indexes
+            .iter()
+            .any(|index| index == SUPERSEDED_LCM_PAYLOAD_OWNER_INDEX),
+        "background convergence left the superseded payload index in place: {indexes:?}"
     );
-    convergence_gate.release();
+    assert_eq!(
+        deferred_lcm_fixture_row_count(&snapshot).await,
+        1,
+        "background convergence must preserve seeded session and LCM rows"
+    );
+    assert_eq!(
+        lcm_migration_applied_at(&snapshot).await,
+        123,
+        "background convergence must not rewrite the current LCM migration marker"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -800,7 +950,66 @@ async fn duplicate_project_attaches_schedule_one_historical_convergence() {
         1,
         "the retained registry must deduplicate convergence tasks"
     );
+    assert_eq!(
+        registry.registered_schema_convergence_execution_count_for_test(),
+        1,
+        "the retained registry must execute the coalesced convergence once"
+    );
     convergence_gate.release();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn schema_convergence_runs_one_shard_while_other_shards_remain_pending() {
+    let (_temporary, identity, project_id, project_root, _sessions_path, _database_scope) =
+        project_sessions_pending_convergence("project.schema-concurrency").await;
+    let registry = DaemonSessionRuntimeRegistryV1::open_with_session_maintenance(identity, true)
+        .await
+        .expect("session runtime registry");
+    let convergence_gate = registry.block_registered_schema_convergence_for_test();
+
+    let profile = registry
+        .profile_sessions()
+        .await
+        .expect("registered profile sessions");
+    convergence_gate.wait_until_blocked().await;
+    let project = registry
+        .project_sessions(project_id, [project_root])
+        .await
+        .expect("registered project sessions");
+    let profile_shard = profile.binding().shard_id.clone();
+    let project_shard = project.binding().shard_id.clone();
+
+    assert_eq!(
+        registry.registered_schema_convergence_status(&profile_shard),
+        Some(RegisteredSchemaConvergenceStatus::Running),
+        "the permit holder must be distinguishable from deferred work"
+    );
+    assert_eq!(
+        registry.registered_schema_convergence_status(&project_shard),
+        Some(RegisteredSchemaConvergenceStatus::Pending),
+        "a second shard must wait without starting convergence"
+    );
+    assert_eq!(
+        registry.registered_schema_convergence_schedule_count_for_test(),
+        2,
+        "both distinct shards must retain one scheduled task"
+    );
+    assert_eq!(
+        registry.registered_schema_convergence_execution_count_for_test(),
+        1,
+        "only the permit holder may enter convergence"
+    );
+
+    convergence_gate.release();
+    convergence_gate.release();
+    assert_eq!(
+        wait_for_schema_convergence(&registry, &profile_shard).await,
+        RegisteredSchemaConvergenceStatus::Complete
+    );
+    assert_eq!(
+        wait_for_schema_convergence(&registry, &project_shard).await,
+        RegisteredSchemaConvergenceStatus::Complete
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -835,7 +1044,7 @@ async fn terminal_shutdown_cancels_and_joins_blocked_schema_convergence() {
 
     assert_eq!(
         registry.registered_schema_convergence_status(&shard_id),
-        Some(RegisteredSchemaConvergenceStatus::Pending),
+        Some(RegisteredSchemaConvergenceStatus::Running),
         "a cancelled convergence task must not publish a fabricated completion"
     );
 }

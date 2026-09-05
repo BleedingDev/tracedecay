@@ -90,7 +90,7 @@ fn denied_candidate(id: &str) -> tracedecay_memory_provider_registry::RecallCand
     decode(value)
 }
 
-/// A near-verbatim duplicate of `alpha`'s content, past the duplicate bar.
+/// An exact duplicate of `alpha`'s content.
 fn duplicate_candidate(id: &str) -> tracedecay_memory_provider_registry::RecallCandidateV1 {
     distinct_candidate(
         id,
@@ -112,7 +112,7 @@ fn trace_of(
 ///
 /// Real defect this catches: a bridge that reports a candidate as merely
 /// "not selected" instead of naming which of denial, deduplication,
-/// diversity exclusion, budget exclusion, or pack exclusion is responsible —
+/// budget exclusion or pack exclusion is responsible —
 /// which would make a stale-recall or missing-context investigation unable
 /// to tell a scope violation from a token-budget squeeze.
 #[test]

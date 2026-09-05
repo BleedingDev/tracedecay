@@ -1,4 +1,4 @@
-//! Behavioral tests for host-owned deduplication and diversity selection over
+//! Behavioral tests for host-owned exact deduplication and budget selection over
 //! normalized recall candidates: duplicate candidates never consume repeated
 //! budget, distinct positive/negative evidence is never collapsed on wording
 //! alone, selection is deterministic and fully explainable, and no
@@ -12,42 +12,10 @@ use std::error::Error;
 use recall_fixture::*;
 use serde_json::{Value, json};
 use tracedecay_memory_provider_registry::{
-    BudgetExclusionReason, DuplicateReason, NEGATION_MARKERS, RecallCandidateV1,
-    RecallSelectionError, RecallSelectionPolicyError, RecallSelectionPolicyV1, RecallSelectionV1,
+    BudgetExclusionReason, DuplicateReason, RecallCandidateV1, RecallSelectionError,
+    RecallSelectionPolicyError, RecallSelectionPolicyV1, RecallSelectionV1,
     admit_recall_candidates, normalize_admitted_candidates, select_recall_candidates,
 };
-
-/// An 18-word sentence with no negation marker in it, used to build pairs
-/// that differ by exactly one inserted word. Inserting one word at position
-/// two leaves 14 of the 19 trigrams in the union shared — 736,842 ppm, above
-/// the 700,000 ppm duplicate bar — so any such pair collapses unless
-/// something other than wording keeps it apart.
-const DUPLICATE_BAR_BASE: &str = "the migration can safely proceed after validation checks confirm \
-                                  schema compatibility and rollback readiness for production \
-                                  deployment today";
-
-/// Measured similarity of a [`DUPLICATE_BAR_BASE`] pair, in parts per
-/// million: 14 shared trigrams out of a 19-trigram union.
-const DUPLICATE_BAR_SIMILARITY_PPM: u32 = 736_842;
-
-/// A 10-word sentence with no negation marker in it. One inserted word leaves
-/// 6 of the 11 trigrams in the union shared — 545,454 ppm, above the 400,000
-/// ppm diversity bar but below the 700,000 ppm duplicate bar — so such a pair
-/// is diversity-excluded, not deduplicated, unless something other than
-/// wording keeps it apart.
-const DIVERSITY_BAR_BASE: &str =
-    "orbit harbor delta canyon meridian cobalt lantern summit quartz falcon";
-
-/// Measured similarity of a [`DIVERSITY_BAR_BASE`] pair, in parts per
-/// million: 6 shared trigrams out of an 11-trigram union.
-const DIVERSITY_BAR_SIMILARITY_PPM: u32 = 545_454;
-
-/// `base` with `word` inserted as the third word.
-fn with_inserted_word(base: &str, word: &str) -> String {
-    let mut words: Vec<&str> = base.split_whitespace().collect();
-    words.insert(2, word);
-    words.join(" ")
-}
 
 /// Builds one candidate with explicit content and an optional stable
 /// reference override (`None` keeps the fixture's per-candidate default,
@@ -67,19 +35,12 @@ fn candidate_with(id: &str, content: &str, stable_memory_ref: Option<&str>) -> R
 
 /// Admits, normalizes, and selects over `candidates` with a selection budget
 /// of `maximum_selected`, returning selected ids in final order alongside the
-/// dedup and diversity ledgers' candidate ids.
+/// deduplication ledger.
 #[allow(clippy::type_complexity)]
 fn select(
     candidates: Vec<RecallCandidateV1>,
     maximum_selected: usize,
-) -> Result<
-    (
-        Vec<String>,
-        Vec<(String, String, DuplicateReason)>,
-        Vec<(String, String)>,
-    ),
-    Box<dyn Error>,
-> {
+) -> Result<(Vec<String>, Vec<(String, String, DuplicateReason)>), Box<dyn Error>> {
     let (selection, all_candidate_ids) = selection_of(candidates, maximum_selected)?;
     assert_complete_accounting(&selection, &all_candidate_ids);
     Ok((
@@ -97,11 +58,6 @@ fn select(
                     entry.reason,
                 )
             })
-            .collect(),
-        selection
-            .diversity_excluded
-            .into_iter()
-            .map(|entry| (entry.candidate_id, entry.similar_to_candidate_id))
             .collect(),
     ))
 }
@@ -130,7 +86,7 @@ fn selection_of(
     Ok((selection, all_candidate_ids))
 }
 
-/// Every input candidate must appear in exactly one of the four ledgers: a
+/// Every input candidate must appear in exactly one of the three ledgers: a
 /// selection whose ledgers do not partition its input cannot be reconciled,
 /// and a candidate that vanished silently is exactly the accounting hole this
 /// asserts against.
@@ -168,27 +124,35 @@ fn same_stable_memory_ref_collapses_regardless_of_wording() -> Result<(), Box<dy
             Some("memory:shared-1"),
         ),
     ];
-    let (selected, deduplicated, diversity_excluded) = select(candidates, 8)?;
+    let (selected, deduplicated) = select(candidates, 8)?;
     assert_eq!(selected, vec!["a".to_owned()]);
     assert_eq!(deduplicated.len(), 1);
     assert_eq!(deduplicated[0].0, "b");
     assert_eq!(deduplicated[0].1, "a");
     assert_eq!(deduplicated[0].2, DuplicateReason::StableMemoryRef);
-    assert!(diversity_excluded.is_empty());
     Ok(())
 }
 
 /// Two candidates with byte-identical content but different candidate ids
-/// and different stable references still collapse: identical bytes cannot
+/// and no stable references still collapse: identical bytes cannot
 /// express different evidence no matter the source.
 #[test]
 fn identical_content_collapses_by_digest_without_a_stable_reference() -> Result<(), Box<dyn Error>>
 {
-    let candidates = vec![
-        candidate_with("a", "the exact same words, byte for byte", None),
-        candidate_with("b", "the exact same words, byte for byte", None),
-    ];
-    let (selected, deduplicated, _) = select(candidates, 8)?;
+    let candidates = ["a", "b"]
+        .into_iter()
+        .map(|id| {
+            let mut value = candidate_value(
+                id,
+                "the exact same words, byte for byte",
+                scope_value(&admitted_scope()),
+                current_validity(),
+            );
+            value["stable_memory_ref"] = Value::Null;
+            decode(value)
+        })
+        .collect();
+    let (selected, deduplicated) = select(candidates, 8)?;
     assert_eq!(selected, vec!["a".to_owned()]);
     assert_eq!(deduplicated.len(), 1);
     assert_eq!(deduplicated[0].0, "b");
@@ -197,7 +161,7 @@ fn identical_content_collapses_by_digest_without_a_stable_reference() -> Result<
 }
 
 /// A duplicate never consumes a second unit of the selection budget: with a
-/// budget of one, a genuinely distinct third candidate is still selected
+/// budget of two, a distinct third candidate is still selected
 /// once the exact duplicate is folded away rather than the budget being
 /// exhausted by the duplicate pair.
 #[test]
@@ -211,212 +175,33 @@ fn duplicate_candidates_do_not_consume_repeated_budget() -> Result<(), Box<dyn E
             None,
         ),
     ];
-    let (selected, deduplicated, _) = select(candidates, 2)?;
+    let (selected, deduplicated) = select(candidates, 2)?;
     assert_eq!(selected, vec!["a".to_owned(), "c".to_owned()]);
     assert_eq!(deduplicated.len(), 1);
     assert_eq!(deduplicated[0].0, "b");
     Ok(())
 }
 
-// --- bounded content-similarity near-duplicate collapse -------------------
-
-/// Two candidates with no shared identity but near-identical wording (one
-/// word changed out of many) collapse as a near-content duplicate.
+/// Similar wording can express distinct claims; only exact identity deduplicates.
 #[test]
-fn near_identical_wording_without_shared_identity_collapses() -> Result<(), Box<dyn Error>> {
-    let candidates = vec![
-        candidate_with(
-            "a",
-            "the deploy pipeline requires a database migration before release",
-            None,
-        ),
-        candidate_with(
-            "b",
-            "the deploy pipeline requires a database migration before shipping",
-            None,
-        ),
-    ];
-    let (selected, deduplicated, _) = select(candidates, 8)?;
-    assert_eq!(selected, vec!["a".to_owned()]);
-    assert_eq!(deduplicated.len(), 1);
-    assert_eq!(deduplicated[0].0, "b");
-    assert!(matches!(
-        deduplicated[0].2,
-        DuplicateReason::NearContent { .. }
-    ));
-    Ok(())
-}
-
-/// Candidates about unrelated topics never collapse, however short.
-#[test]
-fn unrelated_content_never_collapses() -> Result<(), Box<dyn Error>> {
-    let candidates = vec![
-        candidate_with(
-            "a",
-            "the deploy pipeline requires a database migration",
-            None,
-        ),
-        candidate_with(
-            "b",
-            "the frontend build uses a separate bundler config",
-            None,
-        ),
-    ];
-    let (selected, deduplicated, _) = select(candidates, 8)?;
-    assert_eq!(selected.len(), 2);
-    assert!(deduplicated.is_empty());
-    Ok(())
-}
-
-// --- negation guard: distinct polarity is never collapsed -----------------
-
-/// Two candidates that share almost every word but disagree on negation
-/// assert opposite things and must never be collapsed, however high their
-/// wording overlap would otherwise score.
-#[test]
-fn negated_and_unnegated_claims_are_not_collapsed() -> Result<(), Box<dyn Error>> {
-    let candidates = vec![
-        candidate_with("a", "the migration is safe to run in production", None),
-        candidate_with("b", "the migration is not safe to run in production", None),
-    ];
-    let (selected, deduplicated, diversity_excluded) = select(candidates, 8)?;
-    assert_eq!(selected.len(), 2);
-    assert!(deduplicated.is_empty());
-    assert!(diversity_excluded.is_empty());
-    Ok(())
-}
-
-/// Control for the diversity guard below: with a *non*-negating word
-/// inserted, the pair's measured similarity clears the diversity bar (but not
-/// the duplicate bar) and the second candidate really is excluded. Without
-/// this the guard test could pass on a pair the metric would never have
-/// excluded anyway.
-#[test]
-fn one_inserted_neutral_word_clears_the_diversity_bar() -> Result<(), Box<dyn Error>> {
-    let variant = with_inserted_word(DIVERSITY_BAR_BASE, "clearly");
-    let (selection, all_ids) = selection_of(
-        vec![
-            candidate_with("a", DIVERSITY_BAR_BASE, None),
-            candidate_with("b", &variant, None),
-        ],
-        8,
-    )?;
-    assert_complete_accounting(&selection, &all_ids);
-    assert!(selection.deduplicated.is_empty(), "below the duplicate bar");
-    assert_eq!(selection.diversity_excluded.len(), 1);
-    assert_eq!(selection.diversity_excluded[0].candidate_id, "b");
-    assert_eq!(selection.diversity_excluded[0].similar_to_candidate_id, "a");
-    assert_eq!(
-        selection.diversity_excluded[0].similarity_ppm,
-        DIVERSITY_BAR_SIMILARITY_PPM
-    );
-    Ok(())
-}
-
-/// The negation guard stops diversity selection from discarding the negative
-/// half of contradictory evidence: the identical insertion the control above
-/// shows is diversity-excluded is kept when the inserted word negates. Run
-/// for every marker of the vocabulary, so a marker the tokenizer cannot
-/// actually match fails here.
-#[test]
-fn every_negation_marker_protects_diversity_selection() -> Result<(), Box<dyn Error>> {
-    for marker in NEGATION_MARKERS {
-        let variant = with_inserted_word(DIVERSITY_BAR_BASE, marker);
-        let (selection, all_ids) = selection_of(
+fn near_wording_and_negations_remain_distinct() -> Result<(), Box<dyn Error>> {
+    for suffix in [
+        "shipping",
+        "not release",
+        "can't release",
+        "can’t release",
+        "never release",
+    ] {
+        let base = "the deploy pipeline requires a database migration before";
+        let (selected, deduplicated) = select(
             vec![
-                candidate_with("a", DIVERSITY_BAR_BASE, None),
-                candidate_with("b", &variant, None),
+                candidate_with("a", &format!("{base} release"), None),
+                candidate_with("b", &format!("{base} {suffix}"), None),
             ],
             8,
         )?;
-        assert_complete_accounting(&selection, &all_ids);
-        let selected: Vec<&str> = selection.selected_candidate_ids().collect();
-        assert_eq!(selected, vec!["a", "b"], "marker {marker:?}");
-        assert!(
-            selection.diversity_excluded.is_empty(),
-            "marker {marker:?} was diversity-excluded: {:?}",
-            selection.diversity_excluded
-        );
-    }
-    Ok(())
-}
-
-/// Control for the duplicate-bar guard below: a single inserted neutral word
-/// leaves the pair above the duplicate bar, so it collapses as a near-content
-/// duplicate. Every negation test that follows uses the same insertion, which
-/// is what makes those tests non-vacuous.
-#[test]
-fn one_inserted_neutral_word_clears_the_duplicate_bar() -> Result<(), Box<dyn Error>> {
-    let variant = with_inserted_word(DUPLICATE_BAR_BASE, "clearly");
-    let (selected, deduplicated, _) = select(
-        vec![
-            candidate_with("a", DUPLICATE_BAR_BASE, None),
-            candidate_with("b", &variant, None),
-        ],
-        8,
-    )?;
-    assert_eq!(selected, vec!["a".to_owned()]);
-    assert_eq!(deduplicated.len(), 1);
-    assert_eq!(
-        deduplicated[0].2,
-        DuplicateReason::NearContent {
-            similarity_ppm: DUPLICATE_BAR_SIMILARITY_PPM
-        }
-    );
-    Ok(())
-}
-
-/// Every marker of the negation vocabulary — the contractions included —
-/// blocks a collapse that the control above proves the metric would
-/// otherwise make. Splitting tokens on every non-alphanumeric character turns
-/// "can't" into "can" and "t", which match nothing, so a pair differing only
-/// by a contraction would be collapsed as a duplicate and the negative
-/// evidence lost; that regression fails this test on the first contraction.
-#[test]
-fn every_negation_marker_blocks_a_duplicate_collapse() -> Result<(), Box<dyn Error>> {
-    for marker in NEGATION_MARKERS {
-        let variant = with_inserted_word(DUPLICATE_BAR_BASE, marker);
-        let (selection, all_ids) = selection_of(
-            vec![
-                candidate_with("a", DUPLICATE_BAR_BASE, None),
-                candidate_with("b", &variant, None),
-            ],
-            8,
-        )?;
-        assert_complete_accounting(&selection, &all_ids);
-        let selected: Vec<&str> = selection.selected_candidate_ids().collect();
-        assert_eq!(selected, vec!["a", "b"], "marker {marker:?}");
-        assert!(
-            selection.deduplicated.is_empty(),
-            "marker {marker:?} was collapsed: {:?}",
-            selection.deduplicated
-        );
-        assert!(
-            selection.diversity_excluded.is_empty(),
-            "marker {marker:?} was diversity-excluded: {:?}",
-            selection.diversity_excluded
-        );
-    }
-    Ok(())
-}
-
-/// Real content writes contractions with a typographic apostrophe. A marker
-/// written that way is the same marker, so it must block the same collapse
-/// the ASCII form does.
-#[test]
-fn typographic_apostrophe_contractions_block_a_duplicate_collapse() -> Result<(), Box<dyn Error>> {
-    for marker in ["can\u{2019}t", "won\u{2019}t", "doesn\u{2019}t"] {
-        let variant = with_inserted_word(DUPLICATE_BAR_BASE, marker);
-        let (selected, deduplicated, diversity_excluded) = select(
-            vec![
-                candidate_with("a", DUPLICATE_BAR_BASE, None),
-                candidate_with("b", &variant, None),
-            ],
-            8,
-        )?;
-        assert_eq!(selected.len(), 2, "marker {marker:?}");
-        assert!(deduplicated.is_empty(), "marker {marker:?}");
-        assert!(diversity_excluded.is_empty(), "marker {marker:?}");
+        assert_eq!(selected, ["a", "b"], "{suffix}");
+        assert!(deduplicated.is_empty(), "{suffix}");
     }
     Ok(())
 }
@@ -425,7 +210,7 @@ fn typographic_apostrophe_contractions_block_a_duplicate_collapse() -> Result<()
 
 /// A distinct candidate the selection budget cannot admit is recorded as a
 /// budget exclusion instead of disappearing: `selected`, `deduplicated`,
-/// `diversity_excluded`, and `budget_excluded` together account for every
+/// and `budget_excluded` together account for every
 /// input candidate exactly once.
 #[test]
 fn candidates_past_the_budget_are_recorded_not_dropped() -> Result<(), Box<dyn Error>> {
@@ -458,7 +243,6 @@ fn candidates_past_the_budget_are_recorded_not_dropped() -> Result<(), Box<dyn E
     assert_eq!(selected, vec!["a", "c"]);
     assert_eq!(selection.deduplicated.len(), 1);
     assert_eq!(selection.deduplicated[0].candidate_id, "b");
-    assert!(selection.diversity_excluded.is_empty());
     assert_eq!(selection.budget_excluded.len(), 1);
     assert_eq!(selection.budget_excluded[0].candidate_id, "d");
     assert_eq!(
@@ -478,21 +262,19 @@ fn candidates_past_the_budget_are_recorded_not_dropped() -> Result<(), Box<dyn E
     Ok(())
 }
 
-/// A candidate that is redundant with an already-selected one is still
-/// classified as redundant after the budget is full, rather than being
-/// reported as a budget exclusion: the ledger says why each candidate was
-/// dropped, not merely that it was.
+/// Duplicates are still classified after the budget fills; the later distinct
+/// candidate receives an explicit budget exclusion.
 #[test]
 fn classification_continues_after_the_budget_is_full() -> Result<(), Box<dyn Error>> {
-    let redundant = with_inserted_word(DIVERSITY_BAR_BASE, "clearly");
+    let content = "deployment requires validation";
     let candidates = vec![
-        candidate_with("a", DIVERSITY_BAR_BASE, None),
+        candidate_with("a", content, None),
         candidate_with(
             "b",
             "telemetry sampling runs at one percent in staging",
             None,
         ),
-        candidate_with("c", &redundant, None),
+        candidate_with("c", content, None),
         candidate_with(
             "d",
             "release notes are generated from the changelog file",
@@ -504,9 +286,9 @@ fn classification_continues_after_the_budget_is_full() -> Result<(), Box<dyn Err
 
     let selected: Vec<&str> = selection.selected_candidate_ids().collect();
     assert_eq!(selected, vec!["a", "b"]);
-    assert_eq!(selection.diversity_excluded.len(), 1);
-    assert_eq!(selection.diversity_excluded[0].candidate_id, "c");
-    assert_eq!(selection.diversity_excluded[0].similar_to_candidate_id, "a");
+    assert_eq!(selection.deduplicated.len(), 1);
+    assert_eq!(selection.deduplicated[0].candidate_id, "c");
+    assert_eq!(selection.deduplicated[0].duplicate_of_candidate_id, "a");
     assert_eq!(selection.budget_excluded.len(), 1);
     assert_eq!(selection.budget_excluded[0].candidate_id, "d");
     Ok(())
@@ -537,14 +319,7 @@ fn reordered_admitted_slice_is_refused() -> Result<(), Box<dyn Error>> {
     let error =
         select_recall_candidates(RecallSelectionPolicyV1::new(8)?, &normalization, &reordered)
             .expect_err("a reordered admitted slice is not the normalized slice");
-    assert_eq!(
-        error,
-        RecallSelectionError::CandidateIdentityMismatch {
-            provider_rank: 0,
-            expected: "a".to_owned(),
-            admitted: "b".to_owned(),
-        }
-    );
+    assert_eq!(error, RecallSelectionError::NormalizationMismatch);
     Ok(())
 }
 
@@ -571,20 +346,12 @@ fn out_of_range_provider_rank_is_refused() -> Result<(), Box<dyn Error>> {
         &admission.admitted[..1],
     )
     .expect_err("a truncated admitted slice cannot describe the normalization");
-    assert_eq!(
-        error,
-        RecallSelectionError::ProviderRankOutOfRange {
-            candidate_id: "b".to_owned(),
-            provider_rank: 1,
-            admitted_len: 1,
-        }
-    );
+    assert_eq!(error, RecallSelectionError::NormalizationMismatch);
     Ok(())
 }
 
 /// A normalized candidate whose canonical content digest disagrees with the
-/// admitted entry is refused: the metric would otherwise sample bytes the
-/// candidate was not admitted with.
+/// admitted entry is refused before any selection decision.
 #[test]
 fn content_digest_disagreement_is_refused() -> Result<(), Box<dyn Error>> {
     let admission = admit_recall_candidates(
@@ -599,9 +366,8 @@ fn content_digest_disagreement_is_refused() -> Result<(), Box<dyn Error>> {
         )],
     )?;
     let mut normalization = normalize_admitted_candidates(Default::default(), &admission.admitted)?;
-    let admitted_digest = normalization.candidates[0].content_sha256.clone();
     let foreign_digest = "f".repeat(64);
-    normalization.candidates[0].content_sha256 = foreign_digest.clone();
+    normalization.candidates[0].content_sha256 = foreign_digest;
 
     let error = select_recall_candidates(
         RecallSelectionPolicyV1::new(8)?,
@@ -609,50 +375,7 @@ fn content_digest_disagreement_is_refused() -> Result<(), Box<dyn Error>> {
         &admission.admitted,
     )
     .expect_err("a foreign content digest is not the admitted candidate's");
-    assert_eq!(
-        error,
-        RecallSelectionError::ContentDigestMismatch {
-            candidate_id: "a".to_owned(),
-            expected: foreign_digest,
-            admitted: admitted_digest,
-        }
-    );
-    Ok(())
-}
-
-// --- diversity selection ----------------------------------------------------
-
-/// Below the duplicate bar but clearly redundant wording is excluded by
-/// diversity selection so it does not crowd out a distinct third candidate
-/// under a constrained budget.
-#[test]
-fn redundant_wording_is_diversity_excluded_under_budget() -> Result<(), Box<dyn Error>> {
-    let candidates = vec![
-        candidate_with(
-            "a",
-            "orbit harbor delta canyon meridian cobalt lantern summit quartz falcon",
-            None,
-        ),
-        // Single interior word changed (cobalt -> topaz): shares 5 of 8
-        // trigrams with `a`, a similarity clearly above the diversity bar but
-        // below the stricter duplicate bar.
-        candidate_with(
-            "b",
-            "orbit harbor delta canyon meridian topaz lantern summit quartz falcon",
-            None,
-        ),
-        candidate_with(
-            "c",
-            "vector nimbus thistle bramble cinder holloway pewter marlin ochre wisteria",
-            None,
-        ),
-    ];
-    let (selected, deduplicated, diversity_excluded) = select(candidates, 2)?;
-    assert!(deduplicated.is_empty());
-    assert_eq!(selected, vec!["a".to_owned(), "c".to_owned()]);
-    assert_eq!(diversity_excluded.len(), 1);
-    assert_eq!(diversity_excluded[0].0, "b");
-    assert_eq!(diversity_excluded[0].1, "a");
+    assert_eq!(error, RecallSelectionError::NormalizationMismatch);
     Ok(())
 }
 
@@ -669,19 +392,18 @@ fn selection_is_deterministic_for_a_fixed_policy() -> Result<(), Box<dyn Error>>
             candidate_with("c", "topic two about test isolation", None),
         ]
     };
-    let (first, first_dedup, first_diversity) = select(candidates(), 8)?;
-    let (second, second_dedup, second_diversity) = select(candidates(), 8)?;
+    let (first, first_dedup) = select(candidates(), 8)?;
+    let (second, second_dedup) = select(candidates(), 8)?;
     assert_eq!(first, second);
     assert_eq!(first_dedup, second_dedup);
-    assert_eq!(first_diversity, second_diversity);
     Ok(())
 }
 
 /// A candidate whose content is a reference rather than inline text can
-/// still be deduplicated by stable reference or content digest, but is never
-/// treated as similar to anything on wording it never carried inline.
+/// still be deduplicated by stable reference or content digest. Distinct
+/// references with distinct digests remain independent candidates.
 #[test]
-fn reference_only_content_is_never_near_content_collapsed() -> Result<(), Box<dyn Error>> {
+fn distinct_reference_only_content_is_retained() -> Result<(), Box<dyn Error>> {
     let mut a = candidate_value(
         "a",
         "irrelevant since content_ref takes precedence in the fixture builder",
@@ -694,10 +416,9 @@ fn reference_only_content_is_never_near_content_collapsed() -> Result<(), Box<dy
     a["content_ref"] = json!({"kind": "test-ref", "id": "ref-a"});
     let b = candidate_with("b", "a totally different sentence about networking", None);
     let candidates = vec![decode(a), b];
-    let (selected, deduplicated, diversity_excluded) = select(candidates, 8)?;
+    let (selected, deduplicated) = select(candidates, 8)?;
     assert_eq!(selected.len(), 2);
     assert!(deduplicated.is_empty());
-    assert!(diversity_excluded.is_empty());
     Ok(())
 }
 
@@ -713,32 +434,16 @@ fn zero_budget_policy_is_refused() {
     );
 }
 
-/// A diversity bar stricter than the duplicate bar is refused: diversity
-/// would then exclude candidates dedup itself would already have collapsed,
-/// making the two passes' evidence contradictory.
 #[test]
-fn inverted_thresholds_are_refused() {
-    let result = RecallSelectionPolicyV1::with_thresholds(4, 500_000, 900_000);
+fn narrowing_never_expands_the_pinned_budget() -> Result<(), Box<dyn Error>> {
+    let policy = RecallSelectionPolicyV1::new(4)?;
+    assert_eq!(policy.narrowed_to(2)?.maximum_selected(), 2);
+    assert_eq!(policy.narrowed_to(9)?.maximum_selected(), 4);
     assert_eq!(
-        result,
-        Err(RecallSelectionPolicyError::ThresholdOrderInverted {
-            duplicate: 500_000,
-            diversity: 900_000,
-        })
+        policy.narrowed_to(0),
+        Err(RecallSelectionPolicyError::ZeroBudget)
     );
-}
-
-/// A threshold above the unit scale cannot be a similarity fraction.
-#[test]
-fn out_of_range_threshold_is_refused() {
-    let result = RecallSelectionPolicyV1::with_thresholds(4, 1_000_001, 100);
-    assert_eq!(
-        result,
-        Err(RecallSelectionPolicyError::ThresholdOutOfRange {
-            value: 1_000_001,
-            unit: 1_000_000,
-        })
-    );
+    Ok(())
 }
 
 // --- no provider-specific ID assumption ------------------------------------
@@ -757,8 +462,109 @@ fn stable_reference_dedup_makes_no_assumption_about_id_shape() -> Result<(), Box
             Some(odd_ref),
         ),
     ];
-    let (selected, deduplicated, _) = select(candidates, 8)?;
+    let (selected, deduplicated) = select(candidates, 8)?;
     assert_eq!(selected, vec!["a".to_owned()]);
     assert_eq!(deduplicated[0].2, DuplicateReason::StableMemoryRef);
+    Ok(())
+}
+
+#[test]
+fn distinct_meaning_is_preserved_without_a_wording_heuristic() -> Result<(), Box<dyn Error>> {
+    for (left, right) in [
+        ("safe", "unsafe"),
+        ("enabled", "disabled"),
+        ("10", "100"),
+        ("x == y", "x != y"),
+        ("x > y", "x < y"),
+    ] {
+        let base = "the deployment rule after validation and review of production configuration is";
+        let (selection, ids) = selection_of(
+            vec![
+                candidate_with("a", &format!("{base} {left}"), None),
+                candidate_with("b", &format!("{base} {right}"), None),
+            ],
+            8,
+        )?;
+        assert_complete_accounting(&selection, &ids);
+        assert_eq!(
+            selection.selected_candidate_ids().collect::<Vec<_>>(),
+            ["a", "b"],
+            "{left} versus {right}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn differences_beyond_the_old_sample_prefix_are_preserved() -> Result<(), Box<dyn Error>> {
+    let prefix = "shared deployment validation context ".repeat(130);
+    assert!(prefix.len() > 4096);
+    let (selection, ids) = selection_of(
+        vec![
+            candidate_with("a", &format!("{prefix}allow production rollout"), None),
+            candidate_with("b", &format!("{prefix}deny production rollout"), None),
+        ],
+        8,
+    )?;
+    assert_complete_accounting(&selection, &ids);
+    assert_eq!(
+        selection.selected_candidate_ids().collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    Ok(())
+}
+
+#[test]
+fn altered_normalization_cannot_change_selection() -> Result<(), Box<dyn Error>> {
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &current_query(),
+        &authorized_exact(),
+        vec![
+            candidate_with("a", "deployment allowed", None),
+            candidate_with("b", "deployment denied", None),
+        ],
+    )?;
+    let canonical = normalize_admitted_candidates(Default::default(), &admission.admitted)?;
+    let mut variants = Vec::new();
+    let mut omitted = canonical.clone();
+    omitted.candidates.clear();
+    variants.push(("empty candidates", omitted));
+    let mut truncated = canonical.clone();
+    truncated.candidates.pop();
+    variants.push(("omitted candidate", truncated));
+    let mut duplicated = canonical.clone();
+    duplicated.candidates.push(duplicated.candidates[0].clone());
+    variants.push(("duplicated candidate", duplicated));
+    let mut stable_ref = canonical.clone();
+    stable_ref.candidates[1].stable_memory_ref = stable_ref.candidates[0].stable_memory_ref.clone();
+    variants.push(("forged stable reference", stable_ref));
+    let mut reordered = canonical.clone();
+    reordered.candidates.reverse();
+    variants.push(("forged host order", reordered));
+    let mut metadata = canonical.clone();
+    metadata.candidates[0].explanation_summary = Some("forged evidence".to_owned());
+    variants.push(("forged candidate metadata", metadata));
+    let mut policy = canonical.clone();
+    policy.normalization_policy_revision += 1;
+    variants.push(("forged policy", policy));
+    let mut warnings = canonical.clone();
+    warnings.warnings.push("forged set evidence".to_owned());
+    variants.push(("forged set warnings", warnings));
+    let mut ordering = canonical;
+    ordering.cross_provider_ordering_admissible = !ordering.cross_provider_ordering_admissible;
+    variants.push(("forged cross-provider ordering", ordering));
+    for (label, altered) in variants {
+        assert_eq!(
+            select_recall_candidates(
+                RecallSelectionPolicyV1::new(8)?,
+                &altered,
+                &admission.admitted
+            ),
+            Err(RecallSelectionError::NormalizationMismatch),
+            "incorrect refusal for {label}"
+        );
+    }
     Ok(())
 }

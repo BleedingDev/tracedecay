@@ -125,42 +125,45 @@ impl GuardedStoreTelemetryPort {
         store: &'a StoreKeyV1,
         observation: TableGrowthObservation,
     ) -> StorageTelemetryFuture<'a, TableGrowthTelemetryReadV1> {
-        Box::pin(async move {
-            if !self.admits(context, store) {
-                return TableGrowthTelemetryReadV1::Denied {
-                    store: store.clone(),
-                };
-            }
-            let Ok(current) = self
-                .handle
-                .table_size_telemetry(self.reader_wait, || telemetry_interruption(context))
-            else {
-                return TableGrowthTelemetryReadV1::Unknown {
-                    store: store.clone(),
-                };
-            };
-            let observed_at = now_micros();
-            let mut current_tables = BTreeMap::new();
-            for sample in current {
-                let Ok(table) = TableNameV1::new(sample.table_name) else {
+        Box::pin(hotpath::future!(
+            async move {
+                if !self.admits(context, store) {
+                    return TableGrowthTelemetryReadV1::Denied {
+                        store: store.clone(),
+                    };
+                }
+                let Ok(current) = self
+                    .handle
+                    .table_size_telemetry(self.reader_wait, || telemetry_interruption(context))
+                else {
                     return TableGrowthTelemetryReadV1::Unknown {
                         store: store.clone(),
                     };
                 };
-                current_tables.insert(table, StorageByteSizeV1(sample.bytes));
-            }
-            let mut watermarks = match self.table_watermarks.lock() {
-                Ok(watermarks) => watermarks,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            compare_table_growth(
-                store,
-                current_tables,
-                observed_at,
-                &mut watermarks,
-                observation,
-            )
-        })
+                let observed_at = now_micros();
+                let mut current_tables = BTreeMap::new();
+                for sample in current {
+                    let Ok(table) = TableNameV1::new(sample.table_name) else {
+                        return TableGrowthTelemetryReadV1::Unknown {
+                            store: store.clone(),
+                        };
+                    };
+                    current_tables.insert(table, StorageByteSizeV1(sample.bytes));
+                }
+                let mut watermarks = match self.table_watermarks.lock() {
+                    Ok(watermarks) => watermarks,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                compare_table_growth(
+                    store,
+                    current_tables,
+                    observed_at,
+                    &mut watermarks,
+                    observation,
+                )
+            },
+            label = "daemon.maintenance.read_table_growth"
+        ))
     }
 }
 
@@ -170,34 +173,37 @@ impl StoreSizeTelemetryPort for GuardedStoreTelemetryPort {
         context: &'a RequestContext,
         store: &'a StoreKeyV1,
     ) -> StorageTelemetryFuture<'a, StorageTelemetryReadV1> {
-        Box::pin(async move {
-            if !self.admits(context, store) {
-                return StorageTelemetryReadV1::Denied {
-                    store: store.clone(),
+        Box::pin(hotpath::future!(
+            async move {
+                if !self.admits(context, store) {
+                    return StorageTelemetryReadV1::Denied {
+                        store: store.clone(),
+                    };
+                }
+                let Ok(sample) = self
+                    .handle
+                    .store_size_telemetry(self.reader_wait, || telemetry_interruption(context))
+                else {
+                    return StorageTelemetryReadV1::Unknown {
+                        store: store.clone(),
+                    };
                 };
-            }
-            let Ok(sample) = self
-                .handle
-                .store_size_telemetry(self.reader_wait, || telemetry_interruption(context))
-            else {
-                return StorageTelemetryReadV1::Unknown {
+                let sample = StoreSizeSampleV1 {
                     store: store.clone(),
+                    page_size_bytes: sample.page_size_bytes,
+                    page_count: sample.page_count,
+                    freelist_pages: sample.freelist_pages,
+                    observed_at: now_micros(),
                 };
-            };
-            let sample = StoreSizeSampleV1 {
-                store: store.clone(),
-                page_size_bytes: sample.page_size_bytes,
-                page_count: sample.page_count,
-                freelist_pages: sample.freelist_pages,
-                observed_at: now_micros(),
-            };
-            if sample.validate().is_err() {
-                return StorageTelemetryReadV1::Unknown {
-                    store: store.clone(),
-                };
-            }
-            StorageTelemetryReadV1::Observed { sample }
-        })
+                if sample.validate().is_err() {
+                    return StorageTelemetryReadV1::Unknown {
+                        store: store.clone(),
+                    };
+                }
+                StorageTelemetryReadV1::Observed { sample }
+            },
+            label = "daemon.maintenance.read_store_size"
+        ))
     }
 
     fn table_growth<'a>(
@@ -209,6 +215,7 @@ impl StoreSizeTelemetryPort for GuardedStoreTelemetryPort {
     }
 }
 
+#[hotpath::measure(label = "daemon.maintenance.compare_table_growth")]
 fn compare_table_growth(
     store: &StoreKeyV1,
     current_tables: BTreeMap<TableNameV1, StorageByteSizeV1>,
@@ -303,6 +310,8 @@ pub(super) struct StoreTelemetrySamplingRegistry {
     semantic_vector_retention:
         Arc<std::sync::Mutex<HashMap<PathBuf, SemanticVectorRetentionProgressV1>>>,
     graph_replay_release: Arc<std::sync::Mutex<HashMap<PathBuf, GraphReplayReleaseProgressV1>>>,
+    graph_staging_release:
+        Arc<std::sync::Mutex<HashMap<PathBuf, tracedecay_store::GraphProjectionIdentityV1>>>,
     /// Last by-design retention operator line per lane and project. A
     /// persistent unavailable-by-design condition logs once, then counts on
     /// [`daemon.git.maintenance.retention_quiet_total`]; a state change or a
@@ -547,6 +556,10 @@ impl StoreTelemetrySamplingRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|project, _| active_projects.contains(project));
+        self.graph_staging_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|project, _| active_projects.contains(project));
         self.retention_operator_log
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -633,6 +646,33 @@ impl StoreTelemetrySamplingRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(project_root)
             .and_then(|state| state.cursor.clone())
+    }
+
+    pub(super) fn graph_staging_release_cursor(
+        &self,
+        project_root: &Path,
+    ) -> Option<tracedecay_store::GraphProjectionIdentityV1> {
+        self.graph_staging_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(project_root)
+            .cloned()
+    }
+
+    pub(super) fn record_graph_staging_release_cursor(
+        &self,
+        project_root: &Path,
+        cursor: Option<tracedecay_store::GraphProjectionIdentityV1>,
+    ) {
+        let mut cursors = self
+            .graph_staging_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cursor) = cursor {
+            cursors.insert(project_root.to_path_buf(), cursor);
+        } else {
+            cursors.remove(project_root);
+        }
     }
 
     /// Open a fresh per-tick loud-vs-quiet window before any retention pass
@@ -863,7 +903,7 @@ impl StoreTelemetrySamplingRegistry {
         )
     }
 
-    #[hotpath::skip]
+    #[hotpath::measure(label = "daemon.maintenance.sample_store_telemetry", future = true)]
     async fn advance_registered(
         &self,
         active_paths: &BTreeSet<PathBuf>,
@@ -920,6 +960,7 @@ pub(super) fn retention_failure_is_by_design(
     }
 }
 
+#[hotpath::measure(label = "daemon.maintenance.mint_telemetry_context")]
 fn storage_telemetry_request_context(
     scope: ResolvedScope,
 ) -> Result<RequestContext, ApplicationContractError> {
@@ -1298,6 +1339,12 @@ pub(super) struct MaintenanceCoordinator {
     /// Instant of the last branch-store GC pass that succeeded for every
     /// mounted project. `None` keeps the daily cadence retry-eligible.
     last_branch_gc: Arc<Mutex<Option<Instant>>>,
+    /// The resident-memory sampler task; see [`Self::spawn`].
+    resident_memory_sampler: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Last resident-memory verdict logged, shared by the sampler and the
+    /// retention tick so a sustained over-budget state logs once per
+    /// transition rather than once per sample.
+    resident_memory_log: Arc<std::sync::Mutex<ResidentMemoryLogStateV1>>,
 }
 
 impl Default for MaintenanceCoordinator {
@@ -1309,6 +1356,10 @@ impl Default for MaintenanceCoordinator {
             metrics: Arc::new(Mutex::new(MaintenanceMetricsV1::default())),
             store_cursor: Arc::new(Mutex::new(None)),
             last_branch_gc: Arc::new(Mutex::new(None)),
+            resident_memory_sampler: Arc::new(Mutex::new(None)),
+            resident_memory_log: Arc::new(std::sync::Mutex::new(
+                ResidentMemoryLogStateV1::default(),
+            )),
         }
     }
 }
@@ -1384,6 +1435,27 @@ impl MaintenanceCoordinator {
         branch_gc: BranchStoreGcCadenceV1,
     ) -> Self {
         let coordinator = Self::default();
+        // Measured RSS is a process fact that admission trusts, so it is
+        // sampled on its own short cadence regardless of whether retention
+        // maintenance runs: the retention tick is hours apart, and a cold
+        // index climbs from nothing to the admission watermark in minutes.
+        if let Err(error) =
+            tracedecay_runtime_core::resident_memory::install_process_allocator_pressure_reclaimer_v1()
+        {
+            tracing::error!(
+                event = "process_allocator_pressure_reclaimer_unavailable",
+                error = %error,
+                "could not install the allocator pressure reclaimer"
+            );
+        }
+        let sampler_owner = coordinator.clone();
+        let sampler = tokio::spawn(hotpath::future!(
+            async move {
+                sampler_owner.run_resident_memory_sampler().await;
+            },
+            label = "daemon.maintenance.resident_memory_sampler"
+        ));
+        *coordinator.resident_memory_sampler.lock().await = Some(sampler);
         if !retention_maintenance_enabled(&retention) {
             return coordinator;
         }
@@ -1434,6 +1506,24 @@ impl MaintenanceCoordinator {
         if let Some(task) = self.task.lock().await.take() {
             let _ = task.await;
         }
+        if let Some(sampler) = self.resident_memory_sampler.lock().await.take() {
+            let _ = sampler.await;
+        }
+    }
+
+    /// Sample measured RSS every [`RESIDENT_MEMORY_SAMPLE_INTERVAL_V1`] until
+    /// cancelled. Publishing a sample runs the pressure reclaimers when it
+    /// reaches the high watermark, so this loop is what turns a climb during
+    /// a cold index into released memory instead of refused admissions.
+    #[hotpath::skip]
+    async fn run_resident_memory_sampler(&self) {
+        let log = Arc::clone(&self.resident_memory_log);
+        run_resident_memory_sampler_loop(
+            &self.cancellation,
+            RESIDENT_MEMORY_SAMPLE_INTERVAL_V1,
+            Arc::new(move || record_process_resident_memory_gauge(&log)),
+        )
+        .await;
     }
 
     #[hotpath::skip]
@@ -1472,11 +1562,6 @@ impl MaintenanceCoordinator {
         branch_gc: BranchStoreGcCadenceV1,
         continuation: Option<MaintenanceContinuation>,
     ) -> MaintenanceTickOutcome {
-        // Piggybacks on the retention tick's existing cadence instead of a
-        // dedicated timer thread: this is the daemon's only always-running
-        // periodic loop, so it is where a slow RSS climb toward the
-        // admission limit becomes visible between full telemetry snapshots.
-        record_process_resident_memory_gauge();
         administration
             .store_telemetry_sampling()
             .begin_retention_tick_log_window();
@@ -1749,41 +1834,132 @@ impl MaintenanceCoordinator {
 /// Hotpath gauge, and feeds it to the resident-memory admission authority.
 ///
 /// A 20G RSS overrun past the admission limit was visible only to `ps` during
-/// a 2026-08 incident; this closes that gap using the retention tick's
-/// existing cadence rather than a new background timer. Publishing the same
-/// sample to
+/// a 2026-08 incident; the dedicated sampler closes that gap on a short
+/// cadence. Publishing the same sample to
 /// [`process_resident_memory_pressure_v1`](tracedecay_runtime_core::resident_memory::process_resident_memory_pressure_v1)
 /// closes the loop: admission stops trusting its reservation model once the
-/// measurement says the process is over budget. There is exactly one reader
-/// here — the gauge and the admission cell consume the same sample.
+/// measurement says the process is over budget. The post-reclaim observation
+/// returned by the pressure cell is the authority for the gauge and logs.
 #[cfg(target_os = "linux")]
-fn record_process_resident_memory_gauge() {
-    if let Some(bytes) =
-        tracedecay_runtime_core::resident_memory::sampled_process_resident_bytes_v1()
-    {
-        hotpath::gauge!("daemon.process.resident_bytes").set(bytes);
-        let state = tracedecay_runtime_core::resident_memory::process_resident_memory_pressure_v1()
-            .publish_observed_resident_bytes(bytes);
-        if let tracedecay_runtime_core::resident_memory::ResidentMemoryPressureStateV1::OverBudget {
-            observed_bytes,
-            limit_bytes,
-            high_watermark_bytes,
-            ..
-        } = state
-        {
+fn record_process_resident_memory_gauge(log: &std::sync::Mutex<ResidentMemoryLogStateV1>) {
+    use tracedecay_runtime_core::resident_memory::ResidentMemoryPressureStateV1;
+
+    let Some(bytes) = tracedecay_runtime_core::resident_memory::sampled_process_resident_bytes_v1()
+    else {
+        return;
+    };
+    let pressure = tracedecay_runtime_core::resident_memory::process_resident_memory_pressure_v1();
+    let state = pressure.publish_observed_resident_bytes(bytes);
+    if let Some(observed_bytes) = state.observed_bytes() {
+        hotpath::gauge!("daemon.process.resident_bytes").set(observed_bytes);
+    }
+    let over_budget = matches!(state, ResidentMemoryPressureStateV1::OverBudget { .. });
+    let transition = {
+        let mut log = log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        log.observe(over_budget)
+    };
+    match (transition, state) {
+        (
+            Some(ResidentMemoryLogTransitionV1::EnteredOverBudget),
+            ResidentMemoryPressureStateV1::OverBudget {
+                observed_bytes,
+                limit_bytes,
+                high_watermark_bytes,
+                ..
+            },
+        ) => {
             tracing::warn!(
                 event = "daemon_resident_memory_over_budget",
                 observed_bytes,
                 limit_bytes,
                 high_watermark_bytes,
-                "measured process RSS is over the admission high watermark; refusing new growth and releasing reclaimable retained state"
+                "measured process RSS reached the admission high watermark; refusing new growth and releasing reclaimable retained state"
             );
         }
+        (
+            Some(ResidentMemoryLogTransitionV1::ReturnedToNominal),
+            ResidentMemoryPressureStateV1::Nominal { observed_bytes, .. },
+        ) => {
+            tracing::info!(
+                event = "daemon_resident_memory_nominal",
+                observed_bytes,
+                low_watermark_bytes = pressure.low_watermark_bytes(),
+                "measured process RSS fell back under the admission low watermark"
+            );
+        }
+        _ => {}
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn record_process_resident_memory_gauge() {}
+fn record_process_resident_memory_gauge(_log: &std::sync::Mutex<ResidentMemoryLogStateV1>) {}
+
+type ResidentMemorySampleV1 = Arc<dyn Fn() + Send + Sync + 'static>;
+
+async fn run_resident_memory_sampler_loop(
+    cancellation: &tracedecay_session_memory::context::CancellationToken,
+    interval: Duration,
+    sample: ResidentMemorySampleV1,
+) {
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => return,
+            () = tokio::time::sleep(interval) => {}
+        }
+        if cancellation.is_cancelled() {
+            return;
+        }
+        let sample = Arc::clone(&sample);
+        // Reclaimers run inside the publish and an allocator trim over a
+        // multi-gigabyte heap takes real time; keep it off the runtime. A
+        // shutdown stops awaiting that blocking pass but cannot unsafely
+        // interrupt allocator maintenance already running on its worker.
+        let mut sampled = tokio::task::spawn_blocking(move || sample());
+        tokio::select! {
+            () = cancellation.cancelled() => return,
+            result = &mut sampled => {
+                if result.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Cadence of the measured-RSS sampler. Reading `/proc/self/status` is
+/// microseconds; a cold index of a few thousand files climbs from nothing to
+/// the admission watermark in about two minutes, so thirty seconds bounds
+/// how long freed-but-retained pages can count against admission.
+const RESIDENT_MEMORY_SAMPLE_INTERVAL_V1: Duration = Duration::from_secs(30);
+
+/// Whether the last resident-memory sample was logged as over budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ResidentMemoryLogStateV1 {
+    over_budget: bool,
+}
+
+/// A change in the logged resident-memory verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResidentMemoryLogTransitionV1 {
+    EnteredOverBudget,
+    ReturnedToNominal,
+}
+
+impl ResidentMemoryLogStateV1 {
+    /// Record one verdict and return the transition it made, if any: a
+    /// sustained state is logged once, when it starts and when it ends.
+    fn observe(&mut self, over_budget: bool) -> Option<ResidentMemoryLogTransitionV1> {
+        let transition = match (self.over_budget, over_budget) {
+            (false, true) => Some(ResidentMemoryLogTransitionV1::EnteredOverBudget),
+            (true, false) => Some(ResidentMemoryLogTransitionV1::ReturnedToNominal),
+            _ => None,
+        };
+        self.over_budget = over_budget;
+        transition
+    }
+}
 
 #[derive(Debug)]
 struct ColdStorePageMetrics {
@@ -1948,11 +2124,13 @@ fn checkpoint_path(profile_root: &Path) -> PathBuf {
         .join(CHECKPOINT_FILE)
 }
 
+#[hotpath::measure(label = "daemon.maintenance.load_cursor")]
 fn load_cursor(path: &Path) -> Option<ColdStoreCursorV1> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
+#[hotpath::measure(label = "daemon.maintenance.persist_cursor")]
 fn persist_cursor(path: &Path, cursor: &ColdStoreCursorV1) -> std::io::Result<()> {
     let parent = path
         .parent()
@@ -1991,8 +2169,8 @@ pub(crate) fn now_secs_i64() -> Result<i64, &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex as StdMutex};
     use std::time::Duration;
 
     use tokio::sync::Notify;
@@ -2009,7 +2187,7 @@ mod tests {
         StoreTelemetrySamplingRegistry, TableGrowthObservation, checkpoint_path,
         classify_cold_store_state, compare_table_growth, cursor_after_attempted_units, load_cursor,
         next_cold_store_cursor, persist_cursor, retention_failure_is_by_design,
-        run_maintenance_loop, select_store_window,
+        run_maintenance_loop, run_resident_memory_sampler_loop, select_store_window,
     };
 
     #[test]
@@ -3048,5 +3226,94 @@ mod tests {
     #[test]
     fn retention_window_conversion_never_wraps_negative() {
         assert_eq!(super::retention_window_secs(u64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn resident_memory_log_reports_each_transition_once() {
+        use super::{ResidentMemoryLogStateV1, ResidentMemoryLogTransitionV1};
+
+        let mut log = ResidentMemoryLogStateV1::default();
+        assert_eq!(log.observe(false), None, "nominal from the start is silent");
+        assert_eq!(
+            log.observe(true),
+            Some(ResidentMemoryLogTransitionV1::EnteredOverBudget)
+        );
+        assert_eq!(log.observe(true), None, "a sustained overrun logs once");
+        assert_eq!(
+            log.observe(false),
+            Some(ResidentMemoryLogTransitionV1::ReturnedToNominal)
+        );
+        assert_eq!(log.observe(false), None);
+        assert_eq!(
+            log.observe(true),
+            Some(ResidentMemoryLogTransitionV1::EnteredOverBudget),
+            "a fresh overrun after recovery logs again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_resident_memory_reclaimer_never_stalls_runtime_or_sampler_cancellation() {
+        let cancellation = tracedecay_session_memory::context::CancellationToken::new();
+        let started = Arc::new(Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((StdMutex::new(false), Condvar::new()));
+        let callback_started = Arc::clone(&started);
+        let callback_calls = Arc::clone(&calls);
+        let callback_release = Arc::clone(&release);
+        let fake_reclaimer = Arc::new(move || {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            callback_started.notify_one();
+            let (released, ready) = &*callback_release;
+            let mut released = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = ready
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        });
+        let task_cancellation = cancellation.clone();
+        let sampler = tokio::spawn(async move {
+            run_resident_memory_sampler_loop(
+                &task_cancellation,
+                Duration::from_secs(30),
+                fake_reclaimer,
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        let calls_before_deadline = calls.load(Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let started_on_deadline =
+            tokio::time::timeout(Duration::from_secs(1), started.notified()).await;
+        let heartbeat = tokio::spawn(async { 7_u8 });
+        let heartbeat_result = heartbeat.await;
+
+        cancellation.cancel();
+        tokio::task::yield_now().await;
+        let cancelled_while_blocked = sampler.is_finished();
+
+        let (released, ready) = &*release;
+        *released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        ready.notify_all();
+        let sampler_result = sampler.await;
+
+        assert_eq!(calls_before_deadline, 0);
+        assert!(
+            started_on_deadline.is_ok(),
+            "the sampler must preserve its thirty-second cadence"
+        );
+        assert_eq!(heartbeat_result.expect("runtime heartbeat"), 7);
+        assert!(
+            cancelled_while_blocked,
+            "cancellation must not wait for a blocked pressure reclaimer"
+        );
+        sampler_result.expect("sampler joins after cancellation");
     }
 }

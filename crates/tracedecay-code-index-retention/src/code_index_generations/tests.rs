@@ -996,6 +996,54 @@ fn next_retention_plan_limits_collection_to_one_generation() {
     assert_eq!(plan.superseded_generations.len(), 7);
 }
 
+/// The bounded collection unit must name the OLDEST collectable generation.
+///
+/// Planning newest-first meant a store that publishes at least as fast as
+/// maintenance collects never reclaimed its floor: every single-unit plan
+/// named the generation sealed a moment ago, and the first generation ever
+/// sealed stayed on disk forever.
+#[test]
+fn next_retention_plan_collects_the_oldest_superseded_generation_first() {
+    let (store, generations) = fixture_store(5);
+
+    let plan = plan_next_code_generation_retention_cancellable(
+        store.path(),
+        &BTreeSet::new(),
+        DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+        &|| false,
+    )
+    .expect("plan one retention unit");
+
+    assert_eq!(
+        plan.collectable_generations
+            .iter()
+            .map(|generation| generation.generation_id.clone())
+            .collect::<Vec<_>>(),
+        vec![generations[0].id.clone()],
+        "the bounded unit must reclaim the oldest superseded generation"
+    );
+}
+
+/// The rollback reserve still holds the NEWEST superseded generations while
+/// the batch sweeps from the oldest end, so the two orders cannot collapse
+/// into one another.
+#[test]
+fn retention_reserves_the_newest_superseded_window_and_sweeps_from_the_oldest() {
+    let (store, generations) = fixture_store(6);
+
+    let plan = plan_code_generation_retention(store.path(), &BTreeSet::new(), TEST_ROLLBACK_FLOOR)
+        .expect("plan retention with a rollback reserve");
+
+    assert_eq!(
+        plan.collectable_generations
+            .iter()
+            .map(|generation| generation.generation_id.clone())
+            .collect::<Vec<_>>(),
+        vec![generations[0].id.clone(), generations[1].id.clone()],
+        "generations 2..4 are the newest superseded rollback reserve"
+    );
+}
+
 #[test]
 fn unpublished_store_collects_sealed_crash_debris_under_the_absent_pointer() {
     let (store, generations) = fixture_store(2);
@@ -1046,6 +1094,50 @@ fn idle_maintenance_preparation_stays_metadata_only() {
         plan.verification,
         GenerationDigestVerificationV1::MetadataOnly,
         "an idle maintenance tick must not re-hash every retained generation"
+    );
+}
+
+#[test]
+fn maintenance_preparation_wakes_for_an_unreferenced_final_segment() {
+    let store = tempfile::TempDir::new().expect("create unpublished store");
+    std::fs::create_dir_all(store.path().join(GENERATIONS_DIRECTORY))
+        .expect("create generation root");
+    let segments_root = store.path().join(GENERATION_SEGMENTS_DIRECTORY);
+    std::fs::create_dir_all(&segments_root).expect("create segment root");
+    let orphan_bytes = b"pack committed before generation manifest";
+    let orphan_digest = encode_lowercase_hex(&Sha256::digest(orphan_bytes));
+    let orphan_path = segments_root.join(format!("segment-{orphan_digest}.json"));
+    std::fs::write(&orphan_path, orphan_bytes).expect("write final orphan segment");
+
+    let plan = prepare_next_code_generation_retention_cancellable(
+        store.path(),
+        &BTreeSet::new(),
+        DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+        &|| false,
+        None,
+    )
+    .expect("prepare segment-only retention unit");
+    assert!(plan.has_collectable_work());
+    assert!(plan.collectable_generations.is_empty());
+    assert_eq!(
+        plan.verification,
+        GenerationDigestVerificationV1::Full,
+        "segment unlinking must keep the full-verification execution fence"
+    );
+
+    let report = execute_code_generation_retention(
+        store.path(),
+        plan,
+        CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(99),
+        None,
+    )
+    .expect("execute segment-only retention unit");
+    assert!(report.deleted_generations.is_empty());
+    assert!(report.receipt.is_none());
+    assert!(
+        !orphan_path.exists(),
+        "ordinary maintenance must remove the segment without waiting for a generation deletion"
     );
 }
 

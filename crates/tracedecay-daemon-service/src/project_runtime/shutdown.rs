@@ -152,10 +152,10 @@ impl ProjectRuntimeRegistryV1 {
     /// woken tasks are scheduled, never polled inline — so no cancelled owner
     /// can re-enter this lock while the guard is held.
     ///
-    /// No owner can slip past the sweep. `register_or_reconcile` tests
-    /// `closed` and mounts the component under one continuously-held guard on
-    /// this same map, so a concurrent registrar either takes the lock first
-    /// and is swept here, or takes it after and is refused.
+    /// No owner can slip past the sweep. `register_or_reconcile` rechecks
+    /// `closed` while committing its exact reservation under this same map
+    /// lock, so a concurrent registrar either commits first and is swept here,
+    /// or observes closed admission and rolls its reservation back.
     fn cancel_retained_background_recovery(&self) {
         for runtime in self.lock_runtimes().values() {
             runtime.cancel_background_recovery();
@@ -306,7 +306,7 @@ impl ProjectRuntimeRegistryV1 {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
             {
-                drain_waiting.send(()).expect("drain-waiting receiver");
+                let _ = drain_waiting.send(());
             }
             let mut current_version = version
                 .lock()
@@ -421,7 +421,7 @@ async fn shut_down_semantic(
     let mut clean = true;
     for runtime in runtimes.values_mut() {
         if let Some(reconciler) = runtime.semantic_activation_reconciler.take() {
-            reconciler.cancel_and_join().await;
+            reconciler.reconciler.cancel_and_join().await;
         }
         if let Some(configuration) = runtime.configuration.as_ref() {
             let receipt = tracedecay_code_index_runtime::collect_semantic_evaluation_shutdown(

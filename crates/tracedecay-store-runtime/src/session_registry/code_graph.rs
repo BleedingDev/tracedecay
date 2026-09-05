@@ -1,5 +1,7 @@
+#[cfg(any(test, feature = "test-helpers"))]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -20,15 +22,15 @@ use tracedecay_store::{
     CodeShardScopeV1, FactReadControl, GraphGenerationIdV1, GraphPendingReplayDiscardOutcomeV1,
     GraphProjectionIdV1, GraphProjectionIdentityV1, GraphPublicationIdempotencyKeyV1,
     GraphPublicationInputDigestV1, GraphPublicationKeyV1, GraphPublicationOperationContextV1,
-    GraphPublicationReplayLookupV1, GraphPublicationReplayRecordV1, GraphPublicationStoreErrorV1,
-    GraphPublicationStoreV1, GraphReplayAppendOutcomeV1, GraphVerifiedHeadV1, ProjectId,
-    RetainedGraphStoreLeaseV1, RuntimeCancellationIdV1, RuntimeCancellationIdentityV1,
-    RuntimeDeadlineIdV1, RuntimeDeadlineV1, RuntimeInterruptionV1, RuntimeRequestControlV1,
-    RuntimeRequestProbeV1, SemanticVectorStageBatchReceipt, SemanticVectorStageCancelOutcome,
-    SemanticVectorStageKey, SemanticVectorStagePlan, SemanticVectorStagePublicationPrepareOutcome,
+    GraphPublicationProjectionPageRequestV1, GraphPublicationReplayLookupV1,
+    GraphPublicationReplayRecordV1, GraphPublicationStoreErrorV1, GraphPublicationStoreV1,
+    GraphReplayAppendOutcomeV1, GraphVerifiedHeadV1, ProjectId, RetainedGraphStoreLeaseV1,
+    RuntimeCancellationIdV1, RuntimeCancellationIdentityV1, RuntimeDeadlineIdV1, RuntimeDeadlineV1,
+    RuntimeInterruptionV1, RuntimeRequestControlV1, RuntimeRequestProbeV1,
+    SemanticVectorStageBatchReceipt, SemanticVectorStageCancelOutcome, SemanticVectorStageKey,
+    SemanticVectorStagePlan, SemanticVectorStagePublicationPrepareOutcome,
     SemanticVectorStagePublishOutcome, SemanticVectorStagePublishSettlement,
-    SemanticVectorStageRecord, SemanticVectorStageResumeOutcome, SemanticVectorStagingStore,
-    StoreShardIdV1,
+    SemanticVectorStageResumeOutcome, SemanticVectorStagingStore, StoreShardIdV1,
 };
 
 use super::{DaemonSessionRuntimeRegistryV1, Result, session_registry_error};
@@ -38,10 +40,11 @@ use tracedecay_code_index_runtime::{
 use tracedecay_usecases::semantic_runtime::{
     SemanticVectorGraphScopeV1, VerifiedSemanticVectorGraphRuntimeV1,
 };
+use tracedecay_usecases::store::vector_generations::GRAPH_BACKGROUND_OPERATION_BUDGET;
 
 mod memory_runtime;
 pub(super) use memory_runtime::{
-    inline_graph_publication_input_digest, schedule_bound_memory_graph_reconciliation,
+    MemoryGraphRuntimeTaskContext, inline_graph_publication_input_digest,
 };
 pub(super) mod graph_attachment;
 #[cfg(test)]
@@ -51,21 +54,69 @@ mod semantic_vector;
 mod semantic_vector_runtime;
 use seals::{
     finalize_project_graph_replay_unlink, lock_project_graph_replay_pool,
+    prove_stable_sealed_source, revalidate_stable_sealed_source,
     sealed_digest_from_generation_file, stage_project_graph_replay_unlink,
 };
 use semantic_vector_runtime::DaemonVerifiedSemanticVectorGraphRuntimeV1;
 
 const GRAPH_OPERATION_DEADLINE: Duration = Duration::from_secs(30);
-
-/// Effectively-unbounded budget for background graph work (sealed projection
-/// and generation publication); cancellation is the governing mechanism.
-const GRAPH_BACKGROUND_OPERATION_BUDGET: Duration = Duration::from_hours(168);
 const GRAPH_OPEN_DEADLINE: Duration = Duration::from_secs(30);
 /// How many orphaned pending predecessors one publication attempt will
 /// complete before reporting Conflict. Each completion advances the verified
 /// head by one, so even a journal wedged across many interrupted boots drains
 /// across a few reconcile passes rather than blocking forever.
 const MAX_PENDING_REPLAY_COMPLETIONS_V1: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GraphReplayReconcileDisposition {
+    Retired,
+    Retained,
+    Absent,
+}
+
+fn graph_replay_reconcile_disposition(
+    outcome: GraphReplayCollectionOutcome,
+    generation: &CodeGenerationId,
+    sealed_digest: &tracedecay_graph_db::SealedGraphStateDigest,
+) -> std::result::Result<GraphReplayReconcileDisposition, GraphDbError> {
+    match outcome {
+        GraphReplayCollectionOutcome::Retired(source) => {
+            let GraphGenerationReplaySource::SealedCodeGeneration(source) = *source else {
+                return Err(GraphDbError::Corrupt {
+                    message: "code generation retirement selected an inline graph replay"
+                        .to_owned(),
+                });
+            };
+            if source.generation != *generation || source.sealed_state_digest != *sealed_digest {
+                return Err(GraphDbError::conflict(
+                    "code_graph.reconcile_deleted_code_generation_graph_replays",
+                ));
+            }
+            Ok(GraphReplayReconcileDisposition::Retired)
+        }
+        GraphReplayCollectionOutcome::RetentionPending => {
+            tracing::info!(
+                event = "graph_replay_retention_pending",
+                generation = generation.as_str(),
+                reason = "staging_engine_hibernated",
+                "graph replay remains queued until staging is already open"
+            );
+            Ok(GraphReplayReconcileDisposition::Retained)
+        }
+        GraphReplayCollectionOutcome::Retained => Ok(GraphReplayReconcileDisposition::Retained),
+        GraphReplayCollectionOutcome::Absent => Ok(GraphReplayReconcileDisposition::Absent),
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+static PUBLICATION_PROJECTION_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(test, feature = "test-helpers"))]
+static PUBLICATION_PROJECTION_OVERLAP_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn take_publication_projection_overlap_peak() -> usize {
+    PUBLICATION_PROJECTION_OVERLAP_PEAK.swap(0, Ordering::AcqRel)
+}
 
 #[derive(Clone, Copy)]
 enum CodeGraphPublicationConflictStageV1 {
@@ -316,7 +367,7 @@ impl CodeGraphPublicationFlightV1 {
     }
 }
 
-/// The registry-owned per-code-shard publication locks.
+/// The registry-owned per-project-publication-shard locks.
 ///
 /// `gate` is the serving gate: a leaf lock held only across the short
 /// storage-ordered slices of a publication — manifest-provider bind plus
@@ -326,8 +377,9 @@ impl CodeGraphPublicationFlightV1 {
 /// gate held. `flight` dedupes same-key publishers; see
 /// [`CodeGraphPublicationFlightV1`].
 ///
-/// `build` admits one corpus-sized sealed publish at a time across the whole
-/// shard, keys included. Every scope of a project stages into the one shared
+/// `build` admits one corpus-sized sealed publish at a time across every
+/// worktree/branch scope of the project. The permit is held from manifest
+/// projection through publication. Every scope stages into the one shared
 /// staging store, and each in-flight publish holds a decoded generation, a
 /// projection manifest, staging pages, and the sealed-store copy at once —
 /// several times the corpus in transient memory. A daemon recovering a
@@ -338,8 +390,11 @@ impl CodeGraphPublicationFlightV1 {
 /// observe their typed interruption while parked, and no read or serving
 /// path ever takes this permit.
 ///
-/// Lock order is `replay-pool file lock -> build -> flight -> gate`; the
-/// gate acquires nothing while held.
+/// Lock order is `build -> replay-pool file lock -> flight -> gate`. Build is
+/// acquired first and is never taken while holding replay-pool, flight, or
+/// gate. Replay-pool is released after a stable source identity proof;
+/// hashing and materialization run without it. The gate acquires nothing
+/// while held.
 #[derive(Default)]
 pub(crate) struct CodeGraphShardPublicationLocksV1 {
     gate: Mutex<()>,
@@ -378,6 +433,79 @@ impl CodeGraphShardPublicationLocksV1 {
     }
 }
 
+/// Returns the arenas a finished publication emptied back to the operating
+/// system.
+///
+/// A corpus-sized publish frees hundreds of megabytes as it unwinds, but
+/// glibc keeps freed pages in the per-thread arena that allocated them, and
+/// each publishing worktree scope publishes on its own thread. Measured on
+/// the 600-file harness at four scopes, arena retention alone accounted for
+/// 0.24 GB of the 0.60 GB that each additional scope added to peak RSS —
+/// memory that was already dead, held only because nothing asked for it back.
+/// Asking here, at the permit boundary, is what turns "freed" into "not
+/// resident" for the next scope's build.
+///
+/// Best effort by construction: a build with a non-glibc allocator (the
+/// daemon's optional jemalloc and mimalloc lanes purge on their own) simply
+/// does nothing, and a failed trim only means the pages stay where they were.
+/// Reports what one staging-release attempt decided, at info.
+///
+/// Retention was previously invisible: only a hard error was logged, so a
+/// sweep that answered `Retained` for every generation looked identical to one
+/// that had nothing to do. On the live daemon that difference was 8.6 GB of
+/// staging container and a 20+ GB open, with 13 release-queue entries pending
+/// for a day and no way to see why.
+fn observe_sealed_staging_release(
+    stage: &'static str,
+    projection: &GraphProjectionIdentityV1,
+    outcome: tracedecay_graph_db::SealedStagingRelease,
+) {
+    match outcome {
+        tracedecay_graph_db::SealedStagingRelease::Released {
+            entities,
+            relations,
+        } => tracing::info!(
+            event = "graph_staging_rows_released",
+            stage,
+            namespace = projection.namespace.as_str(),
+            projection = projection.projection.as_str(),
+            entities,
+            relations,
+            "released a sealed generation's duplicate staging rows"
+        ),
+        tracedecay_graph_db::SealedStagingRelease::AlreadyReleased => tracing::debug!(
+            event = "graph_staging_rows_already_released",
+            stage,
+            namespace = projection.namespace.as_str(),
+            projection = projection.projection.as_str(),
+            "sealed generation had already released its staging rows"
+        ),
+        tracedecay_graph_db::SealedStagingRelease::Retained(reason) => tracing::info!(
+            event = "graph_staging_rows_retained",
+            stage,
+            namespace = projection.namespace.as_str(),
+            projection = projection.projection.as_str(),
+            reason = reason.as_str(),
+            "sealed generation kept its duplicate staging rows"
+        ),
+    }
+}
+
+fn release_publish_transient_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: `malloc_trim` takes no pointers and no ownership; it only
+        // asks the allocator to return unused top-of-arena pages. It is safe
+        // to call at any time from any thread.
+        let released = unsafe { libc::malloc_trim(0) };
+        tracing::debug!(
+            event = "graph_publish_arena_trim",
+            released = released == 1,
+            "returned publication arenas to the operating system"
+        );
+    }
+}
+
 pub(crate) struct RetainedCodeGraphRuntimeV1 {
     graph_registry: tracedecay_graph_db::GraphDbRegistry,
     graph_manifest_provider: Arc<super::code_graph_manifest::DaemonCodeGraphManifestProviderV1>,
@@ -392,7 +520,7 @@ pub(crate) struct RetainedCodeGraphRuntimeV1 {
     replay_root: std::path::PathBuf,
     sealed_state_digest: tracedecay_graph_db::SealedGraphStateDigest,
     lifecycle_cancelled: Arc<AtomicBool>,
-    /// Registry-owned per-shard publication locks; see
+    /// Registry-owned per-project-publication-shard locks; see
     /// `DaemonSessionRuntimeRegistryV1::code_graph_publication_gates`.
     publication_locks: Arc<CodeGraphShardPublicationLocksV1>,
 }
@@ -995,15 +1123,13 @@ impl RetainedCodeGraphRuntimeV1 {
             ));
         }
         self.sweep_aborted_read_bundle_temporaries()?;
-        // Everything up to `prepared` below is a pure function of the
-        // immutable published generation and this runtime's identity — no
-        // publication storage is read or written — so racing publishers
-        // compute it concurrently instead of serializing manifest projection
-        // behind the per-shard publication gate. The manifest build memoizes
-        // on the generation handle (first complete build wins), so the seat
-        // pass and the background reconcile still share one projection. The
-        // deadline window consequently also spans the gate wait; under the
-        // background budget, cancellation stays the governing mechanism.
+        // The project-shard build permit is claimed before manifest
+        // projection and held through publication so 1/2/4/8 worktree scopes
+        // cannot overlap corpus-sized transients. Same-generation seat and
+        // reconcile publishers still share one memoized projection once the
+        // winner finishes; they wait here instead of projecting in parallel.
+        // The deadline window consequently also spans the build wait; under
+        // the background budget, cancellation stays the governing mechanism.
         let projection_deadline = sealed_projection_deadline();
         let deadline_at = Instant::now() + projection_deadline;
         let graph_generation = tracedecay_code_index::graph_projection::code_graph_generation_id(
@@ -1046,18 +1172,29 @@ impl RetainedCodeGraphRuntimeV1 {
         };
         let context = GraphPublicationOperationContextV1::new(&control, &probe)
             .map_err(|error| GraphDbError::invalid(error.to_string()))?;
+        let interruption = || match probe.interruption() {
+            Some(RuntimeInterruptionV1::Cancelled) => Err(GraphDbError::Cancelled),
+            Some(RuntimeInterruptionV1::DeadlineExceeded) => Err(GraphDbError::DeadlineExceeded),
+            None => Ok(()),
+        };
+        let _build = self.publication_locks.claim_build(&interruption)?;
         let projection = tracedecay_code_index::graph_projection::code_graph_projection_identity(
             self.authority.namespace().clone(),
         )
         .map_err(map_code_graph_error)?;
+        let projector_revision = GraphProjectorRevision::try_from(
+            tracedecay_code_index::graph_projection::CODE_GRAPH_PROJECTOR_REVISION.to_owned(),
+        )?;
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            let overlapping = PUBLICATION_PROJECTION_IN_FLIGHT.fetch_add(1, Ordering::AcqRel) + 1;
+            PUBLICATION_PROJECTION_OVERLAP_PEAK.fetch_max(overlapping, Ordering::AcqRel);
+        }
         let manifest =
             tracedecay_code_index::graph_projection::build_published_code_graph_manifest_checked(
                 projection.clone(),
                 generation,
-                &GraphProjectorRevision::try_from(
-                    tracedecay_code_index::graph_projection::CODE_GRAPH_PROJECTOR_REVISION
-                        .to_owned(),
-                )?,
+                &projector_revision,
                 &|| match probe.interruption() {
                     Some(RuntimeInterruptionV1::Cancelled) => Err(GraphDbError::Cancelled),
                     Some(RuntimeInterruptionV1::DeadlineExceeded) => {
@@ -1065,8 +1202,10 @@ impl RetainedCodeGraphRuntimeV1 {
                     }
                     None => Ok(()),
                 },
-            )
-            .map_err(map_code_graph_error)?;
+            );
+        #[cfg(any(test, feature = "test-helpers"))]
+        PUBLICATION_PROJECTION_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+        let manifest = manifest.map_err(map_code_graph_error)?;
         let relational_projection = GraphProjectionIdentityV1 {
             shard_id: self.authority.binding().shard_id.clone(),
             namespace: tracedecay_store::GraphNamespaceV1::new(self.authority.namespace().as_str())
@@ -1104,7 +1243,26 @@ impl RetainedCodeGraphRuntimeV1 {
             publication_key,
             request_cancelled,
         };
-        self.publish_prepared_sealed_generation(&prepared, &probe, &context)
+        let mut staging_release = None;
+        let published = self.publish_prepared_sealed_generation(
+            &prepared,
+            &probe,
+            &context,
+            &mut staging_release,
+        );
+        // Everything corpus-sized this publication built — the projection
+        // manifest, the staged relational rows, the sealed copy buffers — is
+        // dead by here. Free it, release the duplicate staging rows the seal
+        // made redundant, and return the emptied arenas to the OS *before*
+        // the build permit goes to the next scope. Deferring any of that past
+        // the permit is what made peak RSS grow with the number of published
+        // worktree scopes even though the builds never overlapped (#830).
+        drop(prepared);
+        if let Some(projection) = staging_release {
+            self.release_sealed_staging_rows(projection);
+        }
+        release_publish_transient_memory();
+        published
     }
 
     /// Seat the exact durable code-graph head without rebuilding its projection
@@ -1330,6 +1488,92 @@ impl RetainedCodeGraphRuntimeV1 {
         )
     }
 
+    /// Releases the duplicate staging rows this publication's seal made
+    /// redundant, on the publishing thread, before the build permit is
+    /// handed to the next scope.
+    ///
+    /// This used to be a `spawn_blocking` task. Two things were wrong with
+    /// that for the retention this fixes. It ran *after* the permit was
+    /// released, so the next corpus build started on top of rows that were
+    /// already redundant; and it silently did not run at all off a Tokio
+    /// thread, which is exactly how the publication measurement harness
+    /// calls this path — the release was warned about and left to
+    /// maintenance. Running it here makes "released when the permit is
+    /// released" a property of the code rather than of the caller's runtime.
+    fn release_sealed_staging_rows(&self, projection: GraphProjectionIdentityV1) {
+        let graph_registry = self.graph_registry.clone();
+        let project_database = Arc::clone(&self.project_database);
+        let authority: Arc<dyn RetainedGraphStoreLeaseV1> = self.authority.clone();
+        let lifecycle_cancelled = Arc::clone(&self.lifecycle_cancelled);
+        {
+            let release: std::result::Result<
+                tracedecay_graph_db::SealedStagingRelease,
+                GraphDbError,
+            > = (|| {
+                let deadline_at = Instant::now() + GRAPH_BACKGROUND_OPERATION_BUDGET;
+                let lifecycle_cancellation =
+                    graph_lifecycle_cancellation(&lifecycle_cancelled, None);
+                let request_cancellation = Arc::clone(&lifecycle_cancellation);
+                let cancellation_identity = RuntimeCancellationIdentityV1 {
+                    cancellation_id: RuntimeCancellationIdV1::new(format!(
+                        "graph-staging-release:{}",
+                        projection.projection.as_str()
+                    ))
+                    .map_err(|error| GraphDbError::invalid(error.to_string()))?,
+                    generation: 1,
+                };
+                let deadline_identity = RuntimeDeadlineV1 {
+                    deadline_id: RuntimeDeadlineIdV1::new(format!(
+                        "graph-staging-release-deadline:{}",
+                        projection.projection.as_str()
+                    ))
+                    .map_err(|error| GraphDbError::invalid(error.to_string()))?,
+                };
+                let probe = GraphPublicationProbeV1 {
+                    request_cancellation: Arc::clone(&request_cancellation),
+                    lifecycle_cancellation: Arc::clone(&lifecycle_cancellation),
+                    deadline_at,
+                    cancellation: cancellation_identity.clone(),
+                    deadline: deadline_identity.clone(),
+                    commit_started: AtomicBool::new(false),
+                    deadline_warned: AtomicBool::new(false),
+                };
+                let control = RuntimeRequestControlV1 {
+                    requested_at: tracedecay_application::clock::now_micros(),
+                    deadline: deadline_identity,
+                    cancellation: cancellation_identity,
+                };
+                let context = GraphPublicationOperationContextV1::new(&control, &probe)
+                    .map_err(|error| GraphDbError::invalid(error.to_string()))?;
+                let registration = GraphDbRegistration {
+                    authority_lease: authority,
+                    cancellation: request_cancellation,
+                    lifecycle_cancellation,
+                    deadline: deadline_at,
+                };
+                let mut storage = project_database
+                    .graph_publication_storage()
+                    .map_err(|error| GraphDbError::unavailable(error.to_string()))?;
+                let outcome = graph_registry.release_sealed_generation_staging_rows(
+                    registration,
+                    &mut storage,
+                    &context,
+                    &projection,
+                )?;
+                observe_sealed_staging_release("publish", &projection, outcome);
+                Ok(outcome)
+            })();
+            if let Err(error) = release {
+                tracing::warn!(
+                    event = "graph_staging_release_failed",
+                    projection = projection.projection.as_str(),
+                    error = ?error,
+                    "sealed generation staging release will be retried by maintenance"
+                );
+            }
+        }
+    }
+
     /// The classification gate slice: observe the typed interruption first
     /// (a publisher may have blocked on the gate), bind the shared manifest
     /// provider, then read the journaled replay and verified head to decide
@@ -1417,6 +1661,7 @@ impl RetainedCodeGraphRuntimeV1 {
         prepared: &PreparedSealedPublicationV1,
         probe: &GraphPublicationProbeV1,
         context: &GraphPublicationOperationContextV1<'_>,
+        staging_release: &mut Option<GraphProjectionIdentityV1>,
     ) -> std::result::Result<VerifiedGraphSnapshot, GraphDbError> {
         // A request cancelled or expired before publication starts must
         // answer its typed interruption before touching the publication
@@ -1440,15 +1685,20 @@ impl RetainedCodeGraphRuntimeV1 {
             deadline: prepared.deadline_at,
         };
         let verify_durable_source = || {
-            let replay_pool_lock = lock_project_graph_replay_pool(
+            let check = || match probe.interruption() {
+                Some(RuntimeInterruptionV1::Cancelled) => Err(GraphDbError::Cancelled),
+                Some(RuntimeInterruptionV1::DeadlineExceeded) => {
+                    Err(GraphDbError::DeadlineExceeded)
+                }
+                None => Ok(()),
+            };
+            // Stable identity under the replay-pool lock, then release so
+            // retention/replay cleanup is not blocked by seal hashing.
+            let proof = prove_stable_sealed_source(
+                &self.generations_root,
                 &self.replay_root,
-                &|| match probe.interruption() {
-                    Some(RuntimeInterruptionV1::Cancelled) => Err(GraphDbError::Cancelled),
-                    Some(RuntimeInterruptionV1::DeadlineExceeded) => {
-                        Err(GraphDbError::DeadlineExceeded)
-                    }
-                    None => Ok(()),
-                },
+                &self.sealed_state_digest,
+                &check,
             )?;
             hotpath::measure_block!(
                 "daemon.session_registry.publish_snapshot.verify_source",
@@ -1456,16 +1706,10 @@ impl RetainedCodeGraphRuntimeV1 {
                     &self.generations_root,
                     &self.replay_root,
                     &self.sealed_state_digest,
-                    &|| match probe.interruption() {
-                        Some(RuntimeInterruptionV1::Cancelled) => Err(GraphDbError::Cancelled),
-                        Some(RuntimeInterruptionV1::DeadlineExceeded) => {
-                            Err(GraphDbError::DeadlineExceeded)
-                        }
-                        None => Ok(()),
-                    },
+                    &check,
                 )
             )?;
-            Ok::<_, GraphDbError>(replay_pool_lock)
+            revalidate_stable_sealed_source(&proof, &self.replay_root, &check)
         };
         let mut storage = self
             .project_database
@@ -1533,11 +1777,10 @@ impl RetainedCodeGraphRuntimeV1 {
                 }
                 None => Ok(()),
             };
-            // One corpus-sized build at a time across the shard: the decoded
-            // generation, the projection manifest, the staging pages, and
-            // the sealed-store copy of concurrent scope publications
-            // otherwise overlap into an unbounded replay working set.
-            let _build = self.publication_locks.claim_build(&interruption)?;
+            // The project-shard build permit is already held by
+            // `publish_verified_snapshot` from projection through this
+            // publish, including predecessor completions. Claiming it again
+            // here would deadlock the non-reentrant mutex.
             let _flight = self.publication_locks.flight.claim(key, &interruption)?;
             // The already-built projection manifest rides along so first
             // publication does not re-read and re-project the sealed artifact
@@ -1664,7 +1907,10 @@ impl RetainedCodeGraphRuntimeV1 {
                 );
             }
             SealedPublicationClassificationV1::ResumeJournaled => {
-                let _replay_pool_lock = verify_durable_source()?;
+                let replay_pool_lock = verify_durable_source()?;
+                // Hashing already ran without the pool lock. Release before
+                // materialization so retention/replay cleanup can proceed.
+                drop(replay_pool_lock);
                 // Seal-time bundle: stage from the in-hand rows before the
                 // publish consumes them, commit only after it succeeds.
                 let bundle_identity = prepared.manifest.identity();
@@ -1680,6 +1926,7 @@ impl RetainedCodeGraphRuntimeV1 {
                 ) {
                     Ok(publication) => {
                         self.commit_sealed_read_bundle(staged_bundle, &bundle_identity);
+                        *staging_release = Some(prepared.relational_projection.clone());
                         return Ok(publication.snapshot);
                     }
                     // Resuming this publication's own journaled replay
@@ -1859,6 +2106,7 @@ impl RetainedCodeGraphRuntimeV1 {
             ),
         )?;
         self.commit_sealed_read_bundle(staged_bundle, &bundle_identity);
+        *staging_release = Some(prepared.relational_projection.clone());
         Ok(publication.snapshot)
     }
 
@@ -2220,6 +2468,25 @@ impl DaemonSessionRuntimeRegistryV1 {
         }
     }
 
+    /// One lock cell per project publication shard, reused while any runtime
+    /// holds it and dropped once the last strong reference retires.
+    fn retain_project_publication_locks(
+        &self,
+        project_shard: &StoreShardIdV1,
+    ) -> Arc<CodeGraphShardPublicationLocksV1> {
+        let mut gates = self
+            .code_graph_publication_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gates.retain(|_, weak| weak.strong_count() > 0);
+        if let Some(existing) = gates.get(project_shard).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let cell = Arc::new(CodeGraphShardPublicationLocksV1::default());
+        gates.insert(project_shard.clone(), Arc::downgrade(&cell));
+        cell
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[hotpath::measure(
         label = "daemon.session_registry.retain_code_graph_runtime",
@@ -2313,13 +2580,7 @@ impl DaemonSessionRuntimeRegistryV1 {
         let replay_root = project_database
             .database_path()
             .with_extension("graph-replay");
-        let publication_locks = {
-            let mut gates = self
-                .code_graph_publication_gates
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Arc::clone(gates.entry(code_shard.clone()).or_default())
-        };
+        let publication_locks = self.retain_project_publication_locks(&project_shard);
         Ok(RetainedCodeGraphRuntimeV1 {
             graph_registry: self.graph_registry.clone(),
             graph_manifest_provider: Arc::clone(&self.graph_manifest_provider),
@@ -2336,6 +2597,103 @@ impl DaemonSessionRuntimeRegistryV1 {
             lifecycle_cancelled: Arc::clone(&self.graph_lifecycle_cancelled),
             publication_locks,
         })
+    }
+
+    pub async fn release_one_sealed_generation_staging_rows(
+        &self,
+        project_id: ProjectId,
+        project_database: &tracedecay_runtime_core::db::Database,
+        cancellation: &tracedecay_session_memory::context::CancellationToken,
+        after: Option<GraphProjectionIdentityV1>,
+    ) -> std::result::Result<Option<GraphProjectionIdentityV1>, GraphDbError> {
+        let project_shard = StoreShardIdV1::project(
+            self.identity.brain_id().clone(),
+            self.identity.profile_id().clone(),
+            project_id,
+        );
+        self.ensure_code_graph_shard_attached(&project_shard).await;
+        let authority = self
+            .registry
+            .retain_graph_store(StoreRuntimeKey::new(
+                project_shard.clone(),
+                self.incarnation,
+            ))
+            .await
+            .map_err(|error| GraphDbError::unavailable(format!("{error:?}")))?;
+        let bound_shard = authority.binding().shard_id.clone();
+        if bound_shard != project_shard {
+            self.ensure_code_graph_shard_attached(&bound_shard).await;
+        }
+        let authority_lease: Arc<dyn RetainedGraphStoreLeaseV1> = authority;
+        let mut storage = project_database
+            .graph_publication_storage()
+            .map_err(|error| GraphDbError::unavailable(error.to_string()))?;
+        let graph_registry = self.graph_registry.clone();
+        let graph_lifecycle_cancelled = Arc::clone(&self.graph_lifecycle_cancelled);
+        let cancellation = cancellation.clone();
+        tokio::task::spawn_blocking(move || {
+            let deadline_at = Instant::now() + GRAPH_OPERATION_DEADLINE;
+            let request_cancellation: Arc<dyn GraphCancellation> =
+                Arc::new(MaintenanceGraphCancellationV1(cancellation));
+            let cancellation_identity = RuntimeCancellationIdentityV1 {
+                cancellation_id: RuntimeCancellationIdV1::new("graph-staging-release-sweep")
+                    .map_err(|error| GraphDbError::invalid(error.to_string()))?,
+                generation: 1,
+            };
+            let deadline_identity = RuntimeDeadlineV1 {
+                deadline_id: RuntimeDeadlineIdV1::new("graph-staging-release-sweep-deadline")
+                    .map_err(|error| GraphDbError::invalid(error.to_string()))?,
+            };
+            let probe = GraphPublicationProbeV1 {
+                request_cancellation: Arc::clone(&request_cancellation),
+                lifecycle_cancellation: graph_lifecycle_cancellation(
+                    &graph_lifecycle_cancelled,
+                    None,
+                ),
+                deadline_at,
+                cancellation: cancellation_identity.clone(),
+                deadline: deadline_identity.clone(),
+                commit_started: AtomicBool::new(false),
+                deadline_warned: AtomicBool::new(false),
+            };
+            let control = RuntimeRequestControlV1 {
+                requested_at: tracedecay_application::clock::now_micros(),
+                deadline: deadline_identity,
+                cancellation: cancellation_identity,
+            };
+            let context = GraphPublicationOperationContextV1::new(&control, &probe)
+                .map_err(|error| GraphDbError::invalid(error.to_string()))?;
+            let request = GraphPublicationProjectionPageRequestV1::new(bound_shard, after, 1)
+                .map_err(|error| GraphDbError::invalid(error.to_string()))?;
+            let page = storage
+                .projection_page(&request, &context)
+                .map_err(map_publication_error)?;
+            let Some(projection) = page.projections.into_iter().next() else {
+                return Ok(None);
+            };
+            let registration = GraphDbRegistration {
+                authority_lease,
+                cancellation: request_cancellation,
+                lifecycle_cancellation: Arc::new(AtomicGraphCancellationV1::new(Arc::clone(
+                    &graph_lifecycle_cancelled,
+                ))),
+                deadline: deadline_at,
+            };
+            let outcome = graph_registry.release_sealed_generation_staging_rows(
+                registration,
+                &mut storage,
+                &context,
+                &projection,
+            )?;
+            observe_sealed_staging_release("sweep", &projection, outcome);
+            Ok(Some(projection))
+        })
+        .await
+        .map_err(|error| {
+            GraphDbError::unavailable(format!(
+                "graph staging release sweep blocking task failed: {error}"
+            ))
+        })?
     }
 
     #[hotpath::measure(
@@ -2467,34 +2825,17 @@ impl DaemonSessionRuntimeRegistryV1 {
                     ))),
                     deadline: deadline_at,
                 };
-                match graph_registry.retire_one_code_generation_replay(
+                let outcome = graph_registry.retire_one_code_generation_replay(
                     registration,
                     &mut storage,
                     &context,
                     &generation,
                     &sealed_digest,
-                )? {
-                    GraphReplayCollectionOutcome::Retired(source) => {
-                        let tracedecay_graph_db::GraphGenerationReplaySource::SealedCodeGeneration(
-                            source,
-                        ) = *source
-                        else {
-                            return Err(GraphDbError::Corrupt {
-                                message:
-                                    "code generation retirement selected an inline graph replay"
-                                        .to_owned(),
-                            });
-                        };
-                        if source.generation != generation
-                            || source.sealed_state_digest != sealed_digest
-                        {
-                            return Err(GraphDbError::conflict(
-                                "code_graph.reconcile_deleted_code_generation_graph_replays",
-                            ));
-                        }
-                    }
-                    GraphReplayCollectionOutcome::Retained => return Ok(false),
-                    GraphReplayCollectionOutcome::Absent => {
+                )?;
+                match graph_replay_reconcile_disposition(outcome, &generation, &sealed_digest)? {
+                    GraphReplayReconcileDisposition::Retired => {}
+                    GraphReplayReconcileDisposition::Retained => return Ok(false),
+                    GraphReplayReconcileDisposition::Absent => {
                         staged_unlink =
                             stage_project_graph_replay_unlink(&replay_root, &sealed_digest)?;
                         break;
@@ -2791,7 +3132,10 @@ impl Drop for DaemonSessionRuntimeRegistryV1 {
 
 #[cfg(test)]
 mod sealed_projection_deadline_tests {
-    use super::{GRAPH_BACKGROUND_OPERATION_BUDGET, sealed_projection_deadline};
+    use super::{
+        GRAPH_BACKGROUND_OPERATION_BUDGET, GraphReplayReconcileDisposition,
+        graph_replay_reconcile_disposition, sealed_projection_deadline,
+    };
 
     #[test]
     fn sealed_projection_has_no_wall_clock_bail_out() {
@@ -2804,5 +3148,27 @@ mod sealed_projection_deadline_tests {
             GRAPH_BACKGROUND_OPERATION_BUDGET
         );
         assert!(GRAPH_BACKGROUND_OPERATION_BUDGET >= std::time::Duration::from_hours(24));
+    }
+
+    #[test]
+    fn retention_pending_keeps_graph_replay_release_queued() {
+        let generation =
+            tracedecay_domain::CodeGenerationId::new("code-generation.retention-pending")
+                .expect("code generation");
+        let digest = tracedecay_graph_db::SealedGraphStateDigest::try_from(format!(
+            "sha256:{}",
+            "a".repeat(64)
+        ))
+        .expect("sealed digest");
+
+        assert_eq!(
+            graph_replay_reconcile_disposition(
+                tracedecay_graph_db::GraphReplayCollectionOutcome::RetentionPending,
+                &generation,
+                &digest,
+            )
+            .expect("retention disposition"),
+            GraphReplayReconcileDisposition::Retained
+        );
     }
 }

@@ -41,6 +41,7 @@ fn observation_envelope(
         .map_err(|error| storage(PERSIST_OPERATION, error))
 }
 
+#[hotpath::measure(future = true, label = "session_temporal.projection.record_count")]
 pub async fn session_temporal_projection_record_count(
     conn: &impl crate::handle::SessionTemporalQuery,
     session_id: &SessionId,
@@ -266,6 +267,7 @@ async fn canonical_occurrence_projection(
     })
 }
 
+#[hotpath::measure(future = true, label = "session_temporal.persist.occurrences")]
 pub(super) async fn persist_occurrences(
     conn: &impl crate::handle::SessionTemporalExec,
     batch: &SessionTemporalProjectionBatchV1,
@@ -791,6 +793,7 @@ pub(super) async fn require_exact_occurrence(
     Ok(())
 }
 
+#[hotpath::measure(future = true, label = "session_temporal.projection.validate_copy")]
 pub(super) async fn validate_copy(
     conn: &impl crate::handle::SessionTemporalExec,
     batch: &SessionTemporalProjectionBatchV1,
@@ -1005,6 +1008,7 @@ pub(super) async fn validate_copy_proof(
     Ok(())
 }
 
+#[hotpath::measure(future = true, label = "session_temporal.persist.assertion")]
 pub(super) async fn persist_assertion(
     conn: &impl crate::handle::SessionTemporalExec,
     batch: &SessionTemporalProjectionBatchV1,

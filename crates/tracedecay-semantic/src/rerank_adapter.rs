@@ -39,6 +39,7 @@ const CODE_SYMBOL_ANCHOR_PREFIX: &str = "code-symbol:";
 pub enum RerankArtifactAdmissionErrorV1 {
     IncompatiblePins,
     IncompatibleArtifact,
+    Unavailable,
 }
 
 #[derive(Clone)]
@@ -81,6 +82,13 @@ impl AdmittedRerankArtifactV1 {
             resident_byte_ceiling: resources.max_resident_bytes,
         })
     }
+}
+
+pub(super) fn admit_reranker_artifact(
+    artifact: AdmittedArtifactV1,
+    pins: RerankCompatibilityPinsV1,
+) -> Result<(), RerankArtifactAdmissionErrorV1> {
+    AdmittedRerankArtifactV1::admit(artifact, pins).map(drop)
 }
 
 pub fn validate_reranker_manifest_pins(
@@ -131,20 +139,36 @@ pub fn validate_reranker_manifest_pins(
 /// of waiting or opening an unbounded second model.
 pub struct FastEmbedRerankExecutorV1 {
     authority: Arc<AdmittedRerankArtifactV1>,
-    session: Mutex<Option<FastEmbedRerankSessionV1>>,
+    session: Mutex<FastEmbedRerankSessionV1>,
 }
 
 impl FastEmbedRerankExecutorV1 {
-    fn new(authority: Arc<AdmittedRerankArtifactV1>) -> Self {
-        Self {
+    fn new(
+        authority: Arc<AdmittedRerankArtifactV1>,
+    ) -> Result<Self, RerankArtifactAdmissionErrorV1> {
+        let session = hotpath::measure_block!("semantic.model.load", {
+            open_session(&authority).inspect_err(|error| {
+                crate::hotpath_observe::record_rerank_error(error);
+            })
+        })
+        .map_err(|_| RerankArtifactAdmissionErrorV1::Unavailable)?;
+        Ok(Self {
             authority,
-            session: Mutex::new(None),
-        }
+            session: Mutex::new(session),
+        })
     }
 
     pub fn compatibility(&self) -> &RerankCompatibilityPinsV1 {
         &self.authority.pins
     }
+}
+
+pub(super) fn warm_reranker_executor(
+    artifact: AdmittedArtifactV1,
+    pins: RerankCompatibilityPinsV1,
+) -> Result<Arc<FastEmbedRerankExecutorV1>, RerankArtifactAdmissionErrorV1> {
+    let authority = Arc::new(AdmittedRerankArtifactV1::admit(artifact, pins)?);
+    FastEmbedRerankExecutorV1::new(authority).map(Arc::new)
 }
 
 #[cfg(feature = "semantic-fastembed")]
@@ -195,17 +219,8 @@ impl DeterministicLocalRerankExecutorV1 for FastEmbedRerankExecutorV1 {
             }
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
         };
-        if session.is_none() {
-            *session = Some(hotpath::measure_block!("semantic.model.load", {
-                open_session(&self.authority).inspect_err(|error| {
-                    crate::hotpath_observe::record_rerank_error(error);
-                })?
-            }));
-        }
         run_session(
-            session.as_mut().ok_or(LocalRerankFailureV1::Unavailable(
-                SanitizedStageFailure::Internal,
-            ))?,
+            &mut session,
             query,
             &documents,
             inputs,
@@ -503,15 +518,21 @@ pub struct ProductionCodeRerankAuthorityV1 {
 }
 
 impl ProductionCodeRerankAuthorityV1 {
+    /// Publish only after one model session is resident. A caller that receives
+    /// this authority never pays model activation on its first rerank request.
     pub fn from_admitted(
         artifact: AdmittedArtifactV1,
         pins: RerankCompatibilityPinsV1,
     ) -> Result<Self, RerankArtifactAdmissionErrorV1> {
-        let authority = Arc::new(AdmittedRerankArtifactV1::admit(artifact, pins.clone())?);
-        Ok(Self {
-            pins,
-            executor: Arc::new(FastEmbedRerankExecutorV1::new(authority)),
-        })
+        let executor = warm_reranker_executor(artifact, pins.clone())?;
+        Ok(Self::from_warmed(pins, executor))
+    }
+
+    pub(super) fn from_warmed(
+        pins: RerankCompatibilityPinsV1,
+        executor: Arc<FastEmbedRerankExecutorV1>,
+    ) -> Self {
+        Self { pins, executor }
     }
 
     #[cfg(test)]
@@ -528,6 +549,11 @@ impl ProductionCodeRerankAuthorityV1 {
 
     pub fn executor(&self) -> &dyn AdmittedNativeRerankExecutorV1 {
         self.executor.as_ref()
+    }
+
+    #[cfg(all(test, feature = "semantic-fastembed"))]
+    pub(crate) fn executor_handle(&self) -> &Arc<dyn MountedRerankExecutorV1> {
+        &self.executor
     }
 
     pub fn execute(

@@ -367,10 +367,39 @@ impl McpServer {
         }
     }
 
-    #[hotpath::measure(label = "mcp.server.request", future = true)]
+    /// Dispatches a request parsed off the legacy line-oriented JSON-RPC
+    /// transport.
+    ///
+    /// A thin adapter onto [`Self::dispatch_envelope`]: the raw params are
+    /// borrowed from the parsed request exactly as before, so this transport's
+    /// behavior and wire bytes are unchanged by the typed envelope.
+    #[hotpath::skip]
     pub(crate) async fn handle_request_for_connection(
         &self,
         request: &JsonRpcRequest,
+        timings_enabled: bool,
+        connection: &mut ConnectionRouteState,
+        pre_cancelled: bool,
+    ) -> Option<JsonRpcResponse> {
+        Box::pin(self.dispatch_envelope(
+            McpDispatchRequest::from_legacy(request),
+            timings_enabled,
+            connection,
+            pre_cancelled,
+        ))
+        .await
+    }
+
+    /// The single dispatch authority behind every MCP transport.
+    ///
+    /// Reads the request only through [`McpDispatchRequest`] accessors, so a
+    /// typed `rmcp` request and a raw JSON-RPC request take the same path
+    /// through the same handler catalog without either one being converted
+    /// into the other's representation first.
+    #[hotpath::measure(label = "mcp.server.request", future = true)]
+    pub(crate) async fn dispatch_envelope(
+        &self,
+        request: McpDispatchRequest<'_>,
         timings_enabled: bool,
         connection: &mut ConnectionRouteState,
         pre_cancelled: bool,
@@ -380,9 +409,13 @@ impl McpServer {
         // connection state after observing the returned response.
         connection.clear_selected_response_lease();
         connection.clear_selected_request_server();
-        if matches!(classify_mcp_method(&request.method), McpMethod::HookEvent) {
+        let method = request.method_class();
+        // Borrowed from the transport's request, not the envelope, so it
+        // survives the envelope move into `tools/call` preparation below.
+        let method_name = request.method();
+        if matches!(method, McpMethod::HookEvent) {
             Box::pin(self.handle_hook_event_notification(
-                request.params.as_ref(),
+                request.raw_notification_params(),
                 &mut connection.route_cache,
             ))
             .await;
@@ -391,15 +424,13 @@ impl McpServer {
             // so it cannot close the socket while daemon profile/project binding
             // is still racing peer disconnect, before the private route is stored.
             return request
-                .id
-                .clone()
+                .cloned_id()
                 .map(|id| JsonRpcResponse::success(id, json!({ "processed": true })));
         }
-        if matches!(classify_mcp_method(&request.method), McpMethod::Cancelled) {
-            self.record_request_accounting(&request.method, false);
+        if matches!(method, McpMethod::Cancelled) {
+            self.record_request_accounting(method_name, false);
             if let Some(cancelled_id) = request
-                .params
-                .as_ref()
+                .raw_notification_params()
                 .and_then(|params| params.get("requestId"))
             {
                 let _ = self.cancel_application_surface_request(
@@ -413,29 +444,27 @@ impl McpServer {
             .hook_project_routes
             .refresh_into(&mut connection.route_cache)
         {
-            self.record_request_accounting(&request.method, true);
+            self.record_request_accounting(method_name, true);
             return request
-                .id
-                .clone()
-                .map(|id| tool_error_response(id, &request.method, &error));
+                .cloned_id()
+                .map(|id| tool_error_response(id, method_name, &error));
         }
-        let method = classify_mcp_method(&request.method);
         if matches!(&method, McpMethod::Initialize) {
             connection
                 .observe_initialize(
-                    request.params.as_ref(),
+                    request.initialize_roots_params(),
                     self.registry_db.as_deref(),
                     self.retained_project_server_resolver.clone(),
                 )
                 .await;
         }
-        let Some(id) = request.id.clone() else {
-            self.record_request_accounting(&request.method, false);
+        let Some(id) = request.cloned_id() else {
+            self.record_request_accounting(method_name, false);
             return None;
         };
 
         let result = match method {
-            McpMethod::Initialize => Some(self.handle_initialize(id, request.params.as_ref())),
+            McpMethod::Initialize => Some(self.handle_initialize(id, request.client_info_name())),
             // Some clients send the initialized notification with an id (or
             // via the alternate method name); both stay compatibility no-ops.
             // Hook events were consumed by the early notification dispatch
@@ -445,7 +474,7 @@ impl McpServer {
             McpMethod::ToolsCall => Some(
                 Box::pin(self.handle_tools_call(
                     id,
-                    request.params.as_ref(),
+                    request.into_tool_call(),
                     timings_enabled,
                     connection,
                     pre_cancelled,
@@ -453,15 +482,14 @@ impl McpServer {
                 .await,
             ),
             McpMethod::ResourcesList => Some(Self::handle_resources_list(id)),
-            McpMethod::ResourcesRead => Some(
-                self.handle_resources_read(id, request.params.as_ref())
-                    .await,
-            ),
+            McpMethod::ResourcesRead => {
+                Some(self.handle_resources_read(id, request.resource_uri()).await)
+            }
             McpMethod::TrivialAck => Some(JsonRpcResponse::success(id, json!({}))),
             McpMethod::Unknown => Some(JsonRpcResponse::error(
                 id,
                 ErrorCode::MethodNotFound,
-                format!("method not found: {}", request.method),
+                format!("method not found: {method_name}"),
             )),
         };
 
@@ -469,9 +497,9 @@ impl McpServer {
             .as_ref()
             .is_some_and(|response| response.error.is_some());
         if let Some(server) = connection.take_selected_request_server() {
-            server.record_request_accounting(&request.method, response_is_error);
+            server.record_request_accounting(method_name, response_is_error);
         } else {
-            self.record_request_accounting(&request.method, response_is_error);
+            self.record_request_accounting(method_name, response_is_error);
         }
 
         result
@@ -486,7 +514,7 @@ impl McpServer {
         let Some(event) = hook_events::parse_hook_event(params) else {
             self.record_request_accounting("tracedecay/hookEvent", false);
             let outcome = HostAdmissionOutcome::degraded("malformed_event");
-            Self::report_host_admission_outcome(outcome);
+            Self::report_host_admission_outcome(&outcome);
             return outcome;
         };
         // Resolve the hook's exact project before opening a graph, publishing
@@ -501,7 +529,7 @@ impl McpServer {
                 let outcome = HostAdmissionOutcome::retained_unavailable(
                     "project_registry_route_unavailable",
                 );
-                Self::report_host_admission_outcome(outcome);
+                Self::report_host_admission_outcome(&outcome);
                 return outcome;
             }
         };
@@ -519,7 +547,7 @@ impl McpServer {
                 self.record_request_accounting("tracedecay/hookEvent", false);
                 let outcome =
                     HostAdmissionOutcome::retained_unavailable("project_route_unavailable");
-                Self::report_host_admission_outcome(outcome);
+                Self::report_host_admission_outcome(&outcome);
                 return outcome;
             }
         };
@@ -576,7 +604,7 @@ impl McpServer {
         let plan = hook_events::plan_hook_event(&event, &root, current_branch.as_deref());
         let Ok(payload) = hook_events::encode_durable_hook_event_plan(&plan) else {
             let outcome = HostAdmissionOutcome::degraded("invalid_host_event_plan");
-            Self::report_host_admission_outcome(outcome);
+            Self::report_host_admission_outcome(&outcome);
             return outcome;
         };
         let admission_source = event.admission_source();
@@ -589,7 +617,7 @@ impl McpServer {
         let admitted = match admitted {
             Ok(admitted) => admitted,
             Err(outcome) => {
-                Self::report_host_admission_outcome(outcome);
+                Self::report_host_admission_outcome(&outcome);
                 return outcome;
             }
         };
@@ -616,7 +644,7 @@ impl McpServer {
             );
             dispatch_server.record_hook_span_observation(&event, &hook_route);
         }
-        Self::report_host_admission_outcome(outcome);
+        Self::report_host_admission_outcome(&outcome);
         outcome
     }
 
@@ -626,14 +654,13 @@ impl McpServer {
     /// call recording the same opaque `provider="mcp"`. Only the short
     /// name field is retained — never the full `clientInfo` payload.
     #[hotpath::measure(label = "mcp.server.initialize")]
-    pub(crate) fn handle_initialize(&self, id: Value, params: Option<&Value>) -> JsonRpcResponse {
-        let client_name = params
-            .and_then(|p| p.get("clientInfo"))
-            .and_then(|ci| ci.get("name"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        if client_name.is_some() {
-            *recover_lock(&self.client_name) = client_name;
+    pub(crate) fn handle_initialize(
+        &self,
+        id: Value,
+        client_name: Option<&str>,
+    ) -> JsonRpcResponse {
+        if let Some(client_name) = client_name {
+            *recover_lock(&self.client_name) = Some(client_name.to_owned());
         }
         match initialize_result(SERVER_INSTRUCTIONS) {
             Ok(result) => JsonRpcResponse::success(id, result),
@@ -674,7 +701,8 @@ impl McpServer {
         };
         match hotpath::measure_block!(
             "mcp.server.tools_list.compose",
-            crate::mcp::tools::get_catalog_filtered_tool_definitions_with_warming_budget(
+            crate::mcp::tools::catalog_discovery_tools_list_payload(
+                None,
                 budget,
                 &profile_id,
                 &authority,
@@ -682,13 +710,7 @@ impl McpServer {
                 ToolRegistryMode::HostAvailable,
             )
         ) {
-            Ok(tools) => {
-                let payload = hotpath::measure_block!(
-                    "mcp.server.tools_list.compose_payload",
-                    json!({ "tools": tools })
-                );
-                JsonRpcResponse::success(id, payload)
-            }
+            Ok(payload) => JsonRpcResponse::success(id, payload),
             Err(error) => JsonRpcResponse::error(
                 id,
                 ErrorCode::InternalError,
@@ -706,10 +728,8 @@ impl McpServer {
     pub(crate) async fn handle_resources_read(
         &self,
         id: Value,
-        params: Option<&Value>,
+        uri: Option<&str>,
     ) -> JsonRpcResponse {
-        let uri = params.and_then(|p| p.get("uri")).and_then(|v| v.as_str());
-
         let Some(uri) = uri else {
             return JsonRpcResponse::error(
                 id,
@@ -829,41 +849,59 @@ impl McpServer {
     }
 
     #[allow(clippy::result_large_err)]
+    /// Normalizes either transport's `tools/call` params into one prepared
+    /// call.
+    ///
+    /// The typed arm moves the tool name and the argument map straight out of
+    /// the `rmcp` DTO: `arguments` is already a JSON object, so it becomes the
+    /// argument `Value` without being re-encoded, and the caller deadline is
+    /// read from the typed `_meta` map through the same authority the raw arm
+    /// uses.
     fn prepare_tool_call(
         id: &Value,
-        params: Option<&Value>,
+        params: ToolCallParams<'_>,
     ) -> std::result::Result<PreparedToolCall, JsonRpcResponse> {
-        let Some(params) = params else {
-            return Err(JsonRpcResponse::error(
-                id.clone(),
-                ErrorCode::InvalidParams,
-                "missing params for tools/call".to_string(),
-            ));
+        let invalid_params = |message: &str| {
+            JsonRpcResponse::error(id.clone(), ErrorCode::InvalidParams, message.to_owned())
         };
-
-        let Some(tool_name) = params.get("name").and_then(|v| v.as_str()) else {
-            return Err(JsonRpcResponse::error(
-                id.clone(),
-                ErrorCode::InvalidParams,
-                "missing 'name' in tools/call params".to_string(),
-            ));
+        let (tool_name, mut arguments, caller_deadline) = match params {
+            ToolCallParams::Raw(None) => {
+                return Err(invalid_params("missing params for tools/call"));
+            }
+            ToolCallParams::Raw(Some(params)) => {
+                let Some(tool_name) = params.get("name").and_then(Value::as_str) else {
+                    return Err(invalid_params("missing 'name' in tools/call params"));
+                };
+                (
+                    tool_name.to_owned(),
+                    params.get("arguments").cloned().unwrap_or(json!({})),
+                    tracedecay_mcp::caller_tool_call_deadline(Some(params)),
+                )
+            }
+            ToolCallParams::Typed(::rmcp::model::CallToolRequestParams {
+                meta,
+                name,
+                arguments,
+                ..
+            }) => (
+                name.into_owned(),
+                arguments.map_or_else(|| json!({}), Value::Object),
+                tracedecay_mcp::caller_tool_call_deadline_from_meta(
+                    meta.as_ref()
+                        .map(|meta| -> &serde_json::Map<String, Value> { meta }),
+                ),
+            ),
         };
-
-        let mut arguments = params.get("arguments").cloned().unwrap_or(json!({}));
         if crate::mcp::project_route::protect_tool_structural_ids(&mut arguments).is_err() {
-            return Err(JsonRpcResponse::error(
-                id.clone(),
-                ErrorCode::InvalidParams,
-                "invalid structural identifier".to_string(),
-            ));
+            return Err(invalid_params("invalid structural identifier"));
         }
 
         Ok(PreparedToolCall {
-            tool_name: tool_name.to_string(),
-            analytics_arguments: analytics_arguments_snapshot(tool_name, &arguments),
+            analytics_arguments: analytics_arguments_snapshot(&tool_name, &arguments),
             analytics_session_id: mcp_analytics_session_id(&arguments),
+            tool_name,
             arguments,
-            caller_deadline: tracedecay_mcp::caller_tool_call_deadline(Some(params)),
+            caller_deadline,
         })
     }
 
@@ -883,9 +921,14 @@ impl McpServer {
         // a full project walk; on very large indexes (especially when
         // node_modules was intentionally included) that turns diagnostics and
         // search into sync operations.
-        if !project_reader_preselected && needs_lazy_sync_before_dispatch(tool_name) {
+        let skip_graph_freshness = crate::mcp::tools::binding::tool_branch_sensitivity(tool_name)
+            == crate::mcp::tools::binding::BranchSensitivity::Independent;
+        if !skip_graph_freshness
+            && !project_reader_preselected
+            && needs_lazy_sync_before_dispatch(tool_name)
+        {
             self.maybe_sync_if_stale().await;
-        } else if !project_reader_preselected {
+        } else if !skip_graph_freshness && !project_reader_preselected {
             // D4: sync-on-read (never blocking). Read tools serve the current
             // answer IMMEDIATELY and, when the read-refresh cooldown has
             // elapsed, kick a single-flighted background refresh so the *next*
@@ -1004,7 +1047,7 @@ impl McpServer {
                     }
                     std::fs::metadata(project_root.join(relative))
                         .ok()
-                        .filter(|metadata| metadata.is_file())
+                        .filter(std::fs::Metadata::is_file)
                         .map(|metadata| metadata.len() / 4)
                 })
                 .fold(0_u64, u64::saturating_add)
@@ -1019,7 +1062,7 @@ impl McpServer {
 
     #[hotpath::skip]
     async fn apply_token_accounting(
-        &self,
+        self: &Arc<Self>,
         cg: &TraceDecay,
         tool_name: &str,
         result: &mut ToolResult,
@@ -1040,7 +1083,7 @@ impl McpServer {
             net_saved_tokens,
             raw_file_tokens,
         );
-        self.maybe_flush_worldwide().await;
+        self.maybe_flush_worldwide();
 
         // Append per-call token savings to the response content.
         if raw_file_tokens > 0
@@ -1144,7 +1187,7 @@ impl McpServer {
     #[allow(clippy::too_many_arguments)]
     #[hotpath::measure(label = "mcp.server.tools_call.complete.accounting", future = true)]
     async fn record_success_accounting(
-        &self,
+        self: &Arc<Self>,
         cg: &TraceDecay,
         accounting_project_root: &Path,
         tool_name: &str,
@@ -1224,7 +1267,7 @@ impl McpServer {
 
     #[hotpath::measure(label = "mcp.server.tools_call.complete", future = true)]
     async fn complete_tool_call(
-        &self,
+        self: &Arc<Self>,
         id: Value,
         tool_name: String,
         analytics_arguments: Value,
@@ -1435,7 +1478,7 @@ impl McpServer {
     pub(crate) async fn handle_tools_call(
         &self,
         id: Value,
-        params: Option<&Value>,
+        params: ToolCallParams<'_>,
         timings_enabled: bool,
         connection: &mut ConnectionRouteState,
         pre_cancelled: bool,
@@ -1576,33 +1619,42 @@ impl McpServer {
         let worker_server = dispatch_server.dispatch_authority.server();
         let worker_tool_name = tool_name.clone();
         let worker_control = control.clone();
-        let retained = control
-            .run_retained(dispatch_server.dispatch_authority.registry(), async move {
-                let server = worker_server.upgrade().ok_or_else(|| {
-                    TraceDecayError::project_route(
-                        "tool_dispatch_shutdown",
-                        true,
-                        "MCP server was released before retained dispatch admission",
-                    )
-                })?;
-                Ok(server
-                    .dispatch_routed_tool_call(
-                        &worker_tool_name,
-                        routed,
-                        timings_enabled,
-                        !fast_unavailable,
-                        application_request_id,
-                        worker_control,
-                    )
-                    .await)
-            })
-            .await;
+        let worker = async move {
+            let server = worker_server.upgrade().ok_or_else(|| {
+                TraceDecayError::project_route(
+                    "tool_dispatch_shutdown",
+                    true,
+                    "MCP server was released before retained dispatch admission",
+                )
+            })?;
+            Ok(server
+                .dispatch_routed_tool_call(
+                    &worker_tool_name,
+                    routed,
+                    timings_enabled,
+                    !fast_unavailable,
+                    application_request_id,
+                    worker_control,
+                )
+                .await)
+        };
+        let dispatch_outcome = if connection.connection_owns_dispatch()
+            && control.permits_connection_owned_execution()
+        {
+            control
+                .run_connection_owned(dispatch_server.dispatch_authority.registry(), worker)
+                .await
+        } else {
+            control
+                .run_retained(dispatch_server.dispatch_authority.registry(), worker)
+                .await
+        };
         tracing::trace!(
             tool_name,
-            settlement = ?retained.settlement(),
+            settlement = ?dispatch_outcome.settlement(),
             "MCP tool dispatch settled"
         );
-        let dispatch = match retained.result {
+        let dispatch = match dispatch_outcome.result {
             Ok(dispatch) => dispatch,
             Err(failure) => {
                 connection.clear_selected_response_lease();
@@ -1641,6 +1693,109 @@ impl McpServer {
             connection.clear_selected_response_lease();
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tool_call_preparation_tests {
+    use super::*;
+    use ::rmcp::model::CallToolRequestParams;
+
+    fn arguments_object() -> serde_json::Map<String, Value> {
+        json!({"query": "typed dispatch", "limit": 5})
+            .as_object()
+            .cloned()
+            .expect("object arguments")
+    }
+
+    /// The typed `rmcp` params and the equivalent raw JSON-RPC params must
+    /// prepare byte-identical dispatch inputs. This is the contract that lets
+    /// the typed transport skip the JSON bridge without forking the catalog.
+    #[test]
+    fn typed_and_raw_tool_call_params_prepare_identically() {
+        let deadline_meta = tracedecay_mcp::tool_call_deadline_meta(tracedecay_domain::UtcMicros(
+            1_765_000_000_000_000,
+        ));
+        let raw_params = json!({
+            "name": "tracedecay_search",
+            "arguments": arguments_object(),
+            "_meta": deadline_meta.clone(),
+        });
+        let mut typed_params =
+            CallToolRequestParams::new("tracedecay_search").with_arguments(arguments_object());
+        typed_params.meta = Some(::rmcp::model::RequestMetaObject::from(
+            ::rmcp::model::MetaObject(
+                deadline_meta
+                    .as_object()
+                    .cloned()
+                    .expect("deadline meta object"),
+            ),
+        ));
+
+        let id = json!(7);
+        let raw = McpServer::prepare_tool_call(&id, ToolCallParams::Raw(Some(&raw_params)))
+            .expect("raw tools/call prepares");
+        let typed = McpServer::prepare_tool_call(&id, ToolCallParams::Typed(typed_params))
+            .expect("typed tools/call prepares");
+
+        assert_eq!(raw.tool_name, typed.tool_name);
+        assert_eq!(raw.arguments, typed.arguments);
+        assert_eq!(raw.analytics_arguments, typed.analytics_arguments);
+        assert_eq!(raw.analytics_session_id, typed.analytics_session_id);
+        let raw_deadline = raw
+            .caller_deadline
+            .as_ref()
+            .map(|deadline| deadline.expires_at);
+        let typed_deadline = typed
+            .caller_deadline
+            .as_ref()
+            .map(|deadline| deadline.expires_at);
+        assert_eq!(
+            raw_deadline, typed_deadline,
+            "the caller deadline must be read from the typed `_meta` map too",
+        );
+        assert!(typed_deadline.is_some());
+    }
+
+    #[test]
+    fn a_typed_tool_call_without_arguments_matches_the_raw_empty_object() {
+        let id = json!(1);
+        let raw_params = json!({"name": "tracedecay_status"});
+        let raw = McpServer::prepare_tool_call(&id, ToolCallParams::Raw(Some(&raw_params)))
+            .expect("raw tools/call prepares");
+        let typed = McpServer::prepare_tool_call(
+            &id,
+            ToolCallParams::Typed(CallToolRequestParams::new("tracedecay_status")),
+        )
+        .expect("typed tools/call prepares");
+        assert_eq!(raw.arguments, json!({}));
+        assert_eq!(typed.arguments, json!({}));
+        assert!(raw.caller_deadline.is_none());
+        assert!(typed.caller_deadline.is_none());
+    }
+
+    #[test]
+    fn absent_tool_call_params_stay_an_invalid_params_refusal() {
+        let id = json!(3);
+        let Err(missing_params) = McpServer::prepare_tool_call(&id, ToolCallParams::Raw(None))
+        else {
+            panic!("absent params must refuse");
+        };
+        assert_eq!(
+            serde_json::to_string(&missing_params).expect("serialize refusal"),
+            r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"missing params for tools/call"}}"#,
+        );
+
+        let no_name = json!({"arguments": {}});
+        let Err(missing_name) =
+            McpServer::prepare_tool_call(&id, ToolCallParams::Raw(Some(&no_name)))
+        else {
+            panic!("absent tool name must refuse");
+        };
+        assert_eq!(
+            serde_json::to_string(&missing_name).expect("serialize refusal"),
+            r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"missing 'name' in tools/call params"}}"#,
+        );
     }
 }
 

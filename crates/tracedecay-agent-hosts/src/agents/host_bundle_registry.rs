@@ -22,10 +22,14 @@ const FIRST_PARTY_COMPONENT_SCHEMA_VERSION: u16 = 1;
 /// Canonical hosts whose first-party component lifecycle can publish durable
 /// ownership receipts. Discovery-only and evidence-unadmitted hosts stay in
 /// `HostKindV1::ALL`, but never enter install/update/uninstall sweeps.
-pub const RECEIPT_BACKED_HOST_KINDS: [HostKindV1; 12] = [
+pub const RECEIPT_BACKED_HOST_KINDS: [HostKindV1; 16] = [
     HostKindV1::ClaudeCode,
     HostKindV1::CursorDesktop,
     HostKindV1::Codex,
+    HostKindV1::Devin,
+    HostKindV1::Zed,
+    HostKindV1::Antigravity,
+    HostKindV1::Vibe,
     HostKindV1::Hermes,
     HostKindV1::Kiro,
     HostKindV1::KimiCode,
@@ -109,6 +113,10 @@ pub fn unsupported_host_component_set_reason(
     match host {
         HostKindV1::ClaudeCode
         | HostKindV1::Codex
+        | HostKindV1::Devin
+        | HostKindV1::Zed
+        | HostKindV1::Antigravity
+        | HostKindV1::Vibe
         | HostKindV1::CursorDesktop
         | HostKindV1::Hermes
         | HostKindV1::Kiro
@@ -147,6 +155,13 @@ pub fn default_components(host: HostKindV1) -> Vec<HostBundleComponentV1> {
         HostKindV1::ClaudeCode | HostKindV1::Codex => vec![
             HostBundleComponentV1::Core,
             HostBundleComponentV1::ContextMcp,
+        ],
+        HostKindV1::Devin | HostKindV1::Zed | HostKindV1::Antigravity => {
+            vec![HostBundleComponentV1::ContextMcp]
+        }
+        HostKindV1::Vibe => vec![
+            HostBundleComponentV1::ContextMcp,
+            HostBundleComponentV1::Core,
         ],
         HostKindV1::CursorDesktop | HostKindV1::OpenCode => vec![
             HostBundleComponentV1::Core,
@@ -603,6 +618,50 @@ fn component_assets(
             vec![(
                 "context-mcp.json",
                 r#"{"host":"cline","registration":"../mcp.json","registrar":"tracedecay managed merge","route":"mcp","server":{"command":"__TRACEDECAY_BIN__","args":["serve"]}}"#,
+            )],
+        ),
+        // Devin owns the shared user configuration document directly.
+        // The component receipt owns this descriptor only; the activation
+        // adapter merges its server entry into `mcp_config.json`.
+        (HostKindV1::Devin, HostBundleComponentV1::ContextMcp) => (
+            ".config/devin/tracedecay",
+            vec![(
+                "context-mcp.json",
+                r#"{"host":"devin","registration":"../mcp_config.json","registrar":"tracedecay managed merge","route":"mcp","server":{"command":"__TRACEDECAY_BIN__","args":["serve"],"transport":"stdio"}}"#,
+            )],
+        ),
+        // Zed's JSONC settings file is host-owned. The catalog artifact is a
+        // descriptor; the activation adapter merges the exact
+        // `context_servers.tracedecay` entry and retains the byte snapshot.
+        (HostKindV1::Zed, HostBundleComponentV1::ContextMcp) => (
+            ".config/zed/tracedecay",
+            vec![(
+                "context-mcp.json",
+                r#"{"host":"zed","registration":"../settings.json","registrar":"tracedecay managed JSONC merge","route":"mcp","server":{"command":"__TRACEDECAY_BIN__","args":["serve"]}}"#,
+            )],
+        ),
+        // One Antigravity component owns both the IDE and CLI documents.
+        // The descriptor names both paths; activation publishes them under a
+        // shared rollback boundary before the receipt can become current.
+        (HostKindV1::Antigravity, HostBundleComponentV1::ContextMcp) => (
+            ".gemini/antigravity/tracedecay",
+            vec![(
+                "context-mcp.json",
+                r#"{"host":"antigravity","registrations":["../mcp_config.json","../../antigravity-cli/plugins/tracedecay.json"],"registrar":"tracedecay managed dual-document merge","route":"mcp","server":{"command":"__TRACEDECAY_BIN__","args":["serve"],"transport":"stdio"}}"#,
+            )],
+        ),
+        (HostKindV1::Vibe, HostBundleComponentV1::ContextMcp) => (
+            ".vibe/tracedecay",
+            vec![(
+                "context-mcp.json",
+                r#"{"host":"vibe","registration":"../config.toml","registrar":"tracedecay managed TOML merge","route":"mcp","server":{"name":"tracedecay","transport":"stdio","command":"__TRACEDECAY_BIN__","args":["serve"]}}"#,
+            )],
+        ),
+        (HostKindV1::Vibe, HostBundleComponentV1::Core) => (
+            ".vibe/tracedecay",
+            vec![(
+                "core.json",
+                r#"{"host":"vibe","registration":"../prompts/cli.md","registrar":"tracedecay managed prompt rules","route":"prompt"}"#,
             )],
         ),
         (HostKindV1::RooCode, HostBundleComponentV1::ContextMcp) => (

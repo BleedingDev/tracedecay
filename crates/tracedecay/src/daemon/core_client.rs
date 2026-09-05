@@ -17,13 +17,11 @@ use tracedecay_framing::{
     WIRE_RECORD_TOO_LARGE, is_wire_oversized_io_error, read_bounded_mcp_line,
 };
 
+pub(crate) use tracedecay_daemon_protocol::DAEMON_TOOL_LIVENESS_POLL_INTERVAL;
 pub use tracedecay_daemon_protocol::{
     DAEMON_CONNECT_DOWN, DAEMON_CONNECT_SATURATED, DAEMON_RESPONSE_STALLED,
     DAEMON_TOOL_RESPONSE_GRACE, DEFAULT_TOOL_REQUEST_DEADLINE, MAX_TOOL_REQUEST_DEADLINE,
     TOOL_REQUEST_DEADLINE_ENV, tool_request_deadline,
-};
-pub(crate) use tracedecay_daemon_protocol::{
-    DAEMON_TOOL_HEALTH_CONNECT_TIMEOUT, DAEMON_TOOL_LIVENESS_POLL_INTERVAL,
 };
 
 #[cfg(unix)]
@@ -47,7 +45,6 @@ use super::{
 /// outcome was already on the wire. The read bound must therefore outlive the
 /// request deadline; this is by how much. It bounds only a dead or wedged
 /// daemon, never the request.
-
 /// The local read bound for a request whose caller deadline is `request_deadline`.
 pub fn daemon_tool_response_bound(request_deadline: Instant) -> Result<Instant> {
     request_deadline
@@ -76,15 +73,35 @@ fn wire_request_deadline_micros(request_deadline: Instant) -> tracedecay_domain:
 
 /// How long daemon clients keep retrying a failed connect before giving up.
 ///
-/// `tracedecay update` restarts the daemon service (`systemctl --user restart`);
-/// between the old daemon unlinking its socket and the new one binding it,
-/// connects fail with `NotFound` or `ConnectionRefused`. Long-lived MCP
-/// sessions (Cursor's `tracedecay serve` stdio proxy) reconnect per request,
-/// so retrying inside this window lets a live session ride out a self-update
-/// instead of surfacing a hard JSON-RPC error.
+/// An explicit restart, or an update of a service that was already running,
+/// briefly unlinks the socket before the replacement binds it. Connects in
+/// that bounded window fail with `NotFound` or `ConnectionRefused`. Long-lived
+/// MCP sessions (Cursor's `tracedecay serve` stdio proxy) reconnect per request
+/// so a live session can ride out replacement without surfacing a hard
+/// JSON-RPC error. This grace does not start an intentionally held service.
 pub(crate) const DAEMON_RESTART_GRACE: Duration = Duration::from_secs(8);
 pub(crate) const DAEMON_RESTART_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// How long a liveness probe waits for the daemon endpoint to accept a
+/// connection before the in-flight request is declared unreachable.
+const DAEMON_TOOL_HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Liveness for a one-shot request that is already on the wire.
+///
+/// Two independent facts have to hold, and neither implies the other:
+///
+/// * the authority record that named this endpoint is still the current one,
+///   which catches a daemon that restarted under a rotated epoch while its
+///   old connection was never closed; and
+/// * the endpoint still accepts connections, which catches a daemon that
+///   stopped listening (socket unlinked, listener dropped) while holding this
+///   connection open. Nothing on the read half distinguishes that from a
+///   healthy daemon still computing a long answer, so without the probe the
+///   caller waits out its whole deadline on a daemon that can never answer.
+///
+/// The one-shot tool-call and stdio-proxy clients open exactly one connection
+/// per request, so a probe connection here costs one accept per poll interval
+/// and never competes with a pooled connection budget.
 #[hotpath::measure(label = "daemon.core.ensure_connection_live", future = true)]
 pub(crate) async fn ensure_daemon_connection_live(
     connection: &DaemonConnection,

@@ -6,6 +6,7 @@
 
 use super::*;
 use tracedecay_code_index_runtime::code_index_scheduler::query_runtime::QueryRuntimeMountErrorV1;
+use tracedecay_domain::EmbeddingDocumentCompositionV1;
 use tracedecay_semantic_contracts::SemanticResourceCeilings;
 
 /// Inputs the deferred mount closure re-clones on every activation attempt.
@@ -19,12 +20,14 @@ pub(super) struct CodeIndexActivationMountInputs {
     pub(super) semantic_runtime: tracedecay_semantic::DaemonSemanticRuntimeHandleV1,
     pub(super) semantic_lifecycle: Option<Arc<tracedecay_semantic::SemanticModelLifecycleOwnerV1>>,
     pub(super) semantic_resources: SemanticResourceCeilings,
+    pub(super) semantic_document_composition: EmbeddingDocumentCompositionV1,
     pub(super) native_graph_activation: bool,
     pub(super) scope: tracedecay_application::ResolvedScope,
     pub(super) route_registered: Arc<AtomicBool>,
     pub(super) cancellation: CancellationToken,
     pub(super) graph_runtime: Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>,
     pub(super) graph_publication_database: Arc<tracedecay_runtime_core::db::Database>,
+    pub(super) configuration_runtime: Arc<tracedecay_configuration::ProjectConfigurationRuntime>,
     pub(super) profile_id: tracedecay_domain::configuration::UserProfileId,
 }
 
@@ -43,12 +46,14 @@ pub(super) fn code_index_activation_mount(
         semantic_runtime,
         semantic_lifecycle,
         semantic_resources,
+        semantic_document_composition,
         native_graph_activation,
         scope,
         route_registered,
         cancellation,
         graph_runtime,
         graph_publication_database,
+        configuration_runtime,
         profile_id,
     } = inputs;
     let mount: code_index_scheduler::CodeIndexActivationMountV1 = Arc::new(move || {
@@ -65,12 +70,15 @@ pub(super) fn code_index_activation_mount(
         let cancellation = cancellation.clone();
         let graph_runtime = Arc::clone(&graph_runtime);
         let graph_publication_database = Arc::clone(&graph_publication_database);
+        let configuration_runtime = Arc::clone(&configuration_runtime);
         let profile_id = profile_id.clone();
         Box::pin(hotpath::future!(
             async move {
                 if cancellation.is_cancelled() || !route_registered.load(Ordering::Acquire) {
                     return Err("project route was revoked before code-index mount".to_owned());
                 }
+                let query_project_id = project_id.clone();
+                let query_graph_runtime = Arc::clone(&graph_runtime);
                 // Order-sensitive: subscribing before the mount is what keeps the
                 // first generation publication observable by the waiter below.
                 let publications = invocation
@@ -83,6 +91,7 @@ pub(super) fn code_index_activation_mount(
                     Some(&semantic_runtime),
                     semantic_lifecycle,
                     Some(semantic_resources),
+                    semantic_document_composition,
                     native_graph_activation,
                     graph_runtime,
                     graph_publication_database,
@@ -94,6 +103,14 @@ pub(super) fn code_index_activation_mount(
                     }
                     outcome = mount => outcome.map_err(|error| error.to_string())?,
                 }
+                project_open_owners::install_semantic_activation_runtime_owner(
+                    &invocation,
+                    &project_root,
+                    configuration_runtime,
+                    scope.clone(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
                 if cancellation.is_cancelled() || !route_registered.load(Ordering::Acquire) {
                     return Err("project route was revoked after code-index mount".to_owned());
                 }
@@ -105,6 +122,8 @@ pub(super) fn code_index_activation_mount(
                     invocation: invocation.clone(),
                     publications,
                     project_root: project_root.clone(),
+                    project_id: query_project_id,
+                    graph_runtime: query_graph_runtime,
                     profile_id: profile_id.clone(),
                     scope: scope.clone(),
                     route_registered: Arc::clone(&route_registered),
@@ -124,6 +143,8 @@ struct QueryAuthorityWaitInputs {
     publications:
         tokio::sync::broadcast::Receiver<code_index_scheduler::CodeIndexGenerationPublishedV1>,
     project_root: PathBuf,
+    project_id: tracedecay_domain::ProjectId,
+    graph_runtime: Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>,
     profile_id: tracedecay_domain::configuration::UserProfileId,
     scope: tracedecay_application::ResolvedScope,
     route_registered: Arc<AtomicBool>,
@@ -140,6 +161,8 @@ fn spawn_query_authority_when_generation_ready(inputs: QueryAuthorityWaitInputs)
         invocation: authority_invocation,
         mut publications,
         project_root: authority_project,
+        project_id: authority_project_id,
+        graph_runtime: authority_graph_runtime,
         profile_id: authority_profile_id,
         scope: authority_scope,
         route_registered: authority_route_registered,
@@ -206,21 +229,78 @@ fn spawn_query_authority_when_generation_ready(inputs: QueryAuthorityWaitInputs)
             {
                 return;
             }
-            let outcome = tokio::select! {
-                biased;
-                () = authority_cancellation.cancelled() => return,
-                outcome = authority_invocation.mount_query_authority_for_project(
-                    &authority_project,
-                    &authority_profile_id,
-                    &authority_scope,
-                ) => outcome,
-            };
-            if authority_cancellation.is_cancelled()
-                || !authority_route_registered.load(Ordering::Acquire)
-            {
-                return;
+            let mut awaiting_generation_logged = false;
+            loop {
+                let configured = tokio::select! {
+                    biased;
+                    () = authority_cancellation.cancelled() => return,
+                    outcome = authority_invocation.mount_query_authority_for_project(
+                        &authority_project,
+                        &authority_profile_id,
+                        &authority_scope,
+                    ) => outcome,
+                };
+                let outcome = match configured {
+                    Err(
+                        error @ (QueryRuntimeMountErrorV1::Provider(_)
+                        | QueryRuntimeMountErrorV1::AuthorityMissing
+                        | QueryRuntimeMountErrorV1::Authority(
+                            tracedecay_query::retrieval::QueryAuthorityErrorV1::AuthorityUnavailable,
+                        )),
+                    ) => {
+                        // A fresh profile has no evaluated optional authority. The
+                        // post-seat owner must therefore install the checked-in core
+                        // policy from this project's durable cursor-key authority;
+                        // otherwise a ready generation remains unqueryable forever.
+                        match authority_graph_runtime
+                            .mounted_project_sessions(&authority_project_id)
+                            .await
+                        {
+                            Some(session_db) => {
+                                match session_db.load_session_cursor_key_provider_result().await {
+                                    Ok(cursor_keys) => {
+                                        authority_invocation
+                                            .mount_core_query_authority_for_project(
+                                                &authority_project,
+                                                &authority_scope,
+                                                &cursor_keys,
+                                            )
+                                            .await
+                                    }
+                                    Err(_) => Err(QueryRuntimeMountErrorV1::KeyUnavailable),
+                                }
+                            }
+                            None => Err(error),
+                        }
+                    }
+                    outcome => outcome,
+                };
+                if authority_cancellation.is_cancelled()
+                    || !authority_route_registered.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                match outcome {
+                    Err(error @ QueryRuntimeMountErrorV1::GenerationUnavailable) => {
+                        if !awaiting_generation_logged {
+                            log_query_authority_activation_outcome(&authority_project, Err(error));
+                            awaiting_generation_logged = true;
+                        }
+                        tokio::select! {
+                            () = authority_cancellation.cancelled() => return,
+                            _ = route_poll.tick() => {},
+                            publication = publications.recv() => match publication {
+                                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                            }
+                        }
+                    }
+                    outcome => {
+                        log_query_authority_activation_outcome(&authority_project, outcome);
+                        return;
+                    }
+                }
             }
-            log_query_authority_activation_outcome(&authority_project, outcome);
         },
         label = "daemon.project.activate.query_authority"
     ));
@@ -270,25 +350,6 @@ fn log_query_authority_activation_outcome(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::daemon) enum QueryAuthorityActivationLogV1 {
-    Mounted,
-    AwaitingGeneration,
-    Degraded,
-}
-
-pub(in crate::daemon) fn classify_query_authority_activation_outcome(
-    outcome: &std::result::Result<(), QueryRuntimeMountErrorV1>,
-) -> QueryAuthorityActivationLogV1 {
-    match outcome {
-        Ok(()) => QueryAuthorityActivationLogV1::Mounted,
-        Err(QueryRuntimeMountErrorV1::GenerationUnavailable) => {
-            QueryAuthorityActivationLogV1::AwaitingGeneration
-        }
-        Err(_) => QueryAuthorityActivationLogV1::Degraded,
-    }
-}
-
 /// Hint sink handed to the activation owner: it coalesces after-edit hook paths
 /// and overflow notices onto the mounted scheduler.
 pub(super) fn code_index_activation_hint_sink(
@@ -331,8 +392,19 @@ pub(super) fn code_index_hook_sink(
     sink
 }
 
-/// MCP-facing reconcile sink: an overflowed hook batch asks the activation
-/// owner for a full reconcile instead of enumerating paths.
+/// MCP-facing reconcile sink: a caller that has already decided the whole
+/// worktree must be reconciled asks the activation owner for that pass instead
+/// of enumerating paths.
+///
+/// This is the *explicit demand* channel — `tracedecay init` / `tracedecay
+/// sync` through `tracedecay_admin_sync`, and the hook effects that have
+/// concluded a full reconcile is required. It is therefore not subject to
+/// `CodeIndexAutomaticAdmissionV1`, which answers only "may the daemon start
+/// indexing this route on its own?" and is derived from
+/// `sync.watch_linked_worktrees` — a filesystem-watcher policy. Watch-driven
+/// hints keep that gate: they arrive through [`code_index_hook_sink`] and
+/// [`code_index_freshness_probe_sink`], which still call the automatic
+/// entry points.
 pub(super) fn code_index_reconcile_sink(
     schedulers: code_index_scheduler::CodeIndexSchedulerRegistryV1,
     activation: Arc<code_index_scheduler::CodeIndexActivationV1>,
@@ -344,7 +416,7 @@ pub(super) fn code_index_reconcile_sink(
             if schedulers.notify_hook_overflow(&root).await {
                 true
             } else {
-                activation.notify_hook_overflow(&root).await
+                activation.notify_explicit_reconciliation(&root).await
             }
         })
     });
@@ -363,36 +435,23 @@ pub(super) fn code_index_freshness_probe_sink(
     })
 }
 
+pub(super) fn diagnostics_change_generation_resolver(
+    schedulers: code_index_scheduler::CodeIndexSchedulerRegistryV1,
+) -> crate::mcp::server::DiagnosticsChangeGenerationResolver {
+    Arc::new(move |root: PathBuf| {
+        let schedulers = schedulers.clone();
+        Box::pin(async move { schedulers.diagnostics_change_generation(&root).await })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::process::Command;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
-    use tempfile::TempDir;
-    use tracedecay_code_index_runtime::code_index_scheduler::query_runtime::QueryRuntimeMountErrorV1;
-
     use super::*;
-
-    #[test]
-    fn pre_seat_generation_gap_is_typed_status_not_degraded() {
-        assert_eq!(
-            classify_query_authority_activation_outcome(&Ok(())),
-            QueryAuthorityActivationLogV1::Mounted
-        );
-        assert_eq!(
-            classify_query_authority_activation_outcome(&Err(
-                QueryRuntimeMountErrorV1::GenerationUnavailable
-            )),
-            QueryAuthorityActivationLogV1::AwaitingGeneration
-        );
-        assert_eq!(
-            classify_query_authority_activation_outcome(&Err(
-                QueryRuntimeMountErrorV1::KeyUnavailable
-            )),
-            QueryAuthorityActivationLogV1::Degraded
-        );
-    }
+    use tempfile::TempDir;
 
     fn git(root: &Path, arguments: &[&str]) {
         let status = Command::new(
@@ -476,5 +535,65 @@ mod tests {
         })
         .await
         .expect("pre-mount reconcile must mount the scheduler and flush the overflow request");
+    }
+
+    /// A linked worktree under the default `sync.watch_linked_worktrees = false`
+    /// carries `LinkedWorktreeDisabled` automatic admission, which is the
+    /// filesystem-watcher policy. `tracedecay init` inside that worktree still
+    /// asks for a reconcile by name through this sink, and that demand must
+    /// mount the scheduler: otherwise a daemon-first init from a linked
+    /// worktree reports "code-index reconciliation requested" while nothing is
+    /// ever indexed.
+    #[tokio::test]
+    async fn explicit_reconcile_overrides_linked_worktree_watch_policy() {
+        let repository = repository();
+        let root = repository
+            .path()
+            .canonicalize()
+            .expect("canonical repository root");
+        let mount_attempts = Arc::new(AtomicUsize::new(0));
+        let mount: code_index_scheduler::CodeIndexActivationMountV1 = {
+            let mount_attempts = Arc::clone(&mount_attempts);
+            Arc::new(move || {
+                let mount_attempts = Arc::clone(&mount_attempts);
+                Box::pin(async move {
+                    mount_attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        };
+        let hint_sink: code_index_scheduler::CodeIndexActivationHintSinkV1 =
+            Arc::new(move |_batch| Box::pin(async move { true }));
+        let activation = Arc::new(
+            code_index_scheduler::CodeIndexActivationV1::new_with_admission(
+                &root,
+                Arc::new(AtomicBool::new(true)),
+                CancellationToken::new(),
+                code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled,
+                mount,
+                hint_sink,
+            ),
+        );
+        // The watch-driven hint path keeps the gate.
+        assert!(
+            !activation
+                .notify_hook_paths(&root, vec!["lib.rs".to_owned()])
+                .await,
+            "a watch-driven hint must still honour the linked-worktree watch policy"
+        );
+
+        let registry = code_index_scheduler::CodeIndexSchedulerRegistryV1::new(1);
+        let sink = code_index_reconcile_sink(registry, Arc::clone(&activation));
+        assert!(
+            sink(root.clone()).await,
+            "explicit reconcile demand must be accepted on a linked worktree"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while mount_attempts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("explicit reconcile must mount the scheduler on a linked worktree");
     }
 }

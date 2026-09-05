@@ -23,6 +23,7 @@ use tracedecay_domain::{
 pub use tracedecay_domain::VectorGenerationIdV1;
 
 use tracedecay_code_index::projection::{expected_publication_digest, verify_batch_receipt};
+use tracedecay_graph_db::GraphConflictContextV1;
 use tracedecay_semantic::projector::{
     PreparedVectorGenerationV1, ProjectedChunkVectorV1, SemanticProjectionErrorV1,
 };
@@ -229,6 +230,7 @@ impl PhysicalVectorBytePoolV1 {
 
     /// Release every entry whose generation has been retired. Interning is
     /// unaffected: a swept key is re-interned on its next use.
+    #[hotpath::measure(label = "usecases.vector.sweep_retired")]
     pub fn sweep_retired(&self) -> Result<(), VectorGenerationStoreErrorV1> {
         self.lock()?.sweep();
         Ok(())
@@ -1201,8 +1203,8 @@ pub enum VectorGenerationStoreErrorV1 {
     PhysicalVectorConflict,
     #[error("project vector generation storage failed: {0}")]
     Storage(String),
-    #[error("project vector generation state changed repeatedly during compare-and-swap")]
-    ConcurrentMutation,
+    #[error("project vector generation state changed during compare-and-swap {0}")]
+    ConcurrentMutation(GraphConflictContextV1),
     #[error("semantic projector handoff rejected: {0}")]
     Projection(#[from] SemanticProjectionErrorV1),
 }
@@ -1274,6 +1276,7 @@ impl VectorGenerationStateMachineV1 {
         }
     }
 
+    #[hotpath::measure(label = "usecases.vector.begin_generation")]
     pub fn begin_generation(
         &mut self,
         plan: VectorGenerationPlanV1,
@@ -1323,6 +1326,7 @@ impl VectorGenerationStateMachineV1 {
     /// Discard any checkpointed execution for the same deterministic build
     /// identity and restart projection from its authoritative query inputs.
     /// Already-published generations are untouched.
+    #[hotpath::measure(label = "usecases.vector.rebuild_generation")]
     pub fn rebuild_generation(
         &mut self,
         plan: VectorGenerationPlanV1,
@@ -1373,6 +1377,7 @@ impl VectorGenerationStateMachineV1 {
     /// Borrowing form of [`Self::commit_batch`]. The persistent adapter drives
     /// this one so a whole-corpus batch is never copied just to satisfy a
     /// retryable mutation closure.
+    #[hotpath::measure(label = "usecases.vector.commit_batch")]
     pub(crate) fn commit_batch_ref(
         &mut self,
         build_id: &VectorGenerationBuildIdV1,
@@ -1390,6 +1395,7 @@ impl VectorGenerationStateMachineV1 {
     /// freshness, receipt verification, per-row validation against the
     /// admitted embedding key, base-generation lineage — happens here, while
     /// the batch's float payloads are still in hand.
+    #[hotpath::measure(label = "usecases.vector.validate_batch")]
     pub fn validate_batch(
         &self,
         build_id: &VectorGenerationBuildIdV1,
@@ -1589,6 +1595,7 @@ impl VectorGenerationStateMachineV1 {
     /// that disappeared between decision and application and a census that
     /// contradicts the decision — both are foreign-mutation corruption, never
     /// a property of the batch itself.
+    #[hotpath::measure(label = "usecases.vector.apply_batch")]
     pub fn apply_batch(
         &mut self,
         build_id: &VectorGenerationBuildIdV1,
@@ -1642,6 +1649,7 @@ impl VectorGenerationStateMachineV1 {
     /// after every batch) allocates nothing, a rejected publication leaves the
     /// machine byte-identical, and an accepted one moves the staged rows into
     /// the published generation instead of deep-copying the corpus.
+    #[hotpath::measure(label = "usecases.vector.publish_generation")]
     pub fn publish_generation(
         &mut self,
         build_id: &VectorGenerationBuildIdV1,
@@ -1791,6 +1799,7 @@ impl VectorGenerationStateMachineV1 {
     /// vector bytes are persisted beside the document because the row map
     /// elides them, so the payload index is (re)derived here — publication
     /// itself never copies floats into the pool.
+    #[hotpath::measure(label = "usecases.vector.persist_sealed")]
     pub fn persist_sealed(&mut self) -> Result<Vec<u8>, VectorGenerationStoreErrorV1> {
         if self.staged_values == StagedVectorValueRetentionV1::Elided {
             return Err(VectorGenerationStoreErrorV1::Storage(
@@ -1809,6 +1818,7 @@ impl VectorGenerationStateMachineV1 {
     }
 
     /// Reload a document persisted by [`Self::persist_sealed`].
+    #[hotpath::measure(label = "usecases.vector.reopen_sealed")]
     pub fn reopen_sealed(bytes: &[u8]) -> Result<Self, VectorGenerationStoreErrorV1> {
         let persisted: PersistedSealedStateV1 =
             serde_json::from_slice(bytes).map_err(storage_error)?;
@@ -1893,6 +1903,7 @@ fn physical_vector_reuse_key(
     Ok((physical_id, reuse_key))
 }
 
+#[hotpath::measure(label = "usecases.vector.intern_vectors")]
 fn intern_generation_vectors(
     physical_vector_pool: &PhysicalVectorBytePoolV1,
     published: &mut PublishedStateV1,
@@ -2143,6 +2154,7 @@ struct PersistedSealedStateV1 {
     physical_vectors: BTreeMap<ManifestDigest, PhysicalVectorPayloadV1>,
 }
 
+#[hotpath::measure(label = "usecases.vector.hydrate_values")]
 fn hydrate_elided_vector_values(
     state: &mut VectorGenerationStateMachineV1,
 ) -> Result<(), VectorGenerationStoreErrorV1> {
@@ -2372,9 +2384,10 @@ mod tests {
     use super::*;
     use tracedecay_domain::{
         ChangedCodeChunkSetV1, ChangedCodeChunkV1, ChunkerRevision, EmbeddingDeviceClassV1,
-        EmbeddingMetricV1, EmbeddingNormalizationV1, EmbeddingPoolingV1, EmbeddingPrecisionV1,
-        EmbeddingProjectionKeyV1, EmbeddingTruncationSideV1, PrivacyDomainId,
-        ProjectionBatchRequestV1, ProjectionReplayReasonV1,
+        EmbeddingDocumentCompositionV1, EmbeddingMetricV1, EmbeddingNormalizationV1,
+        EmbeddingPoolingV1, EmbeddingPrecisionV1, EmbeddingProjectionKeyV1,
+        EmbeddingTruncationSideV1, PrivacyDomainId, ProjectionBatchRequestV1,
+        ProjectionReplayReasonV1,
     };
     fn id<T>(value: &str) -> T
     where
@@ -2399,6 +2412,7 @@ mod tests {
             config_digest: manifest_digest('3'),
             query_instruction_digest: Some(manifest_digest('4')),
             document_instruction_digest: Some(manifest_digest('5')),
+            document_composition: EmbeddingDocumentCompositionV1::SanitizedText,
             pooling: EmbeddingPoolingV1::Mean,
             truncation_side: EmbeddingTruncationSideV1::Right,
             truncation_length: 512,

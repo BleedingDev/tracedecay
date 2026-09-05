@@ -14,7 +14,12 @@ use tracedecay_query::retrieval::rerank::LocalRerankFailureV1;
 #[cfg(any(feature = "hotpath", test))]
 use crate::artifact_store::ArtifactImportErrorV1;
 use crate::artifact_store::SemanticCapabilityDisabledV1;
-#[cfg(any(feature = "hotpath", feature = "semantic-fastembed", test))]
+#[cfg(any(
+    feature = "hotpath",
+    feature = "semantic-fastembed",
+    feature = "semantic-model2vec",
+    test
+))]
 use crate::fastembed_adapter::EmbedError;
 #[cfg(any(feature = "hotpath", test))]
 use crate::fastembed_adapter::RuntimeFailureKindV1;
@@ -52,6 +57,7 @@ pub(crate) fn lifecycle_error_class(error: &ModelLifecycleErrorV1) -> &'static s
         ModelLifecycleErrorV1::DownloadFailed
         | ModelLifecycleErrorV1::DownloadFailedWithReason(_) => "download_failed",
         ModelLifecycleErrorV1::VerificationFailed => "verification_failed",
+        ModelLifecycleErrorV1::RerankerUnavailable => "reranker_unavailable",
         ModelLifecycleErrorV1::InstallFailed => "install_failed",
         ModelLifecycleErrorV1::WorkerJoinFailed => "worker_join_failed",
         ModelLifecycleErrorV1::Cancelled => "cancelled",
@@ -218,9 +224,9 @@ pub(crate) fn record_lifecycle_error(error: &ModelLifecycleErrorV1) {
     let _ = error;
 }
 
-/// Every call site lives in the FastEmbed adapter, compiled only when
-/// `semantic-fastembed` is selected.
-#[cfg(feature = "semantic-fastembed")]
+/// Every call site lives in an embedding adapter, compiled only when that
+/// adapter's backend feature is selected.
+#[cfg(any(feature = "semantic-fastembed", feature = "semantic-model2vec"))]
 #[inline(always)]
 pub(crate) fn record_embed_error(error: &EmbedError) {
     #[cfg(feature = "hotpath")]

@@ -496,8 +496,66 @@ fn cross_binding_reads_and_writes_are_denied_and_busy_is_preserved() {
         Err(SemanticVectorStagingStoreError::InvalidRequest(_))
     ));
     assert_eq!(
-        super::support::map_exact(ExactSqlError::Busy),
+        super::support::map_exact(
+            super::support::ExactSqlFailureOperation::BeginImmediate,
+            ExactSqlError::Busy,
+        ),
         SemanticVectorStagingStoreError::Busy
+    );
+}
+
+#[test]
+fn exact_sql_authority_denial_diagnostics_bound_reason_and_operation() {
+    assert_eq!(
+        super::support::classify_exact_sql_failure(
+            super::support::ExactSqlFailureOperation::Query,
+            &ExactSqlError::IsolatedSemanticEvaluationAuthorityClosed,
+        ),
+        super::support::ExactSqlFailureDiagnostic {
+            operation: super::support::ExactSqlFailureOperation::Query,
+            kind: "authority_denied",
+            authority_denial_reason: Some(
+                super::support::ExactSqlAuthorityDeniedReason::IsolatedEvaluationClosed,
+            ),
+            sqlite: None,
+        }
+    );
+    assert_eq!(
+        super::support::classify_exact_sql_failure(
+            super::support::ExactSqlFailureOperation::Execute,
+            &ExactSqlError::AuthorityDenied("fixture-private denial detail".to_owned()),
+        ),
+        super::support::ExactSqlFailureDiagnostic {
+            operation: super::support::ExactSqlFailureOperation::Execute,
+            kind: "authority_denied",
+            authority_denial_reason: Some(super::support::ExactSqlAuthorityDeniedReason::Other,),
+            sqlite: None,
+        }
+    );
+}
+
+#[test]
+fn exact_sql_sqlite_diagnostics_preserve_safe_operation_and_codes() {
+    assert_eq!(
+        super::support::classify_exact_sql_failure(
+            super::support::ExactSqlFailureOperation::Execute,
+            &ExactSqlError::Sqlite {
+                operation: "advance query",
+                code: Some(5),
+                extended_code: Some(517),
+                message: "fixture-private SQLite text".to_owned(),
+            },
+        ),
+        super::support::ExactSqlFailureDiagnostic {
+            operation: super::support::ExactSqlFailureOperation::Execute,
+            kind: "sqlite",
+            authority_denial_reason: None,
+            sqlite: Some(super::support::ExactSqliteFailureDiagnostic {
+                operation: "advance query",
+                code: Some(5),
+                extended_code: Some(517),
+            }),
+        }
     );
 }
 

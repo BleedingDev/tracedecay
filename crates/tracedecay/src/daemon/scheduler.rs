@@ -152,6 +152,7 @@ fn scheduler_run_observer(
     })
 }
 
+#[hotpath::measure(label = "daemon.scheduler.settle_retained_automation", future = true)]
 async fn settle_scheduler_retained_automation<T, P>(
     engine: &DaemonEngine,
     project_id: &tracedecay_domain::ProjectId,
@@ -792,7 +793,7 @@ impl DaemonEngine {
         AutomationSchedulerReconcileOutcome::Started
     }
 
-    #[hotpath::skip]
+    #[hotpath::measure(label = "daemon.scheduler.commit_exit", future = true)]
     async fn commit_automation_scheduler_exit(
         &self,
         key: &ProjectServerKey,
@@ -881,7 +882,7 @@ impl DaemonEngine {
             .await
     }
 
-    #[hotpath::skip]
+    #[hotpath::measure(label = "daemon.scheduler.retire_scheduler", future = true)]
     async fn retire_matching_automation_scheduler_locked(
         &self,
         key: &ProjectServerKey,
@@ -1004,6 +1005,7 @@ fn observed_scheduler_lifecycle(
     }
 }
 
+#[hotpath::measure(label = "daemon.scheduler.retained_project_graph", future = true)]
 async fn retained_project_graph(
     engine: &DaemonEngine,
     key: &ProjectServerKey,
@@ -1068,6 +1070,42 @@ fn scheduler_project_open_backoff(consecutive_failures: u32) -> Duration {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The scheduler tick as a type-erased boxed future: the loop's state machine
+/// (and every layout query that reaches it from a runtime open) then names
+/// only a pointer, not the instrumented tick future.
+fn boxed_automation_scheduler_tick<'a>(
+    project_path: &'a Path,
+    cg: &'a TraceDecay,
+    handshake: &'a DaemonHandshake,
+    engine: &'a DaemonEngine,
+    run_control: &'a AutomationRunControl,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(run_automation_scheduler_tick(
+        project_path,
+        cg,
+        handshake,
+        engine,
+        run_control,
+    ))
+}
+
+/// See [`boxed_automation_scheduler_tick`].
+fn boxed_host_receipt_review<'a>(
+    project_path: &'a Path,
+    cg: &'a TraceDecay,
+    handshake: &'a DaemonHandshake,
+    engine: &'a DaemonEngine,
+    run_control: &'a AutomationRunControl,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(run_host_receipt_review(
+        project_path,
+        cg,
+        handshake,
+        engine,
+        run_control,
+    ))
+}
+
 async fn run_automation_scheduler_loop(
     project_path: PathBuf,
     handshake: DaemonHandshake,
@@ -1193,14 +1231,8 @@ async fn run_automation_scheduler_loop(
         );
         let tick_result = {
             let _background_job = BackgroundJobGaugeGuard::enter();
-            Box::pin(run_automation_scheduler_tick(
-                &project_path,
-                &cg,
-                &handshake,
-                &engine,
-                &run_control,
-            ))
-            .await
+            boxed_automation_scheduler_tick(&project_path, &cg, &handshake, &engine, &run_control)
+                .await
         };
         if let Err(e) = tick_result {
             log_daemon_event(
@@ -1212,14 +1244,8 @@ async fn run_automation_scheduler_loop(
                 ],
             );
         }
-        if let Err(error) = Box::pin(run_host_receipt_review(
-            &project_path,
-            &cg,
-            &handshake,
-            &engine,
-            &run_control,
-        ))
-        .await
+        if let Err(error) =
+            boxed_host_receipt_review(&project_path, &cg, &handshake, &engine, &run_control).await
         {
             log_daemon_event(
                 "host_receipt_review",
@@ -1250,13 +1276,13 @@ async fn run_automation_scheduler_loop(
                         () = wake.notified() => {}
                     }
                 }
-                if let Err(error) = Box::pin(run_host_receipt_review(
+                if let Err(error) = boxed_host_receipt_review(
                     &project_path,
                     &cg,
                     &handshake,
                     &engine,
                     &run_control,
-                ))
+                )
                 .await
                 {
                     log_daemon_event(
@@ -1459,6 +1485,7 @@ fn global_table_retention_config(
 /// Applies the configured retention windows to the global telemetry tables,
 /// at most once per [`RETENTION_MIN_INTERVAL_SECS`]. Best-effort: retention is
 /// housekeeping, so failures are logged and never abort a scheduler tick.
+#[hotpath::measure(label = "daemon.scheduler.global_retention", future = true)]
 async fn maybe_run_global_retention(
     administration: &super::branch_admin::StoreAdministration,
     database: &tracedecay_global_db::RegisteredGlobalDb,
@@ -1873,6 +1900,7 @@ struct PinnedAutomationConfiguration {
     settings: tracedecay_automation_runtime::automation::config::AutomationConfig,
 }
 
+#[hotpath::measure(label = "daemon.scheduler.read_automation_config", future = true)]
 async fn effective_automation_config_for_project(
     cg: &crate::tracedecay::TraceDecay,
 ) -> Result<PinnedAutomationConfiguration> {
@@ -1936,6 +1964,7 @@ pub(super) fn automation_scheduler_configured(
 
 /// True when the scheduler loop has anything to do for this project: a
 /// scheduled fixed task or a schedulable user-defined job.
+#[hotpath::measure(label = "daemon.scheduler.probe_scheduler_work", future = true)]
 async fn automation_scheduler_has_work(
     cg: &crate::tracedecay::TraceDecay,
     config: &tracedecay_automation_runtime::automation::config::AutomationConfig,
@@ -1961,6 +1990,7 @@ async fn automation_scheduler_has_work(
 
 /// Ticks every schedulable user-defined job with the same lock/cooldown
 /// discipline as the fixed tasks (enforced inside the job runner).
+#[hotpath::measure(label = "daemon.scheduler.user_jobs_pass", future = true)]
 async fn run_user_jobs_scheduler_pass(
     engine: &DaemonEngine,
     run_control: &AutomationRunControl,
@@ -2141,6 +2171,7 @@ async fn run_user_jobs_scheduler_pass(
 /// Deriving a fresher anchor at append time can bound the scan below an
 /// already-appended row and silently write a byte-different duplicate.
 /// `None` means this snapshot held no scheduler-effectful terminal at all.
+#[hotpath::measure(label = "daemon.scheduler.mint_user_job_run_id", future = true)]
 async fn scheduled_user_job_run_id(
     dashboard_root: &Path,
     job: &tracedecay_automation_runtime::automation::jobs::AutomationJob,

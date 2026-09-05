@@ -262,6 +262,7 @@ impl ProjectFeedbackObservationSinkV1 {
         })
     }
 
+    #[hotpath::measure(label = "usecases.feedback.close_drain", future = true)]
     async fn close_and_drain(&self) -> Result<(), FeedbackRuntimeError> {
         let terminal = {
             let _admission = self
@@ -921,43 +922,49 @@ impl DurableFeedbackReadStoreV1 for ProjectFeedbackStore {
         context: &'a FeedbackReadPortContext<'a>,
         request: &'a FeedbackDiagnosticsReadRequestV1,
     ) -> FeedbackReadPortFuture<'a, FeedbackDiagnosticsReadResultV1> {
-        Box::pin(async move {
-            let domains = vec![
-                EvidenceDomain::Diagnostic,
-                EvidenceDomain::Graph,
-                EvidenceDomain::Test,
-            ];
-            if let Some(interrupted) = interruption(context.request, now_micros(), domains.clone())
-            {
-                return interrupted;
-            }
-            let Ok(publications) = self.scoped_publications(context.request).await else {
-                return unavailable(now_micros(), domains);
-            };
-            let finished_at = now_micros();
-            if let Some(interrupted) = interruption(context.request, finished_at, domains.clone()) {
-                return interrupted;
-            }
-            let publication = publications
-                .iter()
-                .filter(|publication| {
-                    publication.result.scope.head_commit_id == request.head_commit_id
-                })
-                .max_by(|left, right| publication_order(left, right));
-            let Some(publication) = publication else {
-                return unavailable(finished_at, domains);
-            };
-            complete(
-                FeedbackDiagnosticsReadResultV1 {
-                    cycle: publication.result.clone(),
-                },
-                vec![publication],
-                domains,
-                None,
-                None,
-                finished_at,
-            )
-        })
+        Box::pin(hotpath::future!(
+            async move {
+                let domains = vec![
+                    EvidenceDomain::Diagnostic,
+                    EvidenceDomain::Graph,
+                    EvidenceDomain::Test,
+                ];
+                if let Some(interrupted) =
+                    interruption(context.request, now_micros(), domains.clone())
+                {
+                    return interrupted;
+                }
+                let Ok(publications) = self.scoped_publications(context.request).await else {
+                    return unavailable(now_micros(), domains);
+                };
+                let finished_at = now_micros();
+                if let Some(interrupted) =
+                    interruption(context.request, finished_at, domains.clone())
+                {
+                    return interrupted;
+                }
+                let publication = publications
+                    .iter()
+                    .filter(|publication| {
+                        publication.result.scope.head_commit_id == request.head_commit_id
+                    })
+                    .max_by(|left, right| publication_order(left, right));
+                let Some(publication) = publication else {
+                    return unavailable(finished_at, domains);
+                };
+                complete(
+                    FeedbackDiagnosticsReadResultV1 {
+                        cycle: publication.result.clone(),
+                    },
+                    vec![publication],
+                    domains,
+                    None,
+                    None,
+                    finished_at,
+                )
+            },
+            label = "usecases.feedback.read_diagnostics"
+        ))
     }
 
     fn get<'a>(
@@ -965,36 +972,43 @@ impl DurableFeedbackReadStoreV1 for ProjectFeedbackStore {
         context: &'a FeedbackReadPortContext<'a>,
         request: &'a FeedbackGetRequestV1,
     ) -> FeedbackReadPortFuture<'a, FeedbackGetResultV1> {
-        Box::pin(async move {
-            let domains = vec![EvidenceDomain::Diagnostic];
-            if let Some(interrupted) = interruption(context.request, now_micros(), domains.clone())
-            {
-                return interrupted;
-            }
-            let Ok(publications) = self.scoped_publications(context.request).await else {
-                return unavailable(now_micros(), domains);
-            };
-            let finished_at = now_micros();
-            if let Some(interrupted) = interruption(context.request, finished_at, domains.clone()) {
-                return interrupted;
-            }
-            let selected = latest_finding(&publications, &request.finding_id);
-            let Some((publication, finding)) = selected else {
-                return unavailable(finished_at, domains);
-            };
-            let Ok(view) = self.finding_view(context.request, publication, finding, finished_at)
-            else {
-                return unavailable(finished_at, domains);
-            };
-            complete(
-                FeedbackGetResultV1 { finding: view },
-                vec![publication],
-                domains,
-                None,
-                None,
-                finished_at,
-            )
-        })
+        Box::pin(hotpath::future!(
+            async move {
+                let domains = vec![EvidenceDomain::Diagnostic];
+                if let Some(interrupted) =
+                    interruption(context.request, now_micros(), domains.clone())
+                {
+                    return interrupted;
+                }
+                let Ok(publications) = self.scoped_publications(context.request).await else {
+                    return unavailable(now_micros(), domains);
+                };
+                let finished_at = now_micros();
+                if let Some(interrupted) =
+                    interruption(context.request, finished_at, domains.clone())
+                {
+                    return interrupted;
+                }
+                let selected = latest_finding(&publications, &request.finding_id);
+                let Some((publication, finding)) = selected else {
+                    return unavailable(finished_at, domains);
+                };
+                let Ok(view) =
+                    self.finding_view(context.request, publication, finding, finished_at)
+                else {
+                    return unavailable(finished_at, domains);
+                };
+                complete(
+                    FeedbackGetResultV1 { finding: view },
+                    vec![publication],
+                    domains,
+                    None,
+                    None,
+                    finished_at,
+                )
+            },
+            label = "usecases.feedback.read_get"
+        ))
     }
 
     fn expand<'a>(
@@ -1002,121 +1016,132 @@ impl DurableFeedbackReadStoreV1 for ProjectFeedbackStore {
         context: &'a FeedbackReadPortContext<'a>,
         request: &'a FeedbackExpandRequestV1,
     ) -> FeedbackReadPortFuture<'a, FeedbackExpandResultV1> {
-        Box::pin(async move {
-            let domains = vec![EvidenceDomain::Anchor];
-            let started_at = now_micros();
-            if let Some(interrupted) = interruption(context.request, started_at, domains.clone()) {
+        Box::pin(hotpath::future!(
+            async move {
+                let domains = vec![EvidenceDomain::Anchor];
+                let started_at = now_micros();
+                if let Some(interrupted) =
+                    interruption(context.request, started_at, domains.clone())
+                {
+                    self.observe_expansion(
+                        context.request,
+                        request,
+                        interruption_outcome(context.request, started_at),
+                        0,
+                        started_at,
+                    );
+                    return interrupted;
+                }
+                let Ok(publications) = self.scoped_publications(context.request).await else {
+                    let observed_at = now_micros();
+                    self.observe_expansion(
+                        context.request,
+                        request,
+                        FeedbackOutcomeV1::Unavailable,
+                        0,
+                        observed_at,
+                    );
+                    return unavailable(observed_at, domains);
+                };
+                let mut finished_at = now_micros();
+                if let Some(interrupted) =
+                    interruption(context.request, finished_at, domains.clone())
+                {
+                    self.observe_expansion(
+                        context.request,
+                        request,
+                        interruption_outcome(context.request, finished_at),
+                        0,
+                        finished_at,
+                    );
+                    return interrupted;
+                }
+                let Some((publication, finding)) =
+                    latest_finding(&publications, &request.finding_id)
+                else {
+                    self.observe_expansion(
+                        context.request,
+                        request,
+                        FeedbackOutcomeV1::Stale,
+                        0,
+                        finished_at,
+                    );
+                    return unavailable(finished_at, domains);
+                };
+                if finding.retrieval_anchor_id.as_ref() != Some(&request.expansion.anchor) {
+                    self.observe_expansion(
+                        context.request,
+                        request,
+                        FeedbackOutcomeV1::Denied,
+                        0,
+                        finished_at,
+                    );
+                    return unavailable(finished_at, domains);
+                }
+                let diagnostics = DiagnosticsStore::new(self.database.clone());
+                let Ok(Some(_)) = diagnostics
+                    .diagnostic_by_anchor(&request.expansion.anchor)
+                    .await
+                else {
+                    let observed_at = now_micros();
+                    self.observe_expansion(
+                        context.request,
+                        request,
+                        FeedbackOutcomeV1::Partial,
+                        0,
+                        observed_at,
+                    );
+                    return unavailable(observed_at, domains);
+                };
+                let expanded = tracedecay_application::AnchorExpandResult {
+                    anchors: vec![request.expansion.anchor.clone()],
+                };
+                finished_at = now_micros();
+                if let Some(interrupted) =
+                    interruption(context.request, finished_at, domains.clone())
+                {
+                    self.observe_expansion(
+                        context.request,
+                        request,
+                        interruption_outcome(context.request, finished_at),
+                        0,
+                        finished_at,
+                    );
+                    return interrupted;
+                }
+                let Ok(view) =
+                    self.finding_view(context.request, publication, finding, finished_at)
+                else {
+                    self.observe_expansion(
+                        context.request,
+                        request,
+                        FeedbackOutcomeV1::Unavailable,
+                        0,
+                        finished_at,
+                    );
+                    return unavailable(finished_at, domains);
+                };
                 self.observe_expansion(
                     context.request,
                     request,
-                    interruption_outcome(context.request, started_at),
-                    0,
-                    started_at,
-                );
-                return interrupted;
-            }
-            let Ok(publications) = self.scoped_publications(context.request).await else {
-                let observed_at = now_micros();
-                self.observe_expansion(
-                    context.request,
-                    request,
-                    FeedbackOutcomeV1::Unavailable,
-                    0,
-                    observed_at,
-                );
-                return unavailable(observed_at, domains);
-            };
-            let mut finished_at = now_micros();
-            if let Some(interrupted) = interruption(context.request, finished_at, domains.clone()) {
-                self.observe_expansion(
-                    context.request,
-                    request,
-                    interruption_outcome(context.request, finished_at),
-                    0,
+                    FeedbackOutcomeV1::Completed,
+                    expanded.anchors.len().try_into().unwrap_or(u32::MAX),
                     finished_at,
                 );
-                return interrupted;
-            }
-            let Some((publication, finding)) = latest_finding(&publications, &request.finding_id)
-            else {
-                self.observe_expansion(
-                    context.request,
-                    request,
-                    FeedbackOutcomeV1::Stale,
-                    0,
+                complete(
+                    FeedbackExpandResultV1 {
+                        finding: view,
+                        expansion: expanded,
+                    },
+                    vec![publication],
+                    domains,
+                    None,
+                    None,
                     finished_at,
-                );
-                return unavailable(finished_at, domains);
-            };
-            if finding.retrieval_anchor_id.as_ref() != Some(&request.expansion.anchor) {
-                self.observe_expansion(
-                    context.request,
-                    request,
-                    FeedbackOutcomeV1::Denied,
-                    0,
-                    finished_at,
-                );
-                return unavailable(finished_at, domains);
-            }
-            let diagnostics = DiagnosticsStore::new(self.database.clone());
-            let Ok(Some(_)) = diagnostics
-                .diagnostic_by_anchor(&request.expansion.anchor)
-                .await
-            else {
-                let observed_at = now_micros();
-                self.observe_expansion(
-                    context.request,
-                    request,
-                    FeedbackOutcomeV1::Partial,
-                    0,
-                    observed_at,
-                );
-                return unavailable(observed_at, domains);
-            };
-            let expanded = tracedecay_application::AnchorExpandResult {
-                anchors: vec![request.expansion.anchor.clone()],
-            };
-            finished_at = now_micros();
-            if let Some(interrupted) = interruption(context.request, finished_at, domains.clone()) {
-                self.observe_expansion(
-                    context.request,
-                    request,
-                    interruption_outcome(context.request, finished_at),
-                    0,
-                    finished_at,
-                );
-                return interrupted;
-            }
-            let Ok(view) = self.finding_view(context.request, publication, finding, finished_at)
-            else {
-                self.observe_expansion(
-                    context.request,
-                    request,
-                    FeedbackOutcomeV1::Unavailable,
-                    0,
-                    finished_at,
-                );
-                return unavailable(finished_at, domains);
-            };
-            self.observe_expansion(
-                context.request,
-                request,
-                FeedbackOutcomeV1::Completed,
-                expanded.anchors.len().try_into().unwrap_or(u32::MAX),
-                finished_at,
-            );
-            complete(
-                FeedbackExpandResultV1 {
-                    finding: view,
-                    expansion: expanded,
-                },
-                vec![publication],
-                domains,
-                None,
-                None,
-                finished_at,
-            )
-        })
+                )
+            },
+            label = "usecases.feedback.read_expand"
+        ))
     }
 
     fn list<'a>(
@@ -1124,87 +1149,96 @@ impl DurableFeedbackReadStoreV1 for ProjectFeedbackStore {
         context: &'a FeedbackReadPortContext<'a>,
         request: &'a FeedbackListRequestV1,
     ) -> FeedbackReadPortFuture<'a, FeedbackListResultV1> {
-        Box::pin(async move {
-            let domains = vec![EvidenceDomain::Diagnostic];
-            if let Some(interrupted) = interruption(context.request, now_micros(), domains.clone())
-            {
-                return interrupted;
-            }
-            let Ok(publications) = self.scoped_publications(context.request).await else {
-                return unavailable(now_micros(), domains);
-            };
-            let mut finished_at = now_micros();
-            if let Some(interrupted) = interruption(context.request, finished_at, domains.clone()) {
-                return interrupted;
-            }
-            let mut latest = BTreeMap::<FeedbackFindingId, (usize, FeedbackFindingV1)>::new();
-            for (index, publication) in publications.iter().enumerate() {
-                if request
-                    .head_commit_id
-                    .as_ref()
-                    .is_some_and(|head| &publication.result.scope.head_commit_id != head)
+        Box::pin(hotpath::future!(
+            async move {
+                let domains = vec![EvidenceDomain::Diagnostic];
+                if let Some(interrupted) =
+                    interruption(context.request, now_micros(), domains.clone())
                 {
-                    continue;
+                    return interrupted;
                 }
-                for finding in &publication.result.findings {
-                    match latest.get(&finding.finding_id) {
-                        Some((prior, _))
-                            if publication_order(&publications[*prior], publication)
-                                != std::cmp::Ordering::Less => {}
-                        _ => {
-                            latest.insert(finding.finding_id.clone(), (index, finding.clone()));
+                let Ok(publications) = self.scoped_publications(context.request).await else {
+                    return unavailable(now_micros(), domains);
+                };
+                let mut finished_at = now_micros();
+                if let Some(interrupted) =
+                    interruption(context.request, finished_at, domains.clone())
+                {
+                    return interrupted;
+                }
+                let mut latest = BTreeMap::<FeedbackFindingId, (usize, FeedbackFindingV1)>::new();
+                for (index, publication) in publications.iter().enumerate() {
+                    if request
+                        .head_commit_id
+                        .as_ref()
+                        .is_some_and(|head| &publication.result.scope.head_commit_id != head)
+                    {
+                        continue;
+                    }
+                    for finding in &publication.result.findings {
+                        match latest.get(&finding.finding_id) {
+                            Some((prior, _))
+                                if publication_order(&publications[*prior], publication)
+                                    != std::cmp::Ordering::Less => {}
+                            _ => {
+                                latest.insert(finding.finding_id.clone(), (index, finding.clone()));
+                            }
                         }
                     }
                 }
-            }
-            let records: Vec<_> = latest.into_iter().collect();
-            let Ok(start) = self.list_start(context.request, request, &records, finished_at) else {
-                return unavailable(finished_at, domains);
-            };
-            let end = start
-                .saturating_add(request.page.page_size as usize)
-                .min(records.len());
-            let selected = &records[start..end];
-            let mut views = Vec::with_capacity(selected.len());
-            let mut authorities = Vec::new();
-            for (_, (publication_index, finding)) in selected {
-                let publication = &publications[*publication_index];
-                let Ok(view) =
-                    self.finding_view(context.request, publication, finding, finished_at)
+                let records: Vec<_> = latest.into_iter().collect();
+                let Ok(start) = self.list_start(context.request, request, &records, finished_at)
                 else {
                     return unavailable(finished_at, domains);
                 };
-                views.push(view);
-                authorities.push(publication);
-            }
-            let (cursor, expires_at) = if end < records.len() {
-                match self.next_list_handle(
-                    context.request,
-                    request,
-                    &records[end - 1].0,
-                    finished_at,
-                ) {
-                    Ok(next) => (Some(next.0), Some(next.1)),
-                    Err(_) => {
+                let end = start
+                    .saturating_add(request.page.page_size as usize)
+                    .min(records.len());
+                let selected = &records[start..end];
+                let mut views = Vec::with_capacity(selected.len());
+                let mut authorities = Vec::new();
+                for (_, (publication_index, finding)) in selected {
+                    let publication = &publications[*publication_index];
+                    let Ok(view) =
+                        self.finding_view(context.request, publication, finding, finished_at)
+                    else {
                         return unavailable(finished_at, domains);
-                    }
+                    };
+                    views.push(view);
+                    authorities.push(publication);
                 }
-            } else {
-                (None, None)
-            };
-            finished_at = now_micros();
-            if let Some(interrupted) = interruption(context.request, finished_at, domains.clone()) {
-                return interrupted;
-            }
-            complete(
-                FeedbackListResultV1 { findings: views },
-                authorities,
-                domains,
-                Some((records.len() as u64, cursor)),
-                expires_at,
-                finished_at,
-            )
-        })
+                let (cursor, expires_at) = if end < records.len() {
+                    match self.next_list_handle(
+                        context.request,
+                        request,
+                        &records[end - 1].0,
+                        finished_at,
+                    ) {
+                        Ok(next) => (Some(next.0), Some(next.1)),
+                        Err(_) => {
+                            return unavailable(finished_at, domains);
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+                finished_at = now_micros();
+                if let Some(interrupted) =
+                    interruption(context.request, finished_at, domains.clone())
+                {
+                    return interrupted;
+                }
+                complete(
+                    FeedbackListResultV1 { findings: views },
+                    authorities,
+                    domains,
+                    Some((records.len() as u64, cursor)),
+                    expires_at,
+                    finished_at,
+                )
+            },
+            label = "usecases.feedback.read_list"
+        ))
     }
 }
 
@@ -1245,6 +1279,7 @@ impl ProjectFeedbackStore {
         );
     }
 
+    #[hotpath::measure(label = "usecases.feedback.load_publications", future = true)]
     async fn load_publications(
         &self,
     ) -> Result<Vec<FeedbackCompletedPublicationV1>, FeedbackRuntimeError> {
@@ -1276,6 +1311,7 @@ impl ProjectFeedbackStore {
     /// Latest validated durable publication visible in the exact admitted
     /// project/repository/worktree/ref scope. Doctor consumes this mounted read
     /// store; it does not scan provider-local state or mutable paths.
+    #[hotpath::measure(label = "usecases.feedback.doctor_latest", future = true)]
     pub async fn doctor_latest_publication(
         &self,
         context: &RequestContext,
@@ -1293,6 +1329,7 @@ impl ProjectFeedbackStore {
         Ok(publication)
     }
 
+    #[hotpath::measure(label = "usecases.feedback.record_publication", future = true)]
     async fn record_publication(
         &self,
         publication: FeedbackCompletedPublicationV1,
@@ -1482,6 +1519,7 @@ impl ProjectFeedbackStore {
 /// Read the canonical durable Plan-26 observation projection from an already
 /// admitted project database. Doctor uses this same projection rather than
 /// deriving a second telemetry model.
+#[hotpath::measure(label = "usecases.feedback.observation_read_model", future = true)]
 pub async fn feedback_observation_read_model(
     database: &Database,
 ) -> Result<FeedbackObservationReadModelV1, FeedbackRuntimeError> {
@@ -1609,6 +1647,7 @@ fn interruption_outcome(context: &RequestContext, observed_at: UtcMicros) -> Fee
     }
 }
 
+#[hotpath::measure(label = "usecases.feedback.persist_observation", future = true)]
 async fn persist_feedback_observation(
     database: &Database,
     envelope: FeedbackObservationEnvelopeV1,
@@ -1690,6 +1729,7 @@ async fn persist_feedback_observation(
         .map_err(|_| FeedbackRuntimeError::Store)
 }
 
+#[hotpath::measure(label = "usecases.feedback.persist_boot", future = true)]
 async fn persist_feedback_producer_boot(
     database: &Database,
     boot_id: ManifestDigest,
@@ -1736,6 +1776,7 @@ async fn persist_feedback_producer_boot(
         .map_err(|_| FeedbackRuntimeError::Store)
 }
 
+#[hotpath::measure(label = "usecases.feedback.load_ledger", future = true)]
 async fn load_observation_ledger(
     transaction: &DatabaseWriteTransaction<'_>,
 ) -> Result<StoredFeedbackObservationLedgerV1, FeedbackRuntimeError> {

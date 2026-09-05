@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU64;
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -22,9 +23,12 @@ pub const DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1: NonZeroU64 =
 /// Environment override for the process resident-memory admission limit, in
 /// bytes. Unset, unparseable, or zero values fall back to the RAM-derived
 /// authority. The code-index worker pool derives its reservation from this
-/// same limit, so on hosts with plenty of RAM raising it both admits and
-/// widens indexing.
+/// same limit, so raising it can both admit and widen indexing, up to any
+/// finite cgroup-v2 memory ceiling.
 pub const PROCESS_RESIDENT_MEMORY_LIMIT_ENV_V1: &str = "TRACEDECAY_RESIDENT_MEMORY_LIMIT_BYTES";
+
+const PROC_SELF_CGROUP_V1: &str = "/proc/self/cgroup";
+const CGROUP_V2_ROOT_V1: &str = "/sys/fs/cgroup";
 
 /// Derive the concurrent resident-allocation authority for a known host size.
 #[must_use]
@@ -45,26 +49,117 @@ fn process_resident_memory_limit_override_v1() -> Option<NonZeroU64> {
         .and_then(NonZeroU64::new)
 }
 
+fn cgroup_v2_process_directory_v1(
+    proc_self_cgroup: &Path,
+    cgroup_root: &Path,
+) -> Option<std::path::PathBuf> {
+    let membership = std::fs::read_to_string(proc_self_cgroup).ok()?;
+    let relative = membership.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        let path = fields.next()?;
+        if hierarchy != "0" || !controllers.is_empty() {
+            return None;
+        }
+        Path::new(path)
+            .strip_prefix("/")
+            .ok()
+            .map(Path::to_path_buf)
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return None;
+    }
+    Some(cgroup_root.join(relative))
+}
+
+fn finite_cgroup_memory_value_v1(path: &Path) -> Option<u64> {
+    let value = std::fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    if value == "max" {
+        return None;
+    }
+    value.parse::<u64>().ok().map(|value| value.max(1))
+}
+
+fn cgroup_v2_memory_limit_v1(proc_self_cgroup: &Path, cgroup_root: &Path) -> Option<u64> {
+    let mut directory = cgroup_v2_process_directory_v1(proc_self_cgroup, cgroup_root)?;
+    let mut effective_limit = None;
+    loop {
+        for filename in ["memory.max", "memory.high"] {
+            if let Some(limit) = finite_cgroup_memory_value_v1(&directory.join(filename)) {
+                effective_limit =
+                    Some(effective_limit.map_or(limit, |current: u64| current.min(limit)));
+            }
+        }
+        if directory == cgroup_root {
+            break;
+        }
+        let parent = directory.parent()?;
+        if !parent.starts_with(cgroup_root) {
+            return None;
+        }
+        directory = parent.to_path_buf();
+    }
+    effective_limit
+}
+
+fn effective_memory_bytes_v1(total_memory_bytes: u64, cgroup_limit: Option<u64>) -> u64 {
+    match cgroup_limit {
+        Some(cgroup_limit) if total_memory_bytes == 0 => cgroup_limit,
+        Some(cgroup_limit) => total_memory_bytes.min(cgroup_limit),
+        None => total_memory_bytes,
+    }
+}
+
+fn process_resident_memory_limit_v1(
+    total_memory_bytes: u64,
+    cgroup_limit: Option<u64>,
+    override_limit: Option<NonZeroU64>,
+) -> NonZeroU64 {
+    let automatic_limit = process_resident_memory_limit_for_system_v1(effective_memory_bytes_v1(
+        total_memory_bytes,
+        cgroup_limit,
+    ));
+    override_limit.map_or(automatic_limit, |override_limit| {
+        cgroup_limit.map_or(override_limit, |cgroup_limit| {
+            NonZeroU64::new(override_limit.get().min(cgroup_limit))
+                .unwrap_or(DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1)
+        })
+    })
+}
+
 /// Size the shared resident-allocation authority for this process.
 ///
-/// [`PROCESS_RESIDENT_MEMORY_LIMIT_ENV_V1`] wins when it names a usable limit,
-/// so operators can raise or lower the authority without rebuilding. Otherwise
-/// `TraceDecay` retains one quarter of physical RAM outside its modeled
-/// concurrent allocations for the OS, agent hosts, and allocations that do
-/// not yet participate in this authority. The remaining authority throttles
-/// simultaneous scratch ownership; it never limits repository bytes on disk.
+/// The automatic authority uses the lower of physical RAM and this process's
+/// finite cgroup-v2 `memory.max` / `memory.high`, then retains one quarter
+/// outside modeled concurrent allocations. [`PROCESS_RESIDENT_MEMORY_LIMIT_ENV_V1`]
+/// can lower or raise the automatic authority, but a finite cgroup ceiling
+/// remains an upper bound. The resulting authority throttles simultaneous
+/// scratch ownership; it never limits repository bytes on disk.
 #[must_use]
 pub fn detected_process_resident_memory_limit_v1() -> NonZeroU64 {
-    if let Some(limit) = process_resident_memory_limit_override_v1() {
-        hotpath::gauge!("resident_memory.admission_limit_bytes").set(limit.get() as f64);
-        return limit;
-    }
     let system = System::new_with_specifics(
         RefreshKind::new().with_memory(MemoryRefreshKind::new().with_ram()),
     );
     let total_memory_bytes = system.total_memory();
-    let limit = process_resident_memory_limit_for_system_v1(total_memory_bytes);
+    let proc_self_cgroup = Path::new(PROC_SELF_CGROUP_V1);
+    let cgroup_root = Path::new(CGROUP_V2_ROOT_V1);
+    let cgroup_limit = cgroup_v2_memory_limit_v1(proc_self_cgroup, cgroup_root);
+    let effective_memory_bytes = effective_memory_bytes_v1(total_memory_bytes, cgroup_limit);
+    let limit = process_resident_memory_limit_v1(
+        total_memory_bytes,
+        cgroup_limit,
+        process_resident_memory_limit_override_v1(),
+    );
     hotpath::gauge!("resident_memory.system_total_bytes").set(total_memory_bytes as f64);
+    hotpath::gauge!("resident_memory.effective_total_bytes").set(effective_memory_bytes as f64);
+    if let Some(cgroup_limit) = cgroup_limit {
+        hotpath::gauge!("resident_memory.cgroup_limit_bytes").set(cgroup_limit as f64);
+    }
     hotpath::gauge!("resident_memory.admission_limit_bytes").set(limit.get() as f64);
     limit
 }
@@ -106,8 +201,8 @@ pub fn resident_memory_watermark_bytes_v1(limit_bytes: NonZeroU64, permille: u64
 
 /// Sample this process's resident set size directly from the kernel.
 ///
-/// The one `/proc/self/status` `VmRSS` parser in the workspace: the daemon
-/// retention tick publishes its samples into
+/// The one `/proc/self/status` `VmRSS` parser in the workspace: the daemon's
+/// dedicated resident-memory sampler publishes its samples into
 /// [`process_resident_memory_pressure_v1`], and load-scoped watchdogs (the
 /// semantic session pool's cold-load resident bound) sample it directly.
 /// Returns `None` where the kernel surface is unavailable (non-Linux hosts),
@@ -204,10 +299,10 @@ pub struct ResidentMemoryPressureRegistrationFailureV1;
 
 /// The measured side of the memory accounting loop.
 ///
-/// One reader samples real RSS (`/proc/self/status` `VmRSS` on Linux, from the
-/// daemon retention tick that already publishes the
-/// `daemon.process.resident_bytes` gauge) and publishes it here. Admission
-/// reads this cell; there is no second parser and no second timer.
+/// One dedicated reader samples real RSS (`/proc/self/status` `VmRSS` on
+/// Linux), publishes the `daemon.process.resident_bytes` gauge, and feeds this
+/// cell. Admission reads the same canonical observation; there is no second
+/// parser or publisher.
 pub struct ResidentMemoryPressureV1 {
     limit_bytes: NonZeroU64,
     high_watermark_bytes: u64,
@@ -286,19 +381,43 @@ impl ResidentMemoryPressureV1 {
         &self,
         observed_bytes: u64,
     ) -> ResidentMemoryPressureStateV1 {
+        self.publish_observation(observed_bytes);
+        if observed_bytes >= self.high_watermark_bytes {
+            self.run_pressure_reclaimers(observed_bytes);
+        }
+        self.publish_over_budget_gauge();
+        self.state()
+    }
+
+    /// Publish RSS measured by a reclaimer after it released memory.
+    ///
+    /// This updates the canonical admission observation without running the
+    /// reclaimer registry again. Reclaimers that can measure their process
+    /// effect use this path from inside the original pressure pass.
+    fn publish_post_reclaim_observed_resident_bytes(
+        &self,
+        observed_bytes: u64,
+    ) -> ResidentMemoryPressureStateV1 {
+        self.publish_observation(observed_bytes);
+        self.publish_over_budget_gauge();
+        self.state()
+    }
+
+    fn publish_observation(&self, observed_bytes: u64) {
         self.observed_bytes.store(observed_bytes, Ordering::Release);
         self.observed.store(true, Ordering::Release);
         hotpath::gauge!("daemon.memory.observed_resident_bytes").set(observed_bytes as f64);
         if observed_bytes >= self.high_watermark_bytes {
             self.over_budget.store(true, Ordering::Release);
-            self.run_pressure_reclaimers(observed_bytes);
         } else if observed_bytes <= self.low_watermark_bytes {
             self.over_budget.store(false, Ordering::Release);
         }
+    }
+
+    fn publish_over_budget_gauge(&self) {
         hotpath::gauge!("daemon.memory.over_budget").set(f64::from(u8::from(
             self.over_budget.load(Ordering::Acquire),
         )));
-        self.state()
     }
 
     #[must_use]
@@ -423,6 +542,131 @@ pub fn process_resident_memory_pressure_v1() -> &'static Arc<ResidentMemoryPress
             detected_process_resident_memory_limit_v1(),
         ))
     })
+}
+
+/// The allocator trim runs after every state reclaimer, so the pages those
+/// reclaimers just freed are returned in the same pass.
+pub const PROCESS_ALLOCATOR_TRIM_PRESSURE_PRIORITY_V1: u32 = u32::MAX;
+
+static PROCESS_ALLOCATOR_TRIM_REGISTRATION_V1: OnceLock<
+    Result<ResidentMemoryPressureRegistrationV1, ResidentMemoryPressureRegistrationFailureV1>,
+> = OnceLock::new();
+
+/// Bytes of RSS returned by one allocator trim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessAllocatorTrimV1 {
+    /// Whether the allocator reported releasing anything.
+    pub trimmed: bool,
+    /// Measured RSS before the trim, when the kernel surface reports it.
+    pub before_bytes: Option<u64>,
+    /// Measured RSS after the trim, when the kernel surface reports it.
+    pub after_bytes: Option<u64>,
+}
+
+impl ProcessAllocatorTrimV1 {
+    /// RSS the trim returned to the kernel; zero when it was not measurable.
+    #[must_use]
+    pub fn released_bytes(self) -> u64 {
+        match (self.before_bytes, self.after_bytes) {
+            (Some(before), Some(after)) => before.saturating_sub(after),
+            _ => 0,
+        }
+    }
+}
+
+/// Return freed-but-retained allocator pages to the kernel.
+///
+/// glibc keeps freed chunks inside its per-thread arenas and only unmaps a
+/// heap from its top, so a fan-out that allocates and frees on dozens of
+/// worker threads leaves most of that memory resident forever: indexing a
+/// 68 MB source tree on four cores measured 8.5 GB of arena system memory
+/// with 3.5 GB live and 4.9 GB free, and one `malloc_trim(0)` returned 3.9 GB
+/// of RSS at once. Measured RSS is what admission trusts, so those pages
+/// refuse real work. Other allocators return zero here; the reclaimer is a
+/// no-op for them.
+#[must_use]
+pub fn release_process_allocator_memory_v1() -> ProcessAllocatorTrimV1 {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        let before_bytes = sampled_process_resident_bytes_v1();
+        // SAFETY: `malloc_trim` is a process-wide, thread-safe glibc
+        // maintenance call that takes no pointers and invalidates no live
+        // allocation; it only advises the kernel about pages the allocator
+        // no longer uses.
+        let trimmed = unsafe { libc::malloc_trim(0) } == 1;
+        let after_bytes = sampled_process_resident_bytes_v1();
+        let trim = ProcessAllocatorTrimV1 {
+            trimmed,
+            before_bytes,
+            after_bytes,
+        };
+        hotpath::gauge!("daemon.memory.allocator_trim_released_bytes").set(trim.released_bytes());
+        trim
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        ProcessAllocatorTrimV1 {
+            trimmed: false,
+            before_bytes: None,
+            after_bytes: None,
+        }
+    }
+}
+
+/// Register the allocator trim as the last pressure reclaimer of `pressure`.
+pub fn register_process_allocator_pressure_reclaimer_v1(
+    pressure: &Arc<ResidentMemoryPressureV1>,
+) -> Result<ResidentMemoryPressureRegistrationV1, ResidentMemoryPressureRegistrationFailureV1> {
+    let pressure_weak = Arc::downgrade(pressure);
+    pressure.register_pressure_reclaimer(
+        PROCESS_ALLOCATOR_TRIM_PRESSURE_PRIORITY_V1,
+        Arc::new(move |request| {
+            let trim = release_process_allocator_memory_v1();
+            if let (Some(after_bytes), Some(pressure)) = (trim.after_bytes, pressure_weak.upgrade())
+            {
+                pressure.publish_post_reclaim_observed_resident_bytes(after_bytes);
+            }
+            tracing::info!(
+                event = "process_allocator_trimmed",
+                trimmed = trim.trimmed,
+                released_bytes = trim.released_bytes(),
+                observed_bytes = request.observed_bytes,
+                high_watermark_bytes = request.high_watermark_bytes,
+                "returned freed allocator pages under resident-memory pressure"
+            );
+            trim.released_bytes()
+        }),
+    )
+}
+
+/// Install the allocator trim reclaimer on the process pressure cell, once.
+///
+/// Returns whether this call installed it; later calls are no-ops that
+/// return `false`. Registration failure remains typed, and the registration
+/// lives for the process.
+pub fn install_process_allocator_pressure_reclaimer_v1()
+-> Result<bool, ResidentMemoryPressureRegistrationFailureV1> {
+    install_process_allocator_pressure_reclaimer_on_v1(
+        &PROCESS_ALLOCATOR_TRIM_REGISTRATION_V1,
+        process_resident_memory_pressure_v1(),
+    )
+}
+
+fn install_process_allocator_pressure_reclaimer_on_v1(
+    registration: &OnceLock<
+        Result<ResidentMemoryPressureRegistrationV1, ResidentMemoryPressureRegistrationFailureV1>,
+    >,
+    pressure: &Arc<ResidentMemoryPressureV1>,
+) -> Result<bool, ResidentMemoryPressureRegistrationFailureV1> {
+    let mut installed = false;
+    let result = registration.get_or_init(|| {
+        installed = true;
+        register_process_allocator_pressure_reclaimer_v1(pressure)
+    });
+    result
+        .as_ref()
+        .map(|_| installed)
+        .map_err(|failure| *failure)
 }
 
 /// Stable component label inside one exact generation identity.

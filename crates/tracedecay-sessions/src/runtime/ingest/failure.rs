@@ -484,6 +484,9 @@ pub fn classify_claude_observation_failure(
     let store = |error: &Store| match error {
         Store::CursorConflict { .. } => contended("observation_cursor_conflict"),
         Store::CursorAdvanceCollision => permanent("observation_cursor_advance_collision"),
+        Store::CursorAdvanceLedgerDisagreement { .. } => {
+            permanent("observation_cursor_advance_ledger_disagreement")
+        }
         Store::ObservationCollision { .. } => permanent("observation_identity_collision"),
         Store::SanitizationReceiptCollision => permanent("sanitization_receipt_collision"),
         Store::CursorObservationMismatch => permanent("observation_cursor_mismatch"),
@@ -646,6 +649,7 @@ mod cancellation_tests {
             provider: "cursor",
             reason: "cursor_conflict",
             retryable: true,
+            detail: None,
         };
         let disposition = classify_transcript_ingest_disposition(&conflict);
         assert_eq!(disposition.reason_code, "cursor_conflict");

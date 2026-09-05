@@ -425,7 +425,7 @@ impl RetainedParseDocument {
         edits: &[ParseInputEdit],
         new_source: impl Into<String>,
     ) -> Result<ParseReport, ParseError> {
-        self.apply_edits_normalized(next_identity, edits, new_source.into(), None)
+        self.apply_edits_normalized(next_identity, edits, new_source.into(), None, None)
     }
 
     pub fn apply_edits_prepared(
@@ -437,7 +437,7 @@ impl RetainedParseDocument {
     ) -> Result<ParseReport, ParseError> {
         let new_source = new_source.into();
         let new_parsed_source = normalize_parsed_source(&new_source, new_parsed_source.into());
-        self.apply_edits_normalized(next_identity, edits, new_source, new_parsed_source)
+        self.apply_edits_normalized(next_identity, edits, new_source, new_parsed_source, None)
     }
 
     fn apply_edits_normalized(
@@ -446,6 +446,7 @@ impl RetainedParseDocument {
         edits: &[ParseInputEdit],
         new_source: String,
         new_parsed_source: Option<String>,
+        source_edit: Option<ParseInputEdit>,
     ) -> Result<ParseReport, ParseError> {
         if !self.identity.identifies_same_document(&next_identity) {
             crate::hotpath_observe::record_retained_parse_abstention(
@@ -495,7 +496,7 @@ impl RetainedParseDocument {
             });
         }
 
-        let source_edit = minimal_edit(&self.source, &new_source);
+        let source_edit = source_edit.unwrap_or_else(|| minimal_edit(&self.source, &new_source));
         let mut edited_tree = self.tree.clone();
         for edit in edits {
             edited_tree.edit(&(*edit).into());
@@ -575,10 +576,22 @@ impl RetainedParseDocument {
             if self.parsed_source != new_parsed_source {
                 return self.replace_normalized(next_identity, new_source, new_parsed_source);
             }
-            return self.apply_edits_normalized(next_identity, &[], new_source, new_parsed_source);
+            return self.apply_edits_normalized(
+                next_identity,
+                &[],
+                new_source,
+                new_parsed_source,
+                None,
+            );
         }
         let edit = minimal_edit(&self.source, &new_source);
-        self.apply_edits_normalized(next_identity, &[edit], new_source, new_parsed_source)
+        self.apply_edits_normalized(
+            next_identity,
+            &[edit],
+            new_source,
+            new_parsed_source,
+            Some(edit),
+        )
     }
 
     /// Parse a whole-document replacement without consulting the prior tree.
@@ -1001,5 +1014,23 @@ fn grammar_key<'a>(language_id: &'a str, logical_path: &str) -> &'a str {
         },
         "typescriptreact" => "tsx",
         _ => language_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimal_edit_is_confined_to_the_changed_token() {
+        let before = "fn unchanged() {}\nfn edited() -> u32 { 1 }\n";
+        let after = "fn unchanged() {}\nfn edited() -> u32 { 123 }\n";
+        let edit = minimal_edit(before, after);
+
+        assert_eq!(&before[edit.start_byte..edit.old_end_byte], "");
+        assert_eq!(&after[edit.start_byte..edit.new_end_byte], "23");
+        assert_eq!(edit.start_position, ParsePoint { row: 1, column: 22 });
+        assert_eq!(edit.old_end_position, ParsePoint { row: 1, column: 22 });
+        assert_eq!(edit.new_end_position, ParsePoint { row: 1, column: 24 });
     }
 }

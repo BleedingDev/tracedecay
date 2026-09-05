@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_runtime_core::{
@@ -23,6 +23,15 @@ pub use delivery_settlement::{
     PendingDeliverySourceReceiptV1, WorkAttemptDeliveryCensusReadV1,
 };
 
+type SessionRelationGraphStateV1 = RwLock<
+    Option<(
+        tracedecay_session_temporal_store::relations::SessionRelationScope,
+        tracedecay_graph_db::GraphDbLeaseV1,
+        StoreRuntimeBindingV1,
+        VerifiedStoreLocatorV1,
+    )>,
+>;
+
 /// The sole map owner for one registered global-database publication.
 ///
 /// It can issue independently counted client leases, but cannot be cloned or
@@ -31,6 +40,7 @@ pub use delivery_settlement::{
 pub struct RegisteredGlobalDbOwnerV1 {
     database: DatabaseOwnerV1,
     project_graph: Arc<OnceLock<VerifiedGraphRuntimeWeakProxyV1>>,
+    session_relation_graph: Arc<SessionRelationGraphStateV1>,
 }
 
 /// Cloneable, weak issuance route for one registered global-database owner.
@@ -42,6 +52,7 @@ pub struct RegisteredGlobalDbOwnerV1 {
 pub struct RegisteredGlobalDbWeakLeaseIssuerV1 {
     database: DatabaseOwnerWeakLeaseIssuerV1,
     project_graph: Arc<OnceLock<VerifiedGraphRuntimeWeakProxyV1>>,
+    session_relation_graph: Weak<SessionRelationGraphStateV1>,
 }
 
 impl RegisteredGlobalDbOwnerV1 {
@@ -77,6 +88,7 @@ impl RegisteredGlobalDbOwnerV1 {
         Ok(Self {
             database,
             project_graph: Arc::new(OnceLock::new()),
+            session_relation_graph: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -97,6 +109,7 @@ impl RegisteredGlobalDbOwnerV1 {
             Self {
                 database,
                 project_graph: Arc::new(OnceLock::new()),
+                session_relation_graph: Arc::new(RwLock::new(None)),
             },
             convergence,
         ))
@@ -110,6 +123,7 @@ impl RegisteredGlobalDbOwnerV1 {
             RegisteredGlobalDb::from_database_with_project_graph(
                 self.database.issue_lease()?,
                 Arc::clone(&self.project_graph),
+                Arc::clone(&self.session_relation_graph),
             ),
         ))
     }
@@ -120,6 +134,7 @@ impl RegisteredGlobalDbOwnerV1 {
             RegisteredGlobalDb::from_database_with_project_graph(
                 self.database.issue_read_only_lease()?,
                 Arc::clone(&self.project_graph),
+                Arc::clone(&self.session_relation_graph),
             ),
         ))
     }
@@ -131,7 +146,20 @@ impl RegisteredGlobalDbOwnerV1 {
         RegisteredGlobalDbWeakLeaseIssuerV1 {
             database: self.database.weak_lease_issuer(),
             project_graph: Arc::clone(&self.project_graph),
+            session_relation_graph: Arc::downgrade(&self.session_relation_graph),
         }
+    }
+
+    /// Releases the graph client shared by every live lease from this owner.
+    ///
+    /// Session-runtime retirement calls this before closing the native graph
+    /// owner. Existing database leases remain valid for SQL access but can no
+    /// longer keep the retired graph writer locked.
+    pub fn detach_session_relation_graph(&self) {
+        *self
+            .session_relation_graph
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Starts the exact database-owner reservation used by daemon map
@@ -158,10 +186,15 @@ impl RegisteredGlobalDbWeakLeaseIssuerV1 {
     pub fn issue_lease(
         &self,
     ) -> Result<RegisteredGlobalDbLeaseV1, DatabaseOwnerWeakLeaseIssuerErrorV1> {
+        let session_relation_graph = self
+            .session_relation_graph
+            .upgrade()
+            .ok_or(DatabaseOwnerWeakLeaseIssuerErrorV1::Unavailable)?;
         Ok(RegisteredGlobalDbLeaseV1::from_database(
             RegisteredGlobalDb::from_database_with_project_graph(
                 self.database.issue_lease()?,
                 Arc::clone(&self.project_graph),
+                session_relation_graph,
             ),
         ))
     }
@@ -228,12 +261,7 @@ impl RegisteredGlobalDbLeaseV1 {
 pub struct RegisteredGlobalDb {
     database: Database,
     project_graph: Arc<OnceLock<VerifiedGraphRuntimeWeakProxyV1>>,
-    session_relation_graph: OnceLock<(
-        tracedecay_session_temporal_store::relations::SessionRelationScope,
-        tracedecay_graph_db::GraphDbLeaseV1,
-        StoreRuntimeBindingV1,
-        VerifiedStoreLocatorV1,
-    )>,
+    session_relation_graph: Arc<SessionRelationGraphStateV1>,
 }
 
 impl RegisteredGlobalDb {
@@ -242,7 +270,7 @@ impl RegisteredGlobalDb {
         &self,
         convergence: super::schema_stages::RegisteredSchemaConvergence,
     ) -> tracedecay_domain::errors::Result<()> {
-        super::schema_stages::converge_registered_schema(&self.database, convergence).await
+        super::schema_stages::converge_registered_schema(self.runtime_database(), convergence).await
     }
 
     pub async fn release_connection_memory(&self) -> tracedecay_domain::errors::Result<()> {
@@ -271,17 +299,22 @@ impl RegisteredGlobalDb {
     }
 
     fn from_database(database: Database) -> Self {
-        Self::from_database_with_project_graph(database, Arc::new(OnceLock::new()))
+        Self::from_database_with_project_graph(
+            database,
+            Arc::new(OnceLock::new()),
+            Arc::new(RwLock::new(None)),
+        )
     }
 
     fn from_database_with_project_graph(
         database: Database,
         project_graph: Arc<OnceLock<VerifiedGraphRuntimeWeakProxyV1>>,
+        session_relation_graph: Arc<SessionRelationGraphStateV1>,
     ) -> Self {
         Self {
             database,
             project_graph,
-            session_relation_graph: OnceLock::new(),
+            session_relation_graph,
         }
     }
 
@@ -623,6 +656,10 @@ impl RegisteredGlobalDb {
 
     pub fn db_path(&self) -> &Path {
         self.database.canonical_database_path()
+    }
+
+    pub(crate) fn runtime_database(&self) -> &Database {
+        &self.database
     }
 
     pub fn git_index_transaction_store(

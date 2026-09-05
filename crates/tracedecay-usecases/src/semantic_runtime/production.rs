@@ -13,12 +13,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tracedecay_domain::{
     ChangedCodeChunkSetV1, ChangedCodeChunkV1, CodeGenerationId, CodeSearchChunkV1,
-    CompactCandidate, ComponentRevision, EvidenceRole, FixedPointScore, LogicalEvidenceId,
-    ManifestDigest, ProjectionBatchRequestV1, ProjectionOperationV1, ProjectionReplayReasonV1,
-    QueryFallbackSubpayload, RetrievalAnchorId, RetrievalCursorKeyId, RetrieverBatch,
-    RetrieverKind, RetrieverOutcome, ScoreDomainId, SemanticSearchIndexKeyV1,
-    SemanticSearchIndexKindV1, SemanticSearchIndexProfileV1, SourceOccurrenceId,
-    VectorGenerationIdV1, WorktreeId, canonical_sha256,
+    CompactCandidate, ComponentRevision, EmbeddingDocumentCompositionV1, EvidenceRole,
+    FixedPointScore, LogicalEvidenceId, ManifestDigest, ProjectionBatchRequestV1,
+    ProjectionOperationV1, ProjectionReplayReasonV1, QueryFallbackSubpayload, RetrievalAnchorId,
+    RetrievalCursorKeyId, RetrieverBatch, RetrieverKind, RetrieverOutcome, ScoreDomainId,
+    SemanticSearchIndexKeyV1, SemanticSearchIndexKindV1, SemanticSearchIndexProfileV1,
+    SourceOccurrenceId, VectorGenerationIdV1, WorktreeId, canonical_sha256,
 };
 use tracedecay_policy::retrieval_selection::{
     RetrievalAvailabilityV1, RetrievalRequirementV1, RetrievalSelectionV1, select_retrieval,
@@ -46,6 +46,9 @@ pub use application_status::{
     prefer_lifecycle_over_generic_unavailable, resolve_semantic_application_status,
 };
 use publication_failure::SemanticPublicationFailureRecorderV1;
+use tracedecay_code_index::embedding_document::{
+    EmbeddingDocumentComposerV1, EmbeddingSymbolContextIndexV1,
+};
 use tracedecay_code_index::production::CodeIndexPublishedGenerationV1;
 use tracedecay_code_index::projection::expected_request_digest;
 use tracedecay_graph_db::GraphCancellation;
@@ -58,12 +61,13 @@ use tracedecay_query::retrieval::ports::{
 use tracedecay_query::retrieval::rerank::RerankExecutionControlV1;
 use tracedecay_query::retrieval::semantic::{
     CalibratedSemanticQueryService, CodeSemanticEvidenceV1, CompleteSemanticGenerationV1,
-    SemanticAbstentionDispositionV1, SemanticAnnCandidatesV1, SemanticAnnIndexStateV1,
-    SemanticCalibrationProfileV1, SemanticCodeRetriever, SemanticExecutionControl,
-    SemanticIndexStateV1, SemanticLaneReadinessV1, SemanticLaneRetriever, SemanticQueryDecisionV1,
-    SemanticQueryModeV1, SemanticQueryServiceError, SemanticQueryServiceOutcomeV1,
-    SemanticRetrievalRequestV1, SemanticSearchKindV1, SemanticVectorReadPort,
-    SemanticVectorReadRequestV1, SemanticVectorRecordV1, SemanticVectorScanSummaryV1,
+    SemanticAbstentionDispositionV1, SemanticAnnCandidateWindowV1, SemanticAnnCandidatesV1,
+    SemanticAnnIndexStateV1, SemanticCalibrationProfileV1, SemanticCodeRetriever,
+    SemanticExecutionControl, SemanticIndexStateV1, SemanticLaneReadinessV1, SemanticLaneRetriever,
+    SemanticQueryDecisionV1, SemanticQueryModeV1, SemanticQueryServiceError,
+    SemanticQueryServiceOutcomeV1, SemanticRetrievalRequestV1, SemanticSearchKindV1,
+    SemanticVectorReadPort, SemanticVectorReadRequestV1, SemanticVectorRecordV1,
+    SemanticVectorScanSummaryV1,
 };
 use tracedecay_query::search_quality::candidate_output::ProductionCandidateSemanticProjectionSourcesV1;
 use tracedecay_query::search_quality::semantic_native::{
@@ -162,6 +166,7 @@ where
         generation.manifest().generation_id.clone(),
         generation.projection().request().clone(),
         generation.chunks().chunks().to_vec(),
+        embedding_documents(generation),
         SEMANTIC_EMBEDS_PER_COMMIT,
         load_artifact,
         // This helper owns no staged build, so it never resumes and its
@@ -177,6 +182,18 @@ where
     handle.schedule_generation(request)
 }
 
+/// The symbol-context authority that composes one published generation's
+/// embedding documents. It is the generation's own sealed symbol index, so
+/// header content is parser evidence from the same sanitized bytes as the
+/// chunks it accompanies.
+fn embedding_documents(
+    generation: &CodeIndexPublishedGenerationV1,
+) -> Arc<EmbeddingDocumentComposerV1> {
+    Arc::new(EmbeddingDocumentComposerV1::new(
+        EmbeddingSymbolContextIndexV1::from_generation_symbols(generation.symbols()),
+    ))
+}
+
 /// Daemon-owned production bridge from lifecycle-ready model bytes to the
 /// persistent vector store and exact process-local query cache.
 #[derive(Clone)]
@@ -188,6 +205,9 @@ pub struct ProductionSemanticRuntimeV1 {
     code_index_store_root: PathBuf,
     lifecycle: Arc<SemanticModelLifecycleOwnerV1>,
     resources: SemanticResourceCeilings,
+    /// Configured embedding-document composition; with `resources` it fixes
+    /// the projection key every production and evaluator projection mints.
+    document_composition: EmbeddingDocumentCompositionV1,
     vector_read_cache: Arc<Mutex<Option<CachedPublishedVectorsV1>>>,
 }
 
@@ -269,6 +289,7 @@ pub struct SemanticCompatibleCurrentGenerationSnapshotV1 {
 pub struct SemanticEvaluationCurrentGenerationSnapshotV1 {
     pub vector_state_revision: i64,
     pub vector_generation_id: VectorGenerationIdV1,
+    pub source_manifest_digest: ManifestDigest,
 }
 
 /// Exact pre-acceptance target certified against the live semantic runtime.
@@ -338,7 +359,10 @@ pub struct PreparedProductionSemanticCacheCommitV1 {
 }
 
 enum PreparedProductionSemanticCacheActionV1 {
-    Observation(PreparedSemanticRuntimeObservationV1),
+    Observation {
+        prepared: PreparedSemanticRuntimeObservationV1,
+        lifecycle: Arc<SemanticModelLifecycleOwnerV1>,
+    },
     Restore {
         prepared: Box<PreparedSemanticRuntimeRestoreV1>,
         cache: Arc<Mutex<Option<CachedPublishedVectorsV1>>>,
@@ -350,9 +374,12 @@ enum PreparedProductionSemanticCacheActionV1 {
 impl PreparedProductionSemanticCacheCommitV1 {
     pub fn commit(self) -> bool {
         match self.prepared {
-            PreparedProductionSemanticCacheActionV1::Observation(prepared) => {
-                self.handle.commit_current_observation(prepared)
-            }
+            PreparedProductionSemanticCacheActionV1::Observation {
+                prepared,
+                lifecycle,
+            } => commit_current_observation_and_then(&self.handle, prepared, || {
+                let _ = lifecycle.mark_ready();
+            }),
             PreparedProductionSemanticCacheActionV1::Restore {
                 prepared,
                 cache,
@@ -376,6 +403,18 @@ impl PreparedProductionSemanticCacheCommitV1 {
     }
 }
 
+fn commit_current_observation_and_then(
+    handle: &DaemonSemanticRuntimeHandleV1,
+    prepared: PreparedSemanticRuntimeObservationV1,
+    after_commit: impl FnOnce(),
+) -> bool {
+    let committed = handle.commit_current_observation(prepared);
+    if committed {
+        after_commit();
+    }
+    committed
+}
+
 impl ProductionSemanticRuntimeV1 {
     pub fn new(
         handle: DaemonSemanticRuntimeHandleV1,
@@ -383,6 +422,7 @@ impl ProductionSemanticRuntimeV1 {
         graph: Arc<dyn SemanticVectorGraphProviderV1>,
         lifecycle: Arc<SemanticModelLifecycleOwnerV1>,
         resources: SemanticResourceCeilings,
+        document_composition: EmbeddingDocumentCompositionV1,
     ) -> Self {
         let code_index_store_root = database
             .database_path()
@@ -395,6 +435,7 @@ impl ProductionSemanticRuntimeV1 {
             code_index_store_root,
             lifecycle,
             resources,
+            document_composition,
         )
     }
 
@@ -404,6 +445,7 @@ impl ProductionSemanticRuntimeV1 {
         code_index_store_root: PathBuf,
         lifecycle: Arc<SemanticModelLifecycleOwnerV1>,
         resources: SemanticResourceCeilings,
+        document_composition: EmbeddingDocumentCompositionV1,
     ) -> Self {
         Self {
             handle,
@@ -412,6 +454,7 @@ impl ProductionSemanticRuntimeV1 {
             code_index_store_root,
             lifecycle,
             resources,
+            document_composition,
             vector_read_cache: Arc::new(Mutex::new(None)),
         }
     }
@@ -428,6 +471,7 @@ impl ProductionSemanticRuntimeV1 {
     }
 
     /// Restore a compatible immutable generation after daemon restart.
+    #[hotpath::measure(label = "usecases.semantic.restore_current", future = true)]
     pub async fn restore_current(
         &self,
         generation: &CodeIndexPublishedGenerationV1,
@@ -442,6 +486,7 @@ impl ProductionSemanticRuntimeV1 {
         Ok(prepared.commit())
     }
 
+    #[hotpath::measure(label = "usecases.semantic.prepare_restore", future = true)]
     pub async fn prepare_restore_current(
         &self,
         generation: &CodeIndexPublishedGenerationV1,
@@ -467,6 +512,7 @@ impl ProductionSemanticRuntimeV1 {
             &self.lifecycle,
             generation.manifest(),
             self.resources,
+            self.document_composition,
         )?;
         let source_manifest_digest =
             semantic_source_manifest_digest(generation.projection().request());
@@ -521,8 +567,14 @@ impl ProductionSemanticRuntimeV1 {
         let lifecycle = Arc::clone(&self.lifecycle);
         let manifest = generation.manifest().clone();
         let resources = self.resources;
+        let document_composition = self.document_composition;
         let artifact = tokio::task::spawn_blocking(move || {
-            LoadedSemanticArtifactV1::from_lifecycle(&lifecycle, &manifest, resources)
+            LoadedSemanticArtifactV1::from_lifecycle(
+                &lifecycle,
+                &manifest,
+                resources,
+                document_composition,
+            )
         })
         .await
         .map_err(|_| SemanticRuntimeScheduleFailureV1::Runtime)??;
@@ -559,7 +611,10 @@ impl ProductionSemanticRuntimeV1 {
         let prepared = self.handle.prepare_current_observation(&pointer)?;
         Some(PreparedProductionSemanticCacheCommitV1 {
             handle: self.handle.clone(),
-            prepared: PreparedProductionSemanticCacheActionV1::Observation(prepared),
+            prepared: PreparedProductionSemanticCacheActionV1::Observation {
+                prepared,
+                lifecycle: Arc::clone(&self.lifecycle),
+            },
         })
     }
 
@@ -605,6 +660,7 @@ impl ProductionSemanticRuntimeV1 {
     ) -> Result<PreparedSemanticEvaluationGenerationV1, SemanticRuntimeScheduleFailureV1> {
         self.prepare_evaluation_generation_with_cache(
             generation,
+            None,
             Arc::new(SemanticEvaluationProjectionBatchCacheV1::new()),
             cancellation,
         )
@@ -628,12 +684,14 @@ impl ProductionSemanticRuntimeV1 {
         ))
     }
 
-    /// Prepare one evaluator generation with a cache retained by the daemon's
-    /// enclosing evaluation request. The cache is never attached to the
-    /// runtime, lifecycle, or durable vector state.
+    /// Prepare one evaluator generation with authorities retained by the
+    /// daemon's enclosing evaluation request. The optional query factory owns
+    /// the one shared model runtime; the batch cache remains detached from the
+    /// lifecycle and durable vector state.
     pub fn prepare_evaluation_generation_with_cache(
         &self,
         generation: &CodeIndexPublishedGenerationV1,
+        query_factory: Option<&SemanticEvaluationQueryFactoryV1>,
         projection_batch_cache: Arc<SemanticEvaluationProjectionBatchCacheV1>,
         cancellation: Arc<dyn SemanticEvaluationCancellationV1>,
     ) -> Result<PreparedSemanticEvaluationGenerationV1, SemanticRuntimeScheduleFailureV1> {
@@ -643,6 +701,7 @@ impl ProductionSemanticRuntimeV1 {
             &self.lifecycle,
             generation.manifest(),
             self.resources,
+            self.document_composition,
         )?;
         let artifact_digest = artifact
             .projection()
@@ -653,15 +712,19 @@ impl ProductionSemanticRuntimeV1 {
         let request = semantic_projection_request(generation, &projection, None)?;
         let projection_input_bytes = projection_input_bytes(generation.chunks().chunks())?;
         let started = std::time::Instant::now();
-        let prepared = prepare_semantic_evaluation_projection(
-            artifact,
-            request,
-            generation.chunks().chunks(),
-            evaluation_projection_resources(execution),
-            projection_batch_cache.as_ref(),
-            SemanticEvaluationProjectionBatchCachePolicyV1::ReuseCompletedBatches,
-            Arc::clone(&cancellation),
-        )?;
+        let prepared = hotpath::measure_block!("search_eval.projection.case.clean.prepare", {
+            prepare_semantic_evaluation_projection(
+                artifact,
+                query_factory,
+                request,
+                generation.chunks().chunks(),
+                embedding_documents(generation),
+                evaluation_projection_resources(execution),
+                projection_batch_cache.as_ref(),
+                SemanticEvaluationProjectionBatchCachePolicyV1::ReuseCompletedBatches,
+                Arc::clone(&cancellation),
+            )
+        })?;
         PreparedSemanticEvaluationGenerationV1::new(
             generation.clone(),
             prepared,
@@ -716,17 +779,22 @@ impl ProductionSemanticRuntimeV1 {
             &self.lifecycle,
             generation.manifest(),
             self.resources,
+            self.document_composition,
         )?;
         let started = std::time::Instant::now();
-        let prepared = prepare_semantic_evaluation_projection(
-            artifact,
-            request,
-            &chunks,
-            evaluation_projection_resources(self.resources),
-            current.projection_batch_cache.as_ref(),
-            SemanticEvaluationProjectionBatchCachePolicyV1::ReuseCompletedBatches,
-            Arc::clone(&current.cancellation),
-        )?;
+        let prepared = hotpath::measure_block!("search_eval.projection.incremental.prepare", {
+            prepare_semantic_evaluation_projection(
+                artifact,
+                Some(&current.query_factory),
+                request,
+                &chunks,
+                embedding_documents(generation),
+                evaluation_projection_resources(self.resources),
+                current.projection_batch_cache.as_ref(),
+                SemanticEvaluationProjectionBatchCachePolicyV1::ReuseCompletedBatches,
+                Arc::clone(&current.cancellation),
+            )
+        })?;
         if prepared.prepared.request.changes.from_generation.as_ref()
             != Some(&current.source_generation)
             || prepared.prepared.request.changes.to_generation
@@ -771,15 +839,17 @@ impl ProductionSemanticRuntimeV1 {
             Arc::new(SemanticEvaluationGraphCancellationV1 {
                 evaluation: Arc::clone(&clean.cancellation),
             });
-        let graph = isolated_semantic_evaluation_graph(
-            &[
-                &clean.code,
-                sources.one_symbol,
-                sources.no_op,
-                sources.deletion,
-            ],
-            graph_cancellation,
-        )
+        let graph = hotpath::measure_block!("search_eval.projection.case_graph.materialize", {
+            isolated_semantic_evaluation_graph(
+                &[
+                    &clean.code,
+                    sources.one_symbol,
+                    sources.no_op,
+                    sources.deletion,
+                ],
+                graph_cancellation,
+            )
+        })
         .map_err(SemanticRuntimeScheduleFailureV1::publication)?;
         self.measure_evaluation_projection_cases_in_store(&graph, clean, sources)
             .await
@@ -812,12 +882,14 @@ impl ProductionSemanticRuntimeV1 {
             .map_err(SemanticRuntimeScheduleFailureV1::publication)?;
         let cancellation = Arc::clone(clean_retained.cancellation());
         let store = evaluation_projection_case_store(&clean_retained, clean_prepared)?;
-        let clean_build = store
-            .rebuild_generation(clean_plan.clone(), Arc::clone(&cancellation))
-            .await
-            .map_err(SemanticRuntimeScheduleFailureV1::projection)?
-            .build_id()
-            .clone();
+        let clean_build = hotpath::future!(
+            store.rebuild_generation(clean_plan.clone(), Arc::clone(&cancellation)),
+            label = "search_eval.projection.case.clean.graph_begin"
+        )
+        .await
+        .map_err(SemanticRuntimeScheduleFailureV1::projection)?
+        .build_id()
+        .clone();
 
         // Replay workload: the first writer begins the durable
         // stage and dies before committing; a fresh store partition recovers
@@ -844,18 +916,23 @@ impl ProductionSemanticRuntimeV1 {
                 ));
             }
         };
-        commit_evaluation_prepared_generation(
-            &replay_store,
-            &replay_build,
-            clean_prepared,
-            clean.code.chunks().chunks(),
-            Arc::clone(&cancellation),
+        hotpath::future!(
+            commit_evaluation_prepared_generation(
+                &replay_store,
+                &replay_build,
+                clean_prepared,
+                clean.code.chunks().chunks(),
+                Arc::clone(&cancellation),
+            ),
+            label = "search_eval.projection.case.clean.graph_commit"
         )
         .await?;
-        let clean_publication = replay_store
-            .publish_generation(&replay_build, Arc::clone(&cancellation))
-            .await
-            .map_err(SemanticRuntimeScheduleFailureV1::projection)?;
+        let clean_publication = hotpath::future!(
+            replay_store.publish_generation(&replay_build, Arc::clone(&cancellation)),
+            label = "search_eval.projection.case.clean.graph_publish"
+        )
+        .await
+        .map_err(SemanticRuntimeScheduleFailureV1::projection)?;
         if !replay_store
             .published_generation_is_visible(
                 &clean_publication.generation_id,
@@ -872,10 +949,12 @@ impl ProductionSemanticRuntimeV1 {
         // generation without re-doing any work.
         let idempotent_store = evaluation_projection_case_store(&clean_retained, clean_prepared)?;
         let idempotent_started = std::time::Instant::now();
-        let idempotent = idempotent_store
-            .begin_generation(clean_plan, Arc::clone(&cancellation))
-            .await
-            .map_err(SemanticRuntimeScheduleFailureV1::projection)?;
+        let idempotent = hotpath::future!(
+            idempotent_store.begin_generation(clean_plan, Arc::clone(&cancellation)),
+            label = "search_eval.projection.case.idempotency.graph_observe"
+        )
+        .await
+        .map_err(SemanticRuntimeScheduleFailureV1::projection)?;
         if !matches!(
             idempotent,
             VectorGenerationBeginOutcomeV1::AlreadyPublished {
@@ -917,22 +996,29 @@ impl ProductionSemanticRuntimeV1 {
             source_generation: clean_prepared.request.changes.to_generation.clone(),
             projection_key: clean_prepared.request.target_projection_key.clone(),
         };
-        let (one_symbol, one_symbol_elapsed, one_symbol_input) = self.prepare_projection_case(
-            sources.one_symbol,
-            Some(&clean_pointer),
-            &clean.projection_batch_cache,
-            &clean.cancellation,
+        let (one_symbol, one_symbol_elapsed, one_symbol_input) = hotpath::measure_block!(
+            "search_eval.projection.case.one_symbol.prepare",
+            self.prepare_projection_case(
+                sources.one_symbol,
+                Some(&clean_pointer),
+                &clean.query_factory,
+                &clean.projection_batch_cache,
+                &clean.cancellation,
+            )
         )?;
         let one_symbol_retained = graph
             .retained(&one_symbol.request.changes.to_generation)
             .map_err(SemanticRuntimeScheduleFailureV1::publication)?;
         let one_symbol_store = evaluation_projection_case_store(&one_symbol_retained, &one_symbol)?;
-        let one_symbol_publication = publish_evaluation_projection_case_isolated(
-            &one_symbol_store,
-            &cancellation,
-            sources.one_symbol,
-            &one_symbol,
-            Some(clean_publication.generation_id.clone()),
+        let one_symbol_publication = hotpath::future!(
+            publish_evaluation_projection_case_isolated(
+                &one_symbol_store,
+                &cancellation,
+                sources.one_symbol,
+                &one_symbol,
+                Some(clean_publication.generation_id.clone()),
+            ),
+            label = "search_eval.projection.case.one_symbol.graph_publish"
         )
         .await?;
         samples.insert(
@@ -950,22 +1036,29 @@ impl ProductionSemanticRuntimeV1 {
             source_generation: one_symbol.request.changes.to_generation.clone(),
             projection_key: one_symbol.request.target_projection_key.clone(),
         };
-        let (no_op, no_op_elapsed, no_op_input) = self.prepare_projection_case(
-            sources.no_op,
-            Some(&one_symbol_pointer),
-            &clean.projection_batch_cache,
-            &clean.cancellation,
+        let (no_op, no_op_elapsed, no_op_input) = hotpath::measure_block!(
+            "search_eval.projection.case.no_op.prepare",
+            self.prepare_projection_case(
+                sources.no_op,
+                Some(&one_symbol_pointer),
+                &clean.query_factory,
+                &clean.projection_batch_cache,
+                &clean.cancellation,
+            )
         )?;
         let no_op_retained = graph
             .retained(&no_op.request.changes.to_generation)
             .map_err(SemanticRuntimeScheduleFailureV1::publication)?;
         let no_op_store = evaluation_projection_case_store(&no_op_retained, &no_op)?;
-        let no_op_publication = publish_evaluation_projection_case_isolated(
-            &no_op_store,
-            &cancellation,
-            sources.no_op,
-            &no_op,
-            Some(one_symbol_publication.generation_id.clone()),
+        let no_op_publication = hotpath::future!(
+            publish_evaluation_projection_case_isolated(
+                &no_op_store,
+                &cancellation,
+                sources.no_op,
+                &no_op,
+                Some(one_symbol_publication.generation_id.clone()),
+            ),
+            label = "search_eval.projection.case.no_op.graph_publish"
         )
         .await?;
         samples.insert(
@@ -983,22 +1076,29 @@ impl ProductionSemanticRuntimeV1 {
             source_generation: no_op.request.changes.to_generation.clone(),
             projection_key: no_op.request.target_projection_key.clone(),
         };
-        let (deletion, deletion_elapsed, deletion_input) = self.prepare_projection_case(
-            sources.deletion,
-            Some(&no_op_pointer),
-            &clean.projection_batch_cache,
-            &clean.cancellation,
+        let (deletion, deletion_elapsed, deletion_input) = hotpath::measure_block!(
+            "search_eval.projection.case.deletion.prepare",
+            self.prepare_projection_case(
+                sources.deletion,
+                Some(&no_op_pointer),
+                &clean.query_factory,
+                &clean.projection_batch_cache,
+                &clean.cancellation,
+            )
         )?;
         let deletion_retained = graph
             .retained(&deletion.request.changes.to_generation)
             .map_err(SemanticRuntimeScheduleFailureV1::publication)?;
         let deletion_store = evaluation_projection_case_store(&deletion_retained, &deletion)?;
-        let _deletion_publication = publish_evaluation_projection_case_isolated(
-            &deletion_store,
-            &cancellation,
-            sources.deletion,
-            &deletion,
-            Some(no_op_publication.generation_id.clone()),
+        let _deletion_publication = hotpath::future!(
+            publish_evaluation_projection_case_isolated(
+                &deletion_store,
+                &cancellation,
+                sources.deletion,
+                &deletion,
+                Some(no_op_publication.generation_id.clone()),
+            ),
+            label = "search_eval.projection.case.deletion.graph_publish"
         )
         .await?;
         samples.insert(
@@ -1015,6 +1115,7 @@ impl ProductionSemanticRuntimeV1 {
             &self.lifecycle,
             sources.deletion.manifest(),
             self.resources,
+            self.document_composition,
         )?;
         let cancellation_projection = cancellation_artifact.projection().clone();
         let cancellation_request =
@@ -1060,10 +1161,12 @@ impl ProductionSemanticRuntimeV1 {
             generation_identity_digest(&cancellation_plan)
                 .map_err(SemanticRuntimeScheduleFailureV1::projection)?,
         );
-        let cancellation_build = cancellation_store
-            .begin_generation(cancellation_plan, Arc::clone(&cancellation))
-            .await
-            .map_err(SemanticRuntimeScheduleFailureV1::projection)?;
+        let cancellation_build = hotpath::future!(
+            cancellation_store.begin_generation(cancellation_plan, Arc::clone(&cancellation)),
+            label = "search_eval.projection.case.cancellation.graph_begin"
+        )
+        .await
+        .map_err(SemanticRuntimeScheduleFailureV1::projection)?;
         let VectorGenerationBeginOutcomeV1::ReplayFromStart {
             build_id: cancellation_build,
         } = cancellation_build
@@ -1077,19 +1180,24 @@ impl ProductionSemanticRuntimeV1 {
         {
             return Err(SemanticRuntimeScheduleFailureV1::Projection);
         }
-        let cancellation_measurement = measure_semantic_evaluation_projection_cancellation(
-            cancellation_artifact,
-            cancellation_request.clone(),
-            &cancellation_chunks,
-            evaluation_projection_resources(self.resources).max_sessions,
-            self.resources.max_resident_bytes,
-            clean.projection_batch_cache.as_ref(),
-            Arc::clone(&clean.cancellation),
+        let cancellation_measurement = hotpath::measure_block!(
+            "search_eval.projection.case.cancellation.prepare",
+            measure_semantic_evaluation_projection_cancellation(
+                cancellation_artifact,
+                &clean.query_factory,
+                cancellation_request.clone(),
+                &cancellation_chunks,
+                embedding_documents(sources.deletion),
+                clean.projection_batch_cache.as_ref(),
+                Arc::clone(&clean.cancellation),
+            )
         );
-        if !cancellation_store
-            .cancel_generation(&cancellation_build, Arc::clone(&cancellation))
-            .await
-            .map_err(SemanticRuntimeScheduleFailureV1::projection)?
+        if !hotpath::future!(
+            cancellation_store.cancel_generation(&cancellation_build, Arc::clone(&cancellation),),
+            label = "search_eval.projection.case.cancellation.graph_cancel"
+        )
+        .await
+        .map_err(SemanticRuntimeScheduleFailureV1::projection)?
         {
             return Err(SemanticRuntimeScheduleFailureV1::Projection);
         }
@@ -1136,13 +1244,16 @@ impl ProductionSemanticRuntimeV1 {
             },
         );
 
-        let (incompatible, incompatible_elapsed, incompatible_input) = self
-            .prepare_projection_case(
+        let (incompatible, incompatible_elapsed, incompatible_input) = hotpath::measure_block!(
+            "search_eval.projection.case.incompatible.prepare",
+            self.prepare_projection_case(
                 sources.one_symbol,
                 None,
+                &clean.query_factory,
                 &clean.projection_batch_cache,
                 &clean.cancellation,
-            )?;
+            )
+        )?;
         if incompatible.request.changes.from_generation.is_some()
             || incompatible.request.previous_projection_key.is_some()
             || incompatible.request.replay_reason
@@ -1154,24 +1265,31 @@ impl ProductionSemanticRuntimeV1 {
             evaluation_projection_plan(sources.one_symbol, &incompatible, None)?;
         let incompatible_store =
             evaluation_projection_case_store(&one_symbol_retained, &incompatible)?;
-        let incompatible_build = incompatible_store
-            .rebuild_generation(incompatible_plan, Arc::clone(&cancellation))
-            .await
-            .map_err(SemanticRuntimeScheduleFailureV1::projection)?
-            .build_id()
-            .clone();
-        commit_evaluation_prepared_generation(
-            &incompatible_store,
-            &incompatible_build,
-            &incompatible,
-            sources.one_symbol.chunks().chunks(),
-            Arc::clone(&cancellation),
+        let incompatible_build = hotpath::future!(
+            incompatible_store.rebuild_generation(incompatible_plan, Arc::clone(&cancellation),),
+            label = "search_eval.projection.case.incompatible.graph_begin"
+        )
+        .await
+        .map_err(SemanticRuntimeScheduleFailureV1::projection)?
+        .build_id()
+        .clone();
+        hotpath::future!(
+            commit_evaluation_prepared_generation(
+                &incompatible_store,
+                &incompatible_build,
+                &incompatible,
+                sources.one_symbol.chunks().chunks(),
+                Arc::clone(&cancellation),
+            ),
+            label = "search_eval.projection.case.incompatible.graph_commit"
         )
         .await?;
-        if !incompatible_store
-            .cancel_generation(&incompatible_build, Arc::clone(&cancellation))
-            .await
-            .map_err(SemanticRuntimeScheduleFailureV1::projection)?
+        if !hotpath::future!(
+            incompatible_store.cancel_generation(&incompatible_build, Arc::clone(&cancellation),),
+            label = "search_eval.projection.case.incompatible.graph_cancel"
+        )
+        .await
+        .map_err(SemanticRuntimeScheduleFailureV1::projection)?
         {
             return Err(SemanticRuntimeScheduleFailureV1::Projection);
         }
@@ -1203,6 +1321,7 @@ impl ProductionSemanticRuntimeV1 {
         &self,
         generation: &CodeIndexPublishedGenerationV1,
         current: Option<&SemanticGenerationPointerV1>,
+        query_factory: &SemanticEvaluationQueryFactoryV1,
         projection_batch_cache: &Arc<SemanticEvaluationProjectionBatchCacheV1>,
         cancellation: &Arc<dyn SemanticEvaluationCancellationV1>,
     ) -> Result<(PreparedVectorGenerationV1, u64, u64), SemanticRuntimeScheduleFailureV1> {
@@ -1210,6 +1329,7 @@ impl ProductionSemanticRuntimeV1 {
             &self.lifecycle,
             generation.manifest(),
             self.resources,
+            self.document_composition,
         )?;
         let projection = artifact.projection().clone();
         let request = semantic_projection_request(generation, &projection, current)?;
@@ -1233,8 +1353,10 @@ impl ProductionSemanticRuntimeV1 {
         let started = std::time::Instant::now();
         let prepared = prepare_semantic_evaluation_projection(
             artifact,
+            Some(query_factory),
             request,
             &chunks,
+            embedding_documents(generation),
             evaluation_projection_resources(self.resources),
             projection_batch_cache.as_ref(),
             SemanticEvaluationProjectionBatchCachePolicyV1::ReuseCompletedBatches,
@@ -1435,6 +1557,7 @@ impl ProductionSemanticRuntimeV1 {
     /// Recheck the opaque pre-acceptance lifecycle observation immediately
     /// before publication. A changed vector/code/lifecycle target is a CAS
     /// conflict, while a malformed or foreign lease remains rejected.
+    #[hotpath::measure(label = "usecases.semantic.revalidate_target", future = true)]
     pub async fn revalidate_verified_evaluation_target(
         &self,
         verification: &SemanticEvaluationLifecycleVerificationV1,
@@ -1544,6 +1667,7 @@ impl ProductionSemanticRuntimeV1 {
     /// Inspect only immutable vector/source identity before native evaluation.
     /// Resource evidence does not exist yet and is therefore not fabricated
     /// from the evaluator's configured ceilings.
+    #[hotpath::measure(label = "usecases.semantic.inspect_eval_snapshot", future = true)]
     pub async fn inspect_evaluation_current_generation_snapshot(
         &self,
         required: &crate::config::retrieval::SemanticCompatibilityPinsV1,
@@ -1577,6 +1701,7 @@ impl ProductionSemanticRuntimeV1 {
             vector_state_revision: i64::try_from(verified.revision())
                 .map_err(|_| SemanticRuntimeBackendErrorV1::Rejected)?,
             vector_generation_id: verified.generation().generation_id().clone(),
+            source_manifest_digest: verified.generation().source_manifest_digest().clone(),
         })
     }
 
@@ -1626,6 +1751,7 @@ impl ProductionSemanticRuntimeV1 {
     ///
     /// The installed runtime pointer is a cache observation only and cannot
     /// substitute another graph generation.
+    #[hotpath::measure(label = "usecases.semantic.active_generation", future = true)]
     pub async fn active_vector_generation(
         &self,
         pins: &crate::config::retrieval::SemanticCompatibilityPinsV1,
@@ -1703,6 +1829,7 @@ impl ProductionSemanticRuntimeV1 {
             &self.lifecycle,
             generation.manifest(),
             self.resources,
+            self.document_composition,
         ) {
             Ok(projection) => {
                 crate::hotpath_observe::semantic_candidate_chunks(
@@ -1782,6 +1909,8 @@ impl ProductionSemanticRuntimeV1 {
         let base_generation = None;
         let manifest = generation.manifest().clone();
         let resources = self.resources;
+        let document_composition = self.document_composition;
+        let documents = embedding_documents(&generation);
         let total_units = request.changes.added_or_changed.len().max(1) as u64;
         // The plan is decided from the whole request before any batch runs, so
         // splitting the run never moves the generation identity: the plan's
@@ -1847,12 +1976,14 @@ impl ProductionSemanticRuntimeV1 {
             target_generation,
             request,
             canonical_chunks,
+            documents,
             SEMANTIC_EMBEDS_PER_COMMIT,
             move || {
                 LoadedSemanticArtifactV1::from_lifecycle(
                     &load_handles.lifecycle,
                     &manifest,
                     resources,
+                    document_composition,
                 )
             },
             move || async move {
@@ -2102,6 +2233,7 @@ impl ProductionSemanticRuntimeV1 {
     /// Real application consumer for the optional semantic lane. The exact
     /// configuration-pinned generation is loaded before composition; indexing/download never
     /// enters this request path.
+    #[hotpath::measure(label = "usecases.semantic.execute_search", future = true)]
     pub async fn execute_search<C>(
         &self,
         code_generation: &CodeIndexPublishedGenerationV1,
@@ -2314,10 +2446,9 @@ impl PreparedSemanticEvaluationGenerationV1 {
             batch_size: execution.max_batch_size,
             sequence_length,
             load_deadline_ms: execution.load_deadline_ms,
-            // A shared projection-batch cache can prepare this generation
-            // without opening its fresh query runtime. The genuine query pass
-            // below opens it; `generation_resources` observes the resulting
-            // cold-load duration before publication evidence is accepted.
+            // Vector preparation or the first genuine query opens the one
+            // request-scoped runtime. `generation_resources` observes that
+            // shared runtime's cold-load duration before evidence is accepted.
             cold_model_load_micros: 0,
             vector_bytes,
             index_bytes: 0,
@@ -2382,6 +2513,10 @@ impl PreparedSemanticEvaluationGenerationV1 {
 
     pub fn projection(&self) -> &tracedecay_domain::AdmittedEmbeddingProjectionKeyV1 {
         &self.projection
+    }
+
+    pub fn query_factory(&self) -> &SemanticEvaluationQueryFactoryV1 {
+        &self.query_factory
     }
 
     pub fn with_query_inputs(
@@ -2664,7 +2799,6 @@ fn evaluation_projection_resources(
     configured: SemanticResourceCeilings,
 ) -> SemanticEvaluationProjectionResourcesV1 {
     SemanticEvaluationProjectionResourcesV1 {
-        max_sessions: configured.max_concurrent_sessions as usize,
         memory_ceiling_bytes: configured.max_resident_bytes,
     }
 }
@@ -2816,6 +2950,7 @@ fn lifecycle_publication_error(
         | tracedecay_semantic::ModelLifecycleErrorV1::DownloadFailed
         | tracedecay_semantic::ModelLifecycleErrorV1::DownloadFailedWithReason(_)
         | tracedecay_semantic::ModelLifecycleErrorV1::VerificationFailed
+        | tracedecay_semantic::ModelLifecycleErrorV1::RerankerUnavailable
         | tracedecay_semantic::ModelLifecycleErrorV1::InstallFailed
         | tracedecay_semantic::ModelLifecycleErrorV1::WorkerJoinFailed
         | tracedecay_semantic::ModelLifecycleErrorV1::ArtifactImport(_) => {
@@ -3214,11 +3349,15 @@ impl SemanticVectorReadPort for PublishedSemanticVectorReadPortV1 {
         })
     }
 
+    /// Serves `window` as the ranks past `window.skip` of one index search
+    /// to `window.depth`. HNSW has no rank offset: the deeper search is the
+    /// only way to reach those ranks, and its prefix may reorder relative to
+    /// the shallower pass, which is why the lane tolerates re-served rows.
     fn ann_candidates(
         &self,
         request: SemanticVectorReadRequestV1<'_>,
         query: &[f32],
-        limit: usize,
+        window: SemanticAnnCandidateWindowV1,
     ) -> Result<SemanticAnnCandidatesV1<'_>, RetrievalPortError> {
         if request.search_kind != SemanticSearchKindV1::AnnHnswExactRescore
             || request.vector_generation != &self.generation
@@ -3240,11 +3379,14 @@ impl SemanticVectorReadPort for PublishedSemanticVectorReadPortV1 {
         };
         let chunks = hotpath::measure_block!(
             "semantic.vector.ann_candidates",
-            index.search(query, limit).map_err(ann_search_port_error)
+            index
+                .search(query, window.depth)
+                .map_err(ann_search_port_error)
         )?;
         hotpath::gauge!("semantic_ann_candidates").set(chunks.len());
         chunks
             .into_iter()
+            .skip(window.skip)
             .map(|chunk_id| {
                 rows_by_chunk
                     .get(&chunk_id)
@@ -3986,6 +4128,7 @@ pub struct SavedGenerationScheduleHookParametersV1 {
     pub graph: Arc<dyn SemanticVectorGraphProviderV1>,
     pub lifecycle: Arc<SemanticModelLifecycleOwnerV1>,
     pub resources: SemanticResourceCeilings,
+    pub document_composition: EmbeddingDocumentCompositionV1,
     pub fair_scheduler: DaemonGlobalSemanticProjectionSchedulerV1,
 }
 
@@ -4005,6 +4148,7 @@ pub fn production_saved_generation_schedule_hook(
         graph,
         lifecycle,
         resources,
+        document_composition,
         fair_scheduler,
     } = parameters;
     let runtime = Arc::new(ProductionSemanticRuntimeV1::new_with_code_index_store_root(
@@ -4013,6 +4157,7 @@ pub fn production_saved_generation_schedule_hook(
         code_index_store_root,
         lifecycle,
         resources,
+        document_composition,
     ));
     project_semantic_production_runtimes()
         .lock()
@@ -4133,6 +4278,17 @@ mod tests {
         CodeGenerationId::new(format!("code-generation.{value}")).expect("source generation")
     }
 
+    fn documents(value: char) -> Arc<EmbeddingDocumentComposerV1> {
+        let index = tracedecay_code_index::lineage::GenerationSymbolIndexV1::new(
+            source_generation(value),
+            Vec::new(),
+        )
+        .expect("empty symbol index");
+        Arc::new(EmbeddingDocumentComposerV1::new(
+            EmbeddingSymbolContextIndexV1::from_generation_symbols(&index),
+        ))
+    }
+
     fn vector_generation(value: char) -> VectorGenerationIdV1 {
         VectorGenerationIdV1::new(
             canonical_sha256(&("semantic.test.vector-generation", value)).expect("manifest digest"),
@@ -4244,25 +4400,6 @@ mod tests {
         assert_eq!(requirement.resident_bytes, configured.max_resident_bytes);
         assert_eq!(requirement.threads, configured.max_threads);
         assert!(configured_resource_ceiling_covers(&configured, requirement));
-    }
-
-    #[test]
-    fn evaluator_projection_inherits_configured_session_width() {
-        let configured = SemanticResourceCeilings {
-            max_model_bytes: 700,
-            max_tokenizer_bytes: 64,
-            max_resident_bytes: 2_048,
-            max_threads: 8,
-            max_concurrent_sessions: 4,
-            max_batch_size: 32,
-            max_sequence_length: 512,
-            load_deadline_ms: 30_000,
-        };
-
-        let resources = evaluation_projection_resources(configured);
-
-        assert_eq!(resources.max_sessions, 4);
-        assert_eq!(resources.memory_ceiling_bytes, 2_048);
     }
 
     #[test]
@@ -4916,6 +5053,7 @@ mod tests {
             source_generation('a'),
             projection_request('a'),
             Vec::new(),
+            documents('a'),
             SEMANTIC_EMBEDS_PER_COMMIT,
             move || {
                 let _ = started_tx.send(());
@@ -5097,17 +5235,32 @@ mod tests {
         let exact_observation = handle
             .prepare_current_observation(&observed_pointer)
             .expect("prepare exact warmed-cache observation");
+        let ready_publications = AtomicUsize::new(0);
         assert!(
-            handle.commit_current_observation(exact_observation),
+            commit_current_observation_and_then(&handle, exact_observation, || {
+                ready_publications.fetch_add(1, Ordering::SeqCst);
+            }),
             "unchanged exact cache observation must commit"
+        );
+        assert_eq!(
+            ready_publications.load(Ordering::SeqCst),
+            1,
+            "successful observation CAS must publish lifecycle readiness"
         );
         let stale_observation = handle
             .prepare_current_observation(&observed_pointer)
             .expect("prepare cache observation before concurrent unbind");
         assert!(handle.unbind_query_runtime_if_current(&vector));
         assert!(
-            !handle.commit_current_observation(stale_observation),
+            !commit_current_observation_and_then(&handle, stale_observation, || {
+                ready_publications.fetch_add(1, Ordering::SeqCst);
+            }),
             "cache observation must fail CAS after a concurrent transition"
+        );
+        assert_eq!(
+            ready_publications.load(Ordering::SeqCst),
+            1,
+            "stale observation CAS must not publish false lifecycle readiness"
         );
 
         let backend = DaemonSemanticRuntimeBackendV1::new(handle.clone());

@@ -28,7 +28,8 @@ use tracedecay_query::retrieval::graph::{
     GraphExecutionControl, GraphLaneRequest, GraphLaneRetriever,
 };
 use tracedecay_query::retrieval::lexical::{
-    LexicalLaneEvidence, LexicalLaneRequest, lexical_query_parts,
+    LexicalLaneEvidence, LexicalLaneRequest, LexicalRouteOutcomeV1, LexicalRoutePlanV1,
+    LexicalRouteReceiptV1, LexicalRoutingV1, merge_lexical_routes,
 };
 use tracedecay_query::retrieval::{
     AuthorizedQueryFallbackV1, QueryAuthorityErrorV1, QueryAuthorityV1, RawRetrievalRequestV1,
@@ -119,7 +120,8 @@ pub async fn mount_core_query_authority_on_project_open(
     cursor_keys: &tracedecay_session_temporal_store::GlobalDbCursorKeyProvider,
 ) -> Result<(), QueryRuntimeMountErrorV1> {
     let authority =
-        prepare_core_query_authority_on_project_open(registry, scope, cursor_keys).await?;
+        prepare_core_query_authority_on_project_open(registry, project_root, scope, cursor_keys)
+            .await?;
     registry
         .mount_query_authority(project_root, scope, authority)
         .await
@@ -137,7 +139,8 @@ pub async fn mount_core_query_authority_for_committed_fallback_on_project_open(
     cursor_keys: &tracedecay_session_temporal_store::GlobalDbCursorKeyProvider,
 ) -> Result<(), QueryRuntimeMountErrorV1> {
     let authority =
-        prepare_core_query_authority_on_project_open(registry, scope, cursor_keys).await?;
+        prepare_core_query_authority_on_project_open(registry, project_root, scope, cursor_keys)
+            .await?;
     registry
         .mount_query_authority_for_committed_fallback(
             project_root,
@@ -151,10 +154,16 @@ pub async fn mount_core_query_authority_for_committed_fallback_on_project_open(
 
 async fn prepare_core_query_authority_on_project_open(
     registry: &CodeIndexSchedulerRegistryV1,
+    project_root: &Path,
     scope: &ResolvedScope,
     cursor_keys: &tracedecay_session_temporal_store::GlobalDbCursorKeyProvider,
 ) -> Result<Arc<QueryAuthorityV1>, QueryRuntimeMountErrorV1> {
-    let privacy_domain = if let Some(text) = registry.latest_text_serving_for_scope(scope).await {
+    let root_text = registry.latest_text_serving_for_root(project_root).await;
+    let privacy_domain = if let Some(text) = registry
+        .latest_text_serving_for_scope(scope)
+        .await
+        .or(root_text)
+    {
         text.metadata().manifest().privacy_domain.clone()
     } else {
         registry
@@ -308,6 +317,7 @@ pub struct QuerySearchExecutionRequestV1 {
     pub graph_max_depth: u32,
     pub page_size: usize,
     pub cursor: Option<RetrievalCursor>,
+    pub lexical_routing: LexicalRoutingV1,
 }
 
 impl QuerySearchExecutionRequestV1 {
@@ -326,6 +336,7 @@ impl QuerySearchExecutionRequestV1 {
             graph_max_depth: policy.graph_max_depth,
             page_size: policy.page_size,
             cursor: policy.cursor,
+            lexical_routing: policy.lexical_routing,
         }
     }
 }
@@ -344,6 +355,8 @@ pub struct QuerySearchExecutionPolicyV1 {
     pub graph_max_depth: u32,
     pub page_size: usize,
     pub cursor: Option<RetrievalCursor>,
+    /// Additive lexical routes requested by the caller; query-only by default.
+    pub lexical_routing: LexicalRoutingV1,
 }
 
 pub struct ExecutedQuerySearchV1 {
@@ -355,6 +368,9 @@ pub struct ExecutedQuerySearchV1 {
     /// for `generation`; freshness is not. Callers must report the lanes as
     /// `CodeIndexLaneStatusV1::Stale` rather than complete.
     pub served_stale: bool,
+    /// The lexical routes that ran and the per-candidate route evidence when
+    /// additive routes were requested.
+    pub lexical_routes: LexicalRouteReceiptV1,
 }
 
 #[derive(Debug, Error)]
@@ -436,8 +452,47 @@ impl CodeIndexSchedulerRegistryV1 {
         // fail-fast rather than degrading into an empty answer.
         let (latest, served_stale) = match self.latest_complete_serving_for_scope(scope).await {
             Some(serving) => match self.latest_complete_ready_decoded_for_scope(scope).await {
-                // Warm path: the ready gate admits, byte-identical to before.
-                Some(ready) => (ready, false),
+                Some(ready) => {
+                    // The graph-bearing generation and the lightweight text
+                    // projection can be restored through distinct handles.
+                    // The mounted text slot is the canonical exact/lexical
+                    // owner, so use its ready owner when the graph ready gate
+                    // has proved the same generation current. Falling back to
+                    // the decoded generation's independent warming handle
+                    // would report `generation_unverified` forever even after
+                    // the background projection had finished.
+                    if let Some(text) = self.latest_text_serving_for_scope(scope).await {
+                        if text.metadata().manifest().generation_id
+                            == ready.generation().manifest().generation_id
+                        {
+                            return execute_query_search_on_text(
+                                self,
+                                scope,
+                                input,
+                                text,
+                                Some(ready),
+                                false,
+                                graph_control,
+                            )
+                            .await;
+                        }
+                        if let Some((text, true)) =
+                            self.latest_text_serving_freshness_for_scope(scope).await
+                        {
+                            return execute_query_search_on_text(
+                                self,
+                                scope,
+                                input,
+                                text,
+                                None,
+                                false,
+                                graph_control,
+                            )
+                            .await;
+                        }
+                    }
+                    (ready, false)
+                }
                 None => {
                     // Graph decode/activation is optional enrichment. Its
                     // readiness gate may abstain while the authenticated text
@@ -609,6 +664,10 @@ where
     let (sanitized, owners) = hotpath::measure_block!("daemon.code_index.query.admission", {
         let sanitized = RawRetrievalRequestV1::new(input.query, request)
             .sanitize(input.sanitizer_revision, input.normalization_revision)?;
+        if text.text_serving_needs_work() {
+            schedulers.request_query_background_reconcile(scope).await;
+            return Err(QuerySearchExecutionErrorV1::GenerationUnverified);
+        }
         let owners = text.production_query_owners_with_budget(&sanitized.request().budget)?;
         (sanitized, owners)
     });
@@ -624,22 +683,40 @@ where
             budget: request.budget,
         })
     })?;
-    let lexical_parts = lexical_query_parts(query_view.as_str())?;
-    let lexical = hotpath::measure_block!("daemon.code_index.query.lane.lexical", {
-        owners.retrieve_lexical(&LexicalLaneRequest {
-            base: request.clone(),
-            query_view,
-            generation: generation.clone(),
-            whole_terms: lexical_parts.whole_terms,
-            subtokens: lexical_parts.subtokens,
-            phrases: lexical_parts.phrases,
-            field_filters: Vec::new(),
-            fuzzy_budget: input.fuzzy_budget,
-            lexical_profile_revision: input.lexical_profile_revision,
-            score_domain: input.lexical_score_domain,
-            budget: request.budget,
-        })
-    })?;
+    // Every lexical route (the query plus each caller anchor and the optional
+    // preferred-symbol route) runs through the same lane against the same
+    // pinned generation; the merge below is what composition admits as the
+    // single lexical lane input.
+    let route_plan = LexicalRoutePlanV1::plan(query_view.as_str(), &input.lexical_routing)?;
+    let (lexical, lexical_routes) =
+        hotpath::measure_block!("daemon.code_index.query.lane.lexical", {
+            let mut route_outcomes = Vec::with_capacity(route_plan.routes().len());
+            for route in route_plan.routes() {
+                let outcome = owners.retrieve_lexical(&LexicalLaneRequest {
+                    base: request.clone(),
+                    query_view,
+                    generation: generation.clone(),
+                    whole_terms: route.parts.whole_terms.clone(),
+                    subtokens: route.parts.subtokens.clone(),
+                    phrases: route.parts.phrases.clone(),
+                    field_filters: route.field_filters.clone(),
+                    fuzzy_budget: input.fuzzy_budget,
+                    lexical_profile_revision: input.lexical_profile_revision.clone(),
+                    score_domain: input.lexical_score_domain.clone(),
+                    budget: request.budget,
+                })?;
+                route_outcomes.push(LexicalRouteOutcomeV1 {
+                    kind: route.kind.clone(),
+                    outcome,
+                });
+            }
+            merge_lexical_routes(
+                &generation,
+                &request.budget,
+                &request.budget,
+                route_outcomes,
+            )
+        })?;
     let graph_seeds = graph_seeds_from_outcomes(&exact, &lexical);
     let graph = hotpath::measure_block!("daemon.code_index.query.lane.graph", {
         // Graph retrieval requires at least one seed. An empty seed list is
@@ -724,6 +801,7 @@ where
         authorized,
         sanitized,
         served_stale,
+        lexical_routes,
     })
 }
 

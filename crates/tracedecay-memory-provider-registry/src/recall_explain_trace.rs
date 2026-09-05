@@ -3,7 +3,7 @@
 //! [`RecallAdmissionReport`], [`RecallSelectionV1`], and [`ContextPackV1`]
 //! each carry their own stage's reasons: the admission ledger names why a
 //! candidate was refused, the selection ledgers name why an admitted
-//! candidate was collapsed, excluded for diversity, or did not fit the
+//! candidate was collapsed or did not fit the
 //! selection budget, and the pack's exclusion ledger names why a selected
 //! candidate never reached the rendered text. Read separately they cannot
 //! answer "what happened to candidate X end to end", because each stage only
@@ -84,9 +84,7 @@ pub enum RecallExplainStageV1 {
     SelectionUnavailable,
     /// Collapsed into an earlier, surviving candidate at deduplication.
     Deduplicated,
-    /// Excluded for content redundancy with an already-selected candidate.
-    DiversityExcluded,
-    /// Survived deduplication and diversity but did not fit the selection
+    /// Survived deduplication but did not fit the selection
     /// budget.
     BudgetExcluded,
     /// Selected, then withheld by a host stage that runs between selection
@@ -112,7 +110,6 @@ impl RecallExplainStageV1 {
             Self::NormalizationUnavailable => "normalization_unavailable",
             Self::SelectionUnavailable => "selection_unavailable",
             Self::Deduplicated => "deduplicated",
-            Self::DiversityExcluded => "diversity_excluded",
             Self::BudgetExcluded => "budget_excluded",
             Self::HostWithheld => "host_withheld",
             Self::Selected => "selected",
@@ -148,13 +145,6 @@ pub enum RecallExplainHostDecisionV1 {
         duplicate_of_candidate_id: String,
         /// The deduplication ledger's own typed reason.
         reason: DuplicateReason,
-    },
-    /// Excluded as redundant with an already-selected candidate.
-    DiversityExcluded {
-        /// The already-selected candidate it was too similar to.
-        similar_to_candidate_id: String,
-        /// Measured similarity in parts per million.
-        similarity_ppm: u32,
     },
     /// Did not fit the selection budget.
     BudgetExcluded {
@@ -196,7 +186,6 @@ impl RecallExplainHostDecisionV1 {
             Self::NormalizationUnavailable => RecallExplainStageV1::NormalizationUnavailable,
             Self::SelectionUnavailable => RecallExplainStageV1::SelectionUnavailable,
             Self::Deduplicated { .. } => RecallExplainStageV1::Deduplicated,
-            Self::DiversityExcluded { .. } => RecallExplainStageV1::DiversityExcluded,
             Self::BudgetExcluded { .. } => RecallExplainStageV1::BudgetExcluded,
             Self::HostWithheld { .. } => RecallExplainStageV1::HostWithheld,
             Self::Selected => RecallExplainStageV1::Selected,
@@ -218,7 +207,6 @@ impl RecallExplainHostDecisionV1 {
             Self::NormalizationUnavailable => "normalization_unavailable",
             Self::SelectionUnavailable => "selection_unavailable",
             Self::Deduplicated { reason, .. } => duplicate_reason_code(reason),
-            Self::DiversityExcluded { .. } => "near_content",
             Self::BudgetExcluded { reason, .. } => budget_exclusion_reason_code(reason),
             Self::HostWithheld { reason_code, .. } => reason_code.as_str(),
             Self::Selected => "selected_pack_not_compiled",
@@ -240,12 +228,6 @@ impl RecallExplainHostDecisionV1 {
                 duplicate_of_candidate_id,
                 ..
             } => Some(format!("duplicate_of={duplicate_of_candidate_id}")),
-            Self::DiversityExcluded {
-                similar_to_candidate_id,
-                similarity_ppm,
-            } => Some(format!(
-                "similar_to={similar_to_candidate_id} similarity_ppm={similarity_ppm}"
-            )),
             Self::BudgetExcluded {
                 host_order_position,
                 reason,
@@ -267,7 +249,6 @@ fn duplicate_reason_code(reason: &DuplicateReason) -> &'static str {
     match reason {
         DuplicateReason::StableMemoryRef => "stable_memory_ref",
         DuplicateReason::ContentDigest => "content_digest",
-        DuplicateReason::NearContent { .. } => "near_content",
     }
 }
 
@@ -847,18 +828,6 @@ pub fn build_recall_explain_trace(
                     reason: dedup.reason,
                 },
                 explanation_for(normalization, redactor, &dedup.candidate_id),
-            )?;
-        }
-        for excluded in &selection.diversity_excluded {
-            place(
-                &mut slots,
-                &rank_of,
-                &excluded.candidate_id,
-                RecallExplainHostDecisionV1::DiversityExcluded {
-                    similar_to_candidate_id: excluded.similar_to_candidate_id.clone(),
-                    similarity_ppm: excluded.similarity_ppm,
-                },
-                explanation_for(normalization, redactor, &excluded.candidate_id),
             )?;
         }
         for excluded in &selection.budget_excluded {

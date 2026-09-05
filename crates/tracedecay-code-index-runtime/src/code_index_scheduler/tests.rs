@@ -60,14 +60,18 @@ use super::{
     CodeIndexReconcileOutcomeV1, CodeIndexSchedulerRegistryV1, CodeIndexWorktreeSchedulerV1,
     GenerationDecodeAdmissionV1, SharedCodeIndexBytePoolV1,
 };
-use crate::code_index::production::{CodeIndexAtomicPublicationPort, CodeIndexExecutionControlV1};
+use crate::code_index::production::{
+    CodeIndexAtomicPublicationPort, CodeIndexExecutionControlV1, CodeIndexPublicationStoreErrorV1,
+};
 use crate::semantic_code::rerank_adapter::GenerationBoundCodeRerankViewsV1;
 use tracedecay_query::retrieval::QueryAuthorityV1;
 use tracedecay_query::retrieval::exact::{
     CentralExactAdmissionAuthorityV1, ExactAdmissionAuthority, ExactLaneRequest,
 };
 use tracedecay_query::retrieval::fusion::RetrievalCursorKeyringV1;
-use tracedecay_query::retrieval::lexical::LexicalLaneRequest;
+use tracedecay_query::retrieval::lexical::{
+    LexicalLaneRequest, LexicalRouteKindV1, LexicalRoutingV1,
+};
 use tracedecay_query::retrieval::rerank::{
     BoundedRerankRuntimeV1, DeterministicLocalRerankExecutorV1, LocalRerankFailureV1,
     LocalRerankInputV1, LocalRerankPermitV1, RerankExecutionControlV1,
@@ -112,6 +116,16 @@ impl GitFixture {
             root.path(),
             &["config", "user.email", "tracedecay@example.invalid"],
         );
+        // `git commit` runs `git maintenance run --auto`, and with the default
+        // `maintenance.autoDetach` that child outlives the commit we waited on.
+        // It touches `.git` (its own lock, `gc.log`) after `git commit` has
+        // already returned, which races `from_template`'s directory walk: an
+        // entry listed by `read_dir` can be gone by the time it is copied, and
+        // the fixture fails with a bare `NotFound`. Fixtures need no
+        // maintenance at all, so switch it off in the repository itself; the
+        // setting is inherited by every copy taken from this template.
+        git(root.path(), &["config", "maintenance.auto", "false"]);
+        git(root.path(), &["config", "gc.auto", "0"]);
         for (path, source) in files {
             write(root.path(), path, source);
         }
@@ -132,6 +146,15 @@ impl GitFixture {
 
     fn edit(&self, path: &str, source: &str) {
         write(self.path(), path, source);
+    }
+
+    fn remove(&self, path: &str) {
+        std::fs::remove_file(self.path().join(path)).expect("remove fixture source");
+    }
+
+    fn commit_all(&self, message: &str) {
+        git(self.path(), &["add", "-A"]);
+        git(self.path(), &["commit", "-qm", message]);
     }
 }
 
@@ -154,11 +177,22 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
     for entry in std::fs::read_dir(src).expect("read fixture template") {
         let entry = entry.expect("fixture template entry");
         let file_type = entry.file_type().expect("fixture template entry type");
+        let source = entry.path();
         let destination = dst.join(entry.file_name());
         if file_type.is_dir() {
-            copy_dir_recursive(&entry.path(), &destination);
+            copy_dir_recursive(&source, &destination);
         } else {
-            std::fs::copy(entry.path(), &destination).expect("copy fixture template file");
+            // `file_type` is the un-followed type, so a symlink lands here and
+            // `fs::copy` would resolve it; name the entry either way so a
+            // failure identifies the exact template path rather than reporting
+            // a bare errno.
+            std::fs::copy(&source, &destination).unwrap_or_else(|error| {
+                panic!(
+                    "copy fixture template file '{}' to '{}': {error}",
+                    source.display(),
+                    destination.display()
+                )
+            });
         }
     }
 }
@@ -357,10 +391,507 @@ fn remove_historical_pointer_entries(store_root: &Path) {
 }
 
 #[test]
+fn one_file_increment_captures_only_edited_bytes_with_one_thousand_unchanged_files() {
+    let mut owned_sources = (0..1_000)
+        .map(|index| {
+            (
+                format!("src/unchanged_{index:04}.rs"),
+                format!("pub fn unchanged_{index:04}() -> usize {{ {index} }}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    owned_sources.push((
+        "src/edited.rs".to_owned(),
+        "pub fn edited() -> usize { 1 }\n".to_owned(),
+    ));
+    let borrowed_sources = owned_sources
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = GitFixture::new(&borrowed_sources);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    published(
+        scheduler
+            .reconcile_now()
+            .expect("publish initial large generation"),
+    );
+
+    let edited_source = "pub fn edited() -> usize { 2 }\n";
+    fixture.edit("src/edited.rs", edited_source);
+    scheduler.notify_hook_paths([PathBuf::from("src/edited.rs")]);
+
+    let captured = scheduler
+        .capture_authoritative_snapshot(None)
+        .expect("capture one-file increment");
+    assert_eq!(
+        captured.snapshot.files.len(),
+        1_001,
+        "the complete snapshot must retain every unchanged row"
+    );
+    assert_eq!(
+        captured.captured_files.len(),
+        1,
+        "only the classified changed file may be read and sanitized"
+    );
+    assert_eq!(
+        captured
+            .captured_files
+            .iter()
+            .map(|file| file.sanitized_bytes.len())
+            .sum::<usize>(),
+        edited_source.len(),
+        "captured bytes must be proportional to the one edited file"
+    );
+    let full_capture = scheduler
+        .capture_authoritative_snapshot_without_active_generation_reuse(None)
+        .expect("capture full comparison snapshot");
+    assert_eq!(
+        captured.snapshot.content_identity, full_capture.snapshot.content_identity,
+        "active-row reuse must preserve the full capture's byte-exact snapshot identity"
+    );
+    let untouched_row = captured
+        .snapshot
+        .files
+        .iter()
+        .find(|file| file.logical_path == "src/unchanged_0001.rs")
+        .expect("untouched snapshot row")
+        .clone();
+
+    published(
+        scheduler
+            .reconcile_now()
+            .expect("publish first dirty generation"),
+    );
+    fixture.edit(
+        "src/unchanged_0000.rs",
+        "pub fn unchanged_0000() -> usize { 10_000 }\n",
+    );
+    scheduler.notify_hook_paths([PathBuf::from("src/unchanged_0000.rs")]);
+
+    let second = scheduler
+        .capture_authoritative_snapshot(None)
+        .expect("capture second consecutive edit");
+    assert_eq!(
+        second.snapshot.files.len(),
+        1_001,
+        "the second complete snapshot must retain every file row"
+    );
+    assert_eq!(
+        second.captured_files.len(),
+        2,
+        "the previously dirty file and newly edited file must both be captured"
+    );
+    assert_eq!(
+        second
+            .snapshot
+            .files
+            .iter()
+            .find(|file| file.logical_path == "src/unchanged_0001.rs"),
+        Some(&untouched_row),
+        "an untouched file row must still be reused from the dirty active generation"
+    );
+}
+
+/// Unchanged-file count for the committed one-file-edit capture. Defaults to
+/// 1,000; the 10k acceptance measurement sets `TRACEDECAY_CAPTURE_CORPUS_FILES`.
+fn committed_capture_corpus_files() -> usize {
+    match std::env::var("TRACEDECAY_CAPTURE_CORPUS_FILES") {
+        Ok(value) => value
+            .parse()
+            .expect("TRACEDECAY_CAPTURE_CORPUS_FILES must be a positive integer"),
+        Err(std::env::VarError::NotPresent) => 1_000,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("TRACEDECAY_CAPTURE_CORPUS_FILES must contain valid Unicode")
+        }
+    }
+}
+
+#[test]
+fn committed_one_file_edit_reuses_unchanged_rows_across_the_new_head_tree() {
+    let unchanged_files = committed_capture_corpus_files();
+    let mut owned_sources = (0..unchanged_files)
+        .map(|index| {
+            (
+                format!("src/unchanged_{index:04}.rs"),
+                format!("pub fn unchanged_{index:04}() -> usize {{ {index} }}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    owned_sources.push((
+        "src/edited.rs".to_owned(),
+        "pub fn committed_edit() -> usize { 1 }\n".to_owned(),
+    ));
+    let borrowed_sources = owned_sources
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = GitFixture::new(&borrowed_sources);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    published(
+        scheduler
+            .reconcile_now()
+            .expect("publish initial large generation"),
+    );
+
+    fixture.edit("src/edited.rs", "pub fn committed_edit() -> usize { 2 }\n");
+    fixture.commit_all("commit one-file edit");
+    scheduler.identity = super::identity::IndexingIdentityV1::resolve(fixture.path())
+        .expect("refresh HEAD identity");
+
+    let capture_started = Instant::now();
+    let captured = scheduler
+        .capture_authoritative_snapshot(None)
+        .expect("capture committed one-file delta");
+    let capture_elapsed = capture_started.elapsed();
+    assert_eq!(captured.captured_files.len(), 1);
+    assert_eq!(captured.snapshot.files.len(), unchanged_files + 1);
+    assert!(captured.changed_paths.contains("src/edited.rs"));
+    let captured_bytes = captured
+        .captured_files
+        .iter()
+        .map(|file| file.sanitized_bytes.len())
+        .sum::<usize>();
+    println!(
+        "committed one-file edit over {unchanged_files} unchanged files: captured_files=1 \
+         captured_bytes={captured_bytes} capture_ms={}",
+        capture_elapsed.as_millis()
+    );
+    let full_started = Instant::now();
+    let full = scheduler
+        .capture_authoritative_snapshot_without_active_generation_reuse(None)
+        .expect("capture full comparison snapshot");
+    println!(
+        "full capture over {unchanged_files} unchanged files: captured_files={} \
+         captured_bytes={} capture_ms={}",
+        full.captured_files.len(),
+        full.captured_files
+            .iter()
+            .map(|file| file.sanitized_bytes.len())
+            .sum::<usize>(),
+        full_started.elapsed().as_millis()
+    );
+    assert_eq!(
+        captured.snapshot.content_identity, full.snapshot.content_identity,
+        "clean-tip reuse must preserve the full capture identity"
+    );
+
+    published(
+        scheduler
+            .reconcile_now()
+            .expect("publish committed one-file delta"),
+    );
+    let chunks = scheduler
+        .latest_complete()
+        .expect("committed generation")
+        .lexical()
+        .iter()
+        .filter(|chunk| chunk.sanitized_text.as_str().contains("fn committed_edit"))
+        .map(|chunk| chunk.sanitized_text.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert!(!chunks.is_empty());
+    assert!(chunks.iter().all(|text| text.contains("{ 2 }")));
+}
+
+#[test]
+fn committed_revert_recaptures_the_reverted_file() {
+    let committed = "pub fn committed_revert() -> u32 { 1 }\n";
+    let fixture = GitFixture::new(&[
+        ("src/lib.rs", committed),
+        ("src/other.rs", "pub fn other() -> u32 { 2 }\n"),
+    ]);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    published(
+        scheduler
+            .reconcile_now()
+            .expect("publish initial generation"),
+    );
+    let original_digest = scheduler
+        .latest_complete()
+        .expect("initial generation")
+        .generation
+        .snapshot()
+        .files
+        .iter()
+        .find(|file| file.logical_path == "src/lib.rs")
+        .expect("initial lib row")
+        .content_digest
+        .clone();
+
+    fixture.edit("src/lib.rs", "pub fn committed_revert() -> u32 { 99 }\n");
+    fixture.commit_all("commit edit");
+    published(scheduler.reconcile_now().expect("publish committed edit"));
+
+    fixture.edit("src/lib.rs", committed);
+    fixture.commit_all("commit revert");
+    scheduler.identity = super::identity::IndexingIdentityV1::resolve(fixture.path())
+        .expect("refresh HEAD identity");
+    let captured = scheduler
+        .capture_authoritative_snapshot(None)
+        .expect("capture committed revert");
+    assert_eq!(captured.captured_files.len(), 1);
+    assert!(captured.changed_paths.contains("src/lib.rs"));
+    assert_eq!(
+        captured
+            .snapshot
+            .files
+            .iter()
+            .find(|file| file.logical_path == "src/lib.rs")
+            .expect("reverted lib row")
+            .content_digest,
+        original_digest
+    );
+
+    published(scheduler.reconcile_now().expect("publish committed revert"));
+    let chunks = scheduler
+        .latest_complete()
+        .expect("reverted generation")
+        .lexical()
+        .iter()
+        .filter(|chunk| {
+            chunk
+                .sanitized_text
+                .as_str()
+                .contains("fn committed_revert")
+        })
+        .map(|chunk| chunk.sanitized_text.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert!(!chunks.is_empty());
+    assert!(chunks.iter().all(|text| text.contains("{ 1 }")));
+    assert!(chunks.iter().all(|text| !text.contains("{ 99 }")));
+}
+
+#[test]
+fn committed_deletion_drops_the_row_and_committed_addition_captures_it() {
+    let owned_sources = (0..1_001)
+        .map(|index| {
+            (
+                format!("src/original_{index:04}.rs"),
+                format!("pub fn original_{index:04}() -> usize {{ {index} }}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let borrowed_sources = owned_sources
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = GitFixture::new(&borrowed_sources);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    published(
+        scheduler
+            .reconcile_now()
+            .expect("publish initial large generation"),
+    );
+
+    fixture.remove("src/original_0000.rs");
+    fixture.edit(
+        "src/added.rs",
+        "pub fn committed_addition() -> usize { 7 }\n",
+    );
+    fixture.commit_all("replace one committed file");
+    scheduler.identity = super::identity::IndexingIdentityV1::resolve(fixture.path())
+        .expect("refresh HEAD identity");
+    let captured = scheduler
+        .capture_authoritative_snapshot(None)
+        .expect("capture committed deletion and addition");
+
+    assert_eq!(captured.snapshot.files.len(), 1_001);
+    assert_eq!(captured.captured_files.len(), 1);
+    assert!(captured.changed_paths.contains("src/original_0000.rs"));
+    assert!(captured.changed_paths.contains("src/added.rs"));
+    assert!(
+        captured
+            .snapshot
+            .files
+            .iter()
+            .any(|file| file.logical_path == "src/added.rs")
+    );
+    assert!(
+        captured
+            .snapshot
+            .files
+            .iter()
+            .all(|file| file.logical_path != "src/original_0000.rs")
+    );
+    let full = scheduler
+        .capture_authoritative_snapshot_without_active_generation_reuse(None)
+        .expect("capture full comparison snapshot");
+    assert_eq!(
+        captured.snapshot.content_identity,
+        full.snapshot.content_identity
+    );
+}
+
+#[test]
+fn unresolvable_active_tree_falls_back_to_full_capture() {
+    let fixture = GitFixture::new(&[
+        ("src/lib.rs", "pub fn old_tree() -> u32 { 1 }\n"),
+        ("src/other.rs", "pub fn other() -> u32 { 2 }\n"),
+    ]);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    published(
+        scheduler
+            .reconcile_now()
+            .expect("publish initial generation"),
+    );
+    let active_tree = scheduler
+        .latest_complete()
+        .expect("initial generation")
+        .generation
+        .repository_parse_identity()
+        .tree
+        .as_ref()
+        .expect("active tree")
+        .as_str()
+        .to_owned();
+
+    fixture.edit("src/lib.rs", "pub fn old_tree() -> u32 { 3 }\n");
+    fixture.commit_all("move HEAD tree");
+    let object_path = fixture
+        .path()
+        .join(".git")
+        .join("objects")
+        .join(&active_tree[..2])
+        .join(&active_tree[2..]);
+    assert!(object_path.is_file(), "active tree must be a loose object");
+    std::fs::remove_file(object_path).expect("remove active tree object");
+    scheduler.identity = super::identity::IndexingIdentityV1::resolve(fixture.path())
+        .expect("refresh HEAD identity");
+
+    let captured = scheduler
+        .capture_authoritative_snapshot(None)
+        .expect("fall back to full capture");
+    assert_eq!(
+        captured.captured_files.len(),
+        2,
+        "an unresolvable active tree must disable row reuse"
+    );
+    let full = scheduler
+        .capture_authoritative_snapshot_without_active_generation_reuse(None)
+        .expect("capture full comparison snapshot");
+    assert_eq!(
+        captured.snapshot.content_identity,
+        full.snapshot.content_identity
+    );
+}
+
+#[test]
+fn reverted_dirty_file_is_recaptured_from_clean_content() {
+    let committed = "pub fn alpha() -> u32 { 1 }\n";
+    let fixture = GitFixture::new(&[
+        ("src/lib.rs", committed),
+        ("src/other.rs", "pub fn other() -> u32 { 2 }\n"),
+    ]);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    let clean_row = |captured: &super::CapturedSnapshotV1| {
+        captured
+            .snapshot
+            .files
+            .iter()
+            .find(|file| file.logical_path == "src/lib.rs")
+            .expect("lib.rs snapshot row")
+            .content_digest
+            .clone()
+    };
+    let clean_digest = clean_row(
+        &scheduler
+            .capture_authoritative_snapshot(None)
+            .expect("capture clean tree"),
+    );
+
+    fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 99 }\n");
+    scheduler.notify_hook_paths([PathBuf::from("src/lib.rs")]);
+    published(scheduler.reconcile_now().expect("publish dirty generation"));
+
+    // Revert to the committed bytes: the path is git-clean again, but the
+    // active generation still carries the dirty row.
+    fixture.edit("src/lib.rs", committed);
+    scheduler.notify_hook_paths([PathBuf::from("src/lib.rs")]);
+    let captured = scheduler
+        .capture_authoritative_snapshot(None)
+        .expect("capture reverted tree");
+    assert_eq!(
+        clean_row(&captured),
+        clean_digest,
+        "a file reverted to its committed content must be recaptured, not carried from the dirty active generation"
+    );
+    assert!(
+        captured
+            .captured_files
+            .iter()
+            .any(|file| file.sanitized_bytes.as_ref() == committed.as_bytes()),
+        "the reverted file must be re-read from disk"
+    );
+
+    // The served index must reflect the revert: the dirty body is gone and
+    // the committed body is back in the lexical chunks.
+    published(
+        scheduler
+            .reconcile_now()
+            .expect("publish reverted generation"),
+    );
+    let latest = scheduler.latest_complete().expect("reverted generation");
+    let lib_chunks = latest
+        .lexical()
+        .iter()
+        .filter(|chunk| chunk.sanitized_text.as_str().contains("fn alpha"))
+        .map(|chunk| chunk.sanitized_text.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        !lib_chunks.is_empty(),
+        "the reverted file must still be indexed"
+    );
+    assert!(
+        lib_chunks.iter().all(|text| text.contains("{ 1 }")),
+        "queries must serve the committed body after the revert, got {lib_chunks:?}"
+    );
+    assert!(
+        lib_chunks.iter().all(|text| !text.contains("{ 99 }")),
+        "queries must not serve the reverted dirty body, got {lib_chunks:?}"
+    );
+}
+
+#[test]
 fn partitioned_publication_reuses_unchanged_file_segments() {
-    let unchanged = (0..256)
-        .map(|index| format!("pub fn unchanged_{index}() -> usize {{ {index} }}\n"))
-        .collect::<String>();
+    let unchanged = (0..256).fold(String::new(), |mut source, index| {
+        writeln!(
+            source,
+            "// stable unchanged body padding xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        )
+        .expect("write generated fixture padding");
+        writeln!(source, "pub fn unchanged_{index}() -> usize {{ {index} }}")
+            .expect("write generated fixture source");
+        source
+    });
     let fixture = GitFixture::new(&[
         ("src/large.rs", unchanged.as_str()),
         ("src/edited.rs", "pub fn edited() -> usize { 1 }\n"),
@@ -377,6 +908,10 @@ fn partitioned_publication_reuses_unchanged_file_segments() {
             .reconcile_now()
             .expect("publish first segmented generation"),
     );
+    let first_encoded_segment_bytes = scheduler
+        .publication
+        .seal_encoded_segment_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
     let pointer_path = store.path().join("active-code-generation-v1.json");
     let first_pointer: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&pointer_path).expect("read first pointer"))
@@ -401,6 +936,22 @@ fn partitioned_publication_reuses_unchanged_file_segments() {
         scheduler
             .reconcile_now()
             .expect("publish one-line-edit generation"),
+    );
+    let second_encoded_segment_bytes = scheduler
+        .publication
+        .seal_encoded_segment_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let second_existing_segment_bytes_read = scheduler
+        .publication
+        .seal_existing_segment_bytes_read
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        second_encoded_segment_bytes.saturating_mul(4) < first_encoded_segment_bytes,
+        "one-file increment encoded {second_encoded_segment_bytes} segment bytes after the cold generation encoded {first_encoded_segment_bytes}"
+    );
+    assert_eq!(
+        second_existing_segment_bytes_read, 0,
+        "unchanged content-addressed segments must not be reopened during incremental seal"
     );
     let second_pointer: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&pointer_path).expect("read second pointer"))
@@ -482,6 +1033,16 @@ fn partitioned_publication_reuses_unchanged_file_segments() {
     };
     let first_components = component_sizes(&first_manifest);
     let second_components = component_sizes(&second_manifest);
+    let first_evidence_pack = first_manifest["generation"]["generation_evidence"]["segment_digest"]
+        .as_str()
+        .expect("first evidence pack digest")
+        .to_owned();
+    let second_evidence_pack =
+        second_manifest["generation"]["generation_evidence"]["segment_digest"]
+            .as_str()
+            .expect("second evidence pack digest")
+            .to_owned();
+    assert_ne!(first_evidence_pack, second_evidence_pack);
     let second_generation_growth = std::fs::metadata(&second_manifest_path)
         .expect("second manifest metadata")
         .len()
@@ -532,11 +1093,54 @@ fn partitioned_publication_reuses_unchanged_file_segments() {
         .find(|segment| segment["file_key"].as_u64() == Some(edited_key))
         .and_then(|segment| segment["segment_size_bytes"].as_u64())
         .expect("edited segment size");
+    assert_eq!(
+        first_encoded_segment_bytes, first_generation_segment_bytes,
+        "cold seal counts every encoded file segment byte"
+    );
+    assert_eq!(
+        second_encoded_segment_bytes, second_generation_new_bytes,
+        "incremental seal counts only the edited file segment bytes"
+    );
     assert!(
         second_generation_new_bytes.saturating_mul(8) < first_generation_segment_bytes,
         "one-line edit rewrote {second_generation_new_bytes} bytes from a \
          {first_generation_segment_bytes}-byte first generation"
     );
+
+    let orphan_bytes = b"evidence pack committed before its manifest";
+    let orphan_digest = hex::encode(Sha256::digest(orphan_bytes));
+    let orphan_pack = segment_root.join(format!("segment-{orphan_digest}.json"));
+    std::fs::write(&orphan_pack, orphan_bytes).expect("write committed orphan evidence pack");
+    let orphan_report = tracedecay_code_index_retention::code_index_generations::run_code_generation_retention(
+        store.path(),
+        &BTreeSet::new(),
+        tracedecay_code_index_retention::code_index_generations::DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+        tracedecay_code_index_retention::code_index_generations::CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(8_000_000),
+        None,
+    )
+    .expect("sweep committed orphan without collecting a generation");
+    assert!(
+        orphan_report.deleted_generations.is_empty(),
+        "both pointer-addressable generations must remain retained"
+    );
+    assert!(
+        !orphan_pack.exists(),
+        "retention must sweep an unreferenced final pack even without a generation deletion"
+    );
+    for live_segment in [&shared_segment, &first_evidence_pack, &second_evidence_pack] {
+        assert!(
+            segment_root
+                .join(format!(
+                    "segment-{}.json",
+                    live_segment
+                        .strip_prefix("sha256:")
+                        .expect("tagged live segment digest")
+                ))
+                .is_file(),
+            "active, retained, and parent-reused segment {live_segment} must remain marked"
+        );
+    }
 
     remove_historical_pointer_entries(store.path());
     let report = tracedecay_code_index_retention::code_index_generations::run_code_generation_retention(
@@ -564,6 +1168,392 @@ fn partitioned_publication_reuses_unchanged_file_segments() {
     assert!(
         !segment_path(&retired_edited_segment).exists(),
         "retention must collect a segment referenced only by the retired generation"
+    );
+    assert!(
+        segment_path(&second_evidence_pack).is_file(),
+        "retention must preserve the active generation's packed evidence"
+    );
+    assert!(
+        !segment_path(&first_evidence_pack).exists(),
+        "retention must collect packed evidence referenced only by the retired generation"
+    );
+}
+
+#[test]
+fn multi_page_evidence_uses_one_durable_pack_and_survives_restart() {
+    let source = (0..1_600).fold(String::new(), |mut source, index| {
+        writeln!(
+            source,
+            "pub fn evidence_{index}(value: usize) -> usize {{ value + {index} }}"
+        )
+        .expect("write generated fixture source");
+        source
+    });
+    let fixture = GitFixture::new(&[("src/evidence.rs", source.as_str())]);
+    let store = TempDir::new().expect("store root");
+    let (generation_id, evidence_pack_path) = {
+        let mut scheduler = scheduler(
+            &fixture,
+            store.path().to_path_buf(),
+            Arc::new(SharedCodeIndexBytePoolV1::default()),
+        );
+        published(
+            scheduler
+                .reconcile_now()
+                .expect("publish multi-page generation"),
+        );
+        let latest = scheduler
+            .latest_complete_already_decoded()
+            .expect("multi-page generation remains decoded");
+        let generation_id = latest.generation.manifest().generation_id.clone();
+        let pointer: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(store.path().join("active-code-generation-v1.json"))
+                .expect("read active pointer"),
+        )
+        .expect("decode active pointer");
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                store.path().join("code-generations-v1").join(
+                    pointer["generation_file"]
+                        .as_str()
+                        .expect("generation manifest path"),
+                ),
+            )
+            .expect("read partitioned manifest"),
+        )
+        .expect("decode partitioned manifest");
+        let pages = manifest["generation"]["generation_evidence"]["pages"]
+            .as_array()
+            .expect("evidence page descriptors");
+        assert!(pages.len() > 1, "the production fixture must span pages");
+        let segments_root = store.path().join("code-generation-segments-v1");
+        let file_segment_count = manifest["generation"]["file_segments"]
+            .as_array()
+            .expect("file segment descriptors")
+            .len();
+        assert_eq!(
+            std::fs::read_dir(&segments_root)
+                .expect("read segment objects")
+                .count(),
+            file_segment_count + 1,
+            "pages must be ranges in one pack, never separate filesystem objects"
+        );
+        for page in pages {
+            let page_digest = page["page_digest"]
+                .as_str()
+                .expect("page digest")
+                .strip_prefix("sha256:")
+                .expect("tagged page digest");
+            assert!(
+                !segments_root
+                    .join(format!("segment-{page_digest}.json"))
+                    .exists(),
+                "an evidence page must not receive its own durable transaction"
+            );
+        }
+        assert_eq!(
+            scheduler
+                .publication
+                .seal_evidence_page_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            pages.len() as u64,
+            "the scale counter must report every streamed page"
+        );
+        assert_eq!(
+            scheduler
+                .publication
+                .seal_evidence_durable_transaction_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "all evidence pages must use one fsync/rename transaction"
+        );
+        let evidence_digest = manifest["generation"]["generation_evidence"]["segment_digest"]
+            .as_str()
+            .expect("evidence pack digest")
+            .strip_prefix("sha256:")
+            .expect("tagged evidence pack digest");
+        (
+            generation_id,
+            store
+                .path()
+                .join("code-generation-segments-v1")
+                .join(format!("segment-{evidence_digest}.json")),
+        )
+    };
+
+    let reopened = super::DaemonCodeIndexPublicationStoreV1::new(
+        store.path(),
+        fixture.path(),
+        SanitizerRevision::new(tracedecay_runtime_core::privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+            .expect("sanitizer revision"),
+    )
+    .expect("reopen publication store");
+    assert!(
+        reopened
+            .load_generation(&generation_id)
+            .expect("decode multi-page evidence after restart")
+            .is_some(),
+        "the one-pack generation must remain restart-readable"
+    );
+    drop(reopened);
+
+    let evidence_len = std::fs::metadata(&evidence_pack_path)
+        .expect("evidence pack metadata")
+        .len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&evidence_pack_path)
+        .expect("open evidence pack for truncation")
+        .set_len(evidence_len - 1)
+        .expect("truncate one evidence byte");
+    let corrupted = super::DaemonCodeIndexPublicationStoreV1::new(
+        store.path(),
+        fixture.path(),
+        SanitizerRevision::new(tracedecay_runtime_core::privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+            .expect("sanitizer revision"),
+    )
+    .expect("reopen corrupted publication store");
+    assert!(
+        corrupted.load_generation(&generation_id).is_err(),
+        "a pack missing any page byte must fail closed after restart"
+    );
+}
+
+#[test]
+fn failed_and_crashed_evidence_pack_temporaries_are_removed() {
+    let fixture = GitFixture::new(&[("src/lib.rs", "pub fn fixture() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let segments_root = store.path().join("code-generation-segments-v1");
+    std::fs::create_dir_all(&segments_root).expect("create segment root");
+    let temporary_path = segments_root.join(".evidence-pack-publication.injected.tmp");
+    {
+        let mut pack = super::TemporaryEvidencePackV1::create(temporary_path.clone())
+            .expect("create temporary evidence pack");
+        for ordinal in 0..3 {
+            let bytes = format!("page-{ordinal}");
+            let digest = ManifestDigest::from_sha256_bytes(&Sha256::digest(bytes.as_bytes()))
+                .expect("page digest");
+            pack.append_page(ordinal, &digest, bytes.as_bytes())
+                .expect("append page before injected failure");
+        }
+    }
+    assert!(
+        !temporary_path.exists(),
+        "a failure after N pages must remove the incomplete pack"
+    );
+
+    std::fs::write(&temporary_path, b"crash orphan").expect("write crash orphan");
+    let _reopened = super::DaemonCodeIndexPublicationStoreV1::new(
+        store.path(),
+        fixture.path(),
+        SanitizerRevision::new(tracedecay_runtime_core::privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+            .expect("sanitizer revision"),
+    )
+    .expect("restart publication store");
+    assert!(
+        !temporary_path.exists(),
+        "restart must durably clean an abandoned evidence pack"
+    );
+}
+
+#[test]
+fn evidence_pack_failure_after_pages_never_publishes_manifest_or_pointer() {
+    let source = (0..1_600).fold(String::new(), |mut source, index| {
+        writeln!(
+            source,
+            "pub fn failed_evidence_{index}(value: usize) -> usize {{ value + {index} }}"
+        )
+        .expect("write generated fixture source");
+        source
+    });
+    let fixture = GitFixture::new(&[("src/evidence.rs", source.as_str())]);
+    let source_store = TempDir::new().expect("source store root");
+    let generation = {
+        let mut scheduler = scheduler(
+            &fixture,
+            source_store.path().to_path_buf(),
+            Arc::new(SharedCodeIndexBytePoolV1::default()),
+        );
+        published(
+            scheduler
+                .reconcile_now()
+                .expect("build multi-page generation"),
+        );
+        Arc::clone(
+            &scheduler
+                .latest_complete_already_decoded()
+                .expect("multi-page generation remains decoded")
+                .generation,
+        )
+    };
+    let source_pointer: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(source_store.path().join("active-code-generation-v1.json"))
+            .expect("read source pointer"),
+    )
+    .expect("decode source pointer");
+    let source_generation_file = source_pointer["generation_file"]
+        .as_str()
+        .expect("source generation manifest path")
+        .to_owned();
+    let source_manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            source_store
+                .path()
+                .join("code-generations-v1")
+                .join(&source_generation_file),
+        )
+        .expect("read source manifest"),
+    )
+    .expect("decode source manifest");
+    let evidence = &source_manifest["generation"]["generation_evidence"];
+    let evidence_page_count = evidence["pages"]
+        .as_array()
+        .expect("evidence page descriptors")
+        .len();
+    assert!(
+        evidence_page_count > 1,
+        "the failure fixture must append multiple pages before commit"
+    );
+    let evidence_digest = evidence["segment_digest"]
+        .as_str()
+        .expect("evidence pack digest")
+        .strip_prefix("sha256:")
+        .expect("tagged evidence pack digest");
+    let source_pack = source_store
+        .path()
+        .join("code-generation-segments-v1")
+        .join(format!("segment-{evidence_digest}.json"));
+
+    let failed_store = TempDir::new().expect("failed publication store root");
+    let mut publication = super::DaemonCodeIndexPublicationStoreV1::new(
+        failed_store.path(),
+        fixture.path(),
+        SanitizerRevision::new(tracedecay_runtime_core::privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+            .expect("sanitizer revision"),
+    )
+    .expect("open failed publication store");
+    let segments_root = failed_store.path().join("code-generation-segments-v1");
+    let colliding_pack = segments_root.join(format!("segment-{evidence_digest}.json"));
+    std::fs::write(&colliding_pack, b"wrong immutable evidence pack")
+        .expect("seed corrupt immutable evidence target");
+
+    let error = publication
+        .publish_atomically(&generation.sealed_scope(), None, Arc::clone(&generation))
+        .expect_err("a conflicting aggregate pack must fail publication");
+    assert!(
+        error
+            .to_string()
+            .contains("existing sealed evidence pack does not match its content address"),
+        "the real pack commit must reject the conflicting aggregate: {error}"
+    );
+    assert_eq!(
+        publication
+            .seal_evidence_page_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        evidence_page_count as u64,
+        "publication must fail only after every evidence page was appended"
+    );
+    assert_eq!(
+        publication
+            .seal_evidence_durable_transaction_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a rejected pack must not claim a completed durability transaction"
+    );
+    assert!(
+        !failed_store
+            .path()
+            .join("active-code-generation-v1.json")
+            .exists(),
+        "a failed aggregate commit must not publish a pointer"
+    );
+    assert_eq!(
+        std::fs::read_dir(failed_store.path().join("code-generations-v1"))
+            .expect("read failed generation directory")
+            .count(),
+        0,
+        "a failed aggregate commit must not publish a manifest or leave its temporary"
+    );
+    assert!(
+        std::fs::read_dir(&segments_root)
+            .expect("read failed segment directory")
+            .all(|entry| {
+                !entry
+                    .expect("failed segment directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".evidence-pack-publication.")
+            }),
+        "a failed aggregate commit must remove its incomplete evidence temporary"
+    );
+
+    std::fs::remove_file(&colliding_pack).expect("remove injected collision");
+    let colliding_manifest = failed_store
+        .path()
+        .join("code-generations-v1")
+        .join(&source_generation_file);
+    std::fs::write(&colliding_manifest, b"wrong immutable generation manifest")
+        .expect("seed corrupt immutable generation target");
+    let error = publication
+        .publish_atomically(&generation.sealed_scope(), None, Arc::clone(&generation))
+        .expect_err("a post-pack manifest collision must fail publication");
+    assert!(
+        error
+            .to_string()
+            .contains("immutable code-generation path contains different bytes"),
+        "the real manifest commit must reject the conflicting generation: {error}"
+    );
+    assert_eq!(
+        publication
+            .seal_evidence_durable_transaction_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the failure must occur after the final evidence-pack durability transaction"
+    );
+    assert!(
+        !colliding_pack.exists(),
+        "a pre-manifest publication failure must immediately roll back its final pack"
+    );
+    assert!(
+        !failed_store
+            .path()
+            .join("active-code-generation-v1.json")
+            .exists(),
+        "a post-pack manifest failure must not publish a pointer"
+    );
+    std::fs::remove_file(colliding_manifest).expect("remove injected manifest collision");
+
+    std::fs::copy(&source_pack, &colliding_pack)
+        .expect("simulate a crash after the final evidence-pack rename");
+    drop(publication);
+    let _reopened = super::DaemonCodeIndexPublicationStoreV1::new(
+        failed_store.path(),
+        fixture.path(),
+        SanitizerRevision::new(tracedecay_runtime_core::privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+            .expect("sanitizer revision"),
+    )
+    .expect("reopen after committed-pack crash");
+    assert!(
+        colliding_pack.exists(),
+        "publication-store construction lacks graph replay liveness and must not sweep final packs"
+    );
+
+    let graph_replay_pool = failed_store.path().join("graph-replay-pool");
+    tracedecay_private_fs::create_private_directory(&graph_replay_pool)
+        .expect("create graph replay pool");
+    let report = tracedecay_code_index_retention::code_index_generations::run_code_generation_retention(
+        failed_store.path(),
+        &BTreeSet::new(),
+        tracedecay_code_index_retention::code_index_generations::DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+        tracedecay_code_index_retention::code_index_generations::CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(8_100_000),
+        Some(&graph_replay_pool),
+    )
+    .expect("maintenance sweeps committed-pack crash debris");
+    assert!(report.deleted_generations.is_empty());
+    assert!(
+        !colliding_pack.exists(),
+        "canonical locked maintenance must remove a final pack with no durable manifest"
     );
 }
 
@@ -605,6 +1595,49 @@ fn code_generation_retention_preserves_every_pointer_addressable_generation() {
             "retention must preserve every generation still named by the pointer"
         );
     }
+}
+
+#[test]
+fn sealed_replay_binding_resolves_an_exact_superseded_generation() {
+    let fixture = GitFixture::new(RETAINED_REVISION_0);
+    let store = TempDir::new().expect("store root");
+    let generations = retention_generations(&fixture, store.path(), 2);
+    let scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    let pointer = scheduler
+        .publication
+        .read_publication_pointer()
+        .expect("read publication pointer")
+        .expect("published generation pointer");
+    let superseded = &generations[0];
+    assert_ne!(pointer.generation_id, superseded.as_str());
+    let entry = pointer
+        .generation_index
+        .iter()
+        .find(|entry| entry.generation_id == superseded.as_str())
+        .expect("superseded generation remains pointer-addressable");
+
+    let binding = scheduler
+        .publication
+        .sealed_replay_binding(superseded)
+        .expect("bind the exact superseded sealed replay");
+
+    assert_eq!(
+        binding.sealed_state_digest.as_str(),
+        entry.state_digest,
+        "the replay binding must retain the requested generation's sealed identity",
+    );
+
+    let unknown = CodeGenerationId::new("generation.not-retained").expect("unknown generation");
+    assert!(matches!(
+        scheduler.publication.sealed_replay_binding(&unknown),
+        Err(CodeIndexPublicationStoreErrorV1::Unavailable(message))
+            if message.contains(unknown.as_str())
+                && message.contains("not retained in the publication index")
+    ));
 }
 
 #[test]
@@ -1989,16 +3022,11 @@ fn saved_edit_incremental_publish() {
         .expect("graph owner is activated");
 }
 
-/// Committing content the index already serves re-seals for provenance (see
-/// `same_content_head_move_publishes_new_source_identity`), and that re-seal
-/// must be delta-empty at the parse boundary: zero capture-declared changed
-/// files and zero changed chunks, with every chunk reused. This pins the
-/// evidence the downstream phases receive — graph activation, text-artifact
-/// projection, and semantic staging currently rebuild generation-scoped
-/// state from scratch even when these counters say the corpus is
-/// byte-identical, which is what makes a small drift cost a full pass.
+/// Committing content the dirty index already serves re-seals for provenance
+/// and recaptures the HEAD-tree delta, while byte identity still proves that
+/// every chunk can be reused.
 #[test]
-fn provenance_only_reseal_carries_the_full_parse_forward() {
+fn provenance_only_reseal_recaptures_the_tree_delta_without_changing_chunks() {
     let fixture = GitFixture::new(&[
         ("src/lib.rs", "pub fn alpha() -> u32 { 1 }\n"),
         ("src/other.rs", "pub fn gamma() -> u32 { 3 }\n"),
@@ -2039,8 +3067,8 @@ fn provenance_only_reseal_carries_the_full_parse_forward() {
         "committing indexed content must not change the content identity"
     );
     assert_eq!(
-        resealed.reextracted_files, 0,
-        "a provenance-only reseal declares no changed files to re-extract"
+        resealed.reextracted_files, 1,
+        "the moved HEAD tree must declare its one changed path for recapture"
     );
     assert_eq!(
         resealed.changed_chunks, 0,
@@ -4004,6 +5032,145 @@ fn incompatible_partial_text_artifact_is_discarded_and_rebuilt() {
 }
 
 #[test]
+fn invalid_partial_text_artifact_cursor_is_discarded_and_rebuilt() {
+    let mut source = "import { readFileSync } from 'node:fs';\n".to_owned();
+    for index in 0..256 {
+        writeln!(
+            &mut source,
+            "export function staleCursor{index}(): number {{ return {index}; }}"
+        )
+        .expect("write staged source fixture");
+    }
+    let fixture = GitFixture::new(&[("src/lib.ts", source.as_str())]);
+    let store = TempDir::new().expect("store root");
+    let (generation_id, snapshot) = {
+        let mut scheduler = scheduler(
+            &fixture,
+            store.path().to_path_buf(),
+            Arc::new(SharedCodeIndexBytePoolV1::default()),
+        );
+        published(scheduler.reconcile_now().expect("publish"));
+        let latest = scheduler.latest_complete().expect("latest generation");
+        assert!(
+            !latest
+                .advance_text_serving(1)
+                .expect("start bounded text artifact build"),
+            "one page must leave resumable staging state"
+        );
+        (
+            latest.metadata().manifest().generation_id.clone(),
+            latest.metadata().snapshot().clone(),
+        )
+    };
+    let artifacts_root = store.path().join("code-text-artifacts-v1");
+    let staging_path = std::fs::read_dir(&artifacts_root)
+        .expect("read artifacts root")
+        .map(|entry| entry.expect("artifact entry").path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".staging"))
+        })
+        .expect("partial staging database");
+    {
+        let connection =
+            rusqlite::Connection::open(&staging_path).expect("open partial staging database");
+        let cursor_bytes: Vec<u8> = connection
+            .query_row(
+                "SELECT next_cursor FROM source_pages ORDER BY page_ordinal DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read persisted cursor");
+        let mut cursor: Vec<serde_json::Value> =
+            serde_json::from_slice(&cursor_bytes).expect("decode persisted cursor");
+        assert_eq!(
+            cursor[1].as_u64(),
+            Some(0),
+            "cursor must remain in its file"
+        );
+        assert!(
+            cursor[3].as_u64().is_some_and(|ordinal| ordinal > 0),
+            "first page must advance within the file's chunks"
+        );
+        cursor[3] = serde_json::Value::from(0_u64);
+        cursor[7] = serde_json::Value::from(1_u64);
+
+        let text = |index: usize| {
+            cursor[index]
+                .as_str()
+                .expect("cursor digest field")
+                .as_bytes()
+        };
+        let number = |index: usize| cursor[index].as_u64().expect("cursor numeric field");
+        let mut hasher = Sha256::new();
+        hasher.update(b"tracedecay.sealed-lexical-cursor.v1\0");
+        hasher.update(
+            u64::try_from(text(0).len())
+                .expect("digest length")
+                .to_le_bytes(),
+        );
+        hasher.update(text(0));
+        for index in [1, 2, 3, 7, 4, 5, 6, 8, 9] {
+            hasher.update(number(index).to_le_bytes());
+        }
+        for index in [10, 11] {
+            hasher.update(
+                u64::try_from(text(index).len())
+                    .expect("digest length")
+                    .to_le_bytes(),
+            );
+            hasher.update(text(index));
+        }
+        cursor[12] = serde_json::Value::from(format!("sha256:{}", hex::encode(hasher.finalize())));
+        let cursor_bytes = serde_json::to_vec(&cursor).expect("encode invalid persisted cursor");
+        connection
+            .execute_batch("DROP TRIGGER immutable_source_pages_update")
+            .expect("open immutable page fixture for corruption");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE source_pages SET next_cursor = ?1 WHERE page_ordinal = \
+                     (SELECT MAX(page_ordinal) FROM source_pages)",
+                    [cursor_bytes],
+                )
+                .expect("rewrite persisted cursor"),
+            1
+        );
+        connection
+            .execute_batch(
+                "CREATE TRIGGER immutable_source_pages_update BEFORE UPDATE ON source_pages \
+                 BEGIN SELECT RAISE(ABORT, 'immutable lexical source pages'); END",
+            )
+            .expect("restore immutable page contract");
+    }
+
+    let scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    let latest = scheduler.latest_complete().expect("restored generation");
+    assert_eq!(latest.metadata().manifest().generation_id, generation_id);
+    assert_eq!(latest.metadata().snapshot(), &snapshot);
+    let mut passes = 0_usize;
+    while !latest
+        .advance_text_serving(64)
+        .expect("discard invalid cursor and rebuild")
+    {
+        passes += 1;
+        assert!(passes < 10_000, "invalid cursor rebuild did not converge");
+    }
+
+    assert!(latest.query_owners_are_warm());
+    assert!(active_text_artifact_path(store.path()).is_file());
+    assert!(
+        !staging_path.exists(),
+        "invalid resumable staging state must not survive repair"
+    );
+}
+
+#[test]
 fn reader_reservation_refusal_precedes_missing_artifact_access() {
     let fixture = GitFixture::new(&[("src/lib.rs", "pub fn reserved_first() {}\n")]);
     let store = TempDir::new().expect("store root");
@@ -5189,6 +6356,7 @@ async fn core_query_profile_composes_live_code_index_lanes() {
             graph_max_depth: 1,
             page_size: 10,
             cursor: None,
+            lexical_routing: LexicalRoutingV1::query_only(),
         },
     );
     let executed = registry
@@ -5202,6 +6370,207 @@ async fn core_query_profile_composes_live_code_index_lanes() {
     assert!(
         !executed.served_stale,
         "a ready generation serves the fresh path and is never marked stale"
+    );
+    assert_eq!(
+        executed.lexical_routes.routes,
+        vec![LexicalRouteKindV1::Query],
+        "a plain query runs exactly the query route"
+    );
+    assert!(executed.lexical_routes.matches_by_anchor.is_empty());
+    registry.shutdown().await;
+}
+
+/// Build the core-authority search policy with caller lexical routing.
+fn routed_core_search_request(
+    query: &str,
+    lexical_routing: LexicalRoutingV1,
+) -> super::query_runtime::QuerySearchExecutionRequestV1 {
+    let mut request = core_search_request(query);
+    request.lexical_routing = lexical_routing;
+    request
+}
+
+/// The qualified symbol name behind each composed candidate, in rank order;
+/// `None` for file-grain chunk anchors.
+fn ranked_symbol_names(
+    executed: &super::query_runtime::ExecutedQuerySearchV1,
+    latest: &super::LatestCompleteCodeIndexV1,
+) -> Vec<Option<String>> {
+    let symbols = latest.generation.symbols();
+    executed
+        .authorized
+        .fallback
+        .ordered_candidates
+        .iter()
+        .map(|ranked| {
+            let anchor = ranked.candidate.anchor_id.as_str();
+            let occurrence = anchor.strip_prefix("code-symbol:")?;
+            let symbol = symbols
+                .symbols
+                .iter()
+                .find(|symbol| symbol.occurrence.as_str() == occurrence)
+                .unwrap_or_else(|| panic!("anchor {anchor} names a published symbol"));
+            Some(symbol.qualified_name.clone())
+        })
+        .collect()
+}
+
+fn ranks_symbol(names: &[Option<String>], suffix: &str) -> bool {
+    names.iter().flatten().any(|name| name.ends_with(suffix))
+}
+
+/// A lexical anchor is its own ranked route: a symbol the natural-language
+/// query never reaches enters the composed page with evidence naming the
+/// anchor, and the query-only page is unchanged.
+#[tokio::test]
+async fn lexical_anchor_route_ranks_the_anchored_symbol_with_named_evidence() {
+    // The file path must not repeat the query term: path postings would
+    // otherwise reach every symbol in the file and blur the anchor's effect.
+    let fixture = GitFixture::new(&[(
+        "src/lib.rs",
+        "pub fn allocate_inventory() {}\n\npub fn reserve_stock() {}\n\npub fn ship_order() {}\n",
+    )]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+    let latest = wait_for_live_complete_generation(&registry, fixture.path()).await;
+
+    // Whole query terms match whole indexed tokens and query subtokens match
+    // the subtoken field, so this multi-token query reaches
+    // `allocate_inventory` (whole term + subtokens) and nothing in
+    // `reserve_stock`'s vocabulary.
+    let query = "allocate_inventory callers";
+    let query_only = registry
+        .execute_query_search(&scope, core_search_request(query))
+        .await
+        .expect("query-only search composes");
+    let query_only_names = ranked_symbol_names(&query_only, &latest);
+    assert!(
+        ranks_symbol(&query_only_names, "allocate_inventory"),
+        "the natural-language query reaches allocate_inventory: {query_only_names:?}"
+    );
+    assert!(
+        !ranks_symbol(&query_only_names, "reserve_stock"),
+        "the natural-language query alone never reaches reserve_stock: {query_only_names:?}"
+    );
+
+    let routing =
+        LexicalRoutingV1::new(vec!["reserve_stock".to_owned()], false).expect("one valid anchor");
+    let anchored = registry
+        .execute_query_search(&scope, routed_core_search_request(query, routing))
+        .await
+        .expect("anchored search composes");
+    let anchored_names = ranked_symbol_names(&anchored, &latest);
+    assert!(
+        ranks_symbol(&anchored_names, "reserve_stock"),
+        "the anchor route adds reserve_stock to the composed page: {anchored_names:?}"
+    );
+    assert!(
+        ranks_symbol(&anchored_names, "allocate_inventory"),
+        "the query route still contributes: {anchored_names:?}"
+    );
+    assert_eq!(anchored.lexical_routes.routes.len(), 2);
+    let anchor_kind = anchored.lexical_routes.routes[1].clone();
+    assert!(
+        matches!(&anchor_kind, LexicalRouteKindV1::Anchor { anchor } if anchor.as_str() == "reserve_stock"),
+        "{anchor_kind:?}"
+    );
+    let reserve = anchored
+        .authorized
+        .fallback
+        .ordered_candidates
+        .iter()
+        .zip(&anchored_names)
+        .find(|(_, name)| {
+            name.as_deref()
+                .is_some_and(|name| name.ends_with("reserve_stock"))
+        })
+        .map(|(ranked, _)| ranked)
+        .expect("reserve_stock is ranked");
+    let matches = anchored
+        .lexical_routes
+        .matches_by_anchor
+        .get(&reserve.candidate.anchor_id)
+        .expect("the anchored candidate carries route evidence");
+    assert!(
+        matches
+            .iter()
+            .any(|route_match| route_match.route == anchor_kind
+                && route_match
+                    .matched_terms
+                    .iter()
+                    .any(|term| term == "reserve_stock")),
+        "the evidence names the anchor that ranked the hit: {matches:?}"
+    );
+    registry.shutdown().await;
+}
+
+/// `prefer_symbol` adds a deterministic symbol-name route built from the
+/// query's identifier-shaped tokens; a query with no such token adds nothing.
+#[tokio::test]
+async fn preferred_symbol_route_is_derived_from_query_identifiers() {
+    let fixture = GitFixture::new(&[(
+        "src/lib.rs",
+        "pub fn allocate_inventory() {}\n\npub fn reserve_stock() {}\n",
+    )]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+    let latest = wait_for_live_complete_generation(&registry, fixture.path()).await;
+
+    let routing = LexicalRoutingV1::new(Vec::new(), true).expect("prefer_symbol routing");
+    let preferred = registry
+        .execute_query_search(
+            &scope,
+            routed_core_search_request("explain the function reserve_stock", routing.clone()),
+        )
+        .await
+        .expect("preferred-symbol search composes");
+    assert_eq!(
+        preferred.lexical_routes.routes,
+        vec![
+            LexicalRouteKindV1::Query,
+            LexicalRouteKindV1::PreferredSymbol {
+                tokens: vec!["reserve_stock".to_owned()],
+            },
+        ],
+        "stoplisted query words never become symbol tokens"
+    );
+    let names = ranked_symbol_names(&preferred, &latest);
+    let reserve = preferred
+        .authorized
+        .fallback
+        .ordered_candidates
+        .iter()
+        .zip(&names)
+        .find(|(_, name)| {
+            name.as_deref()
+                .is_some_and(|name| name.ends_with("reserve_stock"))
+        })
+        .map(|(ranked, _)| ranked)
+        .expect("reserve_stock is ranked");
+    let matches = preferred
+        .lexical_routes
+        .matches_by_anchor
+        .get(&reserve.candidate.anchor_id)
+        .expect("the symbol-name hit carries route evidence");
+    assert!(
+        matches.iter().any(|route_match| matches!(
+            route_match.route,
+            LexicalRouteKindV1::PreferredSymbol { .. }
+        )),
+        "{matches:?}"
+    );
+
+    let no_identifiers = registry
+        .execute_query_search(
+            &scope,
+            routed_core_search_request("what is the type of a", routing),
+        )
+        .await
+        .expect("a query without identifiers still composes");
+    assert_eq!(
+        no_identifiers.lexical_routes.routes,
+        vec![LexicalRouteKindV1::Query],
+        "no identifier-shaped token means no preferred-symbol route"
     );
     registry.shutdown().await;
 }
@@ -5316,6 +6685,7 @@ fn core_search_request(query: &str) -> super::query_runtime::QuerySearchExecutio
             graph_max_depth: 1,
             page_size: 10,
             cursor: None,
+            lexical_routing: LexicalRoutingV1::query_only(),
         },
     )
 }
@@ -5519,8 +6889,15 @@ fn moved_reference_scope(scope: &ResolvedScope) -> ResolvedScope {
 /// last complete generation stays in `serving_generation`. A seat whose
 /// currency witness still re-proves against the unchanged checkout serves as
 /// current; once the checkout drifts under the held mutex the witness
-/// disproves, the ready gate abstains, and the fallback serves the same
-/// complete generation reported stale.
+/// disproves and the fallback serves the same complete generation reported
+/// stale.
+///
+/// The ready gate itself no longer abstains for this window. Decoupling
+/// freshness from publication work moved readiness onto the per-worktree
+/// source-freshness state, so the gate reads it without the scheduler and an
+/// unchanged checkout stays ready while a rebuild owns the mutex — which is
+/// the point of the decoupling, and what the witnessed assertion below
+/// already required of the query path.
 // Holding the scheduler guard across the awaits is the scenario, not an
 // oversight: it is how this test occupies the rebuild window that the fallback
 // exists to serve through. The guard is released before shutdown.
@@ -5559,8 +6936,9 @@ async fn search_serves_the_last_complete_generation_while_the_scheduler_rebuilds
         registry
             .latest_complete_ready_for_scope(&scope)
             .await
-            .is_none(),
-        "the ready gate abstains for the whole rebuild window"
+            .is_some(),
+        "the ready gate reads source freshness without the scheduler, so a rebuild \
+         window over an unchanged checkout does not make it abstain"
     );
     assert!(
         registry
@@ -5584,11 +6962,22 @@ async fn search_serves_the_last_complete_generation_while_the_scheduler_rebuilds
     // Drift the checkout while the rebuild still owns the scheduler: the
     // witness disproves, the ready gate abstains, and the fallback serves the
     // last complete generation reported stale.
+    //
+    // The drift is Git-mediated because that is what the decoupled freshness
+    // authority observes without the scheduler. A bare worktree write is the
+    // documented tier-2 case: it is proven only by the periodic
+    // stat-signature ladder, and until that ladder runs the bounded-staleness
+    // contract deliberately keeps serving the preceding generation as
+    // current. Using it here would assert against that contract rather than
+    // against this test's subject, which is what search reports once the seat
+    // *is* disproved mid-rebuild.
     std::fs::write(
         fixture.path().join("src/main.rs"),
         "fn main() { drifted(); }\n",
     )
     .expect("drift the checkout under the held scheduler");
+    git(fixture.path(), &["add", "src/main.rs"]);
+    git(fixture.path(), &["commit", "-qm", "drift under rebuild"]);
     let stale = registry
         .execute_query_search(&scope, core_search_request("main"))
         .await
@@ -6705,6 +8094,131 @@ fn repeated_identical_conflict_verdict_is_terminal_not_retryable() {
     );
 }
 
+/// A first publication conflict is a concurrent-publisher race, not a
+/// deterministic refusal. The seat loop must schedule exactly one retry and
+/// seat the sealed generation when that retry succeeds (issue #765). A later
+/// conflict at a different guard site stays retryable — only an identical
+/// repeat is terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_activation_conflict_retries_once_and_then_seats() {
+    use tracedecay_graph_db::GraphDbError;
+
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let scoped_store = super::scoped_code_index_store_root(
+        store.path(),
+        &fixture.path().canonicalize().expect("canonical fixture"),
+    );
+    let (scope, worktree_id, sealed_generation_id) = {
+        let mut scheduler = scheduler(
+            &fixture,
+            scoped_store,
+            Arc::new(SharedCodeIndexBytePoolV1::default()),
+        );
+        published(scheduler.reconcile_now().expect("seed generation"));
+        let latest = scheduler.latest_complete().expect("seeded generation");
+        let snapshot = latest.generation.snapshot();
+        let worktree_id = snapshot.worktree.clone().expect("worktree id");
+        (
+            ResolvedScope::new(
+                test_project_id(),
+                snapshot.repository.clone(),
+                worktree_id.clone(),
+                snapshot.reference.clone(),
+            )
+            .expect("resolved scope"),
+            worktree_id,
+            latest.generation.manifest().generation_id.clone(),
+        )
+    };
+
+    let conflict_error = |site: &'static str| {
+        super::CodeIndexSchedulerErrorV1::GraphProjection(GraphDbError::conflict(site).into())
+    };
+    let context_of = |site: &'static str| {
+        conflict_error(site)
+            .activation_conflict_context()
+            .expect("conflict error carries its context")
+            .clone()
+    };
+    let first = conflict_error("publication.prepare.expected_prior_head");
+    let different_site = (
+        sealed_generation_id.clone(),
+        context_of("publication.complete.cas_prior_head"),
+    );
+    assert!(
+        !super::registry::is_repeated_conflict_verdict(&first, &sealed_generation_id, None),
+        "the first conflict retries; it may be a concurrent-publisher race"
+    );
+    assert!(
+        !super::registry::is_repeated_conflict_verdict(
+            &first,
+            &sealed_generation_id,
+            Some(&different_site)
+        ),
+        "a second different conflict is not classified terminal"
+    );
+
+    super::graph_activation::set_injected_activation_conflicts(&worktree_id, 1);
+    let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("mount retained generation");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let freshness = registry
+            .dashboard_freshness(fixture.path())
+            .await
+            .expect("mounted dashboard freshness");
+        if let Some(
+            tracedecay_dashboard_api::code_index_freshness_api::CodeGraphServingReadinessV1::Unavailable {
+                ref reason,
+            },
+        ) = freshness.code_graph_serving
+            && reason != "generation_unavailable"
+        {
+            panic!("first conflict became a terminal graph refusal: {reason}");
+        }
+        let seated = registry
+            .latest_complete_serving_for_scope(&scope)
+            .await
+            .is_some_and(|latest| {
+                latest.generation().manifest().generation_id == sealed_generation_id
+                    && latest.code_graph_serving_readiness()
+                        == tracedecay_dashboard_api::code_index_freshness_api::CodeGraphServingReadinessV1::Ready
+            });
+        if seated
+            && matches!(
+                freshness.code_graph_serving,
+                Some(
+                    tracedecay_dashboard_api::code_index_freshness_api::CodeGraphServingReadinessV1::Ready
+                )
+            )
+        {
+            break;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "the first-conflict retry did not seat the sealed generation: {freshness:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(
+        super::graph_activation::injected_activation_attempt_count(&worktree_id),
+        2,
+        "one injected conflict must schedule exactly one retry that then seats"
+    );
+    registry.shutdown().await;
+}
+
 /// The serving gates are relaxed on `reference` only. A different repository
 /// or a different worktree is a different checkout identity and must stay
 /// unservable, or an answer would be mis-attributed rather than merely old.
@@ -7303,6 +8817,105 @@ async fn unchanged_background_freshness_probe_posts_no_overflow_wake() {
 }
 
 #[tokio::test]
+async fn diagnostics_change_generation_is_stable_until_a_sibling_edit_hint() {
+    let fixture = GitFixture::new(&[
+        ("src/lib.rs", "pub fn primary() {}\n"),
+        ("src/sibling.rs", "pub fn sibling() {}\n"),
+    ]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree_with_one_permit(&fixture, &store).await;
+    let admission = registry
+        .background_reconcile_admission()
+        .acquire_owned()
+        .await
+        .expect("hold background reconcile admission");
+    registry.clear_pending_wake_for_scope(&scope).await;
+
+    let first = registry
+        .diagnostics_change_generation(fixture.path())
+        .await
+        .expect("mounted diagnostics generation");
+    let unchanged = registry
+        .diagnostics_change_generation(fixture.path())
+        .await
+        .expect("stable diagnostics generation");
+    assert_eq!(unchanged, first);
+
+    fixture.edit(
+        "src/sibling.rs",
+        "pub fn sibling() { println!(\"changed\"); }\n",
+    );
+    assert!(
+        registry
+            .notify_hook_paths(fixture.path(), &["src/sibling.rs".to_owned()])
+            .await
+    );
+    let changed = registry
+        .diagnostics_change_generation(fixture.path())
+        .await
+        .expect("changed diagnostics generation");
+    assert!(changed > first);
+    let still_pending = registry
+        .diagnostics_change_generation(fixture.path())
+        .await
+        .expect("pending diagnostics generation");
+    assert_eq!(
+        still_pending, changed,
+        "a coalesced pending reconcile must not mint another generation"
+    );
+
+    drop(admission);
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn diagnostics_change_generation_advances_for_out_of_band_git_drift() {
+    let fixture = GitFixture::new(&[
+        ("src/lib.rs", "pub fn primary() {}\n"),
+        ("src/sibling.rs", "pub fn sibling() {}\n"),
+    ]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree_with_one_permit(&fixture, &store).await;
+    let admission = registry
+        .background_reconcile_admission()
+        .acquire_owned()
+        .await
+        .expect("hold background reconcile admission");
+    registry.clear_pending_wake_for_scope(&scope).await;
+
+    let first = registry
+        .diagnostics_change_generation(fixture.path())
+        .await
+        .expect("mounted diagnostics generation");
+    fixture.edit(
+        "src/sibling.rs",
+        "pub fn sibling() { println!(\"out of band\"); }\n",
+    );
+    git(fixture.path(), &["add", "src/sibling.rs"]);
+    git(fixture.path(), &["commit", "-qm", "out-of-band drift"]);
+
+    let changed = registry
+        .diagnostics_change_generation(fixture.path())
+        .await
+        .expect("drifted diagnostics generation");
+    assert!(
+        changed > first,
+        "Git metadata drift must advance the canonical change generation"
+    );
+    let unchanged = registry
+        .diagnostics_change_generation(fixture.path())
+        .await
+        .expect("stable drifted diagnostics generation");
+    assert_eq!(
+        unchanged, changed,
+        "repeated reads of the same pending drift must stay stable"
+    );
+
+    drop(admission);
+    registry.shutdown().await;
+}
+
+#[tokio::test]
 async fn elapsed_freshness_window_alone_does_not_make_dashboard_state_stale() {
     let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
     let store = TempDir::new().expect("store root");
@@ -7864,6 +9477,13 @@ fn durable_publication_writes_partitioned_manifest_and_reuses_immutable_targets(
             Arc::clone(&latest.generation),
         )
         .expect("identical immutable generation republishes");
+    assert_eq!(
+        reopened
+            .seal_evidence_durable_transaction_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an identical evidence pack retry must not repeat a durability transaction"
+    );
 
     assert_eq!(
         std::fs::read(&generation_path).expect("read republished generation"),
@@ -9142,6 +10762,7 @@ async fn configured_jina_lifecycle_publishes_and_restores_semantic_generation() 
             max_sequence_length: 512,
             load_deadline_ms: 180_000,
         },
+        tracedecay_domain::EmbeddingDocumentCompositionV1::SanitizedText,
     );
 
     assert!(runtime.schedule_saved_generation(Arc::clone(&latest.generation)));
@@ -9183,6 +10804,7 @@ async fn configured_jina_lifecycle_publishes_and_restores_semantic_generation() 
             max_sequence_length: 512,
             load_deadline_ms: 180_000,
         },
+        tracedecay_domain::EmbeddingDocumentCompositionV1::SanitizedText,
     );
     assert!(
         restarted
@@ -9539,6 +11161,370 @@ async fn callable_application_operations_consume_exact_lexical_and_graph_owners(
             .is_empty()
     );
 
+    registry.shutdown().await;
+}
+
+const CALLER_STAR: usize = 2_000;
+const CALLER_STAR_FILES: usize = 8;
+const CALLER_PAGE: u32 = 10;
+
+fn caller_star_sources() -> Vec<(String, String)> {
+    let per_file = CALLER_STAR / CALLER_STAR_FILES;
+    let mut mods = String::from("pub fn hub() {}\n");
+    let mut files = Vec::with_capacity(CALLER_STAR_FILES.saturating_add(1));
+    for file_idx in 0..CALLER_STAR_FILES {
+        let _ = writeln!(mods, "mod callers_{file_idx:02};");
+        let mut body = String::new();
+        for local in 0..per_file {
+            let index = file_idx * per_file + local;
+            let _ = writeln!(body, "pub fn caller_{index:04}() {{ crate::hub(); }}");
+        }
+        files.push((format!("src/callers_{file_idx:02}.rs"), body));
+    }
+    files.insert(0, ("src/lib.rs".to_owned(), mods));
+    files
+}
+
+fn callers_page_meta(page_size: u32, cursor: Option<OpaqueCursor>) -> RetrievalRequestMeta {
+    RetrievalRequestMeta::current(
+        PageRequest::new(page_size, cursor).expect("callers page"),
+        ResultProjection::Evidence,
+        RetrievalOrder::Relevance,
+    )
+}
+
+async fn wait_for_live_complete_generation_deadline(
+    registry: &CodeIndexSchedulerRegistryV1,
+    path: &Path,
+    budget: Duration,
+) -> super::LatestCompleteCodeIndexV1 {
+    let deadline = Instant::now() + budget;
+    let mut publications = registry.subscribe_generation_publications();
+    loop {
+        if let Some(latest) = registry.latest_complete_serving_for_test(path).await {
+            return latest;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "large callers fixture did not seat a complete generation"
+        );
+        tokio::select! {
+            _ = publications.recv() => {}
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn callers_page_hydrates_only_the_requested_slice() {
+    let sources = caller_star_sources();
+    let files = sources
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = GitFixture::new(&files);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("mount daemon-owned scheduler");
+    let latest = wait_for_live_complete_generation_deadline(
+        &registry,
+        fixture.path(),
+        Duration::from_mins(2),
+    )
+    .await;
+    let generation = latest.generation.manifest().generation_id.clone();
+    let repository = latest.generation.snapshot().repository.clone();
+    let worktree = latest
+        .generation
+        .snapshot()
+        .worktree
+        .clone()
+        .expect("worktree identity");
+    let scope = CodeQueryScope::new(generation.clone(), None).expect("query scope");
+    let hub = latest
+        .generation
+        .symbols()
+        .symbols
+        .iter()
+        .find(|record| record.qualified_name.ends_with("hub"))
+        .expect("hub symbol");
+    let expected_keys = super::queries::relation_keys(
+        &latest,
+        &hub.occurrence,
+        &[RelationEdgeKindV1::Calls],
+        true,
+        1,
+        &scope,
+    );
+    let expected = super::queries::hydrate_relation_records(&latest, &expected_keys)
+        .expect("hydrate all keys");
+    assert_eq!(expected.len(), CALLER_STAR);
+    let _ = super::queries::take_relation_symbol_hydrations();
+
+    let operation = callable_code_operation(CallableCodeOperationKind::Callers).expect("operation");
+    let context = application_context(&operation, repository, worktree);
+    mount_query_authority(
+        &registry,
+        fixture.path(),
+        &context,
+        latest.generation.manifest().privacy_domain.clone(),
+    )
+    .await;
+    let request = CodeRelationRequest {
+        node_id: hub.occurrence.as_str().to_owned(),
+        maximum_depth: 1,
+        resolve_trait_dispatch: false,
+        scope: scope.clone(),
+        meta: callers_page_meta(CALLER_PAGE, None),
+    };
+    let first = registry
+        .callers(
+            RetrievalPortContext {
+                request: &context,
+                operation: &operation,
+            },
+            &request,
+        )
+        .await;
+    let first_page = match first {
+        RetrievalPortOutcome::Completed(evidence) => evidence.payload.expect("first callers page"),
+        other => panic!("expected completed callers page, got {other:?}"),
+    };
+    assert_eq!(first_page.items.len(), CALLER_PAGE as usize);
+    assert_eq!(first_page.total, Some(CALLER_STAR as u64));
+    assert_eq!(
+        first_page.items,
+        expected[..CALLER_PAGE as usize],
+        "page 1 must match the pre-change (depth, node_id) order"
+    );
+    let page1_hydrations = super::queries::take_relation_symbol_hydrations();
+    assert_eq!(
+        page1_hydrations,
+        u64::from(CALLER_PAGE),
+        "page 1 must hydrate only the returned slice; observed {page1_hydrations}"
+    );
+
+    let cursor = first_page.next_cursor.clone().expect("page 2 cursor");
+    let second_request = CodeRelationRequest {
+        node_id: hub.occurrence.as_str().to_owned(),
+        maximum_depth: 1,
+        resolve_trait_dispatch: false,
+        scope: scope.clone(),
+        meta: callers_page_meta(CALLER_PAGE, Some(cursor)),
+    };
+    let second = registry
+        .callers(
+            RetrievalPortContext {
+                request: &context,
+                operation: &operation,
+            },
+            &second_request,
+        )
+        .await;
+    let second_page = match second {
+        RetrievalPortOutcome::Completed(evidence) => evidence.payload.expect("second callers page"),
+        other => panic!("expected completed callers continuation, got {other:?}"),
+    };
+    assert_eq!(second_page.items.len(), CALLER_PAGE as usize);
+    assert_eq!(
+        second_page.items,
+        expected[CALLER_PAGE as usize..CALLER_PAGE as usize * 2]
+    );
+    assert!(
+        second_page
+            .items
+            .iter()
+            .all(|item| !first_page.items.contains(item)),
+        "page 2 must return a disjoint slice"
+    );
+    let page2_hydrations = super::queries::take_relation_symbol_hydrations();
+    assert_eq!(
+        page2_hydrations,
+        u64::from(CALLER_PAGE),
+        "page 2 must hydrate only the returned slice; observed {page2_hydrations}"
+    );
+
+    let mut collected = first_page.items.clone();
+    collected.extend(second_page.items);
+    let mut cursor = second_page.next_cursor;
+    while let Some(next) = cursor {
+        let page_request = CodeRelationRequest {
+            node_id: hub.occurrence.as_str().to_owned(),
+            maximum_depth: 1,
+            resolve_trait_dispatch: false,
+            scope: scope.clone(),
+            meta: callers_page_meta(CALLER_PAGE, Some(next)),
+        };
+        let page = match registry
+            .callers(
+                RetrievalPortContext {
+                    request: &context,
+                    operation: &operation,
+                },
+                &page_request,
+            )
+            .await
+        {
+            RetrievalPortOutcome::Completed(evidence) => evidence.payload.expect("callers page"),
+            other => panic!("expected completed callers page, got {other:?}"),
+        };
+        collected.extend(page.items);
+        cursor = page.next_cursor;
+    }
+    let _ = super::queries::take_relation_symbol_hydrations();
+    assert_eq!(
+        collected, expected,
+        "concatenated pages must equal the full (depth, occurrence) neighborhood"
+    );
+    registry.shutdown().await;
+}
+
+/// An unpinned candidate-page cursor is bound to the immutable generation that
+/// minted it: after a rebuild publishes generation B, page 2 still answers from
+/// generation A (same contract as
+/// `unpinned_cursor_continues_on_its_immutable_generation`), hydrating only its
+/// own slice.
+#[tokio::test]
+async fn callers_candidate_cursor_continues_on_its_immutable_generation() {
+    let fixture = GitFixture::new(&[(
+        "src/lib.rs",
+        "pub fn hub() {}\npub fn caller_a() { hub(); }\npub fn caller_b() { hub(); }\n",
+    )]);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("mount daemon-owned scheduler");
+    let latest = wait_for_live_complete_generation(&registry, fixture.path()).await;
+    let generation_a = latest.generation.manifest().generation_id.clone();
+    let repository = latest.generation.snapshot().repository.clone();
+    let worktree = latest
+        .generation
+        .snapshot()
+        .worktree
+        .clone()
+        .expect("worktree identity");
+    let scope = CodeQueryScope::new(super::queries::unpinned_latest_generation(), None)
+        .expect("unpinned callers scope");
+    let hub = latest
+        .generation
+        .symbols()
+        .symbols
+        .iter()
+        .find(|record| record.qualified_name.ends_with("hub"))
+        .expect("hub symbol")
+        .occurrence
+        .as_str()
+        .to_owned();
+    let operation = callable_code_operation(CallableCodeOperationKind::Callers).expect("operation");
+    let context = application_context(&operation, repository, worktree);
+    mount_query_authority(
+        &registry,
+        fixture.path(),
+        &context,
+        latest.generation.manifest().privacy_domain.clone(),
+    )
+    .await;
+    let first = registry
+        .callers(
+            RetrievalPortContext {
+                request: &context,
+                operation: &operation,
+            },
+            &CodeRelationRequest {
+                node_id: hub.clone(),
+                maximum_depth: 1,
+                resolve_trait_dispatch: false,
+                scope: scope.clone(),
+                meta: callers_page_meta(1, None),
+            },
+        )
+        .await;
+    let first_page = match first {
+        RetrievalPortOutcome::Completed(evidence) => evidence.payload.expect("generation A page"),
+        other => panic!("expected completed callers page, got {other:?}"),
+    };
+    let cursor = first_page.next_cursor.clone().expect("generation A cursor");
+    assert_eq!(first_page.generation, generation_a);
+
+    fixture.edit(
+        "src/lib.rs",
+        "pub fn hub() {}\npub fn caller_a() { hub(); }\npub fn caller_b() { hub(); }\npub fn caller_c() { hub(); }\n",
+    );
+    git(fixture.path(), &["commit", "-qam", "publish generation B"]);
+    let _ = registry
+        .latest_complete_fresh(fixture.path())
+        .await
+        .expect("retained generation stays servable while the rebuild runs");
+    let generation_b = wait_for_generation_change(&registry, fixture.path(), &generation_a).await;
+    assert_ne!(generation_b, generation_a);
+    let serving_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if registry
+            .latest_complete_fresh(fixture.path())
+            .await
+            .is_some_and(|latest| latest.generation.manifest().generation_id == generation_b)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() <= serving_deadline,
+            "generation B must be the unpinned latest before the continuation read"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = super::queries::take_relation_symbol_hydrations();
+    let continuation = registry
+        .callers(
+            RetrievalPortContext {
+                request: &context,
+                operation: &operation,
+            },
+            &CodeRelationRequest {
+                node_id: hub,
+                maximum_depth: 1,
+                resolve_trait_dispatch: false,
+                scope,
+                meta: callers_page_meta(1, Some(cursor)),
+            },
+        )
+        .await;
+    let continuation_page = match continuation {
+        RetrievalPortOutcome::Completed(evidence) => {
+            evidence.payload.expect("generation A continuation page")
+        }
+        other => panic!("cursor from generation A must continue on generation A; got {other:?}"),
+    };
+    assert_eq!(continuation_page.generation, generation_a);
+    assert_eq!(continuation_page.total, Some(2));
+    assert_eq!(continuation_page.items.len(), 1);
+    assert!(
+        continuation_page.next_cursor.is_none(),
+        "generation A has exactly two callers"
+    );
+    assert!(
+        !first_page.items.contains(&continuation_page.items[0]),
+        "page 2 must be the remaining generation-A caller"
+    );
+    assert_eq!(
+        super::queries::take_relation_symbol_hydrations(),
+        1,
+        "the continuation must hydrate only its own slice"
+    );
     registry.shutdown().await;
 }
 
@@ -14249,6 +16235,57 @@ fn a_publication_seats_its_own_generation_without_waiting_for_a_quiet_tree() {
         .into_iter()
         .all(|gate| gate.skip_reason().is_some()),
         "every arm that seats nothing must name itself in the log"
+    );
+}
+
+/// Refusing a redundant activation must never refuse the seat.
+///
+/// Preparation and activation shared one gate, so an owner whose native graph
+/// was already Ready cleared `prepare_graph` and skipped the bind and the
+/// serving swap along with the activation call. A restart that restored such
+/// an owner therefore left `serving_generation` empty forever: every
+/// complete-generation demand answered unavailable while the dashboard read
+/// the same owner and reported Ready/fresh/complete. This table pins the
+/// separation - every refusal here is activation-only.
+#[test]
+fn a_redundant_activation_is_refused_without_refusing_the_seat() {
+    use super::registry::GraphActivationGateV1;
+
+    assert_eq!(
+        GraphActivationGateV1::decide(true, true, true, false),
+        GraphActivationGateV1::AlreadyServing,
+        "a restored owner that already serves a native graph is never activated again, not \
+         even when it takes an empty serving slot"
+    );
+    assert_eq!(
+        GraphActivationGateV1::decide(false, true, false, true),
+        GraphActivationGateV1::Activate,
+        "a generation entering the serving slot installs its native graph"
+    );
+    assert_eq!(
+        GraphActivationGateV1::decide(false, false, false, false),
+        GraphActivationGateV1::UnchangedGraph,
+        "an unchanged pass over a terminal graph has no effect to install"
+    );
+    assert_eq!(
+        GraphActivationGateV1::decide(false, false, true, false),
+        GraphActivationGateV1::Activate,
+        "a generation serving text with a still-Pending graph gets one further attempt"
+    );
+    assert_eq!(
+        GraphActivationGateV1::decide(false, false, true, true),
+        GraphActivationGateV1::PendingAttemptSpent,
+        "that attempt is bounded to one per generation per worker"
+    );
+    assert!(
+        [
+            GraphActivationGateV1::AlreadyServing,
+            GraphActivationGateV1::UnchangedGraph,
+            GraphActivationGateV1::PendingAttemptSpent,
+        ]
+        .into_iter()
+        .all(|gate| !gate.activates()),
+        "only the Activate arm may call native graph activation"
     );
 }
 

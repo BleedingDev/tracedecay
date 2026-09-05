@@ -85,6 +85,7 @@ jobs:
       - name: Test dogfood harnesses
         run: |
           python3 scripts/test-check-pr-dogfood-output.py
+          python3 scripts/test-efficiency-scorecard.py
           python3 scripts/test-pr-dogfood-portability.py
 
       - name: Initialize checkout and exercise CLI tools
@@ -113,18 +114,15 @@ jobs:
       - name: Reject tracked ignored files
         run: scripts/check-release-pr-integrity.sh HEAD HEAD
 
+      - name: Test bounded commit range linting
+        run: python3 scripts/test-lint-commit-range.py
+
       - name: Validate PR commit messages
         if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          commit_shas=$(git rev-list --no-merges "$BASE_SHA..$HEAD_SHA")
-          while IFS= read -r commit_sha; do
-            [[ -n "$commit_sha" ]] || continue
-            git show --no-patch --format=%B "$commit_sha" | npm run --silent lint:commit --
-          done <<<"$commit_shas"
+        run: scripts/lint-commit-range.sh "$BASE_SHA" "$HEAD_SHA"
 
       - name: Validate pushed commit messages
         if: github.event_name == 'push'
@@ -135,19 +133,15 @@ jobs:
           set -euo pipefail
           if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
             if git rev-parse "${HEAD_SHA}^" >/dev/null 2>&1; then
-              range="${HEAD_SHA}^..${HEAD_SHA}"
+              base_sha="${HEAD_SHA}^"
             else
               git show --no-patch --format=%B "$HEAD_SHA" | npm run lint:commit --
               exit 0
             fi
           else
-            range="$BEFORE_SHA..$HEAD_SHA"
+            base_sha="$BEFORE_SHA"
           fi
-          commit_shas=$(git rev-list --no-merges "$range")
-          while IFS= read -r commit_sha; do
-            [[ -n "$commit_sha" ]] || continue
-            git show --no-patch --format=%B "$commit_sha" | npm run --silent lint:commit --
-          done <<<"$commit_shas"
+          scripts/lint-commit-range.sh "$base_sha" "$HEAD_SHA"
 
   release-version-drift:
     name: Release Version Drift
@@ -266,6 +260,56 @@ jobs:
       # moment that dev-dependency changes, and nextest would then silently
       # select zero of them and report green having run nothing. Asking for the
       # feature explicitly makes the selection independent of that accident.
+      # `tracedecay-search-eval` ships two binaries and has no test target of
+      # its own, and cargo only links a package's bins for a test build when
+      # that same package has a test or bench selected. `cargo nextest run`
+      # therefore never produced them, and the acceptance tests that execute
+      # them out of the profile directory
+      # (`runtime_acceptance_suite::search_eval_cli_test`,
+      # `product_surface_suite::packaged_semantic_evaluator`) failed closed.
+      #
+      # The package selection and features must match the test lane below
+      # exactly. `tracedecay-search-eval` depends on `tracedecay-code-index`
+      # with `default-features = false`, so a `-p tracedecay-search-eval` build
+      # resolves without the language tiers and produces an evaluator that
+      # cannot parse Rust ("no bundled Tree-sitter grammar is available for
+      # language rust", exit 2 where the contract is exit 1). Only the same
+      # `--workspace --features tracedecay/test-helpers` resolution turns the
+      # tiers back on, and it makes these artifacts a cache hit for the run
+      # that follows rather than a second, differently-featured build.
+      - name: Build workspace binaries for the test lane
+        run: cargo build --workspace --bins --locked --features tracedecay/test-helpers
+
+      # This parity test must execute separate feature-off/on binaries. Copy
+      # each result immediately so the second Cargo resolution cannot replace
+      # the first executable in target/debug/examples.
+      - name: Build controlled-workload hotpath parity executables
+        shell: bash
+        run: |
+          set -euo pipefail
+          helper_dir=target/controlled-workload-hotpath
+          example=target/debug/examples/emit_controlled_workload_reports
+          mkdir -p "$helper_dir"
+          cargo build -p tracedecay-search-eval --profile test --example emit_controlled_workload_reports --locked
+          cp "$example" "$helper_dir/hotpath-off"
+          cargo build -p tracedecay-search-eval --profile test --example emit_controlled_workload_reports --locked --features controlled-workload-hotpath
+          cp "$example" "$helper_dir/hotpath-on"
+
+      # `nested_chunk_fanout_admits_stolen_workers_without_exceeding_width`
+      # installs the process-global background CPU authority at width 2, and
+      # that authority is a set-once `OnceLock` with no uninstall. Inside the
+      # shared `tracedecay-code-index` lib binary every later test that nests
+      # `with_background_cpu_permit` then queues behind a width-2 gate, which
+      # deadlocked the binary under libtest fan-out. It is therefore `#[ignore]`d
+      # and run here on its own, single-threaded, so the coverage is kept
+      # without letting one test's process-global install decide the width for
+      # every sibling.
+      - name: Run isolated background-CPU width test
+        run: |
+          cargo test -p tracedecay-code-index --locked --lib \
+            nested_chunk_fanout_admits_stolen_workers_without_exceeding_width \
+            -- --ignored --test-threads=1
+
       - name: Run tests
         run: cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers
 
@@ -301,21 +345,30 @@ jobs:
     needs: scope-gate
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
     runs-on: windows-latest
-    # Full-workspace `nextest archive` on hosted windows-latest has been
-    # dying at the job timeout with no failed step: first at 30m, then at 45m
-    # (run 32789438873 burned 44m08s in `Build nextest archive` on a cold
-    # Swatinem cache -- the restore step took 12s, i.e. a miss -- and was
-    # killed mid-compile). Earlier runs only "finished" faster because a
-    # resolution error aborted the `tracedecay` lib-test unit early. 75m fits
-    # a genuinely cold cache while still failing loudly on a hung linker.
-    timeout-minutes: 75
+    # Build every Windows test once, then shard execution from the archive.
+    # Keep a bounded guard around the hosted build; Cargo timings are retained
+    # below so a slow or failed archive can be attributed instead of treating
+    # the timeout itself as the defect. Measured 2026-09-05 (run 33954670866,
+    # no parity rebuild): portability compile 31 min, archive still compiling
+    # the root crate's test targets at the 75-minute bound, so the archive
+    # never completed and the compiler caches never seeded. The bound is
+    # widened so one archive can finish and seed them; shrink it back once a
+    # warm run's timings show the real cost.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
 
       - name: Tune Windows runner for build I/O
         uses: ./.github/actions/tune-windows-runner
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Install only the toolchain pinned by rust-toolchain.toml. Installing
+      # `stable` as well makes Swatinem/rust-cache include an unused compiler
+      # in its environment key, fragmenting the cache whenever stable moves.
+      - name: Install pinned toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
 
       - name: Use lld-link linker
         shell: pwsh
@@ -357,9 +410,26 @@ jobs:
           command -v kache >/dev/null 2>&1 || cargo install kache --locked
           kache init --no-service
           echo "RUSTC_WRAPPER=kache" >> "$GITHUB_ENV"
+
+      # Compile this portable historical-artifact journey before the large
+      # root test binaries monopolize the hosted runner. The workspace and
+      # feature selection match the archive, so Cargo reuses the result below.
+      - name: Compile Windows search-quality portability target
+        shell: pwsh
+        run: cargo test --no-run --workspace --locked --features tracedecay/test-helpers --test search_quality_suite
+
       - name: Build nextest archive
         shell: pwsh
-        run: cargo nextest archive --workspace --locked --features tracedecay/test-helpers --archive-file "$env:RUNNER_TEMP/nextest-archive.tar.zst"
+        run: cargo nextest archive --workspace --profile ci --locked --features tracedecay/test-helpers --timings --archive-file "$env:RUNNER_TEMP/nextest-archive.tar.zst"
+
+      - name: Upload Windows archive build timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-nextest-build-timings
+          path: target/cargo-timings/cargo-timing.html
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload nextest archive
         uses: actions/upload-artifact@v4
@@ -613,9 +683,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      # Judge formatting with the toolchain `rust-toolchain.toml` pins, not
+      # whatever `stable` is on the runner. rustfmt's output changes between
+      # releases — 1.98.1 breaks a `.unwrap_or_else(|err| { ... })` chain that
+      # 1.97.1 keeps inline — so a `stable` rustfmt rejects a tree the pinned
+      # rustfmt developers run formats exactly, and every contributor sees a
+      # red lane they cannot reproduce. `dtolnay/rust-toolchain@stable` also
+      # exports `RUSTUP_TOOLCHAIN`, which overrides the toolchain file rather
+      # than deferring to it. Installing through rustup with no override keeps
+      # the pin in one place: the toolchain file, components included.
+      - name: Install the repository's pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
       - run: cargo fmt --all -- --check
 
   dashboard:

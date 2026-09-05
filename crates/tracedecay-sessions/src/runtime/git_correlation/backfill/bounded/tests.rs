@@ -1,6 +1,8 @@
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tracedecay_runtime_core::db::engine::{
@@ -9,8 +11,10 @@ use tracedecay_runtime_core::db::engine::{
 use tracedecay_runtime_core::store_runtime::VerifiedGraphRuntimePortV1;
 
 use super::*;
-use crate::runtime::git_correlation::ensure_git_correlation_receipt_schema_in_transaction;
 use crate::runtime::git_correlation::test_support::MemoryEvidenceGraphRuntime;
+use crate::runtime::git_correlation::{
+    ensure_git_correlation_receipt_schema_in_transaction, read_meta_value,
+};
 
 impl GitCorrelationWriteTxn for Transaction {
     async fn commit(self) -> Result<(), GitCorrelationError> {
@@ -23,6 +27,7 @@ impl GitCorrelationWriteTxn for Transaction {
 struct TestStore {
     connection: TestConnection,
     graph: std::sync::Arc<MemoryEvidenceGraphRuntime>,
+    fail_next_write: AtomicBool,
 }
 
 impl TestStore {
@@ -39,7 +44,12 @@ impl TestStore {
         Self {
             connection: TestConnection::open(path),
             graph,
+            fail_next_write: AtomicBool::new(false),
         }
+    }
+
+    fn fail_next_write(&self) {
+        self.fail_next_write.store(true, Ordering::Release);
     }
 }
 
@@ -59,13 +69,20 @@ impl GitCorrelationSessionStore for TestStore {
     }
 
     async fn open_write_transaction(&self) -> Result<Transaction, GitCorrelationError> {
+        if self.fail_next_write.swap(false, Ordering::AcqRel) {
+            return Err(GitCorrelationError::Db(
+                "injected frontier transaction failure".to_owned(),
+            ));
+        }
         self.connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
             .map_err(GitCorrelationError::from)
     }
 
-    fn git_evidence_publication_lock(&self) -> Result<&std::sync::Mutex<()>, GitCorrelationError> {
+    fn git_evidence_publication_lock(
+        &self,
+    ) -> Result<Arc<std::sync::Mutex<()>>, GitCorrelationError> {
         Ok(self.graph.git_evidence_publication_lock())
     }
 
@@ -98,6 +115,29 @@ fn repository_fixture() -> tempfile::TempDir {
     let fixture = tempfile::tempdir().unwrap();
     initialize_repository(fixture.path());
     fixture
+}
+
+struct FailCommitLogCall {
+    calls: AtomicUsize,
+    fail_on: usize,
+}
+
+impl GitReflogSource for FailCommitLogCall {
+    fn reflog(&self, worktree: &Path) -> Option<String> {
+        SystemGit.reflog(worktree)
+    }
+
+    fn current_branch(&self, worktree: &Path) -> Option<String> {
+        SystemGit.current_branch(worktree)
+    }
+
+    fn commit_log(&self, worktree: &Path, branch: &str, since: i64) -> Option<String> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == self.fail_on {
+            None
+        } else {
+            SystemGit.commit_log(worktree, branch, since)
+        }
+    }
 }
 
 fn initialize_repository(path: &Path) {
@@ -216,6 +256,169 @@ async fn prepare_store(path: &Path, project_path: &Path) -> TestStore {
         .await
         .unwrap();
     store
+}
+
+#[tokio::test]
+async fn incremental_publication_failure_holds_frontier_until_retry_succeeds() {
+    let repository = repository_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let store = prepare_store(&directory.path().join("sessions.db"), repository.path()).await;
+    store.graph.fail_next_publication();
+
+    let failed = run_incremental_backfill(&store, &SystemGit, 1)
+        .await
+        .unwrap();
+    assert_eq!(failed.sessions_scanned, 1);
+    assert_eq!(failed.skipped_git_error, 1);
+    assert_eq!(
+        read_meta_value(&store.connection, AUTO_BACKFILL_WATERMARK_KEY)
+            .await
+            .unwrap(),
+        None,
+        "a transient graph failure must not settle the source tuple"
+    );
+
+    let retried = run_incremental_backfill(&store, &SystemGit, 1)
+        .await
+        .unwrap();
+    assert_eq!(retried.sessions_scanned, 1);
+    assert_eq!(retried.skipped_git_error, 0);
+    assert!(retried.spans_written > 0);
+    assert_eq!(
+        read_meta_value(&store.connection, AUTO_BACKFILL_WATERMARK_KEY)
+            .await
+            .unwrap(),
+        Some(i64::MAX)
+    );
+    assert_eq!(
+        run_incremental_backfill(&store, &SystemGit, 1)
+            .await
+            .unwrap()
+            .sessions_scanned,
+        0
+    );
+}
+
+#[tokio::test]
+async fn incremental_missing_commit_log_holds_frontier_until_retry_succeeds() {
+    let repository = repository_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let store = prepare_store(&directory.path().join("sessions.db"), repository.path()).await;
+    let git = FailCommitLogCall {
+        calls: AtomicUsize::new(0),
+        fail_on: 0,
+    };
+
+    let failed = run_incremental_backfill(&store, &git, 1).await.unwrap();
+    assert_eq!(failed.skipped_git_error, 1);
+    assert!(!failed.frontier_advanced);
+    assert_eq!(
+        read_meta_value(&store.connection, AUTO_BACKFILL_WATERMARK_KEY)
+            .await
+            .unwrap(),
+        None
+    );
+
+    let retried = run_incremental_backfill(&store, &git, 1).await.unwrap();
+    assert_eq!(retried.skipped_git_error, 0);
+    assert!(retried.frontier_advanced);
+}
+
+#[tokio::test]
+async fn later_attribution_failure_returns_committed_backfill_progress() {
+    let repository = repository_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let store = prepare_store(&directory.path().join("sessions.db"), repository.path()).await;
+    let git = FailCommitLogCall {
+        calls: AtomicUsize::new(0),
+        fail_on: 1,
+    };
+
+    let partial = run_incremental_backfill_outcome(&store, &git, 1)
+        .await
+        .unwrap();
+    assert!(partial.stats.frontier_advanced);
+    assert!(partial.stats.spans_written > 0);
+    assert_eq!(partial.stats.skipped_git_error, 1);
+    assert!(matches!(
+        partial.later_failure,
+        Some(GitCorrelationError::Unavailable(_))
+    ));
+
+    let retried = run_incremental_backfill(&store, &SystemGit, 1)
+        .await
+        .unwrap();
+    assert_eq!(retried.sessions_scanned, 0);
+    assert_eq!(retried.skipped_git_error, 0);
+}
+
+#[tokio::test]
+async fn later_frontier_failure_returns_committed_graph_progress() {
+    let repository = repository_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let store = prepare_store(&directory.path().join("sessions.db"), repository.path()).await;
+    store.fail_next_write();
+
+    let partial = run_incremental_backfill_outcome(&store, &SystemGit, 1)
+        .await
+        .unwrap();
+    assert!(partial.stats.spans_written > 0);
+    assert!(!partial.stats.frontier_advanced);
+    assert!(matches!(
+        partial.later_failure,
+        Some(GitCorrelationError::Db(_))
+    ));
+    assert_eq!(
+        read_meta_value(&store.connection, AUTO_BACKFILL_WATERMARK_KEY)
+            .await
+            .unwrap(),
+        None
+    );
+
+    let retried = run_incremental_backfill(&store, &SystemGit, 1)
+        .await
+        .unwrap();
+    assert!(retried.frontier_advanced);
+}
+
+#[tokio::test]
+async fn unavailable_attribution_target_is_a_retryable_error() {
+    let repository = repository_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let store = prepare_store(&directory.path().join("sessions.db"), repository.path()).await;
+    run_incremental_backfill(&store, &SystemGit, 1)
+        .await
+        .unwrap();
+
+    let error = run_commit_attribution_sweep(&store, 0, |_| TargetScan::Unavailable)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, GitCorrelationError::Unavailable(_)));
+}
+
+#[tokio::test]
+async fn incremental_permanent_exclusion_advances_frontier() {
+    let plain_directory = tempfile::tempdir().unwrap();
+    let database_directory = tempfile::tempdir().unwrap();
+    let store = prepare_store(
+        &database_directory.path().join("sessions.db"),
+        plain_directory.path(),
+    )
+    .await;
+
+    let excluded = run_incremental_backfill(&store, &SystemGit, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(excluded.sessions_scanned, 1);
+    assert_eq!(excluded.skipped_not_worktree, 1);
+    assert!(excluded.frontier_advanced);
+    assert_eq!(
+        read_meta_value(&store.connection, AUTO_BACKFILL_WATERMARK_KEY)
+            .await
+            .unwrap(),
+        Some(i64::MAX)
+    );
 }
 
 async fn scalar(store: &TestStore, sql: &str) -> i64 {
@@ -580,6 +783,27 @@ async fn resume_uses_sealed_canonical_worktree_after_alias_repoint() {
     assert!(completed.stats.spans_written > 0);
 }
 
+/// Report whether `directory`'s filesystem accepts a name that is not valid
+/// UTF-8.
+///
+/// `cfg(unix)` is a compile gate, not a filesystem capability: APFS refuses
+/// such a name outright with `EILSEQ`, so a macOS run fails at the fixture
+/// instead of exercising the backfill. Probing keeps the coverage everywhere
+/// the bytes are really accepted and makes the skip visible where they are not.
+#[cfg(unix)]
+fn non_utf8_file_names_supported(directory: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let probe = directory.join(std::ffi::OsString::from_vec(b"probe-\xff".to_vec()));
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn non_utf8_canonical_worktree_resumes_exactly_then_fails_typed_publish() {
@@ -588,6 +812,13 @@ async fn non_utf8_canonical_worktree_resumes_exactly_then_fails_typed_publish() 
     use std::os::unix::fs::symlink;
 
     let root = tempfile::tempdir().unwrap();
+    if !non_utf8_file_names_supported(root.path()) {
+        println!(
+            "skipping non_utf8_canonical_worktree_resumes_exactly_then_fails_typed_publish: \
+             this filesystem refuses non-UTF-8 file names"
+        );
+        return;
+    }
     let canonical = root
         .path()
         .join(OsString::from_vec(b"canonical-\xff".to_vec()));

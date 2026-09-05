@@ -104,13 +104,43 @@ async fn assert_fresh_project_open_owners(label: &str, git_state: ProjectGitStat
             .is_some(),
         "fresh project open must retain its LSP owner"
     );
-    assert_eq!(
-        engine
-            .invocation
-            .service
-            .feedback_cycle(Some(&canonical_project))
+    // Project open publishes the route as soon as its owners are registered and
+    // lets the cold code-index mount finish behind it, so the feedback cycle —
+    // which is minted against a sealed generation — arrives with that
+    // generation rather than inside the open. Sampling the instant the open
+    // returns therefore measures mount latency, not ownership. Wait for the
+    // deferred mount for the one Git state that must reach it; the other two
+    // refuse synchronously (`register_project_open_dependent_owners` returns
+    // before any feedback work when HEAD is not attached), so their absence is
+    // already settled.
+    let feedback_cycle = match git_state {
+        ProjectGitState::Committed => {
+            tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                loop {
+                    if let Some(cycle) = engine
+                        .invocation
+                        .service
+                        .feedback_cycle(Some(&canonical_project))
+                        .await
+                    {
+                        return cycle;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            })
             .await
-            .is_some(),
+            .ok()
+        }
+        ProjectGitState::NonGit | ProjectGitState::Unborn => {
+            engine
+                .invocation
+                .service
+                .feedback_cycle(Some(&canonical_project))
+                .await
+        }
+    };
+    assert_eq!(
+        feedback_cycle.is_some(),
         matches!(git_state, ProjectGitState::Committed),
         "feedback cycle presence must follow exact committed Git identity"
     );
@@ -1563,12 +1593,28 @@ async fn released_automation_tombstone_allows_one_eventual_replacement() {
         .await
         .expect("noncooperative owner start timed out")
         .expect("noncooperative owner start sender dropped");
-    engine
-        .store_administration
-        .automation_schedulers()
-        .lock()
-        .await
-        .insert(old.clone(), test_automation_scheduler_handle(task));
+    // Project open publishes the live scheduler owner for this project, so the
+    // map already holds `new` before the tombstone goes in. This fixture is
+    // about a retiring predecessor standing alone: leaving the published owner
+    // beside it gives the reconcile two logical owners for one project and
+    // lets it answer for whichever the map yields first.
+    if let Some(retirement) = engine.retire_automation_scheduler_locked(&new).await {
+        tokio::time::timeout(std::time::Duration::from_secs(10), retirement.wait())
+            .await
+            .expect("the published scheduler owner must retire before the tombstone stands in");
+    }
+    {
+        let mut schedulers = engine
+            .store_administration
+            .automation_schedulers()
+            .lock()
+            .await;
+        assert!(
+            schedulers.is_empty(),
+            "the tombstone must be the only scheduler owner in this fixture"
+        );
+        schedulers.insert(old.clone(), test_automation_scheduler_handle(task));
+    }
 
     let retirement_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
     let retirement = {

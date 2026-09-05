@@ -376,24 +376,14 @@ fn current_cancellable_request_key(
 
 #[hotpath::measure(label = "mcp.server.connection.classify")]
 pub(super) fn request_is_independent_read(request: &JsonRpcRequest) -> bool {
-    match classify_mcp_method(&request.method) {
-        McpMethod::ToolsCall => request
+    super::dispatch_envelope::dispatch_is_independent_read(
+        classify_mcp_method(&request.method),
+        request
             .params
             .as_ref()
             .and_then(|params| params.get("name"))
-            .and_then(Value::as_str)
-            .and_then(|tool_name| crate::mcp::tools::mcp_dispatch_contract(tool_name).ok())
-            .is_some_and(tracedecay_tool_catalog::McpDispatchContractV1::read_only),
-        McpMethod::ToolsList
-        | McpMethod::ResourcesList
-        | McpMethod::ResourcesRead
-        | McpMethod::TrivialAck => true,
-        McpMethod::Initialize
-        | McpMethod::InitializedAck
-        | McpMethod::HookEvent
-        | McpMethod::Cancelled
-        | McpMethod::Unknown => false,
-    }
+            .and_then(Value::as_str),
+    )
 }
 
 struct ConcurrentReadCompletion {
@@ -409,7 +399,7 @@ struct ConcurrentReadCompletion {
 enum ConnectionLoopEvent {
     Queued(String),
     Incoming(std::io::Result<Option<String>>),
-    Completed(Option<std::result::Result<ConcurrentReadCompletion, tokio::task::JoinError>>),
+    Completed(Box<Option<std::result::Result<ConcurrentReadCompletion, tokio::task::JoinError>>>),
     Shutdown,
     PeerClosed,
 }
@@ -995,7 +985,9 @@ impl McpServer {
                     () = &mut external_shutdown_requested => ConnectionLoopEvent::Shutdown,
                     () = wait_for_peer_close(&mut peer_close_check), if input_closed =>
                         ConnectionLoopEvent::PeerClosed,
-                    result = active_reads.join_next() => ConnectionLoopEvent::Completed(result),
+                    result = active_reads.join_next() => {
+                        ConnectionLoopEvent::Completed(Box::new(result))
+                    },
                     result = &mut incoming, if can_read_more =>
                         ConnectionLoopEvent::Incoming(result),
                 }
@@ -1020,7 +1012,7 @@ impl McpServer {
                     return Err(error.into());
                 }
                 ConnectionLoopEvent::Completed(completed) => {
-                    let Some(completed) = completed else {
+                    let Some(completed) = *completed else {
                         continue;
                     };
                     let mut completion = completed.map_err(|error| TraceDecayError::Config {
@@ -1158,7 +1150,7 @@ impl McpServer {
                             Arc::clone(self),
                             request.clone(),
                             timings_enabled,
-                            connection_route.fork_for_independent_read(),
+                            connection_route.fork_for_connection_owned_read(),
                             request_activity,
                             cancellation,
                             connection_shutdown.clone(),
@@ -1486,7 +1478,7 @@ impl McpServer {
                 let outcome = HostAdmissionOutcome::spool_ack_conflict();
                 blocked_sources.insert(record.source);
                 retained_leases.push(record.seq);
-                non_committed_outcome.get_or_insert(outcome);
+                non_committed_outcome.get_or_insert(outcome.clone());
                 if target_seq == Some(record.seq) {
                     target_outcome = Some(outcome);
                 }
@@ -1498,7 +1490,7 @@ impl McpServer {
                     let outcome = HostAdmissionOutcome::durable_payload_unsupported_version();
                     blocked_sources.insert(record.source);
                     retained_leases.push(record.seq);
-                    non_committed_outcome.get_or_insert(outcome);
+                    non_committed_outcome.get_or_insert(outcome.clone());
                     if target_seq == Some(record.seq) {
                         target_outcome = Some(outcome);
                     }
@@ -1511,7 +1503,7 @@ impl McpServer {
                         .await
                     {
                         Ok(_) => {
-                            non_committed_outcome.get_or_insert(outcome);
+                            non_committed_outcome.get_or_insert(outcome.clone());
                             if target_seq == Some(record.seq) {
                                 target_outcome = Some(outcome);
                             }
@@ -1519,7 +1511,7 @@ impl McpServer {
                         Err(failure) if failure == HostAdmissionOutcome::quarantine_full() => {
                             blocked_sources.insert(record.source);
                             retained_leases.push(record.seq);
-                            non_committed_outcome.get_or_insert(failure);
+                            non_committed_outcome.get_or_insert(failure.clone());
                             if target_seq == Some(record.seq) {
                                 target_outcome = Some(failure);
                             }
@@ -1543,13 +1535,13 @@ impl McpServer {
                     .await
                 {
                     Ok(_) => {
-                        non_committed_outcome.get_or_insert(canonical_outcome);
+                        non_committed_outcome.get_or_insert(canonical_outcome.clone());
                         canonical_outcome
                     }
                     Err(failure) if failure == HostAdmissionOutcome::quarantine_full() => {
                         blocked_sources.insert(record.source);
                         retained_leases.push(record.seq);
-                        non_committed_outcome.get_or_insert(failure);
+                        non_committed_outcome.get_or_insert(failure.clone());
                         failure
                     }
                     Err(failure) => {
@@ -1571,7 +1563,7 @@ impl McpServer {
             } else {
                 blocked_sources.insert(record.source);
                 retained_leases.push(record.seq);
-                non_committed_outcome.get_or_insert(canonical_outcome);
+                non_committed_outcome.get_or_insert(canonical_outcome.clone());
                 canonical_outcome
             };
             if target_seq == Some(record.seq) {
@@ -1589,7 +1581,7 @@ impl McpServer {
             .unwrap_or_else(HostAdmissionOutcome::accepted_for_replay)
     }
 
-    pub(crate) fn report_host_admission_outcome(outcome: HostAdmissionOutcome) {
+    pub(crate) fn report_host_admission_outcome(outcome: &HostAdmissionOutcome) {
         if outcome.status.is_replay_progress() {
             return;
         }
@@ -1925,6 +1917,54 @@ mod cancellable_queue_tests {
             .await
             .expect("join concurrent connection")
             .expect("serve concurrent connection");
+        fixture.harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_connection_read_has_one_connection_task_owner() {
+        let fixture = DelayedRouteFixture::new().await;
+        let registry = fixture.caller.dispatch_authority.registry();
+        let retained_before = registry.retained_spawn_count_for_test();
+        let connection_owned_before = registry.connection_owned_count_for_test();
+        let (mut transport, sender, mut responses) =
+            tracedecay_mcp::transport::ChannelTransport::new();
+        let serving = tokio::spawn({
+            let caller = Arc::clone(&fixture.caller);
+            async move { caller.run_connection(&mut transport).await }
+        });
+
+        sender
+            .send(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "tracedecay_status",
+                        "arguments": {"admission_only": true}
+                    }
+                })
+                .to_string(),
+            )
+            .expect("send ordinary connection read");
+        assert_eq!(receive_response(&mut responses).await["id"], json!(3));
+
+        assert_eq!(
+            registry.retained_spawn_count_for_test(),
+            retained_before,
+            "the connection's active-read task must be the sole task owner"
+        );
+        assert_eq!(
+            registry.connection_owned_count_for_test(),
+            connection_owned_before + 1,
+            "one inline registry lease must cover the ordinary read"
+        );
+
+        drop(sender);
+        serving
+            .await
+            .expect("join ordinary read connection")
+            .expect("serve ordinary read connection");
         fixture.harness.shutdown().await;
     }
 

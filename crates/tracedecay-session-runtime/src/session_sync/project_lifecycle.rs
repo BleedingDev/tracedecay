@@ -16,8 +16,8 @@ use tracedecay_sessions::admission::SESSION_INGEST_DISABLED_REASON_V1;
 
 use super::{
     ActiveSessionImport, DaemonSessionSyncConfig, DaemonSessionSyncService,
-    SESSION_SYNC_SHUTDOWN_DEADLINE, contract_error, import_scope_key, journal_decode_error,
-    journal_key, journal_prefix, store_error, work,
+    SESSION_SYNC_SHUTDOWN_DEADLINE, SessionSyncTerminalMaterial, contract_error, import_scope_key,
+    journal_decode_error, journal_key, journal_prefix, store_error, work,
 };
 
 const SESSION_SYNC_STARTUP_DEADLINE_MICROS: i64 = 60_000_000;
@@ -153,11 +153,13 @@ impl DaemonSessionSyncService {
                         self.persist_terminal(
                             context,
                             &key,
-                            OperationTermination::Cancelled,
-                            journal.stats,
-                            journal.coverage,
-                            journal.source_frontiers,
-                            Vec::new(),
+                            SessionSyncTerminalMaterial {
+                                termination: OperationTermination::Cancelled,
+                                stats: journal.stats,
+                                coverage: journal.coverage,
+                                source_frontiers: journal.source_frontiers,
+                                failure_codes: Vec::new(),
+                            },
                         )
                         .await?;
                         continue;
@@ -166,11 +168,13 @@ impl DaemonSessionSyncService {
                         self.persist_terminal(
                             context,
                             &key,
-                            OperationTermination::TimedOut,
-                            journal.stats,
-                            journal.coverage,
-                            journal.source_frontiers,
-                            Vec::new(),
+                            SessionSyncTerminalMaterial {
+                                termination: OperationTermination::TimedOut,
+                                stats: journal.stats,
+                                coverage: journal.coverage,
+                                source_frontiers: journal.source_frontiers,
+                                failure_codes: Vec::new(),
+                            },
                         )
                         .await?;
                         continue;
@@ -195,11 +199,13 @@ impl DaemonSessionSyncService {
                     self.persist_terminal(
                         context,
                         &key,
-                        OperationTermination::Cancelled,
-                        journal.stats,
-                        journal.coverage,
-                        journal.source_frontiers,
-                        Vec::new(),
+                        SessionSyncTerminalMaterial {
+                            termination: OperationTermination::Cancelled,
+                            stats: journal.stats,
+                            coverage: journal.coverage,
+                            source_frontiers: journal.source_frontiers,
+                            failure_codes: Vec::new(),
+                        },
                     )
                     .await?;
                     continue;
@@ -208,11 +214,13 @@ impl DaemonSessionSyncService {
                     self.persist_terminal(
                         context,
                         &key,
-                        OperationTermination::TimedOut,
-                        journal.stats,
-                        journal.coverage,
-                        journal.source_frontiers,
-                        Vec::new(),
+                        SessionSyncTerminalMaterial {
+                            termination: OperationTermination::TimedOut,
+                            stats: journal.stats,
+                            coverage: journal.coverage,
+                            source_frontiers: journal.source_frontiers,
+                            failure_codes: Vec::new(),
+                        },
                     )
                     .await?;
                     continue;

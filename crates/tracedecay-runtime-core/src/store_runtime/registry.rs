@@ -28,9 +28,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tracedecay_store::{
-    AdmissionConfigV1, RuntimeMaintenanceStateV1, StoreAuthorityEpochV1, StoreIncarnationV1,
-    StoreRuntimeBindingV1, StoreRuntimeRegistryPublicationV1, StoreShardIdV1, StoreShardScopeV1,
-    VerifiedStoreLocatorV1,
+    AdmissionConfigV1, RuntimeMaintenanceStateV1, StorageRuntimeErrorV1, StoreAuthorityEpochV1,
+    StoreIncarnationV1, StoreRuntimeBindingV1, StoreRuntimeRegistryPublicationV1, StoreShardIdV1,
+    StoreShardScopeV1, VerifiedStoreLocatorV1,
 };
 
 use super::shard::ShardRuntime;
@@ -72,6 +72,10 @@ pub use retirement::{
 };
 pub use tracedecay_rusqlite_runtime::repository::{
     RepositoryRuntimePhysicalSnapshot, RepositoryWriterRuntimeSnapshot,
+};
+pub use tracedecay_rusqlite_runtime::{
+    CheckpointBlocker, CheckpointBlockers, CheckpointOutcome, CheckpointPressure, CheckpointStatus,
+    CheckpointWal,
 };
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StoreRuntimeKey {
@@ -282,10 +286,12 @@ impl StoreRuntimeLeaseSource {
         operation: &'static str,
     ) -> Result<u64, StoreRuntimeRegistryFailure> {
         let current_file_identity = crate::db::sqlite_generation_identity(self.locator().path())
-            .map_err(|_| StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
-                operation,
-                message: "could not verify the registered SQLite file identity".to_owned(),
-            })?;
+            .map_err(
+                |source| StoreRuntimeRegistryFailure::SqliteFileIdentityInspectionFailed {
+                    operation,
+                    source,
+                },
+            )?;
         if current_file_identity != self.opened_file_identity {
             return Err(StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
                 operation,
@@ -759,12 +765,19 @@ impl RuntimeDatabaseWriteAuthority {
             .require_active_write_scope(intent)
             .map_err(|error| error.to_string())?;
         let current_file_identity = crate::db::sqlite_generation_identity(&self.canonical_path)
-            .map_err(|_| "could not verify the registered SQLite file identity".to_owned())?;
+            .map_err(|source| sqlite_file_identity_authority_denial(intent, source))?;
         if current_file_identity != self.opened_file_identity {
             return Err("database file identity changed after registry attachment".to_owned());
         }
         Ok(())
     }
+}
+
+pub(super) fn sqlite_file_identity_authority_denial(
+    operation: &str,
+    source: crate::db::SqliteFileIdentityError,
+) -> String {
+    format!("{operation}: registered SQLite file identity inspection failed: {source}")
 }
 
 impl tracedecay_rusqlite_runtime::RuntimeWriteAuthority for RuntimeDatabaseWriteAuthority {
@@ -1341,6 +1354,11 @@ pub enum StoreRuntimeRegistryFailure {
         operation: &'static str,
         message: String,
     },
+    SqliteFileIdentityInspectionFailed {
+        operation: &'static str,
+        source: crate::db::SqliteFileIdentityError,
+    },
+    StorageRuntime(Box<StorageRuntimeErrorV1>),
     PhysicalRuntimeNotDrained {
         snapshot: Box<PhysicalRuntimeSnapshot>,
     },

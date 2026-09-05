@@ -12,8 +12,8 @@ use tracedecay_store::runtime::GraphRecoveredGenerationDigestV1;
 
 use crate::generation::verify_recovered_generation;
 use crate::lease::{
-    GenerationLocator, VerifiedGenerationLease, VerifiedGraphSnapshot, VerifiedTraversalResult,
-    VerifiedTraversalVisit,
+    GenerationLocator, VerifiedGenerationLease, VerifiedGenerationState, VerifiedGraphSnapshot,
+    VerifiedTraversalResult, VerifiedTraversalVisit,
 };
 use crate::limits::{
     MAX_NATIVE_GENERATION_STAGE_LIVE_BYTES, MAX_NATIVE_GENERATION_STAGE_MUTATIONS,
@@ -30,7 +30,8 @@ use crate::schema::{NAMESPACE_PROPERTY, relation_kind_from_type, required_string
 use crate::sealed_store::SealedStoreInstall;
 use crate::state::{
     EndpointIdentityCache, latest_projection, load_relation, load_relation_by_edge_cached,
-    projection_entity_deletion_page_checked, projection_relation_deletion_page_checked,
+    projection_entity_deletion_page_checked, projection_node_counts,
+    projection_relation_deletion_page_checked,
 };
 use crate::verified_marker::GenerationVerification;
 use crate::{
@@ -39,6 +40,88 @@ use crate::{
     GraphIdempotencyKey, GraphMutation, GraphNamespace, GraphRelation, GraphRelationRef,
     GraphTraversalDirection, GraphWriteBatch, TraversalRequest, mutation,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SealedStagingRetentionReason {
+    NoSealedStore,
+    NoSealedCodeGenerationReplay,
+    SealedDigestMismatch,
+    DependencyBearing,
+    NoVerifiedLease,
+    StoredDependent,
+    Retiring,
+    Collected,
+    Quarantined,
+    StagingEngineHibernated,
+}
+
+impl SealedStagingRetentionReason {
+    /// Stable operator-facing name for the `graph_staging_rows_retained`
+    /// event. A sweep that answers `Retained` and logs nothing is why 13
+    /// queued releases sat pending for a day while the staging container kept
+    /// every sealed generation's rows; the reason has to be readable.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSealedStore => "no_sealed_store",
+            Self::NoSealedCodeGenerationReplay => "no_sealed_code_generation_replay",
+            Self::SealedDigestMismatch => "sealed_digest_mismatch",
+            Self::DependencyBearing => "dependency_bearing",
+            Self::NoVerifiedLease => "no_verified_lease",
+            Self::StoredDependent => "stored_dependent",
+            Self::Retiring => "retiring",
+            Self::Collected => "collected",
+            Self::Quarantined => "quarantined",
+            Self::StagingEngineHibernated => "staging_engine_hibernated",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SealedStagingRelease {
+    Released { entities: usize, relations: usize },
+    AlreadyReleased,
+    Retained(SealedStagingRetentionReason),
+}
+
+/// What authorizes releasing one sealed generation's duplicate staging rows.
+///
+/// A resident lease is the strongest form and stays preferred. It is not
+/// available in the case this exists for: at project open the daemon recovers
+/// the memory graph's head and the serving code generation, so every other
+/// sealed code scope has no lease in this process and its rows were retained
+/// forever — the staging container reached 8.6 GB on disk and cost 20+ GB of
+/// heap on every open, entirely for rows nothing reads. The sealed artifact
+/// is the serving authority for those generations: it was built from these
+/// exact rows and reopened under a digest proof against the relational head,
+/// so it is sufficient evidence that the staging copy is redundant.
+enum SealedStagingReleaseAuthorityV1 {
+    Lease(Arc<VerifiedGenerationLease>),
+    /// The installed, digest-verified sealed artifact for this locator, with
+    /// the recovered digest the caller resolved from the relational head.
+    SealedArtifact(String),
+}
+
+impl SealedStagingReleaseAuthorityV1 {
+    fn recovered_digest(&self) -> &str {
+        match self {
+            Self::Lease(lease) => lease.head.recovered_digest.as_str(),
+            Self::SealedArtifact(digest) => digest.as_str(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GenerationContentsDeletion {
+    Deleted,
+    RetentionPending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StagedGenerationRowsDeletion {
+    Deleted { removed_rows: bool },
+    RetentionPending,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GenerationStagePageKind {
@@ -78,6 +161,15 @@ struct GenerationStageContext {
     physical_namespace: GraphNamespace,
     dependency_namespaces: BTreeMap<crate::GraphProjectionIdentity, GraphNamespace>,
     dependency_digest: tracedecay_store::runtime::GraphDependencyGenerationClosureDigestV1,
+}
+
+struct GenerationStagePlan<'a> {
+    identity: &'a GraphGenerationManifestIdentity,
+    expected: &'a GraphRecoveredGenerationDigestV1,
+    context: &'a GenerationStageContext,
+    pages: &'a [GenerationStagePage],
+    adopt_legacy_partial: bool,
+    restaging_sealed_only: bool,
 }
 
 /// CPU-only page batch, built outside the exclusive snapshot gate so the next
@@ -275,6 +367,7 @@ impl GraphDb {
         check: &dyn Fn() -> Result<(), GraphDbError>,
     ) -> Result<(GraphCommit, GraphRecoveredGenerationDigestV1), GraphDbError> {
         check()?;
+        self.ensure_opened()?;
         let physical_namespace = identity.physical_namespace()?;
         let guard = self.read_guard()?;
         let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
@@ -317,15 +410,66 @@ impl GraphDb {
         );
     }
 
+    pub(crate) fn generation_commit(
+        &self,
+        locator: &GenerationLocator,
+    ) -> Result<Option<GraphCommit>, GraphDbError> {
+        let physical_namespace = locator.physical_namespace()?;
+        if let Some(sealed) = self.sealed_generation_reader(locator) {
+            let guard = sealed.database().read_guard()?;
+            let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
+            if let Some(projection) = latest_projection(
+                database,
+                &physical_namespace,
+                &locator.projection.projection,
+            )? {
+                return Ok(Some(projection.commit));
+            }
+        }
+        self.staging_generation_commit(locator)
+    }
+
+    pub(crate) fn staging_generation_commit(
+        &self,
+        locator: &GenerationLocator,
+    ) -> Result<Option<GraphCommit>, GraphDbError> {
+        let physical_namespace = locator.physical_namespace()?;
+        let guard = self.read_guard()?;
+        let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
+        Ok(latest_projection(
+            database,
+            &physical_namespace,
+            &locator.projection.projection,
+        )?
+        .map(|projection| projection.commit))
+    }
+
+    /// Whether the shared staging container still holds native rows for this
+    /// generation. A leftover empty projection commit after row release is
+    /// not serving state — remount must still adopt the sealed store.
+    pub(crate) fn staging_generation_has_rows(
+        &self,
+        locator: &GenerationLocator,
+    ) -> Result<bool, GraphDbError> {
+        let physical_namespace = locator.physical_namespace()?;
+        let guard = self.read_guard()?;
+        let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
+        Ok(projection_node_counts(
+            database,
+            &physical_namespace,
+            &locator.projection.projection,
+        )? != (0, 0))
+    }
+
     /// Proves a generation durably before its relational head can advance.
     ///
     /// A sealed per-generation store is closed, reopened, and checked against
-    /// `expected` before installation. When that proof is available, closing
-    /// and reopening the accumulated staging database would prove the same
-    /// rows a second time while checkpointing every older generation too.
-    /// The staging database remains the WAL-backed replay and fallback
-    /// authority; configurations without a sealed artifact retain the
-    /// original close/reopen proof when `reopen_fallback` requires it.
+    /// `expected` before installation. That complete immutable copy becomes
+    /// the serving authority once its dependency-free relational head is
+    /// seated, so publication may release the duplicate staging rows without
+    /// weakening the recovered-digest invariant. Dependency-bearing
+    /// generations and configurations without an installed sealed artifact
+    /// retain staging and the original proof path.
     #[hotpath::measure(
         label = "graph_db.generation.publish.verify_proof",
         impl_type = "GraphDb"
@@ -350,21 +494,11 @@ impl GraphDb {
             GenerationLocator::new(identity.projection.clone(), identity.generation.clone());
         if let Some(canonical_bytes) = self.inner.markers.lookup(&locator, expected.as_str()) {
             check()?;
-            let physical_namespace = identity.physical_namespace()?;
-            let guard = self.read_guard()?;
-            let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
-            let commit = latest_projection(
-                database,
-                &physical_namespace,
-                &identity.projection.projection,
-            )?
-            .ok_or_else(|| {
+            let commit = self.generation_commit(&locator)?.ok_or_else(|| {
                 GraphDbError::unavailable(
                     "verified graph generation has no complete native generation rows",
                 )
-            })?
-            .commit;
-            drop(guard);
+            })?;
             // Carry the inherited proof into this open's published set, so a
             // daemon that only serves reads does not drop it at close.
             self.inner.markers.record_fresh(&locator);
@@ -378,21 +512,11 @@ impl GraphDb {
             self.ensure_sealed_generation_store(identity, expected, check)?
         {
             check()?;
-            let physical_namespace = identity.physical_namespace()?;
-            let guard = self.read_guard()?;
-            let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
-            let commit = latest_projection(
-                database,
-                &physical_namespace,
-                &identity.projection.projection,
-            )?
-            .ok_or_else(|| {
+            let commit = self.generation_commit(&locator)?.ok_or_else(|| {
                 GraphDbError::unavailable(
                     "sealed graph publication has no complete native generation rows",
                 )
-            })?
-            .commit;
-            drop(guard);
+            })?;
             // A sealed *build* enumerated this container's rows and its
             // reopen digest matched the authority, which is the same proof
             // the staging close/reopen path files: record it so the close
@@ -458,6 +582,7 @@ impl GraphDb {
         check()?;
         manifest.validate_checked(check)?;
         let identity = manifest.identity();
+        let expected_row_counts = manifest.row_counts();
         let context = GenerationStageContext {
             locator: GenerationLocator::new(
                 identity.projection.clone(),
@@ -467,7 +592,14 @@ impl GraphDb {
             dependency_namespaces: self.require_exact_dependencies(&identity)?,
             dependency_digest: identity.dependency_closure_digest(check)?,
         };
-        if let Some(commit) = self.reseat_complete_staged_generation(&identity, &context)? {
+        let restaging_sealed_only = self
+            .wait_verified_generations_write()?
+            .sealed_only
+            .remove(&context.locator);
+        if !restaging_sealed_only
+            && let Some(commit) =
+                self.reseat_complete_staged_generation(&identity, &context, expected_row_counts)?
+        {
             // A complete durable generation is already seated; these rows were
             // never needed.
             drop(manifest);
@@ -490,6 +622,14 @@ impl GraphDb {
                 crate::hotpath_observe::HydrationSource::Staged,
             );
         }
+        let plan = GenerationStagePlan {
+            identity: &identity,
+            expected,
+            context: &context,
+            pages: &pages,
+            adopt_legacy_partial,
+            restaging_sealed_only,
+        };
         match Arc::try_unwrap(manifest) {
             Ok(mut manifest) => {
                 let entities = std::mem::take(&mut manifest.entities);
@@ -497,27 +637,10 @@ impl GraphDb {
                 // Drop metadata and digest memo before staging. The separately
                 // owned identity carries every value later phases need.
                 drop(manifest);
-                self.stage_owned_generation_pages(
-                    entities,
-                    relations,
-                    &identity,
-                    expected,
-                    &context,
-                    &pages,
-                    adopt_legacy_partial,
-                    check,
-                )?;
+                self.stage_owned_generation_pages(entities, relations, plan, check)?;
             }
             Err(manifest) => {
-                self.stage_generation_pages(
-                    &manifest,
-                    &identity,
-                    expected,
-                    &context,
-                    &pages,
-                    adopt_legacy_partial,
-                    check,
-                )?;
+                self.stage_generation_pages(&manifest, plan, check)?;
                 // Shared supplied manifests cannot donate their rows, but the
                 // staging owner still releases its Arc at the exact boundary.
                 drop(manifest);
@@ -531,16 +654,24 @@ impl GraphDb {
         &self,
         identity: &GraphGenerationManifestIdentity,
         context: &GenerationStageContext,
+        expected_row_counts: (usize, usize),
     ) -> Result<Option<GraphCommit>, GraphDbError> {
         let _snapshot_gate = self.wait_snapshot_gate_upgradable();
-        let existing = {
+        let (existing, actual_row_counts) = {
             let guard = self.read_guard()?;
             let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
-            latest_projection(
-                database,
-                &context.physical_namespace,
-                &identity.projection.projection,
-            )?
+            (
+                latest_projection(
+                    database,
+                    &context.physical_namespace,
+                    &identity.projection.projection,
+                )?,
+                projection_node_counts(
+                    database,
+                    &context.physical_namespace,
+                    &identity.projection.projection,
+                )?,
+            )
         };
         let Some(existing) = existing else {
             return Ok(None);
@@ -549,6 +680,7 @@ impl GraphDb {
             || existing.commit.watermark != identity.watermark
             || existing.commit.generation_dependency_digest.as_ref()
                 != Some(&context.dependency_digest)
+            || actual_row_counts != expected_row_counts
         {
             return Ok(None);
         }
@@ -564,23 +696,31 @@ impl GraphDb {
     /// Constructs page N+1 while page N holds the exclusive apply gate.
     /// Receipted pages skip construct so wedge-retry replay stays a peek.
     #[hotpath::measure(label = "graph_db.generation.page_pipeline", impl_type = "GraphDb")]
+    #[allow(clippy::too_many_arguments)]
     fn stage_generation_pages(
         &self,
         manifest: &GraphGenerationManifest,
-        identity: &GraphGenerationManifestIdentity,
-        expected: &GraphRecoveredGenerationDigestV1,
-        context: &GenerationStageContext,
-        pages: &[GenerationStagePage],
-        adopt_legacy_partial: bool,
+        plan: GenerationStagePlan<'_>,
         check: &dyn Fn() -> Result<(), GraphDbError>,
     ) -> Result<(), GraphDbError> {
+        let GenerationStagePlan {
+            identity,
+            expected,
+            context,
+            pages,
+            adopt_legacy_partial,
+            restaging_sealed_only,
+        } = plan;
         let mut prepared_next = None;
         for (index, page) in pages.iter().enumerate() {
             check()?;
-            let first_page_blocked = index == 0
+            let first_page_blocked = !restaging_sealed_only
+                && index == 0
                 && self.generation_stage_first_page_blocked_without_legacy(
                     identity,
+                    expected,
                     context,
+                    page,
                     adopt_legacy_partial,
                 )?;
             let current = if first_page_blocked {
@@ -650,27 +790,33 @@ impl GraphDb {
         label = "graph_db.generation.page_pipeline_owned",
         impl_type = "GraphDb"
     )]
-    #[allow(clippy::too_many_arguments)]
     fn stage_owned_generation_pages(
         &self,
         entities: Vec<crate::GraphEntity>,
         relations: Vec<GraphGenerationRelation>,
-        identity: &GraphGenerationManifestIdentity,
-        expected: &GraphRecoveredGenerationDigestV1,
-        context: &GenerationStageContext,
-        pages: &[GenerationStagePage],
-        adopt_legacy_partial: bool,
+        plan: GenerationStagePlan<'_>,
         check: &dyn Fn() -> Result<(), GraphDbError>,
     ) -> Result<(), GraphDbError> {
+        let GenerationStagePlan {
+            identity,
+            expected,
+            context,
+            pages,
+            adopt_legacy_partial,
+            restaging_sealed_only,
+        } = plan;
         let mut rows = OwnedGenerationStageRows::new(entities, relations);
         let Some(first_page) = pages.first() else {
             return rows.finish();
         };
-        let first_page_blocked = self.generation_stage_first_page_blocked_without_legacy(
-            identity,
-            context,
-            adopt_legacy_partial,
-        )?;
+        let first_page_blocked = !restaging_sealed_only
+            && self.generation_stage_first_page_blocked_without_legacy(
+                identity,
+                expected,
+                context,
+                first_page,
+                adopt_legacy_partial,
+            )?;
         let first_rows = rows.take_page(first_page)?;
         let mut current = if first_page_blocked
             || self
@@ -690,12 +836,17 @@ impl GraphDb {
             let successor_rows = successor
                 .map(|next_page| rows.take_page(next_page))
                 .transpose()?;
+            // Owned rows are taken from the manifest exactly once and are
+            // gone after this iteration, so a successor's need for a prepared
+            // page is decided by that successor alone. A blocked first page
+            // refuses inside its own batch before any successor runs; letting
+            // it suppress every later construct dropped rows the apply then
+            // demanded ("owned generation stage page was not prepared").
             let successor_needs_construct = match successor {
-                Some(next_page) if !first_page_blocked => !self
-                    .generation_stage_page_already_applied(
-                        identity, expected, context, next_page,
-                    )?,
-                Some(_) | None => false,
+                Some(next_page) => !self.generation_stage_page_already_applied(
+                    identity, expected, context, next_page,
+                )?,
+                None => false,
             };
             current = thread::scope(|scope| {
                 let successor_handle = match (successor, successor_rows) {
@@ -763,7 +914,9 @@ impl GraphDb {
     fn generation_stage_first_page_blocked_without_legacy(
         &self,
         identity: &GraphGenerationManifestIdentity,
+        expected: &GraphRecoveredGenerationDigestV1,
         context: &GenerationStageContext,
+        page: &GenerationStagePage,
         adopt_legacy_partial: bool,
     ) -> Result<bool, GraphDbError> {
         let guard = self.read_guard()?;
@@ -776,11 +929,45 @@ impl GraphDb {
         else {
             return Ok(false);
         };
+        // A durable receipt that binds this exact identity, recovered digest
+        // and page says the leftover projection commit is this generation's
+        // own: the rows behind it were released after its sealed artifact
+        // installed, and restoring them is a restage, not the adoption of a
+        // foreign prefix. `apply_prepared_generation_stage_page` reaches the
+        // same conclusion inside the batch (`reuse_receipt`), so the
+        // pre-flight decision has to agree with it or the page it refuses to
+        // prepare is a page the batch then demands.
+        if Self::generation_stage_page_receipt_binds(database, identity, expected, context, page)? {
+            return Ok(false);
+        }
         let exact_incomplete_legacy = adopt_legacy_partial
             && existing.commit.source_generation == identity.source_generation
             && existing.commit.watermark == identity.watermark
             && existing.commit.generation_dependency_digest.is_none();
         Ok(!exact_incomplete_legacy)
+    }
+
+    /// Whether a durable receipt for `page` already binds this exact manifest
+    /// identity and recovered digest, regardless of whether its rows are
+    /// still resident. This is the single rule for "this page is mine", read
+    /// by the pre-flight block above and by the page apply below.
+    fn generation_stage_page_receipt_binds(
+        database: &grafeo_engine::GrafeoDB,
+        identity: &GraphGenerationManifestIdentity,
+        expected: &GraphRecoveredGenerationDigestV1,
+        context: &GenerationStageContext,
+        page: &GenerationStagePage,
+    ) -> Result<bool, GraphDbError> {
+        let (idempotency_key, input_digest) =
+            generation_stage_page_receipt(identity, expected, page)?;
+        Ok(
+            crate::state::publication(database, &context.physical_namespace, &idempotency_key)?
+                .is_some_and(|existing| {
+                    existing.input_digest == input_digest
+                        && existing.commit.source_generation == identity.source_generation
+                        && existing.commit.watermark == identity.watermark
+                }),
+        )
     }
 
     fn generation_stage_page_already_applied(
@@ -790,26 +977,28 @@ impl GraphDb {
         context: &GenerationStageContext,
         page: &GenerationStagePage,
     ) -> Result<bool, GraphDbError> {
-        let (idempotency_key, input_digest) =
-            generation_stage_page_receipt(identity, expected, page)?;
         let guard = self.read_guard()?;
         let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
         Ok(
-            match crate::state::publication(
-                database,
-                &context.physical_namespace,
-                &idempotency_key,
-            )? {
-                Some(existing)
-                    if existing.input_digest == input_digest
-                        && existing.commit.source_generation == identity.source_generation
-                        && existing.commit.watermark == identity.watermark =>
-                {
-                    true
-                }
-                Some(_) | None => false,
-            },
+            Self::generation_stage_page_receipt_binds(database, identity, expected, context, page)?
+                && Self::generation_stage_page_rows_present(database, context, page)?,
         )
+    }
+
+    fn generation_stage_page_rows_present(
+        database: &grafeo_engine::GrafeoDB,
+        context: &GenerationStageContext,
+        page: &GenerationStagePage,
+    ) -> Result<bool, GraphDbError> {
+        let (entities, relations) = projection_node_counts(
+            database,
+            &context.physical_namespace,
+            &context.locator.projection.projection,
+        )?;
+        Ok(match page.kind {
+            GenerationStagePageKind::Entities => entities >= page.range.end,
+            GenerationStagePageKind::Relations => relations >= page.range.end,
+        })
     }
 
     #[cfg(test)]
@@ -862,6 +1051,7 @@ impl GraphDb {
         self.run_gated_batch(
             check,
             |database| {
+                let mut reuse_receipt = false;
                 if let Some(existing) = crate::state::publication(
                     database,
                     &context.physical_namespace,
@@ -871,13 +1061,17 @@ impl GraphDb {
                         && existing.commit.source_generation == identity.source_generation
                         && existing.commit.watermark == identity.watermark
                     {
-                        return Ok(GraphBatchPlan::Settled(existing.commit, ()));
+                        if Self::generation_stage_page_rows_present(database, context, page)? {
+                            return Ok(GraphBatchPlan::Settled(existing.commit, ()));
+                        }
+                        reuse_receipt = true;
+                    } else {
+                        return Err(self.sealed_write_refusal(&context.locator).unwrap_or(
+                            GraphDbError::conflict(
+                                "generation_runtime.apply_generation_stage_page_with_context",
+                            ),
+                        ));
                     }
-                    return Err(self.sealed_write_refusal(&context.locator).unwrap_or(
-                        GraphDbError::conflict(
-                            "generation_runtime.apply_generation_stage_page_with_context",
-                        ),
-                    ));
                 }
                 if let Some(predecessor) = predecessor {
                     let (prior_key, prior_input) =
@@ -897,11 +1091,17 @@ impl GraphDb {
                             "generation_runtime.apply_generation_stage_page_with_context",
                         ));
                     }
+                    if !Self::generation_stage_page_rows_present(database, context, predecessor)? {
+                        return Err(GraphDbError::unavailable(
+                            "graph generation stage predecessor rows are absent",
+                        ));
+                    }
                 } else if let Some(existing) = latest_projection(
                     database,
                     &context.physical_namespace,
                     &identity.projection.projection,
-                )? {
+                )? && !reuse_receipt
+                {
                     // A finalized generation always carries its dependency
                     // digest. Only an exact unfinished legacy stage may let
                     // the wider first page replace its old prefix.
@@ -942,7 +1142,7 @@ impl GraphDb {
                         metadata: mutation::CommitMetadata {
                             digest: digest.clone(),
                             generation_dependency_digest: None,
-                            publication_record: Some((
+                            publication_record: (!reuse_receipt).then_some((
                                 idempotency_key.clone(),
                                 digest,
                                 input_digest.clone(),
@@ -1128,7 +1328,7 @@ impl GraphDb {
                 || self.inner.database.write(),
             )
             .map_err(|_| GraphDbError::unavailable("graph database write lock is poisoned"))?;
-            self.inner.identity_indexes.invalidate();
+            self.inner.invalidate_store_epoch_caches();
             self.ensure_available()?;
             check()?;
             let mut state_guard = self.state_write_guard()?;
@@ -1155,7 +1355,7 @@ impl GraphDb {
                     return Err(error);
                 }
             };
-            *state_guard = recovered_state;
+            *state_guard = Some(recovered_state);
             *quarantined_guard = quarantined;
             *database_guard = Some(recovered);
         }
@@ -1229,7 +1429,7 @@ impl GraphDb {
                 || self.inner.database.write(),
             )
             .map_err(|_| GraphDbError::unavailable("graph database write lock is poisoned"))?;
-            self.inner.identity_indexes.invalidate();
+            self.inner.invalidate_store_epoch_caches();
             let mut state_guard = self.state_write_guard()?;
             let mut quarantined_guard = self
                 .inner
@@ -1259,7 +1459,7 @@ impl GraphDb {
                     }
                 };
             let still_quarantined = quarantined.contains(&quarantine_key);
-            *state_guard = recovered_state;
+            *state_guard = Some(recovered_state);
             *quarantined_guard = quarantined;
             *database_guard = Some(recovered);
             if still_quarantined {
@@ -1294,7 +1494,7 @@ impl GraphDb {
                     || self.inner.database.write(),
                 )
                 .map_err(|_| GraphDbError::unavailable("graph database write lock is poisoned"))?;
-                self.inner.identity_indexes.invalidate();
+                self.inner.invalidate_store_epoch_caches();
                 let mut state_guard = self.state_write_guard()?;
                 let mut quarantined_guard =
                     self.inner.quarantined_projections.write().map_err(|_| {
@@ -1318,7 +1518,7 @@ impl GraphDb {
                 if is_database_fault(&error) {
                     self.inner.poisoned.store(true, Ordering::Release);
                 }
-                *state_guard = recovered_state;
+                *state_guard = Some(recovered_state);
                 *quarantined_guard = quarantined;
                 *database_guard = Some(recovered);
                 Err(error)
@@ -1342,30 +1542,347 @@ impl GraphDb {
         state.remember(lease)
     }
 
+    pub(crate) fn remember_sealed_only_generation(
+        &self,
+        lease: &std::sync::Arc<VerifiedGenerationLease>,
+    ) -> Result<(), GraphDbError> {
+        let mut state = self.wait_verified_generations_write()?;
+        state.remember(lease)?;
+        state.stored.remove(&lease.locator);
+        state.sealed_only.insert(lease.locator.clone());
+        Ok(())
+    }
+
+    /// Releases one sealed generation's duplicate staging rows.
+    ///
+    /// `relational_recovered_digest` is the digest the relational authority
+    /// records for this projection's verified head, when the caller has it.
+    /// Supplying it is the stronger contract: the installed sealed artifact
+    /// must reproduce that exact digest before anything is deleted. The
+    /// registry hook for it is
+    /// `registry::publication::release_sealed_generation_staging_rows`, which
+    /// already reads `relational_head` — passing
+    /// `Some(relational_head.recovered_digest.as_str())` here binds the
+    /// release to the authority's head instead of letting the artifact vouch
+    /// for itself.
+    pub(crate) fn release_sealed_generation_staging_rows_with(
+        &self,
+        locator: &GenerationLocator,
+        relational_recovered_digest: Option<&str>,
+        check: &dyn Fn() -> Result<(), GraphDbError>,
+    ) -> Result<SealedStagingRelease, GraphDbError> {
+        check()?;
+        let Some(sealed) = self.sealed_generation_reader(locator) else {
+            return Ok(Self::retained(
+                locator,
+                SealedStagingRetentionReason::NoSealedStore,
+            ));
+        };
+        // A caller-supplied head digest is the authority; it must agree with
+        // the artifact this process installed before anything is deleted.
+        if let Some(expected) = relational_recovered_digest
+            && sealed.recovered_digest() != expected
+        {
+            return Ok(Self::retained(
+                locator,
+                SealedStagingRetentionReason::SealedDigestMismatch,
+            ));
+        }
+        let state = self.inner.verified_generations.read().map_err(|_| {
+            GraphDbError::unavailable("verified graph generation state lock is poisoned")
+        })?;
+        let (authority, was_sealed_only) =
+            match Self::sealed_staging_release_lease(&state, locator, sealed.recovered_digest()) {
+                Ok(eligible) => eligible,
+                Err(reason) => return Ok(Self::retained(locator, reason)),
+            };
+        drop(state);
+        // A hibernated staging engine used to end the release here, and the
+        // live daemon reported `staging_engine_hibernated` for every queued
+        // generation forever: the release needs the engine, the engine only
+        // opens for work, and the only work waiting was the release. Deleting
+        // rows is exactly the work that makes the *next* open cheaper, so it
+        // is worth one open now — and the engine goes straight back to
+        // hibernation afterwards, so the sweep never leaves a container
+        // resident that was not resident before it ran.
+        let hibernated_on_entry = !self.native_engine_open()?;
+        if hibernated_on_entry {
+            self.ensure_opened()?;
+        }
+        let release = self.release_sealed_generation_staging_rows_locked(
+            locator,
+            authority,
+            was_sealed_only,
+            &sealed,
+            check,
+        );
+        if hibernated_on_entry && let Err(error) = self.hibernate_if_lazy() {
+            tracing::warn!(
+                %error,
+                namespace = locator.projection.namespace.as_str(),
+                projection = locator.projection.projection.as_str(),
+                "staging engine opened for a release sweep could not hibernate again"
+            );
+        }
+        release
+    }
+
+    fn release_sealed_generation_staging_rows_locked(
+        &self,
+        locator: &GenerationLocator,
+        authority: SealedStagingReleaseAuthorityV1,
+        was_sealed_only: bool,
+        sealed: &Arc<crate::sealed_store::SealedGenerationStore>,
+        check: &dyn Fn() -> Result<(), GraphDbError>,
+    ) -> Result<SealedStagingRelease, GraphDbError> {
+        let removed_rows = match self.delete_staged_generation_rows(locator, check)? {
+            StagedGenerationRowsDeletion::RetentionPending => {
+                return Ok(Self::retained(
+                    locator,
+                    SealedStagingRetentionReason::StagingEngineHibernated,
+                ));
+            }
+            StagedGenerationRowsDeletion::Deleted { removed_rows } => removed_rows,
+        };
+        let mut state = self.wait_verified_generations_write()?;
+        let (current, now_sealed_only) =
+            match Self::sealed_staging_release_lease(&state, locator, sealed.recovered_digest()) {
+                Ok(eligible) => eligible,
+                Err(reason) => return Ok(Self::retained(locator, reason)),
+            };
+        if current.recovered_digest() != authority.recovered_digest() {
+            return Ok(Self::retained(
+                locator,
+                SealedStagingRetentionReason::NoVerifiedLease,
+            ));
+        }
+        state.stored.remove(locator);
+        state.sealed_only.insert(locator.clone());
+        // Absent rows are the durable truth; the process-local sealed-only
+        // flag is lost across hibernation, so it must not decide whether a
+        // repeat sweep reports a release that never happened.
+        let _ = (was_sealed_only, now_sealed_only);
+        if !removed_rows {
+            Ok(SealedStagingRelease::AlreadyReleased)
+        } else {
+            let (entities, relations) = sealed.row_counts();
+            tracing::info!(
+                event = "graph_staging_rows_released",
+                namespace = locator.projection.namespace.as_str(),
+                projection = locator.projection.projection.as_str(),
+                generation = locator.generation.as_str(),
+                entities,
+                relations,
+                "verified sealed generation released duplicate staging rows"
+            );
+            Ok(SealedStagingRelease::Released {
+                entities,
+                relations,
+            })
+        }
+    }
+
+    /// Records why one generation's staging rows stayed, at the only place
+    /// that knows the generation as well as the reason.
+    fn retained(
+        locator: &GenerationLocator,
+        reason: SealedStagingRetentionReason,
+    ) -> SealedStagingRelease {
+        tracing::info!(
+            event = "graph_staging_rows_retained",
+            namespace = locator.projection.namespace.as_str(),
+            projection = locator.projection.projection.as_str(),
+            generation = locator.generation.as_str(),
+            reason = reason.as_str(),
+            "sealed generation kept its duplicate staging rows"
+        );
+        SealedStagingRelease::Retained(reason)
+    }
+
+    /// Decides whether this generation's staging rows are redundant, and on
+    /// what authority.
+    ///
+    /// Every fail-closed check below is unconditional: a retiring, collected,
+    /// quarantined, depended-on, dependency-bearing or digest-mismatched
+    /// generation keeps its rows regardless of which authority applies.
+    ///
+    /// The lease arm is preferred. When no lease is resident, the installed
+    /// sealed artifact stands in — see
+    /// [`SealedStagingReleaseAuthorityV1::SealedArtifact`]. The caller
+    /// resolved this locator from the relational verified head and installed
+    /// the artifact for it, and the artifact only installs after its reopened
+    /// rows reproduce the digest that head names, so "the head names this
+    /// generation and the sealed store reproduces its digest" already holds
+    /// here. Without this arm the sweep answered `NoVerifiedLease` for every
+    /// code scope a freshly opened daemon had not recovered a lease for,
+    /// which is every scope but the serving one.
+    fn sealed_staging_release_lease(
+        state: &VerifiedGenerationState,
+        locator: &GenerationLocator,
+        sealed_digest: &str,
+    ) -> Result<(SealedStagingReleaseAuthorityV1, bool), SealedStagingRetentionReason> {
+        if state.retiring.contains(locator) {
+            return Err(SealedStagingRetentionReason::Retiring);
+        }
+        if state.collected.contains(locator) {
+            return Err(SealedStagingRetentionReason::Collected);
+        }
+        if state.quarantined.contains(locator) {
+            return Err(SealedStagingRetentionReason::Quarantined);
+        }
+        if state
+            .stored
+            .iter()
+            .any(|(owner, dependencies)| owner != locator && dependencies.contains(locator))
+        {
+            return Err(SealedStagingRetentionReason::StoredDependent);
+        }
+        let sealed_only = state.sealed_only.contains(locator);
+        let Some(lease) = state
+            .heads
+            .get(&locator.projection)
+            .filter(|head| head.locator == *locator)
+            .cloned()
+            .or_else(|| state.known.get(locator).and_then(std::sync::Weak::upgrade))
+        else {
+            // No lease in this process. The generation must still carry no
+            // stored dependencies of its own, and the sealed artifact's
+            // digest is the one the release is authorized against.
+            if state
+                .stored
+                .get(locator)
+                .is_some_and(|dependencies| !dependencies.is_empty())
+            {
+                return Err(SealedStagingRetentionReason::DependencyBearing);
+            }
+            return Ok((
+                SealedStagingReleaseAuthorityV1::SealedArtifact(sealed_digest.to_owned()),
+                sealed_only,
+            ));
+        };
+        if !lease.dependency_identities.is_empty() {
+            return Err(SealedStagingRetentionReason::DependencyBearing);
+        }
+        if sealed_digest != lease.head.recovered_digest.as_str() {
+            return Err(SealedStagingRetentionReason::SealedDigestMismatch);
+        }
+        Ok((SealedStagingReleaseAuthorityV1::Lease(lease), sealed_only))
+    }
+
+    /// Drops every resident verified-generation lease while keeping the
+    /// durable ledger — stored rows, sealed-only marks, and installed sealed
+    /// readers — exactly as it stands.
+    ///
+    /// This is the state a freshly opened daemon is in for every code scope
+    /// it has not activated: the sealed artifact is adopted from disk and the
+    /// staging rows are still there, but no lease for that generation exists
+    /// in the process. Retention behaviour in that state is what the
+    /// lease-independent release contract is about, so tests need to be able
+    /// to reach it without a restart.
+    #[cfg(any(test, feature = "test-helpers", feature = "eval-helpers"))]
+    pub fn forget_resident_verified_leases(&self) -> Result<(), GraphDbError> {
+        let mut state = self.wait_verified_generations_write()?;
+        state.heads.clear();
+        state.known.clear();
+        Ok(())
+    }
+
+    /// Test surface for
+    /// [`Self::release_sealed_generation_staging_rows_for_relational_head`].
+    #[cfg(any(test, feature = "test-helpers", feature = "eval-helpers"))]
+    pub fn release_staging_rows_for_relational_head(
+        &self,
+        identity: &GraphGenerationManifestIdentity,
+        relational_recovered_digest: &str,
+    ) -> Result<SealedStagingRelease, GraphDbError> {
+        self.release_sealed_generation_staging_rows_with(
+            &GenerationLocator::new(identity.projection.clone(), identity.generation.clone()),
+            Some(relational_recovered_digest),
+            &|| Ok(()),
+        )
+    }
+
+    #[cfg(any(test, feature = "test-helpers", feature = "eval-helpers"))]
+    pub fn staging_generation_row_counts(
+        &self,
+        identity: &GraphGenerationManifestIdentity,
+    ) -> Result<(usize, usize), GraphDbError> {
+        let namespace = identity.physical_namespace()?;
+        let guard = self.read_guard()?;
+        let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
+        projection_node_counts(database, &namespace, &identity.projection.projection)
+    }
+
+    #[cfg(any(test, feature = "test-helpers", feature = "eval-helpers"))]
+    pub fn is_generation_sealed_only(
+        &self,
+        identity: &GraphGenerationManifestIdentity,
+    ) -> Result<bool, GraphDbError> {
+        self.is_sealed_only_generation(&GenerationLocator::new(
+            identity.projection.clone(),
+            identity.generation.clone(),
+        ))
+    }
+
     #[hotpath::measure(label = "graph_db.generation.delete", impl_type = "GraphDb")]
     pub(crate) fn delete_generation_contents(
         &self,
         locator: &GenerationLocator,
         check: &dyn Fn() -> Result<(), GraphDbError>,
-    ) -> Result<(), GraphDbError> {
+    ) -> Result<GenerationContentsDeletion, GraphDbError> {
+        if matches!(
+            self.delete_staged_generation_rows(locator, check)?,
+            StagedGenerationRowsDeletion::RetentionPending
+        ) {
+            return Ok(GenerationContentsDeletion::RetentionPending);
+        }
+        let mut state = self.wait_verified_generations_write()?;
+        state.known.remove(locator);
+        state.quarantined.remove(locator);
+        state.stored.remove(locator);
+        state.sealed_only.remove(locator);
+        state.retiring.remove(locator);
+        state.collected.insert(locator.clone());
+        // A retired projection head (a deleted code generation's own
+        // projection) must leave the installed-head cache with its rows, or
+        // the stale lease would keep retaining its dependency closure.
+        if state
+            .heads
+            .get(&locator.projection)
+            .is_some_and(|installed| installed.locator == *locator)
+        {
+            state.heads.remove(&locator.projection);
+        }
+        drop(state);
+        self.retire_sealed_generation_store(locator);
+        Ok(GenerationContentsDeletion::Deleted)
+    }
+
+    fn delete_staged_generation_rows(
+        &self,
+        locator: &GenerationLocator,
+        check: &dyn Fn() -> Result<(), GraphDbError>,
+    ) -> Result<StagedGenerationRowsDeletion, GraphDbError> {
         check()?;
         let namespace = locator.physical_namespace()?;
+        let Some(guard) = self.try_read_open_engine()? else {
+            return Ok(StagedGenerationRowsDeletion::RetentionPending);
+        };
         let commit = {
-            let guard = self.read_guard()?;
             let database = guard.as_ref().ok_or(GraphDbError::Closed)?;
-            latest_projection(database, &namespace, &locator.projection.projection)?
+            let projection =
+                latest_projection(database, &namespace, &locator.projection.projection)?;
+            let counts =
+                projection_node_counts(database, &namespace, &locator.projection.projection)?;
+            projection
+                .filter(|_| counts != (0, 0))
                 .map(|projection| projection.commit)
         };
+        drop(guard);
         let Some(commit) = commit else {
-            let mut state = self.wait_verified_generations_write()?;
-            state.known.remove(locator);
-            state.quarantined.remove(locator);
-            state.stored.remove(locator);
-            state.retiring.remove(locator);
-            state.collected.insert(locator.clone());
-            drop(state);
-            self.retire_sealed_generation_store(locator);
-            return Ok(());
+            return Ok(StagedGenerationRowsDeletion::Deleted {
+                removed_rows: false,
+            });
         };
         self.delete_projection_checked(
             namespace,
@@ -1374,15 +1891,7 @@ impl GraphDb {
             commit.watermark,
             check,
         )?;
-        let mut state = self.wait_verified_generations_write()?;
-        state.known.remove(locator);
-        state.quarantined.remove(locator);
-        state.stored.remove(locator);
-        state.retiring.remove(locator);
-        state.collected.insert(locator.clone());
-        drop(state);
-        self.retire_sealed_generation_store(locator);
-        Ok(())
+        Ok(StagedGenerationRowsDeletion::Deleted { removed_rows: true })
     }
 
     fn delete_projection_checked(
@@ -1680,6 +2189,30 @@ impl GraphDb {
         Ok(state.known.get(locator).and_then(std::sync::Weak::upgrade))
     }
 
+    pub(crate) fn is_sealed_only_generation(
+        &self,
+        locator: &GenerationLocator,
+    ) -> Result<bool, GraphDbError> {
+        let state = self.inner.verified_generations.read().map_err(|_| {
+            GraphDbError::unavailable("verified graph generation state lock is poisoned")
+        })?;
+        Ok(state.sealed_only.contains(locator))
+    }
+
+    pub(crate) fn installed_verified_generation(
+        &self,
+        locator: &GenerationLocator,
+    ) -> Result<Option<std::sync::Arc<VerifiedGenerationLease>>, GraphDbError> {
+        let state = self.inner.verified_generations.read().map_err(|_| {
+            GraphDbError::unavailable("verified graph generation state lock is poisoned")
+        })?;
+        Ok(state
+            .heads
+            .get(&locator.projection)
+            .filter(|head| head.locator == *locator)
+            .cloned())
+    }
+
     /// The verified-generation cache as seen by a publisher that can re-prove
     /// the generation from its canonical replay inputs.
     ///
@@ -1701,6 +2234,11 @@ impl GraphDb {
             if state.quarantined.contains(locator) {
                 return Ok(None);
             }
+            if state.sealed_only.contains(locator)
+                && self.sealed_generation_reader(locator).is_none()
+            {
+                return Ok(None);
+            }
         }
         self.verified_generation(locator)
     }
@@ -1718,7 +2256,10 @@ impl GraphDb {
                 dependency.projection.clone(),
                 dependency.generation.clone(),
             );
-            if state.retiring.contains(&locator) || state.collected.contains(&locator) {
+            if state.retiring.contains(&locator)
+                || state.collected.contains(&locator)
+                || state.sealed_only.contains(&locator)
+            {
                 return Err(GraphDbError::conflict(
                     "generation_runtime.require_exact_dependencies",
                 ));
@@ -1741,6 +2282,7 @@ impl GraphDb {
         &self,
         identity: &GraphGenerationManifestIdentity,
     ) -> Result<(), GraphDbError> {
+        self.ensure_opened()?;
         let locator =
             GenerationLocator::new(identity.projection.clone(), identity.generation.clone());
         let physical_namespace = locator.physical_namespace()?;
@@ -1750,7 +2292,7 @@ impl GraphDb {
             || self.inner.database.write(),
         )
         .map_err(|_| GraphDbError::unavailable("graph database write lock is poisoned"))?;
-        self.inner.identity_indexes.invalidate();
+        self.inner.invalidate_store_epoch_caches();
         let mut format_state = self.state_write_guard()?;
         let mut projection_quarantine = self
             .inner
@@ -1789,7 +2331,7 @@ impl GraphDb {
                 message: "generation quarantine disappeared after durable checkpoint".to_owned(),
             });
         }
-        *format_state = recovered_state;
+        *format_state = Some(recovered_state);
         *projection_quarantine = recovered_quarantine;
         *database_guard = Some(recovered);
         let mut state = self.wait_verified_generations_write()?;
@@ -2246,7 +2788,10 @@ mod tests {
         VectorMetric,
     };
 
-    use super::{GenerationLocator, GenerationStageOutcome, generation_stage_pages};
+    use super::{
+        GenerationLocator, GenerationStageOutcome, StagedGenerationRowsDeletion,
+        generation_stage_pages,
+    };
 
     fn manifest(source: &str, watermark: &str) -> GraphGenerationManifest {
         GraphGenerationManifest::new(
@@ -2716,6 +3261,65 @@ mod tests {
     }
 
     #[test]
+    fn persistent_reopen_replays_released_rows_instead_of_false_reseat() {
+        let temp = TempDir::new().unwrap();
+        let manifest = large_manifest("released-row-replay");
+        let sealed = sealed_digest(&manifest);
+        let retained_manifest = arc_manifest(&manifest);
+        let locator =
+            GenerationLocator::new(manifest.projection.clone(), manifest.generation.clone());
+        let (owner, database) = persistent_database(&temp);
+        let staged = database
+            .apply_generation_unverified_with_digest_observed(
+                Arc::clone(&retained_manifest),
+                &sealed,
+                &|| Ok(()),
+            )
+            .unwrap();
+        assert!(matches!(staged, GenerationStageOutcome::Applied(_)));
+        assert!(matches!(
+            database.delete_staged_generation_rows(&locator, &|| Ok(())),
+            Ok(StagedGenerationRowsDeletion::Deleted { removed_rows: true })
+        ));
+        assert_eq!(
+            database
+                .staging_generation_row_counts(&manifest.identity())
+                .unwrap(),
+            (0, 0),
+            "released staging rows must remain absent across a process restart"
+        );
+        drop(database);
+        owner.close().unwrap();
+
+        let (reopened_owner, reopened) = persistent_database(&temp);
+        let replayed = reopened
+            .apply_generation_unverified_with_digest_observed(
+                Arc::clone(&retained_manifest),
+                &sealed,
+                &|| Ok(()),
+            )
+            .unwrap();
+        assert!(matches!(replayed, GenerationStageOutcome::Applied(_)));
+        assert_eq!(
+            reopened
+                .staging_generation_row_counts(&manifest.identity())
+                .unwrap(),
+            manifest.row_counts(),
+            "a cold re-open must restage the exact retained generation before publication"
+        );
+        let (_, recovered) = reopened
+            .reopen_and_verify_existing_generation(
+                &manifest.identity(),
+                &sealed,
+                manifest.row_counts(),
+                &|| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(recovered, sealed);
+        reopened_owner.close().unwrap();
+    }
+
+    #[test]
     fn second_generation_apply_writes_instead_of_reseating_prior() {
         let temp = TempDir::new().unwrap();
         let (owner, database, manifest_a) = large_persistent_generation(&temp, "two-generations");
@@ -3076,11 +3680,14 @@ mod tests {
         database
             .stage_generation_pages(
                 &manifest,
-                &identity,
-                &sealed,
-                &context,
-                &pages,
-                false,
+                super::GenerationStagePlan {
+                    identity: &identity,
+                    expected: &sealed,
+                    context: &context,
+                    pages: &pages,
+                    adopt_legacy_partial: false,
+                    restaging_sealed_only: false,
+                },
                 &|| Ok(()),
             )
             .unwrap();

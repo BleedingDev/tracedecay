@@ -5,7 +5,10 @@ mod authority;
 pub mod backup;
 mod checkpoint;
 mod connection;
-pub use connection::{ConnectionPolicyError, OpenedDatabaseFileError, open_immutable_reader};
+pub use connection::{
+    ConnectionPolicyError, OpenedDatabaseFileError, VerifiedImmutableReader,
+    VerifiedImmutableReaderError, open_immutable_reader, open_verified_immutable_reader,
+};
 mod content_digest;
 pub use content_digest::{CanonicalContentDigestError, canonical_session_domain_content_sha256};
 #[doc(hidden)]
@@ -42,7 +45,7 @@ pub use checkpoint::{
     CheckpointKind, CheckpointOutcome, CheckpointPressure, CheckpointStatus, CheckpointWal,
     MaintenanceCheckpointMode,
 };
-pub use operation::StorageOperationExecutor;
+pub use operation::{StorageOperationError, StorageOperationExecutor};
 pub use telemetry::{
     ReaderAdmissionSnapshot, SqliteStoreSizeTelemetryPort, SqliteVmSnapshot, WalCheckpointSample,
     WalCheckpointSnapshot, WriterBatchMetrics, WriterBatchTotals, WriterClientServiceSnapshot,

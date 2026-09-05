@@ -834,10 +834,76 @@ fn load_host_lifecycle_user_config() -> tracedecay_domain::errors::Result<UserCo
 }
 
 pub(crate) async fn handle_project_local_lifecycle_command(
-    _agent_id: String,
-    _operation: HostBundleCliOperation,
+    agent_id: String,
+    operation: HostBundleCliOperation,
 ) -> tracedecay_domain::errors::Result<()> {
-    Err(project_local_host_lifecycle_unavailable())
+    if !matches!(agent_id.as_str(), "devin" | "zed" | "vibe") {
+        return Err(project_local_host_lifecycle_unavailable());
+    }
+    let home = tracedecay::agents::home_dir().ok_or_else(|| {
+        tracedecay_domain::errors::TraceDecayError::Config {
+            message: "could not determine home directory".to_string(),
+        }
+    })?;
+    let tracedecay_bin = tracedecay::agents::which_tracedecay().ok_or_else(|| {
+        tracedecay_domain::errors::TraceDecayError::Config {
+            message: "tracedecay not found on PATH. Install the checksummed GitHub release:\n  \
+                      https://github.com/ScriptedAlchemy/tracedecay/releases/latest"
+                .to_string(),
+        }
+    })?;
+    let project_path = std::env::current_dir().map_err(|error| {
+        tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!("could not determine project directory: {error}"),
+        }
+    })?;
+    let integration = tracedecay::agents::get_integration(&agent_id)?;
+    if !integration.supports_local_install() {
+        return Err(project_local_host_lifecycle_unavailable());
+    }
+    let context = tracedecay::agents::InstallContext {
+        home: home.clone(),
+        tracedecay_bin,
+        tool_permissions: tracedecay::agents::expected_tool_perms(),
+        project_root: Some(project_path.clone()),
+        dashboard: false,
+    };
+    // Project-local lifecycle installs the host's default component set:
+    // Devin and Zed carry only the MCP registration, while Vibe also owns a
+    // project prompt-rules document.
+    let components = tracedecay::agents::host_bundle_registry::default_components(
+        host_kind_for_agent(&agent_id)?,
+    );
+    let _registration_paths =
+        integration.project_host_component_registration_paths(&components, &home, &project_path)?;
+    match operation {
+        HostBundleCliOperation::Install
+        | HostBundleCliOperation::Update
+        | HostBundleCliOperation::Repair => {
+            prepare_native_activation_if_needed(integration.as_ref(), &context)?;
+            integration.activate_project_host_component_registration(
+                &components,
+                &context,
+                &project_path,
+            )?;
+            eprintln!(
+                "\x1b[32m+\x1b[0m {} project MCP registration",
+                integration.name()
+            );
+        }
+        HostBundleCliOperation::Uninstall => {
+            integration.deactivate_project_host_component_registration(
+                &components,
+                &context,
+                &project_path,
+            )?;
+            eprintln!(
+                "\x1b[31m-\x1b[0m {} project MCP registration",
+                integration.name()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn project_local_host_lifecycle_unavailable() -> tracedecay_domain::errors::TraceDecayError {
@@ -2653,7 +2719,12 @@ pub(crate) async fn handle_install_command(
 ) -> tracedecay_domain::errors::Result<()> {
     validate_codex_automation_flags(agent.as_deref(), automation)?;
     if local {
-        return Err(project_local_host_lifecycle_unavailable());
+        let agent_id = agent.ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: "`tracedecay install --local` requires a project-capable `--agent`"
+                .to_string(),
+        })?;
+        return handle_project_local_lifecycle_command(agent_id, HostBundleCliOperation::Install)
+            .await;
     }
     let home = tracedecay::agents::home_dir().ok_or_else(|| {
         tracedecay_domain::errors::TraceDecayError::Config {
@@ -3869,6 +3940,24 @@ mod tests {
             unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
+
+        /// Put `dir` in front of the inherited `PATH` instead of replacing it.
+        ///
+        /// A host lifecycle test needs its fake host CLI to win resolution on
+        /// a developer machine that also has the real one installed, but the
+        /// same tests resolve `tracedecay` itself off `PATH`
+        /// (`which_tracedecay`) and must keep seeing whatever the ambient
+        /// environment offers — replacing `PATH` outright would silently
+        /// change the staged binary identity the activation probe compares.
+        #[cfg(unix)]
+        fn prepend_path(dir: &Path) -> Self {
+            let mut entries = vec![dir.to_path_buf()];
+            if let Some(existing) = std::env::var_os("PATH") {
+                entries.extend(std::env::split_paths(&existing));
+            }
+            let joined = std::env::join_paths(entries).expect("join PATH entries");
+            Self::set("PATH", joined)
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -3898,7 +3987,7 @@ case "${1-}:${2-}" in
       exit 64
     fi
     command="$6"
-    if [ -f "$config" ] && /bin/grep -q '"other"' "$config"; then
+    if [ -f "$config" ] && /usr/bin/grep -q '"other"' "$config"; then
       printf '{"mcpServers":{"other":{"command":"other","args":[]},"tracedecay":{"command":"%s","args":["serve"]}}}\n' "$command" > "$config"
     else
       printf '{"mcpServers":{"tracedecay":{"command":"%s","args":["serve"]}}}\n' "$command" > "$config"
@@ -3909,7 +3998,7 @@ case "${1-}:${2-}" in
       echo "unexpected kiro-cli mcp remove arguments: $*" >&2
       exit 64
     fi
-    if [ -f "$config" ] && /bin/grep -q '"other"' "$config"; then
+    if [ -f "$config" ] && /usr/bin/grep -q '"other"' "$config"; then
       printf '{"mcpServers":{"other":{"command":"other","args":[]}}}\n' > "$config"
     else
       /bin/rm -f "$config"
@@ -3927,6 +4016,87 @@ esac
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).expect("chmod fake kiro-cli");
+    }
+
+    /// Install a fake `codex` on `PATH` for the Core lifecycle tests, and hand
+    /// back both the `PATH` guard and the directory that holds it.
+    ///
+    /// Core activation drives Codex's own `codex plugin add`
+    /// (`plugin_registry::require_codex_plugin_cli`), which is a *requirement*,
+    /// not a preference: the host-capability doctrine forbids a fallback that
+    /// edits Codex-owned files behind the host's back. CI runners carry no
+    /// `codex` binary, so a test that exercises activation has to supply the
+    /// host CLI the same way the Kiro and MCP-registry tests supply theirs.
+    #[cfg(unix)]
+    fn install_fake_codex_cli(dir: &std::path::Path) -> EnvVarGuard {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Mirrors the probed behaviour recorded in
+        // `agents::codex::plugin_registry`: `plugin add` enables
+        // `[plugins."tracedecay@<marketplace>"]` in `config.toml` and copies
+        // the staged source into the versioned cache; `plugin remove` undoes
+        // exactly those two. Peer plugins, `[mcp_servers]`, and `[hooks]` are
+        // preserved because the entry is appended and removed in place —
+        // rewriting the file would trip the registry's own region guard.
+        //
+        // The child is launched with a cleared environment, so the script
+        // establishes its own `PATH` for the utilities it calls and derives
+        // everything else from the admitted `HOME`.
+        let body = format!(
+            r#"#!/bin/sh
+set -eu
+PATH=/usr/bin:/bin
+export PATH
+selector="${{3-}}"
+case "$selector" in
+  tracedecay@?*) ;;
+  *) echo "unexpected codex plugin selector: $*" >&2; exit 64 ;;
+esac
+marketplace="${{selector#tracedecay@}}"
+config="$HOME/.codex/config.toml"
+entry='[plugins."'"$selector"'"]'
+source_dir="$HOME/.codex/plugins/tracedecay"
+cache_dir="$HOME/.codex/plugins/cache/$marketplace/tracedecay/{version}"
+case "${{1-}} ${{2-}}" in
+  "plugin add")
+    mkdir -p "$HOME/.codex"
+    if [ ! -f "$config" ] || ! grep -qF "$entry" "$config"; then
+      printf '\n%s\nenabled = true\n' "$entry" >> "$config"
+    fi
+    rm -rf "$cache_dir"
+    mkdir -p "$cache_dir"
+    cp -R "$source_dir/." "$cache_dir/"
+    ;;
+  "plugin remove")
+    if [ -f "$config" ]; then
+      awk -v entry="$entry" '
+        BEGIN {{ dropping = 0 }}
+        $0 == entry {{ dropping = 1; next }}
+        dropping == 1 && substr($0, 1, 1) == "[" {{ dropping = 0 }}
+        dropping == 0 {{ print }}
+      ' "$config" > "$config.next"
+      mv "$config.next" "$config"
+    fi
+    rm -rf "$cache_dir"
+    ;;
+  *)
+    echo "unexpected codex invocation: $*" >&2
+    exit 64
+    ;;
+esac
+exit 0
+"#,
+            version = tracedecay_agent_hosts::PRODUCT_VERSION,
+        );
+
+        let path = dir.join("codex");
+        std::fs::write(&path, body).expect("write fake codex");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("fake codex metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod fake codex");
+        EnvVarGuard::prepend_path(dir)
     }
 
     fn seed_opencode_non_context_state(home: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
@@ -3968,6 +4138,7 @@ esac
 
     #[tokio::test]
     async fn codex_automation_project_initializes_through_daemon() {
+        crate::product_runtime::register_for_tests();
         let project = tempfile::tempdir().unwrap();
         let project_path = project.path().to_path_buf();
         let expected_project_path = project_path.clone();
@@ -3992,6 +4163,9 @@ esac
 
     #[tokio::test]
     async fn unavailable_daemon_does_not_resolve_or_open_local_project() {
+        // Without a registered provider the handshake fails first, and this
+        // test's injected `daemon unavailable` failure never runs.
+        crate::product_runtime::register_for_tests();
         let project = tempfile::tempdir().unwrap();
         let resolved = Arc::new(AtomicBool::new(false));
         let resolver_called = Arc::clone(&resolved);
@@ -4800,9 +4974,15 @@ esac
         assert_eq!(std::fs::read(&prompt_path).unwrap(), original_prompt);
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_core_rollback_restores_generated_agent_exports_byte_for_byte() {
         let _profile = pinned_host_profile();
+        // Core `apply` drives Codex's own `codex plugin add`, which is a hard
+        // requirement of that path. Supply the host CLI rather than depending
+        // on whatever the machine happens to have installed.
+        let codex_cli_dir = tempfile::tempdir().unwrap();
+        let _codex_path = install_fake_codex_cli(codex_cli_dir.path());
         let home = host_cli_tempdir();
         // Same filesystem as `home`: the receipt transaction backs up a
         // staged artifact by renaming it into `lifecycle`, and rename cannot
@@ -5441,6 +5621,7 @@ esac
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn codex_native_activated_retry_tracks_component_set() {
         use tracedecay::agents::host_bundle_v2::{
@@ -5449,6 +5630,11 @@ esac
         };
 
         let _profile = pinned_host_profile();
+        // The stale-cache leg below is exactly the leg that has to re-drive
+        // `codex plugin add`, so the host CLI is a precondition of the
+        // behaviour under test, not an ambient machine detail.
+        let codex_cli_dir = tempfile::tempdir().unwrap();
+        let _codex_path = install_fake_codex_cli(codex_cli_dir.path());
         let home = host_cli_tempdir();
         // Keep the lifecycle root on the same filesystem as `home`: receipt
         // transactions back up staged artifacts with an atomic rename.

@@ -4180,6 +4180,7 @@ mod tests {
         Confidence, FactCategoryV1, FactOwnerV1, ProjectId, RefId, RepositoryId, UserProfileId,
         UtcMicros, WorktreeId,
     };
+    use tracedecay_mcp::JsonRpcRequest;
     use tracedecay_memory_provider_registry::{
         ActiveRoutingPolicy, CognitiveRecallAdmittedOutcomeV1, ContextItemProvenanceV1,
         DegradationCause, DegradationRule, DeniedRecallCandidate, EnabledProviderMode,
@@ -4458,19 +4459,20 @@ mod tests {
                 .server
                 .new_connection_route_state()
                 .expect("connection route state");
+            let request = JsonRpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: Some(serde_json::json!(1)),
+                method: "tools/call".to_owned(),
+                params: Some(serde_json::json!({
+                    "name": ADVISORY_RECALL_CONTEXT_TOOL,
+                    "arguments": { "task": task },
+                })),
+            };
             let response = self
                 .server
-                .handle_tools_call(
-                    serde_json::json!(1),
-                    Some(&serde_json::json!({
-                        "name": ADVISORY_RECALL_CONTEXT_TOOL,
-                        "arguments": { "task": task },
-                    })),
-                    false,
-                    &mut connection,
-                    false,
-                )
-                .await;
+                .handle_request_for_connection(&request, false, &mut connection, false)
+                .await
+                .expect("the context request receives a response");
             assert!(
                 response.error.is_none(),
                 "the canonical context call must succeed: {:?}",

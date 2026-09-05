@@ -100,6 +100,9 @@ pub enum HostProjectRegistrationPathV1 {
     ClaudeProjectDirectory,
     CursorProjectDirectory,
     CodexProjectDirectory,
+    DevinProjectDirectory,
+    ZedProjectDirectory,
+    VibeProjectDirectory,
     HermesProjectDirectory,
     KiroProjectDirectory,
     KimiProjectDirectory,
@@ -113,6 +116,9 @@ impl HostProjectRegistrationPathV1 {
             Self::ClaudeProjectDirectory => Some(".claude"),
             Self::CursorProjectDirectory => Some(".cursor"),
             Self::CodexProjectDirectory => Some(".codex"),
+            Self::DevinProjectDirectory => Some(".devin"),
+            Self::ZedProjectDirectory => Some(".zed"),
+            Self::VibeProjectDirectory => Some(".vibe"),
             Self::HermesProjectDirectory => Some(".hermes"),
             Self::KiroProjectDirectory => Some(".kiro"),
             Self::KimiProjectDirectory => Some(".kimi-code"),
@@ -188,7 +194,13 @@ impl HostKindV1 {
             // and Copilot publishes no third-party hook surface at all, so
             // persisting a hook key for any of them would name a spool no event
             // can ever reach.
-            Self::ClineFamily | Self::Gemini | Self::Copilot => None,
+            Self::Devin
+            | Self::Zed
+            | Self::Antigravity
+            | Self::Vibe
+            | Self::ClineFamily
+            | Self::Gemini
+            | Self::Copilot => None,
             Self::Cline => Some(NativeHostIdentityV1::Cline),
             Self::RooCode => Some(NativeHostIdentityV1::RooCode),
             Self::Kilo => Some(NativeHostIdentityV1::Kilo),
@@ -209,8 +221,8 @@ pub fn host_descriptor_v1(host: HostKindV1) -> HostDescriptorV1 {
     use HostHookMappingV1::{Native, NotApplicable};
     use HostProjectRegistrationPathV1::{
         ClaudeProjectDirectory, CodexProjectDirectory, CursorProjectDirectory,
-        HermesProjectDirectory, KimiProjectDirectory, KiroProjectDirectory,
-        OpenCodeProjectDirectory,
+        DevinProjectDirectory, HermesProjectDirectory, KimiProjectDirectory, KiroProjectDirectory,
+        OpenCodeProjectDirectory, VibeProjectDirectory, ZedProjectDirectory,
     };
 
     let (cli_id, slug, hook, components, asset_render_policy, activation_policy, path) = match host
@@ -250,6 +262,42 @@ pub fn host_descriptor_v1(host: HostKindV1) -> HostDescriptorV1 {
             ManagedEmbedded,
             Managed,
             CodexProjectDirectory,
+        ),
+        HostKindV1::Devin => (
+            "devin",
+            "devin",
+            NotApplicable,
+            vec![ContextMcp],
+            ManagedEmbedded,
+            Managed,
+            DevinProjectDirectory,
+        ),
+        HostKindV1::Zed => (
+            "zed",
+            "zed",
+            NotApplicable,
+            vec![ContextMcp],
+            ManagedEmbedded,
+            Managed,
+            ZedProjectDirectory,
+        ),
+        HostKindV1::Antigravity => (
+            "antigravity",
+            "antigravity",
+            NotApplicable,
+            vec![ContextMcp],
+            ManagedEmbedded,
+            Managed,
+            HostProjectRegistrationPathV1::Unavailable,
+        ),
+        HostKindV1::Vibe => (
+            "vibe",
+            "vibe",
+            NotApplicable,
+            vec![Core, ContextMcp],
+            ManagedEmbedded,
+            Managed,
+            VibeProjectDirectory,
         ),
         HostKindV1::Hermes => (
             "hermes",

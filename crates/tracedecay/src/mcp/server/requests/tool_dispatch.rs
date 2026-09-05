@@ -108,6 +108,10 @@ impl McpServer {
 
     #[cfg(feature = "test-transport")]
     #[doc(hidden)]
+    // The request identity, deadline, and cancellation below are static
+    // literals that cannot fail to parse; this entry point exists only for
+    // the test transport.
+    #[cfg_attr(not(test), allow(clippy::expect_used))]
     #[hotpath::skip]
     pub async fn call_tool_for_test(
         &self,
@@ -187,7 +191,20 @@ impl McpServer {
         // `routed.selected_server`; an unselected call is admitted on `self`.
         // Never resolve or fall back to another project inside the worker.
         let dispatch_server = self;
-        let (cg, live_branch) = dispatch_server.reopen_if_branch_drifted_memoized().await;
+        let (cg, live_branch) = match crate::mcp::tools::binding::tool_branch_sensitivity(tool_name)
+        {
+            crate::mcp::tools::binding::BranchSensitivity::Independent => {
+                let cg = dispatch_server.cg_snapshot().await;
+                let live_branch = tracedecay_runtime_core::branch::BranchMemo::resolved(
+                    cg.project_root(),
+                    cg.serving_branch().map(str::to_owned),
+                );
+                (cg, live_branch)
+            }
+            crate::mcp::tools::binding::BranchSensitivity::Sensitive => {
+                dispatch_server.reopen_if_branch_drifted_memoized().await
+            }
+        };
         let project_reader_preselected = routed.selected_project.is_some();
         let application_invocation_target =
             invocation_target_for_route(routed.selected_project.as_ref());
@@ -329,6 +346,7 @@ impl McpServer {
                 explorer_semantic_reader: self.dashboard_explorer_semantic_reader.clone(),
                 feedback_status_reader: self.dashboard_feedback_status_reader.clone(),
                 diagnostics_cache: Some(&self.diagnostics_cache),
+                diagnostics_change_generation: self.diagnostics_change_generation.clone(),
                 diagnostics_lsp: Some(Arc::clone(&self.diagnostics_lsp)),
                 application_invocation_executor,
                 application_invocation_target,

@@ -219,6 +219,7 @@ pub enum TranscriptIngestError {
         provider: &'static str,
         reason: &'static str,
         retryable: bool,
+        detail: Option<String>,
     },
     #[error("{provider} frame state is invalid")]
     InvalidFrameState { provider: &'static str },
@@ -595,7 +596,7 @@ enum PreparedTranscriptFile {
         path: PathBuf,
         loaded: LoadedTranscriptCursor,
         previous: TranscriptCursorCheckpoint,
-        parsed: ParsedTranscript,
+        parsed: Box<ParsedTranscript>,
     },
 }
 
@@ -627,7 +628,7 @@ fn prepare_loaded_transcript(
         path,
         loaded,
         previous,
-        parsed,
+        parsed: Box::new(parsed),
     })
 }
 
@@ -653,7 +654,7 @@ async fn persist_prepared_transcript<S: TranscriptIngestStore>(
         project_root,
         loaded,
         &previous,
-        parsed,
+        *parsed,
     )
     .await
 }

@@ -20,6 +20,7 @@ mod session_database_admission;
 use code_index_activation::{
     CodeIndexActivationMountInputs, code_index_activation_hint_sink, code_index_activation_mount,
     code_index_freshness_probe_sink, code_index_hook_sink, code_index_reconcile_sink,
+    diagnostics_change_generation_resolver,
 };
 pub(in crate::daemon) use runtime::ProductionProjectCompositionRuntime;
 use runtime::bind_verified_project_graph_runtime;
@@ -439,7 +440,29 @@ async fn release_one_idle_project_server_before_open(
     capacity_admission: tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
     let runtime_registry = store_administration.session_runtime_registry().await?;
-    if runtime_registry.has_project_graph_admission_capacity()? {
+    // Two independent bounds share this one release path.
+    //
+    // Graph admission is the original one. The second is the project-server
+    // cache: the code-index scheduler registry is sized to
+    // `MAX_CACHED_PROJECT_SERVERS`, and the bounded route-cache eviction
+    // inside `bind_or_insert_route_bounded` retires only the evicted MCP
+    // server -- it never releases that project's invocation runtime owners, so
+    // the evicted project's code-index worktree holds its scheduler slot for
+    // the life of the daemon. Past `MAX_CACHED_PROJECT_SERVERS` distinct
+    // projects every further project then failed its mount with "code-index
+    // scheduler capacity is exhausted" and served, silently, with no code
+    // indexing at all. Release a whole idle owner here instead: this is the
+    // only path that drains the code-index workers along with the server it
+    // retires.
+    let project_server_cache_saturated = store_administration
+        .project_servers()
+        .lock()
+        .await
+        .servers
+        .len()
+        >= MAX_CACHED_PROJECT_SERVERS;
+    let graph_admission_available = runtime_registry.has_project_graph_admission_capacity()?;
+    if graph_admission_available && !project_server_cache_saturated {
         return Ok(capacity_admission);
     }
     if let Some(error) = store_administration
@@ -460,9 +483,18 @@ async fn release_one_idle_project_server_before_open(
         let mut servers = store_administration.project_servers().lock().await;
         servers.retire_lru_ready_under_graph_pressure(project_server_has_in_flight_response)
     };
-    let Some((retired_owner, retired_servers)) =
-        victim.map_err(|()| project_server_capacity_error())?
-    else {
+    let victim = match victim {
+        Ok(victim) => victim,
+        // Nothing is idle enough to retire. That is terminal only when graph
+        // admission itself is exhausted; a merely saturated project-server
+        // cache still has the bounded route-cache eviction (and the
+        // already-cached-key fast path) behind it, so leave that decision to
+        // the bind below rather than refusing an open this path was not
+        // entered to refuse.
+        Err(()) if graph_admission_available => return Ok(capacity_admission),
+        Err(()) => return Err(project_server_capacity_error()),
+    };
+    let Some((retired_owner, retired_servers)) = victim else {
         return Ok(capacity_admission);
     };
     let prior_owner_retirements = retirement_admission.prior_completions_for_owner(&retired_owner);
@@ -667,6 +699,28 @@ pub(super) async fn production_project_server_with_activation(
     .await
 }
 
+/// The primary checkout this route must be served from, when a linked worktree
+/// is checked out on the *same* branch as its primary.
+///
+/// `ProjectServerKey` is root-bound so distinct linked worktrees keep exact
+/// root-bound servers over one shared `StoreOwnerKey` — a worktree on another
+/// branch (or detached) serves a different generation and must not be answered
+/// from the primary's graph. A worktree on the same branch serves the same
+/// branch content from the same store owner and the same graph database, so a
+/// second physical server for it is a duplicate owner over one authority, not
+/// an exact route: the route belongs in the alias map beside the primary's.
+///
+/// Returns `None` for a primary checkout, a non-worktree path, a detached or
+/// unborn checkout, and any worktree whose branch differs from the primary's.
+fn shared_primary_checkout_root(project_path: &std::path::Path) -> Option<PathBuf> {
+    let primary = tracedecay_runtime_core::worktree::repository_identity_root(project_path)?;
+    let branch = tracedecay_runtime_core::branch::current_branch(project_path)?;
+    if tracedecay_runtime_core::branch::current_branch(&primary)? != branch {
+        return None;
+    }
+    tracedecay_daemon_identity::authority::canonical_identity_path(&primary).ok()
+}
+
 async fn production_project_server_inner(
     store_administration: &StoreAdministration,
     project_open_gates: &tokio::sync::Mutex<ProjectOpenGates>,
@@ -748,7 +802,10 @@ async fn production_project_server_inner(
         store_administration,
     ))
     .await?;
-    let key = ProjectServerKey::from_open_project(&cg, handshake)?;
+    let mut key = ProjectServerKey::from_open_project(&cg, handshake)?;
+    if let Some(shared_root) = shared_primary_checkout_root(canonical_project_path) {
+        key.project_root = shared_root;
+    }
     let cg = Arc::new(cg);
     log_daemon_event(
         "project_open_phase",
@@ -780,6 +837,7 @@ async fn production_project_server_inner(
         handle: semantic_runtime,
         lifecycle: semantic_lifecycle,
         resources: semantic_resources,
+        document_composition: semantic_document_composition,
         auto_download_enabled: semantic_auto_download_enabled,
         startup_selection: semantic_startup_selection,
     } = semantic_project_runtime(&runtime_configuration, &runtime)?;
@@ -947,12 +1005,14 @@ async fn production_project_server_inner(
         semantic_runtime: semantic_runtime.clone(),
         semantic_lifecycle: semantic_lifecycle.clone(),
         semantic_resources,
+        semantic_document_composition,
         native_graph_activation: runtime_configuration.config.native_graph_activation,
         scope: code_search_scope.clone(),
         route_registered: Arc::clone(&route_registered),
         cancellation: cancellation.clone(),
         graph_runtime: Arc::clone(&graph_runtime),
         graph_publication_database: Arc::new(cg.db().clone()),
+        configuration_runtime: Arc::clone(cg.configuration_runtime()),
         profile_id: cg.store_runtime_registry().profile_id().clone(),
     });
     let code_index_hint_sink = code_index_activation_hint_sink(
@@ -984,6 +1044,8 @@ async fn production_project_server_inner(
     );
     let code_index_freshness_probe_sink =
         code_index_freshness_probe_sink(invocation.code_index_schedulers.clone());
+    let diagnostics_change_generation =
+        diagnostics_change_generation_resolver(invocation.code_index_schedulers.clone());
     // The daemon mounts the same broker the MCP server and the directly
     // served dashboard open: persisted analyzer settings (with a recorded
     // degradation for an unreadable file) plus the home-level OpenCode
@@ -1075,6 +1137,7 @@ async fn production_project_server_inner(
     .with_code_index_hook_sink(Arc::clone(&code_index_hook_sink))
     .with_code_index_reconcile_sink(Arc::clone(&code_index_reconcile_sink))
     .with_code_index_freshness_probe_sink(Arc::clone(&code_index_freshness_probe_sink))
+    .with_diagnostics_change_generation(Arc::clone(&diagnostics_change_generation))
     .with_code_index_publication_identity(Arc::clone(&code_index_publication_identity))
     .with_code_index_search_executor(Arc::clone(&code_index_search_executor))
     .with_code_index_branch_diff_executor(Arc::clone(&code_index_branch_diff_executor))
@@ -1297,6 +1360,18 @@ async fn production_project_server_inner(
                 profile_session_open,
             ))
             .await?;
+            let session_runtime_registry =
+                Box::pin(store_administration.session_runtime_registry()).await?;
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    return Err(project_open_cancellation_error());
+                }
+                settlement = session_runtime_registry
+                    .settle_project_session_graph_for_serving(&code_search_scope.project_id) => {
+                    settlement?;
+                }
+            }
             if !project_database_is_read_only {
                 Box::pin(bind_verified_project_graph_runtime(
                     cg.db(),
@@ -1509,6 +1584,7 @@ async fn production_project_server_inner(
             .with_code_index_hook_sink(code_index_hook_sink)
             .with_code_index_reconcile_sink(code_index_reconcile_sink)
             .with_code_index_freshness_probe_sink(code_index_freshness_probe_sink)
+            .with_diagnostics_change_generation(diagnostics_change_generation)
             .with_code_index_publication_identity(code_index_publication_identity)
             .with_code_index_search_executor(code_index_search_executor)
             .with_code_index_branch_diff_executor(code_index_branch_diff_executor)
@@ -1673,6 +1749,15 @@ async fn production_project_server_inner(
                     Err(DaemonSemanticRuntimeRegistrationError::RegistryClosed) => {
                         return Err(TraceDecayError::Config {
                             message: "semantic runtime registration failed: the daemon project runtime registry is closed".to_owned(),
+                        });
+                    }
+                    Err(DaemonSemanticRuntimeRegistrationError::ConcurrentBuildFailed {
+                        detail,
+                    }) => {
+                        return Err(TraceDecayError::Config {
+                            message: format!(
+                                "semantic runtime registration failed after a concurrent build: {detail}"
+                            ),
                         });
                     }
                 }
@@ -1866,6 +1951,7 @@ struct SemanticProjectRuntime {
     handle: tracedecay_semantic::DaemonSemanticRuntimeHandleV1,
     lifecycle: Option<Arc<tracedecay_semantic::SemanticModelLifecycleOwnerV1>>,
     resources: SemanticResourceCeilings,
+    document_composition: tracedecay_domain::EmbeddingDocumentCompositionV1,
     auto_download_enabled: bool,
     startup_selection: Option<String>,
 }
@@ -1899,6 +1985,7 @@ fn semantic_project_runtime(
         handle,
         lifecycle: tracedecay_semantic::default_shared_lifecycle_owner(),
         resources: *semantic_resources,
+        document_composition: semantic_config.document_composition,
         auto_download_enabled: semantic_config.auto_download && runtime.semantic_auto_download(),
         startup_selection: semantic_config.selected_model.clone(),
     })

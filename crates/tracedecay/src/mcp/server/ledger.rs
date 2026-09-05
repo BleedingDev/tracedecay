@@ -89,7 +89,7 @@ impl McpServer {
     /// Reads the upload policy from the daemon-retained desired configuration
     /// snapshot. There is deliberately no `config.toml` fallback: without the
     /// canonical authority, the upload decision is unavailable.
-    #[hotpath::skip]
+    #[hotpath::measure(label = "mcp.ledger.read_upload_policy", future = true)]
     pub(super) async fn canonical_upload_enabled(&self) -> Result<bool> {
         let cg = self.cg_snapshot().await;
         let desired = cg
@@ -108,6 +108,7 @@ impl McpServer {
     /// Estimates the raw-file token cost ("before") for the given file
     /// paths from the cached file-token map (indexed file bytes / 4).
     /// Pure lookup — persists nothing.
+    #[hotpath::measure(label = "mcp.ledger.estimate_raw_tokens")]
     pub(crate) fn estimate_raw_file_tokens(&self, file_paths: &[String]) -> u64 {
         if file_paths.is_empty() {
             return 0;
@@ -137,6 +138,7 @@ impl McpServer {
     /// ledger-write path so the response never waits on them and tests can
     /// still await durability via [`Self::ledger_writes_settled`]. Shutdown
     /// persists the final counter independently.
+    #[hotpath::measure(label = "mcp.ledger.persist_token_accounting")]
     pub(crate) fn spawn_token_accounting_persist(
         &self,
         monitor_project_root: &Path,
@@ -260,10 +262,12 @@ impl McpServer {
         crate::mcp::server::requests::recover_lock(&self.file_token_map).clone()
     }
 
-    /// Flushes pending tokens to the worldwide counter if at least 30 seconds
-    /// have elapsed since the last flush. Best-effort, never blocks for long.
-    #[hotpath::skip]
-    pub(crate) async fn maybe_flush_worldwide(&self) {
+    /// Admits one background worldwide-counter flush at each 30-second boundary.
+    ///
+    /// The complete flush runs on the observed ledger-write path so responses
+    /// never await configuration or cloud I/O and shutdown still drains it.
+    #[hotpath::measure(label = "mcp.ledger.flush_worldwide")]
+    pub(crate) fn maybe_flush_worldwide(self: &Arc<Self>) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -272,8 +276,9 @@ impl McpServer {
         if now - last < 30 {
             return;
         }
-        // Mark as attempted immediately to prevent re-entry.
-        self.last_flush_at.store(now, Ordering::Relaxed);
+        if !claim_worldwide_flush(&self.last_flush_at, last, now) {
+            return;
+        }
 
         let (Some(tokens_saved), Some(last_flushed_tokens)) =
             (&self.tokens_saved, &self.last_flushed_tokens)
@@ -291,44 +296,35 @@ impl McpServer {
             return;
         }
 
-        let upload_enabled = match self.canonical_upload_enabled().await {
-            Ok(enabled) => enabled,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "worldwide counter upload skipped because configuration authority is unavailable"
-                );
-                return;
-            }
-        };
-
-        let success = tokio::task::spawn_blocking(move || {
-            let mut config = tracedecay_session_memory::user_config::UserConfig::load();
-            config.pending_upload += delta;
-            if upload_enabled && crate::cloud::flush_pending(config.pending_upload).is_some() {
-                config.pending_upload = 0;
-                config.last_upload_at = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                if let Err(err) = config.save() {
-                    tracing::warn!(error = %err, "could not save upload config");
+        let server = Arc::clone(self);
+        self.spawn_observed_ledger_write(async move {
+            let upload_enabled = match server.canonical_upload_enabled().await {
+                Ok(enabled) => enabled,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "worldwide counter upload skipped because configuration authority is unavailable"
+                    );
+                    return;
                 }
-                return true;
+            };
+            let saved = tokio::task::spawn_blocking(move || {
+                persist_worldwide_delta(delta, upload_enabled)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "worldwide counter flush task failed");
+                false
+            });
+            if saved
+                && let Some(last_flushed_tokens) = server.last_flushed_tokens.as_ref()
+            {
+                last_flushed_tokens.store(current, Ordering::Release);
             }
-            if let Err(err) = config.save() {
-                tracing::warn!(error = %err, "could not save upload config");
-            }
-            false
-        })
-        .await
-        .unwrap_or(false);
-
-        if success {
-            last_flushed_tokens.store(current, Ordering::Relaxed);
-        }
+        });
     }
 
+    #[hotpath::measure(label = "mcp.ledger.record_error_analytics")]
     pub(crate) fn record_mcp_tool_error_analytics(
         &self,
         request: McpToolErrorAnalyticsRequest<'_>,
@@ -382,6 +378,7 @@ impl McpServer {
     /// [`HostAdmissionOutcome`]. The durable admission sequence is carried as
     /// the event idempotency identity, so identical but distinct admissions
     /// remain distinct analytics rows.
+    #[hotpath::measure(label = "mcp.ledger.record_route_analytics")]
     pub(crate) fn record_hook_route_analytics(
         &self,
         project_root: &std::path::Path,
@@ -428,6 +425,7 @@ impl McpServer {
     /// [`DEFAULT_SPAN_OBSERVATION_DEBOUNCE_SECS`](tracedecay_sessions::runtime::git_correlation::DEFAULT_SPAN_OBSERVATION_DEBOUNCE_SECS)
     /// (spans merge regardless, so a dropped observation only widens a span
     /// slightly less).
+    #[hotpath::measure(label = "mcp.ledger.record_span_observation")]
     pub(crate) fn record_hook_span_observation(
         self: &Arc<Self>,
         event: &hook_events::HookEvent,
@@ -564,8 +562,35 @@ impl McpServer {
     }
 }
 
+fn persist_worldwide_delta(delta: u64, upload_enabled: bool) -> bool {
+    let mut config = tracedecay_session_memory::user_config::UserConfig::load();
+    config.pending_upload = config.pending_upload.saturating_add(delta);
+    if upload_enabled && crate::cloud::flush_pending(config.pending_upload).is_some() {
+        config.pending_upload = 0;
+        config.last_upload_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+    }
+    match config.save() {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(error = %error, "could not save upload config");
+            false
+        }
+    }
+}
+
+fn claim_worldwide_flush(last_flush_at: &AtomicI64, expected: i64, now: i64) -> bool {
+    last_flush_at
+        .compare_exchange(expected, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use tracedecay_domain::configuration::{
         ConfigurationSnapshotV1, ConfigurationValueV1, SettingKey, USER_UPLOAD_ENABLED_SETTING_KEY,
     };
@@ -620,5 +645,103 @@ mod tests {
             Err(TraceDecayError::Config { message })
                 if message.starts_with("configuration authority unavailable")
         ));
+    }
+
+    #[test]
+    fn concurrent_boundary_calls_claim_exactly_one_worldwide_flush() {
+        let last_flush_at = Arc::new(AtomicI64::new(10));
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let claimed = Arc::new(AtomicU64::new(0));
+        let workers = (0..16)
+            .map(|_| {
+                let last_flush_at = Arc::clone(&last_flush_at);
+                let barrier = Arc::clone(&barrier);
+                let claimed = Arc::clone(&claimed);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    if claim_worldwide_flush(&last_flush_at, 10, 40) {
+                        claimed.fetch_add(1, Ordering::AcqRel);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("flush claimant");
+        }
+
+        assert_eq!(claimed.load(Ordering::Acquire), 1);
+        assert_eq!(last_flush_at.load(Ordering::Acquire), 40);
+    }
+
+    #[test]
+    fn disabled_upload_records_each_delta_once_after_durable_save() {
+        let _profile = crate::config::PinnedUserDataDir::new();
+        let mut config = tracedecay_session_memory::user_config::UserConfig::load();
+        config.pending_upload = 0;
+        config.save().expect("initialize isolated user config");
+        let current = 37_u64;
+        let last_flushed = AtomicU64::new(0);
+
+        for _ in 0..2 {
+            let previous = last_flushed.load(Ordering::Acquire);
+            if current > previous {
+                let saved = persist_worldwide_delta(current - previous, false);
+                if saved {
+                    last_flushed.store(current, Ordering::Release);
+                }
+            }
+        }
+
+        let persisted = tracedecay_session_memory::user_config::UserConfig::load();
+        assert_eq!(persisted.pending_upload, current);
+        assert_eq!(last_flushed.load(Ordering::Acquire), current);
+    }
+
+    #[tokio::test]
+    async fn concurrent_response_boundary_admits_one_observed_background_flush() {
+        let (cg, _project, _pin) = super::super::writer_test_support::init_indexed_repo().await;
+        let database = tracedecay_global_db::tests::harness::RegisteredGlobalDbHarness::open(
+            "ledger-worldwide-single-flight",
+        )
+        .await;
+        let context = super::super::McpServerConstructionContext::direct(cg, None)
+            .with_direct_databases(Some(database.registered.clone()), None, None, None);
+        let server = super::super::McpServer::new_with_context(context).await;
+        let tokens_saved = server.tokens_saved.as_ref().expect("fixture token counter");
+        let last_flushed = server
+            .last_flushed_tokens
+            .as_ref()
+            .expect("fixture flushed counter");
+        let baseline = last_flushed.load(Ordering::Acquire);
+        tokens_saved.store(baseline + 41, Ordering::Release);
+        server.last_flush_at.store(0, Ordering::Release);
+        let started_before = server.ledger_writes_started.load(Ordering::SeqCst);
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let callers = (0..16)
+            .map(|_| {
+                let server = Arc::clone(&server);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    server.maybe_flush_worldwide();
+                })
+            })
+            .collect::<Vec<_>>();
+        for caller in callers {
+            caller.await.expect("boundary caller");
+        }
+
+        assert_eq!(
+            server.ledger_writes_started.load(Ordering::SeqCst),
+            started_before + 1,
+            "concurrent completed responses must admit exactly one flush owner"
+        );
+        server.ledger_writes_settled().await;
+        assert_eq!(
+            last_flushed.load(Ordering::Acquire),
+            baseline + 41,
+            "shutdown-observed settlement must advance durable token accounting"
+        );
+        server.shutdown_background_tasks().await;
     }
 }

@@ -6,6 +6,7 @@
 
 use rusqlite::{OptionalExtension, params};
 use tracedecay_domain::{ObservationSourceCursorV1, RetrievalAnchorRecordV2};
+use tracedecay_store::observation::ObservationProvenanceDispositionV1;
 use tracedecay_store::{
     AnchoredObservationWrite, ObservationCursorAdvance, RepositoryProvenanceAttachmentV1,
 };
@@ -14,6 +15,7 @@ use super::super::support::{decode, encode, invalid};
 use super::cursor_authority::{
     READ_CURSOR_ADVANCE_SQL, READ_SOURCE_CURSOR_SQL, cursor_advance_ledger_row_matches,
 };
+use super::rows::{OBSERVATION_ROW_PROJECTION, decode_observation_row, encoded_observation_row};
 
 pub(super) fn persist_sanitization_receipt(
     connection: &rusqlite::Connection,
@@ -230,7 +232,25 @@ pub(super) fn verify_observation_authority(
     }
     verify_retrieval_anchor(connection, write.retrieval_anchor())?;
 
-    let attachment = write.repository_provenance_attachment();
+    // The executor has already verified the exact observation and receipt, and
+    // the stable observation anchor was checked above. Fresh admission retains
+    // the first attachment, but still validates its complete persisted binding
+    // and anchor authority rather than accepting or repairing corrupt evidence.
+    let retained_attachment;
+    let attachment = match write.provenance_disposition() {
+        ObservationProvenanceDispositionV1::RequireExact => {
+            write.repository_provenance_attachment()
+        }
+        ObservationProvenanceDispositionV1::RetainCommittedOnReplay => {
+            let row = connection.query_row(
+                &format!("{OBSERVATION_ROW_PROJECTION} WHERE observation.observation_id = ?1"),
+                [observation_id],
+                encoded_observation_row,
+            )?;
+            retained_attachment = decode_observation_row(row)?.repository_provenance;
+            &retained_attachment
+        }
+    };
     let stored = connection
         .query_row(
             "SELECT availability_json, capture_json, retrieval_anchor_id, owner_json

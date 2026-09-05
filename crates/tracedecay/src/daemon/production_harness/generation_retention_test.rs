@@ -10,9 +10,10 @@ use tracedecay_application::doctor::{
 };
 use tracedecay_domain::{
     AdmittedEmbeddingProjectionKeyV1, ChangedCodeChunkSetV1, ChangedCodeChunkV1, ChunkerRevision,
-    CodeGenerationId, CodeSearchChunkId, ContentDigest, EmbeddingDeviceClassV1, EmbeddingMetricV1,
-    EmbeddingNormalizationV1, EmbeddingPoolingV1, EmbeddingPrecisionV1, EmbeddingProjectionKeyV1,
-    EmbeddingTruncationSideV1, PrivacyDomainId, ProjectionBatchRequestV1, ProjectionReplayReasonV1,
+    CodeGenerationId, CodeSearchChunkId, ContentDigest, EmbeddingDeviceClassV1,
+    EmbeddingDocumentCompositionV1, EmbeddingMetricV1, EmbeddingNormalizationV1,
+    EmbeddingPoolingV1, EmbeddingPrecisionV1, EmbeddingProjectionKeyV1, EmbeddingTruncationSideV1,
+    PrivacyDomainId, ProjectionBatchRequestV1, ProjectionReplayReasonV1,
 };
 use tracedecay_graph_db::NeverCancelled;
 use tracedecay_semantic::projector::{PreparedVectorGenerationV1, ProjectedChunkVectorV1};
@@ -23,7 +24,8 @@ use tracedecay_semantic_contracts::{
 use super::journey_test_support::git;
 use super::*;
 use tracedecay_code_index_retention::code_index_generations::{
-    DEFAULT_SUPERSEDED_GENERATION_FLOOR, prepare_next_code_generation_retention_cancellable,
+    DEFAULT_SUPERSEDED_GENERATION_FLOOR, MAX_DURABLE_GENERATION_INDEX_ENTRIES_V1,
+    prepare_next_code_generation_retention_cancellable,
 };
 use tracedecay_usecases::semantic_runtime::{
     ProjectSemanticActivationExt, project_semantic_retained_vector_generations,
@@ -72,6 +74,7 @@ fn admitted_embedding() -> AdmittedEmbeddingProjectionKeyV1 {
         config_digest: digest('3'),
         query_instruction_digest: None,
         document_instruction_digest: None,
+        document_composition: EmbeddingDocumentCompositionV1::SanitizedText,
         pooling: EmbeddingPoolingV1::Mean,
         truncation_side: EmbeddingTruncationSideV1::Right,
         truncation_length: 512,
@@ -298,8 +301,11 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
             .expect("published activation generation");
     drop(retained);
 
+    // Pointer-addressable history is live even with a zero superseded floor.
+    // Publish one more generation than that history can hold so the first source
+    // is evicted by the canonical count bound, leaving only its vector lease pin.
     let mut latest = first_source.clone();
-    for revision in 1..=4 {
+    for revision in 1..=MAX_DURABLE_GENERATION_INDEX_ENTRIES_V1 {
         latest = publish_code_edit(schedulers, &canonical_root, &latest, revision).await;
     }
     let newer_vector_generation =
@@ -323,7 +329,21 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
         .collectable_generations
         .iter()
         .find(|generation| generation.generation_id == first_source)
-        .expect("vector source is old enough to collect");
+        .unwrap_or_else(|| {
+            panic!(
+                "vector source is old enough to collect: first_source={first_source} \
+                 active={:?} collectable={:?} superseded={:?}",
+                plan.active_generation_id,
+                plan.collectable_generations
+                    .iter()
+                    .map(|generation| generation.generation_id.as_str())
+                    .collect::<Vec<_>>(),
+                plan.superseded_generations
+                    .iter()
+                    .map(|generation| generation.generation_id.as_str())
+                    .collect::<Vec<_>>(),
+            )
+        });
     let first_source_file = code_store_root
         .join("code-generations-v1")
         .join(&first_candidate.generation_file);
@@ -535,6 +555,7 @@ async fn set_semantic_disabled(harness: &ProductionProjectCompositionHarnessV1, 
                 active_profile: None,
                 rollback_profile: None,
                 resources: SemanticResourceCeilings::default(),
+                document_composition: EmbeddingDocumentCompositionV1::SanitizedText,
             })
             .expect("disabled semantic runtime JSON"),
         ),
@@ -636,10 +657,20 @@ async fn linked_worktree_scope_retention_crash_replay_and_pure_inventory_journey
         selection, set_semantic_profile, wait_for_semantic_generation,
     };
 
-    let fixture_root = std::env::var_os("TRACEDECAY_DISTRIBUTION_FASTEMBED_FIXTURE")
+    // Same byte-pinned FastEmbed prerequisite as the semantic activation
+    // journey: skip explicitly rather than fail a lane that has no way to
+    // supply it.
+    let Some(fixture_root) = std::env::var_os("TRACEDECAY_DISTRIBUTION_FASTEMBED_FIXTURE")
         .map(std::path::PathBuf::from)
         .filter(|path| path.is_dir())
-        .expect("linked-worktree retention journey requires the distribution FastEmbed fixture");
+    else {
+        eprintln!(
+            "skipping the linked-worktree retention journey; prepare the \
+             distribution-acceptance package and set \
+             TRACEDECAY_DISTRIBUTION_FASTEMBED_FIXTURE"
+        );
+        return;
+    };
     let _profile = crate::config::PinnedUserDataDir::new();
     let lifecycle_root =
         tracedecay_semantic::default_lifecycle_root().expect("isolated lifecycle root");

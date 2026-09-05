@@ -78,6 +78,10 @@ fn completed_lexical_search() -> crate::mcp::server::CodeIndexSearchOutcomeV1 {
             coverage: crate::mcp::server::CodeIndexSearchCoverageV1::fused(&semantic),
             semantic,
             next_cursor: None,
+            lexical_routes: tracedecay_query::retrieval::lexical::LexicalRouteReceiptV1 {
+                routes: vec![tracedecay_query::retrieval::lexical::LexicalRouteKindV1::Query],
+                matches_by_anchor: BTreeMap::new(),
+            },
         },
     )
 }
@@ -472,7 +476,7 @@ fn stale_lexical_search() -> crate::mcp::server::CodeIndexSearchOutcomeV1 {
             );
             crate::mcp::server::CodeIndexSearchOutcomeV1::Complete(complete)
         }
-        other => other,
+        other @ crate::mcp::server::CodeIndexSearchOutcomeV1::Unavailable(_) => other,
     }
 }
 

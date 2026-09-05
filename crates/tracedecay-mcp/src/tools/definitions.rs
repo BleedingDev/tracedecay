@@ -50,6 +50,7 @@ use edit::*;
 use git::*;
 use github_stack::*;
 use graph::*;
+pub use graph::{SEARCH_MAX_LEXICAL_ANCHOR_BYTES, SEARCH_MAX_LEXICAL_ANCHORS};
 use lcm::*;
 use memory::*;
 use multi_root::*;
@@ -320,21 +321,26 @@ pub fn get_tool_definitions_with_warming_budget(
     Ok(defs)
 }
 
+/// The `tracedecay_context` description while the project graph is still warming.
+pub fn context_warming_description(budget: u8) -> String {
+    format!(
+        "Build an AI-ready context for a task description. Returns relevant symbols, \
+         relationships, up to three untracked project memory matches when available, \
+         and optionally code snippets.\n\n\
+         CALL BUDGET (applies to tracedecay_context ONLY): {budget} calls maximum while \
+         this project graph is warming. The narrow follow-up tools — tracedecay_search, \
+         tracedecay_grep, tracedecay_callers, tracedecay_callees, tracedecay_body, \
+         tracedecay_read, tracedecay_outline — are cheap and UNBUDGETED; call them freely. \
+         When the context budget is spent, keep going with those narrow tracedecay tools \
+         to drill in; do NOT fall back to native grep/glob/file reads. Only re-run \
+         tracedecay_context if you genuinely need another broad semantic sweep."
+    )
+}
+
 pub fn apply_context_warming_budget(defs: &mut [ToolDefinition], budget: u8) {
     for def in defs {
         if def.name == "tracedecay_context" {
-            def.description = format!(
-                "Build an AI-ready context for a task description. Returns relevant symbols, \
-                 relationships, up to three untracked project memory matches when available, \
-                 and optionally code snippets.\n\n\
-                 CALL BUDGET (applies to tracedecay_context ONLY): {budget} calls maximum while \
-                 this project graph is warming. The narrow follow-up tools — tracedecay_search, \
-                 tracedecay_grep, tracedecay_callers, tracedecay_callees, tracedecay_body, \
-                 tracedecay_read, tracedecay_outline — are cheap and UNBUDGETED; call them freely. \
-                 When the context budget is spent, keep going with those narrow tracedecay tools \
-                 to drill in; do NOT fall back to native grep/glob/file reads. Only re-run \
-                 tracedecay_context if you genuinely need another broad semantic sweep."
-            );
+            def.description = context_warming_description(budget);
         }
     }
 }
@@ -533,6 +539,7 @@ fn build_maximal_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogErr
         def_fact_store_get(request_schema("fact_store_get")?),
         def_fact_store_update(request_schema("fact_store_update")?),
         def_fact_store_remove(request_schema("fact_store_remove")?),
+        def_fact_store_supersede(request_schema("fact_store_supersede")?),
         def_fact_store_list(request_schema("fact_store_list")?),
         def_fact_feedback(request_schema("fact_feedback")?),
         def_memory_status(request_schema("memory_status")?),
@@ -855,6 +862,7 @@ const FORMAT_CAPABLE_TOOL_NAMES: &[&str] = &[
     "tracedecay_fact_store_get",
     "tracedecay_fact_store_update",
     "tracedecay_fact_store_remove",
+    "tracedecay_fact_store_supersede",
     "tracedecay_fact_store_list",
     "tracedecay_fact_feedback",
     // workflow
@@ -922,6 +930,7 @@ pub fn tool_defaults_to_markdown(tool_name: &str) -> bool {
             | "tracedecay_fact_store_get"
             | "tracedecay_fact_store_update"
             | "tracedecay_fact_store_remove"
+            | "tracedecay_fact_store_supersede"
             | "tracedecay_fact_store_list"
             | "tracedecay_files"
             | "tracedecay_read"

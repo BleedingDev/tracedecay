@@ -51,25 +51,24 @@ impl DaemonConfigurationGrantAuthority {
     pub fn for_test(
         layers: impl IntoIterator<Item = ConfigurationLayerIdV1>,
         expires_at: UtcMicros,
-    ) -> Self {
-        Self {
-            actor: ActorId::new("actor.configuration.test").expect("actor"),
+    ) -> Option<Self> {
+        Some(Self {
+            actor: ActorId::new("actor.configuration.test").ok()?,
             policy_epoch: 1,
-            policy_digest: AccessPolicyDigest::new(format!("sha256:{}", "a".repeat(64)))
-                .expect("policy"),
+            policy_digest: AccessPolicyDigest::new(format!("sha256:{}", "a".repeat(64))).ok()?,
             expires_at,
             direct_layers: Arc::new(
                 layers
                     .into_iter()
                     .map(|layer| {
-                        let digest =
-                            configuration_layer_scope_digest(&layer).expect("layer digest");
-                        (digest, layer)
+                        configuration_layer_scope_digest(&layer)
+                            .ok()
+                            .map(|digest| (digest, layer))
                     })
-                    .collect(),
+                    .collect::<Option<BTreeMap<_, _>>>()?,
             ),
             grants: Arc::new(RwLock::new(BTreeMap::new())),
-        }
+        })
     }
 
     pub(super) fn issue(
@@ -256,6 +255,8 @@ pub enum DaemonFeedbackRuntimeRegistrationError {
     AlreadyRegistered,
     #[error("the daemon project runtime registry is closed")]
     RegistryClosed,
+    #[error("a concurrent feedback runtime build failed: {detail}")]
+    ConcurrentBuildFailed { detail: String },
     #[error("the shared feedback runtime is not mounted for this project")]
     MissingRuntime,
     #[error("the switchable feedback-cycle route could not be published")]
@@ -277,6 +278,9 @@ impl From<FeedbackCyclePublicationError> for DaemonFeedbackRuntimeRegistrationEr
             FeedbackCyclePublicationError::Registry(ProjectRuntimeRegistryError::Closed) => {
                 Self::RegistryClosed
             }
+            FeedbackCyclePublicationError::Registry(
+                ProjectRuntimeRegistryError::ConcurrentBuildFailed { detail },
+            ) => Self::ConcurrentBuildFailed { detail },
             FeedbackCyclePublicationError::RouterUnavailable => Self::CyclePublication,
         }
     }
@@ -288,7 +292,7 @@ impl From<ProjectRuntimeAlreadyRegistered> for DaemonFeedbackRuntimeRegistration
     }
 }
 
-/// Maps the registry's two refusals into one per-runtime registration enum.
+/// Maps registry refusals into one per-runtime registration enum.
 /// Callers match on the per-runtime variants (and each carries its own error
 /// message), so the enums keep their own `AlreadyRegistered`/`RegistryClosed`
 /// shapes and only this mapping is shared.
@@ -296,16 +300,25 @@ pub(super) fn registry_registration_refusal<E>(
     error: ProjectRuntimeRegistryError,
     already_registered: E,
     registry_closed: E,
+    concurrent_build_failed: impl FnOnce(String) -> E,
 ) -> E {
     match error {
         ProjectRuntimeRegistryError::AlreadyRegistered => already_registered,
         ProjectRuntimeRegistryError::Closed => registry_closed,
+        ProjectRuntimeRegistryError::ConcurrentBuildFailed { detail } => {
+            concurrent_build_failed(detail)
+        }
     }
 }
 
 impl From<ProjectRuntimeRegistryError> for DaemonFeedbackRuntimeRegistrationError {
     fn from(error: ProjectRuntimeRegistryError) -> Self {
-        registry_registration_refusal(error, Self::AlreadyRegistered, Self::RegistryClosed)
+        registry_registration_refusal(
+            error,
+            Self::AlreadyRegistered,
+            Self::RegistryClosed,
+            |detail| Self::ConcurrentBuildFailed { detail },
+        )
     }
 }
 
@@ -318,6 +331,9 @@ impl From<ProjectRuntimeRegistryError> for TraceDecayError {
                 }
                 ProjectRuntimeRegistryError::Closed => {
                     "the daemon project runtime registry is closed".to_owned()
+                }
+                ProjectRuntimeRegistryError::ConcurrentBuildFailed { detail } => {
+                    format!("a concurrent project runtime component build failed: {detail}")
                 }
             },
         }
@@ -343,23 +359,22 @@ impl DaemonFeedbackPublicationTestGate {
     }
 
     #[hotpath::skip]
-    async fn wait(&self) {
-        self.publication_ready
+    async fn wait(&self) -> bool {
+        let Some(publication_ready) = self
+            .publication_ready
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
-            .expect("publication-ready sender")
-            .send(())
-            .expect("publication-ready receiver");
-        let continue_publication = self
-            .continue_publication
-            .lock()
-            .await
-            .take()
-            .expect("continue-publication receiver");
-        continue_publication
-            .await
-            .expect("continue-publication sender");
+        else {
+            return false;
+        };
+        if publication_ready.send(()).is_err() {
+            return false;
+        }
+        let Some(continue_publication) = self.continue_publication.lock().await.take() else {
+            return false;
+        };
+        continue_publication.await.is_ok()
     }
 }
 
@@ -384,6 +399,7 @@ impl DaemonFeedbackRuntimeRegistrar {
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
     pub fn with_publication_gate(mut self, gate: Arc<DaemonFeedbackPublicationTestGate>) -> Self {
         self.publication_gate = Some(gate);
         self
@@ -430,8 +446,8 @@ impl DaemonFeedbackRuntimeRegistrar {
                     runtime.source_observation_port(),
                 ));
                 publication.stage(RegisteredCallableCodeRuntime {
-                    authorization,
                     scope,
+                    authorization,
                 })?;
                 publication.stage(RegisteredFeedbackRuntime {
                     project_id,
@@ -441,8 +457,10 @@ impl DaemonFeedbackRuntimeRegistrar {
                     unavailable_cycle,
                 )))?;
                 #[cfg(any(test, feature = "test-helpers"))]
-                if let Some(gate) = publication_gate {
-                    gate.wait().await;
+                if let Some(gate) = publication_gate
+                    && !gate.wait().await
+                {
+                    return Err(DaemonFeedbackRuntimeRegistrationError::CyclePublication);
                 }
                 Ok((publication, publications))
             })
@@ -542,6 +560,8 @@ pub enum DaemonAdvisoryRuntimeRegistrationError {
     AlreadyRegistered,
     #[error("the daemon project runtime registry is closed")]
     RegistryClosed,
+    #[error("a concurrent advisory runtime build failed: {detail}")]
+    ConcurrentBuildFailed { detail: String },
     #[error("the shared feedback cycle must be registered before advisory")]
     MissingFeedbackRuntime,
     #[error("the advisory production authorities could not be opened")]
@@ -561,7 +581,12 @@ impl From<FeedbackCyclePublicationError> for DaemonAdvisoryRuntimeRegistrationEr
 
 impl From<ProjectRuntimeRegistryError> for DaemonAdvisoryRuntimeRegistrationError {
     fn from(error: ProjectRuntimeRegistryError) -> Self {
-        registry_registration_refusal(error, Self::AlreadyRegistered, Self::RegistryClosed)
+        registry_registration_refusal(
+            error,
+            Self::AlreadyRegistered,
+            Self::RegistryClosed,
+            |detail| Self::ConcurrentBuildFailed { detail },
+        )
     }
 }
 
@@ -858,8 +883,13 @@ impl DaemonConfigurationRuntimeRegistrar {
                     actor: grants.actor.clone(),
                     grants,
                     semantic_operation: Arc::new(OnceLock::new()),
+                    semantic_activation_committed: Arc::new(Notify::new()),
                     semantic_evaluation_workers: Arc::new(
-                        tracedecay_code_index_runtime::semantic_evaluation::DaemonSemanticEvaluationWorkerOwnerV1::default(),
+                        tracedecay_code_index_runtime::semantic_evaluation::DaemonSemanticEvaluationWorkerOwnerV1::with_scheduler_admission(
+                            self.service
+                                .code_index_schedulers
+                                .semantic_evaluation_admission(),
+                        ),
                     ),
                 },
             )
@@ -892,19 +922,63 @@ impl DaemonConfigurationRuntimeRegistrar {
     }
 
     #[hotpath::skip]
-    pub async fn install_semantic_activation_reconciler(
+    pub async fn install_semantic_activation_owner(
         &self,
         project_root: &Path,
-        reconciler: Arc<
-            tracedecay_code_index_runtime::semantic_activation_reconciler::DaemonSemanticActivationReconcilerV1,
+        coordinator: Arc<
+            tracedecay_usecases::semantic_runtime::ProductionSemanticActivationCoordinatorV1,
         >,
-    ) -> Result<(), TraceDecayError> {
+        lifecycle_events: tokio::sync::watch::Receiver<
+            tracedecay_semantic_contracts::SemanticLifecycleVerifiedReadyEventV1,
+        >,
+    ) -> Result<
+        Arc<tracedecay_usecases::semantic_runtime::ProductionSemanticActivationCoordinatorV1>,
+        TraceDecayError,
+    > {
+        let committed_activation_wake = self
+            .service
+            .project_runtimes
+            .read::<RegisteredConfigurationRuntime, _, _>(project_root, |registered| {
+                Arc::clone(&registered.semantic_activation_committed)
+            })
+            .await
+            .ok_or_else(|| TraceDecayError::Config {
+                message:
+                    "semantic activation reconciler requires a registered configuration runtime"
+                        .to_owned(),
+            })?;
+        let project_root = project_root.to_path_buf();
         self.service
             .project_runtimes
-            .register(project_root.to_path_buf(), reconciler)
+            .register_or_reconcile::<RegisteredSemanticActivationOwnerV1, TraceDecayError, _, _, _>(
+                project_root.clone(),
+                |_incumbent| Ok(()),
+                move || async move {
+                    let reconciler = Arc::new(
+                        tracedecay_code_index_runtime::semantic_activation_reconciler::DaemonSemanticActivationReconcilerV1::spawn(
+                            Arc::clone(&coordinator),
+                            lifecycle_events,
+                            committed_activation_wake,
+                        ),
+                    );
+                    Ok(RegisteredSemanticActivationOwnerV1 {
+                        coordinator,
+                        reconciler,
+                    })
+                },
+            )
             .await
-            .map_err(|_| TraceDecayError::Config {
-                message: "semantic activation reconciler is already registered".to_owned(),
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("semantic activation owner registration failed: {error}"),
+            })?;
+        self.service
+            .project_runtimes
+            .read::<RegisteredSemanticActivationOwnerV1, _, _>(&project_root, |registered| {
+                Arc::clone(&registered.coordinator)
+            })
+            .await
+            .ok_or_else(|| TraceDecayError::Config {
+                message: "semantic activation owner disappeared after registration".to_owned(),
             })
     }
 }
@@ -997,7 +1071,9 @@ impl DaemonWorkRuntimeRegistrar {
                                 .to_owned(),
                     })
                 },
-                || {
+                || async {
+                    let durable_write_signal =
+                        super::types::WorkDurableWriteSignalV1::default();
                     let mut registered = RegisteredWorkRuntime {
                         database: database.clone(),
                         actor: actor.clone(),
@@ -1008,12 +1084,14 @@ impl DaemonWorkRuntimeRegistrar {
                         work_topology_policy: work_topology_policy.clone(),
                         proposal_routing: proposal_routing.clone(),
                         evidence_retrieval: evidence_retrieval.clone(),
+                        durable_write_signal: durable_write_signal.clone(),
                         blocked_interval_observation_recovery:
                             super::work_blocked_interval_recovery::WorkBlockedIntervalObservationRecoveryOwnerV1::mount(
                                 database.clone(),
                                 actor.clone(),
                                 grant.clone(),
                                 Arc::clone(&observability_producer),
+                                durable_write_signal.subscribe(),
                             )
                             .map_err(|error| TraceDecayError::Config {
                                 message: format!(
@@ -1025,6 +1103,7 @@ impl DaemonWorkRuntimeRegistrar {
                                 database.clone(),
                                 grant.scope.project_id.clone(),
                                 Arc::clone(&observability_producer),
+                                durable_write_signal.subscribe(),
                             )
                             .map_err(|error| TraceDecayError::Config {
                                 message: format!(
@@ -1127,7 +1206,7 @@ impl DaemonRetainedRuntimeRegistrar {
                         })
                     }
                 },
-                || {
+                || async {
                     Ok(RegisteredRetainedRuntime {
                         scope: scope.clone(),
                         actor: actor.clone(),

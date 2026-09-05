@@ -57,7 +57,29 @@ struct GraphDbLeaseToken {
 
 impl Drop for GraphDbLeaseToken {
     fn drop(&mut self) {
-        self.source.state.lock().leases.remove(&self.lease_id);
+        let (hibernate, close) = {
+            let mut state = self.source.state.lock();
+            state.leases.remove(&self.lease_id);
+            let idle =
+                state.leases.is_empty() && matches!(state.lifecycle, GraphDbOwnerLifecycle::Ready);
+            (
+                idle && state.owner_attachment.is_some(),
+                idle && state.owner_attachment.is_none() && Arc::strong_count(&self.source) == 1,
+            )
+        };
+        if hibernate {
+            if let Err(error) = self.source.database.hibernate_if_lazy() {
+                tracing::warn!(
+                    %error,
+                    "lazy graph engine could not hibernate after its final operation lease"
+                );
+            }
+        } else if close && let Err(error) = self.source.database.close() {
+            tracing::warn!(
+                %error,
+                "derived graph engine could not close after its final operation lease"
+            );
+        }
     }
 }
 
@@ -431,6 +453,16 @@ impl GraphDbOwner {
     #[must_use]
     pub fn runtime_state(&self) -> GraphDbRuntimeState {
         self.source.database.runtime_state()
+    }
+
+    pub(crate) fn engine_is_open(&self) -> Result<bool, GraphDbError> {
+        self.source
+            .database
+            .inner
+            .database
+            .read()
+            .map(|database| database.is_some())
+            .map_err(|_| GraphDbError::unavailable("graph database read lock is poisoned"))
     }
 
     pub fn close(&self) -> Result<(), GraphDbError> {

@@ -91,10 +91,15 @@ pub fn store_response_handle(
     content: &str,
     now: i64,
 ) -> Result<ResponseHandleRecord> {
+    let root = prepared_response_handle_root(project_root)?;
+    store_response_handle_in_root(&root, content, now)
+}
+
+fn prepared_response_handle_root(project_root: &Path) -> Result<PathBuf> {
     let root = resolve_response_handle_root(project_root)?;
     PrivateStoreIo::create_dir_all_durable(&root)
         .map_err(|error| file_error(&root, "create durable directory", error))?;
-    store_response_handle_in_root(&root, content, now)
+    Ok(root)
 }
 
 fn store_response_handle_in_root(
@@ -120,7 +125,7 @@ fn store_response_handle_locked(
     let payload = serde_json::to_vec_pretty(&stored)?;
 
     let rollback_payload = match retrieve_from_root_locked(root, &handle, now) {
-        Ok(ResponseHandleLookup::Found(existing)) if existing.content == content => {
+        Ok(ResponseHandleLookup::Found(existing)) if existing.content == stored.content => {
             Some(serde_json::to_vec_pretty(&StoredResponseHandleRecord {
                 created_at: existing.created_at,
                 expires_at: existing.expires_at,

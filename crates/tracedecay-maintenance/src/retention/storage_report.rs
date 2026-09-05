@@ -473,43 +473,21 @@ pub async fn build_storage_report_page_from_registered_global_db(
     };
     let profile_root_buf = profile_root.to_path_buf();
     let after_directory_owned = after_directory.to_owned();
-    let (directories, has_more) = tokio::task::spawn_blocking(move || {
+    let directory_page = tokio::task::spawn_blocking(move || {
         list_project_directories_page(&profile_root_buf, &after_directory_owned, limit)
     })
     .await
-    .map_err(|error| report_error("join storage directory page", error))?;
-    // Every directory name on this page lies in `(after_directory, last]`, so
-    // one ranged registry scan replaces up to 64 point existence probes (each
-    // of which takes its own registry snapshot); membership is then decided by
-    // local set difference.
-    let mut registered = HashSet::new();
-    if let Some((last_name, _)) = directories.last() {
-        let mut after = (!after_directory.is_empty()).then(|| after_directory.to_owned());
-        loop {
-            let page = global_db
-                .list_code_projects_after(after.as_deref(), MAX_STORAGE_REPORT_PAGE_LIMIT)
-                .await?;
-            let full_page = page.len() == MAX_STORAGE_REPORT_PAGE_LIMIT;
-            let mut next_after = None;
-            let mut past_range = false;
-            for project in page {
-                if project.project_id.as_str() > last_name.as_str() {
-                    past_range = true;
-                    break;
-                }
-                next_after = Some(project.project_id.clone());
-                registered.insert(project.project_id);
-            }
-            if past_range || !full_page {
-                break;
-            }
-            let Some(next_after) = next_after else {
-                break;
-            };
-            after = Some(next_after);
-        }
-    }
-    let unregistered = directories
+    .map_err(|error| report_error("join storage directory page", error))??;
+    hotpath::gauge!("maintenance.storage_report.directory_entries_scanned_total")
+        .inc(directory_page.entries_scanned as u64);
+    let project_ids = directory_page
+        .directories
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let registered = global_db.registered_code_project_ids(&project_ids).await?;
+    let unregistered = directory_page
+        .directories
         .iter()
         .filter(|(name, _)| !registered.contains(name))
         .map(|(_, path)| path.clone())
@@ -522,13 +500,9 @@ pub async fn build_storage_report_page_from_registered_global_db(
     })
     .await
     .map_err(|error| report_error("join unregistered storage page", error))?;
-    let next_cursor = has_more
-        .then(|| {
-            directories
-                .last()
-                .map(|(name, _)| format!("{DIRECTORY_CURSOR_PREFIX}{name}"))
-        })
-        .flatten();
+    let next_cursor = directory_page
+        .next_cursor
+        .map(|cursor| format!("{DIRECTORY_CURSOR_PREFIX}{cursor}"));
     Ok(StorageReport {
         profile_root: profile_root.display().to_string(),
         unregistered_dir_count,
@@ -542,26 +516,70 @@ pub async fn build_storage_report_page_from_registered_global_db(
     })
 }
 
+#[derive(Debug)]
+struct ProjectDirectoryPage {
+    directories: Vec<(String, PathBuf)>,
+    next_cursor: Option<String>,
+    entries_scanned: usize,
+}
+
+/// Reads one bounded page in the directory stream's native order.
+///
+/// The cursor is opaque: callers must return it unchanged rather than treating
+/// it as a directory name or assuming lexical ordering.
 fn list_project_directories_page(
     profile_root: &Path,
-    after_directory: &str,
+    cursor: &str,
     limit: usize,
-) -> (Vec<(String, std::path::PathBuf)>, bool) {
-    let Ok(entries) = std::fs::read_dir(profile_root.join("projects")) else {
-        return (Vec::new(), false);
+) -> tracedecay_domain::errors::Result<ProjectDirectoryPage> {
+    let projects_dir = profile_root.join("projects");
+    match std::fs::symlink_metadata(&projects_dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProjectDirectoryPage {
+                directories: Vec::new(),
+                next_cursor: None,
+                entries_scanned: 0,
+            });
+        }
+        Err(error) => {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
+                message: format!("inspect storage report projects directory: {error}"),
+            });
+        }
+    }
+    let page = super::orphan_stores::read_project_directory_page(
+        profile_root,
+        (!cursor.is_empty()).then_some(cursor),
+        limit,
+        &|| false,
+    )?;
+    let Some(page) = page else {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
+            message: "storage report directory page was unexpectedly interrupted".to_owned(),
+        });
     };
-    let mut directories = entries
-        .flatten()
-        .filter_map(|entry| {
-            entry.file_type().ok().filter(std::fs::FileType::is_dir)?;
-            let name = entry.file_name().into_string().ok()?;
-            (name.as_str() > after_directory).then(|| (name, entry.path()))
+    let directories = page
+        .entries
+        .into_iter()
+        .map(|entry| match entry {
+            super::orphan_stores::ProjectDirectoryWorkV1::Project(name) => {
+                let path = projects_dir.join(&name);
+                (name, path)
+            }
+            super::orphan_stores::ProjectDirectoryWorkV1::Quarantine {
+                quarantine_name, ..
+            } => {
+                let path = projects_dir.join(&quarantine_name);
+                (quarantine_name, path)
+            }
         })
         .collect::<Vec<_>>();
-    directories.sort_by(|left, right| left.0.cmp(&right.0));
-    let has_more = directories.len() > limit;
-    directories.truncate(limit);
-    (directories, has_more)
+    Ok(ProjectDirectoryPage {
+        directories,
+        next_cursor: page.next_cursor,
+        entries_scanned: page.entries_scanned,
+    })
 }
 
 /// Builds one project-scoped report on the daemon's blocking pool so bounded
@@ -1113,6 +1131,161 @@ mod tests {
         connection
             .execute_batch("CREATE TABLE fixture (id INTEGER PRIMARY KEY);")
             .unwrap();
+    }
+
+    /// A full pass over a directory mutated mid-iteration must miss nothing
+    /// and stay bounded.
+    ///
+    /// Repeat-freedom is deliberately *not* asserted. `read_project_directory_page`
+    /// resumes with `seekdir` on a `telldir` cookie, and its own SAFETY note
+    /// records the contract: a cookie invalidated by a concurrent mutation may
+    /// yield a repeated page. APFS does exactly that, while glibc happens not
+    /// to — so a no-repeats assertion tested the platform, not the contract.
+    /// Deduplicating inside the reader would require carrying every name seen
+    /// so far, which is the unbounded state paging exists to avoid, so the
+    /// tolerance stays in the contract and both consumers absorb it: orphan
+    /// collection re-checks each candidate before acting, and the storage
+    /// report may double-count a directory in one page's estimate.
+    #[test]
+    fn project_directory_pages_cover_every_entry_within_a_bounded_pass() {
+        for page_size in [64, 256] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let profile_root = tmp.path().join("profile");
+            let projects_dir = profile_root.join("projects");
+            let expected = (0..513)
+                .map(|index| format!("proj_{index:04}"))
+                .collect::<BTreeSet<_>>();
+            for name in &expected {
+                std::fs::create_dir_all(projects_dir.join(name)).unwrap();
+            }
+
+            let mut cursor = String::new();
+            let mut observed = BTreeSet::new();
+            let mut entries_scanned = 0usize;
+            let mut returned = 0usize;
+            let mut first_page = true;
+            loop {
+                let page =
+                    list_project_directories_page(&profile_root, &cursor, page_size).unwrap();
+                entries_scanned = entries_scanned.saturating_add(page.entries_scanned);
+                for (name, _) in page.directories {
+                    returned = returned.saturating_add(1);
+                    observed.insert(name);
+                }
+
+                let Some(next_cursor) = page.next_cursor else {
+                    break;
+                };
+                cursor = next_cursor;
+                if first_page {
+                    first_page = false;
+                    std::fs::create_dir_all(projects_dir.join("proj_foreign_added")).unwrap();
+                    std::fs::remove_dir(projects_dir.join("proj_0500")).unwrap();
+                }
+            }
+
+            let expected_without_removed = expected
+                .iter()
+                .filter(|name| name.as_str() != "proj_0500")
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            assert!(
+                observed.is_superset(&expected_without_removed),
+                "page size {page_size} skipped an original directory"
+            );
+            // A replay is permitted, an unbounded one is not: the whole pass
+            // must still cost within a constant factor of the directory.
+            assert!(
+                returned <= (expected.len() + 1).saturating_mul(2),
+                "page size {page_size} returned {returned} entries for {} directories",
+                expected.len()
+            );
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            assert!(
+                entries_scanned <= expected.len() + 1,
+                "page size {page_size} rescanned entries: {entries_scanned}"
+            );
+            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+            assert!(
+                entries_scanned <= (expected.len() + 1).saturating_mul(2),
+                "page size {page_size} rescanned directory or inventory entries: {entries_scanned}"
+            );
+            assert!(
+                entries_scanned >= observed.len(),
+                "entry accounting must cover every returned directory"
+            );
+        }
+    }
+
+    #[test]
+    fn project_directory_page_handles_missing_directory_and_garbage_cursor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profile_root = tmp.path().join("profile");
+
+        let missing = list_project_directories_page(&profile_root, "", 64).unwrap();
+        assert!(missing.directories.is_empty());
+        assert_eq!(missing.next_cursor, None);
+        assert_eq!(missing.entries_scanned, 0);
+
+        std::fs::create_dir_all(profile_root.join("projects").join("proj_a")).unwrap();
+        let restarted = list_project_directories_page(&profile_root, "not-a-cursor", 64).unwrap();
+        assert_eq!(
+            restarted
+                .directories
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["proj_a"]
+        );
+        assert_eq!(restarted.next_cursor, None);
+    }
+
+    #[test]
+    #[ignore = "manual filesystem scaling measurement"]
+    fn project_directory_paging_measurements_are_linear() {
+        for directory_count in [1_000usize, 10_000] {
+            for page_size in [64usize, 256] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let profile_root = tmp.path().join("profile");
+                for index in 0..directory_count {
+                    std::fs::create_dir_all(
+                        profile_root
+                            .join("projects")
+                            .join(format!("proj_{index:05}")),
+                    )
+                    .unwrap();
+                }
+
+                let started = std::time::Instant::now();
+                let mut cursor = String::new();
+                let mut entries_scanned = 0usize;
+                let mut observed = 0usize;
+                loop {
+                    let page =
+                        list_project_directories_page(&profile_root, &cursor, page_size).unwrap();
+                    entries_scanned = entries_scanned.saturating_add(page.entries_scanned);
+                    observed = observed.saturating_add(page.directories.len());
+                    let Some(next_cursor) = page.next_cursor else {
+                        break;
+                    };
+                    cursor = next_cursor;
+                }
+                let elapsed = started.elapsed();
+
+                assert_eq!(observed, directory_count);
+                #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
+                assert_eq!(entries_scanned, directory_count);
+                #[cfg(not(any(
+                    all(target_os = "linux", target_env = "gnu"),
+                    target_os = "macos"
+                )))]
+                assert_eq!(entries_scanned, directory_count.saturating_mul(2));
+                eprintln!(
+                    "directories={directory_count} page_size={page_size} \
+                     entries_scanned={entries_scanned} elapsed={elapsed:?}"
+                );
+            }
+        }
     }
 
     fn profile_tree_bytes(root: &Path) -> u64 {

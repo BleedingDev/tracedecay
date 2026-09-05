@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use tracedecay_code_index::embedding_document::{EmbeddingDocumentComposerV1, EmbeddingDocumentV1};
 use tracedecay_domain::{
     AdmittedEmbeddingProjectionKeyV1, CodeSearchChunkV1, EmbeddingProjectionKeyV1,
     ProjectionBatchRequestV1,
@@ -12,8 +13,9 @@ use tracedecay_query::retrieval::semantic::{
 };
 use tracedecay_semantic_contracts::SemanticRuntimeScheduleFailureV1;
 
+use super::embedding_backend::{ProductionEmbeddingRuntime, production_embedding_runtime_factory};
 use super::fastembed_adapter::{
-    AdmittedProjectionArtifactV1, FastEmbedEmbeddingRuntime, SemanticExecutionAuthority,
+    AdmittedProjectionArtifactV1, EmbeddingRuntime, SemanticExecutionAuthority,
     SemanticExecutionInterruptionV1,
 };
 use super::projector::{
@@ -22,7 +24,6 @@ use super::projector::{
 use super::runtime_query::{PooledSemanticQueryEmbedder, PooledSemanticQueryEmbedderFactory};
 use super::runtime_service::{
     SemanticRuntimeScheduleCancellationV1, SemanticRuntimeService, SharedEmbeddingRuntimeFactory,
-    fastembed_runtime_factory,
 };
 use super::session_pool::SessionPoolConfigV1;
 use super::{LoadedSemanticArtifactV1, RuntimeChunkVectorEncoderV1};
@@ -75,7 +76,10 @@ struct SemanticEvaluationProjectionBatchCacheKeyV1 {
     group_len: usize,
     tensor_batch_size: u32,
     tensor_dimensions: u32,
-    ordered_sanitized_inputs: Vec<String>,
+    /// The exact composed documents the model would receive, in group order.
+    /// Composition is keyed here as well as in the admitted projection: two
+    /// generations can share chunk text yet differ in symbol context.
+    ordered_documents: Vec<String>,
 }
 
 impl SemanticEvaluationProjectionBatchCacheV1 {
@@ -161,12 +165,12 @@ fn cache_entry_bytes(
     // allocation headers, then add the vector buffers at their actual
     // capacities rather than their logical lengths.
     let input_bytes = key
-        .ordered_sanitized_inputs
+        .ordered_documents
         .iter()
         .try_fold(0_u64, |total, input| {
             total.checked_add(u64::try_from(input.len()).ok()?)
         });
-    let input_headers = u64::try_from(key.ordered_sanitized_inputs.len())
+    let input_headers = u64::try_from(key.ordered_documents.len())
         .ok()
         .and_then(|count| count.checked_mul(u64::try_from(std::mem::size_of::<String>()).ok()?));
     let vector_bytes = vectors.iter().try_fold(0_u64, |total, vector| {
@@ -203,6 +207,7 @@ struct CachedSemanticEvaluationChunkEncoderV1<'a, E> {
     cache: &'a SemanticEvaluationProjectionBatchCacheV1,
     cache_policy: SemanticEvaluationProjectionBatchCachePolicyV1,
     cancellation: Arc<dyn SemanticEvaluationCancellationV1>,
+    documents: Arc<EmbeddingDocumentComposerV1>,
 }
 
 impl<'a, E> CachedSemanticEvaluationChunkEncoderV1<'a, E> {
@@ -212,6 +217,7 @@ impl<'a, E> CachedSemanticEvaluationChunkEncoderV1<'a, E> {
         cache: &'a SemanticEvaluationProjectionBatchCacheV1,
         cache_policy: SemanticEvaluationProjectionBatchCachePolicyV1,
         cancellation: Arc<dyn SemanticEvaluationCancellationV1>,
+        documents: Arc<EmbeddingDocumentComposerV1>,
     ) -> Self {
         Self {
             inner,
@@ -221,6 +227,7 @@ impl<'a, E> CachedSemanticEvaluationChunkEncoderV1<'a, E> {
             cache,
             cache_policy,
             cancellation,
+            documents,
         }
     }
 
@@ -241,18 +248,24 @@ impl<'a, E> CachedSemanticEvaluationChunkEncoderV1<'a, E> {
         &self,
         embedding_key: &EmbeddingProjectionKeyV1,
         chunks: &[&CodeSearchChunkV1],
-    ) -> SemanticEvaluationProjectionBatchCacheKeyV1 {
-        SemanticEvaluationProjectionBatchCacheKeyV1 {
+    ) -> Result<SemanticEvaluationProjectionBatchCacheKeyV1, String> {
+        let ordered_documents = chunks
+            .iter()
+            .map(|chunk| {
+                self.documents
+                    .compose(embedding_key, chunk)
+                    .map(EmbeddingDocumentV1::into_text)
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SemanticEvaluationProjectionBatchCacheKeyV1 {
             admitted_projection: self.admitted_projection.clone(),
             max_threads: self.max_threads,
             group_len: chunks.len(),
             tensor_batch_size: embedding_key.inference_batch_size,
             tensor_dimensions: embedding_key.dimensions,
-            ordered_sanitized_inputs: chunks
-                .iter()
-                .map(|chunk| chunk.sanitized_text.as_str().to_owned())
-                .collect(),
-        }
+            ordered_documents,
+        })
     }
 }
 
@@ -318,7 +331,7 @@ where
             Vec<usize>,
         )>::new();
         for (position, group) in groups.iter().enumerate() {
-            let cache_key = self.exact_key(key, group);
+            let cache_key = self.exact_key(key, group)?;
             if let Some(vectors) = self.cache.lookup(&cache_key) {
                 encoded[position] = Some(vectors);
             } else if let Some(miss_index) = unique_miss_indices.get(&cache_key) {
@@ -395,7 +408,7 @@ pub struct SemanticEvaluationProjectionCancellationV1 {
 
 #[derive(Clone)]
 pub struct SemanticEvaluationQueryFactoryV1 {
-    inner: Arc<PooledSemanticQueryEmbedderFactory<FastEmbedEmbeddingRuntime>>,
+    inner: Arc<PooledSemanticQueryEmbedderFactory<ProductionEmbeddingRuntime>>,
 }
 
 /// Isolated evaluator projection. It reuses the verified production artifact
@@ -409,14 +422,44 @@ pub struct PreparedSemanticEvaluationProjectionV1 {
 /// Process-local resource ceilings for one evaluator projection runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SemanticEvaluationProjectionResourcesV1 {
-    pub max_sessions: usize,
     pub memory_ceiling_bytes: u64,
 }
 
+fn semantic_evaluation_runtime<R>(
+    authority: Arc<AdmittedProjectionArtifactV1>,
+    factory: SharedEmbeddingRuntimeFactory<R>,
+    resources: SemanticEvaluationProjectionResourcesV1,
+) -> Result<Arc<SemanticRuntimeService<R>>, SemanticRuntimeScheduleFailureV1>
+where
+    R: EmbeddingRuntime + Send + Sync + 'static,
+{
+    SemanticRuntimeService::new_owned(
+        authority,
+        factory,
+        SessionPoolConfigV1 {
+            // Qualification is one request-scoped model owner. Projection
+            // groups and genuine queries reuse that one session; inheriting
+            // the serving/indexing fan-out would construct another complete
+            // model for the same ephemeral request.
+            max_sessions: 1,
+            max_queued_waiters: 0,
+            idle_timeout: std::time::Duration::from_mins(5),
+            memory_ceiling_bytes: resources.memory_ceiling_bytes,
+        },
+    )
+    .map_err(|_| SemanticRuntimeScheduleFailureV1::Runtime)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct caller-owned authority of one evaluator projection"
+)]
 pub fn prepare_semantic_evaluation_projection(
     artifact: LoadedSemanticArtifactV1,
+    request_query_factory: Option<&SemanticEvaluationQueryFactoryV1>,
     request: ProjectionBatchRequestV1,
     canonical_chunks: &[Arc<CodeSearchChunkV1>],
+    documents: Arc<EmbeddingDocumentComposerV1>,
     resources: SemanticEvaluationProjectionResourcesV1,
     cache: &SemanticEvaluationProjectionBatchCacheV1,
     cache_policy: SemanticEvaluationProjectionBatchCachePolicyV1,
@@ -425,20 +468,31 @@ pub fn prepare_semantic_evaluation_projection(
     if let Some(interruption) = cancellation.interruption() {
         return Err(schedule_interruption(interruption));
     }
+    if documents.symbols().generation_id() != &request.changes.to_generation {
+        return Err(SemanticRuntimeScheduleFailureV1::Projection);
+    }
     let authority = artifact.into_authority();
-    let factory: SharedEmbeddingRuntimeFactory<FastEmbedEmbeddingRuntime> =
-        fastembed_runtime_factory();
-    let runtime = SemanticRuntimeService::new_owned(
-        Arc::clone(&authority),
-        factory,
-        SessionPoolConfigV1 {
-            max_sessions: resources.max_sessions,
-            max_queued_waiters: 0,
-            idle_timeout: std::time::Duration::from_mins(5),
-            memory_ceiling_bytes: resources.memory_ceiling_bytes,
-        },
-    )
-    .map_err(|_| SemanticRuntimeScheduleFailureV1::Runtime)?;
+    let factory: SharedEmbeddingRuntimeFactory<ProductionEmbeddingRuntime> =
+        production_embedding_runtime_factory();
+    let (runtime, query_factory) = match request_query_factory {
+        Some(query_factory) => {
+            let (_, active_authority, _) = query_factory.inner.runtime().active_snapshot();
+            if active_authority.as_ref() != authority.as_ref() {
+                return Err(SemanticRuntimeScheduleFailureV1::Projection);
+            }
+            (
+                Arc::clone(query_factory.inner.runtime()),
+                query_factory.clone(),
+            )
+        }
+        None => {
+            let runtime = semantic_evaluation_runtime(Arc::clone(&authority), factory, resources)?;
+            let query_factory = SemanticEvaluationQueryFactoryV1::from_runtime(
+                PooledSemanticQueryEmbedderFactory::new(Arc::clone(&runtime)),
+            );
+            (runtime, query_factory)
+        }
+    };
     let progress = Arc::new(SemanticRuntimeScheduleCancellationV1::new_linked(
         request.changes.added_or_changed.len().max(1) as u64,
         Arc::clone(&cancellation),
@@ -447,6 +501,7 @@ pub fn prepare_semantic_evaluation_projection(
         Arc::clone(&runtime),
         progress,
         authority.embedding_execution_plan(),
+        Arc::clone(&documents),
     );
     let mut encoder = CachedSemanticEvaluationChunkEncoderV1::new(
         inner,
@@ -454,6 +509,7 @@ pub fn prepare_semantic_evaluation_projection(
         cache,
         cache_policy,
         cancellation,
+        documents,
     );
     let prepared = prepare_vector_generation(
         authority.projection(),
@@ -463,13 +519,8 @@ pub fn prepare_semantic_evaluation_projection(
     )
     .map_err(|_| SemanticRuntimeScheduleFailureV1::Projection)?;
     drop(encoder);
-    runtime
-        .warm_query_session()
-        .map_err(|_| SemanticRuntimeScheduleFailureV1::Runtime)?;
     Ok(PreparedSemanticEvaluationProjectionV1 {
-        query_factory: SemanticEvaluationQueryFactoryV1::from_runtime(
-            PooledSemanticQueryEmbedderFactory::new(runtime),
-        ),
+        query_factory,
         prepared,
     })
 }
@@ -478,14 +529,16 @@ pub fn prepare_semantic_evaluation_projection(
 /// evaluator projection can be returned or published.
 pub fn measure_semantic_evaluation_projection_cancellation(
     artifact: LoadedSemanticArtifactV1,
+    query_factory: &SemanticEvaluationQueryFactoryV1,
     request: ProjectionBatchRequestV1,
     canonical_chunks: &[Arc<CodeSearchChunkV1>],
-    max_sessions: usize,
-    memory_ceiling_bytes: u64,
+    documents: Arc<EmbeddingDocumentComposerV1>,
     cache: &SemanticEvaluationProjectionBatchCacheV1,
     cancellation: Arc<dyn SemanticEvaluationCancellationV1>,
 ) -> Result<SemanticEvaluationProjectionCancellationV1, SemanticRuntimeScheduleFailureV1> {
-    if request.changes.added_or_changed.is_empty() {
+    if request.changes.added_or_changed.is_empty()
+        || documents.symbols().generation_id() != &request.changes.to_generation
+    {
         return Err(SemanticRuntimeScheduleFailureV1::Projection);
     }
     if let Some(interruption) = cancellation.interruption() {
@@ -493,19 +546,11 @@ pub fn measure_semantic_evaluation_projection_cancellation(
     }
     let chunks_added_or_changed = request.changes.added_or_changed.len() as u64;
     let authority = artifact.into_authority();
-    let factory: SharedEmbeddingRuntimeFactory<FastEmbedEmbeddingRuntime> =
-        fastembed_runtime_factory();
-    let runtime = SemanticRuntimeService::new_owned(
-        Arc::clone(&authority),
-        factory,
-        SessionPoolConfigV1 {
-            max_sessions,
-            max_queued_waiters: 0,
-            idle_timeout: std::time::Duration::from_mins(5),
-            memory_ceiling_bytes,
-        },
-    )
-    .map_err(|_| SemanticRuntimeScheduleFailureV1::Runtime)?;
+    let (_, active_authority, _) = query_factory.inner.runtime().active_snapshot();
+    if active_authority.as_ref() != authority.as_ref() {
+        return Err(SemanticRuntimeScheduleFailureV1::Projection);
+    }
+    let runtime = Arc::clone(query_factory.inner.runtime());
     let progress = Arc::new(SemanticRuntimeScheduleCancellationV1::new_linked(
         request.changes.added_or_changed.len() as u64,
         Arc::clone(&cancellation),
@@ -514,6 +559,7 @@ pub fn measure_semantic_evaluation_projection_cancellation(
         Arc::clone(&runtime),
         Arc::clone(&progress),
         authority.embedding_execution_plan(),
+        Arc::clone(&documents),
     );
     let inner = CancelAfterFirstModelBatchV1 {
         inner,
@@ -525,6 +571,7 @@ pub fn measure_semantic_evaluation_projection_cancellation(
         cache,
         SemanticEvaluationProjectionBatchCachePolicyV1::Bypass,
         cancellation,
+        documents,
     );
     if prepare_vector_generation(
         authority.projection(),
@@ -559,7 +606,7 @@ fn schedule_interruption(
 }
 
 struct CancelAfterFirstModelBatchV1 {
-    inner: RuntimeChunkVectorEncoderV1<FastEmbedEmbeddingRuntime>,
+    inner: RuntimeChunkVectorEncoderV1<ProductionEmbeddingRuntime>,
     progress: Arc<SemanticRuntimeScheduleCancellationV1>,
 }
 
@@ -612,7 +659,7 @@ impl super::projector::CanonicalChunkVectorEncoderV1 for CancelAfterFirstModelBa
 
 impl SemanticEvaluationQueryFactoryV1 {
     pub(super) fn from_runtime(
-        inner: Arc<PooledSemanticQueryEmbedderFactory<FastEmbedEmbeddingRuntime>>,
+        inner: Arc<PooledSemanticQueryEmbedderFactory<ProductionEmbeddingRuntime>>,
     ) -> Self {
         Self { inner }
     }
@@ -641,6 +688,11 @@ impl SemanticEvaluationQueryFactoryV1 {
     pub fn cold_load_micros(&self) -> Option<u64> {
         self.inner.runtime().stats().last_cold_load_micros
     }
+
+    /// Number of model sessions opened by this request-scoped runtime.
+    pub fn model_open_count(&self) -> usize {
+        self.inner.runtime().stats().sessions_opened
+    }
 }
 
 struct QueryExecutionAuthorityV1<'a, C> {
@@ -667,7 +719,7 @@ where
 }
 
 pub struct SemanticEvaluationQueryEmbedderV1<'a> {
-    inner: PooledSemanticQueryEmbedder<'a, FastEmbedEmbeddingRuntime>,
+    inner: PooledSemanticQueryEmbedder<'a, ProductionEmbeddingRuntime>,
 }
 
 impl SemanticQueryEmbeddingPort for SemanticEvaluationQueryEmbedderV1<'_> {
@@ -688,12 +740,21 @@ mod tests {
     };
 
     use sha2::{Digest, Sha256};
+    use tracedecay_code_index::embedding_document::{
+        EmbeddingDocumentComposerV1, EmbeddingSymbolContextIndexV1,
+    };
+    use tracedecay_code_index::lineage::GenerationSymbolIndexV1;
     use tracedecay_domain::{
         BoundedSanitizedText, ChangedCodeChunkSetV1, ChangedCodeChunkV1, ChunkerRevision,
         CodeGenerationId, CodeSearchChunkAnchorV1, CodeSearchChunkGrainV1, CodeSearchChunkId,
-        ContentDigest, FileOccurrenceId, LanguageDescriptorRevision, ManifestDigest,
-        PolicyRevisionId, ProjectionBatchRequestV1, ProjectionReplayReasonV1, SanitizerRevision,
-        SensitivityDecision, SensitivityLevelV1, SourceSpan,
+        ContentDigest, EmbeddingDocumentCompositionV1, EphemeralSanitizedQueryViewV1,
+        FileOccurrenceId, LanguageDescriptorRevision, ManifestDigest, PolicyRevisionId,
+        ProjectionBatchRequestV1, ProjectionReplayReasonV1, QueryDigest, QueryMac,
+        QueryNormalizationRevision, SanitizerRevision, SensitivityDecision, SensitivityLevelV1,
+        SourceSpan,
+    };
+    use tracedecay_query::retrieval::semantic::{
+        SemanticQueryEmbeddingPort, SemanticQueryEmbeddingRequestV1,
     };
     use tracedecay_semantic_contracts::SemanticResourceCeilings;
 
@@ -701,10 +762,22 @@ mod tests {
         CachedSemanticEvaluationChunkEncoderV1, CanonicalChunkVectorEncoderV1, CodeSearchChunkV1,
         EmbeddingProjectionKeyV1, SemanticEvaluationCancellationV1,
         SemanticEvaluationProjectionBatchCachePolicyV1, SemanticEvaluationProjectionBatchCacheV1,
-        SemanticExecutionAuthority, SemanticExecutionInterruptionV1, prepare_vector_generation,
+        SemanticEvaluationProjectionResourcesV1, SemanticExecutionAuthority,
+        SemanticExecutionInterruptionV1, prepare_vector_generation, semantic_evaluation_runtime,
     };
     use crate::AdmittedProjectionArtifactV1;
-    use crate::model_catalog::{CatalogMemberPinV1, CatalogSourceV1, CatalogedFastEmbedModelV1};
+    use crate::RuntimeChunkVectorEncoderV1;
+    use crate::embedding_parallelism::{
+        EmbeddingExecutionPlanV1, EmbeddingSessionLimitingReasonV1,
+    };
+    use crate::fastembed_adapter::{FakeEmbeddingRuntime, ManualCancellation};
+    use crate::model_catalog::{
+        CatalogMemberPinV1, CatalogSourceV1, CatalogedEmbeddingBackendV1, CatalogedFastEmbedModelV1,
+    };
+    use crate::runtime_query::PooledSemanticQueryEmbedderFactory;
+    use crate::runtime_service::{
+        SemanticRuntimeScheduleCancellationV1, SharedEmbeddingRuntimeFactory,
+    };
 
     struct ActiveCancellation;
 
@@ -860,6 +933,18 @@ mod tests {
             .clone()
     }
 
+    /// A symbol-free composer. Every fixture projection here embeds sanitized
+    /// text, which consults no symbol index.
+    fn documents() -> Arc<EmbeddingDocumentComposerV1> {
+        let generation = CodeGenerationId::new("evaluation-cache.generation".to_owned())
+            .expect("generation fixture");
+        let index =
+            GenerationSymbolIndexV1::new(generation, Vec::new()).expect("empty symbol index");
+        Arc::new(EmbeddingDocumentComposerV1::new(
+            EmbeddingSymbolContextIndexV1::from_generation_symbols(&index),
+        ))
+    }
+
     fn chunk(label: char, text: &str) -> CodeSearchChunkV1 {
         let generation = CodeGenerationId::new("evaluation-cache.generation".to_owned())
             .expect("generation fixture");
@@ -1003,7 +1088,71 @@ mod tests {
             cache,
             policy,
             cancellation(),
+            documents(),
         )
+    }
+
+    #[test]
+    fn native_qualification_projection_and_query_share_exactly_one_model_session() {
+        let authority = Arc::new(crate::session_pool::test_support::authority());
+        let factory: SharedEmbeddingRuntimeFactory<FakeEmbeddingRuntime> =
+            Arc::new(|| Ok(FakeEmbeddingRuntime::new().with_resident_bytes_per_session(1_024)));
+        let runtime = semantic_evaluation_runtime(
+            Arc::clone(&authority),
+            factory,
+            SemanticEvaluationProjectionResourcesV1 {
+                memory_ceiling_bytes: 1 << 20,
+            },
+        )
+        .expect("evaluation runtime");
+        let first = chunk('a', "first native qualification group");
+        let second = chunk('b', "second native qualification group");
+        let first_group = [&first];
+        let second_group = [&second];
+        let mut encoder = RuntimeChunkVectorEncoderV1::new(
+            Arc::clone(&runtime),
+            Arc::new(SemanticRuntimeScheduleCancellationV1::new(2)),
+            EmbeddingExecutionPlanV1 {
+                intra_threads: 1,
+                sessions: 2,
+                limiting_reason: EmbeddingSessionLimitingReasonV1::ConfiguredMaximum,
+            },
+            documents(),
+        );
+        encoder
+            .encode_batches(
+                authority.projection().embedding_key(),
+                &[first_group.as_slice(), second_group.as_slice()],
+            )
+            .expect("multi-group qualification projection");
+        drop(encoder);
+
+        let query_factory = PooledSemanticQueryEmbedderFactory::new(Arc::clone(&runtime));
+        let query = query_factory.create(Arc::new(ManualCancellation::new()));
+        let query_view = EphemeralSanitizedQueryViewV1::sanitize(
+            "reuse the qualification model",
+            SanitizerRevision::new("sanitizer.v1").expect("sanitizer fixture"),
+            QueryNormalizationRevision::new("normalizer.v1").expect("normalizer fixture"),
+        )
+        .expect("bounded query");
+        let query_digest = QueryDigest::new(
+            authority.projection().privacy_domain().clone(),
+            authority.projection().privacy_key_epoch(),
+            QueryMac::new(format!("hmac-sha256:{}", "11".repeat(32))).expect("query MAC"),
+        );
+        query
+            .embed_query(SemanticQueryEmbeddingRequestV1 {
+                query_digest: &query_digest,
+                query_view: &query_view,
+                projection: authority.projection(),
+            })
+            .expect("genuine qualification query");
+
+        assert_eq!(
+            runtime.stats().sessions_opened,
+            1,
+            "one qualification request must construct one model session even when the admitted runtime can fan out",
+        );
     }
 
     struct LifecycleAuthorityFixtureV1 {
@@ -1042,7 +1191,9 @@ mod tests {
         }
         let model = CatalogedFastEmbedModelV1 {
             model_id: "evaluation-cache-model".to_owned(),
-            fastembed_enum: "JinaEmbeddingsV2BaseCode".to_owned(),
+            backend: CatalogedEmbeddingBackendV1::FastEmbedOrt {
+                fastembed_enum: "JinaEmbeddingsV2BaseCode".to_owned(),
+            },
             model_code: "fixture/evaluation-cache-model".to_owned(),
             source: CatalogSourceV1 {
                 upstream: "https://example.invalid/evaluation-cache".to_owned(),
@@ -1072,6 +1223,7 @@ mod tests {
                 max_sequence_length: 512,
                 load_deadline_ms: 1_000,
             },
+            EmbeddingDocumentCompositionV1::SanitizedText,
         )
         .expect("verified lifecycle authority");
         LifecycleAuthorityFixtureV1 {
@@ -1350,6 +1502,7 @@ mod tests {
             &cache,
             SemanticEvaluationProjectionBatchCachePolicyV1::ReuseCompletedBatches,
             cancellation as Arc<dyn SemanticEvaluationCancellationV1>,
+            documents(),
         );
 
         assert!(

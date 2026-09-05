@@ -112,10 +112,19 @@ unchanged content-addressed artifacts when their complete identity matches.
 Duplicate hints and no-op saves produce no new durable work. A failed or
 cancelled refresh leaves the prior complete generation readable.
 
-### Force re-index
+If an authenticated derived lexical cursor no longer fits its sealed source,
+the daemon discards only that resumable text-artifact staging database and
+rebuilds it automatically. Project identity, sessions, memory, configuration,
+the sealed source generation, and any prior complete serving generation remain
+untouched. Run `tracedecay sync`, then re-check `tracedecay status`; do not use
+`storage reset-project-store`, which is reserved for a reported schema reset
+requirement.
 
-If the daemon reports a compatible generation rebuild is needed, an operator may
-request an explicit full refresh with `--force`:
+### Explicit refresh compatibility
+
+`--force` remains accepted for compatibility and queues the same authoritative
+reconciliation as `tracedecay sync`. It does not delete or fully rebuild the
+project store:
 
 ```bash
 tracedecay sync --force
@@ -161,7 +170,7 @@ Example output:
 ✔ sync done — 3 added, 12 modified, 0 removed in 4412ms
 ```
 
-This also works with `--force` for full re-index diagnostics.
+This also accepts the `--force` compatibility flag, with the same diagnostics.
 
 ### Respecting .gitignore
 
@@ -219,6 +228,7 @@ tracedecay install --agent gemini      # Gemini CLI
 tracedecay install --agent hermes      # Hermes Agent
 tracedecay install --agent copilot     # GitHub Copilot CLI
 tracedecay install --agent cursor      # Cursor
+tracedecay install --agent devin       # Devin
 tracedecay install --agent kiro        # AWS Kiro
 tracedecay install --agent kimi        # Kimi Code CLI
 ```
@@ -231,6 +241,9 @@ MCP registration or native plugin tools, with permissions where available.
 
 - Hermes installs one native user plugin through Hermes' plugin API.
 - Cursor installs a local plugin in `~/.cursor/plugins/local/tracedecay` that bundles MCP, hooks, and the tracedecay rule.
+- Devin registers the `tracedecay serve` stdio MCP server in
+  `~/.config/devin/mcp_config.json`, preserving other Devin MCP entries and
+  leaving Devin's permission policy unchanged.
 - Codex uses Codex's plugin source, marketplace, and installed-cache flow: TraceDecay stages the source bundle and marketplace entry, then drives `codex plugin add tracedecay@personal` to install Codex's cache from that source. The plugin owns MCP, hooks, and skills. TraceDecay does not write `~/.codex/AGENTS.md`, `~/.codex/hooks.json`, or `[hooks.state]` trust hashes — Codex still asks you to trust new command hooks via `/hooks`.
 - Kimi Code CLI stages its plugin source at `~/.tracedecay/host-bundle-stage/kimi/tracedecay`; run the printed `/plugins install <staged-path>` command in Kimi Code, then rerun TraceDecay so it can record the staged source. Kimi owns `~/.kimi-code/plugins/installed.json` and its managed/cache paths.
 
@@ -300,6 +313,22 @@ The install is idempotent — safe to run again after upgrading tracedecay. You'
 Each install writes or stages the active profile's host integration; it does
 not create per-repository host configuration. The host's workspace/session
 context selects the active TraceDecay project at runtime.
+
+Devin supports both profile-wide and project installation:
+
+```bash
+tracedecay install --agent devin
+tracedecay install --local --agent devin
+```
+
+The first command writes Devin's user MCP registry at
+`~/.config/devin/mcp_config.json`. The second writes the repository's
+`.devin/mcp_config.json`. Both register the exact stdio entry accepted by
+Devin's `mcp add` command: the resolved `tracedecay` executable, `serve` as its
+argument, and `transport: "stdio"`. Existing Devin MCP servers and unrelated
+configuration remain intact. Restart Devin after installing, updating, or
+removing the integration. See [Devin integration](DEVIN-INTEGRATION.md) for
+the config locations and lifecycle details.
 
 Cursor install is plugin-based:
 
@@ -514,6 +543,16 @@ Use `tracedecay daemon start`, `stop`, or `restart` for explicit lifecycle contr
 ```bash
 tracedecay daemon uninstall-service
 ```
+
+Install without activation with `tracedecay daemon install-service --no-start`.
+Updates and post-update maintenance preserve the exact captured service state:
+running services return to running, stopped-enabled services stay stopped and
+enabled, stopped-disabled services stay stopped and disabled, and masked or
+missing services remain untouched. Passive commands and integrations (`status`,
+`doctor`, `tool`, `serve`, MCP proxying, and hooks) never start or enable the
+service. If the daemon is unavailable, it may be intentionally held; report the
+typed state instead of retrying or changing lifecycle. Use `start` or `restart`
+only when you intentionally want the daemon running.
 
 ### CLI-Only Workflows
 
@@ -1014,6 +1053,12 @@ Your AI agent doesn't see tracedecay tools.
 1. Run `tracedecay doctor` to check the integration
 2. Verify `tracedecay` is on your PATH: `which tracedecay`
 3. Re-run `tracedecay install` and restart your agent completely
+
+The CLI fallback is another client of the same daemon, not a guarantee that
+the daemon is available. If Doctor reports a stopped, missing, or unavailable
+daemon, preserve that state unless you explicitly intend to start it. Do not
+loop on MCP/CLI retries or treat a held daemon as permission to run a lifecycle
+command.
 
 ### Missing symbols in search
 

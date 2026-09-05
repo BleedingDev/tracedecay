@@ -368,6 +368,7 @@ impl<'a> DiagnosticsStore<'a> {
     /// Runs `work` inside an immediate transaction, committing on success and
     /// rolling back on error or cancellation. The transactional store routes
     /// every statement through that exact transaction.
+    #[hotpath::measure(label = "usecases.diagnostics_store.immediate_tx", future = true)]
     async fn with_immediate_tx<T>(
         &self,
         operation: &str,
@@ -955,6 +956,7 @@ impl<'a> DiagnosticsStore<'a> {
         })
     }
 
+    #[hotpath::measure(label = "usecases.diagnostics_store.insert_record", future = true)]
     async fn insert_record(&self, record: &GenerationDiagnosticV1) -> Result<()> {
         let operation = "diagnostics insert_record";
         let (state, state_generation) = state_columns(&record.state);
@@ -1020,6 +1022,7 @@ impl<'a> DiagnosticsStore<'a> {
         Ok(())
     }
 
+    #[hotpath::measure(label = "usecases.diagnostics_store.publication_state", future = true)]
     async fn generation_publication_state(
         &self,
         generation: &CodeGenerationId,
@@ -1042,6 +1045,7 @@ impl<'a> DiagnosticsStore<'a> {
             .transpose()
     }
 
+    #[hotpath::measure(label = "usecases.diagnostics_store.query_generation", future = true)]
     async fn query_generation(
         &self,
         generation: &CodeGenerationId,
@@ -1072,6 +1076,7 @@ impl<'a> DiagnosticsStore<'a> {
         collect_rows(&mut rows, operation).await
     }
 
+    #[hotpath::measure(label = "usecases.diagnostics_store.find_successor", future = true)]
     async fn find_logical_successor(
         &self,
         prior: &GenerationDiagnosticV1,
@@ -1382,6 +1387,7 @@ const SELECT_RECORDS: &str = "SELECT diagnostic_anchor, generation_id, repositor
         collected_at, record_state, state_generation
      FROM generation_diagnostics";
 
+#[hotpath::measure(label = "usecases.diagnostics_store.collect_rows", future = true)]
 async fn collect_rows(rows: &mut Rows, operation: &str) -> Result<Vec<GenerationDiagnosticV1>> {
     let mut records = Vec::new();
     while let Some(row) = rows.next().await.map_err(|e| db_error(operation, e))? {

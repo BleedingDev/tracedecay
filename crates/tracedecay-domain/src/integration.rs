@@ -34,6 +34,7 @@ pub enum HostKindV1 {
     CursorDesktop,
     CursorCloud,
     Codex,
+    Devin,
     Hermes,
     Kiro,
     ClineFamily,
@@ -44,10 +45,13 @@ pub enum HostKindV1 {
     OpenCode,
     Gemini,
     Copilot,
+    Zed,
+    Antigravity,
+    Vibe,
 }
 
 impl HostKindV1 {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 18] = [
         Self::ClaudeCode,
         Self::CursorDesktop,
         Self::CursorCloud,
@@ -62,6 +66,10 @@ impl HostKindV1 {
         Self::OpenCode,
         Self::Gemini,
         Self::Copilot,
+        Self::Devin,
+        Self::Zed,
+        Self::Antigravity,
+        Self::Vibe,
     ];
 
     /// Project a stock host surface into the bounded host observation catalog
@@ -73,7 +81,11 @@ impl HostKindV1 {
             Self::Codex => Some(HostIntegrationIdV1::Codex),
             Self::Hermes => Some(HostIntegrationIdV1::Hermes),
             Self::Kiro => Some(HostIntegrationIdV1::Kiro),
-            Self::CursorCloud
+            Self::Devin
+            | Self::Zed
+            | Self::Antigravity
+            | Self::Vibe
+            | Self::CursorCloud
             | Self::ClineFamily
             | Self::Cline
             | Self::RooCode
@@ -173,6 +185,25 @@ const fn canonical_stock_host_capabilities(host: HostKindV1) -> [HostCapabilityR
             Unavailable(HostRegistrationUnsupported),
             Unavailable(HostApiAbsent),
             Supported,
+            Supported,
+            Supported,
+        ),
+        // Devin owns local stdio MCP registration but exposes no
+        // TraceDecay-specific diagnostic or hook registration surface.
+        HostKindV1::Devin => (
+            Unavailable(HostRegistrationUnsupported),
+            Unavailable(HostApiAbsent),
+            Unavailable(CheckedInEvidenceMissing),
+            Supported,
+            Supported,
+        ),
+        // These direct-config hosts expose documented local stdio MCP
+        // registration but no TraceDecay-specific diagnostics or native hook
+        // capture surface.
+        HostKindV1::Zed | HostKindV1::Antigravity | HostKindV1::Vibe => (
+            Unavailable(HostRegistrationUnsupported),
+            Unavailable(HostApiAbsent),
+            Unavailable(CheckedInEvidenceMissing),
             Supported,
             Supported,
         ),
@@ -492,6 +523,10 @@ impl HostIntegrationCatalogV1 {
             HostKindV1::OpenCode => &STOCK_HOST_CAPABILITIES[11],
             HostKindV1::Gemini => &STOCK_HOST_CAPABILITIES[12],
             HostKindV1::Copilot => &STOCK_HOST_CAPABILITIES[13],
+            HostKindV1::Devin => &STOCK_HOST_CAPABILITIES[14],
+            HostKindV1::Zed => &STOCK_HOST_CAPABILITIES[15],
+            HostKindV1::Antigravity => &STOCK_HOST_CAPABILITIES[16],
+            HostKindV1::Vibe => &STOCK_HOST_CAPABILITIES[17],
         }
     }
 
@@ -582,7 +617,7 @@ impl HostIntegrationCatalogV1 {
     }
 }
 
-const STOCK_HOST_CAPABILITIES: [[HostCapabilityRecordV1; 5]; 14] = [
+const STOCK_HOST_CAPABILITIES: [[HostCapabilityRecordV1; 5]; 18] = [
     canonical_stock_host_capabilities(HostKindV1::ClaudeCode),
     canonical_stock_host_capabilities(HostKindV1::CursorDesktop),
     canonical_stock_host_capabilities(HostKindV1::CursorCloud),
@@ -597,6 +632,10 @@ const STOCK_HOST_CAPABILITIES: [[HostCapabilityRecordV1; 5]; 14] = [
     canonical_stock_host_capabilities(HostKindV1::OpenCode),
     canonical_stock_host_capabilities(HostKindV1::Gemini),
     canonical_stock_host_capabilities(HostKindV1::Copilot),
+    canonical_stock_host_capabilities(HostKindV1::Devin),
+    canonical_stock_host_capabilities(HostKindV1::Zed),
+    canonical_stock_host_capabilities(HostKindV1::Antigravity),
+    canonical_stock_host_capabilities(HostKindV1::Vibe),
 ];
 
 #[derive(Serialize)]

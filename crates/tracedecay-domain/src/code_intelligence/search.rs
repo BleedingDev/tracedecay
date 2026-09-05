@@ -863,6 +863,32 @@ pub enum EmbeddingPrecisionV1 {
     Int8,
 }
 
+/// How one canonical chunk becomes the text handed to the embedding model.
+///
+/// Composition is projection identity: the same chunk under two compositions
+/// is two different tensor inputs, so their vectors never share a projection
+/// key. On the wire the field is absent for `SanitizedText`, which keeps the
+/// shipped composition's persisted projection digests byte-identical.
+#[derive(
+    Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingDocumentCompositionV1 {
+    /// The chunk's sanitized text, unchanged.
+    #[default]
+    SanitizedText,
+    /// A deterministic symbol-context header (symbol kind and name, enclosing
+    /// scope) ahead of the sanitized text, with the whole document bounded by
+    /// [`EmbeddingProjectionKeyV1::document_byte_budget`].
+    SymbolContextHeader,
+}
+
+impl EmbeddingDocumentCompositionV1 {
+    pub const fn is_sanitized_text(&self) -> bool {
+        matches!(self, Self::SanitizedText)
+    }
+}
+
 /// Immutable identity of one fully published semantic vector generation.
 ///
 /// This identity is shared by projection stores and semantic retrieval
@@ -896,6 +922,15 @@ pub struct EmbeddingProjectionKeyV1 {
     pub config_digest: ManifestDigest,
     pub query_instruction_digest: Option<ManifestDigest>,
     pub document_instruction_digest: Option<ManifestDigest>,
+    /// How each chunk's tensor input is composed. Skipped on the wire for
+    /// `SanitizedText` so the shipped composition's canonical digest — and
+    /// every vector generation persisted under it — is unchanged; every other
+    /// composition serializes and therefore mints its own projection key.
+    #[serde(
+        default,
+        skip_serializing_if = "EmbeddingDocumentCompositionV1::is_sanitized_text"
+    )]
+    pub document_composition: EmbeddingDocumentCompositionV1,
     pub pooling: EmbeddingPoolingV1,
     pub truncation_side: EmbeddingTruncationSideV1,
     pub truncation_length: u32,
@@ -1038,6 +1073,28 @@ impl EmbeddingProjectionKeyV1 {
     pub fn projection_key(&self) -> Result<ProjectionKeyV1, DomainError> {
         Ok(self.admit()?.projection_key)
     }
+
+    /// Byte budget of one composed embedding document: the per-document share
+    /// of the admitted inference group byte ceiling. A full group of
+    /// `inference_batch_size` documents each within this budget therefore
+    /// always fits `inference_batch_bytes`, so composing documents never moves
+    /// the canonical group boundaries derived from the chunks' sanitized text.
+    pub fn document_byte_budget(&self) -> Result<usize, DomainError> {
+        if self.inference_batch_size == 0 {
+            return Err(DomainError::Empty {
+                field: "embedding inference batch size",
+            });
+        }
+        let budget = self.inference_batch_bytes / self.inference_batch_size;
+        if budget == 0 {
+            return Err(DomainError::Empty {
+                field: "embedding document byte budget",
+            });
+        }
+        usize::try_from(budget).map_err(|_| DomainError::NonCanonical {
+            field: "embedding document byte budget",
+        })
+    }
 }
 
 impl AdmittedEmbeddingProjectionKeyV1 {
@@ -1074,6 +1131,157 @@ pub enum SemanticSearchIndexKindV1 {
     AnnHnswExactRescore,
 }
 
+/// Deterministic adaptive recall depth for approximate candidate generation.
+///
+/// An approximate index answers with a ranked prefix whose depth the caller
+/// chooses. Too shallow a prefix loses recall the exact rescore can never
+/// recover; too deep a prefix rescores rows that cannot enter the retained
+/// top-k. Instead of a fixed oversample the caller grows the depth
+/// geometrically: every pass asks for the ranks past the previous depth, and
+/// the loop continues only while the pass was *saturated* (the index returned
+/// the full increment, so deeper ranks exist) and the pool is still below
+/// `target(retained_cap)`. `max_depth` bounds the deepest pass.
+///
+/// The sequence of depths and the stop reason are pure functions of the
+/// policy, the retained cap, and the row counts each pass returned, so two
+/// executions over the same index are byte-identical. Every field is committed
+/// into the owning search-index profile's parameters digest.
+///
+/// Only the semantic ANN path uses this policy. The exact and lexical lanes
+/// read posting ports that return an exact, complete ranking prefix bounded by
+/// the lane cap: there is no approximate candidate stage whose recall a deeper
+/// request could recover, so a deeper read there only costs work and changes
+/// nothing the fusion stage observes.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveRecallDepthPolicyV1 {
+    /// Ranking depth of the first pass.
+    pub initial_depth: u32,
+    /// Multiplier applied to the depth between saturated passes; at least 2.
+    pub growth_factor: u32,
+    /// Deepest rank any pass may request.
+    pub max_depth: u32,
+    /// The pool target is `retained_cap × target_multiplier`, floored below.
+    pub target_multiplier: u32,
+    /// Smallest pool the loop aims for regardless of the retained cap.
+    pub target_floor: u32,
+}
+
+/// Why an adaptive recall loop stopped after a pass.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveRecallStopV1 {
+    /// The pool reached the policy target.
+    TargetReached,
+    /// The pass returned fewer rows than requested: the index holds no deeper
+    /// ranks, so growing the depth could not add candidates.
+    Unsaturated,
+    /// The pass already searched `max_depth` and the pool is below target.
+    MaxDepth,
+}
+
+/// The policy's decision after one pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdaptiveRecallStepV1 {
+    /// Ask the next pass for the ranks in `(searched_depth, next_depth]`.
+    Grow {
+        next_depth: u32,
+    },
+    Stop(AdaptiveRecallStopV1),
+}
+
+impl AdaptiveRecallDepthPolicyV1 {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.initial_depth == 0 {
+            return Err(DomainError::Empty {
+                field: "adaptive recall initial depth",
+            });
+        }
+        if self.growth_factor < 2 {
+            return Err(DomainError::NonCanonical {
+                field: "adaptive recall growth factor",
+            });
+        }
+        if self.max_depth < self.initial_depth {
+            return Err(DomainError::NonCanonical {
+                field: "adaptive recall max depth",
+            });
+        }
+        if self.target_multiplier == 0 {
+            return Err(DomainError::Empty {
+                field: "adaptive recall target multiplier",
+            });
+        }
+        if self.target_floor == 0 {
+            return Err(DomainError::Empty {
+                field: "adaptive recall target floor",
+            });
+        }
+        Ok(())
+    }
+
+    /// Pool size the loop aims for when `retained_cap` rows will be kept.
+    pub const fn target(&self, retained_cap: u32) -> u32 {
+        let scaled = retained_cap.saturating_mul(self.target_multiplier);
+        if scaled > self.target_floor {
+            scaled
+        } else {
+            self.target_floor
+        }
+    }
+
+    /// Depth of the first pass.
+    pub const fn first_depth(&self) -> u32 {
+        if self.initial_depth < self.max_depth {
+            self.initial_depth
+        } else {
+            self.max_depth
+        }
+    }
+
+    /// Decide what follows a pass that searched `searched_depth`, was asked
+    /// for `requested` new ranks, answered `returned` rows, and left `pool`
+    /// distinct candidates gathered so far.
+    pub const fn step(
+        &self,
+        retained_cap: u32,
+        searched_depth: u32,
+        requested: u32,
+        returned: u32,
+        pool: u32,
+    ) -> AdaptiveRecallStepV1 {
+        if pool >= self.target(retained_cap) {
+            return AdaptiveRecallStepV1::Stop(AdaptiveRecallStopV1::TargetReached);
+        }
+        if returned < requested {
+            return AdaptiveRecallStepV1::Stop(AdaptiveRecallStopV1::Unsaturated);
+        }
+        if searched_depth >= self.max_depth {
+            return AdaptiveRecallStepV1::Stop(AdaptiveRecallStopV1::MaxDepth);
+        }
+        let grown = searched_depth.saturating_mul(self.growth_factor);
+        let next_depth = if grown < self.max_depth {
+            grown
+        } else {
+            self.max_depth
+        };
+        AdaptiveRecallStepV1::Grow { next_depth }
+    }
+}
+
+/// The recall policy the canonical ANN profile commits to: start at 200
+/// ranks, double while saturated and under `max(cap × 5, 50)`, never past
+/// 2000. The ceiling stays under the vector store's 4096-row hard search
+/// bound so no pass is ever silently clamped by the port.
+pub const SEMANTIC_ANN_RECALL_POLICY_V1: AdaptiveRecallDepthPolicyV1 =
+    AdaptiveRecallDepthPolicyV1 {
+        initial_depth: 200,
+        growth_factor: 2,
+        max_depth: 2_000,
+        target_multiplier: 5,
+        target_floor: 50,
+    };
+
 /// Complete identity inputs for one semantic search structure.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(deny_unknown_fields)]
@@ -1105,16 +1313,26 @@ impl SemanticSearchIndexProfileV1 {
         })
     }
 
-    /// HNSW candidate generation with exact rescoring. The parameters digest
-    /// commits to the candidate-oversample policy so a tuning change mints a
-    /// new index identity instead of silently shifting served candidate sets.
+    /// The canonical HNSW candidate-generation profile: exact rescoring over
+    /// candidates gathered under [`SEMANTIC_ANN_RECALL_POLICY_V1`].
     pub fn ann_hnsw_exact_rescore_v1() -> Result<Self, DomainError> {
+        Self::ann_hnsw_exact_rescore(&SEMANTIC_ANN_RECALL_POLICY_V1)
+    }
+
+    /// HNSW candidate generation with exact rescoring under one adaptive
+    /// recall policy. The parameters digest commits to every policy field, so
+    /// a tuning change mints a new index identity instead of silently
+    /// shifting served candidate sets.
+    pub fn ann_hnsw_exact_rescore(
+        recall_policy: &AdaptiveRecallDepthPolicyV1,
+    ) -> Result<Self, DomainError> {
+        recall_policy.validate()?;
         Ok(Self {
             kind: SemanticSearchIndexKindV1::AnnHnswExactRescore,
             implementation_revision: "semantic.ann-hnsw-exact-rescore.v1".to_owned(),
             parameters_digest: canonical_sha256(&(
                 "tracedecay.semantic-ann-hnsw-exact-rescore-parameters.v1",
-                "hnsw-candidates-oversample-4x",
+                recall_policy,
                 "exact-rescore-canonical-distance-then-anchor",
                 "flat-fallback-on-missing-or-incomplete-index",
             ))?,
@@ -1455,6 +1673,80 @@ mod tests {
         manifest
     }
 
+    fn embedding_key() -> EmbeddingProjectionKeyV1 {
+        EmbeddingProjectionKeyV1 {
+            model_artifact_digest: id(&digest('a')),
+            tokenizer_digest: id(&digest('b')),
+            config_digest: id(&digest('c')),
+            query_instruction_digest: None,
+            document_instruction_digest: None,
+            document_composition: EmbeddingDocumentCompositionV1::SanitizedText,
+            pooling: EmbeddingPoolingV1::Mean,
+            truncation_side: EmbeddingTruncationSideV1::Right,
+            truncation_length: 512,
+            inference_batch_size: 8,
+            inference_batch_bytes: 8 * 512 * 4,
+            runtime_backend: "fastembed-ort".to_owned(),
+            runtime_build_revision: "ort-fixture".to_owned(),
+            device_class: EmbeddingDeviceClassV1::Cpu,
+            dimensions: 8,
+            metric: EmbeddingMetricV1::Cosine,
+            normalization: EmbeddingNormalizationV1::L2,
+            precision: EmbeddingPrecisionV1::Fp32,
+            chunk_schema_revision: "code-search-chunk.v1".to_owned(),
+            chunker_revision: id("chunker.v1"),
+            privacy_domain: PrivacyDomainId::new("privacy.fixture").unwrap(),
+            privacy_key_epoch: 1,
+        }
+    }
+
+    #[test]
+    fn document_composition_is_projection_identity() {
+        let sanitized = embedding_key();
+        let same = embedding_key();
+        let mut header = embedding_key();
+        header.document_composition = EmbeddingDocumentCompositionV1::SymbolContextHeader;
+
+        let sanitized_digest = sanitized.canonical_digest().expect("digest");
+        assert_eq!(sanitized_digest, same.canonical_digest().expect("digest"));
+        assert_ne!(sanitized_digest, header.canonical_digest().expect("digest"));
+        assert_ne!(
+            sanitized.projection_key().expect("projection key"),
+            header.projection_key().expect("projection key")
+        );
+
+        let sanitized_json = serde_json::to_string(&sanitized).expect("JSON");
+        assert!(
+            !sanitized_json.contains("document_composition"),
+            "the shipped composition must serialize exactly as before it existed"
+        );
+        let header_json = serde_json::to_string(&header).expect("JSON");
+        assert!(header_json.contains(r#""document_composition":"symbol_context_header""#));
+
+        let restored: EmbeddingProjectionKeyV1 =
+            serde_json::from_str(&sanitized_json).expect("wire without the field");
+        assert_eq!(restored, sanitized);
+        let restored_header: EmbeddingProjectionKeyV1 =
+            serde_json::from_str(&header_json).expect("wire with the field");
+        assert_eq!(restored_header, header);
+    }
+
+    #[test]
+    fn document_byte_budget_is_the_per_document_share_of_the_group_ceiling() {
+        let key = embedding_key();
+        assert_eq!(key.document_byte_budget().expect("budget"), 512 * 4);
+
+        let mut uneven = embedding_key();
+        uneven.inference_batch_bytes = 1_001;
+        uneven.inference_batch_size = 10;
+        assert_eq!(uneven.document_byte_budget().expect("budget"), 100);
+
+        let mut starved = embedding_key();
+        starved.inference_batch_bytes = 3;
+        starved.inference_batch_size = 8;
+        assert!(starved.document_byte_budget().is_err());
+    }
+
     #[test]
     fn symbol_grains_require_a_symbol_occurrence() {
         let anchor = CodeSearchChunkAnchorV1 {
@@ -1790,5 +2082,92 @@ mod tests {
             capabilities: super::super::language::LanguageCapabilitySetV1::default(),
         };
         assert!(descriptor.validate().is_err());
+    }
+
+    #[test]
+    fn adaptive_recall_policy_steps_are_pure_and_bounded() {
+        let policy = SEMANTIC_ANN_RECALL_POLICY_V1;
+        policy.validate().expect("canonical policy validates");
+        assert_eq!(policy.first_depth(), 200);
+        assert_eq!(policy.target(2), 50, "small caps use the floor");
+        assert_eq!(policy.target(100), 500);
+
+        // Target reached wins over saturation.
+        assert_eq!(
+            policy.step(2, 200, 200, 200, 200),
+            AdaptiveRecallStepV1::Stop(AdaptiveRecallStopV1::TargetReached)
+        );
+        // Under target but the pass came back short: nothing deeper exists.
+        assert_eq!(
+            policy.step(100, 200, 200, 150, 150),
+            AdaptiveRecallStepV1::Stop(AdaptiveRecallStopV1::Unsaturated)
+        );
+        // Under target and saturated: double.
+        assert_eq!(
+            policy.step(100, 200, 200, 200, 200),
+            AdaptiveRecallStepV1::Grow { next_depth: 400 }
+        );
+        // Growth clamps at the ceiling instead of overshooting it.
+        assert_eq!(
+            policy.step(500, 1_600, 800, 800, 1_600),
+            AdaptiveRecallStepV1::Grow { next_depth: 2_000 }
+        );
+        // At the ceiling, saturated and under target stops on MaxDepth.
+        assert_eq!(
+            policy.step(500, 2_000, 400, 400, 2_000),
+            AdaptiveRecallStepV1::Stop(AdaptiveRecallStopV1::MaxDepth)
+        );
+
+        let mut degenerate = policy;
+        degenerate.growth_factor = 1;
+        assert!(
+            degenerate.validate().is_err(),
+            "a non-growing loop never terminates on growth"
+        );
+        let mut inverted = policy;
+        inverted.max_depth = 100;
+        assert!(
+            inverted.validate().is_err(),
+            "the ceiling must admit the first pass"
+        );
+    }
+
+    #[test]
+    fn ann_profile_digest_commits_to_every_recall_policy_field() {
+        let canonical = SemanticSearchIndexProfileV1::ann_hnsw_exact_rescore_v1()
+            .expect("canonical ann profile");
+        let again =
+            SemanticSearchIndexProfileV1::ann_hnsw_exact_rescore(&SEMANTIC_ANN_RECALL_POLICY_V1)
+                .expect("same policy");
+        assert_eq!(
+            canonical, again,
+            "identical policies mint identical identities"
+        );
+        assert_eq!(
+            canonical.index_key().expect("key"),
+            again.index_key().expect("key")
+        );
+
+        let variants: [fn(&mut AdaptiveRecallDepthPolicyV1); 5] = [
+            |policy| policy.initial_depth += 1,
+            |policy| policy.growth_factor += 1,
+            |policy| policy.max_depth += 1,
+            |policy| policy.target_multiplier += 1,
+            |policy| policy.target_floor += 1,
+        ];
+        for tweak in variants {
+            let mut tweaked = SEMANTIC_ANN_RECALL_POLICY_V1;
+            tweak(&mut tweaked);
+            let profile = SemanticSearchIndexProfileV1::ann_hnsw_exact_rescore(&tweaked)
+                .expect("tweaked policy validates");
+            assert_ne!(
+                profile.parameters_digest, canonical.parameters_digest,
+                "a policy change must mint a new parameters digest: {tweaked:?}"
+            );
+            assert_ne!(
+                profile.index_key().expect("key").profile_digest,
+                canonical.index_key().expect("key").profile_digest
+            );
+        }
     }
 }

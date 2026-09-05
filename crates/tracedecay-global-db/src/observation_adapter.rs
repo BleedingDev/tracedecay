@@ -15,9 +15,11 @@ use tracedecay_domain::{
 };
 use tracedecay_store::observation::{
     CursorAdvanceOutcome, ObservationCoverageReason, ObservationCursorAdvance,
+    ObservationIdentityCollisionDispositionV1, ObservationProvenanceDispositionV1,
 };
 use tracedecay_store::{
-    AnchoredObservationWrite, CommandDigestV1, ConsistencyModeV1, DurabilityClassV1,
+    AnchoredObservationWrite, CommandDigestV1, ConsistencyModeV1,
+    CursorAdvanceLedgerDisagreementV1, CursorAdvanceLedgerIdentityV1, DurabilityClassV1,
     IdempotencyIdentityV1, ObservationBatchFallbackCause, ObservationBatchPersistOutcome,
     ObservationCommitReceipt, ObservationPersistOutcome, ObservationProjectionStatus,
     ObservationProjectionStore, ObservationReadOperationV1, ObservationReadResultV1,
@@ -30,11 +32,12 @@ use tracedecay_store::{
     RuntimeDeadlineIdV1, RuntimeDeadlineV1, RuntimeInterruptionV1, RuntimeReadCoverageV1,
     RuntimeReadOperationV1, RuntimeReadRequestV1, RuntimeReadResultV1, RuntimeRequestControlV1,
     RuntimeRequestProbeV1, RuntimeSubmitOutcomeV1, RuntimeSubmitRequestV1, RuntimeTransactionIdV1,
-    RuntimeTransactionScopeV1, StoreClientIdV1, StoreIdempotencyKeyV1, StoreOperationIdV1,
-    StoreOperationMetadataV1, StoredObservation, StoredObservationRowV1,
+    RuntimeTransactionScopeV1, StorageRuntimeErrorV1, StoreClientIdV1, StoreIdempotencyKeyV1,
+    StoreOperationIdV1, StoreOperationMetadataV1, StoredObservation, StoredObservationRowV1,
 };
 
 use tracedecay_runtime_core::db::{Database, DatabaseEngineReadSnapshot, DatabaseRuntimeClientV1};
+use tracedecay_runtime_core::store_runtime::registry::StoreRuntimeRegistryFailure;
 use tracedecay_rusqlite_runtime::repository::observation_cursor_authority::{
     COMMIT_SOURCE_CURSOR_SQL, READ_CURSOR_ADVANCE_SQL, READ_SOURCE_CURSOR_SQL,
     RECORD_CURSOR_ADVANCE_SQL, cursor_advance_ledger_row_matches,
@@ -58,8 +61,9 @@ impl GlobalDbObservationStore {
     }
 
     /// Records a terminal refusal — the marker in
-    /// `observation_admission_refusals` AND the typed `admission_refused`
-    /// coverage advance — in ONE atomic authority transaction, but only when
+    /// `observation_admission_refusals` AND the typed
+    /// `observation_identity_collision` coverage advance — in ONE atomic
+    /// authority transaction, but only when
     /// the candidate stands at the sequential scan frontier; any other shape
     /// (covered replay, stale expected cursor, gap, generation jump) leaves
     /// every ledger untouched.
@@ -69,7 +73,7 @@ impl GlobalDbObservationStore {
     /// can never orphan a marker whose record the cursor still re-reads. The
     /// frontier is re-verified INSIDE the transaction (exact compare-and-set
     /// against the durable cursor), the advance-ledger row must carry the
-    /// `admission_refused` reason with no receipt, and the cursor moves to
+    /// `observation_identity_collision` reason with no receipt, and the cursor moves to
     /// the advance's next position — executed through the one canonical
     /// cursor-advance statement set
     /// (`tracedecay_rusqlite_runtime::repository::observation_cursor_authority`)
@@ -81,12 +85,17 @@ impl GlobalDbObservationStore {
         write: &AnchoredObservationWrite,
         retained_digest: &PayloadDigestV1,
         actual_cursor: Option<&ClaudeSourceCursorV1>,
-    ) -> ObservationStoreResult<()> {
+    ) -> ObservationStoreResult<RefusalCoverageOutcome> {
         const OPERATION: &str = "record refused admission terminal and coverage";
         let candidate = write.observation();
         let identity = candidate.identity();
-        let Some(mut advance) = refused_scan_frontier(write, actual_cursor)? else {
-            return Ok(());
+        let mut advance = match refused_scan_frontier(write, actual_cursor)? {
+            RefusedScanFrontier::AtFrontier(advance) => *advance,
+            RefusedScanFrontier::NotAtFrontier => {
+                return Ok(RefusalCoverageOutcome::NotAtFrontier {
+                    actual: actual_cursor.cloned(),
+                });
+            }
         };
         match (
             write.next_cursor().file_identity(),
@@ -149,7 +158,9 @@ impl GlobalDbObservationStore {
                 .rollback()
                 .await
                 .map_err(|error| runtime_storage_error(OPERATION, error))?;
-            return Ok(());
+            return Ok(RefusalCoverageOutcome::NotAtFrontier {
+                actual: durable_cursor,
+            });
         }
         transaction
             .execute(
@@ -173,7 +184,7 @@ impl GlobalDbObservationStore {
                     source_json.as_str(),
                     scope_json.as_str(),
                     coverage_json.as_str(),
-                    ObservationCoverageReason::AdmissionRefused.as_str(),
+                    ObservationCoverageReason::ObservationIdentityCollision.as_str(),
                     None::<&str>
                 ],
             )
@@ -209,14 +220,65 @@ impl GlobalDbObservationStore {
         // marker is not visible either — no orphan, by construction.
         if !cursor_advance_ledger_row_matches(
             ledger.as_ref(),
-            ObservationCoverageReason::AdmissionRefused.as_str(),
+            ObservationCoverageReason::ObservationIdentityCollision.as_str(),
             None,
         ) {
+            let disagreement = if let Some((stored_reason, stored_receipt_id)) = ledger.as_ref() {
+                let authority_receipt = if let Some(stored_receipt_id) =
+                    stored_receipt_id.as_deref()
+                {
+                    let mut receipt_rows = transaction
+                        .query(
+                            "SELECT receipt_json FROM sanitization_receipts WHERE receipt_id = ?1",
+                            tracedecay_runtime_core::db::engine::params![stored_receipt_id],
+                        )
+                        .await
+                        .map_err(|error| runtime_storage_error(OPERATION, error))?;
+                    let receipt_json = receipt_rows
+                        .next()
+                        .await
+                        .map_err(|error| runtime_storage_error(OPERATION, error))?
+                        .map(|row| {
+                            row.get::<String>(0)
+                                .map_err(|error| runtime_storage_error(OPERATION, error))
+                        })
+                        .transpose()?;
+                    drop(receipt_rows);
+                    receipt_json.and_then(|receipt_json| {
+                        let receipt =
+                            serde_json::from_str::<SanitizationReceiptV1>(&receipt_json).ok()?;
+                        (receipt.receipt().receipt_id().as_str() == stored_receipt_id
+                            && serde_json::to_string(&receipt).ok().as_deref()
+                                == Some(receipt_json.as_str()))
+                        .then_some(receipt)
+                    })
+                } else {
+                    None
+                };
+                Some(CursorAdvanceLedgerDisagreementV1::new(
+                    advance.next_cursor().source().clone(),
+                    advance.next_cursor().scope().clone(),
+                    advance.coverage(),
+                    CursorAdvanceLedgerIdentityV1::from_stored_row_with_authority_receipt(
+                        stored_reason,
+                        stored_receipt_id.as_deref(),
+                        authority_receipt.as_ref(),
+                    ),
+                    advance.ledger_identity(),
+                ))
+            } else {
+                None
+            };
             transaction
                 .rollback()
                 .await
                 .map_err(|error| runtime_storage_error(OPERATION, error))?;
-            return Err(ObservationStoreError::CursorAdvanceCollision);
+            return Err(disagreement.map_or(
+                ObservationStoreError::CursorAdvanceCollision,
+                |disagreement| ObservationStoreError::CursorAdvanceLedgerDisagreement {
+                    disagreement: Box::new(disagreement),
+                },
+            ));
         }
         transaction
             .execute(
@@ -233,7 +295,7 @@ impl GlobalDbObservationStore {
             .commit()
             .await
             .map_err(|error| runtime_storage_error(OPERATION, error))?;
-        Ok(())
+        Ok(RefusalCoverageOutcome::Recorded)
     }
 
     #[hotpath::skip]
@@ -262,7 +324,29 @@ impl GlobalDbObservationStore {
             preflight.admission_refusal(&observation_id, observation.payload_reference().digest())
         {
             let cursor = actual_cursor();
-            self.record_refusal_with_coverage(&write, retained_digest, cursor.as_ref())
+            if write.identity_collision_disposition()
+                == ObservationIdentityCollisionDispositionV1::RetryWithAlternateIdentity
+            {
+                if matches!(
+                    refused_scan_frontier(&write, cursor.as_ref())?,
+                    RefusedScanFrontier::NotAtFrontier
+                ) {
+                    return Err(ObservationStoreError::CursorConflict {
+                        expected: Box::new(write.expected_cursor().cloned()),
+                        actual: Box::new(cursor),
+                    });
+                }
+                return Err(identity_collision(
+                    observation_id,
+                    retained_digest.clone(),
+                    observation.payload_reference().digest().clone(),
+                ));
+            }
+            // The exact refusal marker is already durable. A later stale
+            // reader may no longer stand at its original scan frontier, but
+            // that does not invalidate the terminal content verdict.
+            let _ = self
+                .record_refusal_with_coverage(&write, retained_digest, cursor.as_ref())
                 .await?;
             return Err(identity_collision(
                 observation_id,
@@ -319,8 +403,33 @@ impl GlobalDbObservationStore {
             };
             if pending.is_none() {
                 let cursor = actual_cursor();
-                self.record_refusal_with_coverage(&write, retained_digest, cursor.as_ref())
-                    .await?;
+                if write.identity_collision_disposition()
+                    == ObservationIdentityCollisionDispositionV1::RetryWithAlternateIdentity
+                {
+                    if matches!(
+                        refused_scan_frontier(&write, cursor.as_ref())?,
+                        RefusedScanFrontier::NotAtFrontier
+                    ) {
+                        return Err(ObservationStoreError::CursorConflict {
+                            expected: Box::new(write.expected_cursor().cloned()),
+                            actual: Box::new(cursor),
+                        });
+                    }
+                    return Err(identity_collision(
+                        observation_id,
+                        retained_digest.clone(),
+                        observation.payload_reference().digest().clone(),
+                    ));
+                }
+                if let RefusalCoverageOutcome::NotAtFrontier { actual } = self
+                    .record_refusal_with_coverage(&write, retained_digest, cursor.as_ref())
+                    .await?
+                {
+                    return Err(ObservationStoreError::CursorConflict {
+                        expected: Box::new(write.expected_cursor().cloned()),
+                        actual: Box::new(actual),
+                    });
+                }
             }
             return Err(identity_collision(
                 observation_id,
@@ -1252,9 +1361,15 @@ impl ObservationStore for GlobalDbObservationStore {
             "advance observation source cursor",
         )
         .await;
-        if existed_at_next && outcome.is_err() {
-            return Err(ObservationStoreError::CursorAdvanceCollision);
-        }
+        let outcome = match outcome {
+            Err(error @ ObservationStoreError::CursorAdvanceLedgerDisagreement { .. }) => {
+                return Err(error);
+            }
+            Err(_) if existed_at_next => {
+                return Err(ObservationStoreError::CursorAdvanceCollision);
+            }
+            outcome => outcome,
+        };
         match outcome? {
             RuntimeSubmitOutcomeV1::Committed { .. }
             | RuntimeSubmitOutcomeV1::CommittedAfterCancellation { .. }
@@ -1495,7 +1610,7 @@ fn read_runtime_source_cursor(
 /// the caller's expected cursor matches the durable one. Generation values
 /// are opaque source identities, not ordered counters.
 ///
-/// `Ok(None)` is the not-at-frontier verdict — a covered replay or a stale
+/// `NotAtFrontier` is the not-at-frontier verdict — a covered replay or a stale
 /// expected view — and leaves every ledger untouched. Gaps and generation
 /// jumps never reach the advance constructor here: `ObservationWrite::new`
 /// already validated that this write's expected→next cursor transition
@@ -1504,10 +1619,22 @@ fn read_runtime_source_cursor(
 /// construction failure is therefore a contract violation, and it surfaces
 /// as the typed store error — silently answering "not at the scan frontier"
 /// would record no coverage and leave the refused record re-read forever.
+enum RefusedScanFrontier {
+    AtFrontier(Box<ObservationCursorAdvance>),
+    NotAtFrontier,
+}
+
+enum RefusalCoverageOutcome {
+    Recorded,
+    NotAtFrontier {
+        actual: Option<ClaudeSourceCursorV1>,
+    },
+}
+
 fn refused_scan_frontier(
     write: &AnchoredObservationWrite,
     actual_cursor: Option<&ClaudeSourceCursorV1>,
-) -> ObservationStoreResult<Option<ObservationCursorAdvance>> {
+) -> ObservationStoreResult<RefusedScanFrontier> {
     let identity = write.observation().identity();
     let candidate_covered = actual_cursor.is_some_and(|cursor| {
         cursor.generation() == identity.generation()
@@ -1515,7 +1642,7 @@ fn refused_scan_frontier(
             && cursor.position() >= identity.position().end()
     });
     if candidate_covered || actual_cursor != write.expected_cursor() {
-        return Ok(None);
+        return Ok(RefusedScanFrontier::NotAtFrontier);
     }
     ObservationCursorAdvance::for_ordering(
         identity.source().clone(),
@@ -1524,9 +1651,10 @@ fn refused_scan_frontier(
         identity.ordering_domain(),
         write.expected_cursor().cloned(),
         identity.position(),
-        ObservationCoverageReason::AdmissionRefused,
+        ObservationCoverageReason::ObservationIdentityCollision,
     )
-    .map(Some)
+    .map(Box::new)
+    .map(RefusedScanFrontier::AtFrontier)
 }
 
 fn read_runtime_stored_observation(
@@ -1556,6 +1684,20 @@ async fn submit_observation_writes(
     writes: Vec<(usize, AnchoredObservationWrite)>,
     deferred_exact_duplicates: Vec<(usize, AnchoredObservationWrite)>,
 ) -> ObservationStoreResult<Vec<(usize, ObservationBatchPersistOutcome)>> {
+    // Admission captures repository state before the writer lock. If another
+    // admission wins after our preflight, its exact observation and original
+    // attachment remain authoritative, just as on the preflight duplicate path.
+    let writes = writes
+        .into_iter()
+        .map(|(slot, write)| {
+            (
+                slot,
+                write.with_provenance_disposition(
+                    ObservationProvenanceDispositionV1::RetainCommittedOnReplay,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
     let admitted_at = now_micros();
     let priority = if writes.len() == 1 {
         OperationPriorityV1::Foreground
@@ -1843,7 +1985,25 @@ async fn dispatch_runtime_submit(
             }),
         )
         .await
-        .map_err(|error| runtime_storage_error(operation, format!("{error:?}")))
+        .map_err(|error| map_observation_submit_error(operation, error))
+}
+
+fn map_observation_submit_error(
+    operation: &'static str,
+    error: StoreRuntimeRegistryFailure,
+) -> ObservationStoreError {
+    match error {
+        StoreRuntimeRegistryFailure::StorageRuntime(error) => match *error {
+            StorageRuntimeErrorV1::ObservationSourceCursorConflict { expected, actual } => {
+                ObservationStoreError::CursorConflict { expected, actual }
+            }
+            StorageRuntimeErrorV1::ObservationCursorAdvanceLedgerDisagreement { disagreement } => {
+                ObservationStoreError::CursorAdvanceLedgerDisagreement { disagreement }
+            }
+            error => runtime_storage_error(operation, error.to_string()),
+        },
+        error => runtime_storage_error(operation, format!("{error:?}")),
+    }
 }
 
 fn runtime_command_value(
@@ -1882,6 +2042,10 @@ fn runtime_observation_command(write: &AnchoredObservationWrite) -> serde_json::
         "retrieval_anchor": write.retrieval_anchor(),
         "projection_generation": write.projection_generation(),
         "repository_provenance": write.repository_provenance_attachment(),
+        "provenance_disposition": match write.provenance_disposition() {
+            ObservationProvenanceDispositionV1::RequireExact => "require_exact",
+            ObservationProvenanceDispositionV1::RetainCommittedOnReplay => "retain_committed_on_replay",
+        },
     })
 }
 
@@ -1988,7 +2152,331 @@ fn projection_runtime_error(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use tempfile::TempDir;
+    use tracedecay_domain::{
+        AnchorSourceGenerationV2, ComponentVersion, DurableObservationV1, EvidenceAvailabilityV1,
+        GenerationBoundRepositoryProvenanceV1, ObservationId, ObservationIdentityMaterialV1,
+        ObservationOrderingDomainV1, ObservationScopeV1, ObservationSourceCursorV1,
+        ObservationSourceGenerationV1, ObservationSourceIdentityV1, ObservationSourceRangeV1,
+        PayloadReferenceV1, PrivacyDomainBoundLocatorDigest, ProjectId, ProjectionGenerationId,
+        ProviderId, RepositoryEvidenceV1, RepositoryId, RepositoryProvenanceV1,
+        RepositoryRemoteIdentityV1, RetentionClass, RetrievalAnchorRecordV2,
+        RetrievalAnchorRecordV2Parts, RetrievalAnchorTargetV2, SanitizationReceiptId,
+        SanitizationReceiptRefV1, SanitizationReceiptV1, SanitizerDispositionV1, SensitivityV1,
+        SessionId, UtcMicros,
+    };
+    use tracedecay_runtime_core::db::Database;
+    use tracedecay_store::observation::ObservationProvenanceDispositionV1;
+    use tracedecay_store::{
+        AnchoredObservationWrite, ObservationPersistOutcome, ObservationStore, ObservationWrite,
+        RepositoryWritePayloadV1, build_observation_resolution_authorization_v1,
+        build_observation_retrieval_anchor_v2,
+    };
+
+    use super::{
+        GlobalDbObservationStore, ObservationBatchState, PreparedObservationPersist,
+        canonical_runtime_digest, load_observation_preflight, runtime_command_value,
+        submit_observation_writes,
+    };
+    use crate::tests::harness::{HostAdmissionScope, HostAdmissionTestRuntimeV1};
+
+    fn repository_admission(
+        project_id: &ProjectId,
+        captured_at: UtcMicros,
+    ) -> AnchoredObservationWrite {
+        let source = ObservationSourceIdentityV1::for_provider(
+            ProviderId::new("provider.recapture-test").unwrap(),
+            SessionId::new("session.recapture-test").unwrap(),
+        )
+        .unwrap();
+        let scope = ObservationScopeV1::Project {
+            project_id: project_id.clone(),
+        };
+        let generation = ObservationSourceGenerationV1::new(1).unwrap();
+        let range = ObservationSourceRangeV1::new(0, 1).unwrap();
+        let payload = serde_json::json!({"kind": "assistant_message", "body": "recapture replay"});
+        let receipt = SanitizationReceiptV1::new(
+            SanitizationReceiptRefV1::new(
+                SanitizationReceiptId::new("receipt.recapture-test").unwrap(),
+                ComponentVersion::new("sanitizer.recapture-test").unwrap(),
+            )
+            .unwrap(),
+            SanitizerDispositionV1::Accepted,
+            SensitivityV1::NonSensitive,
+            Some(PayloadReferenceV1::for_payload(&payload).unwrap()),
+        )
+        .unwrap();
+        let observation = DurableObservationV1::new(
+            ObservationIdentityMaterialV1::for_native_record(
+                source.clone(),
+                scope.clone(),
+                generation,
+                range,
+                ObservationOrderingDomainV1::SqliteRowId,
+                ObservationId::new("record.recapture-test").unwrap(),
+            )
+            .unwrap(),
+            receipt,
+            RetentionClass::new("retention.recapture-test").unwrap(),
+            payload,
+        )
+        .unwrap();
+        let cursor = ObservationSourceCursorV1::for_ordering(
+            source,
+            scope.clone(),
+            generation,
+            ObservationOrderingDomainV1::SqliteRowId,
+            range.end(),
+        )
+        .unwrap();
+        let projection = ProjectionGenerationId::new("projection.recapture-test").unwrap();
+        let authorization =
+            build_observation_resolution_authorization_v1(&observation, "recapture-test").unwrap();
+        let anchor = build_observation_retrieval_anchor_v2(
+            &observation,
+            projection.clone(),
+            UtcMicros(1),
+            authorization,
+        )
+        .unwrap();
+        let capture = RepositoryProvenanceV1::new(
+            RepositoryId::new("repository.recapture-test").unwrap(),
+            Some(project_id.clone()),
+            None,
+            PrivacyDomainBoundLocatorDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+            RepositoryEvidenceV1::new(
+                EvidenceAvailabilityV1::Unknown,
+                EvidenceAvailabilityV1::Unknown,
+                EvidenceAvailabilityV1::Unknown,
+                EvidenceAvailabilityV1::Unknown,
+                RepositoryRemoteIdentityV1::Missing,
+                EvidenceAvailabilityV1::Unknown,
+            )
+            .unwrap(),
+            captured_at,
+        )
+        .unwrap();
+        let provenance = GenerationBoundRepositoryProvenanceV1::new(
+            projection.clone(),
+            capture,
+            Some(observation.observation_id().clone()),
+        )
+        .unwrap();
+        let repository_anchor = RetrievalAnchorRecordV2::new(RetrievalAnchorRecordV2Parts {
+            target: RetrievalAnchorTargetV2::RepositoryCapture {
+                repository_id: provenance.capture().repository_id().clone(),
+                capture_id: provenance.capture_id().clone(),
+                receipt: observation.receipt().receipt().clone(),
+            },
+            owner: scope,
+            aliases: vec![],
+            occurred_at: None,
+            ingested_at: anchor.ingested_at(),
+            evidence_class: anchor.evidence_class(),
+            source_generation: AnchorSourceGenerationV2::RepositoryCapture(
+                provenance.capture_id().clone(),
+            ),
+            projection_generation: projection.clone(),
+            projection_watermark: anchor.projection_watermark().clone(),
+            coverage: anchor.coverage().clone(),
+            source_observations: vec![observation.observation_id().clone()],
+            source_anchors: vec![],
+            authorization: anchor.authorization().clone(),
+            payload_access: anchor.payload_access(),
+            retention_class: anchor.retention_class().clone(),
+            durability: anchor.durability().clone(),
+        })
+        .unwrap();
+        AnchoredObservationWrite::new(
+            ObservationWrite::new(observation, None, cursor).unwrap(),
+            anchor,
+            projection,
+        )
+        .unwrap()
+        .with_repository_provenance_attachment(
+            EvidenceAvailabilityV1::Known(provenance),
+            Some(repository_anchor),
+        )
+        .unwrap()
+    }
+
+    async fn authority_counts(database: &Database) -> Vec<i64> {
+        let snapshot = database
+            .begin_engine_read_snapshot("count observation authority")
+            .await
+            .unwrap();
+        let mut counts = Vec::new();
+        for table in [
+            "observations",
+            "sanitization_receipts",
+            "retrieval_anchors",
+            "retrieval_anchor_aliases",
+            "observation_retrieval_anchors",
+            "observation_repository_provenance",
+            "source_cursors",
+            "projection_queue",
+        ] {
+            let mut rows = snapshot
+                .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+                .await
+                .unwrap();
+            counts.push(rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap());
+        }
+        snapshot.commit().await.unwrap();
+        counts
+    }
+
+    #[tokio::test]
+    async fn stale_preflight_repository_recapture_retains_committed_provenance() {
+        let directory = TempDir::new().unwrap();
+        let project_id = ProjectId::new("project.recapture-test").unwrap();
+        let runtime = HostAdmissionTestRuntimeV1::project(
+            directory.path().join("profile"),
+            directory.path().join("project"),
+            project_id.clone(),
+        )
+        .await
+        .unwrap();
+        let store = runtime
+            .observation_store(HostAdmissionScope::Project)
+            .unwrap();
+        let first = repository_admission(&project_id, UtcMicros(100));
+        let second = repository_admission(&project_id, UtcMicros(200));
+        assert_eq!(first.observation(), second.observation());
+        assert_eq!(first.retrieval_anchor(), second.retrieval_anchor());
+        assert_ne!(
+            first.repository_provenance_attachment(),
+            second.repository_provenance_attachment()
+        );
+        // Both admissions really read and prepare against an empty database.
+        // No scheduler timing, barrier, or test-only production port is needed.
+        let first_preflight =
+            load_observation_preflight(&store.database, std::slice::from_ref(&first))
+                .await
+                .unwrap();
+        let second_preflight =
+            load_observation_preflight(&store.database, std::slice::from_ref(&second))
+                .await
+                .unwrap();
+        for snapshot in [&first_preflight, &second_preflight] {
+            assert!(
+                snapshot
+                    .stored_observation(first.observation().observation_id())
+                    .is_none()
+            );
+            assert!(
+                snapshot
+                    .source_cursor(first.observation().source(), first.observation().scope())
+                    .is_none()
+            );
+        }
+        let PreparedObservationPersist::Submit(first_prepared) = store
+            .prepare_observation_persist(
+                first.clone(),
+                &first_preflight,
+                &mut ObservationBatchState::from_preflight(&first_preflight),
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("first admission must reach writer authority")
+        };
+        let PreparedObservationPersist::Submit(second_prepared) = store
+            .prepare_observation_persist(
+                second.clone(),
+                &second_preflight,
+                &mut ObservationBatchState::from_preflight(&second_preflight),
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("stale admission must reach writer authority")
+        };
+        let committed = submit_observation_writes(
+            &store.database,
+            &store.runtime,
+            vec![(0, *first_prepared)],
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            committed[0].1.outcome(),
+            ObservationPersistOutcome::Committed(_)
+        ));
+        let retained = store
+            .get_observation(first.observation().observation_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained.repository_provenance_attachment(),
+            first.repository_provenance_attachment()
+        );
+        let counts = authority_counts(&store.database).await;
+        let raced = submit_observation_writes(
+            &store.database,
+            &store.runtime,
+            vec![(0, *second_prepared)],
+            vec![],
+        )
+        .await
+        .expect("stale fresh admission must retain the winner's provenance");
+        assert_eq!(raced.len(), 1);
+        assert_eq!(raced[0].1.outcome().receipt(), retained.commit_receipt());
+        assert_eq!(
+            store
+                .get_observation(first.observation().observation_id())
+                .await
+                .unwrap()
+                .unwrap(),
+            retained
+        );
+        assert_eq!(authority_counts(&store.database).await, counts);
+        let hot_replay = store.persist_observation(second).await.unwrap();
+        assert!(matches!(
+            hot_replay,
+            ObservationPersistOutcome::ExactDuplicate(_)
+        ));
+        assert_eq!(hot_replay.receipt(), retained.commit_receipt());
+        assert_eq!(authority_counts(&store.database).await, counts);
+    }
+
+    #[test]
+    fn runtime_command_digest_binds_provenance_disposition() {
+        let strict = repository_admission(
+            &ProjectId::new("project.digest-test").unwrap(),
+            UtcMicros(100),
+        );
+        assert_eq!(
+            strict.provenance_disposition(),
+            ObservationProvenanceDispositionV1::RequireExact
+        );
+        let admission = strict.clone().with_provenance_disposition(
+            ObservationProvenanceDispositionV1::RetainCommittedOnReplay,
+        );
+        for (strict, admission) in [
+            (
+                RepositoryWritePayloadV1::Observation(Box::new(strict.clone())),
+                RepositoryWritePayloadV1::Observation(Box::new(admission.clone())),
+            ),
+            (
+                RepositoryWritePayloadV1::ObservationBatch(vec![strict].into_boxed_slice()),
+                RepositoryWritePayloadV1::ObservationBatch(vec![admission].into_boxed_slice()),
+            ),
+        ] {
+            let strict =
+                canonical_runtime_digest(&runtime_command_value(&strict).unwrap()).unwrap();
+            let admission =
+                canonical_runtime_digest(&runtime_command_value(&admission).unwrap()).unwrap();
+            assert_ne!(
+                strict, admission,
+                "different replay behavior must not share a runtime command identity"
+            );
+        }
+    }
 
     #[test]
     fn adapter_contains_only_guarded_database_client() {

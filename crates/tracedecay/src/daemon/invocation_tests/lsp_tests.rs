@@ -24,7 +24,12 @@ async fn production_lsp_bridge_retries_only_an_unconsumed_full_queue_frame() {
     let service = DaemonInvocationService::default();
     let project_root = PathBuf::from("/bridge-backpressure");
     DaemonLspOwnerRegistrar::new(&service)
-        .register_factory(project_root.clone(), unavailable_lsp_session_factory())
+        .register_factory_for_project(
+            project_root.clone(),
+            tracedecay_domain::UserProfileId::new("profile.test.lsp").expect("test LSP profile"),
+            tracedecay_domain::ProjectId::new("project.test.lsp").expect("test LSP project"),
+            unavailable_lsp_session_factory(),
+        )
         .await
         .expect("register LSP owner");
     let registry = Arc::new(Mutex::new(LspSessionRegistry::default()));
@@ -406,6 +411,11 @@ fn lsp_delivery_same_session_identical_frames_after_ack_have_distinct_events() {
 
 struct LspDeliveryFixture {
     _pin: tracedecay_runtime_core::config::PinnedUserDataDir,
+    /// The runtime owns the daemon database scope every durable settlement
+    /// write is admitted under. Dropping it leaves the lease without an active
+    /// write scope, so the recorder's replay would retain every receipt
+    /// instead of settling it.
+    _runtime: tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime,
     _project: tempfile::TempDir,
     project_id: ProjectId,
     recorder: Arc<tracedecay_usecases::observability::BoundedDeliverySettlementRecorderV1>,
@@ -458,6 +468,7 @@ async fn lsp_delivery_fixture() -> LspDeliveryFixture {
     );
     LspDeliveryFixture {
         _pin: pin,
+        _runtime: runtime,
         _project: project,
         project_id,
         recorder,
@@ -565,8 +576,11 @@ async fn assert_one_lsp_delivery_drop(fixture: LspDeliveryFixture) {
         .shutdown()
         .await
         .expect("drain LSP delivery recorder");
-    assert_eq!(summary.settled, 1, "one outbound frame must settle");
-    assert_eq!(summary.failed, 0, "terminal LSP drop must persist");
+    assert_eq!(
+        (summary.settled, summary.failed, summary.retained),
+        (1, 0, 0),
+        "one outbound frame must settle durably with nothing refused or retained: {summary:?}"
+    );
     drop(fixture.recorder);
     drop(fixture.authority);
     let Ok(producer) = Arc::try_unwrap(fixture.producer) else {

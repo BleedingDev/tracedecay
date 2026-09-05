@@ -10,13 +10,12 @@
 //! evidence beyond the pointer's byte-, time-, and count-bounded history.
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
 use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracedecay_private_fs::framed_log::DirectorySyncPolicy;
@@ -24,10 +23,9 @@ use tracedecay_private_fs::framed_log::DirectorySyncPolicy;
 // that number here let the writer be versioned to 3 while retention still
 // demanded 1: every real sealed file was refused as "incompatible" and the store
 // became uncollectable.
-#[cfg(test)]
-use tracedecay_code_index::production::SEALED_GENERATION_FORMAT_REVISION_V1;
-use tracedecay_code_index::production::sealed_generation_format_revision_is_compatible;
-#[cfg(test)]
+use tracedecay_code_index::production::{
+    SEALED_GENERATION_FORMAT_REVISION_V1, sealed_generation_format_revision_is_compatible,
+};
 use tracedecay_domain::canonical_text::encode_lowercase_hex;
 /// Only the generation fixtures build tagged digests; production here works in
 /// untagged hex, so importing this unconditionally is an unused-import error.
@@ -96,7 +94,7 @@ use text_artifacts::{
     recover_pending_text_artifact_transaction_unlocked, text_artifact_transaction_path,
 };
 
-use generation_scan::read_generation_metadata;
+use generation_scan::{read_generation_format_revision, read_generation_metadata};
 #[cfg(test)]
 use scope_quarantine::ScopeQuarantineAuthority;
 
@@ -382,6 +380,36 @@ pub enum GenerationDigestVerificationV1 {
     MetadataOnly,
 }
 
+/// What a census learned about content-addressed generation segments.
+///
+/// Marking live segments means streaming every retained manifest end to end —
+/// the same multi-gigabyte read [`GenerationDigestVerificationV1::MetadataOnly`]
+/// exists to avoid, and one that fails closed when a manifest no longer matches
+/// its content-addressed file name. A metadata-only census therefore refuses to
+/// guess: it reports [`Self::NoneFound`] only from the bounded directory listing
+/// that proves no segment file exists at all, and [`Self::Unknown`] otherwise.
+/// `Unknown` counts as collectable work so the segment sweep is still reached,
+/// never skipped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationSegmentCensusV1 {
+    /// The mark-and-sweep proved no unreferenced segment exists, or the store
+    /// holds no segment files at all.
+    NoneFound,
+    /// The mark-and-sweep found at least one unreferenced segment.
+    Present,
+    /// Segment files exist and this census did not pay the mark phase that
+    /// would classify them. Only a full-verification census resolves this.
+    Unknown,
+}
+
+impl GenerationSegmentCensusV1 {
+    /// Whether a retention pass still has segment work to reach.
+    #[must_use]
+    pub const fn may_have_collectable_segments(self) -> bool {
+        matches!(self, Self::Present | Self::Unknown)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CodeGenerationRetentionGenerationV1 {
@@ -428,6 +456,11 @@ pub struct CodeGenerationRetentionPlanV1 {
     /// inventory. Descriptor-referenced and still-in-progress staging files
     /// are deliberately absent.
     collectable_text_artifacts: Vec<CodeTextArtifactRetentionCandidateV1>,
+    /// Whether a fully content-addressed segment exists outside every retained
+    /// generation manifest (and, when configured, the graph replay pool).
+    /// This is a mark-phase wake signal only: execution recomputes the exact
+    /// live set under the canonical store lock before unlinking anything.
+    collectable_generation_segments: GenerationSegmentCensusV1,
     /// Unique bytes seen in the bounded text-artifact inventory: durable
     /// descriptor targets, the one resumable active staging file, and this
     /// pass's selected debris candidates. A descriptor shared by retained
@@ -462,7 +495,17 @@ impl CodeGenerationRetentionPlanV1 {
 
     #[must_use]
     pub fn has_collectable_work(&self) -> bool {
-        !self.collectable_generations.is_empty() || !self.collectable_text_artifacts.is_empty()
+        !self.collectable_generations.is_empty()
+            || !self.collectable_text_artifacts.is_empty()
+            || self
+                .collectable_generation_segments
+                .may_have_collectable_segments()
+    }
+
+    /// What this plan proved about unreferenced generation segments.
+    #[must_use]
+    pub const fn generation_segment_census(&self) -> GenerationSegmentCensusV1 {
+        self.collectable_generation_segments
     }
 }
 
@@ -624,6 +667,7 @@ pub fn plan_code_generation_retention_with_verification(
         vector_readable_sources,
         rollback_floor,
         verification,
+        None,
         &|| false,
     )
 }
@@ -640,6 +684,7 @@ pub fn plan_next_code_generation_retention_cancellable(
         vector_readable_sources,
         rollback_floor,
         GenerationDigestVerificationV1::Full,
+        None,
         is_cancelled,
     )?;
     plan.collectable_generations.truncate(1);
@@ -675,22 +720,46 @@ pub fn prepare_next_code_generation_retention_cancellable(
     // when this exact census found bytes that may be unlinked. The executor
     // still refuses metadata-only plans, so no deletion can cross this gate
     // without the canonical full verification below.
-    let census = plan_code_generation_retention_with_verification_cancellable(
+    let mut census = plan_code_generation_retention_with_verification_cancellable(
         store_root,
         vector_readable_sources,
         rollback_floor,
         GenerationDigestVerificationV1::MetadataOnly,
+        graph_replay_pool_root,
         is_cancelled,
     )?;
+    // The bounded census leaves segments typed unknown rather than paying the
+    // mark phase. Resolve exactly that question with the sweep alone: a store
+    // whose only possible work is segments must still reach them, and running
+    // a whole full-digest plan to find out would cost a second pass over every
+    // sealed byte on every quiet maintenance tick.
+    if census.collectable_generations.is_empty()
+        && census.collectable_text_artifacts.is_empty()
+        && census.collectable_generation_segments == GenerationSegmentCensusV1::Unknown
+    {
+        census.collectable_generation_segments = if has_unreferenced_generation_segments(
+            store_root,
+            graph_replay_pool_root,
+            is_cancelled,
+        )? {
+            GenerationSegmentCensusV1::Present
+        } else {
+            GenerationSegmentCensusV1::NoneFound
+        };
+    }
     if !census.has_collectable_work() {
         return Ok(census);
     }
-    plan_next_code_generation_retention_cancellable(
+    let mut plan = plan_code_generation_retention_with_verification_cancellable(
         store_root,
         vector_readable_sources,
         rollback_floor,
+        GenerationDigestVerificationV1::Full,
+        graph_replay_pool_root,
         is_cancelled,
-    )
+    )?;
+    plan.collectable_generations.truncate(1);
+    Ok(plan)
 }
 
 #[hotpath::measure(label = "usecases.retention.plan")]
@@ -699,6 +768,7 @@ fn plan_code_generation_retention_with_verification_cancellable(
     vector_readable_sources: &BTreeSet<CodeGenerationId>,
     rollback_floor: usize,
     verification: GenerationDigestVerificationV1,
+    graph_replay_pool_root: Option<&Path>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<CodeGenerationRetentionPlanV1, CodeGenerationRetentionErrorV1> {
     if observe_cancel(is_cancelled) {
@@ -872,8 +942,18 @@ fn plan_code_generation_retention_with_verification_cancellable(
             .take(rollback_floor)
             .map(|generation| generation.generation_id.clone()),
     );
+    // Sweep from the oldest end. `superseded_generations` is newest-first
+    // because the rollback reserve is the *newest* superseded window, but the
+    // collection batch is the opposite question: which bytes may go first.
+    // Reading the batch in the newest-first order made every bounded unit -
+    // `MAX_CODE_GENERATION_RETENTION_BATCH_V1` here, one generation after
+    // `plan_next`/`prepare_next` truncate it - name the newest collectable
+    // generation, so the oldest sealed generation was never in a plan and a
+    // store that publishes at least as fast as maintenance collects never
+    // released its floor.
     let collectable_generations = superseded_generations
         .iter()
+        .rev()
         .filter(|generation| !marked.contains(&generation.generation_id))
         .take(MAX_CODE_GENERATION_RETENTION_BATCH_V1)
         .cloned()
@@ -884,6 +964,35 @@ fn plan_code_generation_retention_with_verification_cancellable(
         verification,
         is_cancelled,
     )?;
+    // The segment mark phase streams every retained manifest end to end and
+    // fails closed when one no longer matches its content-addressed name. That
+    // is exactly the multi-gigabyte read a metadata-only census promises not to
+    // pay, and paying it here made a bounded observability census error out on
+    // stores whose generations are individually larger than any byte budget.
+    // Metadata-only callers get the bounded directory answer plus a typed
+    // unknown; `prepare_next_code_generation_retention_cancellable` resolves
+    // that unknown with the sweep alone, so maintenance still reaches segments
+    // without a second full-digest pass.
+    let collectable_generation_segments = match verification {
+        GenerationDigestVerificationV1::Full => {
+            if has_unreferenced_generation_segments(
+                store_root,
+                graph_replay_pool_root,
+                is_cancelled,
+            )? {
+                GenerationSegmentCensusV1::Present
+            } else {
+                GenerationSegmentCensusV1::NoneFound
+            }
+        }
+        GenerationDigestVerificationV1::MetadataOnly => {
+            if store_holds_generation_segments(store_root, is_cancelled)? {
+                GenerationSegmentCensusV1::Unknown
+            } else {
+                GenerationSegmentCensusV1::NoneFound
+            }
+        }
+    };
     #[cfg(feature = "hotpath")]
     {
         let planned_bytes = total_bytes(&collectable_generations).saturating_add(
@@ -908,6 +1017,7 @@ fn plan_code_generation_retention_with_verification_cancellable(
         superseded_generations,
         collectable_generations,
         collectable_text_artifacts: text_artifact_inventory.candidates,
+        collectable_generation_segments,
         text_artifact_inventory_bytes: text_artifact_inventory.unique_bytes,
         verification,
         active_pointer,
@@ -921,20 +1031,53 @@ fn generation_file_digest(file_name: &str) -> Option<&str> {
         .filter(|digest| is_lowercase_hex(digest, 64))
 }
 
+struct CancellableGenerationManifestReaderV1<'a> {
+    file: File,
+    hasher: Sha256,
+    is_cancelled: &'a dyn Fn() -> bool,
+    cancelled: bool,
+}
+
+impl Read for CancellableGenerationManifestReaderV1<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if (self.is_cancelled)() {
+            self.cancelled = true;
+            crate::hotpath_observe::retention_cancelled();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "generation segment mark cancelled",
+            ));
+        }
+        let read = self.file.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        crate::hotpath_observe::retention_inspected(read as u64);
+        Ok(read)
+    }
+}
+
+impl CancellableGenerationManifestReaderV1<'_> {
+    fn digest_hex(&self) -> String {
+        encode_lowercase_hex(&self.hasher.clone().finalize())
+    }
+}
+
 #[hotpath::measure(label = "usecases.retention.segment_mark_sweep")]
-fn collect_unreferenced_generation_segments(
+fn sweep_unreferenced_generation_segments(
     store_root: &Path,
     graph_replay_pool_root: Option<&Path>,
+    apply: bool,
     is_cancelled: &dyn Fn() -> bool,
-) -> Result<u64, CodeGenerationRetentionErrorV1> {
+) -> Result<(bool, u64), CodeGenerationRetentionErrorV1> {
     let segments_root = store_root.join(GENERATION_SEGMENTS_DIRECTORY);
     let entries = match std::fs::read_dir(&segments_root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((false, 0)),
         Err(error) => return Err(storage(error)),
     };
     let mut live_segments = BTreeSet::new();
-    let mut mark_root = |root: &Path| -> Result<(), CodeGenerationRetentionErrorV1> {
+    let mut mark_root = |root: &Path,
+                         replay_pool: bool|
+     -> Result<(), CodeGenerationRetentionErrorV1> {
         let manifests = match std::fs::read_dir(root) {
             Ok(manifests) => manifests,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -946,20 +1089,69 @@ fn collect_unreferenced_generation_segments(
             }
             let manifest = manifest.map_err(storage)?;
             let path = manifest.path();
-            if generation_file_name(&path).is_none() {
+            let expected_digest = if replay_pool {
+                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                    return Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
+                        "graph replay pool entry '{}' has no UTF-8 file name",
+                        path.display()
+                    )));
+                };
+                if file_name == STORE_LOCK_FILE {
+                    continue;
+                }
+                replay_generation_file_digest(file_name)
+                    .ok_or_else(|| {
+                        CodeGenerationRetentionErrorV1::UnsafeState(format!(
+                            "graph replay pool entry '{}' is not a recognized generation",
+                            path.display()
+                        ))
+                    })?
+                    .to_owned()
+            } else {
+                let Some(file_name) = generation_file_name(&path) else {
+                    continue;
+                };
+                generation_file_digest(&file_name)
+                    .ok_or_else(|| {
+                        CodeGenerationRetentionErrorV1::UnsafeState(format!(
+                            "generation manifest '{}' has no content-addressed file name",
+                            path.display()
+                        ))
+                    })?
+                    .to_owned()
+            };
+            if read_generation_format_revision(&path, is_cancelled)?
+                != SEALED_GENERATION_FORMAT_REVISION_V1
+            {
                 continue;
             }
-            let bytes = std::fs::read(&path).map_err(storage)?;
-            let identities =
-                tracedecay_code_index::production::CodeIndexPublishedGenerationV1::partitioned_segment_identities(
-                    &bytes,
+            let mut reader = CancellableGenerationManifestReaderV1 {
+                file: File::open(&path).map_err(storage)?,
+                hasher: Sha256::new(),
+                is_cancelled,
+                cancelled: false,
+            };
+            let identities = {
+                let buffered = BufReader::with_capacity(1024 * 1024, &mut reader);
+                tracedecay_code_index::production::CodeIndexPublishedGenerationV1::partitioned_segment_identities_from_reader(
+                    buffered,
                 )
-                .map_err(|error| {
-                    CodeGenerationRetentionErrorV1::UnsafeState(format!(
-                        "generation manifest '{}' cannot mark its segments: {error}",
-                        path.display()
-                    ))
-                })?;
+            };
+            if reader.cancelled {
+                return Err(CodeGenerationRetentionErrorV1::Cancelled);
+            }
+            if reader.digest_hex() != expected_digest {
+                return Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
+                    "generation manifest '{}' does not match its content-addressed file name",
+                    path.display()
+                )));
+            }
+            let identities = identities.map_err(|error| {
+                CodeGenerationRetentionErrorV1::UnsafeState(format!(
+                    "generation manifest '{}' cannot mark its segments: {error}",
+                    path.display()
+                ))
+            })?;
             if let Some(identities) = identities {
                 live_segments.extend(
                     identities
@@ -970,11 +1162,12 @@ fn collect_unreferenced_generation_segments(
         }
         Ok(())
     };
-    mark_root(&store_root.join(GENERATIONS_DIRECTORY))?;
+    mark_root(&store_root.join(GENERATIONS_DIRECTORY), false)?;
     if let Some(pool_root) = graph_replay_pool_root {
-        mark_root(pool_root)?;
+        mark_root(pool_root, true)?;
     }
 
+    let mut found = false;
     let mut reclaimed = 0_u64;
     for entry in entries {
         if observe_cancel(is_cancelled) {
@@ -1002,13 +1195,79 @@ fn collect_unreferenced_generation_segments(
                 path.display()
             )));
         }
+        found = true;
+        if !apply {
+            return Ok((true, 0));
+        }
         std::fs::remove_file(&path).map_err(storage)?;
         reclaimed = reclaimed.saturating_add(metadata.len());
     }
     if reclaimed > 0 {
         sync_directory(&segments_root)?;
     }
-    Ok(reclaimed)
+    Ok((found, reclaimed))
+}
+
+fn replay_generation_file_digest(file_name: &str) -> Option<&str> {
+    generation_file_digest(file_name).or_else(|| {
+        let (digest, suffix) = file_name
+            .strip_prefix(".generation-")?
+            .split_once(".unlink-")?;
+        (!suffix.is_empty() && is_lowercase_hex(digest, 64)).then_some(digest)
+    })
+}
+
+/// Whether the store holds any content-addressed segment file at all.
+///
+/// A bounded directory listing: no manifest is opened, so this is the only
+/// segment question a metadata-only census may answer. An empty or absent
+/// directory proves there is nothing to collect; anything else stays typed
+/// unknown until the mark-and-sweep runs.
+fn store_holds_generation_segments(
+    store_root: &Path,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, CodeGenerationRetentionErrorV1> {
+    let entries = match std::fs::read_dir(store_root.join(GENERATION_SEGMENTS_DIRECTORY)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(storage(error)),
+    };
+    for entry in entries {
+        if observe_cancel(is_cancelled) {
+            return Err(CodeGenerationRetentionErrorV1::Cancelled);
+        }
+        let entry = entry.map_err(storage)?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name
+            .strip_prefix("segment-")
+            .and_then(|name| name.strip_suffix(".json"))
+            .is_some_and(|digest| is_lowercase_hex(digest, 64))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn has_unreferenced_generation_segments(
+    store_root: &Path,
+    graph_replay_pool_root: Option<&Path>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, CodeGenerationRetentionErrorV1> {
+    sweep_unreferenced_generation_segments(store_root, graph_replay_pool_root, false, is_cancelled)
+        .map(|(found, _)| found)
+}
+
+fn collect_unreferenced_generation_segments(
+    store_root: &Path,
+    graph_replay_pool_root: Option<&Path>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<u64, CodeGenerationRetentionErrorV1> {
+    sweep_unreferenced_generation_segments(store_root, graph_replay_pool_root, true, is_cancelled)
+        .map(|(_, reclaimed)| reclaimed)
 }
 
 /// `graph_replay_pool_root` is the project graph's replay pool. When present,
@@ -1082,21 +1341,32 @@ pub fn execute_code_generation_retention_cancellable(
             "code-generation retention recovery is pending".to_owned(),
         ));
     }
-    if !plan.has_collectable_work() {
-        return Ok(CodeGenerationRetentionReportV1 {
-            plan,
-            deleted_generations: Vec::new(),
-            receipt: None,
-            deleted_text_artifacts: Vec::new(),
-            text_artifact_receipt: None,
-        });
-    }
     if read_optional_active_pointer(store_root)? != plan.active_pointer {
         return Err(CodeGenerationRetentionErrorV1::UnsafeState(
             "active generation changed after the retention mark phase".to_owned(),
         ));
     }
-    let mut reclaimed_segment_bytes = 0_u64;
+    let mut reclaimed_segment_bytes = if plan.collectable_generations.is_empty()
+        && plan.collectable_generation_segments == GenerationSegmentCensusV1::Present
+    {
+        let graph_replay_pool_lock = match graph_replay_pool_root {
+            Some(pool_root) => Some(acquire_graph_replay_pool_lock_checked(
+                pool_root,
+                Instant::now() + GRAPH_REPLAY_POOL_ACQUIRE_BUDGET,
+                is_cancelled,
+            )?),
+            None => None,
+        };
+        let reclaimed = collect_unreferenced_generation_segments(
+            store_root,
+            graph_replay_pool_root,
+            is_cancelled,
+        )?;
+        drop(graph_replay_pool_lock);
+        reclaimed
+    } else {
+        0
+    };
     let (deleted_generations, receipt) = if plan.collectable_generations.is_empty() {
         (Vec::new(), None)
     } else {
@@ -1312,6 +1582,7 @@ fn run_code_generation_retention_cancellable(
                 vector_readable_sources,
                 rollback_floor,
                 GenerationDigestVerificationV1::Full,
+                graph_replay_pool_root,
                 is_cancelled,
             )?
         }
@@ -1321,6 +1592,7 @@ fn run_code_generation_retention_cancellable(
                 vector_readable_sources,
                 rollback_floor,
                 GenerationDigestVerificationV1::Full,
+                graph_replay_pool_root,
                 is_cancelled,
             )?
         }

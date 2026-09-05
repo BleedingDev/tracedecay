@@ -53,11 +53,13 @@ impl DaemonSessionSyncService {
         self.persist_terminal(
             context,
             alias_key,
-            completion.termination,
-            completion.stats,
-            completion.coverage,
-            completion.source_frontiers,
-            completion.failure_codes,
+            SessionSyncTerminalMaterial {
+                termination: completion.termination,
+                stats: completion.stats,
+                coverage: completion.coverage,
+                source_frontiers: completion.source_frontiers,
+                failure_codes: completion.failure_codes,
+            },
         )
         .await
         .map(Some)
@@ -105,13 +107,16 @@ impl DaemonSessionSyncService {
                                         .persist_terminal(
                                             &context,
                                             &key,
-                                            OperationTermination::Unavailable,
-                                            journal.stats.clone(),
-                                            journal.coverage.clone(),
-                                            journal.source_frontiers.clone(),
-                                            vec![
-                                                "session_sync_coalesced_journal_invalid".to_owned(),
-                                            ],
+                                            SessionSyncTerminalMaterial {
+                                                termination: OperationTermination::Unavailable,
+                                                stats: journal.stats.clone(),
+                                                coverage: journal.coverage.clone(),
+                                                source_frontiers: journal.source_frontiers.clone(),
+                                                failure_codes: vec![
+                                                    "session_sync_coalesced_journal_invalid"
+                                                        .to_owned(),
+                                                ],
+                                            },
                                         )
                                         .await;
                                     return;
@@ -122,11 +127,13 @@ impl DaemonSessionSyncService {
                                     .persist_terminal(
                                         &context,
                                         &key,
-                                        completion.termination,
-                                        completion.stats,
-                                        completion.coverage,
-                                        completion.source_frontiers,
-                                        completion.failure_codes,
+                                        SessionSyncTerminalMaterial {
+                                            termination: completion.termination,
+                                            stats: completion.stats,
+                                            coverage: completion.coverage,
+                                            source_frontiers: completion.source_frontiers,
+                                            failure_codes: completion.failure_codes,
+                                        },
                                     )
                                     .await;
                                 return;
@@ -153,11 +160,15 @@ impl DaemonSessionSyncService {
                                 .persist_terminal(
                                     &context,
                                     &key,
-                                    OperationTermination::Unavailable,
-                                    journal.stats.clone(),
-                                    journal.coverage.clone(),
-                                    journal.source_frontiers.clone(),
-                                    vec!["session_sync_coalesced_journal_missing".to_owned()],
+                                    SessionSyncTerminalMaterial {
+                                        termination: OperationTermination::Unavailable,
+                                        stats: journal.stats.clone(),
+                                        coverage: journal.coverage.clone(),
+                                        source_frontiers: journal.source_frontiers.clone(),
+                                        failure_codes: vec![
+                                            "session_sync_coalesced_journal_missing".to_owned(),
+                                        ],
+                                    },
                                 )
                                 .await;
                             return;
@@ -168,11 +179,15 @@ impl DaemonSessionSyncService {
                                 .persist_terminal(
                                     &context,
                                     &key,
-                                    OperationTermination::Unavailable,
-                                    journal.stats.clone(),
-                                    journal.coverage.clone(),
-                                    journal.source_frontiers.clone(),
-                                    vec!["session_sync_coalesced_journal_read_failed".to_owned()],
+                                    SessionSyncTerminalMaterial {
+                                        termination: OperationTermination::Unavailable,
+                                        stats: journal.stats.clone(),
+                                        coverage: journal.coverage.clone(),
+                                        source_frontiers: journal.source_frontiers.clone(),
+                                        failure_codes: vec![
+                                            "session_sync_coalesced_journal_read_failed".to_owned(),
+                                        ],
+                                    },
                                 )
                                 .await;
                             return;
@@ -374,6 +389,36 @@ impl DaemonSessionSyncService {
     }
 }
 
+fn import_transcript_stats(
+    imported: tracedecay_sessions::TranscriptIngestStats,
+    git: Option<&tracedecay_global_db::GitEvidenceConvergenceStats>,
+) -> SessionSyncStatsV1 {
+    let mut stats = SessionSyncStatsV1 {
+        sessions_imported: imported.sessions_upserted,
+        messages_imported: imported.messages_upserted,
+        ..SessionSyncStatsV1::default()
+    };
+    if let Some(git) = git {
+        stats.sessions_scanned = saturating_usize_to_u64(git.backfill.sessions_scanned);
+        stats.spans_written = saturating_usize_to_u64(git.backfill.spans_written);
+        stats.commits_attributed = saturating_usize_to_u64(git.backfill.commits_attributed);
+        stats.skipped = saturating_usize_to_u64(git.backfill.skipped_total());
+    }
+    stats
+}
+
+fn git_convergence_deferred_units(
+    convergence: &tracedecay_global_db::GitEvidenceConvergenceOutcome,
+) -> u64 {
+    let stats = convergence.stats();
+    stats
+        .pending_publications
+        .unwrap_or(1)
+        .saturating_add(u64::from(stats.backfill_page_saturated))
+        .saturating_add(saturating_usize_to_u64(stats.backfill.skipped_git_error))
+        .saturating_add(u64::from(convergence.later_failure().is_some()))
+}
+
 impl SessionSyncProjectContext {
     #[hotpath::skip]
     pub(super) async fn source_frontiers_for(
@@ -513,12 +558,52 @@ impl SessionSyncProjectContext {
             let project = self
                 .ingest_project_transcripts(&project_authority, &pass_cancellation)
                 .await;
-            let project_stats = SessionSyncStatsV1 {
-                sessions_imported: project.stats.sessions_upserted,
-                messages_imported: project.stats.messages_upserted,
-                ..SessionSyncStatsV1::default()
+            let git_convergence = if pass_cancellation.is_cancelled() {
+                None
+            } else {
+                Some(
+                    GlobalDbGitCorrelationStore::new(project_sessions.clone())
+                        .converge_session_git_evidence(
+                            &tracedecay_sessions::runtime::git_correlation::SystemGit,
+                            tracedecay_sessions::runtime::git_correlation::DEFAULT_AUTO_BACKFILL_SESSIONS_PER_PASS,
+                            tracedecay_sessions::runtime::git_correlation::DEFAULT_GIT_EVIDENCE_PUBLICATION_REPLAY_LIMIT,
+                        )
+                        .await,
+                )
             };
-            let project_coverage = vec![source_coverage("project", project.coverage)];
+            let project_stats = import_transcript_stats(
+                project.stats,
+                git_convergence
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .map(tracedecay_global_db::GitEvidenceConvergenceOutcome::stats),
+            );
+            let git_deferred_units = match git_convergence.as_ref() {
+                Some(Ok(convergence)) => {
+                    if let Some(error) = convergence.later_failure() {
+                        tracing::warn!(%error, "startup session Git convergence made partial progress");
+                    }
+                    git_convergence_deferred_units(convergence)
+                }
+                Some(Err(error)) => {
+                    tracing::warn!(%error, "startup session Git convergence failed");
+                    1
+                }
+                None => 1,
+            };
+            let project_coverage = vec![
+                source_coverage("project", project.coverage),
+                SessionSyncSourceCoverageV1 {
+                    store_scope: "git".to_owned(),
+                    coverage: if git_deferred_units == 0 {
+                        SessionSyncCoverageV1::Complete
+                    } else {
+                        SessionSyncCoverageV1::Partial {
+                            deferred_units: git_deferred_units,
+                        }
+                    },
+                },
+            ];
             let project_progress = hotpath::future!(
                 service.persist_progress(
                     self,
@@ -532,6 +617,11 @@ impl SessionSyncProjectContext {
             .await;
             let project_progress_failed = project_progress.is_err();
             let project_frontiers = project_progress.unwrap_or_default();
+            let git_convergence_committed = git_convergence.as_ref().is_some_and(|result| {
+                result.as_ref().is_ok_and(
+                    tracedecay_global_db::GitEvidenceConvergenceOutcome::committed_progress,
+                )
+            });
 
             let profile_sweep_satisfied = {
                 let completed_profile_sweeps = service
@@ -578,11 +668,13 @@ impl SessionSyncProjectContext {
             let combined = user
                 .as_ref()
                 .map_or(project.stats, |user| project.stats.merge(user.stats));
-            let stats = SessionSyncStatsV1 {
-                sessions_imported: combined.sessions_upserted,
-                messages_imported: combined.messages_upserted,
-                ..SessionSyncStatsV1::default()
-            };
+            let stats = import_transcript_stats(
+                combined,
+                git_convergence
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .map(tracedecay_global_db::GitEvidenceConvergenceOutcome::stats),
+            );
             let mut coverage = project_coverage;
             coverage.push(user.as_ref().map_or_else(
                 || {
@@ -618,6 +710,9 @@ impl SessionSyncProjectContext {
                 source_frontiers,
                 project_frontiers,
                 project_progress_failed,
+                git_convergence.is_some_and(|result| result.is_err()),
+                git_deferred_units > 0,
+                git_convergence_committed,
             )
         };
         let pass = async {
@@ -646,11 +741,15 @@ impl SessionSyncProjectContext {
             source_frontiers,
             project_frontiers,
             project_progress_failed,
+            git_convergence_failed,
+            git_convergence_incomplete,
+            git_convergence_committed,
         ) = outcomes;
         let committed = project.scheduling_state_written
             || user
                 .as_ref()
                 .is_some_and(|outcome| outcome.scheduling_state_written)
+            || git_convergence_committed
             || stats != SessionSyncStatsV1::default();
         let mut failure_codes = project
             .failures
@@ -660,6 +759,11 @@ impl SessionSyncProjectContext {
             .collect::<Vec<_>>();
         if project_progress_failed || source_frontiers.is_err() {
             failure_codes.push("session_sync_frontier_persist_failed".to_owned());
+        }
+        if git_convergence_failed {
+            failure_codes.push("git_convergence_failed".to_owned());
+        } else if git_convergence_incomplete {
+            failure_codes.push("git_convergence_incomplete".to_owned());
         }
         let source_frontiers = source_frontiers.unwrap_or(project_frontiers);
         if committed {
@@ -944,5 +1048,78 @@ pub(super) fn log_session_sync_join(result: Result<(), tokio::task::JoinError>) 
         && !error.is_cancelled()
     {
         tracing::warn!(%error, "session sync worker join failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saturated_git_only_import_preserves_committed_partial_receipt_evidence() {
+        let convergence = tracedecay_global_db::GitEvidenceConvergenceOutcome::Complete(
+            tracedecay_global_db::GitEvidenceConvergenceStats {
+                replayed_publications: 0,
+                pending_publications: Some(0),
+                backfill: tracedecay_sessions::runtime::git_correlation::BackfillStats {
+                    sessions_scanned: 50,
+                    spans_written: 2,
+                    commits_attributed: 3,
+                    skipped_not_worktree: 4,
+                    frontier_advanced: true,
+                    ..tracedecay_sessions::runtime::git_correlation::BackfillStats::default()
+                },
+                backfill_page_saturated: true,
+            },
+        );
+
+        let stats = import_transcript_stats(
+            tracedecay_sessions::TranscriptIngestStats::default(),
+            Some(convergence.stats()),
+        );
+
+        assert_eq!(stats.sessions_imported, 0);
+        assert_eq!(stats.messages_imported, 0);
+        assert_eq!(stats.sessions_scanned, 50);
+        assert_eq!(stats.spans_written, 2);
+        assert_eq!(stats.commits_attributed, 3);
+        assert_eq!(stats.skipped, 4);
+        assert_eq!(git_convergence_deferred_units(&convergence), 1);
+        assert!(convergence.committed_progress());
+        assert_eq!(
+            completion_termination(None, true, &stats, false, true),
+            OperationTermination::Partial
+        );
+    }
+
+    #[test]
+    fn later_git_failure_preserves_committed_startup_progress() {
+        let convergence = tracedecay_global_db::GitEvidenceConvergenceOutcome::Partial {
+            progress: tracedecay_global_db::GitEvidenceConvergenceStats {
+                replayed_publications: 1,
+                pending_publications: Some(0),
+                backfill: tracedecay_sessions::runtime::git_correlation::BackfillStats {
+                    sessions_scanned: 1,
+                    spans_written: 1,
+                    frontier_advanced: true,
+                    skipped_git_error: 1,
+                    ..Default::default()
+                },
+                backfill_page_saturated: false,
+            },
+            later_failure:
+                tracedecay_sessions::runtime::git_correlation::GitCorrelationError::Unavailable(
+                    "retained worktree temporarily unreadable".to_owned(),
+                ),
+        };
+
+        let stats = import_transcript_stats(
+            tracedecay_sessions::TranscriptIngestStats::default(),
+            Some(convergence.stats()),
+        );
+        assert_eq!(stats.sessions_scanned, 1);
+        assert_eq!(stats.spans_written, 1);
+        assert!(git_convergence_deferred_units(&convergence) > 0);
+        assert!(convergence.committed_progress());
     }
 }

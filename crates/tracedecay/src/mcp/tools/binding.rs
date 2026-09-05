@@ -19,14 +19,16 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
+use tracedecay_application::RetainedSurfaceOperation;
 use tracedecay_application::multi_root::{
     MultiRootApplicationOperation, multi_root_capability_manifest,
 };
 use tracedecay_tool_catalog::{
-    BindingSurface, CancellationContract, CancellationPoint, EffectClass, ExecutableBindingV1,
-    McpDeadlineContractV1, McpDispatchAvailability, McpDispatchCatalogV1,
-    McpDispatchContractInputV1, McpDispatchContractV1, McpDispatchUnavailableReason,
-    McpIdempotencyContract, McpInverseContract, McpInverseUnavailableReason, McpTerminalState,
+    ApplicationSurfaceOperation, BindingSurface, CancellationContract, CancellationPoint,
+    EffectClass, ExecutableBindingV1, McpDeadlineContractV1, McpDispatchAvailability,
+    McpDispatchCatalogV1, McpDispatchContractInputV1, McpDispatchContractV1,
+    McpDispatchUnavailableReason, McpIdempotencyContract, McpInverseContract,
+    McpInverseUnavailableReason, McpTerminalState,
 };
 
 mod work;
@@ -54,6 +56,171 @@ pub(crate) enum McpToolDispatchGroup {
     SessionWorkflow,
     Work,
     Workflow,
+}
+
+/// Whether a tool's authority depends on the live checked-out branch.
+///
+/// Kept internal: the `tracedecay/dispatch` contract has no field family for
+/// this policy, and advertising it would freeze a request-routing concern
+/// into the wire catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BranchSensitivity {
+    /// Reads the code graph, project files, or git. Must detect a checkout
+    /// on the next request (today's `reopen_if_branch_drifted_memoized` path).
+    Sensitive,
+    /// Retained memory, configuration, work, and workflow authority. The
+    /// serving snapshot is enough; a live HEAD probe cannot change the answer.
+    Independent,
+}
+
+/// Classifies a dispatched tool's dependence on the live git branch.
+///
+/// Unknown and unlisted names are [`BranchSensitivity::Sensitive`] so a newly
+/// advertised tool keeps today's drift detection until it is classified.
+pub(crate) fn tool_branch_sensitivity(tool_name: &str) -> BranchSensitivity {
+    if let Some(operation) = ApplicationSurfaceOperation::from_tool_name(tool_name) {
+        return application_surface_branch_sensitivity(operation);
+    }
+    match dispatch_group_for_tool(tool_name) {
+        Some(
+            McpToolDispatchGroup::Graph
+            | McpToolDispatchGroup::Info
+            | McpToolDispatchGroup::Admin
+            | McpToolDispatchGroup::Analysis
+            | McpToolDispatchGroup::Git
+            | McpToolDispatchGroup::Edit
+            | McpToolDispatchGroup::Health
+            | McpToolDispatchGroup::MultiRoot
+            | McpToolDispatchGroup::ApplicationSurface
+            | McpToolDispatchGroup::SessionWorkflow,
+        ) => BranchSensitivity::Sensitive,
+        Some(
+            McpToolDispatchGroup::RetainedApplication
+            | McpToolDispatchGroup::Memory
+            | McpToolDispatchGroup::Work
+            | McpToolDispatchGroup::Workflow,
+        ) => BranchSensitivity::Independent,
+        None => {
+            if RetainedSurfaceOperation::from_tool_name(tool_name).is_some() {
+                BranchSensitivity::Independent
+            } else {
+                BranchSensitivity::Sensitive
+            }
+        }
+    }
+}
+
+fn application_surface_branch_sensitivity(
+    operation: ApplicationSurfaceOperation,
+) -> BranchSensitivity {
+    use ApplicationSurfaceOperation::{
+        AffectedTests, CallChain, CodeCallees, CodeCallers, CodeDeclaration, CodeDefinition,
+        CodeExactOccurrence, CodeFacets, CodeImplementations, CodePhraseSearch, CodeReferences,
+        CodeSignatureSearch, CodeSymbolSearch, CodeTimeline, CodeTypeDefinition, CodeTypeHierarchy,
+        ConfigurationAudit, ConfigurationBatch, ConfigurationExplain, ConfigurationGet,
+        ConfigurationList, ConfigurationObservedState, ConfigurationProtectedApply,
+        ConfigurationProtectedPreview, ConfigurationRollbackApply, ConfigurationRollbackPreview,
+        ConfigurationSet, ConfigurationUnset, ConfigurationWriteCredential, ContextScoutBudget,
+        ContextScoutCancel, ContextScoutCapability, ContextScoutClaim, ContextScoutDelivery,
+        ContextScoutExplain, ContextScoutFeedback, ContextScoutPause, ContextScoutRecent,
+        ContextScoutResume, ContextScoutStatus, DiagnosticsRead, FeedbackAdvisoryCycle,
+        FeedbackDiagnostics, FeedbackExpand, FeedbackGet, FeedbackImpact, FeedbackList,
+        FileDependents, FileMetadata, GitApply, GitBlame, GitDiff, GitHistory,
+        GitHubStackSignalExpand, GitHunks, GitPreview, GitStatus, HealthDelta, HealthRead,
+        ModuleApi, NativeIntegrationApply, NativeIntegrationApprove, NativeIntegrationCancel,
+        NativeIntegrationPreflight, NativeIntegrationStackSnapshot, NativeIntegrationStatus,
+        NativeIntegrationWorktreeConfirm, NativeIntegrationWorktreeInspect,
+        NativeIntegrationWorktreeInventory, NativeIntegrationWorktreeReconcile,
+        NativeIntegrationWorktreeRemove, ObservatoryRead, QualifiedName, SessionLookup, SourceBody,
+        SourceLines, SourceOutline, StorageStatus, TestResults,
+    };
+    match operation {
+        // Mixed ApplicationSurface group: these operations read configuration,
+        // host-integration lifecycle, session identity, store identity, or
+        // process observability — never the checkout, code graph, or files.
+        ConfigurationList
+        | ConfigurationExplain
+        | ConfigurationGet
+        | ConfigurationSet
+        | ConfigurationUnset
+        | ConfigurationBatch
+        | ConfigurationWriteCredential
+        | ConfigurationObservedState
+        | ConfigurationProtectedPreview
+        | ConfigurationProtectedApply
+        | ConfigurationRollbackPreview
+        | ConfigurationRollbackApply
+        | ConfigurationAudit
+        | ContextScoutStatus
+        | ContextScoutRecent
+        | ContextScoutExplain
+        | ContextScoutCapability
+        | ContextScoutBudget
+        | ContextScoutPause
+        | ContextScoutResume
+        | ContextScoutCancel
+        | ContextScoutClaim
+        | ContextScoutDelivery
+        | ContextScoutFeedback
+        | SessionLookup
+        | StorageStatus
+        | ObservatoryRead
+        | NativeIntegrationPreflight
+        | NativeIntegrationApprove
+        | NativeIntegrationApply
+        | NativeIntegrationStatus
+        | NativeIntegrationCancel => BranchSensitivity::Independent,
+        // Mixed ApplicationSurface group: git walks, worktree inventory, stack
+        // snapshots, code-graph reads, source-file bodies, health, diagnostics,
+        // and post-edit feedback all depend on the current checkout or graph.
+        GitStatus
+        | GitDiff
+        | GitHistory
+        | GitBlame
+        | GitHunks
+        | GitPreview
+        | GitApply
+        | GitHubStackSignalExpand
+        | NativeIntegrationStackSnapshot
+        | NativeIntegrationWorktreeInventory
+        | NativeIntegrationWorktreeInspect
+        | NativeIntegrationWorktreeConfirm
+        | NativeIntegrationWorktreeRemove
+        | NativeIntegrationWorktreeReconcile
+        | FeedbackDiagnostics
+        | FeedbackGet
+        | FeedbackExpand
+        | FeedbackList
+        | FeedbackImpact
+        | FeedbackAdvisoryCycle
+        | AffectedTests
+        | TestResults
+        | CodeExactOccurrence
+        | CodePhraseSearch
+        | CodeSymbolSearch
+        | CodeSignatureSearch
+        | CodeImplementations
+        | CodeTypeHierarchy
+        | CodeCallers
+        | CodeCallees
+        | CodeFacets
+        | CodeTimeline
+        | CodeDeclaration
+        | CodeDefinition
+        | CodeTypeDefinition
+        | CodeReferences
+        | QualifiedName
+        | CallChain
+        | FileDependents
+        | SourceLines
+        | SourceBody
+        | SourceOutline
+        | ModuleApi
+        | FileMetadata
+        | HealthRead
+        | HealthDelta
+        | DiagnosticsRead => BranchSensitivity::Sensitive,
+    }
 }
 
 /// How a tool may be pointed at a project other than the active one.
@@ -275,6 +442,7 @@ const MCP_TOOL_BINDING_SPECS: &[McpToolBinding] = &[
     McpToolBinding { name: "tracedecay_fact_store_get", group: None, project: RegisteredProjectAccess::SelectorOnly },
     McpToolBinding { name: "tracedecay_fact_store_update", group: None, project: RegisteredProjectAccess::SelectorOnly },
     McpToolBinding { name: "tracedecay_fact_store_remove", group: None, project: RegisteredProjectAccess::SelectorOnly },
+    McpToolBinding { name: "tracedecay_fact_store_supersede", group: None, project: RegisteredProjectAccess::SelectorOnly },
     McpToolBinding { name: "tracedecay_fact_store_list", group: None, project: RegisteredProjectAccess::SelectorOnly },
     McpToolBinding { name: "tracedecay_memory_status", group: None, project: RegisteredProjectAccess::SelectorOnly },
     McpToolBinding { name: "tracedecay_message_search", group: None, project: RegisteredProjectAccess::SelectorOnly },
@@ -379,6 +547,7 @@ fn direct_effect(tool_name: &str) -> EffectClass {
         | "tracedecay_fact_store_add"
         | "tracedecay_fact_store_update"
         | "tracedecay_fact_store_remove"
+        | "tracedecay_fact_store_supersede"
         | "tracedecay_fact_feedback"
         | "tracedecay_session_refresh"
         | "tracedecay_session_refresh_begin"
@@ -421,7 +590,7 @@ fn multi_root_capability_for_tool(
 pub(super) struct DispatchCatalogBinding {
     pub(super) name: String,
     pub(super) group: Option<McpToolDispatchGroup>,
-    pub(super) executable_binding: Option<ExecutableBindingV1>,
+    pub(super) executable_binding: Option<&'static ExecutableBindingV1>,
 }
 
 fn dispatch_catalog_bindings()
@@ -626,6 +795,7 @@ fn verified_effect_journey(tool_name: &str) -> bool {
             | "tracedecay_fact_store_add"
             | "tracedecay_fact_store_update"
             | "tracedecay_fact_store_remove"
+            | "tracedecay_fact_store_supersede"
             | "tracedecay_fact_feedback"
             | "tracedecay_session_refresh"
             | "tracedecay_session_refresh_begin"
@@ -735,7 +905,7 @@ fn build_mcp_dispatch_catalog()
     for binding in dispatch_catalog_bindings()? {
         let application_capability = application_capability_for_tool(&binding.name)?;
         let multi_root_capability = multi_root_capability_for_tool(&binding.name)?;
-        let executable_binding = binding.executable_binding.as_ref();
+        let executable_binding = binding.executable_binding;
         // The multi-root catalog is the sole contract authority for its own
         // tools; every field below prefers it and falls back to the
         // application-surface capability for everything else.
@@ -871,7 +1041,7 @@ pub(super) fn registered_project_reader_tool_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use tracedecay_application::RetainedSurfaceOperation;
-    use tracedecay_tool_catalog::ApplicationSurfaceOperation;
+    use tracedecay_tool_catalog::{ApplicationSurfaceOperation, ProfileId};
 
     use super::*;
 
@@ -1089,6 +1259,7 @@ mod tests {
             "tracedecay_fact_store_get",
             "tracedecay_fact_store_update",
             "tracedecay_fact_store_remove",
+            "tracedecay_fact_store_supersede",
             "tracedecay_fact_store_list",
             "tracedecay_memory_status",
         ] {
@@ -1099,6 +1270,7 @@ mod tests {
             "tracedecay_fact_store_add",
             "tracedecay_fact_store_update",
             "tracedecay_fact_store_remove",
+            "tracedecay_fact_store_supersede",
         ] {
             assert!(
                 tool_is_selector_bound_effect(tool_name),
@@ -1149,5 +1321,247 @@ mod tests {
                 entry.name
             );
         }
+    }
+
+    /// Every Independent catalog tool, plus one Sensitive representative per
+    /// dispatch family that still reopens on branch drift. An advertised tool
+    /// missing from this table must stay Sensitive (fail-safe).
+    #[rustfmt::skip]
+    const PINNED_BRANCH_SENSITIVITY: &[(&str, BranchSensitivity)] = &[
+        // Memory: ledger / skill / analytics reads. Handlers use project_root,
+        // store_layout, and memory identity — never the code graph.
+        ("tracedecay_automation_run_list", BranchSensitivity::Independent),
+        ("tracedecay_automation_run_view", BranchSensitivity::Independent),
+        ("tracedecay_automation_run_artifact_view", BranchSensitivity::Independent),
+        ("tracedecay_analytics", BranchSensitivity::Independent),
+        ("tracedecay_skill_list", BranchSensitivity::Independent),
+        ("tracedecay_skill_view", BranchSensitivity::Independent),
+        ("tracedecay_hermes_skill_bridge", BranchSensitivity::Independent),
+        // Work: product-graph / attempt lifecycle via the Work daemon owner.
+        // `handle_work` does not take `cg`; MutateGraph writes the Work
+        // product graph, not the code index.
+        ("tracedecay_work_generate_proposal", BranchSensitivity::Independent),
+        ("tracedecay_work_create", BranchSensitivity::Independent),
+        ("tracedecay_work_review_proposal", BranchSensitivity::Independent),
+        ("tracedecay_work_accept_proposal", BranchSensitivity::Independent),
+        ("tracedecay_work_admit_execution", BranchSensitivity::Independent),
+        ("tracedecay_work_start_attempt", BranchSensitivity::Independent),
+        ("tracedecay_work_synthesize", BranchSensitivity::Independent),
+        ("tracedecay_work_attempt_status", BranchSensitivity::Independent),
+        ("tracedecay_work_cancel_attempt", BranchSensitivity::Independent),
+        ("tracedecay_work_resume_attempts", BranchSensitivity::Independent),
+        ("tracedecay_work_retry_attempt", BranchSensitivity::Independent),
+        ("tracedecay_work_list_attempts", BranchSensitivity::Independent),
+        ("tracedecay_work_execution_history", BranchSensitivity::Independent),
+        ("tracedecay_work_hydrate_artifacts", BranchSensitivity::Independent),
+        ("tracedecay_work_retrieve_evidence", BranchSensitivity::Independent),
+        ("tracedecay_work_views", BranchSensitivity::Independent),
+        ("tracedecay_work_experience", BranchSensitivity::Independent),
+        ("tracedecay_work_compare_proposal", BranchSensitivity::Independent),
+        ("tracedecay_work_prepare_graph_mutation", BranchSensitivity::Independent),
+        ("tracedecay_work_mutate_graph", BranchSensitivity::Independent),
+        ("tracedecay_work_topology", BranchSensitivity::Independent),
+        ("tracedecay_work_topology_metrics", BranchSensitivity::Independent),
+        ("tracedecay_work_prepare_duplicate_adjudication", BranchSensitivity::Independent),
+        ("tracedecay_work_adjudicate_duplicate", BranchSensitivity::Independent),
+        ("tracedecay_work_adjudicate_leak", BranchSensitivity::Independent),
+        ("tracedecay_work_pause_run", BranchSensitivity::Independent),
+        ("tracedecay_work_resume_run", BranchSensitivity::Independent),
+        ("tracedecay_work_run_control", BranchSensitivity::Independent),
+        ("tracedecay_work_placement_preflight", BranchSensitivity::Independent),
+        ("tracedecay_work_admit_placement", BranchSensitivity::Independent),
+        ("tracedecay_work_placement_status", BranchSensitivity::Independent),
+        ("tracedecay_work_release_placement", BranchSensitivity::Independent),
+        // Workflow: definition and run lifecycle via the Workflow daemon owner.
+        // `handle_workflow` does not take `cg`.
+        ("tracedecay_workflow_register_definition", BranchSensitivity::Independent),
+        ("tracedecay_workflow_activate_definition", BranchSensitivity::Independent),
+        ("tracedecay_workflow_retire_definition", BranchSensitivity::Independent),
+        ("tracedecay_workflow_reject_definition", BranchSensitivity::Independent),
+        ("tracedecay_workflow_validate_definition", BranchSensitivity::Independent),
+        ("tracedecay_workflow_get_definition", BranchSensitivity::Independent),
+        ("tracedecay_workflow_list_definitions", BranchSensitivity::Independent),
+        ("tracedecay_workflow_definition_history", BranchSensitivity::Independent),
+        ("tracedecay_workflow_diff_definition", BranchSensitivity::Independent),
+        ("tracedecay_workflow_handoff_issue", BranchSensitivity::Independent),
+        ("tracedecay_workflow_handoff_redeem", BranchSensitivity::Independent),
+        ("tracedecay_workflow_start_run", BranchSensitivity::Independent),
+        ("tracedecay_workflow_pause_run", BranchSensitivity::Independent),
+        ("tracedecay_workflow_resume_run", BranchSensitivity::Independent),
+        ("tracedecay_workflow_cancel_run", BranchSensitivity::Independent),
+        ("tracedecay_workflow_get_run", BranchSensitivity::Independent),
+        // Retained surface: fact-store, LCM, and session memory. Dispatch
+        // renders with `cg.project_root()` only.
+        ("tracedecay_fact_store_curate", BranchSensitivity::Independent),
+        ("tracedecay_fact_store_add", BranchSensitivity::Independent),
+        ("tracedecay_fact_store_search", BranchSensitivity::Independent),
+        ("tracedecay_fact_store_probe", BranchSensitivity::Independent),
+        ("tracedecay_fact_store_related", BranchSensitivity::Independent),
+        ("tracedecay_fact_store_reason", BranchSensitivity::Independent),
+        ("tracedecay_fact_store_contradict", BranchSensitivity::Independent),
+        ("tracedecay_fact_store_get", BranchSensitivity::Independent),
+        ("tracedecay_fact_store_update", BranchSensitivity::Independent),
+        ("tracedecay_fact_store_remove", BranchSensitivity::Independent),
+        ("tracedecay_fact_store_list", BranchSensitivity::Independent),
+        ("tracedecay_fact_store_supersede", BranchSensitivity::Independent),
+        ("tracedecay_fact_feedback", BranchSensitivity::Independent),
+        ("tracedecay_memory_status", BranchSensitivity::Independent),
+        ("tracedecay_session_refresh", BranchSensitivity::Independent),
+        ("tracedecay_session_refresh_status", BranchSensitivity::Independent),
+        ("tracedecay_session_refresh_cancel", BranchSensitivity::Independent),
+        ("tracedecay_session_refresh_begin", BranchSensitivity::Independent),
+        ("tracedecay_message_search", BranchSensitivity::Independent),
+        ("tracedecay_sessions_for", BranchSensitivity::Independent),
+        ("tracedecay_workflows", BranchSensitivity::Independent),
+        ("tracedecay_lcm_status", BranchSensitivity::Independent),
+        ("tracedecay_lcm_doctor", BranchSensitivity::Independent),
+        ("tracedecay_lcm_load_session", BranchSensitivity::Independent),
+        ("tracedecay_lcm_grep", BranchSensitivity::Independent),
+        ("tracedecay_lcm_describe", BranchSensitivity::Independent),
+        ("tracedecay_lcm_expand", BranchSensitivity::Independent),
+        ("tracedecay_lcm_expand_query", BranchSensitivity::Independent),
+        // ApplicationSurface Independent: configuration, scout lifecycle,
+        // session identity, store status, observatory, host-integration
+        // apply. MCP render uses `cg.project_root()` only; owners do not
+        // read the code graph.
+        ("tracedecay_configuration_list", BranchSensitivity::Independent),
+        ("tracedecay_configuration_explain", BranchSensitivity::Independent),
+        ("tracedecay_configuration_get", BranchSensitivity::Independent),
+        ("tracedecay_configuration_set", BranchSensitivity::Independent),
+        ("tracedecay_configuration_unset", BranchSensitivity::Independent),
+        ("tracedecay_configuration_batch", BranchSensitivity::Independent),
+        ("tracedecay_configuration_write_credential", BranchSensitivity::Independent),
+        ("tracedecay_configuration_observed_state", BranchSensitivity::Independent),
+        ("tracedecay_configuration_protected_preview", BranchSensitivity::Independent),
+        ("tracedecay_configuration_protected_apply", BranchSensitivity::Independent),
+        ("tracedecay_configuration_rollback_preview", BranchSensitivity::Independent),
+        ("tracedecay_configuration_rollback_apply", BranchSensitivity::Independent),
+        ("tracedecay_configuration_audit", BranchSensitivity::Independent),
+        ("tracedecay_context_scout_status", BranchSensitivity::Independent),
+        ("tracedecay_context_scout_recent", BranchSensitivity::Independent),
+        ("tracedecay_context_scout_explain", BranchSensitivity::Independent),
+        ("tracedecay_context_scout_capability", BranchSensitivity::Independent),
+        ("tracedecay_context_scout_budget", BranchSensitivity::Independent),
+        ("tracedecay_context_scout_pause", BranchSensitivity::Independent),
+        ("tracedecay_context_scout_resume", BranchSensitivity::Independent),
+        ("tracedecay_context_scout_cancel", BranchSensitivity::Independent),
+        ("tracedecay_context_scout_claim", BranchSensitivity::Independent),
+        ("tracedecay_context_scout_delivery", BranchSensitivity::Independent),
+        ("tracedecay_context_scout_feedback", BranchSensitivity::Independent),
+        ("tracedecay_session_lookup", BranchSensitivity::Independent),
+        ("tracedecay_storage_status", BranchSensitivity::Independent),
+        ("tracedecay_observatory_read", BranchSensitivity::Independent),
+        ("tracedecay_preflight_native_integration", BranchSensitivity::Independent),
+        ("tracedecay_approve_native_integration", BranchSensitivity::Independent),
+        ("tracedecay_apply_native_integration", BranchSensitivity::Independent),
+        ("tracedecay_native_integration_status", BranchSensitivity::Independent),
+        ("tracedecay_cancel_native_integration", BranchSensitivity::Independent),
+        // One Sensitive representative per remaining dispatch family.
+        ("tracedecay_search", BranchSensitivity::Sensitive),
+        ("tracedecay_status", BranchSensitivity::Sensitive),
+        ("tracedecay_admin_cli", BranchSensitivity::Sensitive),
+        ("tracedecay_dead_code", BranchSensitivity::Sensitive),
+        ("tracedecay_affected", BranchSensitivity::Sensitive),
+        ("tracedecay_str_replace", BranchSensitivity::Sensitive),
+        ("tracedecay_health", BranchSensitivity::Sensitive),
+        ("tracedecay_multi_root_execute", BranchSensitivity::Sensitive),
+        ("tracedecay_code_symbol_search", BranchSensitivity::Sensitive),
+        ("tracedecay_diagnose", BranchSensitivity::Sensitive),
+        ("tracedecay_run_affected_tests", BranchSensitivity::Sensitive),
+        ("tracedecay_dashboard", BranchSensitivity::Sensitive),
+    ];
+
+    fn advertised_tool_names(mode: tracedecay_mcp::ToolRegistryMode) -> Vec<String> {
+        use crate::mcp::tools::catalog_discovery::{
+            default_catalog_discovery_authority, get_catalog_filtered_tool_definitions_with_budget,
+        };
+        use tracedecay_mcp::{explore_call_budget, project_catalog_discovery_scope};
+
+        let profile_id = ProfileId::new(tracedecay_application::APPLICATION_DEFAULT_PROFILE_ID)
+            .expect("default profile");
+        get_catalog_filtered_tool_definitions_with_budget(
+            0,
+            explore_call_budget(0),
+            &profile_id,
+            &default_catalog_discovery_authority().expect("default discovery authority"),
+            &project_catalog_discovery_scope(),
+            mode,
+        )
+        .expect("advertised tools")
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect()
+    }
+
+    /// Every advertised tool resolves to one policy without panicking. The
+    /// pinned table is the Independent allowlist plus one Sensitive
+    /// representative per remaining family; an unlisted advertised Independent
+    /// classification is a failed audit, not a silent pass.
+    #[test]
+    fn advertised_tools_have_exactly_one_branch_sensitivity_policy() {
+        use std::collections::HashMap;
+        use tracedecay_mcp::ToolRegistryMode;
+
+        let pinned: HashMap<&str, BranchSensitivity> =
+            PINNED_BRANCH_SENSITIVITY.iter().copied().collect();
+        for (name, expected) in PINNED_BRANCH_SENSITIVITY {
+            assert_eq!(
+                tool_branch_sensitivity(name),
+                *expected,
+                "{name} must keep its pinned branch-sensitivity"
+            );
+        }
+        let mut policies = HashMap::new();
+        let mut advertised = 0usize;
+        for mode in [
+            ToolRegistryMode::DeterministicMaximal,
+            ToolRegistryMode::HostAvailable,
+        ] {
+            for name in advertised_tool_names(mode) {
+                advertised += 1;
+                let policy = tool_branch_sensitivity(&name);
+                assert!(
+                    matches!(
+                        policy,
+                        BranchSensitivity::Sensitive | BranchSensitivity::Independent
+                    ),
+                    "{name} must resolve to exactly one sensitivity policy"
+                );
+                if let Some(previous) = policies.insert(name.clone(), policy) {
+                    assert_eq!(
+                        previous, policy,
+                        "{name} must not change policy across registry modes"
+                    );
+                }
+                if let Some(expected) = pinned.get(name.as_str()) {
+                    assert_eq!(
+                        policy, *expected,
+                        "{name} must keep its pinned branch-sensitivity"
+                    );
+                } else {
+                    assert_eq!(
+                        policy,
+                        BranchSensitivity::Sensitive,
+                        "{name} is not in the Independent pin and must stay Sensitive"
+                    );
+                }
+            }
+        }
+        assert!(
+            advertised > 0,
+            "tools/list must advertise at least one tool in each registry mode"
+        );
+        assert!(
+            policies
+                .values()
+                .any(|policy| *policy == BranchSensitivity::Independent),
+            "the advertised set must include the pinned Independent tools"
+        );
+        assert!(
+            policies
+                .values()
+                .any(|policy| *policy == BranchSensitivity::Sensitive),
+            "the advertised set must include branch-sensitive graph/git/edit tools"
+        );
     }
 }

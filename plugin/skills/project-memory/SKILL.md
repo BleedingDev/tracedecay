@@ -70,16 +70,24 @@ authority. Hard rules that always apply:
   an exact deletion instruction needs no redundant confirmation.
 - Subagents may inspect and recommend only — never let a subagent call
   `tracedecay_fact_store_add`, `tracedecay_fact_store_update`,
-  `tracedecay_fact_store_remove`, or `tracedecay_fact_feedback`.
+  `tracedecay_fact_store_remove`, `tracedecay_fact_store_supersede`, or
+  `tracedecay_fact_feedback`.
+- Prefer `tracedecay_fact_store_supersede` over removal when a newer fact
+  corrects an older one: name the successor fact id, the old fact leaves
+  default search/list/probe results but stays readable by id through its
+  history, and payload, trust, and provenance are never rewritten. A fact has
+  exactly one successor; superseding it again with a different fact is a
+  typed refusal.
 - Do not lower trust merely for age; cite newer evidence or a contradiction.
 
 ## If tools are deferred or MCP fails
 
 - Deferred: one ToolSearch call —
   `select:tracedecay_fact_store_search,tracedecay_fact_store_add,tracedecay_fact_store_get,tracedecay_fact_store_list,tracedecay_fact_store_probe,tracedecay_memory_status,tracedecay_message_search,tracedecay_fact_feedback,tracedecay_fact_store_curate`.
-- MCP error: `tracedecay tool tracedecay_fact_store_search --query …` (see
-  `tracedecay:using-the-cli`). An MCP failure is not a reason to write
-  MEMORY.md — the CLI reaches the same store.
+- MCP transport error: use the equivalent CLI tool only while the daemon
+  remains available (see `tracedecay:using-the-cli`). An unavailable or
+  intentionally held daemon is not a reason to retry, change lifecycle, or
+  write MEMORY.md; report that durable memory is unavailable.
 
 ## Deliverable
 

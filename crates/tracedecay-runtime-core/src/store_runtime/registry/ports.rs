@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tracedecay_rusqlite_runtime::repository::{
-    RepositoryPhysicalAttachmentFactory, RepositoryRuntimePhysicalAttachment,
-    RepositoryRuntimePhysicalSnapshot,
+    RepositoryDispatchError, RepositoryPhysicalAttachmentFactory,
+    RepositoryRuntimePhysicalAttachment, RepositoryRuntimePhysicalSnapshot,
 };
 use tracedecay_store::{
     AdmissionConfigV1, RuntimeMaintenanceStateV1, RuntimeReadOutcomeV1, RuntimeReadRequestV1,
@@ -157,12 +157,20 @@ async fn publish_lifecycle_runtime(
     }
     if request.mode == StoreRuntimeOpenMode::Existing
         && runtime_core_final_schema_applies(&request.binding.shard_id.scope)
-        && let Err(error) =
+    {
+        if let Err(error) =
+            step_final_schema_before_existing_publication(&request, attachment.as_physical()).await
+        {
+            attachment.abort(request.locator.is_prospective());
+            return Err(error);
+        }
+        if let Err(error) =
             verify_final_schema_before_existing_publication(&request, attachment.as_physical())
                 .await
-    {
-        attachment.abort(request.locator.is_prospective());
-        return Err(error);
+        {
+            attachment.abort(request.locator.is_prospective());
+            return Err(error);
+        }
     }
     if let Err(error) = runtime.transition(RuntimeMaintenanceStateV1::Ready) {
         attachment.abort(request.locator.is_prospective());
@@ -319,9 +327,12 @@ impl tracedecay_rusqlite_runtime::exact_sql::ExactSqlWriteAuthority
                 )
             })?;
         let identity =
-            crate::db::sqlite_generation_identity(&self.canonical_path).map_err(|_| {
+            crate::db::sqlite_generation_identity(&self.canonical_path).map_err(|source| {
                 tracedecay_rusqlite_runtime::exact_sql::ExactSqlError::AuthorityDenied(
-                    "could not verify initialized SQLite file identity".to_owned(),
+                    super::sqlite_file_identity_authority_denial(
+                        "install final schema for initialized SQLite runtime",
+                        source,
+                    ),
                 )
             })?;
         if identity != self.opened_file_identity {
@@ -335,45 +346,43 @@ impl tracedecay_rusqlite_runtime::exact_sql::ExactSqlWriteAuthority
     }
 }
 
-async fn install_final_schema_before_publication(
+/// A write-authorized exact-SQL connection on the attached store for schema
+/// work, bound to the originating database authority and the opened file
+/// identity so the authority cannot outlive the file it was issued for.
+async fn authorized_schema_connection(
     request: &ShardRuntimeBuildRequest,
     attachment: &dyn PhysicalRuntimeAttachment,
-) -> Result<(), StoreRuntimeRegistryFailure> {
+    operation: &'static str,
+) -> Result<crate::db::engine::Connection, StoreRuntimeRegistryFailure> {
     let authority = request.database_authority.clone().ok_or_else(|| {
         StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
-            operation: "install final schema for initialized SQLite runtime",
+            operation,
             message: "initialization requires originating database authority".to_owned(),
         }
     })?;
     authority
-        .require_active_write_scope("install final schema for initialized SQLite runtime")
+        .require_active_write_scope(operation)
         .map_err(|error| StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
-            operation: "install final schema for initialized SQLite runtime",
+            operation,
             message: error.to_string(),
         })?;
     if authority.canonical_database_path() != request.locator.path() {
         return Err(StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
-            operation: "install final schema for initialized SQLite runtime",
+            operation,
             message: "originating database authority does not match initialized locator".to_owned(),
         });
     }
     let opened_file_identity = attachment.opened_file_identity().map_err(|message| {
-        StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
-            operation: "install final schema for initialized SQLite runtime",
-            message,
-        }
+        StoreRuntimeRegistryFailure::PhysicalRuntimeFailed { operation, message }
     })?;
     let handle = attachment.exact_sql_handle().map_err(|message| {
-        StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
-            operation: "install final schema for initialized SQLite runtime",
-            message,
-        }
+        StoreRuntimeRegistryFailure::PhysicalRuntimeFailed { operation, message }
     })?;
     if handle.binding() != &request.binding
         || handle.verified_locator() != request.locator.verified()
     {
         return Err(StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
-            operation: "install final schema for initialized SQLite runtime",
+            operation,
             message: "initialized schema handle identity does not match build request".to_owned(),
         });
     }
@@ -388,7 +397,49 @@ async fn install_final_schema_before_publication(
             operation: "authorize initialized SQLite final-schema installation",
             message: error.to_string(),
         })?;
-    let connection = crate::db::engine::Connection::attach(handle);
+    Ok(crate::db::engine::Connection::attach(handle))
+}
+
+/// Steps an existing runtime-core store that is exactly one sanctioned step
+/// behind the final shape before admission verifies it. Only a request that
+/// carries an active write authority may step; a read-only mount falls
+/// through to the verifier, which names this writer-side remedy.
+async fn step_final_schema_before_existing_publication(
+    request: &ShardRuntimeBuildRequest,
+    attachment: &dyn PhysicalRuntimeAttachment,
+) -> Result<(), StoreRuntimeRegistryFailure> {
+    const OPERATION: &str = "step final schema for existing SQLite runtime";
+    let Some(authority) = request.database_authority.as_ref() else {
+        return Ok(());
+    };
+    if authority.require_active_write_scope(OPERATION).is_err() {
+        return Ok(());
+    }
+    let connection = authorized_schema_connection(request, attachment, OPERATION).await?;
+    crate::db::migrations::step_schema_if_pending(&connection)
+        .await
+        .map(|_stepped| ())
+        .map_err(|error| match error {
+            tracedecay_domain::errors::TraceDecayError::ResetRequired { authority, reason } => {
+                StoreRuntimeRegistryFailure::ResetRequired { authority, reason }
+            }
+            error => StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
+                operation: OPERATION,
+                message: error.to_string(),
+            },
+        })
+}
+
+async fn install_final_schema_before_publication(
+    request: &ShardRuntimeBuildRequest,
+    attachment: &dyn PhysicalRuntimeAttachment,
+) -> Result<(), StoreRuntimeRegistryFailure> {
+    let connection = authorized_schema_connection(
+        request,
+        attachment,
+        "install final schema for initialized SQLite runtime",
+    )
+    .await?;
     match &request.binding.shard_id.scope {
         StoreShardScopeV1::Code { .. }
         | StoreShardScopeV1::ProfileMemory
@@ -454,6 +505,9 @@ impl PhysicalRuntimeAttachment for RepositoryRuntimePhysicalAttachment {
                 error_events: writer.error_events,
                 health_lane_services: writer.health_lane_services,
                 commit_sequence: writer.commit_sequence,
+                checkpoint_status: writer.checkpoint_status,
+                checkpoint_pressure: writer.checkpoint_pressure,
+                checkpoint_hard_retry_wakes: writer.wal.hard_retry_wakes,
             }),
             wal_bytes: snapshot.wal_bytes,
             memory_estimate_bytes: None,
@@ -576,9 +630,14 @@ impl PhysicalRuntimeAttachment for RepositoryRuntimePhysicalAttachment {
         Box::pin(async move {
             RepositoryRuntimePhysicalAttachment::dispatch_submit(self, request, probe, authority)
                 .await
-                .map_err(|error| StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
-                    operation: "dispatch repository submit",
-                    message: error.to_string(),
+                .map_err(|error| match error {
+                    RepositoryDispatchError::WriterRuntime(error) => {
+                        StoreRuntimeRegistryFailure::StorageRuntime(Box::new(error))
+                    }
+                    error => StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
+                        operation: "dispatch repository submit",
+                        message: error.to_string(),
+                    },
                 })
         })
     }

@@ -31,6 +31,7 @@ pub(super) type ResolvedMessageAnchor = (String, bool, i64);
 /// `Ok(None)` means the message has no canonical anchor in this store at all —
 /// the only case in which the publication falls back to a legacy compatibility
 /// anchor.
+#[hotpath::measure(future = true, label = "session_temporal.publication.resolve_anchor")]
 pub(super) async fn resolve_message_anchor(
     conn: &impl crate::handle::SessionTemporalExec,
     provider: &str,

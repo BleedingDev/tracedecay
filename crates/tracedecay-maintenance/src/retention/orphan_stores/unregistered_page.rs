@@ -39,12 +39,20 @@ pub const DEFAULT_UNREGISTERED_STORE_PAGE_LIMIT: usize = 8;
 const MAX_UNREGISTERED_STORE_PAGE_LIMIT: usize = 64;
 const UNREGISTERED_STORE_DIRECTORY_ENTRY_MULTIPLIER: usize = 8;
 
-pub(super) enum ProjectDirectoryWorkV1 {
+pub(in crate::retention) enum ProjectDirectoryWorkV1 {
     Project(String),
     Quarantine {
         project_id: String,
         quarantine_name: String,
     },
+}
+
+pub(in crate::retention) struct ProjectDirectoryPageV1 {
+    pub entries: Vec<ProjectDirectoryWorkV1>,
+    pub next_cursor: Option<String>,
+    /// Raw directory or portable-inventory entries consumed to produce this
+    /// slice. Summing pages exposes nonlinear rescans without timing heuristics.
+    pub entries_scanned: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -237,13 +245,16 @@ async fn census_unregistered_project_dirs_page(
     recovery_outcome: &mut CollectionOutcome,
 ) -> tracedecay_domain::errors::Result<Option<(Vec<UnregisteredStoreFinding>, Option<String>)>> {
     let projects_dir = profile_root.join("projects");
-    let page = read_project_directory_page(profile_root, cursor, limit, cancellation, deadline)?;
-    let Some((work, next_cursor)) = page else {
+    let interrupted =
+        || UnregisteredSweepCompletionV1::interrupted(cancellation, deadline).is_some();
+    let page = read_project_directory_page(profile_root, cursor, limit, &interrupted)?;
+    let Some(page) = page else {
         return Ok(None);
     };
+    let next_cursor = page.next_cursor;
     let mut recovered_project_ids = HashSet::new();
-    let mut findings = Vec::with_capacity(work.len());
-    for work in work {
+    let mut findings = Vec::with_capacity(page.entries.len());
+    for work in page.entries {
         if UnregisteredSweepCompletionV1::interrupted(cancellation, deadline).is_some() {
             return Ok(None);
         }
@@ -374,19 +385,32 @@ async fn census_unregistered_project_dirs_page(
 /// capability opened beneath the profile root. The POSIX directory offset is
 /// opaque; it is accepted only when the directory identity still matches, so
 /// a replacement restarts safely instead of seeking a stale location.
+///
+/// # Contract
+///
+/// A full pass misses no entry that existed for its whole duration, and costs
+/// within a constant factor of the directory. It is **not** repeat-free: a
+/// `telldir` cookie invalidated by a concurrent mutation may replay a page
+/// (APFS does; glibc happens not to). Deduplicating here would mean carrying
+/// every name seen so far, which is the unbounded state paging exists to
+/// avoid, so callers must tolerate a repeated name — re-check each candidate
+/// before acting on it, and treat per-page counts as estimates.
 #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos"))]
-pub(super) fn read_project_directory_page(
+pub(in crate::retention) fn read_project_directory_page(
     profile_root: &Path,
     cursor: Option<&str>,
     limit: usize,
-    cancellation: &CancellationToken,
-    deadline: MonotonicDeadline,
-) -> tracedecay_domain::errors::Result<Option<(Vec<ProjectDirectoryWorkV1>, Option<String>)>> {
+    interrupted: &dyn Fn() -> bool,
+) -> tracedecay_domain::errors::Result<Option<ProjectDirectoryPageV1>> {
     let projects_dir = profile_root.join("projects");
     let root = match open_store_directory_nofollow(profile_root, &projects_dir) {
         Ok(capability) => capability.root,
         Err(super::CollectionFailureKind::PayloadChanged) => {
-            return Ok(Some((Vec::new(), None)));
+            return Ok(Some(ProjectDirectoryPageV1 {
+                entries: Vec::new(),
+                next_cursor: None,
+                entries_scanned: 0,
+            }));
         }
         Err(kind) => {
             return Err(tracedecay_domain::errors::TraceDecayError::Config {
@@ -421,8 +445,15 @@ pub(super) fn read_project_directory_page(
     let mut work = Vec::with_capacity(limit);
     let mut resume_offset = offset;
     loop {
-        if UnregisteredSweepCompletionV1::interrupted(cancellation, deadline).is_some() {
+        if interrupted() {
             return Ok(None);
+        }
+        if work.len() == limit {
+            return Ok(Some(ProjectDirectoryPageV1 {
+                entries: work,
+                next_cursor: Some(format_project_directory_cursor(identity, resume_offset)),
+                entries_scanned: scanned,
+            }));
         }
         let Some(name) = stream.next_name().map_err(|error| {
             tracedecay_domain::errors::TraceDecayError::Config {
@@ -430,7 +461,11 @@ pub(super) fn read_project_directory_page(
             }
         })?
         else {
-            return Ok(Some((work, None)));
+            return Ok(Some(ProjectDirectoryPageV1 {
+                entries: work,
+                next_cursor: None,
+                entries_scanned: scanned,
+            }));
         };
         if name == "." || name == ".." {
             continue;
@@ -451,21 +486,16 @@ pub(super) fn read_project_directory_page(
             None
         };
         if let Some(entry) = entry {
-            if work.len() == limit {
-                return Ok(Some((
-                    work,
-                    Some(format_project_directory_cursor(identity, resume_offset)),
-                )));
-            }
             work.push(entry);
         }
         scanned = scanned.saturating_add(1);
         resume_offset = position;
         if scanned >= scan_limit {
-            return Ok(Some((
-                work,
-                Some(format_project_directory_cursor(identity, resume_offset)),
-            )));
+            return Ok(Some(ProjectDirectoryPageV1 {
+                entries: work,
+                next_cursor: Some(format_project_directory_cursor(identity, resume_offset)),
+                entries_scanned: scanned,
+            }));
         }
     }
 }
@@ -608,13 +638,12 @@ fn reset_errno() {
 }
 
 #[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
-pub(super) fn read_project_directory_page(
+pub(in crate::retention) fn read_project_directory_page(
     profile_root: &Path,
     cursor: Option<&str>,
     limit: usize,
-    cancellation: &CancellationToken,
-    deadline: MonotonicDeadline,
-) -> tracedecay_domain::errors::Result<Option<(Vec<ProjectDirectoryWorkV1>, Option<String>)>> {
+    interrupted: &dyn Fn() -> bool,
+) -> tracedecay_domain::errors::Result<Option<ProjectDirectoryPageV1>> {
     let projects_dir = profile_root.join("projects");
     let saved = cursor.and_then(parse_portable_directory_cursor);
     // Page application mutates `projects/` by removing its own prior entries.
@@ -629,7 +658,11 @@ pub(super) fn read_project_directory_page(
             let signature = match portable_directory_signature(&projects_dir) {
                 Ok(signature) => signature,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(Some((Vec::new(), None)));
+                    return Ok(Some(ProjectDirectoryPageV1 {
+                        entries: Vec::new(),
+                        next_cursor: None,
+                        entries_scanned: 0,
+                    }));
                 }
                 Err(error) => {
                     return Err(tracedecay_domain::errors::TraceDecayError::Config {
@@ -644,7 +677,11 @@ pub(super) fn read_project_directory_page(
         let signature = match portable_directory_signature(&projects_dir) {
             Ok(signature) => signature,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Some((Vec::new(), None)));
+                return Ok(Some(ProjectDirectoryPageV1 {
+                    entries: Vec::new(),
+                    next_cursor: None,
+                    entries_scanned: 0,
+                }));
             }
             Err(error) => {
                 return Err(tracedecay_domain::errors::TraceDecayError::Config {
@@ -655,13 +692,14 @@ pub(super) fn read_project_directory_page(
         let inventory = portable_inventory_path(profile_root, &signature);
         (signature, inventory, 0)
     };
+    let mut entries_scanned = 0usize;
     let build_complete = match advance_portable_inventory(
         &projects_dir,
         &inventory,
         &directory_signature,
         limit.saturating_mul(UNREGISTERED_STORE_DIRECTORY_ENTRY_MULTIPLIER),
-        cancellation,
-        deadline,
+        &mut entries_scanned,
+        interrupted,
     )? {
         Some(complete) => complete,
         None => return Ok(None),
@@ -671,15 +709,20 @@ pub(super) fn read_project_directory_page(
     // opaque cursor instead of opening a missing log and falsely reporting a
     // complete empty page; maintenance and Doctor will retry this exact slice.
     if !build_complete && !inventory.exists() {
-        return Ok(Some((
-            Vec::new(),
-            Some(format_portable_directory_cursor(directory_signature, start)),
-        )));
+        return Ok(Some(ProjectDirectoryPageV1 {
+            entries: Vec::new(),
+            next_cursor: Some(format_portable_directory_cursor(directory_signature, start)),
+            entries_scanned,
+        }));
     }
     let file = match std::fs::File::open(&inventory) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Some((Vec::new(), None)));
+            return Ok(Some(ProjectDirectoryPageV1 {
+                entries: Vec::new(),
+                next_cursor: None,
+                entries_scanned,
+            }));
         }
         Err(error) => {
             return Err(tracedecay_domain::errors::TraceDecayError::Config {
@@ -707,7 +750,7 @@ pub(super) fn read_project_directory_page(
     let scan_limit = limit.saturating_mul(UNREGISTERED_STORE_DIRECTORY_ENTRY_MULTIPLIER);
     let mut scanned = 0usize;
     loop {
-        if UnregisteredSweepCompletionV1::interrupted(cancellation, deadline).is_some() {
+        if interrupted() {
             return Ok(None);
         }
         let mut name = String::new();
@@ -723,7 +766,11 @@ pub(super) fn read_project_directory_page(
                     .ok()
                     .map(|offset| format_portable_directory_cursor(directory_signature, offset))
             });
-            return Ok(Some((work, next_cursor.flatten())));
+            return Ok(Some(ProjectDirectoryPageV1 {
+                entries: work,
+                next_cursor: next_cursor.flatten(),
+                entries_scanned,
+            }));
         }
         let name = name.trim_end_matches(['\r', '\n']).to_owned();
         let next_offset = reader.stream_position().map_err(|error| {
@@ -732,6 +779,7 @@ pub(super) fn read_project_directory_page(
             }
         })?;
         scanned = scanned.saturating_add(1);
+        entries_scanned = entries_scanned.saturating_add(1);
         if let Some(project_id) = quarantined_project_id(&name) {
             work.push(ProjectDirectoryWorkV1::Quarantine {
                 project_id,
@@ -741,13 +789,14 @@ pub(super) fn read_project_directory_page(
             work.push(ProjectDirectoryWorkV1::Project(name));
         }
         if work.len() == limit || scanned >= scan_limit {
-            return Ok(Some((
-                work,
-                Some(format_portable_directory_cursor(
+            return Ok(Some(ProjectDirectoryPageV1 {
+                entries: work,
+                next_cursor: Some(format_portable_directory_cursor(
                     directory_signature,
                     next_offset,
                 )),
-            )));
+                entries_scanned,
+            }));
         }
     }
 }
@@ -914,8 +963,7 @@ fn recover_portable_inventory_tail(inventory: &Path, signature: &str) -> std::io
     let truncate_at = tail
         .iter()
         .rposition(|byte| *byte == b'\n')
-        .map(|position| tail_start + position as u64 + 1)
-        .unwrap_or(header_len)
+        .map_or(header_len, |position| tail_start + position as u64 + 1)
         .max(header_len);
     file.set_len(truncate_at)?;
     file.sync_all()
@@ -981,8 +1029,8 @@ pub(super) fn advance_portable_inventory(
     inventory: &Path,
     signature: &str,
     raw_entry_limit: usize,
-    cancellation: &CancellationToken,
-    deadline: MonotonicDeadline,
+    entries_scanned: &mut usize,
+    interrupted: &dyn Fn() -> bool,
 ) -> tracedecay_domain::errors::Result<Option<bool>> {
     use std::io::{BufRead, Write};
 
@@ -1065,7 +1113,7 @@ pub(super) fn advance_portable_inventory(
     let mut completed = false;
     let mut append_error = None;
     while budget > 0 {
-        if UnregisteredSweepCompletionV1::interrupted(cancellation, deadline).is_some() {
+        if interrupted() {
             return Ok(None);
         }
         if let Some(hydration) = builder.hydration.as_mut() {
@@ -1079,6 +1127,7 @@ pub(super) fn advance_portable_inventory(
                 builder.hydration = None;
                 continue;
             }
+            *entries_scanned = entries_scanned.saturating_add(1);
             budget = budget.saturating_sub(1);
             let name = name.trim_end_matches(['\r', '\n']);
             if portable_inventory_entry_is_valid(name) {
@@ -1095,6 +1144,7 @@ pub(super) fn advance_portable_inventory(
             completed = true;
             break;
         };
+        *entries_scanned = entries_scanned.saturating_add(1);
         budget = budget.saturating_sub(1);
         let Ok(entry) = entry else {
             continue;

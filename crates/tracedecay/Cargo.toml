@@ -252,6 +252,7 @@ production = [
     "lite",
     "full",
     "semantic-fastembed",
+    "semantic-model2vec",
     "graph-sealed-store",
 ]
 
@@ -345,6 +346,7 @@ test-helpers = [
     "tracedecay-daemon-service/test-helpers",
     "tracedecay-host-admission/test-helpers",
     "tracedecay-maintenance/test-helpers",
+    "tracedecay-runtime-core/test-helpers",
     "tracedecay-session-runtime/test-helpers",
     "tracedecay-store-runtime/test-helpers",
 ]
@@ -373,6 +375,15 @@ test-transport = [
     "tracedecay-code-index-runtime/test-transport",
 ]
 
+# The typed RMCP benchmark is the only consumer of the client-side RMCP
+# transport. Keep that surface out of ordinary integration-fixture builds:
+# the benchmark enables its complete client/runtime dependency set explicitly.
+rmcp-benchmark = [
+    "test-transport",
+    "rmcp/client",
+    "rmcp/transport-async-rw",
+]
+
 # SEMANTIC FastEmbed adapter (Plan 31). Bundles ORT while leaving FastEmbed's
 # image defaults disabled. Runtime inference still loads only from locally
 # verified artifact bytes; daemon-owned acquisition uses hf-hub against the
@@ -382,6 +393,15 @@ semantic-fastembed = [
     "tracedecay-semantic/semantic-fastembed",
     "tracedecay-usecases/semantic-fastembed",
     "tracedecay-code-index-runtime/semantic-fastembed",
+]
+# SEMANTIC Model2Vec static-embedding backend: a safetensors token table
+# mean-pooled in-process, no ONNX Runtime. Selected per model by the catalog
+# entry's declared backend; ships in `production` alongside FastEmbed so the
+# cataloged `PotionCode16MV2` selection is servable, not merely listed.
+semantic-model2vec = [
+    "tracedecay-semantic/semantic-model2vec",
+    "tracedecay-usecases/semantic-model2vec",
+    "tracedecay-code-index-runtime/semantic-model2vec",
 ]
 # Opt-in GPU execution providers for the FastEmbed/ORT runtime (owner
 # request: CoreML on macOS, CUDA on Linux). Not part of `production`; a
@@ -528,6 +548,7 @@ sha2 = "0.11"
 hex = "0.4"
 regex = "1.12.3"
 filetime = "0.2"
+rmcp = { version = "3.0.1", default-features = false, features = ["client", "server", "transport-async-rw"] }
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 # test-util enables tokio::test(start_paused = true) so timer-driven unit
 # tests (daemon restart-grace windows) run on virtual time instead of real
@@ -537,6 +558,7 @@ jsonschema = { version = "0.46.8", default-features = false }
 tracedecay-sdk = { path = "../tracedecay-sdk", version = "0.1.0" }
 # Root-only Native baseline over the coding-memory scenario corpus (tdmem-0902).
 tracedecay-memory-conformance = { path = "../tracedecay-memory-conformance" }
+tracedecay-capture = { path = "../tracedecay-capture", version = "0.1.0" }
 # Test builds opt into the query kernel's `*_for_test` constructors; the
 # feature stays off for production builds.
 tracedecay-query = { path = "../tracedecay-query", version = "0.1.0", features = ["test-helpers"] }
@@ -614,6 +636,20 @@ harness = false
 required-features = ["test-transport"]
 test = false
 
+[[bench]]
+name = "rmcp_connection_pipeline"
+path = "benches/rmcp_connection_pipeline.rs"
+harness = false
+required-features = ["rmcp-benchmark"]
+test = false
+
+[[bench]]
+name = "mcp_server_construction"
+path = "benches/mcp_server_construction.rs"
+harness = false
+required-features = ["rmcp-benchmark"]
+test = false
+
 [[test]]
 name = "runtime_acceptance_suite"
 path = "tests/runtime_acceptance_suite/main.rs"
@@ -662,6 +698,11 @@ required-features = ["test-helpers"]
 [[test]]
 name = "session_suite"
 path = "tests/session_suite/main.rs"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "cursor_observation_identity_fallback"
+path = "tests/cursor_observation_identity_fallback.rs"
 required-features = ["test-helpers"]
 
 [[test]]

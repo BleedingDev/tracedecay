@@ -2,14 +2,17 @@
 
 use super::super::primitives::{
     OwnerKey, PROJECT_MEMORY_READ_OPERATION, PROJECT_MEMORY_WRITE_OPERATION, QUERY_OPERATION,
-    ensure_project_memory_read_active, from_json, nonnegative_u64, project_memory_category_label,
+    ensure_project_memory_read_active, nonnegative_u64, project_memory_category_label,
     project_memory_event_time, row_i64, row_string, storage_error, storage_message,
 };
 use super::super::projection::{
     load_project_memory_projection_controlled_tx, load_project_memory_projection_tx,
     load_project_memory_projections_controlled_tx, load_project_memory_projections_tx,
 };
-use super::{DEFAULT_TRUST, commit_fact_tx, content_digest, query_fact_lineage_controlled_tx};
+use super::{
+    DEFAULT_TRUST, commit_fact_tx, query_fact_before_supersession_tx,
+    query_fact_lineage_controlled_tx,
+};
 use crate::db::DatabaseMemoryTransaction as Transaction;
 use crate::db::engine::params;
 use crate::privacy::{
@@ -261,50 +264,52 @@ async fn find_project_memory_fact_by_content_digest_inner_tx(
 ) -> FactStoreResult<Option<ProjectMemoryFactProjectionV1>> {
     ensure_optional_project_memory_read_active(read_control)?;
     let key = OwnerKey::new(query.owner())?;
+    // Indexed point read on the persisted content digest (#834): the digest
+    // rows are written with their payloads, so this answers the duplicate
+    // question without decoding a single payload. The lowest eligible fact id
+    // wins, the same pick the former full scan made.
     let mut rows = transaction
         .query(
-            "SELECT current_facts.fact_id, payloads.payload_json
-             FROM memory_v2_current_facts AS current_facts
-             JOIN memory_v2_facts AS facts
+            "SELECT current_facts.fact_id
+             FROM memory_v2_assertion_payload_digests AS digests
+             CROSS JOIN memory_v2_current_facts AS current_facts
+               ON current_facts.fact_id = digests.fact_id
+              AND current_facts.owner_kind = digests.owner_kind
+              AND current_facts.project_id = digests.project_id
+              AND current_facts.active_assertion_id = digests.assertion_id
+             CROSS JOIN memory_v2_facts AS facts
                ON facts.fact_id = current_facts.fact_id
               AND facts.owner_kind = current_facts.owner_kind
               AND facts.project_id = current_facts.project_id
-             JOIN memory_v2_assertion_payloads AS payloads
-               ON payloads.assertion_id = current_facts.active_assertion_id
-              AND payloads.fact_id = current_facts.fact_id
-              AND payloads.owner_kind = current_facts.owner_kind
-              AND payloads.project_id = current_facts.project_id
-             WHERE current_facts.owner_kind = ?1
-               AND current_facts.project_id = ?2
-               AND facts.owner_json = ?3
+             WHERE digests.owner_kind = ?1
+               AND digests.project_id = ?2
+               AND digests.content_digest = ?3
+               AND facts.owner_json = ?4
                AND current_facts.payload_access = 'eligible'
-               AND current_facts.active_assertion_id IS NOT NULL
-             ORDER BY current_facts.fact_id ASC",
-            params![key.kind, key.project_id.as_str(), key.json.as_str()],
+             ORDER BY current_facts.fact_id ASC
+             LIMIT 1",
+            params![
+                key.kind,
+                key.project_id.as_str(),
+                query.content_digest().as_str(),
+                key.json.as_str(),
+            ],
         )
         .await
         .map_err(|error| storage_error(PROJECT_MEMORY_READ_OPERATION, error))?;
     ensure_optional_project_memory_read_active(read_control)?;
-    let mut matching_fact_id = None;
-    while let Some(row) = rows
+    let matching_fact_id = match rows
         .next()
         .await
         .map_err(|error| storage_error(PROJECT_MEMORY_READ_OPERATION, error))?
     {
-        ensure_optional_project_memory_read_active(read_control)?;
-        let payload = from_json::<FactPayloadV1>(
-            &row_string(&row, 1, PROJECT_MEMORY_READ_OPERATION)?,
+        Some(row) => Some(FactId::new(row_string(
+            &row,
+            0,
             PROJECT_MEMORY_READ_OPERATION,
-        )?;
-        if content_digest(payload.content())? == *query.content_digest() {
-            matching_fact_id = Some(FactId::new(row_string(
-                &row,
-                0,
-                PROJECT_MEMORY_READ_OPERATION,
-            )?)?);
-            break;
-        }
-    }
+        )?)?),
+        None => None,
+    };
     drop(rows);
     ensure_optional_project_memory_read_active(read_control)?;
     match matching_fact_id {
@@ -343,12 +348,24 @@ pub(in crate::store::memory) async fn project_memory_fact_history_controlled_tx(
         query.limit(),
     )?;
     let events = query_fact_lineage_controlled_tx(transaction, &lineage, read_control).await?;
-    let history = ProjectMemoryFactHistoryV1::new(
+    let mut history = ProjectMemoryFactHistoryV1::new(
         query.target().owner().clone(),
         query.target().fact_id().clone(),
         events,
         None,
     )?;
+    // A superseded fact leaves the current views but stays queryable through
+    // this explicit historical path: the projection as of its supersession
+    // event, payload and trust as stored.
+    if let Some(retired) = query_fact_before_supersession_tx(
+        transaction,
+        query.target().owner(),
+        query.target().fact_id(),
+    )
+    .await?
+    {
+        history = history.with_retired_fact(retired)?;
+    }
     ensure_project_memory_read_active(read_control)?;
     Ok(history)
 }

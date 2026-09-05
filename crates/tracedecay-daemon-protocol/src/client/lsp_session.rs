@@ -8,13 +8,15 @@ use tracedecay_application::{CancellationSignal, Deadline};
 
 use super::{
     ConnectionLocalRequestSequence, DaemonInvocationClient, InvocationCancellationPolicy,
-    InvocationError, invocation_error_from_problem, map_invocation_error,
+    InvocationConnectionLease, InvocationError, invocation_error_from_problem,
+    map_invocation_error,
 };
 
 /// Typed client for one daemon-owned LSP session. Every method maps to a
 /// closed invocation operation; no method exposes a generic local socket.
 pub struct DaemonLspSessionClient {
     invocation: DaemonInvocationClient,
+    connection: Option<InvocationConnectionLease>,
     session: crate::contract::DaemonLspSessionAccess,
     scope_set_id: Option<tracedecay_domain::ScopeSetId>,
     scope_set_digest: Option<tracedecay_domain::ManifestDigest>,
@@ -32,8 +34,13 @@ impl DaemonLspSessionClient {
         cancellation: CancellationSignal,
     ) -> Result<Self, InvocationError> {
         let cancellation_context = cancellation.context();
+        let (mut connection, _in_flight) = invocation
+            .checkout_connection_controlled(&deadline, &cancellation)
+            .await
+            .map_err(map_invocation_error)?;
         let response = invocation
-            .invoke_controlled(
+            .invoke_controlled_on_connection(
+                &mut connection,
                 crate::contract::DaemonInvocationRequest::lsp_open(
                     "lsp.1",
                     client_revision,
@@ -59,6 +66,7 @@ impl DaemonLspSessionClient {
         };
         Ok(Self {
             invocation,
+            connection: Some(connection),
             session,
             scope_set_id,
             scope_set_digest,
@@ -177,8 +185,22 @@ impl DaemonLspSessionClient {
     ) -> Result<(), InvocationError> {
         let request_id = self.next_request_id()?;
         let cancellation_context = cancellation.context();
+        // Reconnect exists because the pinned connection is already known
+        // broken: an interrupted invocation took its transport out of the
+        // lease. Reusing it would fail every reconnect with `Unavailable`, so
+        // retire the lease without returning it to the pool — its drop also
+        // discards any idle sibling that shared the same failed daemon
+        // process — and resume the session over a freshly handshaked one.
+        drop(self.connection.take());
+        let (mut connection, _in_flight) = self
+            .invocation
+            .checkout_connection_controlled(&deadline, &cancellation)
+            .await
+            .map_err(map_invocation_error)?;
         let response = self
-            .invoke(
+            .invocation
+            .invoke_controlled_on_connection(
+                &mut connection,
                 crate::contract::DaemonInvocationRequest::lsp_reconnect(
                     request_id,
                     self.session.clone(),
@@ -187,11 +209,14 @@ impl DaemonLspSessionClient {
                 ),
                 deadline,
                 cancellation,
+                InvocationCancellationPolicy::ReadOnly,
             )
-            .await?;
+            .await
+            .map_err(map_invocation_error)?;
         match response.outcome {
             crate::contract::DaemonInvocationOutcome::LspReconnected { session } => {
                 self.session = session;
+                self.connection = Some(connection);
                 Ok(())
             }
             outcome => Err(invocation_outcome_error(outcome)),
@@ -219,20 +244,30 @@ impl DaemonLspSessionClient {
             )
             .await?;
         match response.outcome {
-            crate::contract::DaemonInvocationOutcome::LspDetached => Ok(()),
+            crate::contract::DaemonInvocationOutcome::LspDetached => {
+                if let Some(mut connection) = self.connection.take() {
+                    connection.release_to_pool();
+                }
+                Ok(())
+            }
             outcome => Err(invocation_outcome_error(outcome)),
         }
     }
 
     #[hotpath::skip]
     async fn invoke(
-        &self,
+        &mut self,
         request: crate::contract::DaemonInvocationRequest,
         deadline: Deadline,
         cancellation: CancellationSignal,
     ) -> Result<crate::contract::DaemonInvocationResponse, InvocationError> {
+        let connection = self
+            .connection
+            .as_mut()
+            .ok_or(InvocationError::Unavailable)?;
         self.invocation
-            .invoke_controlled(
+            .invoke_controlled_on_connection(
+                connection,
                 request,
                 deadline,
                 cancellation,

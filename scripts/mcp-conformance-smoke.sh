@@ -48,9 +48,17 @@ run_smoke() {
     shift
     # Run from the fixture so the spawned server's cwd matches the indexed
     # project (otherwise tool results gain a cwd-mismatch warning block).
-    (cd "$fixture" && timeout "$timeout_secs" \
+    # The spawned server inherits the inspector's stderr, which the callers
+    # capture and print when a call fails or times out; ask it for
+    # progress-level logging so a hung call leaves evidence in CI.
+    (cd "$fixture" && RUST_LOG="${SMOKE_SERVE_LOG:-warn,tracedecay=info}" timeout "$timeout_secs" \
       npx -y "@modelcontextprotocol/inspector@$INSPECTOR_VERSION" --cli \
       "$TRACEDECAY_BIN" serve -p "$fixture" "$@")
+    local status=$?
+    if ((status == 124)); then
+      echo "error: inspector call timed out after ${timeout_secs}s: $*" >&2
+    fi
+    return "$status"
   }
 
   # json_assert <file> <node expression over parsed json `j`>
@@ -108,6 +116,14 @@ NODE
     return 1
   fi
   "$TRACEDECAY_BIN" disable-upload-counter >/dev/null 2>&1 || true
+
+  # Resolve and cache the inspector package before any timed call: on a cold
+  # runner `npx` spends its first invocation downloading the package, and
+  # that install time must not count against a single call's budget.
+  if ! (cd "$fixture" && timeout 300 \
+      npx -y "@modelcontextprotocol/inspector@$INSPECTOR_VERSION" --cli --help >/dev/null 2>&1); then
+    echo "warning: inspector warm-up did not complete; timed calls include the install" >&2
+  fi
 
   # 1. tools/list succeeds through the SDK client (implies the full initialize
   #    handshake + version negotiation + Zod validation of every tool schema).

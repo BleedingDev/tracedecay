@@ -90,7 +90,8 @@ pub use jsonrpc::{ErrorCode, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpT
 pub use lifecycle::{McpConnectionLifecyclePort, McpLifecycleDrainFuture, McpRequestActivity};
 pub use project_access::registered_project_reader_tool_names;
 pub use tool_call_deadline::{
-    TOOL_CALL_DEADLINE_META_KEY, caller_tool_call_deadline, tool_call_deadline_meta,
+    TOOL_CALL_DEADLINE_META_KEY, caller_tool_call_deadline, caller_tool_call_deadline_from_meta,
+    tool_call_deadline_meta,
 };
 pub use tool_errors::{
     mark_semantic_tool_error, semantic_failure_reason, serialize_response_line,
@@ -100,8 +101,8 @@ pub use tools::render::format_relative_time;
 pub use tools::{
     MAX_RESPONSE_CHARS, RESERVED_FLAGS_FOOTER, ToolDefinition, ToolRegistryMode, ToolResult,
     apply_context_warming_budget, ast_grep_available, ast_grep_diagnostics_json,
-    ast_grep_outline_available, context_description, explore_call_budget,
-    format_capable_tool_names, get_maximal_tool_definitions,
+    ast_grep_outline_available, context_description, context_warming_description,
+    explore_call_budget, format_capable_tool_names, get_maximal_tool_definitions,
     get_maximal_tool_definitions_with_budget, get_tool_definitions,
     get_tool_definitions_with_budget, get_tool_definitions_with_warming_budget,
     internal_daemon_tool_definition, project_catalog_discovery_scope, render_tool_cli_help,

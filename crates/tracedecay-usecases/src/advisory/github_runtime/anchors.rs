@@ -184,6 +184,7 @@ impl ProjectGitHubAnchorAuthorityV1 {
         self
     }
 
+    #[hotpath::measure(label = "usecases.advisory.github.resolve_seeds", future = true)]
     async fn resolve_seeds(
         &self,
         request: &GitHubReviewReadRequestV1,
@@ -244,6 +245,7 @@ impl ProjectGitHubAnchorAuthorityV1 {
         Some(resolved)
     }
 
+    #[hotpath::measure(label = "usecases.advisory.github.resolve_stored_seed", future = true)]
     async fn resolve_stored_seed(
         &self,
         request: &GitHubReviewReadRequestV1,
@@ -270,6 +272,7 @@ impl ProjectGitHubAnchorAuthorityV1 {
         self.persist_body(&body).await.then_some(anchors)
     }
 
+    #[hotpath::measure(label = "usecases.advisory.github.resolve_new_seed", future = true)]
     async fn resolve_new_seed(
         &self,
         request: &GitHubReviewReadRequestV1,
@@ -309,6 +312,7 @@ impl ProjectGitHubAnchorAuthorityV1 {
         self.persist(&stored, &body).await.then_some(anchors)
     }
 
+    #[hotpath::measure(label = "usecases.advisory.github.remap_original", future = true)]
     async fn remap_original(
         &self,
         context: &RequestContext,
@@ -326,6 +330,7 @@ impl ProjectGitHubAnchorAuthorityV1 {
             .await
     }
 
+    #[hotpath::measure(label = "usecases.advisory.github.remap_seed", future = true)]
     async fn remap_seed(
         &self,
         context: &RequestContext,
@@ -388,6 +393,7 @@ impl ProjectGitHubAnchorAuthorityV1 {
         )
     }
 
+    #[hotpath::measure(label = "usecases.advisory.github.load_anchor", future = true)]
     async fn load(&self, anchor_id: &RetrievalAnchorId) -> Option<Option<StoredGitHubAnchorV1>> {
         let key = anchor_key(anchor_id);
         match self.database.get_metadata(&key).await.ok()? {
@@ -396,6 +402,7 @@ impl ProjectGitHubAnchorAuthorityV1 {
         }
     }
 
+    #[hotpath::measure(label = "usecases.advisory.github.persist_anchor", future = true)]
     async fn persist(
         &self,
         candidate: &StoredGitHubAnchorV1,
@@ -475,6 +482,7 @@ impl ProjectGitHubAnchorAuthorityV1 {
         transaction.commit().await.is_ok()
     }
 
+    #[hotpath::measure(label = "usecases.advisory.github.persist_body", future = true)]
     async fn persist_body(&self, body: &StoredGitHubReviewBodyV1) -> bool {
         let key = body_key(&body.body_anchor);
         let Ok(encoded) = serde_json::to_string(body) else {
@@ -525,73 +533,76 @@ impl ProjectGitHubAnchorAuthorityV1 {
     where
         A: GitHubSourceAccessAuthorityV1 + Sync + ?Sized,
     {
-        Box::pin(async move {
-            if request.validate().is_err()
-                || request.scope != self.scope
-                || !context_matches_scope(context, &self.scope)
-                || body_anchor.validate().is_err()
-            {
-                return GitHubReviewBodyReadOutcomeV1::Denied;
-            }
-            match source_access.authorize(context, request).await {
-                GitHubProviderLifecycleV1::Ready => {}
-                GitHubProviderLifecycleV1::Stale => {
-                    return GitHubReviewBodyReadOutcomeV1::Stale;
-                }
-                GitHubProviderLifecycleV1::Denied | GitHubProviderLifecycleV1::Ambiguous => {
+        Box::pin(hotpath::future!(
+            async move {
+                if request.validate().is_err()
+                    || request.scope != self.scope
+                    || !context_matches_scope(context, &self.scope)
+                    || body_anchor.validate().is_err()
+                {
                     return GitHubReviewBodyReadOutcomeV1::Denied;
                 }
-                GitHubProviderLifecycleV1::Unavailable => {
-                    return GitHubReviewBodyReadOutcomeV1::Unavailable;
+                match source_access.authorize(context, request).await {
+                    GitHubProviderLifecycleV1::Ready => {}
+                    GitHubProviderLifecycleV1::Stale => {
+                        return GitHubReviewBodyReadOutcomeV1::Stale;
+                    }
+                    GitHubProviderLifecycleV1::Denied | GitHubProviderLifecycleV1::Ambiguous => {
+                        return GitHubReviewBodyReadOutcomeV1::Denied;
+                    }
+                    GitHubProviderLifecycleV1::Unavailable => {
+                        return GitHubReviewBodyReadOutcomeV1::Unavailable;
+                    }
                 }
-            }
-            let Some(encoded) = self
-                .database
-                .get_metadata(&body_key(body_anchor))
-                .await
-                .ok()
-                .flatten()
-            else {
-                return GitHubReviewBodyReadOutcomeV1::Denied;
-            };
-            let Some(body) = serde_json::from_str::<StoredGitHubReviewBodyV1>(&encoded)
-                .ok()
-                .filter(valid_stored_body)
-                .filter(|body| {
-                    body.scope == request.scope
-                        && body.pull_request_id == request.pull_request_id
-                        && &body.body_anchor == body_anchor
-                })
-            else {
-                return GitHubReviewBodyReadOutcomeV1::Denied;
-            };
-            match source_access.authorize(context, request).await {
-                GitHubProviderLifecycleV1::Ready => {}
-                GitHubProviderLifecycleV1::Stale => {
-                    return GitHubReviewBodyReadOutcomeV1::Stale;
-                }
-                GitHubProviderLifecycleV1::Denied | GitHubProviderLifecycleV1::Ambiguous => {
+                let Some(encoded) = self
+                    .database
+                    .get_metadata(&body_key(body_anchor))
+                    .await
+                    .ok()
+                    .flatten()
+                else {
                     return GitHubReviewBodyReadOutcomeV1::Denied;
+                };
+                let Some(body) = serde_json::from_str::<StoredGitHubReviewBodyV1>(&encoded)
+                    .ok()
+                    .filter(valid_stored_body)
+                    .filter(|body| {
+                        body.scope == request.scope
+                            && body.pull_request_id == request.pull_request_id
+                            && &body.body_anchor == body_anchor
+                    })
+                else {
+                    return GitHubReviewBodyReadOutcomeV1::Denied;
+                };
+                match source_access.authorize(context, request).await {
+                    GitHubProviderLifecycleV1::Ready => {}
+                    GitHubProviderLifecycleV1::Stale => {
+                        return GitHubReviewBodyReadOutcomeV1::Stale;
+                    }
+                    GitHubProviderLifecycleV1::Denied | GitHubProviderLifecycleV1::Ambiguous => {
+                        return GitHubReviewBodyReadOutcomeV1::Denied;
+                    }
+                    GitHubProviderLifecycleV1::Unavailable => {
+                        return GitHubReviewBodyReadOutcomeV1::Unavailable;
+                    }
                 }
-                GitHubProviderLifecycleV1::Unavailable => {
+                let Some(sanitization_receipt) = body_sanitization_receipt(
+                    &body.body_anchor,
+                    &body.provider_body_digest,
+                    &body.retained_body,
+                ) else {
                     return GitHubReviewBodyReadOutcomeV1::Unavailable;
-                }
-            }
-            let Some(sanitization_receipt) = body_sanitization_receipt(
-                &body.body_anchor,
-                &body.provider_body_digest,
-                &body.retained_body,
-            ) else {
-                return GitHubReviewBodyReadOutcomeV1::Unavailable;
-            };
-            GitHubReviewBodyReadOutcomeV1::Current(Box::new(GitHubReviewBodyEvidenceV1 {
-                body_anchor: body.body_anchor,
-                provider_body_digest: body.provider_body_digest,
-                retained_body_digest: body.retained_body_digest,
-                sanitization_receipt,
-                retained_body: body.retained_body,
-            }))
-        })
+                };
+                GitHubReviewBodyReadOutcomeV1::Current(Box::new(GitHubReviewBodyEvidenceV1 {
+                    body_anchor: body.body_anchor,
+                    provider_body_digest: body.provider_body_digest,
+                    retained_body_digest: body.retained_body_digest,
+                    sanitization_receipt,
+                    retained_body: body.retained_body,
+                }))
+            },
+            label = "usecases.advisory.github.read_body"
+        ))
     }
 }
 

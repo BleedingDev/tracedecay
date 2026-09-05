@@ -170,12 +170,14 @@ impl DaemonSessionRuntimeRegistryV1 {
                     open_runtime(
                         &self.registry,
                         self.resolver.as_ref(),
-                        shard_id.clone(),
-                        self.incarnation,
-                        Some(pin),
-                        Some(authority),
-                        matches!(&access, DatabaseAccessMode::ReadWrite),
-                        "mount project graph store",
+                        super::StoreRuntimeOpenSpec::new(
+                            shard_id.clone(),
+                            self.incarnation,
+                            Some(pin),
+                            Some(authority),
+                            matches!(&access, DatabaseAccessMode::ReadWrite),
+                            "mount project graph store",
+                        ),
                     ),
                     label = "daemon.store.project_graph.open"
                 )
@@ -313,6 +315,7 @@ impl DaemonSessionRuntimeRegistryV1 {
             return Err(error);
         }
 
+        replacement.detach_old_relation_graph()?;
         let graph_target = replacement.graph_retirement_target()?;
         let graph_reservation = match self
             .graph_registry

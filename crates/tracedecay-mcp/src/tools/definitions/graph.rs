@@ -10,11 +10,17 @@ use crate::ToolDefinition;
 
 // ── alwaysLoad tools (loaded into the model prompt immediately) ─────────
 
+/// Caller-facing bounds for `lexical_anchors`; they mirror the retrieval
+/// kernel's `MAX_LEXICAL_ANCHORS_V1` / `MAX_LEXICAL_ANCHOR_BYTES_V1` so the
+/// schema states the same limit the handler enforces.
+pub const SEARCH_MAX_LEXICAL_ANCHORS: usize = 8;
+pub const SEARCH_MAX_LEXICAL_ANCHOR_BYTES: usize = 128;
+
 pub(super) fn def_search() -> ToolDefinition {
     def_always_load(
         "tracedecay_search",
         "Search Symbols",
-        "Search for symbols (functions, structs, traits, etc.) in the active project's code graph by name or keyword.",
+        "Search for symbols (functions, structs, traits, etc.) in the active project's code graph by name or keyword. Every response starts with a `freshness: fresh | possibly_stale` line derived from the served generation, so results can be used without a status preflight. Pass exact identifiers you already know as `lexical_anchors` (each is its own ranked route fused with the query) and set `prefer_symbol` to add a symbol-name route for the identifier-shaped words of the query.",
         json!({
             "type": "object",
             "properties": {
@@ -28,7 +34,19 @@ pub(super) fn def_search() -> ToolDefinition {
                 },
                 "cursor": {
                     "type": "string",
-                    "description": "Authenticated opaque continuation returned as next_cursor."
+                    "description": "Authenticated opaque continuation returned as next_cursor. Repeat the same query, lexical_anchors, and prefer_symbol with it."
+                },
+                "lexical_anchors": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "maxItems": SEARCH_MAX_LEXICAL_ANCHORS,
+                    "description": format!(
+                        "Exact identifiers or technical terms (e.g. 'reserve_stock', 'Foo::bar', 'E0308') ranked through the lexical lane as additional routes fused with the query. Ranked retrieval, not exhaustive grep (use tracedecay_grep for that). Each result names the routes that ranked it. At most {SEARCH_MAX_LEXICAL_ANCHORS} anchors, each one whitespace-free term of at most {SEARCH_MAX_LEXICAL_ANCHOR_BYTES} bytes, no repeats."
+                    )
+                },
+                "prefer_symbol": {
+                    "type": "boolean",
+                    "description": "Add a lexical route restricted to symbol-name matches for the identifier-shaped words of the query (default: false). Query words such as class/struct/function/find/explain are ignored; 'Foo::bar' and 'Foo.bar' contribute 'bar'."
                 },
                 "semantic_mode": {
                     "type": "string",
@@ -92,13 +110,25 @@ pub(super) fn def_retrieve() -> ToolDefinition {
     def(
         "tracedecay_retrieve",
         "Retrieve Truncated Response",
-        "Use `tracedecay_retrieve` with required argument `handle` to retrieve the exact cached original text for a local response handle emitted by a truncated MCP response. This does not re-run the source tool or read a file/session/node again; handles are scoped to the active project store, expire automatically, and never reference remote storage. If the original truncated response used project_selector.project_id, pass the same selector here. Only call it when the missing details are needed to answer the user's request.",
+        "Use `tracedecay_retrieve` with required argument `handle` to retrieve one bounded page of the exact cached original text for a local response handle emitted by a truncated MCP response. Start with offset 0, then pass each returned next_offset until has_more is false; concatenating content in offset order reconstructs the original byte-exactly. max_chars is clamped to the response-frame budget. This does not re-run the source tool or read a file/session/node again; handles are scoped to the active project store, expire automatically, and never reference remote storage. If the original truncated response used project_selector.project_id, pass the same selector here. Only call it when the missing details are needed to answer the user's request.",
         json!({
             "type": "object",
             "properties": with_project_selector_properties(json!({
                 "handle": {
                     "type": "string",
                     "description": "The required `handle` argument copied exactly from a truncated MCP response envelope."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Character offset into the immutable stored response. Use the prior page's next_offset."
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": crate::tools::MAX_RESPONSE_CHARS,
+                    "description": "Maximum characters requested for this page. Values above the safe response-frame budget are clamped."
                 }
             })),
             "required": ["handle"],
@@ -648,7 +678,7 @@ pub(super) fn def_find_exact_symbol() -> ToolDefinition {
 
 #[cfg(test)]
 mod semantic_search_tests {
-    use super::def_search;
+    use super::{SEARCH_MAX_LEXICAL_ANCHORS, def_search};
 
     #[test]
     fn search_schema_exposes_only_the_two_planned_semantic_modes() {
@@ -660,6 +690,28 @@ mod semantic_search_tests {
         assert_eq!(
             definition.input_schema["properties"]["cursor"]["type"],
             "string"
+        );
+    }
+
+    #[test]
+    fn search_schema_declares_lexical_routing_parameters() {
+        let definition = def_search();
+        let anchors = &definition.input_schema["properties"]["lexical_anchors"];
+        assert_eq!(anchors["type"], "array");
+        assert_eq!(anchors["items"]["type"], "string");
+        assert_eq!(
+            anchors["maxItems"],
+            serde_json::json!(SEARCH_MAX_LEXICAL_ANCHORS)
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["prefer_symbol"]["type"],
+            "boolean"
+        );
+        assert!(
+            definition
+                .description
+                .contains("freshness: fresh | possibly_stale"),
+            "the description must tell agents the first line is a freshness verdict"
         );
     }
 }

@@ -389,6 +389,61 @@ async fn duplicates_do_not_displace_a_distinct_candidate_under_a_constrained_bud
     );
 }
 
+#[tokio::test]
+async fn mounted_recall_preserves_opposed_claims_while_pruning_exact_duplicates() {
+    let positive = "after validation and review of production configuration the deployment is safe";
+    let negative =
+        "after validation and review of production configuration the deployment is unsafe";
+    let mut fixture = RecallFixturePort::new();
+    fixture.candidate_contents = Some(
+        [
+            ("a-positive", positive),
+            ("b-duplicate", positive),
+            ("c-negative", negative),
+        ]
+        .into_iter()
+        .map(|(id, content)| (id.to_owned(), content.to_owned()))
+        .collect(),
+    );
+    let port = mount(
+        compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+        Arc::new(LedgerObserver::default()),
+    )
+    .expect("mounted port")
+    .with_selection_policy(RecallSelectionPolicyV1::new(2).expect("selection policy"));
+    let outcome = port
+        .recall_admitted(
+            request(
+                resolved_scope(Some("refs/heads/recall-port")),
+                60_000_000,
+                false,
+            ),
+            &live_signal(),
+        )
+        .await
+        .expect("bridged recall");
+    assert_eq!(
+        outcome
+            .result
+            .candidates()
+            .iter()
+            .map(|candidate| candidate.candidate_id())
+            .collect::<Vec<_>>(),
+        ["a-positive", "c-negative"]
+    );
+    let selection = outcome.selection.expect("selection receipt");
+    assert_eq!(selection.deduplicated.len(), 1);
+    assert_eq!(selection.deduplicated[0].candidate_id, "b-duplicate");
+    assert_eq!(
+        selection.deduplicated[0].reason,
+        DuplicateReason::ContentDigest
+    );
+    assert!(selection.budget_excluded.is_empty());
+    let mut accounted = selection.accounted_candidate_ids().collect::<Vec<_>>();
+    accounted.sort_unstable();
+    assert_eq!(accounted, ["a-positive", "b-duplicate", "c-negative"]);
+}
+
 /// A provider candidate stream whose first two entries are the same memory
 /// under different candidate ids, followed by two distinct memories. Host
 /// order is candidate-id order because every fixture candidate scores the

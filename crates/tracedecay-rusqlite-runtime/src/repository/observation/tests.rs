@@ -1,19 +1,27 @@
 use rusqlite::Connection;
 use serde_json::json;
 use tracedecay_domain::{
-    ComponentVersion, ObservationId, ObservationIdentityMaterialV1, ObservationOrderingDomainV1,
-    ObservationScopeV1, ObservationSourceCursorV1, ObservationSourceGenerationV1,
-    ObservationSourceIdentityV1, ObservationSourceRangeV1, PayloadReferenceV1, ProjectId,
-    ProjectionGenerationId, ProviderId, RetentionClass, SanitizationReceiptId,
-    SanitizationReceiptRefV1, SanitizationReceiptV1, SanitizerDispositionV1, SensitivityV1,
-    SessionId, UtcMicros,
+    AnchorDurabilityClass, AnchorSourceGenerationV2, CommitId, ComponentVersion, CoverageReportV1,
+    EvidenceAvailabilityV1, EvidenceClass, GenerationBoundRepositoryProvenanceV1, ObservationId,
+    ObservationIdentityMaterialV1, ObservationOrderingDomainV1, ObservationScopeV1,
+    ObservationSourceCursorV1, ObservationSourceGenerationV1, ObservationSourceIdentityV1,
+    ObservationSourceRangeV1, PayloadAccessState, PayloadReferenceV1,
+    PrivacyDomainBoundLocatorDigest, ProjectId, ProjectionGenerationId, ProviderId, RefId,
+    RepositoryEvidenceV1, RepositoryId, RepositoryProvenanceV1, RepositoryRemoteIdentityV1,
+    RetentionClass, RetrievalAnchorRecordV2, RetrievalAnchorRecordV2Parts, RetrievalAnchorTargetV2,
+    SanitizationReceiptId, SanitizationReceiptRefV1, SanitizationReceiptV1, SanitizerDispositionV1,
+    SensitivityV1, SessionId, UtcMicros, VectorWatermark, WorktreeId,
 };
+use tracedecay_store::observation::ObservationProvenanceDispositionV1;
 use tracedecay_store::{
-    AnchoredObservationWrite, ObservationCoverageReason, ObservationCursorAdvance,
-    ObservationReadOperationV1, ObservationReadResultV1, ObservationWrite,
-    SESSION_MESSAGE_PROJECTOR_VERSION, build_observation_resolution_authorization_v1,
+    AnchoredObservationWrite, CursorAdvanceLedgerReasonV1, CursorAdvanceLedgerReceiptIdV1,
+    ObservationCoverageReason, ObservationCursorAdvance, ObservationReadOperationV1,
+    ObservationReadResultV1, ObservationWrite, SESSION_MESSAGE_PROJECTOR_VERSION,
+    StorageRuntimeErrorV1, build_observation_resolution_authorization_v1,
     build_observation_retrieval_anchor_v2,
 };
+
+use crate::operation::StorageOperationError;
 
 use super::ObservationExecutor;
 
@@ -139,6 +147,240 @@ fn semantic_anchor_replay_ignores_local_ingest_clock() {
     );
 }
 
+fn with_repository_capture_at(
+    write: AnchoredObservationWrite,
+    captured_at: UtcMicros,
+) -> AnchoredObservationWrite {
+    let observation = write.observation();
+    let ObservationScopeV1::Project { project_id } = observation.scope() else {
+        panic!("repository capture requires project scope");
+    };
+    let digest =
+        PrivacyDomainBoundLocatorDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap();
+    let capture = RepositoryProvenanceV1::new(
+        RepositoryId::new("repository.fixture").unwrap(),
+        Some(project_id.clone()),
+        Some(WorktreeId::new("worktree.fixture").unwrap()),
+        digest.clone(),
+        RepositoryEvidenceV1::new(
+            EvidenceAvailabilityV1::Known(RefId::new("refs/heads/main").unwrap()),
+            EvidenceAvailabilityV1::Known(
+                CommitId::new("0123456789abcdef0123456789abcdef01234567").unwrap(),
+            ),
+            EvidenceAvailabilityV1::Unknown,
+            EvidenceAvailabilityV1::Known(digest),
+            RepositoryRemoteIdentityV1::Missing,
+            EvidenceAvailabilityV1::Unknown,
+        )
+        .unwrap(),
+        captured_at,
+    )
+    .unwrap();
+    let provenance = GenerationBoundRepositoryProvenanceV1::new(
+        write.projection_generation().clone(),
+        capture,
+        Some(observation.observation_id().clone()),
+    )
+    .unwrap();
+    let anchor = RetrievalAnchorRecordV2::new(RetrievalAnchorRecordV2Parts {
+        target: RetrievalAnchorTargetV2::RepositoryCapture {
+            repository_id: provenance.capture().repository_id().clone(),
+            capture_id: provenance.capture_id().clone(),
+            receipt: observation.receipt().receipt().clone(),
+        },
+        owner: observation.scope().clone(),
+        aliases: vec![],
+        occurred_at: None,
+        ingested_at: write.retrieval_anchor().ingested_at(),
+        evidence_class: EvidenceClass::Observed,
+        source_generation: AnchorSourceGenerationV2::RepositoryCapture(
+            provenance.capture_id().clone(),
+        ),
+        projection_generation: write.projection_generation().clone(),
+        projection_watermark: VectorWatermark::default(),
+        coverage: CoverageReportV1::default(),
+        source_observations: vec![observation.observation_id().clone()],
+        source_anchors: vec![],
+        authorization: write.retrieval_anchor().authorization().clone(),
+        payload_access: PayloadAccessState::Eligible,
+        retention_class: observation.retention_class().clone(),
+        durability: AnchorDurabilityClass::DurableEvidence,
+    })
+    .unwrap();
+    write
+        .with_repository_provenance_attachment(
+            EvidenceAvailabilityV1::Known(provenance),
+            Some(anchor),
+        )
+        .unwrap()
+}
+
+#[test]
+fn repository_recapture_replay_retains_original_provenance() {
+    let mut connection = connection();
+    let observation = anchored_observation_write("recapture replay", "receipt.recapture-replay");
+    let first = with_repository_capture_at(observation.clone(), UtcMicros(100));
+    let replay = with_repository_capture_at(observation, UtcMicros(200))
+        .with_provenance_disposition(ObservationProvenanceDispositionV1::RetainCommittedOnReplay);
+    let first_capture = first
+        .repository_provenance_attachment()
+        .provenance()
+        .unwrap()
+        .capture();
+    let replay_capture = replay
+        .repository_provenance_attachment()
+        .provenance()
+        .unwrap()
+        .capture();
+
+    // Independent admissions observe identical repository state at different
+    // clocks. These remain distinct capture events, but the observation replay
+    // must retain its first attachment rather than replacing immutable evidence.
+    assert_eq!(first.observation(), replay.observation());
+    assert_eq!(first.retrieval_anchor(), replay.retrieval_anchor());
+    assert_eq!(
+        first_capture.repository_id(),
+        replay_capture.repository_id()
+    );
+    assert_eq!(first_capture.project_id(), replay_capture.project_id());
+    assert_eq!(first_capture.worktree_id(), replay_capture.worktree_id());
+    assert_eq!(
+        first_capture.canonical_root_digest(),
+        replay_capture.canonical_root_digest()
+    );
+    assert_eq!(first_capture.evidence(), replay_capture.evidence());
+    assert_eq!(first_capture.captured_at(), UtcMicros(100));
+    assert_eq!(replay_capture.captured_at(), UtcMicros(200));
+    assert_ne!(first_capture.capture_id(), replay_capture.capture_id());
+    assert_ne!(
+        first
+            .repository_provenance_attachment()
+            .anchor()
+            .unwrap()
+            .anchor_id(),
+        replay
+            .repository_provenance_attachment()
+            .anchor()
+            .unwrap()
+            .anchor_id(),
+    );
+
+    execute(&mut connection, &first).unwrap();
+    let read_operation = ObservationReadOperationV1::Observation {
+        observation_id: first.observation().observation_id().clone(),
+    };
+    let retained = read(&mut connection, &read_operation).unwrap();
+    // Bypass adapter preflight deliberately: both racing submissions may have
+    // observed an empty snapshot before the first writer committed.
+    execute(&mut connection, &replay)
+        .expect("a recapture of unchanged state must replay the original observation authority");
+    assert_eq!(read(&mut connection, &read_operation).unwrap(), retained);
+    for (table, expected) in [
+        ("observations", 1),
+        ("sanitization_receipts", 1),
+        ("retrieval_anchors", 2),
+        ("observation_retrieval_anchors", 1),
+        ("observation_repository_provenance", 1),
+        ("source_cursors", 1),
+        ("projection_queue", 1),
+    ] {
+        assert_eq!(
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            expected,
+            "{table} changed during observation replay",
+        );
+    }
+}
+
+#[test]
+fn strict_repository_replay_rejects_changed_provenance() {
+    let mut connection = connection();
+    let observation = anchored_observation_write("strict replay", "receipt.strict-replay");
+    let first = with_repository_capture_at(observation.clone(), UtcMicros(100));
+    let recapture = with_repository_capture_at(observation.clone(), UtcMicros(200));
+    execute(&mut connection, &first).unwrap();
+    let operation = ObservationReadOperationV1::Observation {
+        observation_id: first.observation().observation_id().clone(),
+    };
+    let retained = read(&mut connection, &operation).unwrap();
+    for replay in [recapture, observation] {
+        assert_eq!(
+            replay.provenance_disposition(),
+            ObservationProvenanceDispositionV1::RequireExact
+        );
+        let changes = connection.total_changes();
+        let error = execute(&mut connection, &replay).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("observation repository provenance collision")
+        );
+        assert_eq!(connection.total_changes(), changes);
+        assert_eq!(read(&mut connection, &operation).unwrap(), retained);
+    }
+    execute(&mut connection, &first).expect("strict exact attachment still replays");
+}
+
+#[test]
+fn fresh_repository_replay_rejects_corrupt_committed_authority() {
+    for corruption in [
+        "DELETE FROM observation_repository_provenance",
+        "UPDATE observation_repository_provenance SET capture_json = 'null'",
+        "UPDATE observation_repository_provenance SET owner_json = 'null'",
+        "UPDATE retrieval_anchors SET owner_json = 'null' WHERE anchor_id IN
+             (SELECT retrieval_anchor_id FROM observation_repository_provenance)",
+        "UPDATE retrieval_anchors SET projection_generation = 'projection.corrupt' WHERE anchor_id IN
+             (SELECT retrieval_anchor_id FROM observation_repository_provenance)",
+        "INSERT INTO retrieval_anchor_aliases (owner_json, alias_kind, locator_digest, anchor_id)
+             SELECT owner_json, 'corrupt-extra', 'corrupt-digest', retrieval_anchor_id
+             FROM observation_repository_provenance",
+        "DELETE FROM retrieval_anchor_aliases",
+        "UPDATE sanitization_receipts SET receipt_json = 'null'",
+    ] {
+        let mut connection = connection();
+        let observation = anchored_observation_write("corrupt replay", "receipt.corrupt-replay");
+        let first = with_repository_capture_at(observation.clone(), UtcMicros(100));
+        let replay = with_repository_capture_at(observation, UtcMicros(200))
+            .with_provenance_disposition(ObservationProvenanceDispositionV1::RetainCommittedOnReplay);
+        execute(&mut connection, &first).unwrap();
+        connection.execute(corruption, []).unwrap();
+        let changes = connection.total_changes();
+        assert!(execute(&mut connection, &replay).is_err(), "accepted {corruption}");
+        assert_eq!(connection.total_changes(), changes, "repaired {corruption}");
+    }
+}
+
+#[test]
+fn fresh_repository_replay_rejects_changed_observation_and_receipt() {
+    let mut connection = connection();
+    let first = with_repository_capture_at(
+        anchored_observation_write("exact evidence", "receipt.exact-evidence"),
+        UtcMicros(100),
+    );
+    execute(&mut connection, &first).unwrap();
+    for candidate in [
+        anchored_observation_write("changed evidence", "receipt.changed-evidence"),
+        anchored_observation_write("exact evidence", "receipt.changed-receipt"),
+    ] {
+        let candidate = with_repository_capture_at(candidate, UtcMicros(200))
+            .with_provenance_disposition(
+                ObservationProvenanceDispositionV1::RetainCommittedOnReplay,
+            );
+        assert_eq!(
+            candidate.observation().observation_id(),
+            first.observation().observation_id()
+        );
+        let changes = connection.total_changes();
+        let error = execute(&mut connection, &candidate).unwrap_err();
+        assert!(error.to_string().contains("observation identity collision"));
+        assert_eq!(connection.total_changes(), changes);
+    }
+}
+
 fn connection() -> Connection {
     let connection = Connection::open_in_memory().unwrap();
     connection
@@ -222,12 +464,16 @@ fn connection() -> Connection {
     connection
 }
 
-fn execute(connection: &mut Connection, write: &AnchoredObservationWrite) -> rusqlite::Result<()> {
+fn execute(
+    connection: &mut Connection,
+    write: &AnchoredObservationWrite,
+) -> Result<(), StorageOperationError> {
     let mut transaction = connection.transaction()?;
     let savepoint = transaction.savepoint()?;
     ObservationExecutor.execute_write(&savepoint, write)?;
     savepoint.commit()?;
-    transaction.commit()
+    transaction.commit()?;
+    Ok(())
 }
 
 fn read(
@@ -241,12 +487,13 @@ fn read(
 fn execute_cursor_advance(
     connection: &mut Connection,
     advance: &ObservationCursorAdvance,
-) -> rusqlite::Result<()> {
+) -> Result<(), StorageOperationError> {
     let mut transaction = connection.transaction()?;
     let savepoint = transaction.savepoint()?;
     ObservationExecutor.execute_cursor_advance(&savepoint, advance)?;
     savepoint.commit()?;
-    transaction.commit()
+    transaction.commit()?;
+    Ok(())
 }
 
 #[test]
@@ -399,9 +646,14 @@ fn replay_with_different_anchor_fails_without_mutating_authority_rows() {
     )
     .unwrap();
 
-    let error = execute(&mut connection, &conflicting).unwrap_err();
-
-    assert!(error.to_string().contains("retrieval anchor"));
+    for disposition in [
+        ObservationProvenanceDispositionV1::RequireExact,
+        ObservationProvenanceDispositionV1::RetainCommittedOnReplay,
+    ] {
+        let candidate = conflicting.clone().with_provenance_disposition(disposition);
+        let error = execute(&mut connection, &candidate).unwrap_err();
+        assert!(error.to_string().contains("retrieval anchor"));
+    }
     for table in [
         "observations",
         "retrieval_anchors",
@@ -509,7 +761,7 @@ fn identity_collision_fails_without_advancing_the_source_cursor() {
 }
 
 #[test]
-fn source_cursor_advance_replays_exactly_and_rejects_reason_collision() {
+fn source_cursor_advance_replays_exactly_and_reports_ledger_disagreement() {
     let mut connection = connection();
     let write = anchored_observation_write("fixture", "receipt.fixture");
     execute(&mut connection, &write).unwrap();
@@ -546,11 +798,189 @@ fn source_cursor_advance_replays_exactly_and_rejects_reason_collision() {
     )
     .unwrap();
     let error = execute_cursor_advance(&mut connection, &conflicting).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("source cursor advance identity collision")
-    );
+    let StorageOperationError::CursorAdvanceLedgerDisagreement { disagreement } = error else {
+        panic!("expected structured immutable ledger disagreement");
+    };
+    assert_eq!(disagreement.source(), write.observation().source());
+    assert_eq!(disagreement.scope(), write.observation().scope());
+    assert_eq!(disagreement.coverage(), conflicting.coverage());
+    assert!(matches!(
+        disagreement.stored().reason(),
+        CursorAdvanceLedgerReasonV1::Known(ObservationCoverageReason::BlankFrame)
+    ));
+    assert!(matches!(
+        disagreement.stored().receipt_id(),
+        CursorAdvanceLedgerReceiptIdV1::Absent
+    ));
+    assert!(matches!(
+        disagreement.candidate().reason(),
+        CursorAdvanceLedgerReasonV1::Known(ObservationCoverageReason::OutOfScope)
+    ));
+    assert!(matches!(
+        disagreement.candidate().receipt_id(),
+        CursorAdvanceLedgerReceiptIdV1::Absent
+    ));
+}
+
+#[test]
+fn canonical_cursor_advance_receipt_remains_typed_after_authority_lookup() {
+    let mut connection = connection();
+    let write = anchored_observation_write("fixture", "receipt.fixture");
+    execute(&mut connection, &write).unwrap();
+    let advance = ObservationCursorAdvance::for_ordering_with_sanitization_receipt(
+        write.observation().source().clone(),
+        write.observation().scope().clone(),
+        write.observation().identity().generation(),
+        write.observation().identity().ordering_domain(),
+        Some(write.next_cursor().clone()),
+        ObservationSourceRangeV1::new(1, 2).unwrap(),
+        ObservationCoverageReason::DuplicateObservation,
+        write.observation().receipt().clone(),
+    )
+    .unwrap();
+    execute_cursor_advance(&mut connection, &advance).unwrap();
+
+    let conflicting = ObservationCursorAdvance::for_ordering_with_sanitization_receipt(
+        write.observation().source().clone(),
+        write.observation().scope().clone(),
+        write.observation().identity().generation(),
+        write.observation().identity().ordering_domain(),
+        Some(write.next_cursor().clone()),
+        ObservationSourceRangeV1::new(1, 2).unwrap(),
+        ObservationCoverageReason::CanonicalPayloadRevision,
+        write.observation().receipt().clone(),
+    )
+    .unwrap();
+
+    let error = execute_cursor_advance(&mut connection, &conflicting).unwrap_err();
+    let StorageOperationError::CursorAdvanceLedgerDisagreement { disagreement } = error else {
+        panic!("expected structured immutable ledger disagreement");
+    };
+    assert!(matches!(
+        disagreement.stored().receipt_id(),
+        CursorAdvanceLedgerReceiptIdV1::Known(receipt_id)
+            if receipt_id.as_str() == "receipt.fixture"
+    ));
+    assert!(matches!(
+        disagreement.candidate().receipt_id(),
+        CursorAdvanceLedgerReceiptIdV1::Known(receipt_id)
+            if receipt_id.as_str() == "receipt.fixture"
+    ));
+}
+
+#[test]
+fn corrupt_cursor_advance_ledger_values_are_opaque_and_content_free() {
+    let mut connection = connection();
+    let write = anchored_observation_write("fixture", "receipt.fixture");
+    execute(&mut connection, &write).unwrap();
+    let advance = ObservationCursorAdvance::for_ordering(
+        write.observation().source().clone(),
+        write.observation().scope().clone(),
+        write.observation().identity().generation(),
+        write.observation().identity().ordering_domain(),
+        Some(write.next_cursor().clone()),
+        ObservationSourceRangeV1::new(1, 2).unwrap(),
+        ObservationCoverageReason::BlankFrame,
+    )
+    .unwrap();
+    execute_cursor_advance(&mut connection, &advance).unwrap();
+
+    let private_ledger_value = format!("provider-private-transcript:{}", "x".repeat(16_384));
+    connection
+        .execute(
+            "UPDATE source_cursor_advances SET reason = ?1, receipt_id = ?2",
+            rusqlite::params![private_ledger_value, private_ledger_value],
+        )
+        .unwrap();
+    let conflicting = ObservationCursorAdvance::for_ordering(
+        write.observation().source().clone(),
+        write.observation().scope().clone(),
+        write.observation().identity().generation(),
+        write.observation().identity().ordering_domain(),
+        Some(write.next_cursor().clone()),
+        ObservationSourceRangeV1::new(1, 2).unwrap(),
+        ObservationCoverageReason::OutOfScope,
+    )
+    .unwrap();
+
+    let error = execute_cursor_advance(&mut connection, &conflicting).unwrap_err();
+    let StorageOperationError::CursorAdvanceLedgerDisagreement { disagreement } = error else {
+        panic!("expected structured immutable ledger disagreement");
+    };
+    assert!(matches!(
+        disagreement.stored().reason(),
+        CursorAdvanceLedgerReasonV1::Opaque { fingerprint }
+            if fingerprint.as_str().starts_with("sha256:")
+    ));
+    assert!(matches!(
+        disagreement.stored().receipt_id(),
+        CursorAdvanceLedgerReceiptIdV1::Opaque { fingerprint }
+            if fingerprint.as_str().starts_with("sha256:")
+    ));
+    assert!(matches!(
+        disagreement.candidate().reason(),
+        CursorAdvanceLedgerReasonV1::Known(ObservationCoverageReason::OutOfScope)
+    ));
+    assert!(matches!(
+        disagreement.candidate().receipt_id(),
+        CursorAdvanceLedgerReceiptIdV1::Absent
+    ));
+    let rendered = serde_json::to_string(&disagreement).unwrap();
+    assert!(rendered.len() < 4_096, "diagnostic must stay bounded");
+    assert!(!rendered.contains("provider-private-transcript"));
+}
+
+#[test]
+fn short_corrupt_ledger_receipt_stays_opaque_across_runtime_boundary() {
+    let mut connection = connection();
+    let write = anchored_observation_write("fixture", "receipt.fixture");
+    execute(&mut connection, &write).unwrap();
+    let advance = ObservationCursorAdvance::for_ordering(
+        write.observation().source().clone(),
+        write.observation().scope().clone(),
+        write.observation().identity().generation(),
+        write.observation().identity().ordering_domain(),
+        Some(write.next_cursor().clone()),
+        ObservationSourceRangeV1::new(1, 2).unwrap(),
+        ObservationCoverageReason::BlankFrame,
+    )
+    .unwrap();
+    execute_cursor_advance(&mut connection, &advance).unwrap();
+
+    let secret = "provider-private-transcript-secret";
+    assert!(SanitizationReceiptId::new(secret).is_ok());
+    connection
+        .execute(
+            "UPDATE source_cursor_advances SET receipt_id = ?1",
+            rusqlite::params![secret],
+        )
+        .unwrap();
+    let conflicting = ObservationCursorAdvance::for_ordering(
+        write.observation().source().clone(),
+        write.observation().scope().clone(),
+        write.observation().identity().generation(),
+        write.observation().identity().ordering_domain(),
+        Some(write.next_cursor().clone()),
+        ObservationSourceRangeV1::new(1, 2).unwrap(),
+        ObservationCoverageReason::OutOfScope,
+    )
+    .unwrap();
+
+    let error = execute_cursor_advance(&mut connection, &conflicting).unwrap_err();
+    let StorageOperationError::CursorAdvanceLedgerDisagreement { disagreement } = error else {
+        panic!("expected structured immutable ledger disagreement");
+    };
+    assert!(matches!(
+        disagreement.stored().receipt_id(),
+        CursorAdvanceLedgerReceiptIdV1::Opaque { fingerprint }
+            if fingerprint.as_str().starts_with("sha256:")
+    ));
+    let disagreement_json = serde_json::to_string(&disagreement).unwrap();
+    assert!(!disagreement_json.contains(secret));
+    let runtime_error =
+        StorageRuntimeErrorV1::ObservationCursorAdvanceLedgerDisagreement { disagreement };
+    let runtime_error_json = serde_json::to_string(&runtime_error).unwrap();
+    assert!(!runtime_error_json.contains(secret));
 }
 
 #[test]

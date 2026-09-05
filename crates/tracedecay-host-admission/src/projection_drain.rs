@@ -1,6 +1,10 @@
 use std::collections::BTreeSet;
 
 use tracedecay_sessions::admission::{HostAdmissionOutcome, HostProjectionDrainOutcome};
+use tracedecay_sessions::runtime::git_correlation::{
+    DEFAULT_AUTO_BACKFILL_SESSIONS_PER_PASS, DEFAULT_GIT_EVIDENCE_PUBLICATION_REPLAY_LIMIT,
+    SystemGit,
+};
 use tracedecay_store::ProjectionPersistOutcome;
 
 use super::*;
@@ -229,9 +233,44 @@ impl HostAdmissionFacade<'_> {
             }
         }
         outcome.deferred |= observation_deferred;
+        if max > 0 && matches!(scope, ObservationScopeV1::Project { .. }) {
+            if cancellation.is_cancelled() {
+                return Err(classify_error(&ObservationApplicationError::Cancelled));
+            }
+            let convergence = database
+                .converge_session_git_evidence(
+                    &SystemGit,
+                    DEFAULT_AUTO_BACKFILL_SESSIONS_PER_PASS,
+                    DEFAULT_GIT_EVIDENCE_PUBLICATION_REPLAY_LIMIT,
+                )
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, "Git evidence convergence failed during host drain");
+                    HostAdmissionOutcome::retained_unavailable(
+                        "git_evidence_convergence_unavailable",
+                    )
+                })?;
+            if let Some(error) = convergence.later_failure() {
+                tracing::warn!(%error, "Git evidence convergence made partial progress during host drain");
+            }
+            if cancellation.is_cancelled() {
+                return Err(classify_error(&ObservationApplicationError::Cancelled));
+            }
+            outcome.deferred |= git_evidence_convergence_deferred(&convergence);
+        }
         outcome.session_ids = session_ids.into_iter().collect();
         Ok(outcome)
     }
+}
+
+fn git_evidence_convergence_deferred(
+    convergence: &tracedecay_global_db::GitEvidenceConvergenceOutcome,
+) -> bool {
+    let stats = convergence.stats();
+    convergence.later_failure().is_some()
+        || stats.pending_publications.is_none_or(|pending| pending > 0)
+        || stats.backfill_page_saturated
+        || stats.backfill.skipped_git_error > 0
 }
 
 #[cfg(test)]
@@ -259,7 +298,9 @@ fn simulate_drain_project_calls(batch: &[SimulatedProjectOutcome]) -> (u64, usiz
 
 #[cfg(test)]
 mod tests {
-    use super::{SimulatedProjectOutcome, simulate_drain_project_calls};
+    use super::{
+        SimulatedProjectOutcome, git_evidence_convergence_deferred, simulate_drain_project_calls,
+    };
 
     #[test]
     fn multi_item_batch_continues_after_durable_refusals() {
@@ -277,5 +318,36 @@ mod tests {
             batch.len(),
             "durably refused items must not stall healthy items later in the batch"
         );
+    }
+
+    #[test]
+    fn permanent_git_exclusions_do_not_defer_host_admission() {
+        let convergence = tracedecay_global_db::GitEvidenceConvergenceOutcome::Complete(
+            tracedecay_global_db::GitEvidenceConvergenceStats {
+                replayed_publications: 0,
+                pending_publications: Some(0),
+                backfill: tracedecay_sessions::runtime::git_correlation::BackfillStats {
+                    skipped_no_window: 1,
+                    skipped_not_worktree: 1,
+                    ..Default::default()
+                },
+                backfill_page_saturated: false,
+            },
+        );
+
+        assert!(!git_evidence_convergence_deferred(&convergence));
+
+        let transient = tracedecay_global_db::GitEvidenceConvergenceOutcome::Complete(
+            tracedecay_global_db::GitEvidenceConvergenceStats {
+                replayed_publications: 0,
+                pending_publications: Some(0),
+                backfill: tracedecay_sessions::runtime::git_correlation::BackfillStats {
+                    skipped_git_error: 1,
+                    ..Default::default()
+                },
+                backfill_page_saturated: false,
+            },
+        );
+        assert!(git_evidence_convergence_deferred(&transient));
     }
 }

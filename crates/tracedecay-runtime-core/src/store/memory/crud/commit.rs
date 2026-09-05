@@ -10,8 +10,9 @@ use super::super::privacy_purge::{
     assertion_payload_is_explicitly_purged_tx, purge_superseded_payloads_for_fact_tx,
 };
 use super::{
-    CommitAttempt, ensure_event_references, ensure_fact_identity, event_exists, event_matches,
-    insert_event, payload_is_purged_projection, publish_current_projection, receipt_outcome,
+    CommitAttempt, ensure_event_references, ensure_fact_identity,
+    ensure_supersession_endpoints_available, event_exists, event_matches, insert_event,
+    payload_is_purged_projection, publish_current_projection, receipt_outcome,
 };
 use crate::db::DatabaseMemoryTransaction as Transaction;
 use crate::db::engine::{params, params_from_iter};
@@ -82,6 +83,7 @@ pub(super) async fn commit_fact_tx(
             wrote: false,
         });
     }
+    ensure_supersession_endpoints_available(transaction, &owner, batch).await?;
     ensure_append_order(transaction, &owner, batch, actual_last.as_ref()).await?;
 
     ensure_fact_identity(transaction, &owner, batch).await?;
@@ -547,6 +549,29 @@ async fn insert_assertion(
                 owner.project_id.as_str(),
                 to_json(assertion.payload(), "serialize assertion payload")?,
                 assertion.payload().content(),
+            ],
+        )
+        .await
+        .map_err(|error| storage_error(COMMIT_OPERATION, error))?;
+    // The digest row is written by the same authority as the payload so the
+    // indexed duplicate lookup (#834) can never disagree with the bytes it
+    // fingerprints; the payload delete trigger drops it with the payload.
+    let digest = super::content_digest(assertion.payload().content())?;
+    transaction
+        .execute(
+            "INSERT INTO memory_v2_assertion_payload_digests(
+                payload_rowid, assertion_id, fact_id, owner_kind, project_id, content_digest
+             )
+             SELECT rowid, assertion_id, fact_id, owner_kind, project_id, ?5
+             FROM memory_v2_assertion_payloads
+             WHERE assertion_id = ?1 AND fact_id = ?2
+               AND owner_kind = ?3 AND project_id = ?4",
+            params![
+                assertion.assertion_id().as_str(),
+                assertion.fact_id().as_str(),
+                owner.kind,
+                owner.project_id.as_str(),
+                digest.as_str(),
             ],
         )
         .await

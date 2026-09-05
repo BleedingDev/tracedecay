@@ -31,7 +31,7 @@ hotpath-cpu = [
     "tracedecay-private-fs/hotpath-cpu",
     "tracedecay-store/hotpath-cpu",
 ]
-test-helpers = []
+test-helpers = ["graph-sealed-store"]
 eval-helpers = []
 
 # Opt-in tiered graph storage (never in `default`).
@@ -172,6 +172,11 @@ harness = false
 required-features = ["test-helpers"]
 
 [[bench]]
+name = "vector_commit_refresh"
+harness = false
+required-features = ["test-helpers"]
+
+[[bench]]
 name = "replay_after_mismatch"
 harness = false
 required-features = ["test-helpers"]
@@ -211,6 +216,10 @@ required-features = ["test-helpers"]
 
 [[test]]
 name = "runtime_contract"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "paged_relation_ids"
 required-features = ["test-helpers"]
 
 [[test]]

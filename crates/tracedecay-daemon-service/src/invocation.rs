@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use thiserror::Error;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tracedecay_application::feedback::{
     FeedbackReadPort, FeedbackRouteAuthorizationPort, FeedbackRuntimeStatePort,
 };
@@ -76,8 +76,9 @@ use tracedecay_tool_catalog::{CapabilityId, EffectClass, SortContractId, UseCase
 
 use crate::project_runtime::{
     FeedbackCyclePublicationError, ProjectRuntimeAlreadyRegistered, ProjectRuntimeRegistryError,
-    ProjectRuntimeRegistryV1, RegisteredObservabilityProducerV1, StoreObservabilityMountErrorV1,
-    StoreObservabilityMountV1, StoreObservabilityRegistryV1,
+    ProjectRuntimeRegistryV1, RegisteredObservabilityProducerV1,
+    RegisteredSemanticActivationOwnerV1, StoreObservabilityMountErrorV1, StoreObservabilityMountV1,
+    StoreObservabilityRegistryV1,
 };
 use tracedecay_agent_hosts::agents::context_scout_ports::{
     AdmittedContextScoutHookV1, ContextScoutLifecycleAddressV1,
@@ -180,6 +181,7 @@ mod observability_producer;
 mod observatory;
 mod primitive;
 pub use primitive::callable_code_request_context;
+mod recovery_schedule;
 mod registrars;
 mod retained;
 mod semantic_activation;
@@ -206,7 +208,9 @@ use invocation_observability::{
 #[cfg(test)]
 use invocation_observability::{invocation_rejected_argument, invocation_response_outcome};
 use lsp::PublishedCodeIndexWorkspaceDocuments;
-pub use lsp_delivery::{lsp_delivery_attempt, retain_lsp_delivery_attempt};
+pub use lsp_delivery::{
+    LspDeliverySettlementAdmissionV1, lsp_delivery_attempt, retain_lsp_delivery_attempt,
+};
 use native_integration::execute_native_integration;
 use observatory::execute_observatory_read;
 use primitive::*;

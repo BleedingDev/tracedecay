@@ -63,6 +63,26 @@ static EMPTY_LCM_DB_TEMPLATE: OnceCell<Vec<u8>> = OnceCell::const_new();
 static EMPTY_GLOBAL_DB_TEMPLATE: OnceCell<Vec<u8>> = OnceCell::const_new();
 static EMPTY_GRAPH_DB_TEMPLATE: OnceCell<Vec<u8>> = OnceCell::const_new();
 
+/// Registers this process's product runtime provider with the canonical test
+/// fixture provider, so an in-process daemon handshake has a truthful binary
+/// version to advertise.
+///
+/// `tracedecay::daemon::handshake_for_current_client` reads the registered
+/// product runtime through `version::build_version`, and answers
+/// `Config { "no product runtime provider is registered; the generating binary
+/// must register one at process start" }` when the entry point never registered
+/// one. Only `tracedecay-cli`'s `main` performs that registration in production,
+/// and no test binary runs it — nextest gives every test its own process, so a
+/// suite fixture that builds a handshake must register the fixture provider
+/// itself.
+///
+/// Registration is a `get_or_init` on one process-global slot, so calling this
+/// from every fixture entry point is safe, idempotent, and always observes the
+/// identical runtime regardless of test order.
+pub fn register_process_product_runtime() {
+    tracedecay::product_runtime::register_fixture_product_runtime();
+}
+
 /// Installs the canonical registered global/session schema installer into the
 /// kernel's fail-closed port before any integration fixture opens a `Database`.
 ///
@@ -184,6 +204,11 @@ pub struct IsolatedEnv {
 
 impl IsolatedEnv {
     fn build(env_lock: tokio::sync::MutexGuard<'static, ()>) -> (Self, PathBuf) {
+        // Every fixture built on top of this guard eventually asks the shipped
+        // daemon for a handshake, which reads the registered product runtime.
+        // Registering here — the single choke point both `acquire` paths share
+        // — keeps that out of every individual suite fixture.
+        register_process_product_runtime();
         let dir = tempdir_or_panic();
         let storage = TraceDecayStorageEnvGuard::for_tempdir(&dir);
         let project = dir.path().join("project");
@@ -251,6 +276,8 @@ pub struct TraceDecayStorageEnvGuard {
     global_db_path: PathBuf,
     _home_guard: EnvVarGuard,
     _userprofile_guard: EnvVarGuard,
+    _config_home_guard: EnvVarGuard,
+    _runtime_dir_guard: EnvVarGuard,
     _data_dir_guard: EnvVarGuard,
     _global_db_guard: GlobalDbEnvGuard,
     _holder_scan_guard: EnvVarGuard,
@@ -275,6 +302,38 @@ impl TraceDecayStorageEnvGuard {
             );
         }
         let global_db_path = canonicalize_test_db_path(&profile_root.join("global.db"));
+        // Service-manager isolation, not storage isolation. The installed
+        // daemon's unit path is `$XDG_CONFIG_HOME/systemd/user/tracedecay.service`
+        // (`tracedecay-daemon-control::service::unit_file`), and any in-process
+        // lifecycle path that finds that file quiesces the unit it names with
+        // `systemctl --user stop`. `$HOME` alone does not decide it: the XDG
+        // variable wins when the ambient environment exports one, so a fixture
+        // that pinned only `HOME` would stop the developer's or operator's real
+        // `tracedecay.service`. Pin the config home inside the throwaway home so
+        // no unit file is ever found, and pin the runtime dir alongside it so a
+        // stray `systemctl --user` cannot reach the real user manager's socket
+        // either. `apply_tracedecay_home_env` pins the same pair for spawned
+        // child processes.
+        let config_home = home.join(".config");
+        let runtime_dir = home.join("run");
+        for directory in [&config_home, &runtime_dir] {
+            fs::create_dir_all(directory).unwrap_or_else(|err| {
+                panic!(
+                    "failed to create isolated directory '{}': {err}",
+                    directory.display()
+                )
+            });
+        }
+        #[cfg(unix)]
+        {
+            let owner_only = fs::Permissions::from_mode(0o700);
+            fs::set_permissions(&runtime_dir, owner_only).unwrap_or_else(|err| {
+                panic!(
+                    "failed to restrict isolated runtime directory '{}': {err}",
+                    runtime_dir.display()
+                )
+            });
+        }
 
         Self {
             home: home.clone(),
@@ -282,6 +341,8 @@ impl TraceDecayStorageEnvGuard {
             global_db_path: global_db_path.clone(),
             _home_guard: EnvVarGuard::set("HOME", &home),
             _userprofile_guard: EnvVarGuard::set("USERPROFILE", &home),
+            _config_home_guard: EnvVarGuard::set("XDG_CONFIG_HOME", &config_home),
+            _runtime_dir_guard: EnvVarGuard::set("XDG_RUNTIME_DIR", &runtime_dir),
             _data_dir_guard: EnvVarGuard::set(USER_DATA_DIR_ENV, &profile_root),
             _global_db_guard: GlobalDbEnvGuard::set(&global_db_path),
             _holder_scan_guard: EnvVarGuard::set(
@@ -707,10 +768,16 @@ fn detach_from_test_process_group(command: &mut Command) {
 
 pub fn apply_tracedecay_home_env(command: &mut Command, home: &Path) {
     let home = canonical_existing_path(home);
+    // `XDG_RUNTIME_DIR` joins `XDG_CONFIG_HOME` here for the same reason the
+    // in-process guard pins both: a child that resolves an installed unit file
+    // would otherwise reach the real `systemctl --user` manager.
+    let runtime_dir = home.join("run");
+    let _ = fs::create_dir_all(&runtime_dir);
     command
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env(USER_DATA_DIR_ENV, home.join(".tracedecay"))
         .env(GLOBAL_DB_ENV, home.join(".tracedecay/global.db"))
         .env_remove(tracedecay_daemon_protocol::SOCKET_ENV);
@@ -742,7 +809,7 @@ pub fn search_eval_bin(name: &str) -> PathBuf {
         });
     assert!(
         binary.is_file(),
-        "search-eval binary `{name}` is missing at {}; build it with `cargo build -p tracedecay-search-eval --bin {name}` or set {override_env}",
+        "search-eval binary `{name}` is missing at {}; build it with `cargo build --workspace --bins --locked --features tracedecay/test-helpers` or set {override_env}.          A `-p tracedecay-search-eval` build resolves `tracedecay-code-index` without its default language tiers and yields an evaluator that cannot parse Rust, so the package selection must match the test lane's.",
         binary.display()
     );
     binary
@@ -914,9 +981,10 @@ pub fn ensure_tracedecay_daemon(home: &Path) {
     TEST_DAEMONS.with(|daemons| {
         let mut daemons = daemons.borrow_mut();
         daemons.retain(|existing_home, daemon| existing_home == &home && daemon.is_running());
-        daemons
-            .entry(home.clone())
-            .or_insert_with(|| spawn_tracedecay_daemon_process(&home, |_| {}));
+        daemons.entry(home.clone()).or_insert_with(|| {
+            let binary = tracedecay_bin();
+            spawn_tracedecay_daemon_process(&home, &binary, |_| {})
+        });
     });
 }
 
@@ -970,7 +1038,16 @@ pub fn spawn_tracedecay_daemon(home: &Path) -> DaemonProcess {
     if let Some(daemon) = take_managed_daemon(&home) {
         return daemon;
     }
-    spawn_tracedecay_daemon_process(&home, |_| {})
+    let binary = tracedecay_bin();
+    spawn_tracedecay_daemon_process(&home, &binary, |_| {})
+}
+
+/// Starts the explicitly selected shipped binary under the canonical bounded
+/// test-daemon authority, without resolving or probing a workspace binary.
+pub fn spawn_tracedecay_daemon_from(home: &Path, binary: &Path) -> DaemonProcess {
+    let home = canonical_existing_path(home);
+    drop(take_managed_daemon(&home));
+    spawn_tracedecay_daemon_process(&home, binary, |_| {})
 }
 
 /// Spawns a test daemon after applying caller-supplied command customization.
@@ -986,11 +1063,13 @@ pub fn spawn_tracedecay_daemon_with(
 ) -> DaemonProcess {
     let home = canonical_existing_path(home);
     drop(take_managed_daemon(&home));
-    spawn_tracedecay_daemon_process(&home, configure)
+    let binary = tracedecay_bin();
+    spawn_tracedecay_daemon_process(&home, &binary, configure)
 }
 
 fn spawn_tracedecay_daemon_process(
     home: &Path,
+    binary: &Path,
     configure: impl FnOnce(&mut Command),
 ) -> DaemonProcess {
     let profile_root = canonical_existing_path(home).join(".tracedecay");
@@ -1023,7 +1102,7 @@ fn spawn_tracedecay_daemon_process(
         authority_path.display()
     );
 
-    let mut command = Command::new(tracedecay_bin());
+    let mut command = Command::new(binary);
     apply_tracedecay_home_env(&mut command, home);
     command.args(["daemon", "run"]);
     #[cfg(unix)]

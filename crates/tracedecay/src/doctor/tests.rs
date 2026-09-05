@@ -6,7 +6,7 @@ use crate::agents::AgentIntegration;
 use tracedecay_runtime_core::text::format_bytes;
 
 #[test]
-fn supported_kimi_and_kiro_absence_reaches_doctor_without_host_directories() {
+fn supported_optional_host_absences_reach_doctor_without_host_directories() {
     let home = tempfile::tempdir().expect("isolated home");
     let reported = agents::all_integrations()
         .into_iter()
@@ -14,10 +14,13 @@ fn supported_kimi_and_kiro_absence_reaches_doctor_without_host_directories() {
         .map(|agent| agent.id())
         .collect::<std::collections::BTreeSet<_>>();
 
+    // Every host whose integration sets `reports_absence_to_doctor()`. Adding a
+    // host here is a deliberate product decision: an absent optional host stays
+    // an informational Doctor warning, and every other absent host stays quiet.
     assert_eq!(
         reported,
-        std::collections::BTreeSet::from(["kimi", "kiro"]),
-        "supported Kimi and Kiro absences must remain visible while unrelated absent hosts stay quiet"
+        std::collections::BTreeSet::from(["antigravity", "devin", "kimi", "kiro", "vibe", "zed"]),
+        "supported optional-host absences must remain visible while unrelated absent hosts stay quiet"
     );
 
     let context = HealthcheckContext {
@@ -35,7 +38,10 @@ fn supported_kimi_and_kiro_absence_reaches_doctor_without_host_directories() {
         counters.issues, 0,
         "an absent optional host is a truthful Doctor warning, not a broken installation"
     );
-    assert_eq!(counters.warnings, 2);
+    // One warning per absent host, plus one extra each for the two hosts that
+    // register two documents: Antigravity (IDE config and CLI plugin) and Vibe
+    // (MCP config and prompt rules).
+    assert_eq!(counters.warnings, 8);
 }
 
 #[test]
@@ -559,7 +565,7 @@ async fn store_layout_resolution_surfaces_split_identity_conflict()
 }
 
 #[test]
-fn doctor_fails_stopped_or_disabled_units_with_enable_now_remedy() {
+fn doctor_warns_for_intentionally_held_service_states_without_activation_advice() {
     use super::{DaemonServiceDoctorVerdict, daemon_service_doctor_verdict};
     use tracedecay_daemon_control::DaemonServiceState;
 
@@ -570,20 +576,14 @@ fn doctor_fails_stopped_or_disabled_units_with_enable_now_remedy() {
     ] {
         assert_eq!(
             daemon_service_doctor_verdict(state),
-            DaemonServiceDoctorVerdict::Fail,
-            "{state:?} must be a Doctor failure"
+            DaemonServiceDoctorVerdict::Warn,
+            "{state:?} may be an intentional hold and must be a Doctor warning"
         );
         let message = state.lifecycle_operator_advice();
         assert!(
-            message.contains("tracedecay daemon install-service"),
-            "{state:?} must name install-service, got: {message}"
+            message.contains("intentional") && !message.contains("enable --now"),
+            "{state:?} must preserve operator intent without enabling the service, got: {message}"
         );
-        if cfg!(target_os = "linux") {
-            assert!(
-                message.contains("systemctl --user enable --now tracedecay.service"),
-                "{state:?} must name enable --now, got: {message}"
-            );
-        }
     }
 
     let stopped_disabled = DaemonServiceState::StoppedDisabled.lifecycle_operator_advice();
@@ -625,7 +625,7 @@ fn doctor_warns_on_missing_or_running_disabled_units() {
         "missing unit must name install-service, got: {missing}"
     );
     assert!(
-        missing.contains("ensure the service is running"),
-        "missing unit keeps the generic ensure-running text, got: {missing}"
+        missing.contains("only if you want a managed daemon"),
+        "missing-unit advice must make installation intentional, got: {missing}"
     );
 }

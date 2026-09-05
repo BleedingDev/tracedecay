@@ -29,8 +29,9 @@ const MESSAGE_WORKTREE_KEYS: [&str; 9] = [
     "hermes_session_worktree",
 ];
 
-/// Receipt schema version. This schema owns no Git evidence rows.
-pub const GIT_CORRELATION_SCHEMA_VERSION: i64 = 4;
+/// Receipt schema version. This schema owns only convergence receipts and
+/// watermarks; Git evidence itself remains in the verified graph authority.
+pub const GIT_CORRELATION_SCHEMA_VERSION: i64 = 5;
 pub const GIT_EVIDENCE_PROJECTOR_REVISION_V1: &str = "session-git-evidence-projector.v1";
 pub const DEFAULT_SPAN_MERGE_GAP_SECS: i64 = 30 * 60;
 pub const DEFAULT_SPAN_OBSERVATION_DEBOUNCE_SECS: i64 = 30;
@@ -131,7 +132,8 @@ pub struct SessionGitSpan {
     pub source: SpanSource,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpanObservation {
     pub provider: String,
     pub session_id: String,
@@ -514,6 +516,31 @@ impl CorrelationIndexHealth {
     }
 }
 
+/// Bounded row-family presence for the session/Git evidence projection.
+///
+/// Query paths need only distinguish a projection with no applicable evidence
+/// from a populated projection that produced no matches. They must not pay for
+/// exact health counts, which remain a diagnostics concern.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CorrelationIndexPresence {
+    pub projection_available: bool,
+    pub generation: Option<String>,
+    pub source_watermark: Option<String>,
+    pub spans_present: bool,
+    pub commits_present: bool,
+    pub backfill_watermark: Option<i64>,
+}
+
+impl CorrelationIndexPresence {
+    #[hotpath::skip]
+    pub const fn is_empty_for(&self, git_ref: &GitRefFilter) -> bool {
+        match git_ref {
+            GitRefFilter::Branch(_) | GitRefFilter::Worktree(_) => !self.spans_present,
+            GitRefFilter::Commit(_) => !self.commits_present,
+        }
+    }
+}
+
 pub fn normalize_worktree(path: &str) -> String {
     let mut normalized = path.trim().replace('\\', "/");
     if let Some(stripped) = normalized.strip_prefix("//?/UNC/") {
@@ -749,7 +776,20 @@ pub async fn ensure_git_correlation_receipt_schema_in_transaction(
             key TEXT PRIMARY KEY,
             value INTEGER NOT NULL,
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS git_evidence_publication_outbox (
+            receipt_id TEXT PRIMARY KEY CHECK(length(receipt_id) > 0),
+            publication_prefix TEXT NOT NULL CHECK(length(publication_prefix) > 0),
+            evidence_json TEXT NOT NULL CHECK(length(evidence_json) > 0),
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        CREATE INDEX IF NOT EXISTS idx_git_evidence_publication_outbox_pending
+            ON git_evidence_publication_outbox(created_at, receipt_id);
+        CREATE TRIGGER IF NOT EXISTS git_evidence_publication_outbox_immutable
+        BEFORE UPDATE ON git_evidence_publication_outbox
+        BEGIN
+            SELECT RAISE(ABORT, 'Git evidence publication receipt is immutable');
+        END;",
     )
     .await?;
     backfill::history_progress::install_final_schema(conn).await?;
@@ -1007,6 +1047,7 @@ fn commit_hit_strength(hit: &SessionGitCorrelationHit) -> (u8, i64) {
 
 mod attribution;
 mod backfill;
+mod publication_outbox;
 mod store;
 #[cfg(test)]
 pub(crate) use attribution::publish_graph_evidence_controlled;
@@ -1019,10 +1060,16 @@ pub use backfill::{
     BackfillOptions, BackfillSkipReason, BackfillStats, BoundedBackfillInterruption,
     BoundedBackfillOutcome, BoundedGitControl, BranchTimelineEntry,
     DEFAULT_AUTO_BACKFILL_SESSIONS_PER_PASS, GitHistoryIndexFrontier, GitReflogSource,
-    SessionActivityRow, SystemGit, WindowBranchSegment, branch_timeline_from_reflog,
-    parse_commit_log, run_bounded_history_index_page, window_branch_segments,
+    IncrementalBackfillOutcome, SessionActivityRow, SystemGit, WindowBranchSegment,
+    branch_timeline_from_reflog, parse_commit_log, run_bounded_history_index_page,
+    run_incremental_backfill_outcome, window_branch_segments,
 };
 pub use backfill::{run_backfill, run_incremental_backfill};
+pub use publication_outbox::{
+    DEFAULT_GIT_EVIDENCE_PUBLICATION_REPLAY_LIMIT, GitEvidencePublicationReplayOutcome,
+    enqueue_git_evidence_publication, pending_git_evidence_publication_count,
+    replay_pending_git_evidence_publications, replay_pending_git_evidence_publications_outcome,
+};
 pub use store::{
     AnalyticsSessionTimestamp, AnalyticsSessionTimestampSource, GitCorrelationSessionStore,
     GitCorrelationWriteTxn, GitEvidenceProjectionStore, build_git_evidence_manifest_checked,

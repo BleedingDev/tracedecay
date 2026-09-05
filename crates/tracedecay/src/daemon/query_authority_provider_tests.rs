@@ -9,10 +9,10 @@ use tempfile::TempDir;
 use tracedecay_domain::configuration::{ConfigurationRevisionId, ConfigurationSnapshotId};
 use tracedecay_domain::{
     CalibrationProfileId, ChunkerRevision, CodeGenerationId, ComponentRevision, DiversityPolicy,
-    EmbeddingDeviceClassV1, EmbeddingMetricV1, EmbeddingNormalizationV1, EmbeddingPoolingV1,
-    EmbeddingPrecisionV1, EmbeddingProjectionKeyV1, EmbeddingTruncationSideV1,
-    FreshnessVectorDigest, FusionProfile, ManifestDigest, ProjectId, RetrievalBudget, UtcMicros,
-    VectorGenerationIdV1, canonical_sha256,
+    EmbeddingDeviceClassV1, EmbeddingDocumentCompositionV1, EmbeddingMetricV1,
+    EmbeddingNormalizationV1, EmbeddingPoolingV1, EmbeddingPrecisionV1, EmbeddingProjectionKeyV1,
+    EmbeddingTruncationSideV1, FreshnessVectorDigest, FusionProfile, ManifestDigest, ProjectId,
+    RetrievalBudget, UtcMicros, VectorGenerationIdV1, canonical_sha256,
 };
 use tracedecay_domain::{
     EphemeralSanitizedQueryViewV1, PrincipalId, QueryNormalizationRevision, RepositoryId,
@@ -183,6 +183,7 @@ fn semantic_pins() -> SemanticCompatibilityPinsV1 {
         config_digest: digest('c'),
         query_instruction_digest: None,
         document_instruction_digest: None,
+        document_composition: EmbeddingDocumentCompositionV1::SanitizedText,
         pooling: EmbeddingPoolingV1::Mean,
         truncation_side: EmbeddingTruncationSideV1::Right,
         truncation_length: 128,
@@ -673,6 +674,33 @@ fn zero_or_multiple_exact_query_profiles_fail_closed() {
         exact_query_profile_from_slots(&first, Some(&second)),
         Err(QueryAuthorityUnavailableReasonV1::AmbiguousActivatedProfile)
     ));
+}
+
+#[test]
+fn durable_generation_lookup_distinguishes_absence_from_read_failure() {
+    assert!(
+        classify_published_generation_lookup(None)
+            .expect("unmounted publication authority is absent")
+            .is_none()
+    );
+    assert!(
+        classify_published_generation_lookup(Some(Ok(None)))
+            .expect("missing generation is an authoritative absence")
+            .is_none()
+    );
+    let failure = classify_published_generation_lookup(Some(Err(
+        tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerErrorV1::Identity(
+            "injected durable generation read failure".to_owned(),
+        ),
+    )));
+    assert!(
+        matches!(
+            failure,
+            Err(tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerErrorV1::Identity(detail))
+                if detail == "injected durable generation read failure"
+        ),
+        "join, I/O, and corruption failures must not be projected as a missing generation"
+    );
 }
 
 #[path = "query_authority_provider_activation_tests.rs"]

@@ -1,5 +1,6 @@
+use std::fs;
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tracedecay_domain::{CodeGenerationId, ProjectId, WorktreeId};
 
@@ -9,7 +10,8 @@ use super::{
     RESIDENT_MEMORY_PRESSURE_HIGH_WATERMARK_PERMILLE_V1,
     RESIDENT_MEMORY_PRESSURE_LOW_WATERMARK_PERMILLE_V1, ResidentMemoryAdmissionFailureV1,
     ResidentMemoryComponentIdV1, ResidentMemoryKeyV1, ResidentMemoryPressureStateV1,
-    ResidentMemoryPressureV1, process_resident_memory_limit_for_system_v1,
+    ResidentMemoryPressureV1, cgroup_v2_memory_limit_v1, effective_memory_bytes_v1,
+    process_resident_memory_limit_for_system_v1, process_resident_memory_limit_v1,
     resident_memory_watermark_bytes_v1,
 };
 
@@ -30,6 +32,212 @@ fn host_capacity_reserves_one_quarter_without_a_universal_ceiling() {
     assert_eq!(
         process_resident_memory_limit_for_system_v1(0),
         DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1
+    );
+}
+
+fn cgroup_fixture(
+    cgroup_membership: Option<&str>,
+    memory_max: Option<&str>,
+    memory_high: Option<&str>,
+) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let directory = tempfile::tempdir().expect("cgroup fixture root");
+    let proc_self_cgroup = directory.path().join("proc-self-cgroup");
+    let cgroup_root = directory.path().join("sys-fs-cgroup");
+    fs::create_dir_all(&cgroup_root).expect("cgroup mount fixture");
+    if let Some(membership) = cgroup_membership {
+        fs::write(&proc_self_cgroup, membership).expect("process cgroup membership fixture");
+    }
+    let process_cgroup = cgroup_root.join("trace.slice/daemon.scope");
+    fs::create_dir_all(&process_cgroup).expect("process cgroup fixture");
+    if let Some(limit) = memory_max {
+        fs::write(process_cgroup.join("memory.max"), limit).expect("memory.max fixture");
+    }
+    if let Some(limit) = memory_high {
+        fs::write(process_cgroup.join("memory.high"), limit).expect("memory.high fixture");
+    }
+    (directory, proc_self_cgroup, cgroup_root)
+}
+
+fn effective_memory_bytes(
+    total_memory_bytes: u64,
+    proc_self_cgroup: &std::path::Path,
+    cgroup_root: &std::path::Path,
+) -> u64 {
+    effective_memory_bytes_v1(
+        total_memory_bytes,
+        cgroup_v2_memory_limit_v1(proc_self_cgroup, cgroup_root),
+    )
+}
+
+#[test]
+fn absent_cgroup_membership_keeps_host_memory_capacity() {
+    let (_directory, proc_self_cgroup, cgroup_root) = cgroup_fixture(None, None, None);
+    assert_eq!(
+        effective_memory_bytes(88 * 1024 * 1024 * 1024, &proc_self_cgroup, &cgroup_root,),
+        88 * 1024 * 1024 * 1024
+    );
+}
+
+#[test]
+fn absent_cgroup_memory_files_keep_host_memory_capacity() {
+    let (_directory, proc_self_cgroup, cgroup_root) =
+        cgroup_fixture(Some("0::/trace.slice/daemon.scope\n"), None, None);
+    assert_eq!(
+        effective_memory_bytes(88 * 1024 * 1024 * 1024, &proc_self_cgroup, &cgroup_root,),
+        88 * 1024 * 1024 * 1024
+    );
+}
+
+#[test]
+fn cgroup_v1_only_membership_does_not_invent_a_v2_ceiling() {
+    let gib = 1024 * 1024 * 1024;
+    let (_directory, proc_self_cgroup, cgroup_root) = cgroup_fixture(
+        Some("12:memory:/trace.slice/daemon.scope\n"),
+        Some("32212254720\n"),
+        Some("max\n"),
+    );
+
+    assert_eq!(
+        effective_memory_bytes(88 * gib, &proc_self_cgroup, &cgroup_root),
+        88 * gib
+    );
+}
+
+#[test]
+fn hybrid_membership_uses_the_unified_v2_memory_ceiling() {
+    let gib = 1024 * 1024 * 1024;
+    let (_directory, proc_self_cgroup, cgroup_root) = cgroup_fixture(
+        Some("12:memory:/legacy.slice\n0::/trace.slice/daemon.scope\n"),
+        Some("32212254720\n"),
+        Some("max\n"),
+    );
+
+    assert_eq!(
+        effective_memory_bytes(88 * gib, &proc_self_cgroup, &cgroup_root),
+        30 * gib
+    );
+}
+
+#[test]
+fn root_v2_membership_reads_the_mount_root_ceiling() {
+    let gib = 1024 * 1024 * 1024;
+    let directory = tempfile::tempdir().expect("cgroup fixture root");
+    let proc_self_cgroup = directory.path().join("proc-self-cgroup");
+    let cgroup_root = directory.path().join("sys-fs-cgroup");
+    fs::create_dir_all(&cgroup_root).expect("cgroup mount fixture");
+    fs::write(&proc_self_cgroup, "0::/\n").expect("root process cgroup membership fixture");
+    fs::write(cgroup_root.join("memory.max"), "32212254720\n").expect("root memory.max fixture");
+    fs::write(cgroup_root.join("memory.high"), "max\n").expect("root memory.high fixture");
+
+    assert_eq!(
+        effective_memory_bytes(88 * gib, &proc_self_cgroup, &cgroup_root),
+        30 * gib
+    );
+}
+
+#[test]
+fn configured_override_cannot_exceed_the_cgroup_ceiling() {
+    let gib = 1024 * 1024 * 1024;
+
+    assert_eq!(
+        process_resident_memory_limit_v1(88 * gib, Some(30 * gib), Some(bytes(64 * gib))).get(),
+        30 * gib
+    );
+}
+
+#[test]
+fn unlimited_cgroup_memory_files_keep_host_memory_capacity() {
+    let (_directory, proc_self_cgroup, cgroup_root) = cgroup_fixture(
+        Some("0::/trace.slice/daemon.scope\n"),
+        Some("max\n"),
+        Some("max\n"),
+    );
+    assert_eq!(
+        effective_memory_bytes(88 * 1024 * 1024 * 1024, &proc_self_cgroup, &cgroup_root,),
+        88 * 1024 * 1024 * 1024
+    );
+}
+
+#[test]
+fn finite_memory_max_bounds_host_memory_capacity() {
+    let gib = 1024 * 1024 * 1024;
+    let (_directory, proc_self_cgroup, cgroup_root) = cgroup_fixture(
+        Some("0::/trace.slice/daemon.scope\n"),
+        Some("32212254720\n"),
+        Some("max\n"),
+    );
+    assert_eq!(
+        effective_memory_bytes(88 * gib, &proc_self_cgroup, &cgroup_root),
+        30 * gib
+    );
+}
+
+#[test]
+fn finite_memory_high_below_max_is_the_effective_capacity() {
+    let gib = 1024 * 1024 * 1024;
+    let (_directory, proc_self_cgroup, cgroup_root) = cgroup_fixture(
+        Some("0::/trace.slice/daemon.scope\n"),
+        Some("32212254720\n"),
+        Some("25769803776\n"),
+    );
+    assert_eq!(
+        effective_memory_bytes(88 * gib, &proc_self_cgroup, &cgroup_root),
+        24 * gib
+    );
+}
+
+#[test]
+fn finite_ancestor_limit_bounds_an_unlimited_process_cgroup() {
+    let gib = 1024 * 1024 * 1024;
+    let (directory, proc_self_cgroup, cgroup_root) = cgroup_fixture(
+        Some("0::/trace.slice/daemon.scope\n"),
+        Some("max\n"),
+        Some("max\n"),
+    );
+    fs::write(cgroup_root.join("trace.slice/memory.max"), "32212254720\n")
+        .expect("ancestor memory.max fixture");
+    fs::write(cgroup_root.join("trace.slice/memory.high"), "max\n")
+        .expect("ancestor memory.high fixture");
+
+    assert_eq!(
+        effective_memory_bytes(88 * gib, &proc_self_cgroup, &cgroup_root),
+        30 * gib
+    );
+    drop(directory);
+}
+
+#[test]
+fn low_effective_cgroup_ceiling_engages_measured_pressure_before_the_cap() {
+    let mib = 1024 * 1024;
+    let (_directory, proc_self_cgroup, cgroup_root) = cgroup_fixture(
+        Some("0::/trace.slice/daemon.scope\n"),
+        Some("134217728\n"),
+        Some("100663296\n"),
+    );
+    let effective = effective_memory_bytes(8 * 1024 * mib, &proc_self_cgroup, &cgroup_root);
+    let limit = process_resident_memory_limit_for_system_v1(effective);
+    let pressure = Arc::new(ResidentMemoryPressureV1::new(limit));
+    let authority = Arc::new(ProcessResidentMemoryV1::with_pressure(
+        limit,
+        Arc::clone(&pressure),
+    ));
+
+    assert_eq!(effective, 96 * mib);
+    assert_eq!(limit.get(), 72 * mib);
+    assert!(pressure.high_watermark_bytes() < effective);
+    assert!(
+        pressure
+            .publish_observed_resident_bytes(pressure.high_watermark_bytes())
+            .is_over_budget()
+    );
+    assert!(
+        authority
+            .reserve(
+                key("project-a", "worktree-a", "generation-a", "canonical"),
+                growth_request(),
+            )
+            .expect_err("cgroup-bounded pressure must refuse growth")
+            .is_observed_over_budget()
     );
 }
 
@@ -561,6 +769,47 @@ fn reaching_the_high_watermark_runs_pressure_reclaimers_with_the_measurement() {
 }
 
 #[test]
+fn post_reclaim_observation_replaces_pressure_state_without_reentering_reclaimers() {
+    let (authority, pressure) = pressure_authority();
+    let calls = Arc::new(Mutex::new(0_u64));
+    let callback_calls = Arc::clone(&calls);
+    let callback_pressure = Arc::downgrade(&pressure);
+    let after_reclaim = pressure.low_watermark_bytes();
+    let _registration = pressure
+        .register_pressure_reclaimer(
+            10,
+            Arc::new(move |_| {
+                *callback_calls.lock().expect("call count") += 1;
+                callback_pressure
+                    .upgrade()
+                    .expect("pressure authority remains live")
+                    .publish_post_reclaim_observed_resident_bytes(after_reclaim);
+                4096
+            }),
+        )
+        .expect("pressure reclaimer registration");
+
+    let state = pressure.publish_observed_resident_bytes(pressure.high_watermark_bytes());
+
+    assert_eq!(*calls.lock().expect("call count"), 1);
+    assert_eq!(
+        state,
+        ResidentMemoryPressureStateV1::Nominal {
+            observed_bytes: after_reclaim,
+            limit_bytes: PRESSURE_TEST_LIMIT_BYTES,
+            high_watermark_bytes: pressure.high_watermark_bytes(),
+        },
+        "admission must consume the observation measured after reclaim"
+    );
+    authority
+        .reserve(
+            key("project-a", "worktree-a", "generation-a", "canonical"),
+            growth_request(),
+        )
+        .expect("post-reclaim nominal RSS must immediately re-admit growth");
+}
+
+#[test]
 fn dropped_pressure_reclaimer_registration_is_not_called() {
     let (_authority, pressure) = pressure_authority();
     let calls = Arc::new(Mutex::new(0_u64));
@@ -578,4 +827,72 @@ fn dropped_pressure_reclaimer_registration_is_not_called() {
 
     pressure.publish_observed_resident_bytes(pressure.high_watermark_bytes());
     assert_eq!(*calls.lock().expect("call count"), 0);
+}
+
+#[test]
+fn allocator_trim_reclaimer_runs_under_pressure_and_reports_only_measured_release() {
+    let (_authority, pressure) = pressure_authority();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let state_order = Arc::clone(&order);
+    let _state = pressure
+        .register_pressure_reclaimer(
+            10,
+            Arc::new(move |_| {
+                state_order.lock().expect("order").push("state");
+                0
+            }),
+        )
+        .expect("state reclaimer registration");
+    let _trim = super::register_process_allocator_pressure_reclaimer_v1(&pressure)
+        .expect("allocator trim registration");
+
+    // Below the high watermark the trim never runs: freed pages are only
+    // returned once measured RSS threatens admission.
+    pressure.publish_observed_resident_bytes(pressure.low_watermark_bytes());
+    assert!(order.lock().expect("order").is_empty());
+
+    pressure.publish_observed_resident_bytes(pressure.high_watermark_bytes());
+    assert_eq!(order.lock().expect("order").as_slice(), ["state"]);
+
+    let trim = super::release_process_allocator_memory_v1();
+    // A trim can only claim bytes the kernel surface measured on both sides.
+    match (trim.before_bytes, trim.after_bytes) {
+        (Some(before), Some(after)) => {
+            assert_eq!(trim.released_bytes(), before.saturating_sub(after));
+        }
+        _ => assert_eq!(trim.released_bytes(), 0),
+    }
+}
+
+#[test]
+fn process_allocator_pressure_reclaimer_installs_once() {
+    let first = super::install_process_allocator_pressure_reclaimer_v1()
+        .expect("allocator pressure reclaimer installation");
+    let second = super::install_process_allocator_pressure_reclaimer_v1()
+        .expect("installed allocator pressure reclaimer remains available");
+    assert!(!second, "a second install must be a no-op");
+    // Another test in this process may have installed it first; either way
+    // exactly one call reports the installation.
+    let _ = first;
+}
+
+#[test]
+fn allocator_pressure_reclaimer_installation_preserves_registration_failure() {
+    let pressure = Arc::new(ResidentMemoryPressureV1::new(bytes(
+        PRESSURE_TEST_LIMIT_BYTES,
+    )));
+    pressure.lock_state().next_sequence = u64::MAX;
+    let registration = OnceLock::new();
+
+    let failure =
+        super::install_process_allocator_pressure_reclaimer_on_v1(&registration, &pressure)
+            .expect_err("sequence exhaustion must not report an installed reclaimer");
+
+    assert_eq!(failure, super::ResidentMemoryPressureRegistrationFailureV1);
+    assert!(registration.get().is_some_and(Result::is_err));
+    assert_eq!(
+        super::install_process_allocator_pressure_reclaimer_on_v1(&registration, &pressure)
+            .expect_err("a stored registration failure must remain truthful"),
+        failure
+    );
 }

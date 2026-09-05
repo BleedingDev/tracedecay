@@ -31,7 +31,7 @@ use tracedecay_code_index::production::{
     CodeIndexAtomicPublicationPort, CodeIndexBuildRequestV1, CodeIndexCapturedFileV1,
     CodeIndexGenerationScopeV1, CodeIndexProductionConfigV1, CodeIndexProductionOwnerV1,
     CodeIndexPublicationStoreErrorV1, CodeIndexPublishedGenerationV1,
-    CodeIndexRepositoryParseIdentityV1,
+    CodeIndexRepositoryParseIdentityV1, DAEMON_CODE_INDEX_CHUNKER_REVISION,
 };
 use tracedecay_code_index::projection::{
     ChunkProjectionDecisionV1, CodeChunkProjectionSink, ProjectionReceiptBuilderV1,
@@ -42,16 +42,16 @@ use tracedecay_domain::ScoreDomainId;
 use tracedecay_domain::canonical_text::sha256_hex;
 use tracedecay_domain::git::GitOidV1;
 use tracedecay_domain::{
-    ChunkerRevision, CodeGenerationId, CodeSearchChunkV1, ComponentRevision, DiversityPolicy,
-    EphemeralSanitizedQueryViewV1, ExactAdmissionRuleRevision, ExactClass, FileOccurrenceId,
-    HydrationReceipt, HydrationRevision, LanguageId, ManifestDigest, PolicyRevisionId, PrincipalId,
-    PrivacyDomainId, ProjectId, ProjectionBatchRequestV1, ProjectionKeyV1, ProjectionKindV1,
-    ProjectionOperationV1, ProjectionOutcomeV1, PublicRetrieverStatus, QueryFallbackSubpayload,
-    QueryNormalizationRevision, RelationEdgeKindV1, RepositoryDirtyStateV1, RepositoryId,
-    RerankPolicy, RetrievalBudget, RetrievalFailure, RetrievalRequest, RetrievalScope,
-    RetrievalSnapshot, RetrieverKind, RetrieverOutcome, SanitizationReceiptId, SanitizedCodeFileV1,
-    SanitizedCodeSnapshotV1, SanitizerRevision, SingleRootScopeV1, SnapshotFileDispositionV1,
-    TemporalModeV1, UtcMicros, VectorWatermark,
+    ChunkerRevision, CodeGenerationId, CodeSearchChunkId, CodeSearchChunkV1, ComponentRevision,
+    DiversityPolicy, EphemeralSanitizedQueryViewV1, ExactAdmissionRuleRevision, ExactClass,
+    FileOccurrenceId, HydrationReceipt, HydrationRevision, LanguageId, ManifestDigest,
+    PolicyRevisionId, PrincipalId, PrivacyDomainId, ProjectId, ProjectionBatchRequestV1,
+    ProjectionKeyV1, ProjectionKindV1, ProjectionOperationV1, ProjectionOutcomeV1,
+    PublicRetrieverStatus, QueryFallbackSubpayload, QueryNormalizationRevision, RelationEdgeKindV1,
+    RepositoryDirtyStateV1, RepositoryId, RerankPolicy, RetrievalBudget, RetrievalFailure,
+    RetrievalRequest, RetrievalScope, RetrievalSnapshot, RetrieverKind, RetrieverOutcome,
+    SanitizationReceiptId, SanitizedCodeFileV1, SanitizedCodeSnapshotV1, SanitizerRevision,
+    SingleRootScopeV1, SnapshotFileDispositionV1, TemporalModeV1, UtcMicros, VectorWatermark,
 };
 use tracedecay_query::retrieval::exact::{
     CentralExactAdmissionAuthorityV1, ExactAdmissionAuthority, ExactLane, ExactLaneRequest,
@@ -240,16 +240,17 @@ struct OccurrenceMapEntry {
 /// as produced by [`canonical_scope_key`].
 type ScopedLexicalProjections = BTreeMap<Vec<String>, CodeLexicalProjectionAdapterV1>;
 type ScopedGraphEvidence = BTreeMap<Vec<String>, CodeGraphEvidenceReader>;
+type ScopedSemanticAllowedChunks = BTreeMap<Vec<String>, BTreeSet<CodeSearchChunkId>>;
 
 struct PublishedCorpus {
     generation: Arc<CodeIndexPublishedGenerationV1>,
     lexical_projections: ScopedLexicalProjections,
     graph_projections: ScopedGraphEvidence,
+    semantic_allowed_chunks: ScopedSemanticAllowedChunks,
     incremental_generation: Arc<CodeIndexPublishedGenerationV1>,
     incremental_before_content_digest: String,
     incremental_after_content_digest: String,
     occurrence_map: BTreeMap<String, OccurrenceMapEntry>,
-    file_scopes: BTreeMap<String, String>,
     repo_root: PathBuf,
     source_commit: GitOidV1,
     corpus: Vec<CorpusDocumentV1>,
@@ -286,7 +287,14 @@ fn build_query_projections(
     generation: &CodeIndexPublishedGenerationV1,
     file_scopes: &BTreeMap<String, String>,
     queries: &[WorkloadQueryV1],
-) -> Result<(ScopedLexicalProjections, ScopedGraphEvidence), CandidateOutputError> {
+) -> Result<
+    (
+        ScopedLexicalProjections,
+        ScopedGraphEvidence,
+        ScopedSemanticAllowedChunks,
+    ),
+    CandidateOutputError,
+> {
     let generation_id = generation.manifest().generation_id.clone();
     let freshness = production_code_index_freshness(
         generation.manifest().seal.sealed_at,
@@ -316,6 +324,7 @@ fn build_query_projections(
         .map_err(|error| CandidateOutputError::Contract(error.to_string()))?;
     let mut lexical = BTreeMap::new();
     let mut graph = BTreeMap::new();
+    let mut semantic_allowed_chunks = BTreeMap::new();
     for scope_key in queries
         .iter()
         .map(|query| canonical_scope_key(&query.allowed_scopes))
@@ -343,6 +352,13 @@ fn build_query_projections(
             .filter(|chunk| scope_contains(chunk.anchor.file_occurrence_id.as_str()))
             .cloned()
             .collect::<Vec<_>>();
+        semantic_allowed_chunks.insert(
+            scope_key.clone(),
+            graph_chunks
+                .iter()
+                .map(|chunk| chunk.id.clone())
+                .collect::<BTreeSet<_>>(),
+        );
         graph.insert(
             scope_key,
             CodeGraphEvidenceReader::new_for_evaluation(
@@ -355,7 +371,7 @@ fn build_query_projections(
             .map_err(|error| CandidateOutputError::Contract(error.to_string()))?,
         );
     }
-    Ok((lexical, graph))
+    Ok((lexical, graph, semantic_allowed_chunks))
 }
 
 /// The corpora published for one candidate-generation call, memoized by scale.
@@ -386,7 +402,17 @@ impl PublishedCorpusCache {
         admitted_scope: AdmittedCorpusScopeFn,
     ) -> Result<(), CandidateOutputError> {
         if let Entry::Vacant(entry) = self.by_scale.entry(copies) {
-            let published = publish_corpus_with_scale(repo_root, workload, copies, admitted_scope)?;
+            let published = match copies {
+                1 => hotpath::measure_block!(
+                    "search_eval.corpus.publish.current",
+                    publish_corpus_with_scale(repo_root, workload, copies, admitted_scope)
+                ),
+                10 => hotpath::measure_block!(
+                    "search_eval.corpus.publish.10x",
+                    publish_corpus_with_scale(repo_root, workload, copies, admitted_scope)
+                ),
+                _ => publish_corpus_with_scale(repo_root, workload, copies, admitted_scope),
+            }?;
             entry.insert(published);
         }
         Ok(())
@@ -528,7 +554,10 @@ pub fn generate_candidate_outputs_with_native(
     // and 10x corpora, and the native phase reuses those exact builds instead
     // of republishing byte-identical ones.
     let mut corpora = PublishedCorpusCache::default();
-    let mut generated = generate_candidate_outputs_sharing_corpora(options, &mut corpora)?;
+    let mut generated = hotpath::measure_block!(
+        "search_eval.fallback.generate",
+        generate_candidate_outputs_sharing_corpora(options, &mut corpora)
+    )?;
     let workload_path = options.workload_path.map_or_else(
         || options.repo_root.join(WORKLOAD_RELATIVE),
         Path::to_path_buf,
@@ -732,19 +761,16 @@ fn retrieve_one_native_query(
     let prepared = prepare_production_query(published, profile, query)?;
     let mut fusion = fusion_profile(profile, true)?;
     let mut native = None;
+    let scope_key = canonical_scope_key(&query.allowed_scopes);
     let semantic_allowed_chunks = published
-        .generation
-        .chunks()
-        .chunks()
-        .iter()
-        .filter(|chunk| {
-            published
-                .file_scopes
-                .get(chunk.anchor.file_occurrence_id.as_str())
-                .is_some_and(|scope| query.allowed_scopes.contains(scope))
-        })
-        .map(|chunk| chunk.id.clone())
-        .collect::<BTreeSet<_>>();
+        .semantic_allowed_chunks
+        .get(&scope_key)
+        .ok_or_else(|| {
+            CandidateOutputError::Contract(format!(
+                "query {} has no precomputed semantic scope",
+                query.query_id
+            ))
+        })?;
     let mut evaluate = |inputs: ProductionCandidateNativeQueryInputsV1<'_>| {
         if native.is_some() {
             return Err(CandidateOutputError::Contract(format!(
@@ -780,7 +806,7 @@ fn retrieve_one_native_query(
             query_view: &prepared.query_view,
             code: &published.generation,
             code_generation: &prepared.code_generation,
-            semantic_allowed_chunks: &semantic_allowed_chunks,
+            semantic_allowed_chunks,
             rerank_policy: prepared.rerank_policy.as_ref(),
         },
         &mut evaluate,
@@ -1979,8 +2005,8 @@ fn publish_corpus_with_scale(
         policy_revision: id::<PolicyRevisionId>("policy.candidate.v1")?,
         // Must match the daemon production code-index projection identity so
         // evaluate-and-publish can activate the same embedding projection the
-        // mounted journey pins (`chunker.daemon.v2` / `privacy.local-code-index`).
-        chunker_revision: id::<ChunkerRevision>("chunker.daemon.v2")?,
+        // mounted journey pins.
+        chunker_revision: id::<ChunkerRevision>(DAEMON_CODE_INDEX_CHUNKER_REVISION)?,
         privacy_domain: id::<PrivacyDomainId>("privacy.local-code-index")?,
         privacy_key_epoch: 1,
         max_snapshot_age_micros: None,
@@ -2252,17 +2278,17 @@ fn publish_corpus_with_scale(
         .admitted_chunks()
         .map_err(|error| CandidateOutputError::Contract(error.to_string()))?
         .len() as u64;
-    let (lexical_projections, graph_projections) =
+    let (lexical_projections, graph_projections, semantic_allowed_chunks) =
         build_query_projections(&generation, &file_scopes, &workload.queries)?;
     Ok(PublishedCorpus {
         generation,
         lexical_projections,
         graph_projections,
+        semantic_allowed_chunks,
         incremental_generation,
         incremental_before_content_digest,
         incremental_after_content_digest,
         occurrence_map,
-        file_scopes,
         repo_root: repo_root.to_path_buf(),
         source_commit: GitOidV1::new(workload.source_repository_commit.clone())
             .map_err(|error| CandidateOutputError::Contract(error.to_string()))?,
@@ -2551,6 +2577,13 @@ mod tests {
                 "clone repository fixture: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            // The workload pins historical commits by object identity. Rebasing
+            // the integration branch re-parents those commits, so the pinned
+            // identities survive only as unreachable objects that a
+            // wire-protocol clone never transfers. Backfill the checked-in
+            // evaluator pack so the fixture resolves the same history CI does.
+            crate::packaged_assets::write_checked_in_object_pack(&root.join(".git"))
+                .expect("materialize checked-in historical Git objects");
             Self { _temp: temp, root }
         }
     }
@@ -3028,6 +3061,11 @@ mod tests {
             .expect("publish corpus");
 
         for chunk in published.generation.chunks().chunks() {
+            assert_eq!(
+                chunk.chunker_revision.as_str(),
+                DAEMON_CODE_INDEX_CHUNKER_REVISION,
+                "native evaluation corpus must use the current daemon chunker identity"
+            );
             let chunk_occurrence = format!("code-chunk:{}", chunk.id.as_str());
             assert!(
                 published.occurrence_map.contains_key(&chunk_occurrence),
@@ -3406,10 +3444,14 @@ mod tests {
         current.latency_samples_us.fill(u64::MAX);
         let report = crate::evaluate_generated_outputs(fixture_root, &workload, &large_measurement)
             .expect("evaluate");
-        assert_eq!(
-            report.profiles[0].resource_status,
+        // Only "current" was rewritten as measured; "10x" keeps the host's
+        // own sample, which stays pending where peak RSS is unreadable.
+        let expected_large = if peak_rss_bytes().is_some() {
             crate::DirectEvaluationStatusV1::Pass
-        );
+        } else {
+            crate::DirectEvaluationStatusV1::Pending
+        };
+        assert_eq!(report.profiles[0].resource_status, expected_large);
 
         let mut extra_resource = result;
         let synthetic = extra_resource.outputs[0]
@@ -3510,14 +3552,57 @@ mod tests {
         );
 
         let historical = retrieve("train-012");
-        assert!(historical.ranked.iter().take(10).any(|candidate| {
-            candidate.anchor
+        let historical_top = historical.ranked.iter().take(10).collect::<Vec<_>>();
+        assert!(
+            historical_top.iter().any(|candidate| {
+                candidate.anchor
                 == "git:01b0a0afe34c3342d6b5b076383f86ed8a8d0c66:crates/tracedecay-domain/src/session.rs::ClosedUtcIntervalV1"
                 || candidate.anchors.iter().any(|anchor| {
                     anchor
                         == "git:01b0a0afe34c3342d6b5b076383f86ed8a8d0c66:crates/tracedecay-domain/src/session.rs::ClosedUtcIntervalV1"
                 })
-        }));
+            }),
+            "historical top 10: {historical_top:#?}"
+        );
+    }
+
+    #[test]
+    fn published_corpus_precomputes_semantic_allowed_chunks_per_scope() {
+        let fixture = authenticated_repo_fixture();
+        let workload = workload();
+        let published = publish_corpus(&fixture.root, &workload, fixture_admitted_scope)
+            .expect("published corpus");
+        let distinct_scopes = workload
+            .queries
+            .iter()
+            .map(|query| canonical_scope_key(&query.allowed_scopes))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            published.semantic_allowed_chunks.len(),
+            distinct_scopes.len()
+        );
+        for query in &workload.queries {
+            let expected = published
+                .generation
+                .chunks()
+                .chunks()
+                .iter()
+                .filter(|chunk| {
+                    published
+                        .occurrence_map
+                        .get(&format!("code-chunk:{}", chunk.id.as_str()))
+                        .is_some_and(|entry| query.allowed_scopes.contains(&entry.scope))
+                })
+                .map(|chunk| chunk.id.clone())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                published
+                    .semantic_allowed_chunks
+                    .get(&canonical_scope_key(&query.allowed_scopes)),
+                Some(&expected)
+            );
+        }
     }
 
     #[test]

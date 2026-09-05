@@ -70,8 +70,10 @@ store databases directly.
   `tracedecay analytics diagnostics` before concluding anything is dead.
 - Never inspect private store files directly; their schemas are internal. The
   diagnostics JSON already merges every relevant source.
-- If the MCP transport is down, every command above still works — they are
-  plain CLI subcommands (see `tracedecay:using-the-cli`).
+- If only MCP transport is down while the daemon remains available, the plain
+  CLI subcommands above remain usable (see `tracedecay:using-the-cli`). A held
+  or unavailable daemon ends that fallback; report its state without retrying
+  or changing lifecycle.
 
 ## If tools are deferred or MCP fails
 
@@ -81,6 +83,9 @@ store databases directly.
   those tools are deferred, load once with ToolSearch —
   `select:tracedecay_lcm_status,tracedecay_lcm_doctor,tracedecay_observatory_read,tracedecay_analytics` — or just use the CLI
   form shown above (see `tracedecay:using-the-cli`).
+- These commands are passive clients, not lifecycle authority. If the daemon
+  is unavailable or intentionally held, report that state instead of retrying
+  or starting it.
 
 ## Deliverable
 

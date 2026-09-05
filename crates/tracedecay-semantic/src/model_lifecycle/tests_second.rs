@@ -573,6 +573,234 @@
         }
     }
 
+    #[cfg(feature = "semantic-fastembed")]
+    fn pinned_reranker_fixture_catalog(fixture: &Path) -> (FastEmbedModelCatalogV1, String) {
+        let mut members = BTreeMap::new();
+        for (role, name) in [
+            ("model", "model.onnx"),
+            ("tokenizer", "tokenizer.json"),
+            ("config", "config.json"),
+            ("special_tokens_map", "special_tokens_map.json"),
+            ("tokenizer_config", "tokenizer_config.json"),
+        ] {
+            let bytes = fs::read(fixture.join(name)).unwrap_or_else(|error| {
+                panic!(
+                    "cannot read pinned reranker fixture member {}: {error}",
+                    fixture.join(name).display()
+                )
+            });
+            members.insert(
+                role.to_owned(),
+                CatalogMemberPinV1 {
+                    path: name.to_owned(),
+                    upstream_path: name.to_owned(),
+                    length: bytes.len() as u64,
+                    sha256: hex::encode(Sha256::digest(&bytes)),
+                },
+            );
+        }
+        let model = CatalogedFastEmbedModelV1 {
+            model_id: "PinnedJinaRerankerV1TurboEn".to_owned(),
+            backend: CatalogedEmbeddingBackendV1::FastEmbedOrt {
+                fastembed_enum: "JINARerankerV1TurboEn".to_owned(),
+            },
+            model_code: "jinaai/jina-reranker-v1-turbo-en".to_owned(),
+            source: CatalogSourceV1 {
+                upstream: "https://huggingface.co/jinaai/jina-reranker-v1-turbo-en".to_owned(),
+                revision: "b8c14f4e723d9e0aab4732a7b7b93741eeeb77c2".to_owned(),
+                license: "Apache-2.0".to_owned(),
+                license_url: "https://www.apache.org/licenses/LICENSE-2.0".to_owned(),
+                provenance:
+                    "https://huggingface.co/jinaai/jina-reranker-v1-turbo-en/tree/b8c14f4e723d9e0aab4732a7b7b93741eeeb77c2"
+                        .to_owned(),
+            },
+            expected_dimensions: 1,
+            max_length: 512,
+            members,
+        };
+        let mut catalog = FastEmbedModelCatalogV1::production();
+        catalog.models.push(model.clone());
+        (catalog, model.model_id)
+    }
+
+    #[cfg(feature = "semantic-fastembed")]
+    #[test]
+    #[ignore = "requires TRACEDECAY_FASTEMBED_FIXTURE_DIR with a pinned local reranker"]
+    fn pinned_reranker_cold_first_and_warm_queries_reuse_one_session() {
+        let fixture = PathBuf::from(
+            std::env::var("TRACEDECAY_FASTEMBED_FIXTURE_DIR").unwrap_or_else(|_| {
+                panic!(
+                    "this gate requires its pinned reranker in \
+                     TRACEDECAY_FASTEMBED_FIXTURE_DIR"
+                )
+            }),
+        );
+        let (catalog, model_id) = pinned_reranker_fixture_catalog(&fixture);
+        let model = catalog.get(&model_id).unwrap().clone();
+        let root = tempfile::tempdir().unwrap();
+        let owner = Arc::new(
+            SemanticModelLifecycleOwnerV1::open(
+                root.path(),
+                catalog,
+                scoped_hub_source(root.path()),
+            )
+            .unwrap(),
+        );
+        let mut manifest = reranker_manifest(&model, "jinaai/jina-reranker-v1-turbo-en");
+        let package_bytes = manifest
+            .payload
+            .members
+            .iter()
+            .map(|member| member.byte_length)
+            .sum::<u64>();
+        manifest.payload.resource_ceiling.max_model_bytes =
+            manifest.payload.model_member.byte_length;
+        manifest.payload.resource_ceiling.max_tokenizer_bytes =
+            package_bytes.saturating_sub(manifest.payload.model_member.byte_length);
+        manifest.payload.resource_ceiling.max_resident_bytes = package_bytes.saturating_mul(4);
+        manifest.payload.resource_ceiling.max_batch_size = 8;
+        manifest.payload.resource_ceiling.max_sequence_length = 512;
+        let pins = reranker_pins(&manifest);
+        owner
+            .import_local_reranker_artifact(pins.clone(), &manifest, &fixture, 10)
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mounts = (0..2)
+            .map(|_| {
+                let owner = Arc::clone(&owner);
+                let barrier = Arc::clone(&barrier);
+                let pins = pins.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    owner.mount_reranker(pins)
+                })
+            })
+            .collect::<Vec<_>>();
+        let publication_started = Instant::now();
+        barrier.wait();
+        let mut authorities = mounts
+            .into_iter()
+            .map(|mount| mount.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        let publication_micros = publication_started.elapsed().as_micros();
+        let shared_authority = authorities.pop().unwrap();
+        let authority = authorities.pop().unwrap();
+        assert!(
+            Arc::ptr_eq(
+                authority.executor_handle(),
+                shared_authority.executor_handle()
+            ),
+            "repeated mounts must share one resident model session"
+        );
+
+        let candidates = ["session pooling", "unrelated rendering"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, _)| tracedecay_domain::RankedCandidate {
+                candidate: tracedecay_domain::FusedCandidate {
+                    anchor_id: tracedecay_domain::RetrievalAnchorId::new(format!(
+                        "rerank.fixture.{index}"
+                    ))
+                    .unwrap(),
+                    logical_evidence_id: tracedecay_domain::LogicalEvidenceId::new(format!(
+                        "rerank.fixture.evidence.{index}"
+                    ))
+                    .unwrap(),
+                    occurrences: Vec::new(),
+                    exact_class: tracedecay_domain::ExactClass::Approximate,
+                    utility_micros: 0,
+                    contributions: Vec::new(),
+                    freshness: Vec::new(),
+                    decisions: Vec::new(),
+                },
+                final_ordinal: index as u32,
+            })
+            .collect::<Vec<_>>();
+        let snapshot =
+            tracedecay_domain::CandidateSetDigest::new(format!("sha256:{}", "a".repeat(64)))
+                .unwrap();
+        let privacy = tracedecay_domain::PrivacyDomainId::new("privacy.rerank.fixture").unwrap();
+        let query = "reuse one warmed reranker session";
+        let views = candidates
+            .iter()
+            .zip(["session pooling", "unrelated rendering"])
+            .map(|(candidate, document)| {
+                let mut approved_features = Vec::new();
+                approved_features.extend_from_slice(&(query.len() as u32).to_be_bytes());
+                approved_features.extend_from_slice(query.as_bytes());
+                approved_features.extend_from_slice(document.as_bytes());
+                tracedecay_domain::AuthorizedRerankView {
+                    anchor_id: candidate.candidate.anchor_id.clone(),
+                    snapshot_digest: snapshot.clone(),
+                    privacy_domain: privacy.clone(),
+                    compatibility: tracedecay_domain::FreshnessCompatibilityV1::Current,
+                    approved_features,
+                }
+            })
+            .collect::<Vec<_>>();
+        let inputs = candidates
+            .iter()
+            .zip(&views)
+            .map(
+                |(candidate, view)| tracedecay_query::retrieval::rerank::LocalRerankInputV1 {
+                    candidate,
+                    view,
+                },
+            )
+            .collect::<Vec<_>>();
+        let permit = tracedecay_query::retrieval::rerank::LocalRerankPermitV1 {
+            input_bytes: views
+                .iter()
+                .map(|view| view.approved_features.len() as u64)
+                .sum(),
+            input_tokens: 64,
+            work_units: 2,
+            model_invocations: 1,
+            remaining_deadline_micros: None,
+        };
+        let policy = tracedecay_domain::RerankPolicy {
+            policy_id: tracedecay_domain::RerankPolicyId::new("rerank.fixture.policy").unwrap(),
+            evaluation_result_anchor: tracedecay_domain::RetrievalAnchorId::new(
+                "rerank.fixture.evaluation",
+            )
+            .unwrap(),
+            max_candidates: 2,
+            max_input_bytes: permit.input_bytes,
+            max_input_tokens: permit.input_tokens,
+            max_work_units: permit.work_units,
+            max_model_invocations: permit.model_invocations,
+            deadline_micros: None,
+        };
+
+        let first_query_started = Instant::now();
+        let first = authority
+            .executor()
+            .rerank(&policy, &inputs, permit)
+            .unwrap();
+        let first_query_micros = first_query_started.elapsed().as_micros();
+        assert_eq!(first.len(), inputs.len());
+
+        let mut warm_micros = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let started = Instant::now();
+            let warm = authority
+                .executor()
+                .rerank(&policy, &inputs, permit)
+                .unwrap();
+            warm_micros.push(started.elapsed().as_micros());
+            assert_eq!(warm, first);
+        }
+        warm_micros.sort_unstable();
+        let warm_p50_micros = warm_micros[warm_micros.len() / 2];
+        let warm_p95_micros = warm_micros[(warm_micros.len() * 95).div_ceil(100) - 1];
+        println!(
+            "reranker publication={publication_micros}us first_query={first_query_micros}us \
+             warm_p50={warm_p50_micros}us warm_p95={warm_p95_micros}us samples={}",
+            warm_micros.len()
+        );
+    }
+
     // Reranker publication admits the artifact for runtime against
     // `detect_fastembed_process()` evidence; see the gate rationale above.
     #[cfg(feature = "semantic-fastembed")]
@@ -600,7 +828,10 @@
             Some(first_digest.clone())
         );
         assert_eq!(first_status.rollback_artifact_digest, None);
-        assert!(owner.mount_reranker(first_pins.clone()).is_ok());
+        assert!(matches!(
+            owner.mount_reranker(first_pins.clone()),
+            Err(ModelLifecycleErrorV1::RerankerUnavailable)
+        ));
 
         let second = reranker_manifest(&model, "jinaai/jina-reranker-v1-turbo-en");
         let second_pins = reranker_pins(&second);
@@ -616,12 +847,22 @@
             second_status.rollback_artifact_digest,
             Some(first_digest.clone())
         );
-        assert!(owner.mount_reranker(first_pins).is_err());
-        assert!(owner.mount_reranker(second_pins).is_ok());
+        assert!(matches!(
+            owner.mount_reranker(first_pins),
+            Err(ModelLifecycleErrorV1::VerificationFailed)
+        ));
+        assert!(matches!(
+            owner.mount_reranker(second_pins.clone()),
+            Err(ModelLifecycleErrorV1::RerankerUnavailable)
+        ));
 
         let rolled_back = owner.rollback_reranker_artifact(12).unwrap();
         assert_eq!(rolled_back.active_artifact_digest, Some(first_digest));
         assert_eq!(rolled_back.rollback_artifact_digest, Some(second_digest));
+        assert!(matches!(
+            owner.mount_reranker(second_pins),
+            Err(ModelLifecycleErrorV1::VerificationFailed)
+        ));
     }
 
     #[cfg(feature = "semantic-fastembed")]
@@ -709,7 +950,10 @@
             status.active_artifact_digest,
             Some(manifest.artifact_identity_digest())
         );
-        assert!(owner.mount_reranker(pins).is_ok());
+        assert!(matches!(
+            owner.mount_reranker(pins),
+            Err(ModelLifecycleErrorV1::RerankerUnavailable)
+        ));
     }
 
     #[test]

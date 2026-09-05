@@ -16,6 +16,7 @@ use tracedecay_store::{
     FactAsOfResponseV1, FactCommitReceipt, FactContradictionStateV1, FactCurrentResponseV1,
     FactLineageCursor, FactLineageResponseV1, FactQueryCoverageV1, FactStoreResult,
     ProjectMemoryAutomationRunReceiptsV1, ProjectMemoryFactIdV1,
+    ProjectMemoryFactSupersedeCommandV1, ProjectMemoryFactSupersedeOutcomeV1,
 };
 
 use super::*;
@@ -344,6 +345,15 @@ impl ProjectMemoryFactStore for FakeAuthority {
         Err(authority_fixture_error())
     }
 
+    async fn supersede_project_memory_fact(
+        &self,
+        _request: ProjectMemoryFactSupersedeCommandV1,
+        _write_control: &FactWriteControl,
+    ) -> FactStoreResult<ProjectMemoryFactSupersedeOutcomeV1> {
+        self.authority_calls.lock().unwrap().push("supersede");
+        Err(authority_fixture_error())
+    }
+
     async fn record_project_memory_fact_feedback(
         &self,
         _request: ProjectMemoryFactFeedbackCommandV1,
@@ -417,16 +427,31 @@ impl ProjectMemoryFactStore for FakeAuthority {
         Ok(None)
     }
 
-    async fn dashboard_project_memory_vector_points(
+    async fn dashboard_project_memory_store_revision(
+        &self,
+        _owner: FactOwnerV1,
+        _read_control: &FactReadControl,
+    ) -> FactStoreResult<ProjectMemoryStoreRevisionV1> {
+        self.authority_calls
+            .lock()
+            .unwrap()
+            .push("dashboard-store-revision");
+        Ok(ProjectMemoryStoreRevisionV1::default())
+    }
+
+    async fn dashboard_project_memory_vector_snapshot(
         &self,
         _query: ProjectMemoryDashboardVectorPointsQueryV1,
         _read_control: &FactReadControl,
-    ) -> FactStoreResult<Vec<ProjectMemoryDashboardVectorPointV1>> {
+    ) -> FactStoreResult<ProjectMemoryDashboardVectorSnapshotV1> {
         self.authority_calls
             .lock()
             .unwrap()
             .push("dashboard-vectors");
-        Ok(vec![])
+        Ok(ProjectMemoryDashboardVectorSnapshotV1::new(
+            ProjectMemoryStoreRevisionV1::default(),
+            vec![],
+        ))
     }
 
     async fn dashboard_project_memory_oplog(

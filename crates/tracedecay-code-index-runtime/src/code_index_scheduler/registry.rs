@@ -58,7 +58,20 @@ mod scope_identity;
 pub use scope_identity::{latest_matches_scope_identity, text_matches_scope_identity};
 
 const GENERATION_PUBLICATION_CHANNEL_CAPACITY: usize = 128;
-const TEXT_PROJECTION_DOCUMENTS_PER_PASS_V1: usize = 64;
+/// Page/finalization operations one background worker pass hints to the text
+/// projection.
+///
+/// This is the caller hint, and it is what actually sizes the work: the
+/// advance clamps it to `TEXT_ARTIFACT_MAXIMUM_WORK_PER_ADVANCE_V1` and the
+/// sealed source then offers `min(hint, TEXT_ARTIFACT_BATCH_PAGES_V1)` pages
+/// per commit and `hint * TEXT_ARTIFACT_FINALIZATION_ROWS_PER_OPERATION_V1`
+/// rows per finalization slice. Pinning it to the advance ceiling keeps the
+/// two in step; as a hardcoded 64 it silently capped every wake at one
+/// 64-page batch, so the ceiling's own "one wake can still commit two
+/// full-sized batches" contract never held and each batch paid a separate
+/// worker round trip (`spawn_blocking`, admission permit, publication lock).
+const TEXT_PROJECTION_DOCUMENTS_PER_PASS_V1: usize =
+    super::TEXT_ARTIFACT_MAXIMUM_WORK_PER_ADVANCE_V1;
 
 /// Bounded exponential backoff between activation retries of the same sealed
 /// generation. Activation of a large artifact is minutes of real work, so the
@@ -195,6 +208,65 @@ impl GraphSeatGateV1 {
     }
 }
 
+/// Whether a prepared generation still owes native graph activation.
+///
+/// Preparation binds the complete generation and hands it to the serving
+/// swap; activation installs its native graph. The two used to share one
+/// gate, so refusing a redundant activation also refused the seat — a restart
+/// that restored an owner whose graph was already Ready therefore left the
+/// serving slot empty forever while status read the same owner and reported
+/// Ready. Every arm here refuses activation only; the seat always happens.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphActivationGateV1 {
+    /// Install this generation's native graph.
+    Activate,
+    /// The bound owner already serves a native graph. Replaying activation
+    /// reopened the persistent graph, so shutdown cancelled the duplicate
+    /// projection and then conflicted closing the live reconciliation owner.
+    AlreadyServing,
+    /// Nothing new to install: the serving slot already holds this exact
+    /// generation and its graph is terminal (Ready, Refused, or Unavailable).
+    UnchangedGraph,
+    /// A generation whose graph is still Pending gets exactly one further
+    /// attempt per worker; this one is already spent.
+    PendingAttemptSpent,
+}
+
+impl GraphActivationGateV1 {
+    /// Decide activation for a generation this pass prepared and will seat.
+    ///
+    /// `graph_already_serves` is the retained/restored text owner's own
+    /// readiness, not the bound generation's: a restored owner carries its
+    /// Ready graph across the bind, and that owner is the authority status
+    /// reads.
+    #[hotpath::skip]
+    pub const fn decide(
+        graph_already_serves: bool,
+        replaces_serving_generation: bool,
+        graph_activation_is_pending: bool,
+        pending_attempt_spent: bool,
+    ) -> Self {
+        if graph_already_serves {
+            return Self::AlreadyServing;
+        }
+        if replaces_serving_generation {
+            return Self::Activate;
+        }
+        if !graph_activation_is_pending {
+            return Self::UnchangedGraph;
+        }
+        if pending_attempt_spent {
+            return Self::PendingAttemptSpent;
+        }
+        Self::Activate
+    }
+
+    #[hotpath::skip]
+    pub const fn activates(self) -> bool {
+        matches!(self, Self::Activate)
+    }
+}
+
 /// What the serving swap did with a reconciled generation.
 ///
 /// The swap is the only writer of the serving slot, so every arm here is a
@@ -252,6 +324,21 @@ struct ColdMountFinalCommitGateV1 {
 #[cfg(any(test, feature = "test-helpers"))]
 fn cold_mount_final_commit_gate() -> &'static Mutex<Option<ColdMountFinalCommitGateV1>> {
     static GATE: std::sync::OnceLock<Mutex<Option<ColdMountFinalCommitGateV1>>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+struct RetainedGraphRecoverySuccessorGateV1 {
+    project_root: PathBuf,
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn retained_graph_recovery_successor_gate()
+-> &'static Mutex<Option<RetainedGraphRecoverySuccessorGateV1>> {
+    static GATE: std::sync::OnceLock<Mutex<Option<RetainedGraphRecoverySuccessorGateV1>>> =
         std::sync::OnceLock::new();
     GATE.get_or_init(|| Mutex::new(None))
 }
@@ -480,6 +567,7 @@ pub struct CodeIndexGenerationPublishedV1 {
 pub struct QueryActivationAttemptV1 {
     revision: ConfigurationRevisionId,
     token: u64,
+    preserves_existing_authority: bool,
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -641,10 +729,11 @@ pub fn unique_mounted_for_scope<'a>(
 /// Remediation reported beside a parked deterministic contract violation.
 /// The reason names the exact violation (path, observed mode, required mode);
 /// this names the operator journey and the automatic recovery cadence.
-const CONVERGENCE_PARK_CONTRACT_REMEDIATION_V1: &str = "remove the named contract violation \
-     (for example restore owner-only access on the named path, or re-enroll the store); \
-     background convergence re-checks on every wake and resumes automatically once the \
-     contract holds";
+const CONVERGENCE_PARK_CONTRACT_REMEDIATION_V1: &str = "fix the named contract violation \
+     (for example restore owner-only access on the named path), then run `tracedecay sync` and \
+     re-check `tracedecay status`; an incompatible derived lexical cursor is replaced \
+     automatically without resetting project identity, sessions, memory, or configuration; \
+     `storage reset-project-store` is only for a reported schema reset requirement";
 
 /// Remediation reported when the text-projection task itself failed
 /// abnormally. Unchanged input reproduces the failure, so only changed input
@@ -1139,8 +1228,11 @@ impl CodeIndexSchedulerRegistryV1 {
         true
     }
 
-    fn activate_for_scope(&self, scope: &tracedecay_application::ResolvedScope) -> bool {
-        let activation = {
+    fn activation_for_scope(
+        &self,
+        scope: &tracedecay_application::ResolvedScope,
+    ) -> Option<Arc<super::CodeIndexActivationV1>> {
+        {
             let mut activations = self
                 .activations
                 .lock()
@@ -1155,8 +1247,20 @@ impl CodeIndexSchedulerRegistryV1 {
             } else {
                 activation
             }
-        };
-        activation.is_some_and(|activation| activation.activate())
+        }
+    }
+
+    pub fn automatic_admission_for_scope(
+        &self,
+        scope: &tracedecay_application::ResolvedScope,
+    ) -> Option<super::CodeIndexAutomaticAdmissionV1> {
+        self.activation_for_scope(scope)
+            .map(|activation| activation.automatic_admission())
+    }
+
+    fn activate_for_scope(&self, scope: &tracedecay_application::ResolvedScope) -> bool {
+        self.activation_for_scope(scope)
+            .is_some_and(|activation| activation.activate())
     }
 
     #[cfg(test)]
@@ -1197,6 +1301,52 @@ impl CodeIndexSchedulerRegistryV1 {
     async fn wait_for_cold_mount_final_commit_gate(project_root: &Path) {
         let gate = {
             let mut armed = cold_mount_final_commit_gate()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let matches_root = armed
+                .as_ref()
+                .is_some_and(|gate| gate.project_root == project_root);
+            if matches_root { armed.take() } else { None }
+        };
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.await;
+        }
+    }
+
+    /// Pause a revision-7 retained-head recovery after it is queryable and
+    /// before its dirty-checkout successor starts. This makes the recovery
+    /// boundary observable without admitting the successor's partition decode.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn pause_next_retained_graph_recovery_before_successor(
+        &self,
+        project_root: PathBuf,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, entered_observed) = tokio::sync::oneshot::channel();
+        let (released, release) = tokio::sync::oneshot::channel();
+        let mut gate = retained_graph_recovery_successor_gate()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            gate.is_none(),
+            "only one retained graph recovery successor gate may be armed at a time"
+        );
+        *gate = Some(RetainedGraphRecoverySuccessorGateV1 {
+            project_root,
+            entered,
+            release,
+        });
+        (entered_observed, released)
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    async fn wait_for_retained_graph_recovery_successor_gate(project_root: &Path) {
+        let gate = {
+            let mut armed = retained_graph_recovery_successor_gate()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let matches_root = armed
@@ -1263,6 +1413,12 @@ impl CodeIndexSchedulerRegistryV1 {
     #[cfg(any(test, feature = "test-helpers"))]
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn background_reconcile_admission(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.background_reconcile_admission)
+    }
+
+    /// Share the bounded background scheduler admission with semantic
+    /// evaluation so native model work cannot bypass the project-wide limit.
+    pub fn semantic_evaluation_admission(&self) -> Arc<tokio::sync::Semaphore> {
         Arc::clone(&self.background_reconcile_admission)
     }
 
@@ -2853,6 +3009,11 @@ impl CodeIndexSchedulerRegistryV1 {
             // generation that serves text without a native graph to one per
             // generation, so a permanently unactivatable seal cannot spin.
             let mut graph_seat_attempted: Option<tracedecay_domain::CodeGenerationId> = None;
+            // A retained revision-7 graph gets one verified-head attempt
+            // before ordinary source reconciliation owns any repair. A failed
+            // verification falls through to one canonical replay of the same
+            // sealed generation rather than repeating the head read forever.
+            let mut retained_graph_head_recovery_attempted = false;
             // The conflict verdict of the previous failed seat attempt. A
             // Conflict can be a race (a concurrent publisher advanced the
             // head) and is retried once like any transient failure, but the
@@ -3167,6 +3328,19 @@ impl CodeIndexSchedulerRegistryV1 {
                 let retained_text_uses_partitioned_manifest = retained_text
                     .as_ref()
                     .is_some_and(LatestCodeTextGenerationV1::uses_partitioned_manifest);
+                // A revision-7 owner can restore its retained persistent graph
+                // directly from the verified head. Give that recovery exactly
+                // one empty-slot pass before the dirty source capture creates
+                // its successor. Once the retained graph is Ready, this guard
+                // falls through to the ordinary reconciliation path instead of
+                // repeatedly consuming the successor's wake as a Noop.
+                let retained_partitioned_graph_recovery_pending = graph_activation_enabled
+                    && !graph_activation_deferred
+                    && serving_empty
+                    && !retained_graph_head_recovery_attempted
+                    && retained_text.as_ref().is_some_and(|text| {
+                        text.uses_partitioned_manifest() && text.interactive_graph_store().is_err()
+                    });
                 let retained_text_metadata =
                     retained_text.as_ref().map(|text| text.metadata().clone());
                 let shutting_down = Arc::clone(&worker_shutting_down);
@@ -3204,6 +3378,24 @@ impl CodeIndexSchedulerRegistryV1 {
                                 scheduler.seat_retained_generation_on_empty_serving()?
                         {
                             return Ok(outcome);
+                        }
+                        if retained_partitioned_graph_recovery_pending
+                            && let Some(metadata) = retained_text_metadata.as_ref()
+                        {
+                            // Reserve this pass for verified-head recovery.
+                            // `Noop` here means no successor was published;
+                            // it never claims source currency. The successor
+                            // pass below captures the source state itself so
+                            // a quiet remount is not fabricated as dirty.
+                            return Ok(CodeIndexReconcileOutcomeV1::Noop(
+                                CodeIndexNoopEvidenceV1 {
+                                    snapshot_content_identity: metadata
+                                        .snapshot()
+                                        .content_identity
+                                        .clone(),
+                                    overflow_reconciled: false,
+                                },
+                            ));
                         }
                         if let Some(metadata) = retained_text_metadata {
                             match scheduler.reconcile_retained_text_generation_with(
@@ -3522,20 +3714,28 @@ impl CodeIndexSchedulerRegistryV1 {
                         worker_wake.notify_one();
                     }
                 }
-                if prepare_graph
-                    && graph_text
-                        .as_ref()
-                        .is_some_and(|retained| retained.interactive_graph_store().is_ok())
-                {
-                    prepare_graph = false;
-                }
+                // A text owner that already serves a native graph must not be
+                // activated a second time, but preparation is not activation.
+                // Clearing `prepare_graph` here also skipped the bind and the
+                // serving swap, so a restart that restored a Ready retained
+                // graph left `serving_generation` empty forever: every
+                // complete-generation demand (`latest_complete_ready`,
+                // `latest_complete_fresh`, `latest_complete_serving_for_scope`)
+                // answered unavailable while `dashboard_code_graph_serving`
+                // read the same text owner and reported Ready. Prepare, bind
+                // and seat as usual; only the activation call is suppressed.
+                let graph_already_serves = graph_text
+                    .as_ref()
+                    .is_some_and(|retained| retained.interactive_graph_store().is_ok());
                 if prepare_graph
                     && !published_pass
+                    && !retained_graph_head_recovery_attempted
                     && let Some(retained) = graph_text
                         .as_ref()
                         .filter(|retained| retained.uses_partitioned_manifest())
                         .cloned()
                 {
+                    retained_graph_head_recovery_attempted = true;
                     let generation_id = retained.metadata().manifest().generation_id.clone();
                     let replay_scheduler = Arc::clone(&worker_scheduler);
                     let shutting_down = Arc::clone(&worker_shutting_down);
@@ -3567,6 +3767,11 @@ impl CodeIndexSchedulerRegistryV1 {
                                         "revision-7 manifest matched the durable verified graph \
                                          head; startup seated graph reads without replay"
                                     );
+                                    #[cfg(any(test, feature = "test-helpers"))]
+                                    Self::wait_for_retained_graph_recovery_successor_gate(
+                                        &worker_project_root,
+                                    )
+                                    .await;
                                 }
                                 Ok(false) => {}
                                 Err(error) => {
@@ -3574,8 +3779,8 @@ impl CodeIndexSchedulerRegistryV1 {
                                         event = "code_index_graph_head_recovery_degraded",
                                         error = %error,
                                         "verified graph head did not match the revision-7 \
-                                         manifest; graph coverage stays pending while the \
-                                         admitted worker replays canonical segments"
+                                         manifest; replay the exact sealed generation to \
+                                         repair its quarantined graph projection"
                                     );
                                 }
                             }
@@ -3597,6 +3802,19 @@ impl CodeIndexSchedulerRegistryV1 {
                             );
                         }
                     }
+                    // The reserved pass deliberately did not capture the
+                    // checkout, and it consumed whatever wake ran it. Schedule
+                    // the successor for every outcome of the attempt, not only
+                    // the recovered one: an abstaining or degraded attempt
+                    // leaves exactly the same uncaptured source behind, and
+                    // the reservation is armed once per worker, so a quiet
+                    // reserved pass that answered `Noop` for a checkout with
+                    // hook hints already pending stranded them with no wake at
+                    // all and never published the successor generation. The
+                    // `retained_graph_head_recovery_attempted` guard above is
+                    // now false for every later pass, so this cannot spin
+                    // another retained-recovery Noop.
+                    worker_wake.notify_one();
                 }
                 let mut result = match source_result {
                     Ok(mut outcome) if prepare_graph => {
@@ -3694,27 +3912,18 @@ impl CodeIndexSchedulerRegistryV1 {
                     Ok((Ok(_), Some(_), Some(_))) => true,
                     _ => false,
                 };
-                // An unchanged reconcile over the exact serving generation has
-                // no graph effect to install. Replaying activation here opened
-                // the persistent graph again, so daemon shutdown cancelled the
-                // duplicate projection and then conflicted while closing the
-                // still-running graph reconciliation owner.
-                //
-                // Identity alone is not that proof, though: a generation seated
-                // by the exact route, or one whose activation failed earlier,
-                // serves text under the very same id with no native graph at
-                // all. Leaving the replace gate as the only door left those
-                // generations answering "not ready" forever. A generation whose
-                // graph is still Pending - never Ready, never Refused - gets
-                // exactly one further attempt per worker, so nothing is
-                // replayed over a graph that already serves.
+                // Activation is decided independently of the seat: every arm
+                // below refuses only the native graph call, and the serving
+                // swap still installs the prepared generation.
                 let activate_graph = match &result {
-                    Ok((Ok(_), Some(latest), Some(_))) => {
-                        replace_serving_generation
-                            || (latest.graph_activation_is_pending()
-                                && graph_seat_attempted.as_ref()
-                                    != Some(&latest.generation().manifest().generation_id))
-                    }
+                    Ok((Ok(_), Some(latest), Some(_))) => GraphActivationGateV1::decide(
+                        graph_already_serves,
+                        replace_serving_generation,
+                        latest.graph_activation_is_pending(),
+                        graph_seat_attempted.as_ref()
+                            == Some(&latest.generation().manifest().generation_id),
+                    )
+                    .activates(),
                     _ => false,
                 };
                 if activate_graph && let Ok((Ok(_), Some(latest), Some(replay_binding))) = &result {
@@ -4171,15 +4380,7 @@ impl CodeIndexSchedulerRegistryV1 {
         let _activation = activation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if worktree.query_activation_revision.as_ref() != Some(expected_revision)
-            || worktree
-                .query_activation_redundancy
-                .as_ref()
-                .map(
-                    tracedecay_usecases::semantic_runtime::PreparedSemanticRedundancyAuthorityV1::configuration_revision,
-                )
-                != Some(expected_revision)
-        {
+        if worktree.query_activation_revision.as_ref() != Some(expected_revision) {
             return Err(CodeIndexSchedulerErrorV1::Identity(
                 "committed query fallback revision is no longer desired".to_owned(),
             ));
@@ -4256,9 +4457,10 @@ impl CodeIndexSchedulerRegistryV1 {
                 "query activation scope does not match the mounted worktree".to_owned(),
             ));
         }
+        let mut exact_retry = false;
         if let Some(desired_epoch) = worktree.query_activation_epoch {
             let advances = epoch > desired_epoch;
-            let exact_retry = epoch == desired_epoch
+            exact_retry = epoch == desired_epoch
                 && worktree.query_activation_revision.as_ref() == Some(result_revision)
                 && worktree.query_activation_transition_digest.as_ref() == Some(transition_digest)
                 && worktree.query_activation_redundancy.as_ref() == Some(prepared_redundancy);
@@ -4285,15 +4487,18 @@ impl CodeIndexSchedulerRegistryV1 {
         worktree.query_activation_epoch = Some(epoch);
         worktree.query_activation_transition_digest = Some(transition_digest.clone());
         worktree.query_activation_redundancy = Some(prepared_redundancy.clone());
-        worktree.semantic_query_authority = None;
-        tracedecay_usecases::semantic_runtime::commit_project_semantic_redundancy_authority_under_gate(
-            project_root,
-            prepared_redundancy,
-            false,
-        );
+        if !exact_retry {
+            worktree.semantic_query_authority = None;
+            tracedecay_usecases::semantic_runtime::commit_project_semantic_redundancy_authority_under_gate(
+                project_root,
+                prepared_redundancy,
+                false,
+            );
+        }
         Ok(QueryActivationAttemptV1 {
             revision: result_revision.clone(),
             token: worktree.query_activation_attempt,
+            preserves_existing_authority: exact_retry,
         })
     }
 
@@ -4354,14 +4559,16 @@ impl CodeIndexSchedulerRegistryV1 {
         }
         if let Some(prepared_cache) = prepared_cache {
             if !prepared_cache.commit() {
-                worktree.semantic_query_authority = None;
-                worktree.query_activation_revision =
-                    Some(prepared.configuration_revision().clone());
-                tracedecay_usecases::semantic_runtime::commit_project_semantic_redundancy_authority_under_gate(
-                    project_root.clone(),
-                    &prepared_redundancy,
-                    false,
-                );
+                if !attempt.preserves_existing_authority {
+                    worktree.semantic_query_authority = None;
+                    worktree.query_activation_revision =
+                        Some(prepared.configuration_revision().clone());
+                    tracedecay_usecases::semantic_runtime::commit_project_semantic_redundancy_authority_under_gate(
+                        project_root.clone(),
+                        &prepared_redundancy,
+                        false,
+                    );
+                }
                 return Err(CodeIndexSchedulerErrorV1::Identity(
                     "prepared semantic cache became stale before coherent installation".to_owned(),
                 ));
@@ -4375,13 +4582,16 @@ impl CodeIndexSchedulerRegistryV1 {
             );
         }
         if let Err(error) = commit_prepared() {
-            worktree.semantic_query_authority = None;
-            worktree.query_activation_revision = Some(prepared.configuration_revision().clone());
-            tracedecay_usecases::semantic_runtime::commit_project_semantic_redundancy_authority_under_gate(
-                project_root.clone(),
-                &prepared_redundancy,
-                false,
-            );
+            if !attempt.preserves_existing_authority {
+                worktree.semantic_query_authority = None;
+                worktree.query_activation_revision =
+                    Some(prepared.configuration_revision().clone());
+                tracedecay_usecases::semantic_runtime::commit_project_semantic_redundancy_authority_under_gate(
+                    project_root.clone(),
+                    &prepared_redundancy,
+                    false,
+                );
+            }
             return Err(CodeIndexSchedulerErrorV1::Identity(error));
         }
         tracedecay_usecases::semantic_runtime::commit_project_semantic_redundancy_authority_under_gate(
@@ -4436,6 +4646,9 @@ impl CodeIndexSchedulerRegistryV1 {
             && failed_redundancy.configuration_revision() == &attempt.revision
             && worktree.query_activation_redundancy.as_ref() == Some(&failed_redundancy)
         {
+            if attempt.preserves_existing_authority {
+                return Ok(false);
+            }
             worktree.semantic_query_authority = None;
             tracedecay_usecases::semantic_runtime::commit_project_semantic_redundancy_authority_under_gate(
                 project_root.clone(),
@@ -4624,24 +4837,36 @@ impl CodeIndexSchedulerRegistryV1 {
     /// admission wake; a matching stat signature refreshes the scheduler's
     /// cadence watermark and returns without traversal.
     pub async fn probe_freshness(&self, project_root: &Path) -> bool {
+        self.diagnostics_change_generation(project_root)
+            .await
+            .is_some()
+    }
+
+    /// Return the mounted scheduler's canonical worktree-change generation.
+    ///
+    /// The generation is exactly as fresh as the index used by search: hook
+    /// hints and Git metadata changes are observed immediately, while other
+    /// out-of-band edits are observed by the 30-second stat-signature ladder.
+    /// Until that ladder runs, callers intentionally receive the preceding
+    /// generation and must not derive a parallel workspace fingerprint.
+    pub async fn diagnostics_change_generation(&self, project_root: &Path) -> Option<u64> {
         let Ok(project_root) = project_root.canonicalize() else {
-            return false;
+            return None;
         };
-        let (scheduler, wake, pending_wake, reconcile_in_progress) = {
+        let (scheduler, wake, pending_wake, reconcile_in_progress, epoch) = {
             let mounted = self.mounted.lock().await;
-            let Some(worktree) = mounted.get(&project_root) else {
-                return false;
-            };
+            let worktree = mounted.get(&project_root)?;
             (
                 Arc::clone(&worktree.scheduler),
                 Arc::clone(&worktree.wake),
                 Arc::clone(&worktree.pending_wake),
                 Arc::clone(&worktree.reconcile_in_progress),
+                Arc::clone(&worktree.epoch),
             )
         };
         if pending_wake.has_pending_arrival() || reconcile_in_progress.load(Ordering::Acquire) != 0
         {
-            return true;
+            return Some(epoch.load(Ordering::Acquire));
         }
         tokio::task::spawn_blocking(move || {
             let mut scheduler = scheduler
@@ -4654,10 +4879,10 @@ impl CodeIndexSchedulerRegistryV1 {
                     CodeIndexCadenceTriggerV1::QueryAdmission,
                 );
             }
-            true
+            epoch.load(Ordering::Acquire)
         })
         .await
-        .unwrap_or(false)
+        .ok()
     }
 
     /// Mounted scope identity plus the currently serving generation for one
@@ -4746,6 +4971,34 @@ impl CodeIndexSchedulerRegistryV1 {
                 .unwrap_or_else(|error| {
                     Err(CodeIndexSchedulerErrorV1::Identity(format!(
                         "sealed replay-binding read task failed: {error}"
+                    )))
+                }),
+        )
+    }
+
+    /// Load one exact code generation through its durable publication store,
+    /// including a source generation superseded in process-local retention.
+    pub async fn published_generation(
+        &self,
+        project_root: &Path,
+        generation_id: &CodeGenerationId,
+    ) -> Option<Result<Option<Arc<CodeIndexPublishedGenerationV1>>, CodeIndexSchedulerErrorV1>>
+    {
+        let project_root = project_root.canonicalize().ok()?;
+        let owner = {
+            let mounted = self.mounted.lock().await;
+            mounted
+                .get(&project_root)?
+                .historical_generation_owner
+                .clone()
+        };
+        let generation_id = generation_id.clone();
+        Some(
+            tokio::task::spawn_blocking(move || owner.published_generation(&generation_id))
+                .await
+                .unwrap_or_else(|error| {
+                    Err(CodeIndexSchedulerErrorV1::Identity(format!(
+                        "published-generation read task failed: {error}"
                     )))
                 }),
         )
@@ -5578,7 +5831,6 @@ impl CodeIndexSchedulerRegistryV1 {
     /// [`Self::latest_generation_id`], which prefers the graph-bearing serving
     /// slot and therefore stays on the previous generation until optional
     /// graph activation finishes.
-    #[cfg(test)]
     pub async fn latest_text_serving_for_root(
         &self,
         project_root: &Path,
@@ -5804,8 +6056,10 @@ impl CodeIndexSchedulerRegistryV1 {
     /// remedy this admission would ask for, so it is reused rather than
     /// duplicated — that is what keeps a rebuild window's worth of failing
     /// searches from becoming a wake storm and from each fabricating its own
-    /// cadence arrival. Second, when a generation is servable the ladder's own
-    /// suppression decides, exactly as it does on the grep/context/callers path.
+    /// cadence arrival. Second, when a generation's immutable text owners are
+    /// ready, the ladder's own suppression decides, exactly as it does on the
+    /// grep/context/callers path. Authenticated metadata without those owners
+    /// is still warming and always needs the worker's next bounded slice.
     pub async fn request_query_background_reconcile(
         &self,
         scope: &tracedecay_application::ResolvedScope,
@@ -5878,6 +6132,11 @@ impl CodeIndexSchedulerRegistryV1 {
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .is_none();
+            let text_owners_are_warming = text_generation
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(LatestCodeTextGenerationV1::text_serving_needs_work);
             // Nothing is servable at all, so the ladder's suppression cannot
             // apply: a reconcile is the only thing that can ever make this scope
             // answerable, and no other caller on this path will ask for it.
@@ -5889,7 +6148,7 @@ impl CodeIndexSchedulerRegistryV1 {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .overflow();
-            } else if !scheduler.request_fresh_for_query_background() {
+            } else if !text_owners_are_warming && !scheduler.request_fresh_for_query_background() {
                 return false;
             }
             Self::note_wake(
@@ -6244,9 +6503,8 @@ fn feedback_document_logical_path(
     let path = url
         .to_file_path()
         .map_err(|()| LspRuntimeFailure::new("feedback-document-uri-invalid"))?;
-    let relative = path
-        .strip_prefix(project_root)
-        .map_err(|_| LspRuntimeFailure::new("feedback-document-outside-root"))?;
+    let relative = canonical_relative_document_path(project_root, &path)
+        .ok_or_else(|| LspRuntimeFailure::new("feedback-document-outside-root"))?;
     if relative.as_os_str().is_empty()
         || relative
             .components()
@@ -6258,6 +6516,122 @@ fn feedback_document_logical_path(
         .to_str()
         .map(|path| path.replace('\\', "/"))
         .ok_or_else(|| LspRuntimeFailure::new("feedback-document-path-unavailable"))
+}
+
+/// Strip the canonical `project_root` from a client-supplied document path,
+/// comparing canonical to canonical.
+///
+/// The caller canonicalizes the mounted root; the client addresses a document
+/// by whatever path it opened. Those two spellings differ whenever any prefix
+/// of the root is a symlink — on macOS every `/var/folders/...` root the
+/// daemon holds as `/private/var/folders/...` — and a raw prefix strip
+/// refused every document under such a root as outside it.
+///
+/// The document need not exist yet (an unsaved buffer), so the deepest
+/// existing ancestor is canonicalized and the unresolved tail re-appended.
+/// The fence tightens rather than loosens: resolving before the strip refuses
+/// a path that reaches outside the root through a symlink *inside* it, which
+/// a raw prefix strip accepted as an ordinary logical path. The caller still
+/// refuses any relative path that is empty or carries a non-normal component,
+/// so an unresolved tail can neither escape upward nor name a root-external
+/// path.
+fn canonical_relative_document_path(project_root: &Path, path: &Path) -> Option<PathBuf> {
+    let mut unresolved: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut candidate = path;
+    loop {
+        if let Ok(canonical) = candidate.canonicalize() {
+            let mut relative = canonical.strip_prefix(project_root).ok()?.to_path_buf();
+            for component in unresolved.iter().rev() {
+                relative.push(component);
+            }
+            return Some(relative);
+        }
+        unresolved.push(candidate.file_name()?);
+        candidate = candidate.parent()?;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod feedback_document_path_tests {
+    use super::feedback_document_logical_path;
+
+    /// A symlinked root reproduces on Linux exactly what every macOS
+    /// `/var/folders/...` temporary root does in production: the daemon holds
+    /// the canonical root while the client addresses documents through the
+    /// alias it opened.
+    #[test]
+    fn a_symlinked_root_alias_resolves_to_the_same_logical_path() {
+        let base = tempfile::TempDir::new().expect("temporary base");
+        let real = base.path().join("real");
+        std::fs::create_dir_all(real.join("src")).expect("real tree");
+        std::fs::write(real.join("src/lib.rs"), b"pub fn alpha() {}\n").expect("document");
+        let alias = base.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("root alias");
+
+        let canonical_root = real.canonicalize().expect("canonical root");
+        let canonical_uri = url::Url::from_file_path(canonical_root.join("src/lib.rs"))
+            .expect("canonical document uri");
+        let alias_uri =
+            url::Url::from_file_path(alias.join("src/lib.rs")).expect("alias document uri");
+
+        assert_eq!(
+            feedback_document_logical_path(&canonical_root, canonical_uri.as_str())
+                .expect("canonical spelling resolves"),
+            "src/lib.rs"
+        );
+        assert_eq!(
+            feedback_document_logical_path(&canonical_root, alias_uri.as_str())
+                .expect("the client's alias spelling resolves against the canonical root"),
+            "src/lib.rs"
+        );
+    }
+
+    /// An unsaved buffer has no file to canonicalize; the deepest existing
+    /// ancestor still binds it to the root.
+    #[test]
+    fn an_unsaved_document_under_a_root_alias_still_resolves() {
+        let base = tempfile::TempDir::new().expect("temporary base");
+        let real = base.path().join("real");
+        std::fs::create_dir_all(real.join("src")).expect("real tree");
+        let alias = base.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("root alias");
+        let canonical_root = real.canonicalize().expect("canonical root");
+
+        let uri = url::Url::from_file_path(alias.join("src/unsaved.rs")).expect("document uri");
+        assert_eq!(
+            feedback_document_logical_path(&canonical_root, uri.as_str())
+                .expect("an unsaved buffer resolves through its existing ancestor"),
+            "src/unsaved.rs"
+        );
+    }
+
+    /// The escape fence stays closed: an alias that leaves the root, and a
+    /// traversal that climbs out of it, are both refused.
+    #[test]
+    fn paths_outside_the_root_stay_refused_through_an_alias() {
+        let base = tempfile::TempDir::new().expect("temporary base");
+        let real = base.path().join("real");
+        std::fs::create_dir_all(&real).expect("real tree");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside tree");
+        std::fs::write(outside.join("secret.rs"), b"pub fn secret() {}\n").expect("outside file");
+        std::os::unix::fs::symlink(&outside, real.join("escape")).expect("escaping alias");
+        let canonical_root = real.canonicalize().expect("canonical root");
+
+        let escaping = url::Url::from_file_path(canonical_root.join("escape/secret.rs"))
+            .expect("escaping document uri");
+        assert!(
+            feedback_document_logical_path(&canonical_root, escaping.as_str()).is_err(),
+            "a symlink out of the root is not a document of this project"
+        );
+
+        let traversal =
+            url::Url::from_file_path(outside.join("secret.rs")).expect("outside document uri");
+        assert!(
+            feedback_document_logical_path(&canonical_root, traversal.as_str()).is_err(),
+            "a sibling directory is not a document of this project"
+        );
+    }
 }
 
 #[cfg(test)]

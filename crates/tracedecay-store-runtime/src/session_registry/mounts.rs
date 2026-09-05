@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use std::sync::atomic::AtomicBool;
+#[cfg(any(test, feature = "test-helpers"))]
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tracedecay_application::remote::auth::RemoteEnrollmentAdmissionEvidenceV1;
 use tracedecay_domain::{BrainNodeId, EnrollmentGrantV1};
@@ -26,12 +28,67 @@ use super::{
     ProjectRuntimeOwnerStateV1, RegisteredGlobalDbLeaseV1, RegisteredGlobalDbOwnerV1,
     RegisteredSchemaConvergenceMaintenance, RegisteredSessionOwnerV1, RemoteNodeStoreOwnerV1,
     Result, RetainedHookTasks, SessionGraphAttachmentStateV1, SessionGraphOwnerV1,
-    StoreRuntimeClientLease, StoreRuntimeOpenRequest, StoreRuntimeOpenResult, StoreRuntimeRegistry,
-    StoreRuntimeResolver, bind_ready_project_memory_graph, open_runtime,
+    StoreRuntimeClientLease, StoreRuntimeOpenRequest, StoreRuntimeOpenResult, StoreRuntimeOpenSpec,
+    StoreRuntimeRegistry, StoreRuntimeResolver, bind_ready_project_memory_graph, open_runtime,
     open_runtime_with_presence, registry_open_error, runtime_incarnation, session_registry_error,
 };
 use crate::register_registered_schema_installer;
 use tracedecay_domain::errors::TraceDecayError;
+
+/// Test-only hold installed at the tail of the background session
+/// relation-graph open task, immediately after settlement is published and
+/// announced.
+///
+/// It exists so a fixture can pin that task in the exact window that used to
+/// leak a counted client lease past settlement: with the task parked here, any
+/// lease the task still owns is deterministically visible to a retirement
+/// reservation instead of depending on how quickly the task future happens to
+/// be dropped on another worker thread.
+#[cfg(any(test, feature = "test-helpers"))]
+pub(super) struct SessionGraphSettleTestGateState {
+    blocked: AtomicBool,
+    blocked_notify: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl SessionGraphSettleTestGateState {
+    async fn block(&self) {
+        self.blocked.store(true, Ordering::Release);
+        self.blocked_notify.notify_waiters();
+        self.release
+            .acquire()
+            .await
+            .expect("session graph settle test gate remains open")
+            .forget();
+    }
+}
+
+/// Handle returned by
+/// [`DaemonSessionRuntimeRegistryV1::block_session_graph_settle_for_test`].
+#[cfg(any(test, feature = "test-helpers"))]
+pub struct SessionGraphSettleTestGate {
+    state: Arc<SessionGraphSettleTestGateState>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl SessionGraphSettleTestGate {
+    /// Awaits the graph-open task reaching the post-settlement hold.
+    pub async fn wait_until_blocked(&self) {
+        loop {
+            let notified = self.state.blocked_notify.notified();
+            if self.state.blocked.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Lets one held graph-open task finish and drop.
+    pub fn release(&self) {
+        self.state.release.add_permits(1);
+    }
+}
 
 struct UnavailableRemoteSpoolKeyringV1;
 
@@ -113,12 +170,14 @@ impl DaemonSessionRuntimeRegistryV1 {
             open_runtime(
                 &registry,
                 resolver.as_ref(),
-                profile_shard.clone(),
-                incarnation,
-                None,
-                None,
-                true,
-                "mount profile authority store",
+                StoreRuntimeOpenSpec::new(
+                    profile_shard.clone(),
+                    incarnation,
+                    None,
+                    None,
+                    true,
+                    "mount profile authority store",
+                ),
             ),
             label = "daemon.store.profile_authority.bootstrap_open"
         )
@@ -161,6 +220,8 @@ impl DaemonSessionRuntimeRegistryV1 {
             session_sync_service: Arc::new(std::sync::OnceLock::new()),
             remote_recovery_project_lifecycle: Arc::new(std::sync::OnceLock::new()),
             long_lived_session_maintenance,
+            #[cfg(any(test, feature = "test-helpers"))]
+            session_graph_settle_gate: std::sync::Mutex::new(None),
         };
         registry.mount_registered_remote_nodes().await?;
         Ok(registry)
@@ -210,6 +271,24 @@ impl DaemonSessionRuntimeRegistryV1 {
 }
 
 impl DaemonSessionRuntimeRegistryV1 {
+    /// Holds every subsequently mounted session owner's relation-graph open
+    /// task at the tail of its body, after settlement is published and
+    /// announced. Fixtures use it to observe what the task still owns at the
+    /// instant a settlement waiter is released.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn block_session_graph_settle_for_test(&self) -> SessionGraphSettleTestGate {
+        let state = Arc::new(SessionGraphSettleTestGateState {
+            blocked: AtomicBool::new(false),
+            blocked_notify: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        *self
+            .session_graph_settle_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&state));
+        SessionGraphSettleTestGate { state }
+    }
+
     /// Mints one independently counted registered-session client and its
     /// matching graph client. The owner map retains neither issuance.
     fn issue_session_owner_lease(
@@ -240,6 +319,12 @@ impl DaemonSessionRuntimeRegistryV1 {
         let graph_settled = Arc::new(tokio::sync::Notify::new());
         let task_graph_settled = Arc::clone(&graph_settled);
         let task_published_lease = published_lease.clone();
+        #[cfg(any(test, feature = "test-helpers"))]
+        let task_settle_gate = self
+            .session_graph_settle_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let registry = self.registry.clone();
         let graph_registry = self.graph_registry.clone();
         let graph_lifecycle_cancelled = Arc::clone(&self.graph_lifecycle_cancelled);
@@ -284,7 +369,19 @@ impl DaemonSessionRuntimeRegistryV1 {
                 *task_relation_graph
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+                // Settlement is the observable boundary that retirement waits
+                // on, so this task's counted client lease must be released
+                // *before* the notification, never as an incidental drop of
+                // the task future afterwards. Releasing it later lets a woken
+                // retirement observe a `ClientLeases` blocker for a lease that
+                // has already done its job of holding the shard open across
+                // the background graph open.
+                drop(task_published_lease);
                 task_graph_settled.notify_waiters();
+                #[cfg(any(test, feature = "test-helpers"))]
+                if let Some(gate) = task_settle_gate {
+                    gate.block().await;
+                }
             },
         );
         if !retained {
@@ -360,12 +457,14 @@ impl DaemonSessionRuntimeRegistryV1 {
             Box::pin(open_runtime(
                 &self.registry,
                 self.resolver.as_ref(),
-                shard_id,
-                self.incarnation,
-                None,
-                None,
-                true,
-                "mount profile authority store",
+                StoreRuntimeOpenSpec::new(
+                    shard_id,
+                    self.incarnation,
+                    None,
+                    None,
+                    true,
+                    "mount profile authority store",
+                ),
             )),
             label = "daemon.store.profile_authority.mount_open"
         )
@@ -433,12 +532,14 @@ impl DaemonSessionRuntimeRegistryV1 {
             Box::pin(open_runtime(
                 &self.registry,
                 self.resolver.as_ref(),
-                shard_id.clone(),
-                self.incarnation,
-                Some(pin),
-                None,
-                true,
-                "mount profile session store",
+                StoreRuntimeOpenSpec::new(
+                    shard_id.clone(),
+                    self.incarnation,
+                    Some(pin),
+                    None,
+                    true,
+                    "mount profile session store",
+                ),
             )),
             label = "daemon.store.profile_sessions.open"
         )
@@ -513,11 +614,13 @@ impl DaemonSessionRuntimeRegistryV1 {
                     return;
                 };
                 let opened = DaemonSessionRuntimeRegistryV1::retain_memory_graph_runtime_for_task(
-                    identity,
-                    registry,
-                    graph_registry,
-                    graph_lifecycle_cancelled,
-                    incarnation,
+                    super::code_graph::MemoryGraphRuntimeTaskContext::new(
+                        identity,
+                        registry,
+                        graph_registry,
+                        graph_lifecycle_cancelled,
+                        incarnation,
+                    ),
                     task_shard_id,
                     owner,
                     cancellation,
@@ -529,13 +632,7 @@ impl DaemonSessionRuntimeRegistryV1 {
                         let graph_port: Arc<
                             dyn tracedecay_runtime_core::store_runtime::VerifiedGraphRuntimePortV1,
                         > = runtime.clone();
-                        let activation = task_database
-                            .bind_memory_graph_runtime(graph_port)
-                            .and_then(|()| {
-                                super::code_graph::schedule_bound_memory_graph_reconciliation(
-                                    &task_database,
-                                )
-                            });
+                        let activation = task_database.bind_memory_graph_runtime(graph_port);
                         let reconciliation = activation
                             .as_ref()
                             .ok()
@@ -631,12 +728,14 @@ impl DaemonSessionRuntimeRegistryV1 {
             open_runtime(
                 &self.registry,
                 self.resolver.as_ref(),
-                shard_id.clone(),
-                self.incarnation,
-                Some(pin),
-                None,
-                true,
-                "mount profile memory store",
+                StoreRuntimeOpenSpec::new(
+                    shard_id.clone(),
+                    self.incarnation,
+                    Some(pin),
+                    None,
+                    true,
+                    "mount profile memory store",
+                ),
             ),
             label = "daemon.store.profile_memory.open"
         )
@@ -1219,12 +1318,14 @@ impl DaemonSessionRuntimeRegistryV1 {
             open_runtime(
                 &self.registry,
                 self.resolver.as_ref(),
-                shard_id.clone(),
-                self.incarnation,
-                Some(pin),
-                None,
-                true,
-                "mount project session store",
+                StoreRuntimeOpenSpec::new(
+                    shard_id.clone(),
+                    self.incarnation,
+                    Some(pin),
+                    None,
+                    true,
+                    "mount project session store",
+                ),
             ),
             label = "daemon.store.project_sessions.open"
         )
@@ -1384,12 +1485,14 @@ impl DaemonSessionRuntimeRegistryV1 {
             open_runtime(
                 &self.registry,
                 self.resolver.as_ref(),
-                shard_id.clone(),
-                self.incarnation,
-                Some(pin),
-                None,
-                true,
-                "mount project memory store",
+                StoreRuntimeOpenSpec::new(
+                    shard_id.clone(),
+                    self.incarnation,
+                    Some(pin),
+                    None,
+                    true,
+                    "mount project memory store",
+                ),
             ),
             label = "daemon.store.project_memory.open"
         )

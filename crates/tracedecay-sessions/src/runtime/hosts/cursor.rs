@@ -1,24 +1,22 @@
-use std::collections::HashMap;
-use std::fs::File;
 use std::future::Future;
 use std::hash::BuildHasher;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Mutex;
 
 use serde_json::Value;
 #[cfg(test)]
 pub use tracedecay_capture::cursor::normalize_cursor_observation;
+#[cfg(test)]
+use tracedecay_capture::cursor::observation_native_record_id;
 use tracedecay_capture::cursor::{
-    cursor_projected_message_id, normalize_cursor_observation_with_message_id,
-    observation_native_record_id, timestamp_tag_from_record,
+    cursor_observation_identity, cursor_projected_message_id,
+    normalize_cursor_observation_with_message_id, timestamp_tag_from_record,
 };
 #[cfg(test)]
 use tracedecay_domain::CanonicalObservationFactV1;
 use tracedecay_domain::{
-    ObservationOrderingDomainV1, ObservationScopeV1, ObservationSourceIdentityV1, ProjectId,
-    ProviderId, RetentionClass, SessionId,
+    ObservationId, ObservationOrderingDomainV1, ObservationScopeV1, ObservationSourceIdentityV1,
+    ObservationSourceRangeV1, ProjectId, ProviderId, RetentionClass, SessionId,
 };
 use tracedecay_store::cursor_dispatch::{
     cursor_dispatch_model, cursor_model_string, dispatch_text, is_subagent_dispatch_tool,
@@ -39,10 +37,10 @@ use crate::runtime::shared::{
     content_storage_text_and_tools, paths_equal, title_from_messages,
 };
 use crate::runtime::source::{
-    HostProviderCoverage, MAX_JSONL_RECORD_BYTES, ParsedTranscript, RawJsonlFrame,
-    RawJsonlFrameReader, SessionDraft, TranscriptDiscoveryBounds, TranscriptIngestError,
-    TranscriptIngestResult, TranscriptSource, collect_files_with_ext_bounded,
-    persist_host_provider_coverage, run_blocking_transcript_section, stream_new_jsonl,
+    HostProviderCoverage, ParsedTranscript, SessionDraft, TranscriptDiscoveryBounds,
+    TranscriptIngestError, TranscriptIngestResult, TranscriptSource,
+    collect_files_with_ext_bounded, persist_host_provider_coverage,
+    run_blocking_transcript_section, stream_new_jsonl,
 };
 use tracedecay_runtime_core::privacy::{
     ObservationRecordParseErrorV1, parse_normalized_observation_record_v1,
@@ -55,7 +53,13 @@ const CURSOR_SESSION_LOCATION_KEYS: TranscriptLocationMetadataKeys =
     );
 const MAX_CURSOR_PROJECTIONS_PER_PASS: usize = 256;
 
+mod parent_dispatch_index;
 pub(in crate::runtime) mod projection;
+use parent_dispatch_index::record_dispatch_scan_gauges;
+pub use parent_dispatch_index::{
+    DispatchScanReceipt, parent_dispatch_model_for_subagent,
+    parent_dispatch_model_for_subagent_with_receipt,
+};
 pub(in crate::runtime) use projection::CursorSweepIngestOutcome;
 pub use projection::{
     CursorTranscriptIngestStats, try_ingest_cursor_project_sweep_capped,
@@ -93,52 +97,12 @@ fn cursor_observation_context(
     }
 }
 
-/// Memoizes parent-transcript dispatch-model lookups per parent transcript
-/// and agent id. A dispatch record never changes once written, so a found
-/// model holds for every later incremental batch of the same subagent
-/// transcript; misses stay uncached because the parent transcript may simply
-/// not have recorded the dispatch yet.
-#[derive(Default)]
-struct DispatchModelCache {
-    models: Mutex<HashMap<(PathBuf, String), String>>,
-}
-
-impl DispatchModelCache {
-    fn parent_dispatch_model(
-        &self,
-        path: &Path,
-        parent_session_id: &str,
-        agent_id: &str,
-    ) -> Option<String> {
-        let parent_path = path
-            .parent()?
-            .parent()?
-            .join(format!("{parent_session_id}.jsonl"));
-        let key = (parent_path, agent_id.to_string());
-        if let Some(model) = self
-            .models
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-        {
-            return Some(model.clone());
-        }
-        let model = parent_dispatch_model_for_subagent(path, parent_session_id, agent_id)?;
-        self.models
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key, model.clone());
-        Some(model)
-    }
-}
-
 /// A Cursor hook event scoped to one transcript file.
 struct CursorEventSource {
     event: Value,
     transcript_path: PathBuf,
     include_subagents: bool,
     user_scope: bool,
-    dispatch_models: DispatchModelCache,
 }
 
 impl TranscriptSource for CursorEventSource {
@@ -173,7 +137,6 @@ impl TranscriptSource for CursorEventSource {
             prev,
             max_new_bytes,
             self.user_scope,
-            &self.dispatch_models,
         )
     }
 
@@ -197,6 +160,23 @@ struct CursorJsonlAdmitState {
     generation: u64,
     namespace_replacement: bool,
     carry: TimestampCarry,
+}
+
+fn cursor_admission_record_id(
+    native: &Value,
+    session_id: &str,
+    range: ObservationSourceRangeV1,
+    identity_collision_retry: bool,
+) -> Result<(ObservationId, bool), ObservationRecordParseErrorV1> {
+    let identity = cursor_observation_identity(session_id, native, range)?;
+    if identity_collision_retry {
+        return identity
+            .into_collision_disambiguation()
+            .map(|record_id| (record_id, false))
+            .ok_or(ObservationRecordParseErrorV1::NormalizationFailed);
+    }
+    let retry_eligible = identity.collision_disambiguation().is_some();
+    Ok((identity.into_primary(), retry_eligible))
 }
 
 // Cursor JSONL admission chokepoint: the whole per-file admission future is
@@ -236,7 +216,13 @@ fn admit_cursor_jsonl_observations<'a>(
             "sessions.hosts.cursor.dispatch_model_blocking",
             run_blocking_transcript_section(|| {
                 subagent.as_ref().and_then(|(_, agent_id)| {
-                    parent_dispatch_model_for_subagent(path, parent_session_id, agent_id)
+                    let (model, receipt) = parent_dispatch_model_for_subagent_with_receipt(
+                        path,
+                        parent_session_id,
+                        agent_id,
+                    );
+                    record_dispatch_scan_gauges(receipt);
+                    model
                 })
             })
         );
@@ -247,8 +233,9 @@ fn admit_cursor_jsonl_observations<'a>(
                 namespace_replacement: scan.replacement_rescan,
                 carry: TimestampCarry::new(i64::try_from(scan.mtime).ok()),
             },
-            |state, bytes, range, source_offset, _prepared, _hints| {
+            |state, bytes, range, source_offset, _prepared, hints| {
                 let mut stable_record_id = None;
+                let mut identity_collision_retry = false;
                 let mut unsupported_record = false;
                 let parsed = parse_normalized_observation_record_v1(
                     bytes,
@@ -259,9 +246,12 @@ fn admit_cursor_jsonl_observations<'a>(
                             unsupported_record = true;
                             return Err(ObservationRecordParseErrorV1::NormalizationFailed);
                         }
-                        let record_id =
-                            observation_native_record_id("cursor", native_session_id, &native)
-                                .map_err(|_| ObservationRecordParseErrorV1::NormalizationFailed)?;
+                        let (record_id, retry_eligible) = cursor_admission_record_id(
+                            &native,
+                            native_session_id,
+                            range,
+                            hints.identity_collision_retry,
+                        )?;
                         let message_id = cursor_projected_message_id(
                             &native,
                             native_session_id,
@@ -292,16 +282,25 @@ fn admit_cursor_jsonl_observations<'a>(
                             parent_agent_id,
                         )?;
                         stable_record_id = Some(record_id);
+                        identity_collision_retry = retry_eligible;
                         Ok(envelope)
                     },
                 );
                 match parsed {
-                    Ok(parsed) => Ok(JsonlFrameAdmission::durable(
-                        parsed,
-                        stable_record_id.ok_or(TranscriptIngestError::InvalidFrameState {
-                            provider: "cursor",
-                        })?,
-                    )),
+                    Ok(parsed) => {
+                        let stable_record_id =
+                            stable_record_id.ok_or(TranscriptIngestError::InvalidFrameState {
+                                provider: "cursor",
+                            })?;
+                        Ok(if identity_collision_retry {
+                            JsonlFrameAdmission::durable_with_identity_collision_retry(
+                                parsed,
+                                stable_record_id,
+                            )
+                        } else {
+                            JsonlFrameAdmission::durable(parsed, stable_record_id)
+                        })
+                    }
                     Err(_) => Ok(JsonlFrameAdmission::non_durable(if unsupported_record {
                         ObservationCoverageReason::UnsupportedFact
                     } else {
@@ -369,7 +368,6 @@ fn parse_cursor_jsonl(
     prev: StoredCursor,
     max_new_bytes: Option<u64>,
     user_scope: bool,
-    dispatch_models: &DispatchModelCache,
 ) -> Option<ParsedTranscript> {
     let new = stream_new_jsonl(path, prev, max_new_bytes)?;
     // A truncate-and-rewrite can reuse every byte offset from the previous
@@ -390,7 +388,10 @@ fn parse_cursor_jsonl(
         None
     } else {
         subagent.as_ref().and_then(|(_, agent_id)| {
-            dispatch_models.parent_dispatch_model(path, parent_session_id, agent_id)
+            let (model, receipt) =
+                parent_dispatch_model_for_subagent_with_receipt(path, parent_session_id, agent_id);
+            record_dispatch_scan_gauges(receipt);
+            model
         })
     };
     let event_cwd = event_cwd(event);
@@ -567,7 +568,6 @@ pub async fn try_ingest_cursor_transcript_event_capped_with_admission(
         transcript_path,
         include_subagents: true,
         user_scope: false,
-        dispatch_models: DispatchModelCache::default(),
     };
     let scope = ObservationScopeV1::Project { project_id };
     let parent_session_id = event_session_id(&source.event, &source.transcript_path);
@@ -712,7 +712,6 @@ pub async fn try_ingest_cursor_user_transcript_event_capped_with_admission(
         transcript_path,
         include_subagents: true,
         user_scope: true,
-        dispatch_models: DispatchModelCache::default(),
     };
     let scope = ObservationScopeV1::Profile;
     let parent_session_id = event_session_id(&source.event, &source.transcript_path);
@@ -805,6 +804,7 @@ pub(in crate::runtime) async fn try_ingest_cursor_user_sweep_capped_with_session
     .await
 }
 
+#[hotpath::measure(label = "sessions.hosts.cursor.sweep_admit", future = true)]
 async fn admit_cursor_sweep_observations_with_session_ids(
     source: &CursorSweepSource,
     project_root: &Path,
@@ -945,7 +945,6 @@ pub struct CursorSweepSource {
     /// one of these are skipped so the two Cursor sources never double-ingest.
     skip_session_ids: std::collections::HashSet<String>,
     user_registered_slugs: Option<std::collections::HashSet<String>>,
-    dispatch_models: DispatchModelCache,
 }
 
 impl CursorSweepSource {
@@ -962,7 +961,6 @@ impl CursorSweepSource {
             cursor_projects_dir: home.join(".cursor").join("projects"),
             skip_session_ids: std::collections::HashSet::new(),
             user_registered_slugs: None,
-            dispatch_models: DispatchModelCache::default(),
         }
     }
 
@@ -991,6 +989,7 @@ impl TranscriptSource for CursorSweepSource {
         "cursor"
     }
 
+    #[hotpath::measure(label = "sessions.hosts.cursor.sweep_discover")]
     fn transcript_paths(&self, project_root: &Path) -> Vec<PathBuf> {
         if let Some(registered_slugs) = &self.user_registered_slugs {
             let Ok(entries) = std::fs::read_dir(&self.cursor_projects_dir) else {
@@ -1027,7 +1026,7 @@ impl TranscriptSource for CursorSweepSource {
                 remaining_bytes = remaining_bytes.saturating_sub(report.bytes_charged);
                 paths.extend(report.paths);
             }
-            return paths;
+            return select_cursor_session_authorities(paths);
         }
         let Some(slug) = cursor_project_slug(project_root) else {
             return Vec::new();
@@ -1117,7 +1116,6 @@ impl TranscriptSource for CursorSweepSource {
             prev,
             max_new_bytes,
             user_scope,
-            &self.dispatch_models,
         )
     }
 
@@ -1132,6 +1130,45 @@ impl TranscriptSource for CursorSweepSource {
             self.parse_new(path, prev, project_root, max_new_bytes)
         })
     }
+}
+
+fn select_cursor_session_authorities(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut authorities = std::collections::BTreeMap::<String, PathBuf>::new();
+    for path in paths {
+        let Some(session_id) = path
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|session_id| !session_id.is_empty())
+        else {
+            continue;
+        };
+        match authorities.entry(session_id.to_owned()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(path);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry)
+                if cursor_transcript_authority_rank(&path)
+                    > cursor_transcript_authority_rank(entry.get()) =>
+            {
+                entry.insert(path);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    authorities.into_values().collect()
+}
+
+fn cursor_transcript_authority_rank(path: &Path) -> (bool, std::time::SystemTime, u64, &Path) {
+    let metadata = std::fs::metadata(path).ok();
+    (
+        is_subagent_transcript(path),
+        metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        metadata.as_ref().map_or(0, std::fs::Metadata::len),
+        path,
+    )
 }
 
 /// Synthesizes the minimal hook-shaped event used by startup sweeps so their
@@ -1290,84 +1327,6 @@ fn cursor_subagent_identity(path: &Path, parent_session_id: &str) -> Option<(Str
         .filter(|id| !id.is_empty())?
         .to_string();
     Some((session_id.clone(), session_id))
-}
-
-fn parent_dispatch_model_for_subagent(
-    path: &Path,
-    parent_session_id: &str,
-    agent_id: &str,
-) -> Option<String> {
-    let parent_dir = path.parent()?.parent()?;
-    let candidates = [
-        parent_dir.join(format!("{parent_session_id}.jsonl")),
-        parent_dir.with_extension("jsonl"),
-    ];
-    for candidate in candidates {
-        if let Some(model) = dispatch_model_for_agent(&candidate, agent_id) {
-            return Some(model);
-        }
-    }
-    None
-}
-
-fn dispatch_model_for_agent(path: &Path, agent_id: &str) -> Option<String> {
-    let file = File::open(path).ok()?;
-    let mut frames = RawJsonlFrameReader::new(BufReader::new(file), MAX_JSONL_RECORD_BYTES);
-    loop {
-        let frame = frames.next_frame().ok()?;
-        let record = match frame {
-            RawJsonlFrame::Eof => return None,
-            RawJsonlFrame::Complete { .. } | RawJsonlFrame::Partial { .. } => {
-                let Ok(record) = serde_json::from_slice::<Value>(frames.record()) else {
-                    continue;
-                };
-                record
-            }
-            RawJsonlFrame::Oversized { .. } | RawJsonlFrame::BudgetExhausted { .. } => {
-                continue;
-            }
-        };
-        if frames.record().is_empty() {
-            continue;
-        }
-        let message = record.get("message").unwrap_or(&record);
-        let content = message.get("content").unwrap_or(message);
-        let Some(items) = content.as_array() else {
-            continue;
-        };
-        for item in items {
-            let Some(name) = item.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            if is_subagent_dispatch_tool(name)
-                && dispatch_targets_agent(item, agent_id)
-                && let Some(model) = cursor_dispatch_model(item)
-            {
-                return Some(model);
-            }
-        }
-    }
-}
-
-fn dispatch_targets_agent(item: &Value, agent_id: &str) -> bool {
-    let input = item.get("input").unwrap_or(item);
-    [
-        "agent_id",
-        "agentId",
-        "subagent_id",
-        "subagentId",
-        "session_id",
-        "sessionId",
-        "id",
-    ]
-    .into_iter()
-    .any(|key| {
-        input
-            .get(key)
-            .or_else(|| item.get(key))
-            .and_then(Value::as_str)
-            == Some(agent_id)
-    })
 }
 
 /// Per-line timestamp derivation for Cursor transcripts, which carry no

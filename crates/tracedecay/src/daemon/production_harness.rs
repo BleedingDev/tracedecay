@@ -7,6 +7,11 @@
 use std::future::Future;
 #[cfg(any(test, feature = "test-transport"))]
 use std::pin::Pin;
+#[cfg(any(test, feature = "test-transport"))]
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 #[cfg(all(unix, any(test, feature = "test-transport")))]
 use super::bootstrap::set_owner_only_permissions;
@@ -97,6 +102,156 @@ fn composed_profile_root(isolation_root: &Path) -> PathBuf {
 #[cfg(any(test, feature = "test-transport"))]
 type ProductionHarnessOpenFuture =
     Pin<Box<dyn Future<Output = Result<ProductionProjectCompositionHarnessV1>> + Send>>;
+
+/// Harness compositions share one process-wide Rayon pool and FIFO background
+/// CPU budget. On the loaded 96-core integration host, four concurrent wide
+/// fixtures published at p95 1.436 s (9.83 s for the complete group), while
+/// the five-fixture N=8/N=16 runs published at p95 2.302/1.997 s. Dividing the
+/// available or installed worker width by 24 therefore admits only the
+/// measured four-wide load before worker-plan installation and preserves more
+/// than 2x headroom under the unchanged 20 s per-composition wait.
+#[cfg(any(test, feature = "test-transport"))]
+const PRODUCTION_COMPOSITION_CPU_DIVISOR: usize = 24;
+
+#[cfg(any(test, feature = "test-transport"))]
+struct ProductionCompositionAdmissionGateV1 {
+    semaphore: tokio::sync::Semaphore,
+    capacity: usize,
+    admitted: AtomicUsize,
+    waiting: AtomicUsize,
+    #[cfg(test)]
+    high_water_mark: AtomicUsize,
+}
+
+#[cfg(any(test, feature = "test-transport"))]
+impl ProductionCompositionAdmissionGateV1 {
+    fn new(capacity: usize) -> Self {
+        Self {
+            semaphore: tokio::sync::Semaphore::new(capacity),
+            capacity,
+            admitted: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
+            #[cfg(test)]
+            high_water_mark: AtomicUsize::new(0),
+        }
+    }
+
+    async fn acquire(&'static self) -> Result<ProductionCompositionAdmissionPermitV1> {
+        let waiting = ProductionCompositionWaitingV1::new(self);
+        let semaphore =
+            self.semaphore
+                .acquire()
+                .await
+                .map_err(|error| TraceDecayError::Config {
+                    message: format!(
+                        "production-composition admission gate is unavailable: {error}"
+                    ),
+                })?;
+        drop(waiting);
+        let admitted = ProductionCompositionAdmittedV1::new(self);
+        Ok(ProductionCompositionAdmissionPermitV1 {
+            _admitted: admitted,
+            _semaphore: semaphore,
+        })
+    }
+
+    fn snapshot(&self) -> ProductionCompositionAdmissionSnapshotV1 {
+        ProductionCompositionAdmissionSnapshotV1 {
+            capacity: self.capacity,
+            admitted: self.admitted.load(Ordering::Acquire),
+            waiting: self.waiting.load(Ordering::Acquire),
+        }
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    #[cfg(test)]
+    fn high_water_mark(&self) -> usize {
+        self.high_water_mark.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(any(test, feature = "test-transport"))]
+struct ProductionCompositionWaitingV1 {
+    gate: &'static ProductionCompositionAdmissionGateV1,
+}
+
+#[cfg(any(test, feature = "test-transport"))]
+impl ProductionCompositionWaitingV1 {
+    fn new(gate: &'static ProductionCompositionAdmissionGateV1) -> Self {
+        gate.waiting.fetch_add(1, Ordering::AcqRel);
+        Self { gate }
+    }
+}
+
+#[cfg(any(test, feature = "test-transport"))]
+impl Drop for ProductionCompositionWaitingV1 {
+    fn drop(&mut self) {
+        self.gate.waiting.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(any(test, feature = "test-transport"))]
+struct ProductionCompositionAdmittedV1 {
+    gate: &'static ProductionCompositionAdmissionGateV1,
+}
+
+#[cfg(any(test, feature = "test-transport"))]
+impl ProductionCompositionAdmittedV1 {
+    fn new(gate: &'static ProductionCompositionAdmissionGateV1) -> Self {
+        let admitted = gate.admitted.fetch_add(1, Ordering::AcqRel) + 1;
+        #[cfg(test)]
+        gate.high_water_mark.fetch_max(admitted, Ordering::AcqRel);
+        #[cfg(not(test))]
+        let _ = admitted;
+        Self { gate }
+    }
+}
+
+#[cfg(any(test, feature = "test-transport"))]
+impl Drop for ProductionCompositionAdmittedV1 {
+    fn drop(&mut self) {
+        self.gate.admitted.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Field order is the drop order: the admitted counter must retire before
+/// the semaphore permit is returned, or a waiter can be admitted while the
+/// previous composition is still counted and the high-water mark overshoots
+/// the capacity by one.
+#[cfg(any(test, feature = "test-transport"))]
+struct ProductionCompositionAdmissionPermitV1 {
+    _admitted: ProductionCompositionAdmittedV1,
+    _semaphore: tokio::sync::SemaphorePermit<'static>,
+}
+
+#[cfg(any(test, feature = "test-transport"))]
+#[derive(Clone, Copy)]
+struct ProductionCompositionAdmissionSnapshotV1 {
+    capacity: usize,
+    admitted: usize,
+    waiting: usize,
+}
+
+#[cfg(any(test, feature = "test-transport"))]
+fn production_composition_admission_capacity() -> usize {
+    let worker_width = tracedecay_code_index::parallelism::installed_worker_status().map_or_else(
+        || std::thread::available_parallelism().map_or(1, usize::from),
+        |status| usize::from(status.effective_workers),
+    );
+    (worker_width / PRODUCTION_COMPOSITION_CPU_DIVISOR).max(1)
+}
+
+#[cfg(any(test, feature = "test-transport"))]
+fn production_composition_admission_gate() -> &'static ProductionCompositionAdmissionGateV1 {
+    static GATE: OnceLock<ProductionCompositionAdmissionGateV1> = OnceLock::new();
+    GATE.get_or_init(|| {
+        ProductionCompositionAdmissionGateV1::new(production_composition_admission_capacity())
+    })
+}
 
 #[cfg(any(test, feature = "test-transport"))]
 struct IsolatedProductionCompositionRoots {
@@ -310,6 +465,7 @@ async fn mount_production_composition_projects(
     project_roots: Vec<PathBuf>,
     profile_root: &Path,
     scope_prefix: Option<String>,
+    wait_for_code_index: bool,
     #[cfg(all(test, feature = "memory-provider-host"))] native_port_interposition: Option<
         NativeApplicationPortInterpositionV1,
     >,
@@ -328,6 +484,7 @@ async fn mount_production_composition_projects(
                 &client_identity,
                 scope_prefix.as_deref(),
                 index,
+                wait_for_code_index,
                 #[cfg(all(test, feature = "memory-provider-host"))]
                 native_port_interposition.clone(),
             ))
@@ -345,6 +502,7 @@ async fn mount_one_production_composition_project(
     client_identity: &DaemonClientIdentity,
     scope_prefix: Option<&str>,
     index: usize,
+    wait_for_code_index: bool,
     #[cfg(all(test, feature = "memory-provider-host"))] native_port_interposition: Option<
         NativeApplicationPortInterpositionV1,
     >,
@@ -418,23 +576,25 @@ async fn mount_one_production_composition_project(
             })
         })
         .await?;
-    let code_search_scope = {
-        let graph = composition.server.cg().await;
-        let target = graph.configuration_runtime().configuration_target();
-        tracedecay_code_index_runtime::resolved_scope_for_project(
-            graph.project_root(),
-            &target.project_id,
-        )
-        .map_err(|error| TraceDecayError::Config {
-            message: format!("production-composition code-index scope is invalid: {error:?}"),
-        })?
-    };
-    Box::pin(wait_for_production_composition_code_index(
-        &stores.invocation,
-        &composition.canonical_project_path,
-        &code_search_scope,
-    ))
-    .await?;
+    if wait_for_code_index {
+        let code_search_scope = {
+            let graph = composition.server.cg().await;
+            let target = graph.configuration_runtime().configuration_target();
+            tracedecay_code_index_runtime::resolved_scope_for_project(
+                graph.project_root(),
+                &target.project_id,
+            )
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("production-composition code-index scope is invalid: {error:?}"),
+            })?
+        };
+        Box::pin(wait_for_production_composition_code_index(
+            &stores.invocation,
+            &composition.canonical_project_path,
+            &code_search_scope,
+        ))
+        .await?;
+    }
     let semantic_auto_download_enabled =
         composition
             .semantic_auto_download_enabled
@@ -474,6 +634,7 @@ impl ProductionProjectCompositionHarnessV1 {
             live_profile_root,
             None,
             false,
+            true,
             #[cfg(all(test, feature = "memory-provider-host"))]
             None,
         )
@@ -501,7 +662,28 @@ impl ProductionProjectCompositionHarnessV1 {
             live_profile_root,
             None,
             false,
+            true,
             Some(interposition),
+        )
+    }
+
+    /// Opens the production composition without making unrelated code-index
+    /// readiness a precondition for session-only lifecycle journeys.
+    #[doc(hidden)]
+    pub fn open_for_session_retrieval(
+        isolation_root: impl AsRef<Path>,
+        project_roots: impl IntoIterator<Item = PathBuf>,
+    ) -> ProductionHarnessOpenFuture {
+        let live_profile_root = crate::config::user_data_dir().filter(|path| path.exists());
+        Self::open_with_live_profile_root(
+            isolation_root.as_ref().to_path_buf(),
+            project_roots.into_iter().collect(),
+            live_profile_root,
+            None,
+            false,
+            false,
+            #[cfg(all(test, feature = "memory-provider-host"))]
+            None,
         )
     }
 
@@ -517,6 +699,7 @@ impl ProductionProjectCompositionHarnessV1 {
             live_profile_root,
             Some(scope_prefix.into()),
             false,
+            true,
             #[cfg(all(test, feature = "memory-provider-host"))]
             None,
         )
@@ -528,16 +711,21 @@ impl ProductionProjectCompositionHarnessV1 {
         live_profile_root: Option<PathBuf>,
         scope_prefix: Option<String>,
         long_lived_session_maintenance_for_test: bool,
+        wait_for_code_index: bool,
         #[cfg(all(test, feature = "memory-provider-host"))] native_port_interposition: Option<
             NativeApplicationPortInterpositionV1,
         >,
     ) -> ProductionHarnessOpenFuture {
-        // Embedded test compositions never pass through the binary's
-        // product-runtime registration, so the canonical fixture is this
-        // composition's provider; without it daemon bootstrap and version
-        // reporting answer the typed missing-provider state.
-        crate::product_runtime::register_fixture_product_runtime();
+        // Embedded compositions skip the binary logging bootstrap; surface
+        // activation retry/refusal diagnostics in the product journey.
+        install_stderr_tracing(StderrTracingDefault::Warn);
         Box::pin(async move {
+            let _composition_admission = production_composition_admission_gate().acquire().await?;
+            // Embedded test compositions never pass through the binary's
+            // product-runtime registration, so the canonical fixture is this
+            // composition's provider; without it daemon bootstrap and version
+            // reporting answer the typed missing-provider state.
+            crate::product_runtime::register_fixture_product_runtime();
             let isolated = isolate_production_composition_roots(
                 isolation_root,
                 project_roots,
@@ -556,6 +744,7 @@ impl ProductionProjectCompositionHarnessV1 {
                     isolated.project_roots,
                     &isolated.profile_root,
                     scope_prefix,
+                    wait_for_code_index,
                     #[cfg(all(test, feature = "memory-provider-host"))]
                     native_port_interposition,
                 ))
@@ -589,6 +778,7 @@ impl ProductionProjectCompositionHarnessV1 {
             Some(live_profile_root),
             None,
             false,
+            true,
             #[cfg(all(test, feature = "memory-provider-host"))]
             None,
         )
@@ -604,6 +794,7 @@ impl ProductionProjectCompositionHarnessV1 {
             project_roots.into_iter().collect(),
             None,
             None,
+            true,
             true,
             #[cfg(all(test, feature = "memory-provider-host"))]
             None,
@@ -918,7 +1109,8 @@ async fn wait_for_production_composition_code_index(
     project_root: &Path,
     scope: &tracedecay_application::ResolvedScope,
 ) -> Result<Option<code_index_scheduler::LatestCompleteCodeIndexV1>> {
-    timeout(Duration::from_secs(20), async {
+    let wait_started = Instant::now();
+    let publication = timeout(Duration::from_secs(20), async {
         loop {
             // Scope-aware readiness is the authenticated demand boundary that
             // starts the registered route-local activation owner. The root-only
@@ -945,13 +1137,51 @@ async fn wait_for_production_composition_code_index(
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .map_err(|_| TraceDecayError::Config {
-        message: format!(
-            "production-composition code index did not publish for '{}'",
-            project_root.display()
-        ),
-    })
+    .await;
+    match publication {
+        Ok(latest) => Ok(latest),
+        Err(_) => {
+            let elapsed_wait = wait_started.elapsed();
+            let admission = production_composition_admission_gate().snapshot();
+            let scheduler_state = invocation
+                .code_index_schedulers
+                .dashboard_freshness(project_root)
+                .await;
+            // The scope gate is the usual reason a Ready generation is never
+            // admitted: report both sides of the identity comparison so a
+            // mismatch is diagnosable from the failure message alone.
+            let mounted_identity = invocation
+                .code_index_schedulers
+                .latest_complete_ready(project_root)
+                .await
+                .map(|latest| {
+                    let generation = latest.generation();
+                    format!(
+                        "project_id={:?}, repository={:?}, worktree={:?}",
+                        generation.manifest().project_id,
+                        generation.snapshot().repository,
+                        generation.snapshot().worktree,
+                    )
+                });
+            Err(TraceDecayError::Config {
+                message: format!(
+                    "production-composition code index did not publish for '{}' \
+                     after {} ms; composition gate capacity={}, admitted={}, waiting={}; \
+                     scheduler_state={scheduler_state:?}; \
+                     awaited_scope=project_id={:?}, repository={:?}, worktree={:?}; \
+                     mounted_generation={mounted_identity:?}",
+                    project_root.display(),
+                    elapsed_wait.as_millis(),
+                    admission.capacity,
+                    admission.admitted,
+                    admission.waiting,
+                    scope.project_id,
+                    scope.repository_id,
+                    scope.worktree_id,
+                ),
+            })
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-transport"))]
@@ -974,6 +1204,10 @@ async fn shutdown_production_project_harness(mut resources: ProductionProjectHar
     resources
         .store_administration
         .join_project_server_retirements()
+        .await;
+    resources
+        .http_application_registry
+        .drain_project_routes_for_shutdown()
         .await;
     let servers = hotpath::future!(
         detach_project_servers(&resources.store_administration),
@@ -1057,10 +1291,69 @@ async fn shutdown_production_project_harness(mut resources: ProductionProjectHar
 #[cfg(test)]
 mod code_index_activation_test {
     use std::process::Command;
+    use std::sync::Arc;
 
     use tempfile::TempDir;
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[hotpath::skip]
+    async fn concurrent_composition_opens_fill_but_never_exceed_admission_capacity() {
+        let gate = production_composition_admission_gate();
+        let open_count = gate.capacity().saturating_add(2);
+        let start = Arc::new(tokio::sync::Barrier::new(open_count.saturating_add(1)));
+        let mut openings = tokio::task::JoinSet::new();
+
+        for ordinal in 0..open_count {
+            let isolation = TempDir::new().expect("production harness isolation");
+            let project = isolation.path().join(format!("project-{ordinal}"));
+            std::fs::create_dir_all(&project).expect("project root");
+            std::fs::write(project.join("lib.rs"), "pub fn indexed_symbol() {}\n")
+                .expect("project source");
+            for arguments in [
+                vec!["init", "-q"],
+                vec!["add", "."],
+                vec![
+                    "-c",
+                    "user.name=TraceDecay Test",
+                    "-c",
+                    "user.email=tracedecay@example.invalid",
+                    "commit",
+                    "-qm",
+                    "seed project",
+                ],
+            ] {
+                let status = Command::new(
+                    tracedecay_runtime_core::git::try_git_program()
+                        .expect("absolute git executable should resolve"),
+                )
+                .args(&arguments)
+                .current_dir(&project)
+                .status()
+                .expect("git fixture command");
+                assert!(status.success(), "git {arguments:?}");
+            }
+
+            let start = Arc::clone(&start);
+            openings.spawn(async move {
+                start.wait().await;
+                let harness =
+                    ProductionProjectCompositionHarnessV1::open(isolation.path(), [project])
+                        .await
+                        .expect("admitted production composition opens");
+                harness.shutdown().await;
+                isolation
+            });
+        }
+
+        start.wait().await;
+        while let Some(opened) = openings.join_next().await {
+            opened.expect("production composition task");
+        }
+
+        assert_eq!(gate.high_water_mark(), gate.capacity());
+    }
 
     #[tokio::test]
     #[hotpath::skip]

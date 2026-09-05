@@ -52,6 +52,7 @@ pub use unregistered_page::{
     DEFAULT_UNREGISTERED_STORE_PAGE_LIMIT, UnregisteredStoreSweepReport,
     UnregisteredStoreSweepRequestV1, sweep_unregistered_store_page,
 };
+pub(super) use unregistered_page::{ProjectDirectoryWorkV1, read_project_directory_page};
 
 /// One profile-sharded store observed on disk, paired with the registry
 /// identity that points at it. This is the pure input to classification so the

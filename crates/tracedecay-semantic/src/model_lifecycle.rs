@@ -5,6 +5,7 @@
 //! selection; strict semantic demand may queue acquisition of the immutable
 //! revision in the background. The request never waits for model bytes and no
 //! ambient hub or cache becomes serving authority.
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -28,13 +29,12 @@ use tracedecay_semantic_contracts::{
     Sha256DigestHex, TruncationPolicyV1, UpstreamSourceV1,
 };
 
-#[cfg(feature = "semantic-fastembed")]
+#[cfg(any(feature = "semantic-fastembed", feature = "semantic-model2vec"))]
 use hf_hub::{Cache, Repo, RepoType, api::sync::ApiBuilder};
 
 use super::artifact_store::{
     ArtifactImportErrorV1, ArtifactInventoryRecordV1, ArtifactLeaseKindV1, ArtifactLeaseV1,
-    ConfiguredHttpsArtifactSourceV1, ExplicitHttpsArtifactTransportV1,
-    FASTEMBED_RUNTIME_BUILD_REVISION_V1, FASTEMBED_RUNTIME_FAMILY_V1, GcReceiptV1,
+    ConfiguredHttpsArtifactSourceV1, ExplicitHttpsArtifactTransportV1, GcReceiptV1,
     ModelArtifactStore, RetentionPolicyV1, RuntimeEnvironmentV1,
 };
 use super::model_catalog::{
@@ -86,6 +86,8 @@ pub enum ModelLifecycleErrorV1 {
     DownloadFailedWithReason(String),
     #[error("semantic model verification failed")]
     VerificationFailed,
+    #[error("semantic reranker warm-up is unavailable")]
+    RerankerUnavailable,
     #[error("semantic model install failed")]
     InstallFailed,
     #[error("semantic model acquisition worker failed while joining")]
@@ -248,7 +250,9 @@ impl ModelMemberSourceV1 for HfHubModelMemberSourceV1 {
     }
 }
 
-#[cfg(feature = "semantic-fastembed")]
+// Acquisition is backend-independent: any compiled embedding runtime needs
+// the daemon-owned hub source, so it compiles with either backend feature.
+#[cfg(any(feature = "semantic-fastembed", feature = "semantic-model2vec"))]
 fn fetch_hf_hub_member(
     cache_dir: &Path,
     endpoint: Option<&str>,
@@ -325,7 +329,7 @@ fn hf_hub_offline() -> bool {
         .is_ok_and(|value| !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "FALSE"))
 }
 
-#[cfg(not(feature = "semantic-fastembed"))]
+#[cfg(not(any(feature = "semantic-fastembed", feature = "semantic-model2vec")))]
 fn fetch_hf_hub_member(
     cache_dir: &Path,
     endpoint: Option<&str>,

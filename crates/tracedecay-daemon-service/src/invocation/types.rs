@@ -334,6 +334,24 @@ impl BoundedHookOrchestratorV1 {
                 },
                 outcome = &mut work_future => Some(outcome),
             };
+            if outcome.is_none()
+                && operation
+                    .superseded
+                    .load(std::sync::atomic::Ordering::Acquire)
+                && !cancellation.is_cancelled()
+            {
+                // Supersession is not owner retirement: the incumbent's work
+                // already started, its receipt terminal is owed, and the
+                // successor inherits this permit. Both must follow the real
+                // end of that work — including nested blocking work the
+                // future cannot cancel — so join it here instead of dropping
+                // it. Owner retirement still preempts the join.
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {}
+                    _ = &mut work_future => {}
+                }
+            }
             let emit_terminal = match outcome {
                 Some(HookOrchestrationWorkOutcomeV1::Completed) => true,
                 Some(HookOrchestrationWorkOutcomeV1::RetryableFailure) => false,
@@ -622,6 +640,37 @@ impl FeedbackCycleRuntimePort for SwitchableFeedbackCycleRuntimeV1 {
     }
 }
 
+/// Project-local wakeup sequence for recovery work created by durable Work
+/// writes. The sender is retained by [`RegisteredWorkRuntime`]; each recovery
+/// owner receives an independent watch cursor so one scan cannot consume
+/// another owner's notification.
+///
+/// The daemon bumps this sequence after settled blocked-interval receipts,
+/// workflow fan-out census records, and workflow effect terminals are durable.
+/// Reads never bump it.
+#[derive(Clone)]
+pub(crate) struct WorkDurableWriteSignalV1 {
+    sender: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for WorkDurableWriteSignalV1 {
+    fn default() -> Self {
+        let (sender, _) = tokio::sync::watch::channel(0);
+        Self { sender }
+    }
+}
+
+impl WorkDurableWriteSignalV1 {
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.sender.subscribe()
+    }
+
+    pub(crate) fn bump(&self) {
+        self.sender
+            .send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+    }
+}
+
 /// Retained daemon state for the typed Work application operations.
 #[derive(Clone)]
 pub struct RegisteredWorkRuntime {
@@ -640,6 +689,7 @@ pub struct RegisteredWorkRuntime {
     /// Canonical Work evidence retrieval adapter with per-request
     /// evaluated-profile resolution.
     pub(super) evidence_retrieval: Arc<dyn WorkEvidenceRetrievalPortV1>,
+    pub(super) durable_write_signal: WorkDurableWriteSignalV1,
     /// Project-owned bounded replay for receipts that closed outside a request
     /// response, such as terminal attempt compare-and-swaps.
     pub(super) blocked_interval_observation_recovery:
@@ -789,6 +839,7 @@ pub struct RegisteredConfigurationRuntime {
     pub(super) actor: ActorId,
     pub(super) grants: DaemonConfigurationGrantAuthority,
     pub(super) semantic_operation: Arc<OnceLock<Arc<ProductionSemanticConfigurationOperationV1>>>,
+    pub(super) semantic_activation_committed: Arc<Notify>,
     pub(super) semantic_evaluation_workers: Arc<
         tracedecay_code_index_runtime::semantic_evaluation::DaemonSemanticEvaluationWorkerOwnerV1,
     >,
@@ -1059,16 +1110,6 @@ pub struct AuthorizedDaemonLspWorkspace {
 
 impl DaemonLspInvocationOwner {
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn new(factory: Arc<DaemonLspSessionFactory>) -> Self {
-        Self::for_test_project(
-            factory,
-            UserProfileId::new("profile.test.lsp").expect("test LSP profile"),
-            ProjectId::new("project.test.lsp").expect("test LSP project"),
-            PathBuf::from("/test/lsp"),
-        )
-    }
-
-    #[cfg(any(test, feature = "test-helpers"))]
     pub fn for_test_project(
         factory: Arc<DaemonLspSessionFactory>,
         profile_id: UserProfileId,
@@ -1089,12 +1130,14 @@ impl DaemonLspInvocationOwner {
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
     pub fn with_scope_grant(mut self, scope_grant: CapabilityGrantSnapshot) -> Self {
         self.scope_grant = Some(scope_grant);
         self
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
     pub fn with_delivery_settlements(
         mut self,
         delivery_settlements: Arc<

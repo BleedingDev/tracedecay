@@ -626,6 +626,7 @@ async fn resume_git_evidence<S: GitCorrelationSessionStore>(
     }
 }
 
+#[hotpath::measure(label = "sessions.git_correlation.backfill.dry_run", future = true)]
 async fn dry_run_native_history(
     project_path: &std::path::Path,
     window_start: i64,

@@ -7,7 +7,7 @@ use std::pin::Pin;
 #[cfg(feature = "hotpath")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -55,7 +55,12 @@ mod retained_hook_tasks;
 mod terminal_tasks;
 
 use maintenance::RegisteredSchemaConvergenceMaintenance;
+#[cfg(any(test, feature = "test-helpers"))]
+use mounts::SessionGraphSettleTestGateState;
 use retained_hook_tasks::RetainedHookTasks;
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub use mounts::SessionGraphSettleTestGate;
 
 pub use profile_memory::open_user_memory_db;
 
@@ -307,6 +312,7 @@ impl RegisteredSessionOwnerV1 {
         let Some(relation_graph) = relation_graph else {
             return Err(self);
         };
+        self.database.detach_session_relation_graph();
         let SessionGraphOwnerV1 {
             graph,
             store_target,
@@ -333,6 +339,7 @@ impl RegisteredSessionOwnerV1 {
             return None;
         };
         let owner = owner.take()?;
+        self.database.detach_session_relation_graph();
         Some((
             owner.graph.binding().clone(),
             owner.graph.verified_locator().clone(),
@@ -357,6 +364,7 @@ impl ProjectRuntimeOwnerRegistryV1 {
         self.0.lock()
     }
 
+    #[hotpath::measure(label = "daemon.session_registry.list_ready_sessions")]
     fn ready_session_projects(&self) -> Result<Vec<ProjectId>> {
         let entries = self.lock().map_err(|_| {
             session_registry_error(
@@ -424,6 +432,47 @@ impl ProjectRuntimeOwnerRegistryV1 {
         }
     }
 
+    async fn wait_for_serving_session_graph(&self, project_id: &ProjectId) -> Result<()> {
+        self.wait_for_session_graph(project_id).await?;
+        let entries = self.lock().map_err(|_| {
+            session_registry_error(
+                "admit project session relation graph for serving",
+                "project runtime owner map lock is poisoned".to_owned(),
+            )
+        })?;
+        let Some(ProjectRuntimeOwnerStateV1::Ready(owners)) = entries.get(project_id) else {
+            return Err(TraceDecayError::project_route(
+                "project_session_graph_unavailable",
+                true,
+                "Project session runtime is not ready for retrieval serving",
+            ));
+        };
+        let Some(sessions) = owners.sessions.as_ref() else {
+            return Err(TraceDecayError::project_route(
+                "project_session_graph_unavailable",
+                true,
+                "Project session runtime has no relation graph owner",
+            ));
+        };
+        let attached = matches!(
+            &*sessions
+                .relation_graph
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SessionGraphAttachmentStateV1::Attached { owner: Some(_) }
+        );
+        if attached {
+            Ok(())
+        } else {
+            Err(TraceDecayError::project_route(
+                "project_session_graph_unavailable",
+                true,
+                sessions.graph_unavailable_reason(),
+            ))
+        }
+    }
+
+    #[hotpath::measure(label = "daemon.session_registry.reserve_session_replacement")]
     fn reserve_session_replacement(
         &self,
         project_id: &ProjectId,
@@ -482,6 +531,7 @@ impl ProjectRuntimeOwnerRegistryV1 {
         }))
     }
 
+    #[hotpath::measure(label = "daemon.session_registry.reserve_session_recovery")]
     fn reserve_session_recovery(
         &self,
         project_id: &ProjectId,
@@ -527,6 +577,7 @@ impl ProjectRuntimeOwnerRegistryV1 {
     /// Rebuilds the fail-closed post-restart recovery record. The durable
     /// quarantine receipt is written only after the old paired owners have
     /// closed; it never reconstructs or remounts that terminal owner.
+    #[hotpath::measure(label = "daemon.session_registry.reconstruct_terminal_recovery")]
     fn reconstruct_durable_terminal_recovery(
         &self,
         project_id: &ProjectId,
@@ -567,6 +618,7 @@ impl ProjectRuntimeOwnerRegistryV1 {
     }
 }
 
+#[hotpath::measure(label = "daemon.session_registry.bind_memory_graph")]
 fn bind_ready_project_memory_graph(
     owners: &ProjectRuntimeOwnerRegistryV1,
     project_id: &ProjectId,
@@ -1501,6 +1553,17 @@ impl ProjectSessionReplacementReservationV1 {
                 )
             })?;
         Ok(database)
+    }
+
+    fn detach_old_relation_graph(&self) -> Result<()> {
+        let session = self.sessions.as_ref().ok_or_else(|| {
+            session_registry_error(
+                "detach replacing project relation graph",
+                "project session replacement has no retained session owner".to_owned(),
+            )
+        })?;
+        session.database.detach_session_relation_graph();
+        Ok(())
     }
 
     fn graph_retirement_target(&self) -> Result<tracedecay_graph_db::GraphDbRetirementTarget> {
@@ -2710,6 +2773,7 @@ impl DaemonSessionRuntimeRegistryV1 {
             })
     }
 
+    #[hotpath::measure(label = "daemon.session_registry.admit_remote_node")]
     fn admit_remote_node_owner(
         &self,
         node_id: &BrainNodeId,
@@ -2758,6 +2822,7 @@ impl DaemonSessionRuntimeRegistryV1 {
         ))
     }
 
+    #[hotpath::measure(label = "daemon.session_registry.admit_project_runtime")]
     fn admit_project_runtime_owner(
         &self,
         project_id: &ProjectId,
@@ -2826,6 +2891,7 @@ impl DaemonSessionRuntimeRegistryV1 {
         )))
     }
 
+    #[hotpath::measure(label = "daemon.session_registry.extend_project_runtime")]
     fn extend_project_runtime_owner(
         &self,
         project_id: &ProjectId,
@@ -2875,6 +2941,7 @@ impl DaemonSessionRuntimeRegistryV1 {
         )))
     }
 
+    #[hotpath::measure(label = "daemon.session_registry.reserve_runtime_retirement")]
     fn reserve_project_runtime_retirement(
         &self,
         project_id: &ProjectId,
@@ -2954,17 +3021,16 @@ pub struct DaemonSessionRuntimeRegistryV1 {
         >,
     >,
     project_owners: ProjectRuntimeOwnerRegistryV1,
-    /// One set of graph-publication locks per code shard. The seat pass and
-    /// the background reconcile can both activate the same sealed generation,
-    /// and unserialized they race the graph database into Conflicts that burn
-    /// the whole activation window: the flight table dedupes same-key
-    /// publishers while the serving gate covers only the short
-    /// storage-ordered slices. The locks live here because the retained code
-    /// graph runtime itself is minted fresh per activation call.
+    /// One set of graph-publication locks per project publication shard.
+    /// Every worktree/branch scope of a project stages into the one shared
+    /// staging store, so corpus-sized builds must serialize on the project
+    /// shard rather than on `code_shard`. Entries are weak: a cell lives only
+    /// while a retained runtime holds it. The locks live here because the
+    /// retained code graph runtime itself is minted fresh per activation call.
     code_graph_publication_gates: StdMutex<
         BTreeMap<
             tracedecay_store::StoreShardIdV1,
-            Arc<code_graph::CodeGraphShardPublicationLocksV1>,
+            Weak<code_graph::CodeGraphShardPublicationLocksV1>,
         >,
     >,
     registered_schema_convergence: RegisteredSchemaConvergenceMaintenance,
@@ -2976,6 +3042,10 @@ pub struct DaemonSessionRuntimeRegistryV1 {
     /// session maintenance (background historical schema convergence) for the
     /// shards it attaches. Short-lived CLI/hook processes stay `false`.
     long_lived_session_maintenance: bool,
+    /// Test-only hold applied at the tail of each session relation-graph open
+    /// task, after settlement is published and announced.
+    #[cfg(any(test, feature = "test-helpers"))]
+    session_graph_settle_gate: StdMutex<Option<Arc<SessionGraphSettleTestGateState>>>,
 }
 
 impl DaemonSessionRuntimeRegistryV1 {
@@ -3039,6 +3109,21 @@ impl DaemonSessionRuntimeRegistryV1 {
     #[hotpath::measure(label = "daemon.session_registry.settle_project_graph", future = true)]
     pub async fn settle_project_session_graph(&self, project_id: &ProjectId) -> Result<()> {
         self.project_owners.wait_for_session_graph(project_id).await
+    }
+
+    /// Waits for the project's background relation-graph open and requires an
+    /// attached owner before a retrieval-capable surface is published.
+    #[hotpath::measure(
+        label = "daemon.session_registry.settle_project_graph_for_serving",
+        future = true
+    )]
+    pub async fn settle_project_session_graph_for_serving(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<()> {
+        self.project_owners
+            .wait_for_serving_session_graph(project_id)
+            .await
     }
 
     pub fn install_session_sync_service(
@@ -3122,7 +3207,7 @@ impl DaemonSessionRuntimeRegistryV1 {
         })
     }
 
-    #[hotpath::skip]
+    #[hotpath::measure(label = "daemon.session_registry.retire_session_sync", future = true)]
     async fn retire_project_session_sync(&self, project_id: &ProjectId) -> Result<()> {
         self.active_session_sync_service("retire project session sync")?
             .retire_project(self.identity.profile_id(), project_id)
@@ -3131,7 +3216,7 @@ impl DaemonSessionRuntimeRegistryV1 {
             .map_err(|error| session_registry_error("retire project session sync", error))
     }
 
-    #[hotpath::skip]
+    #[hotpath::measure(label = "daemon.session_registry.rebind_session_sync", future = true)]
     async fn rebind_project_session_sync(
         &self,
         project_id: &ProjectId,
@@ -3174,6 +3259,7 @@ impl ProfileRuntime for DaemonSessionRuntimeRegistryV1 {
     }
 }
 
+#[hotpath::measure(label = "daemon.session_registry.runtime_incarnation")]
 fn runtime_incarnation(identity: &LocalProfileIdentityAuthorityV1) -> Result<StoreIncarnationV1> {
     let process_run_id = tracedecay_runtime_core::runtime_identity::process_run_id();
     let daemon_generation =
@@ -3211,16 +3297,48 @@ pub fn process_runtime_generation(process_run_id: &str) -> Option<u64> {
     Some((raw & i64::MAX as u64).max(1))
 }
 
-async fn open_runtime(
-    registry: &StoreRuntimeRegistry,
-    resolver: &LocalStoreRuntimeResolverV1,
+struct StoreRuntimeOpenSpec {
     shard_id: StoreShardIdV1,
     incarnation: StoreIncarnationV1,
     profile_pin: Option<ProfileAuthorityPin>,
     database_authority: Option<DatabaseAuthority>,
     initialize_if_missing: bool,
     operation: &'static str,
+}
+
+impl StoreRuntimeOpenSpec {
+    fn new(
+        shard_id: StoreShardIdV1,
+        incarnation: StoreIncarnationV1,
+        profile_pin: Option<ProfileAuthorityPin>,
+        database_authority: Option<DatabaseAuthority>,
+        initialize_if_missing: bool,
+        operation: &'static str,
+    ) -> Self {
+        Self {
+            shard_id,
+            incarnation,
+            profile_pin,
+            database_authority,
+            initialize_if_missing,
+            operation,
+        }
+    }
+}
+
+async fn open_runtime(
+    registry: &StoreRuntimeRegistry,
+    resolver: &LocalStoreRuntimeResolverV1,
+    spec: StoreRuntimeOpenSpec,
 ) -> Result<StoreRuntimeClientLease> {
+    let StoreRuntimeOpenSpec {
+        shard_id,
+        incarnation,
+        profile_pin,
+        database_authority,
+        initialize_if_missing,
+        operation,
+    } = spec;
     open_runtime_with_presence(
         registry,
         resolver,
@@ -3464,3 +3582,6 @@ mod graph_shutdown_contract_tests;
 
 #[cfg(test)]
 mod project_memory_relation_graph_contract_tests;
+
+#[cfg(test)]
+mod semantic_vector_restart_tests;

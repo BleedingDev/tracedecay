@@ -20,6 +20,7 @@ use tracedecay_lsp::compile_diagnostics::{
 };
 use tracedecay_mcp::ToolResult;
 
+use crate::mcp::server::DiagnosticsChangeGenerationResolver;
 use crate::tracedecay::TraceDecay;
 
 use super::super::support::{generic_tool_result, unique_file_paths};
@@ -171,6 +172,7 @@ pub(crate) async fn handle_diagnostics(
     graph: &VerifiedGraphQuery,
     args: Value,
     diagnostics_cache: Option<&DiagnosticsCache>,
+    diagnostics_change_generation: Option<&DiagnosticsChangeGenerationResolver>,
     diagnostics_lsp: Option<&Mutex<DiagnosticBroker>>,
     session_db: Option<&RegisteredGlobalDb>,
 ) -> Result<ToolResult> {
@@ -197,7 +199,18 @@ pub(crate) async fn handle_diagnostics(
             {
                 Ok(lsp_diagnostics)
             } else if let Some(cache) = diagnostics_cache {
-                cache.run(&project_root, &collect_scope).await
+                let generation = match diagnostics_change_generation {
+                    Some(resolve) => resolve(project_root.clone()).await,
+                    None => None,
+                };
+                match generation {
+                    Some(generation) => {
+                        cache
+                            .run_for_generation(&project_root, &collect_scope, generation)
+                            .await
+                    }
+                    None => cache.run(&project_root, &collect_scope).await,
+                }
             } else {
                 run_all(&project_root, &collect_scope).await
             }
@@ -351,7 +364,9 @@ fn lsp_diagnostic_to_compiler_diagnostic(diagnostic: CodeDiagnostic) -> Diagnost
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod diagnostics_warming_tests {
-    use super::{diagnostics_prewarm_enabled, diagnostics_warming_result};
+    use super::{
+        diagnostics_prewarm_enabled, diagnostics_warming_result, session_correlation_health_json,
+    };
     use serde_json::{Value, json};
     use std::path::Path;
 
@@ -359,6 +374,15 @@ mod diagnostics_warming_tests {
     fn prewarm_follows_resolved_config_snapshot() {
         assert!(!diagnostics_prewarm_enabled(false));
         assert!(diagnostics_prewarm_enabled(true));
+    }
+
+    #[tokio::test]
+    async fn unavailable_session_correlation_is_explicitly_empty() {
+        let correlation = session_correlation_health_json(None).await;
+
+        assert_eq!(correlation["projection_available"], false);
+        assert_eq!(correlation["index_empty"], true);
+        assert_eq!(correlation["span_count"], 0);
     }
 
     #[test]

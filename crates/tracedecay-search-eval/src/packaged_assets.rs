@@ -30,6 +30,7 @@ impl PackagedEvaluatorAssets {
     }
 }
 
+#[hotpath::measure(label = "search_eval.package.materialize")]
 pub(crate) fn materialize() -> Result<PackagedEvaluatorAssets, SearchEvalError> {
     let workload = packaged::load_workload()?;
     let directory = tempfile::tempdir().map_err(|error| {
@@ -57,16 +58,19 @@ pub(crate) fn materialize() -> Result<PackagedEvaluatorAssets, SearchEvalError> 
         })?;
     }
     materialize_git_authority(directory.path())?;
-    let materialized_workload = tracedecay_query::search_quality::load_candidate_workload(
-        &directory
-            .path()
-            .join("tests/fixtures/search_quality/query-semantic-candidate-workload-v1.json"),
-    )?;
-    if materialized_workload != workload {
-        return Err(SearchEvalError::Contract(
-            "materialized evaluator workload differs from packaged bytes".to_owned(),
-        ));
-    }
+    hotpath::measure_block!("search_eval.package.verify", {
+        let materialized_workload = tracedecay_query::search_quality::load_candidate_workload(
+            &directory
+                .path()
+                .join("tests/fixtures/search_quality/query-semantic-candidate-workload-v1.json"),
+        )?;
+        if materialized_workload != workload {
+            return Err(SearchEvalError::Contract(
+                "materialized evaluator workload differs from packaged bytes".to_owned(),
+            ));
+        }
+        Ok::<(), SearchEvalError>(())
+    })?;
     Ok(PackagedEvaluatorAssets {
         root: directory.path().to_path_buf(),
         _directory: directory,
@@ -74,15 +78,27 @@ pub(crate) fn materialize() -> Result<PackagedEvaluatorAssets, SearchEvalError> 
     })
 }
 
-fn materialize_git_authority(root: &Path) -> Result<(), SearchEvalError> {
-    let git = root.join(".git");
+/// Writes the checked-in evaluator object pack into an existing `.git`
+/// directory.
+///
+/// The pack is a genuine sparse subset of the product repository: it carries
+/// the exact commit, tree spine, and blob objects the checked-in workload pins
+/// for its historical queries, under their real object identities. Writing it
+/// into a repository therefore only backfills objects — it can never replace or
+/// contradict an object the repository already holds.
+///
+/// The evaluator needs that backfill because the pinned historical commits live
+/// on a long-running integration branch. A rebase there re-parents the commit,
+/// which mints a new commit identity and leaves the pinned one unreachable from
+/// every ref. Local clones keep resolving it, because cloning a path on the same
+/// filesystem hard-links the whole object store including unreachable objects,
+/// but a wire-protocol clone — which is what CI checks out — transfers only
+/// ref-reachable objects and drops it. Materializing the checked-in pack keeps
+/// the pinned history resolvable in both.
+pub(crate) fn write_checked_in_object_pack(git: &Path) -> Result<(), SearchEvalError> {
     let pack_root = git.join("objects/pack");
-    let refs_root = git.join("refs");
     fs::create_dir_all(&pack_root).map_err(|error| {
         SearchEvalError::Contract(format!("create packaged evaluator Git authority: {error}"))
-    })?;
-    fs::create_dir_all(&refs_root).map_err(|error| {
-        SearchEvalError::Contract(format!("create packaged evaluator Git refs: {error}"))
     })?;
     let decode = |encoded: &str, kind: &str| {
         hex::decode(encoded.split_whitespace().collect::<String>()).map_err(|error| {
@@ -105,6 +121,16 @@ fn materialize_git_authority(root: &Path) -> Result<(), SearchEvalError> {
             "write packaged evaluator Git object index: {error}"
         ))
     })?;
+    Ok(())
+}
+
+fn materialize_git_authority(root: &Path) -> Result<(), SearchEvalError> {
+    let git = root.join(".git");
+    let refs_root = git.join("refs");
+    fs::create_dir_all(&refs_root).map_err(|error| {
+        SearchEvalError::Contract(format!("create packaged evaluator Git refs: {error}"))
+    })?;
+    write_checked_in_object_pack(&git)?;
     fs::write(git.join("HEAD"), format!("{SOURCE_COMMIT}\n")).map_err(|error| {
         SearchEvalError::Contract(format!("write packaged evaluator Git HEAD: {error}"))
     })?;

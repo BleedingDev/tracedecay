@@ -484,6 +484,7 @@ pub(super) async fn apply_configuration_or_semantic_transition(
             requested.is_some(),
         )
     });
+    let coordinated_semantic_transition = semantic_profile.is_some();
     let receipt =
         if current.revision_id != expected_revision {
             Box::pin(registered.runtime.client().mutate_direct(
@@ -528,8 +529,16 @@ pub(super) async fn apply_configuration_or_semantic_transition(
             ))
             .await?
         };
-    Box::pin(reconcile_configuration_runtime(registered, &receipt, now)).await;
+    if !coordinated_semantic_transition {
+        Box::pin(reconcile_configuration_runtime(registered, &receipt, now)).await;
+    } else {
+        notify_committed_semantic_activation(&registered.semantic_activation_committed);
+    }
     Ok(receipt)
+}
+
+pub(super) fn notify_committed_semantic_activation(committed_activation: &Notify) {
+    committed_activation.notify_one();
 }
 
 pub(super) fn requires_coordinated_semantic_profile_transition(
@@ -965,6 +974,8 @@ pub enum DaemonSemanticRuntimeRegistrationError {
     AlreadyRegistered,
     #[error("the daemon project runtime registry is closed")]
     RegistryClosed,
+    #[error("a concurrent semantic runtime build failed: {detail}")]
+    ConcurrentBuildFailed { detail: String },
 }
 
 impl From<ProjectRuntimeAlreadyRegistered> for DaemonSemanticRuntimeRegistrationError {
@@ -975,7 +986,12 @@ impl From<ProjectRuntimeAlreadyRegistered> for DaemonSemanticRuntimeRegistration
 
 impl From<ProjectRuntimeRegistryError> for DaemonSemanticRuntimeRegistrationError {
     fn from(error: ProjectRuntimeRegistryError) -> Self {
-        registry_registration_refusal(error, Self::AlreadyRegistered, Self::RegistryClosed)
+        registry_registration_refusal(
+            error,
+            Self::AlreadyRegistered,
+            Self::RegistryClosed,
+            |detail| Self::ConcurrentBuildFailed { detail },
+        )
     }
 }
 
@@ -996,6 +1012,7 @@ impl DaemonSemanticRuntimeRegistrar {
         project_root: PathBuf,
         handle: tracedecay_semantic::DaemonSemanticRuntimeHandleV1,
     ) -> Result<(), DaemonSemanticRuntimeRegistrationError> {
+        let registry_handle = handle.clone();
         self.service
             .project_runtimes
             .register_or_reconcile(
@@ -1003,18 +1020,17 @@ impl DaemonSemanticRuntimeRegistrar {
                 |_: &mut tracedecay_semantic::DaemonSemanticRuntimeHandleV1| {
                     Err(DaemonSemanticRuntimeRegistrationError::AlreadyRegistered)
                 },
-                || {
-                    // The process-wide table is only joined once the project slot
-                    // is known to be free, so a refused registration cannot
-                    // replace a live handle there.
-                    tracedecay_usecases::semantic_runtime::register_project_semantic_runtime(
-                        project_root.clone(),
-                        handle.clone(),
-                    );
-                    Ok(handle)
-                },
+                || async { Ok(registry_handle) },
             )
-            .await
+            .await?;
+        // This separate process-wide projection has no reservation rollback
+        // authority. Join it only after the owning project slot commits, in
+        // the same poll that observes commit success.
+        tracedecay_usecases::semantic_runtime::register_project_semantic_runtime(
+            project_root,
+            handle,
+        );
+        Ok(())
     }
 }
 
