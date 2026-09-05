@@ -499,6 +499,20 @@ pub struct ObserverReceipt {
     pub terminal: TerminalRecord,
 }
 
+/// Structured result after an observation provider has answered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObserverDeliveryResult {
+    /// The terminal passed every registry validation.
+    Accepted(ObserverReceipt),
+    /// The provider answered, but its terminal cannot be accepted as evidence.
+    RejectedTerminal {
+        /// Provider terminal retained for refusal audit only.
+        terminal: TerminalRecord,
+        /// Typed registry validation failure.
+        error: FabricError,
+    },
+}
+
 /// Capability-driven provider registry and bounded call router.
 pub struct MemoryFabric {
     config: FabricConfig,
@@ -873,7 +887,10 @@ impl MemoryFabric {
     ///
     /// The return type strips payloads and extensions so observer execution is
     /// structurally unable to contribute context through this route.
-    pub fn deliver_observation(&self, call: &ProviderCall) -> Result<ObserverReceipt, FabricError> {
+    pub fn deliver_observation_result(
+        &self,
+        call: &ProviderCall,
+    ) -> Result<ObserverDeliveryResult, FabricError> {
         call.validate()?;
         if call.operation.capability_id() != "observation.accept.v1" {
             return Err(FabricError::OperationNotObservation);
@@ -893,8 +910,7 @@ impl MemoryFabric {
         let _permit = self.admission_lane(registration.mode).try_acquire()?;
         let reply = registration.provider.invoke(call);
         if let Err(error) = reply.validate(readiness.effective_limits.response_bytes) {
-            self.invalidate_matching_readiness(call)?;
-            return Err(error.into());
+            return Ok(self.reject_observation_terminal(call, reply.terminal, error.into()));
         }
         if let Err(error) = Self::validate_terminal(
             call.operation,
@@ -905,28 +921,33 @@ impl MemoryFabric {
             Some(call.expected_state_generation),
             Some(reply.state_generation),
         ) {
-            self.invalidate_matching_readiness(call)?;
-            return Err(error);
+            return Ok(self.reject_observation_terminal(call, reply.terminal, error));
         }
         // A duplicate acknowledgement settles a delivery without the provider
         // doing anything, so it has to name the key of the call it answers.
         // Only the host knows which mutation it delivered; a provider that
         // deduplicated something else is refused here rather than believed.
         if let Err(error) = reply.terminal.validate_duplicate_binding_for_call(call) {
-            self.invalidate_matching_readiness(call)?;
-            return Err(error.into());
+            return Ok(self.reject_observation_terminal(call, reply.terminal, error.into()));
         }
         self.settle_readiness(
             call,
             reply.terminal.committed_effect().state_generation_after(),
         )?;
-        Ok(ObserverReceipt {
+        Ok(ObserverDeliveryResult::Accepted(ObserverReceipt {
             provider_id: call.provider_id.clone(),
             registration_revision: call.registration_revision,
             terminal: reply.terminal,
-        })
+        }))
     }
 
+    /// Delivers an observation, preserving the legacy error-shaped API.
+    pub fn deliver_observation(&self, call: &ProviderCall) -> Result<ObserverReceipt, FabricError> {
+        match self.deliver_observation_result(call)? {
+            ObserverDeliveryResult::Accepted(receipt) => Ok(receipt),
+            ObserverDeliveryResult::RejectedTerminal { error, .. } => Err(error),
+        }
+    }
     /// Selects the finite admission lane a contact with `mode` may consume.
     ///
     /// Lane choice is the registration's own participation mode, never the
@@ -1036,6 +1057,30 @@ impl MemoryFabric {
             });
         }
         Ok(readiness.clone())
+    }
+
+    fn reject_observation_terminal(
+        &self,
+        call: &ProviderCall,
+        terminal: TerminalRecord,
+        error: FabricError,
+    ) -> ObserverDeliveryResult {
+        // Housekeeping cannot erase evidence already received or replace the
+        // validation failure. Neither an absent nor a poisoned registry admits
+        // another call; report cleanup failure without provider-controlled text.
+        if let Err(cleanup_error) = self.invalidate_matching_readiness(call) {
+            let reason = match cleanup_error {
+                FabricError::RegistryPoisoned => "registry_poisoned",
+                FabricError::ProviderUnknown(_) => "provider_unknown",
+                _ => "readiness_invalidation_failed",
+            };
+            tracing::warn!(
+                event = "memory_observation_rejection_cleanup_failed",
+                reason,
+                "rejected observation terminal retained despite readiness cleanup failure"
+            );
+        }
+        ObserverDeliveryResult::RejectedTerminal { terminal, error }
     }
 
     fn invalidate_matching_readiness(&self, call: &ProviderCall) -> Result<(), FabricError> {
@@ -1309,6 +1354,108 @@ impl MemoryFabric {
             }
             _ => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod rejection_tests {
+    use std::error::Error;
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+
+    use tracedecay_memory_provider_api::{
+        CancellationToken, CanonicalPayload, CommittedEffectEvidence, OperationControl,
+        ProviderCallParts,
+    };
+
+    use super::{
+        FabricConfig, FabricError, FallbackDirective, MemoryFabric, ObserverDeliveryResult,
+        OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderOperation,
+        TerminalCode, TerminalRecord,
+    };
+
+    fn rejection_survives_cleanup_failure(poison_registry: bool) -> Result<(), Box<dyn Error>> {
+        let fabric = MemoryFabric::new(FabricConfig::new(1, 1)?)?;
+        let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let call = ProviderCall::new(ProviderCallParts {
+            operation: ProviderOperation::Observe,
+            provider_id: OwnedProviderId::new("provider.rejection")?,
+            registration_revision: 1,
+            ready_receipt_sha256: digest.to_owned(),
+            exact_scope: OwnedExactScope::new(
+                "profile-1",
+                "project-1",
+                "repo-1",
+                "worktree-1",
+                "refs/heads/main",
+                "session-1",
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            )?,
+            request_id: "request-1".to_owned(),
+            operation_id: "operation-1".to_owned(),
+            expected_state_generation: 0,
+            idempotency_key: Some("idempotency-1".to_owned()),
+            control: OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+            payload: CanonicalPayload::new(
+                OwnedVersionedId::new("tracedecay.memory.test-request.v1")?,
+                br#"{}"#.to_vec(),
+                "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            )?,
+            required_capabilities: vec![OwnedVersionedId::new("observation.accept.v1")?],
+            extensions: Vec::new(),
+        })?;
+        let terminal = TerminalRecord::new(
+            ProviderOperation::Observe,
+            call.provider_id.clone(),
+            TerminalCode::Success,
+            CommittedEffectEvidence::committed(
+                0,
+                1,
+                vec!["foreign-operation".to_owned()],
+                digest,
+                digest,
+            )?,
+            FallbackDirective::forbidden(),
+            "foreign-operation",
+            &call.exact_scope.exact_scope_sha256(),
+            None,
+        )?;
+        let error = FabricError::ResponseOperationMismatch {
+            expected: call.operation_id.clone(),
+            returned: "foreign-operation".to_owned(),
+        };
+
+        if poison_registry {
+            let poisoned = catch_unwind(AssertUnwindSafe(|| {
+                let _guard = fabric.registrations.write();
+                resume_unwind(Box::new(()));
+            }));
+            assert!(poisoned.is_err());
+            assert_eq!(
+                fabric.invalidate_matching_readiness(&call),
+                Err(FabricError::RegistryPoisoned)
+            );
+        } else {
+            assert_eq!(
+                fabric.invalidate_matching_readiness(&call),
+                Err(FabricError::ProviderUnknown(call.provider_id.as_str().to_owned()))
+            );
+        }
+
+        assert_eq!(
+            fabric.reject_observation_terminal(&call, terminal.clone(), error.clone()),
+            ObserverDeliveryResult::RejectedTerminal { terminal, error }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_terminal_and_error_survive_absent_registry_entry() -> Result<(), Box<dyn Error>> {
+        rejection_survives_cleanup_failure(false)
+    }
+
+    #[test]
+    fn rejected_terminal_and_error_survive_poisoned_registry() -> Result<(), Box<dyn Error>> {
+        rejection_survives_cleanup_failure(true)
     }
 }
 

@@ -21,12 +21,14 @@ use support::{
 };
 
 use tracedecay_memory_observation::{
-    AttemptRefusalCategoryV1, DeliveryAttemptV1, DeliveryControlV1, DeliveryRuntimeV1,
-    DeliveryStateV1, DeliveryWakeV1, DispatchPolicyV1, DispatchRequestV1, DrainStopV1,
-    JournalInspectionFilterV1, JournalInspectionRowV1, LeasedObservationV1,
-    ObservationCommittedEffectV1, ObservationDispatchPortV1, ObservationJournalError,
-    ObservationJournalReaderV1, ObservationOutcomeV1, ProviderDeliveryAdapterV1, RetentionPolicyV1,
-    RetryBackoffV1, SourceSequenceV1, SqliteObservationJournal,
+    AttemptRefusalCategoryV1, AttemptRefusalOutcomeV1, AttemptRefusalRecordV1, DeliveryAttemptV1,
+    DeliveryControlV1, DeliveryRuntimeV1, DeliveryStateV1, DeliveryWakeV1, DispatchPolicyV1,
+    DispatchRequestV1, DrainStopV1, JournalInspectionFilterV1, JournalInspectionRowV1,
+    LeasedObservationV1, ObservationCommittedEffectV1, ObservationDeliveryReceiptV1,
+    ObservationDispatchPortV1, ObservationIdempotencyKeyV1, ObservationJournalError,
+    ObservationJournalReaderV1, ObservationOutcomeV1, ProviderDeliveryAdapterV1,
+    ProviderEffectSummaryV1, RetentionPolicyV1, RetryBackoffV1, SourceSequenceV1,
+    SqliteObservationJournal,
 };
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
@@ -903,6 +905,38 @@ fn a_refused_provider_terminal_is_recorded_durably_and_never_rewritten() -> Test
         refusal.detail
     );
 
+    // A refusal is evidence about this exact claimed attempt, not merely an
+    // observation id. Every address component is checked before insertion.
+    let mut wrong_key = refusal.clone();
+    wrong_key.idempotency_key = ObservationIdempotencyKeyV1::parse(&"a".repeat(64))?;
+    let mut wrong_provider = refusal.clone();
+    wrong_provider.provider_id = "provider.foreign".to_owned();
+    let mut wrong_instance = refusal.clone();
+    wrong_instance.provider_instance_id = "instance.foreign".to_owned();
+    let mut wrong_scope = refusal.clone();
+    wrong_scope.exact_scope_sha256 = "0".repeat(64);
+    let mut wrong_attempt = refusal.clone();
+    wrong_attempt.attempt_number = 2;
+    let mut wrong_revision = refusal.clone();
+    wrong_revision.registration_revision += 1;
+    for (field, candidate) in [
+        ("idempotency_key", wrong_key),
+        ("provider_id", wrong_provider),
+        ("provider_instance_id", wrong_instance),
+        ("exact_scope_sha256", wrong_scope),
+        ("attempt_number", wrong_attempt),
+        ("registration_revision", wrong_revision),
+    ] {
+        assert!(
+            matches!(
+                store.record_attempt_refusal(&candidate),
+                Err(ObservationJournalError::AttemptRefusalBindingMismatch { field: actual })
+                    if actual == field
+            ),
+            "refusal mismatch for {field} was not rejected"
+        );
+    }
+
     // Immutable: a second refusal for the same attempt does not rewrite it.
     let wake = DeliveryWakeV1::new();
     let provider = WrongScopeProvider {
@@ -923,6 +957,202 @@ fn a_refused_provider_terminal_is_recorded_durably_and_never_rewritten() -> Test
     assert_eq!(
         first.started_at_unix_micros, T0,
         "the standing refusal for attempt 1 was rewritten"
+    );
+    Ok(())
+}
+
+/// The atomic rejected-terminal path accepts only host-owned unknown-effect
+/// evidence. Every malformed field must roll back both the lease release and
+/// the companion refusal insert.
+#[test]
+fn refused_terminal_rejects_malformed_unknown_effect_evidence_atomically() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = journal(&directory.path().join("journal.sqlite3"))?;
+    store.append_admitted(&Builder::at_sequence(1).build()?)?;
+    let leased = store
+        .lease_pending(&lease_request(T0, 1))?
+        .pop()
+        .ok_or("expected lease")?;
+    let receipt = ObservationDeliveryReceiptV1::from_refused_terminal(&leased, T0, T0 + 1)?;
+    let refusal = AttemptRefusalRecordV1 {
+        observation_id: leased.observation_id.clone(),
+        attempt_number: leased.attempt_number,
+        idempotency_key: leased.idempotency_key.clone(),
+        provider_id: leased.target.provider_id.as_str().to_owned(),
+        provider_instance_id: leased.target.provider_instance_id.clone(),
+        registration_revision: leased.target.registration_revision,
+        exact_scope_sha256: leased.exact_scope_sha256.clone(),
+        category: AttemptRefusalCategoryV1::ReceiptNotAdmissible,
+        refused_field: "terminal".to_owned(),
+        expected: None,
+        provided: None,
+        detail: "provider terminal was not admissible".to_owned(),
+        terminal_operation: "observe".to_owned(),
+        terminal_code: "success".to_owned(),
+        terminal_operation_id: format!("observe-{}", leased.observation_id.as_str()),
+        provider_receipt_digest: None,
+        started_at_unix_micros: T0,
+        finished_at_unix_micros: T0 + 1,
+        recorded_at_unix_micros: T0 + 1,
+    };
+
+    let mut wrong_outcome = receipt.clone();
+    wrong_outcome.outcome = ObservationOutcomeV1::Applied;
+    let mut wrong_effect = receipt.clone();
+    wrong_effect.committed_effect = ObservationCommittedEffectV1::Applied;
+    let mut missing_instance = receipt.clone();
+    missing_instance.provider_instance_id = None;
+    let mut state_before = receipt.clone();
+    state_before.state_generation_before = Some(1);
+    let mut state_after = receipt.clone();
+    state_after.state_generation_after = Some(2);
+    let mut provider_digest = receipt.clone();
+    provider_digest.provider_receipt_digest = Some(PROVIDER_RECEIPT_DIGEST.to_owned());
+    let mut effect_summary = receipt.clone();
+    effect_summary.provider_effect_summary = ProviderEffectSummaryV1 {
+        effect_count: 1,
+        ..ProviderEffectSummaryV1::default()
+    };
+    let mut warnings = receipt.clone();
+    warnings.warnings.push("not host-owned".to_owned());
+
+    for (field, malformed) in [
+        (
+            "cancelled",
+            ObservationDeliveryReceiptV1 {
+                outcome: ObservationOutcomeV1::Cancelled,
+                ..receipt.clone()
+            },
+        ),
+        ("outcome", wrong_outcome),
+        ("committed_effect", wrong_effect),
+        ("provider_instance_id", missing_instance),
+        ("state_generation_before", state_before),
+        ("state_generation_after", state_after),
+        ("provider_receipt_digest", provider_digest),
+        ("provider_effect_summary", effect_summary),
+        ("warnings", warnings),
+    ] {
+        assert!(
+            store
+                .record_refused_terminal_attempt(
+                    &refusal,
+                    &malformed,
+                    &leased.lease_id,
+                    T0 + MINUTE,
+                )
+                .is_err(),
+            "malformed {field} was accepted"
+        );
+        assert!(store.receipts_for(&leased.observation_id)?.is_empty());
+        assert!(
+            store
+                .attempt_refusals_for(&leased.observation_id)?
+                .is_empty()
+        );
+        assert_eq!(row_at(&store, 1)?.state, DeliveryStateV1::Leased);
+    }
+
+    // Both attempts are individually valid, but a refusal for the first must
+    // not be atomically paired with the second attempt's receipt and lease.
+    store.append_admitted(&Builder::at_sequence(2).build()?)?;
+    let second = store
+        .lease_pending(&lease_request(T0, 1))?
+        .pop()
+        .ok_or("expected second lease")?;
+    let second_receipt = ObservationDeliveryReceiptV1::from_refused_terminal(&second, T0, T0 + 1)?;
+    let second_refusal = AttemptRefusalRecordV1 {
+        observation_id: second.observation_id.clone(),
+        idempotency_key: second.idempotency_key.clone(),
+        terminal_operation_id: format!("observe-{}", second.observation_id.as_str()),
+        ..refusal.clone()
+    };
+    assert!(matches!(
+        store.record_refused_terminal_attempt(
+            &refusal,
+            &second_receipt,
+            &second.lease_id,
+            T0 + MINUTE,
+        ),
+        Err(ObservationJournalError::AttemptRefusalBindingMismatch {
+            field: "observation_id"
+        })
+    ));
+    for item in [&leased, &second] {
+        assert!(store.receipts_for(&item.observation_id)?.is_empty());
+        assert!(store.attempt_refusals_for(&item.observation_id)?.is_empty());
+    }
+    for sequence in 1..=2 {
+        assert_eq!(row_at(&store, sequence)?.state, DeliveryStateV1::Leased);
+    }
+    // Matching pairs still succeed, proving neither input was invalid alone
+    // and neither original lease was released by the rejected pairing.
+    let (second_outcome, second_attempt) = store.record_refused_terminal_attempt(
+        &second_refusal,
+        &second_receipt,
+        &second.lease_id,
+        T0 + MINUTE,
+    )?;
+    assert_eq!(second_outcome, AttemptRefusalOutcomeV1::Recorded);
+    assert!(matches!(
+        second_attempt,
+        tracedecay_memory_observation::AttemptOutcomeV1::Recorded { .. }
+    ));
+    let (refusal_outcome, attempt_outcome) =
+        store.record_refused_terminal_attempt(&refusal, &receipt, &leased.lease_id, T0 + MINUTE)?;
+    assert_eq!(refusal_outcome, AttemptRefusalOutcomeV1::Recorded);
+    assert!(matches!(
+        attempt_outcome,
+        tracedecay_memory_observation::AttemptOutcomeV1::Recorded { .. }
+    ));
+    Ok(())
+}
+
+/// A stale dispatcher must not be reported as a duplicate refusal when no
+/// immutable refusal row exists.
+#[test]
+fn refused_terminal_distinguishes_lease_loss_from_an_existing_refusal() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = journal(&directory.path().join("journal.sqlite3"))?;
+    store.append_admitted(&Builder::at_sequence(1).build()?)?;
+    let leased = store
+        .lease_pending(&lease_request(T0, 1))?
+        .pop()
+        .ok_or("expected lease")?;
+    let receipt = ObservationDeliveryReceiptV1::from_refused_terminal(&leased, T0, T0 + 1)?;
+    let refusal = AttemptRefusalRecordV1 {
+        observation_id: leased.observation_id.clone(),
+        attempt_number: leased.attempt_number,
+        idempotency_key: leased.idempotency_key.clone(),
+        provider_id: leased.target.provider_id.as_str().to_owned(),
+        provider_instance_id: leased.target.provider_instance_id.clone(),
+        registration_revision: leased.target.registration_revision,
+        exact_scope_sha256: leased.exact_scope_sha256.clone(),
+        category: AttemptRefusalCategoryV1::ReceiptNotAdmissible,
+        refused_field: "terminal".to_owned(),
+        expected: None,
+        provided: None,
+        detail: "provider terminal was not admissible".to_owned(),
+        terminal_operation: "observe".to_owned(),
+        terminal_code: "success".to_owned(),
+        terminal_operation_id: format!("observe-{}", leased.observation_id.as_str()),
+        provider_receipt_digest: None,
+        started_at_unix_micros: T0,
+        finished_at_unix_micros: T0 + 1,
+        recorded_at_unix_micros: T0 + 1,
+    };
+    assert_eq!(store.reap_expired_leases(T0 + LEASE, 1)?, 1);
+    let (refusal_outcome, attempt_outcome) =
+        store.record_refused_terminal_attempt(&refusal, &receipt, &leased.lease_id, T0 + MINUTE)?;
+    assert_eq!(refusal_outcome, AttemptRefusalOutcomeV1::LeaseLost);
+    assert!(matches!(
+        attempt_outcome,
+        tracedecay_memory_observation::AttemptOutcomeV1::LeaseLost { .. }
+    ));
+    assert!(
+        store
+            .attempt_refusals_for(&leased.observation_id)?
+            .is_empty()
     );
     Ok(())
 }

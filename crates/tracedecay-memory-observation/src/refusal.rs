@@ -196,4 +196,7 @@ pub enum AttemptRefusalOutcomeV1 {
     /// A refusal already exists for this `(observation, attempt)` pair. The
     /// original stands; refusals are never rewritten, exactly like receipts.
     AlreadyRecorded,
+    /// The exact lease no longer belongs to this dispatcher, and no refusal
+    /// was written by this call.
+    LeaseLost,
 }

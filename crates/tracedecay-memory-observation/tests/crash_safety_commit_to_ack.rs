@@ -700,6 +700,17 @@ impl ObservationJournalReaderV1 for CrashingJournalReaderV1<'_> {
             .record_unsettled_attempt(receipt, lease, retry_after_unix_micros)
     }
 
+    fn record_refused_terminal_attempt(
+        &self,
+        refusal: &AttemptRefusalRecordV1,
+        receipt: &ObservationDeliveryReceiptV1,
+        lease: &DispatchLeaseIdV1,
+        retry_after_unix_micros: i64,
+    ) -> Result<(AttemptRefusalOutcomeV1, AttemptOutcomeV1), ObservationJournalError> {
+        self.inner
+            .record_refused_terminal_attempt(refusal, receipt, lease, retry_after_unix_micros)
+    }
+
     fn release_lease(
         &self,
         lease: &DispatchLeaseIdV1,

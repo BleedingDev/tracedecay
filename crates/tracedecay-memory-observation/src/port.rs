@@ -171,13 +171,23 @@ pub trait ObservationJournalReaderV1: Send + Sync {
     /// answered but could not accept as delivery evidence.
     ///
     /// This is deliberately *not* `record_attempt`: nothing about the delivery
-    /// row moves, no provider effect is attributed, and no receipt is minted.
+    /// row moves and no provider effect is attributed.
     /// It exists so a crash cannot erase the fact that an attempt number was
     /// consumed by an answer the host refused.
     fn record_attempt_refusal(
         &self,
         refusal: &AttemptRefusalRecordV1,
     ) -> Result<AttemptRefusalOutcomeV1, ObservationJournalError>;
+
+    /// Atomically records a rejected terminal, its unknown-effect receipt, and
+    /// releases the exact lease that produced both records.
+    fn record_refused_terminal_attempt(
+        &self,
+        refusal: &AttemptRefusalRecordV1,
+        receipt: &ObservationDeliveryReceiptV1,
+        lease: &DispatchLeaseIdV1,
+        retry_after_unix_micros: i64,
+    ) -> Result<(AttemptRefusalOutcomeV1, AttemptOutcomeV1), ObservationJournalError>;
 
     /// Returns one lease to `Pending` with an explicit retry instant.
     fn release_lease(

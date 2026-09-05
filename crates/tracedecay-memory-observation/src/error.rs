@@ -117,6 +117,12 @@ pub enum ObservationJournalError {
         /// Canonical committed-effect wire value.
         committed_effect: &'static str,
     },
+    /// A refused-terminal record does not describe the journal row and live delivery attempt.
+    #[error("attempt refusal {field} does not match the leased delivery")]
+    AttemptRefusalBindingMismatch {
+        /// Logical identity field that disagreed.
+        field: &'static str,
+    },
     /// A receipt described content that the journal row does not hold.
     #[error("delivery receipt {field} does not match the journalled observation")]
     ReceiptDigestMismatch {

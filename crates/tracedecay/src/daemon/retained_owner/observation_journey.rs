@@ -74,31 +74,32 @@ use tracedecay_memory_hygiene::{
     ObservationAdmission, ObservationSanitizer, UNTRUSTED_BOUNDARY_LABEL, canonical_payload_bytes,
 };
 use tracedecay_memory_observation::{
-    AdmissionDecisionV1, AdmittedObservationV1, BackpressureGateV1, BackpressureHaltV1,
-    BackpressurePolicyV1, BackpressureReasonV1, BackpressureStateV1, CanonicalSettlementReceiptV1,
-    DeliveryAttemptV1, DeliveryControlV1, DeliveryRuntimeV1, DeliveryWakeV1, DispatchPolicyV1,
-    DispatchRequestV1, DrainStopV1, ForgetSourceKeyV1, IdempotencyInputV1, IngressBatchReportV1,
-    IngressControlV1, IngressHaltV1, IngressRuntimeV1, IngressStopReasonV1, LeaseRequestV1,
-    LeasedObservationV1, OBSERVATION_CONTRACT_ID, ObservationAdmissionAdapterV1,
-    ObservationDispatchPortV1, ObservationIdV1, ObservationIdempotencyKeyV1,
-    ObservationJournalError, ObservationLaneKeyV1, ObservationLoadClassV1, ObservationPrivacyV1,
-    ObservationRuntimeError, PrivacyClassificationV1, ProvenanceOriginV1, ProviderCheckpointV1,
-    ProviderDeliveryAdapterV1, ProviderReplayPositionV1, ProviderTargetV1, QueueBacklogV1,
-    RecoveryBudgetV1, RecoveryControlV1, RecoveryPlanV1, RecoveryRuntimeV1, RecoveryTargetKeyV1,
-    RetentionClassV1, RetentionPolicyV1, RetentionSweepScheduleV1, RetentionSweeperV1,
-    RetentionTickV1, RetryBackoffV1, SanitizationBindingV1, ShutdownRequestV1, SourceAuthorityV1,
-    SourceRecordV1, SourceSequenceV1, SourceStreamIdV1, SourceStreamKeyV1,
-    SqliteObservationJournal, TerminalIdentityMismatchV1, WakeOutcomeV1, WithheldAdmissionV1,
-    extensions_digest,
+    AdapterFailureV1, AdmissionDecisionV1, AdmittedObservationV1, AttemptRefusalCategoryV1,
+    BackpressureGateV1, BackpressureHaltV1, BackpressurePolicyV1, BackpressureReasonV1,
+    BackpressureStateV1, CanonicalSettlementReceiptV1, DeliveryAttemptV1, DeliveryControlV1,
+    DeliveryRuntimeV1, DeliveryWakeV1, DispatchPolicyV1, DispatchRequestV1, DrainStopV1,
+    ForgetSourceKeyV1, IdempotencyInputV1, IngressBatchReportV1, IngressControlV1, IngressHaltV1,
+    IngressRuntimeV1, IngressStopReasonV1, LeaseRequestV1, LeasedObservationV1,
+    OBSERVATION_CONTRACT_ID, ObservationAdmissionAdapterV1, ObservationDispatchPortV1,
+    ObservationIdV1, ObservationIdempotencyKeyV1, ObservationJournalError, ObservationLaneKeyV1,
+    ObservationLoadClassV1, ObservationPrivacyV1, ObservationRuntimeError, PrivacyClassificationV1,
+    ProvenanceOriginV1, ProviderCheckpointV1, ProviderDeliveryAdapterV1, ProviderReplayPositionV1,
+    ProviderTargetV1, QueueBacklogV1, RecoveryBudgetV1, RecoveryControlV1, RecoveryPlanV1,
+    RecoveryRuntimeV1, RecoveryTargetKeyV1, RetentionClassV1, RetentionPolicyV1,
+    RetentionSweepScheduleV1, RetentionSweeperV1, RetentionTickV1, RetryBackoffV1,
+    SanitizationBindingV1, ShutdownRequestV1, SourceAuthorityV1, SourceRecordV1, SourceSequenceV1,
+    SourceStreamIdV1, SourceStreamKeyV1, SqliteObservationJournal, TerminalIdentityMismatchV1,
+    WakeOutcomeV1, WithheldAdmissionV1, extensions_digest,
 };
 use tracedecay_memory_provider_registry::{
     ApiError, BoundedCallRefusalV1, BoundedProviderCallV1, CancellationToken, CanonicalPayload,
     CompositionLifecycleError, FabricError, HandshakeRequest, HandshakeRequestParts,
-    HandshakeResponse, NATIVE_PROVIDER_ID, OperationControl, OwnedExactScope, OwnedProviderId,
-    OwnedVersionedId, PayloadSanitizationReceipt, ProjectMemoryProviderComposition,
-    ProjectMemoryProviderRegistry, ProviderCall, ProviderCallParts, ProviderHandshakeWorkV1,
-    ProviderLimits, ProviderOperation, ReadinessEvidenceV1, RestartBudgetV1, ShutdownBudgetV1,
-    SupervisedProviderReadinessV1, SupervisedReadinessConfigV1, SupervisedReadinessError,
+    HandshakeResponse, NATIVE_PROVIDER_ID, ObserverDeliveryResult, OperationControl,
+    OwnedExactScope, OwnedProviderId, OwnedVersionedId, PayloadSanitizationReceipt,
+    ProjectMemoryProviderComposition, ProjectMemoryProviderRegistry, ProviderCall,
+    ProviderCallParts, ProviderHandshakeWorkV1, ProviderLimits, ProviderOperation,
+    ReadinessEvidenceV1, RestartBudgetV1, ShutdownBudgetV1, SupervisedProviderReadinessV1,
+    SupervisedReadinessConfigV1, SupervisedReadinessError,
 };
 use tracedecay_runtime_core::cancellation::CancellationToken as HostCancellationToken;
 use tracedecay_store::{
@@ -1430,8 +1431,11 @@ struct RegistryObservationDeliveryAdapterV1 {
     recovery: ObservationRecoveryGateV1,
 }
 
-/// Typed delivery refusals. Every one of them produces no receipt, which is
-/// what makes the attempt redeliverable rather than settled.
+/// Typed delivery-adapter failures and provider-terminal refusals.
+///
+/// A failure before an answer produces no receipt. A provider terminal refused
+/// after contact is also published here, but the journal records it separately
+/// as refusal evidence with an unknown-effect receipt before redelivery.
 #[derive(Debug, thiserror::Error)]
 enum DeliveryAdapterError {
     #[error("provider composition is disabled, so no observation can be delivered")]
@@ -1464,7 +1468,7 @@ impl RegistryObservationDeliveryAdapterV1 {
 /// now" and nothing accumulates for the life of the process.
 const DELIVERY_REFUSAL_HISTORY: usize = 16;
 
-/// The exact classification of one delivery that produced no receipt.
+/// The exact classification of one delivery refusal.
 ///
 /// The worker already held this and threw it away into a formatted string. An
 /// operator asking the only question that matters — "is the provider
@@ -1559,7 +1563,7 @@ impl DeliveryRefusalClassV1 {
     }
 }
 
-/// One delivery that produced no receipt, as the lane publishes it.
+/// One delivery refusal, as the lane publishes it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DeliveryRefusalV1 {
     /// Observation the refused attempt addressed.
@@ -1578,9 +1582,9 @@ pub(crate) struct DeliveryRefusalV1 {
 ///
 /// Deliberately finite and deliberately in memory: it is a diagnostic about
 /// the running lane, not durable evidence. The durable statement about a
-/// refused *answer* is the journal's own attempt-refusal audit; this covers
-/// every delivery that produced no receipt, including the ones where no answer
-/// arrived at all and the journal therefore has nothing to record.
+/// refused *answer* is the journal's own attempt-refusal audit; this window
+/// covers every delivery refused by the lane, including the ones where no
+/// answer arrived at all and the journal therefore has nothing to record.
 #[derive(Debug, Default)]
 struct DeliveryRefusalWindowV1 {
     recent: Mutex<std::collections::VecDeque<DeliveryRefusalV1>>,
@@ -1782,6 +1786,48 @@ impl ObservationRecoveryGateV1 {
     }
 }
 
+fn rejected_terminal_binding(
+    error: &FabricError,
+) -> (
+    AttemptRefusalCategoryV1,
+    &'static str,
+    Option<String>,
+    Option<String>,
+) {
+    match error {
+        FabricError::ResponseOperationMismatch { expected, returned } => (
+            AttemptRefusalCategoryV1::TerminalIdentityMismatch,
+            "operation_id",
+            Some(expected.clone()),
+            Some(returned.clone()),
+        ),
+        FabricError::ResponseOperationKindMismatch { expected, returned } => (
+            AttemptRefusalCategoryV1::TerminalIdentityMismatch,
+            "operation_kind",
+            Some(expected.as_wire().to_owned()),
+            Some(returned.as_wire().to_owned()),
+        ),
+        FabricError::ResponseProviderMismatch { expected, returned } => (
+            AttemptRefusalCategoryV1::TerminalIdentityMismatch,
+            "provider_id",
+            Some(expected.clone()),
+            Some(returned.clone()),
+        ),
+        FabricError::ResponseScopeMismatch { expected, returned } => (
+            AttemptRefusalCategoryV1::TerminalIdentityMismatch,
+            "exact_scope_sha256",
+            Some(expected.clone()),
+            Some(returned.clone()),
+        ),
+        _ => (
+            AttemptRefusalCategoryV1::ReceiptNotAdmissible,
+            "terminal_record",
+            None,
+            None,
+        ),
+    }
+}
+
 impl ProviderDeliveryAdapterV1 for RegistryObservationDeliveryAdapterV1 {
     type Error = DeliveryAdapterError;
 
@@ -1955,14 +2001,31 @@ impl RegistryObservationDeliveryAdapterV1 {
         // arrives after cancellation.
         let answered = self
             .registry()?
-            .deliver_observation(&call)
-            .map_err(DeliveryAdapterError::Fabric);
+            .deliver_observation_result(&call)
+            .map_err(DeliveryAdapterError::Fabric)?;
         drop(readiness_dispatch);
-        answered.map(|receipt| DeliveryAttemptV1::Answered {
-            terminal: Box::new(receipt.terminal),
-            started_at_unix_micros,
-            finished_at_unix_micros: tracedecay_application::now_micros().0,
-        })
+        let finished_at_unix_micros = tracedecay_application::now_micros().0;
+        match answered {
+            ObserverDeliveryResult::Accepted(receipt) => Ok(DeliveryAttemptV1::Answered {
+                terminal: Box::new(receipt.terminal),
+                started_at_unix_micros,
+                finished_at_unix_micros,
+            }),
+            ObserverDeliveryResult::RejectedTerminal { terminal, error } => {
+                let (category, refused_field, expected, provided) =
+                    rejected_terminal_binding(&error);
+                Ok(DeliveryAttemptV1::RejectedTerminal {
+                    terminal: Box::new(terminal),
+                    category,
+                    refused_field,
+                    expected,
+                    provided,
+                    cause: AdapterFailureV1::new(DeliveryAdapterError::Fabric(error)),
+                    started_at_unix_micros,
+                    finished_at_unix_micros,
+                })
+            }
+        }
     }
 }
 
@@ -2389,19 +2452,25 @@ impl ThreadBoundedProviderCallV1 {
         });
         let slot = BorrowedWorkerSlotV1(Arc::clone(&accounting));
         let (answers, inbox) = mpsc::sync_channel(1);
+        let diagnostics = tracing::dispatcher::get_default(Clone::clone);
         if let Err(source) = thread::Builder::new()
             .name("tdmem-provider-call".to_owned())
             .spawn(move || {
-                // A provider's panic stops here. The caller is answered with a
-                // typed refusal instead of being unwound by somebody else's
-                // defect.
-                let answer = catch_unwind(AssertUnwindSafe(work));
-                // The slot is released *before* the caller is answered, so a
-                // caller that has its answer can never read a census that
-                // still counts the worker that produced it.
-                drop(slot);
-                // A send failure means the caller already abandoned this call.
-                let _ = answers.send(answer);
+                tracing::dispatcher::with_default(&diagnostics, || {
+                    // Diagnose here, even if cancellation already dropped the
+                    // receiver. Never retain or log the untrusted panic payload.
+                    let answer = catch_unwind(AssertUnwindSafe(work)).map_err(|_| {
+                        tracing::warn!(
+                            event = "memory_provider_panic_contained",
+                            "provider panic was contained by the borrowed worker"
+                        );
+                    });
+                    // Release before answering so a caller with an answer never
+                    // reads a census still counting the worker that produced it.
+                    drop(slot);
+                    // A send failure means the caller already abandoned this call.
+                    let _ = answers.send(answer);
+                });
             })
         {
             // No worker started. The slot is given back here rather than left
@@ -2429,11 +2498,14 @@ impl ThreadBoundedProviderCallV1 {
                     }
                     return Ok(answer);
                 }
-                // A crash is reported as a crash even when cancellation has
-                // already fired. Both are refusals that produce no receipt, and
-                // an operator needs to know the provider unwound rather than
-                // that the host stopped waiting.
                 Ok(Err(_)) => {
+                    // Shutdown owns classification once it has fired, even if
+                    // the contained worker reports its panic on the same edge.
+                    // The worker already diagnosed the crash independently of
+                    // this attempt's terminal outcome.
+                    if cancellation.is_cancelled() {
+                        return Err(BoundedCallRefusalV1::Cancelled);
+                    }
                     return Err(BoundedCallRefusalV1::Unavailable(
                         "provider panicked mid-call; the borrowed worker was contained".to_owned(),
                     ));
@@ -4426,7 +4498,9 @@ mod tests {
         SanitizationReceiptId, SanitizationReceiptRefV1, SanitizationReceiptV1,
         SanitizerDispositionV1, SensitivityV1, SessionId, UtcMicros, WorktreeId,
     };
-    use tracedecay_memory_observation::AppendOutcomeV1;
+    use tracedecay_memory_observation::{
+        AppendOutcomeV1, DeliveryStateV1, JournalInspectionFilterV1, ObservationJournalReaderV1,
+    };
     use tracedecay_memory_provider_registry::{
         CommittedEffectEvidence, EnabledProviderMode, FabricConfig, FallbackDirective,
         HandshakeResponse, NativeMemoryApplicationPort, NativeObservation,
@@ -4666,6 +4740,116 @@ mod tests {
                     .expect("the ceiling of one must be untouched"),
                 4
             );
+        }
+
+        /// Cancellation returns to the caller before a blocked provider is released to panic.
+        ///
+        /// The provider cannot panic until the test releases `release`, and that
+        /// release happens only after the caller thread has joined with a typed
+        /// `Cancelled` refusal. This is the cancellation-first ordering the
+        /// immediate race below cannot establish. The worker is still published
+        /// as abandoned at the join point, then its contained panic must release
+        /// the last slot and emit the application-owned diagnostic after release.
+        #[test]
+        fn cancellation_returns_before_a_released_provider_panic_is_contained() {
+            #[derive(Clone)]
+            struct DiagnosticWriter(Arc<Mutex<Vec<u8>>>);
+
+            impl std::io::Write for DiagnosticWriter {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+
+            let boundary = Arc::new(ThreadBoundedProviderCallV1::new(1));
+            let cancellation = CancellationToken::new();
+            let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+            let diagnostics = Arc::new(Mutex::new(Vec::new()));
+            let writer_diagnostics = Arc::clone(&diagnostics);
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || DiagnosticWriter(Arc::clone(&writer_diagnostics)))
+                .finish();
+            let dispatcher = tracing::Dispatch::new(subscriber);
+
+            let worker_boundary = Arc::clone(&boundary);
+            let worker_cancellation = cancellation.clone();
+            let caller = std::thread::spawn(move || {
+                tracing::dispatcher::with_default(&dispatcher, || {
+                    worker_boundary.call_within(5_000, &worker_cancellation, move || -> u8 {
+                        entered.send(()).expect("provider entry receiver");
+                        release_rx.recv().expect("provider release sender");
+                        panic!("provider panic after caller cancellation")
+                    })
+                })
+            });
+
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("provider did not enter before the cancellation");
+            cancellation.cancel();
+            let refusal = caller
+                .join()
+                .expect("the caller thread")
+                .expect_err("cancellation must return before the provider is released");
+            assert!(
+                matches!(refusal, BoundedCallRefusalV1::Cancelled),
+                "{refusal:?}"
+            );
+            assert_eq!(
+                boundary.census(),
+                BoundedCallCensusV1 {
+                    live: 0,
+                    abandoned: 1,
+                },
+                "the blocked provider must still be counted after the caller returns"
+            );
+            assert!(
+                diagnostics.lock().unwrap().is_empty(),
+                "the provider was diagnosed before the test released it to panic"
+            );
+
+            release.send(()).expect("provider release receiver");
+            settle(&boundary, BoundedCallCensusV1::default());
+            let captured = String::from_utf8(diagnostics.lock().unwrap().clone())
+                .expect("captured diagnostic is UTF-8");
+            assert!(
+                captured.contains("memory_provider_panic_contained"),
+                "the contained panic produced no application-owned diagnostic: {captured:?}"
+            );
+            assert!(
+                !captured.contains("provider panic after caller cancellation"),
+                "the untrusted panic payload escaped into the application-owned diagnostic: \
+                 {captured:?}"
+            );
+        }
+
+        /// Shutdown cancellation owns the attempt when it races a contained panic.
+        #[test]
+        fn cancellation_that_fires_before_a_panic_is_observed_wins_classification() {
+            let boundary = ThreadBoundedProviderCallV1::new(1);
+            for round in 0..64 {
+                let cancellation = CancellationToken::new();
+                let cancelled = cancellation.clone();
+                let refusal = boundary
+                    .call_within(5_000, &cancellation, move || -> u8 {
+                        cancelled.cancel();
+                        panic!("provider panic after cancellation")
+                    })
+                    .expect_err("shutdown cancellation must own the raced attempt");
+                assert!(
+                    matches!(refusal, BoundedCallRefusalV1::Cancelled),
+                    "round {round}: {refusal:?}"
+                );
+                settle(&boundary, BoundedCallCensusV1::default());
+            }
         }
 
         /// An answer produced after cancellation is refused rather than
@@ -5699,8 +5883,16 @@ mod tests {
             );
             assert_eq!(
                 receipt_count(fixture.journal_path()),
-                1,
-                "exactly the compliant attempt may leave a receipt"
+                2,
+                "the rejected terminal and compliant retry must both leave evidence"
+            );
+            assert_eq!(attempt_refusals(fixture.journal_path()).len(), 1);
+            assert_eq!(
+                receipt_outcomes(fixture.journal_path()),
+                vec![
+                    ("effect_unknown".to_owned(), "unknown".to_owned()),
+                    ("applied".to_owned(), "applied".to_owned()),
+                ]
             );
             assert_eq!(provider.in_flight(), 0);
 
@@ -5758,7 +5950,15 @@ mod tests {
                 "the oversized reply must have been refused rather than settled: {}",
                 journal_snapshot(fixture.journal_path())
             );
-            assert_eq!(receipt_count(fixture.journal_path()), 1);
+            assert_eq!(receipt_count(fixture.journal_path()), 2);
+            assert_eq!(attempt_refusals(fixture.journal_path()).len(), 1);
+            assert_eq!(
+                receipt_outcomes(fixture.journal_path()),
+                vec![
+                    ("effect_unknown".to_owned(), "unknown".to_owned()),
+                    ("applied".to_owned(), "applied".to_owned()),
+                ]
+            );
 
             // Refused at the negotiated response ceiling itself, named field
             // and all — the reply never became a receipt for another reason.
@@ -5815,7 +6015,15 @@ mod tests {
                 "corrupted effect evidence must not settle: {}",
                 journal_snapshot(fixture.journal_path())
             );
-            assert_eq!(receipt_count(fixture.journal_path()), 1);
+            assert_eq!(receipt_count(fixture.journal_path()), 2);
+            assert_eq!(attempt_refusals(fixture.journal_path()).len(), 1);
+            assert_eq!(
+                receipt_outcomes(fixture.journal_path()),
+                vec![
+                    ("effect_unknown".to_owned(), "unknown".to_owned()),
+                    ("applied".to_owned(), "applied".to_owned()),
+                ]
+            );
 
             // Refused because the declared digest does not describe the bytes
             // it is attached to: evidence the host cannot verify is not
@@ -5866,7 +6074,15 @@ mod tests {
 
             let (state, _, outcome) = wait_for_attempts(&fixture, 2).await;
             assert_ne!(state, "acknowledged", "outcome={outcome:?}");
-            assert_eq!(receipt_count(fixture.journal_path()), 0);
+            assert_eq!(receipt_count(fixture.journal_path()), 2);
+            assert_eq!(attempt_refusals(fixture.journal_path()).len(), 2);
+            assert_eq!(
+                receipt_outcomes(fixture.journal_path()),
+                vec![
+                    ("effect_unknown".to_owned(), "unknown".to_owned()),
+                    ("effect_unknown".to_owned(), "unknown".to_owned()),
+                ]
+            );
             assert_eq!(provider.in_flight(), 0);
 
             // Refused because the effect evidence contradicts the generation
@@ -5943,15 +6159,21 @@ mod tests {
             );
             assert_eq!(
                 receipt_count(fixture.journal_path()),
-                1,
-                "only the compliant retry may leave a receipt: {}",
+                2,
+                "the rejected terminal and compliant retry must both leave evidence: {}",
                 journal_snapshot(fixture.journal_path())
             );
             assert_eq!(
-                attempt_refusals(fixture.journal_path()),
-                Vec::new(),
-                "a reply refused before it could be weighed as delivery evidence must \
-                 leave no attempt-refusal audit row"
+                attempt_refusals(fixture.journal_path()).len(),
+                1,
+                "the rejected terminal must leave a durable refusal audit row"
+            );
+            assert_eq!(
+                receipt_outcomes(fixture.journal_path()),
+                vec![
+                    ("effect_unknown".to_owned(), "unknown".to_owned()),
+                    ("applied".to_owned(), "applied".to_owned()),
+                ]
             );
 
             // Refused for exactly the thing the behaviour is about: a payload
@@ -6253,9 +6475,9 @@ mod tests {
         /// Judged by the journal on purpose: a host that accepted either would have
         /// acknowledged the row on the first attempt, and the attempt count is what
         /// makes "refused" distinguishable from "never dispatched". The refusal audit
-        /// stays empty as well, which is the stronger statement: a reply that does not
-        /// answer the dispatched call is refused before it can be considered as
-        /// delivery evidence at all.
+        /// records each rejected terminal beside its unknown-effect receipt, so a reply
+        /// that does not answer the dispatched call is retained as bounded evidence
+        /// without being treated as a provider effect.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn replies_that_do_not_answer_the_dispatched_call_settle_nothing() {
             let provider = journey_double(AdversarialScriptV1::then(
@@ -6290,15 +6512,14 @@ mod tests {
             );
             assert_eq!(
                 receipt_count(fixture.journal_path()),
-                1,
-                "exactly the compliant attempt may leave a receipt: {}",
+                3,
+                "each rejected terminal and the compliant attempt leave bounded evidence: {}",
                 journal_snapshot(fixture.journal_path())
             );
             assert_eq!(
-                attempt_refusals(fixture.journal_path()),
-                Vec::new(),
-                "a reply that does not answer the dispatched call must be refused before it \
-                 is weighed as delivery evidence at all"
+                attempt_refusals(fixture.journal_path()).len(),
+                2,
+                "each registry-rejected terminal must leave durable refusal evidence"
             );
             assert_eq!(
                 provider.invocation_count(),
@@ -6381,8 +6602,8 @@ mod tests {
             );
             assert_eq!(
                 receipt_count(fixture.journal_path()),
-                1,
-                "only the reply bound to the host's own scope may leave a receipt: {}",
+                2,
+                "the rejected terminal and compliant retry must both leave evidence: {}",
                 journal_snapshot(fixture.journal_path())
             );
             assert_eq!(
@@ -6391,10 +6612,9 @@ mod tests {
                 "a provider's terminal moved the row onto the checkout the provider named"
             );
             assert_eq!(
-                attempt_refusals(fixture.journal_path()),
-                Vec::new(),
-                "a terminal bound to a foreign checkout must be refused before it is weighed \
-                 as delivery evidence at all"
+                attempt_refusals(fixture.journal_path()).len(),
+                1,
+                "the foreign-scope terminal must leave durable refusal evidence"
             );
             assert_eq!(
                 provider.invocation_count(),
@@ -8151,8 +8371,32 @@ mod tests {
             .backlog_metrics()
             .expect("an admitted record must publish the lane it landed in");
 
-        // Re-reading is what keeps it current. Whatever the delivery worker
-        // has done since, the published reading has to agree with the journal.
+        // Wait until the delivery worker has made the journal stable before
+        // comparing two independent reads. Otherwise it can drain between the
+        // publication and the assertion, which tests scheduling rather than
+        // republication.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = fixture
+                .journey
+                .journal
+                .inspect(&JournalInspectionFilterV1::default())
+                .expect("journal inspection")
+                .rows
+                .first()
+                .map(|row| row.state);
+            if state.is_some_and(DeliveryStateV1::is_terminal) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "delivery did not settle"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Re-reading is what keeps it current. The stable published reading
+        // has to agree with the journal.
         fixture.journey.report_backlog().await;
         let published = fixture
             .journey

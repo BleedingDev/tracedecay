@@ -43,9 +43,28 @@ use super::error::{AdapterFailureV1, ObservationRuntimeError, TerminalIdentityMi
 use super::wake::{DeliveryWakeV1, WakeOutcomeV1};
 
 /// What one delivery attempt produced.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum DeliveryAttemptV1 {
-    /// The provider answered with a typed terminal record.
+    /// The provider answered, but an adapter boundary rejected its terminal.
+    RejectedTerminal {
+        /// The provider terminal retained as audit evidence, never effect proof.
+        terminal: Box<TerminalRecord>,
+        /// Stable refusal category for the durable audit row.
+        category: AttemptRefusalCategoryV1,
+        /// Logical field rejected by the adapter boundary.
+        refused_field: &'static str,
+        /// Expected host-bound value, when the refusal compares values.
+        expected: Option<String>,
+        /// Provider-supplied value, when the refusal compares values.
+        provided: Option<String>,
+        /// Adapter's typed rejection retained for operator classification.
+        cause: AdapterFailureV1,
+        /// Instant the attempt started.
+        started_at_unix_micros: i64,
+        /// Instant the terminal was rejected.
+        finished_at_unix_micros: i64,
+    },
+    /// The provider answered with a terminal accepted by the adapter boundary.
     Answered {
         /// The provider's own terminal, carried verbatim so the receipt is
         /// derived from it rather than from the adapter's opinion of it.
@@ -163,7 +182,7 @@ pub struct DispatchRequestV1 {
     pub attempt_budget_micros: i64,
 }
 
-/// One delivery that produced no receipt.
+/// One delivery attempt that did not settle as an accepted receipt.
 #[derive(Debug)]
 pub struct DeliveryFailureV1 {
     /// Observation the attempt addressed.
@@ -401,8 +420,9 @@ where
     /// Shutdown is honoured at three points: a round that starts after shutdown
     /// leases nothing; a round interrupted between items releases the rest of
     /// its leases without an attempt; and an attempt that returns without a
-    /// receipt after its control was cancelled is counted as cancelled, not
-    /// failed. In every case the row stays `Pending` and no receipt is invented.
+    /// settled receipt after its control was cancelled is counted as cancelled,
+    /// not failed. A provider terminal refused after contact is retained as
+    /// refusal evidence with an unknown-effect receipt, but never settles the row.
     pub fn dispatch_batch(
         &self,
         request: &DispatchRequestV1,
@@ -508,6 +528,60 @@ where
                         }
                     }
                 }
+                DeliveryAttemptV1::RejectedTerminal {
+                    terminal,
+                    category,
+                    refused_field,
+                    expected,
+                    provided,
+                    cause,
+                    started_at_unix_micros,
+                    finished_at_unix_micros,
+                } => {
+                    if control.is_cancelled() {
+                        report.cancelled_in_flight = report.cancelled_in_flight.saturating_add(1);
+                        self.record_cancelled(
+                            &mut report,
+                            &item,
+                            started_at_unix_micros,
+                            finished_at_unix_micros,
+                            request.lease.now_unix_micros,
+                        )?;
+                        continue;
+                    }
+                    let refusal = Self::refusal_record(
+                        &item,
+                        &terminal,
+                        category,
+                        refused_field,
+                        expected,
+                        provided,
+                        &cause.to_string(),
+                        started_at_unix_micros,
+                        finished_at_unix_micros,
+                    );
+                    let receipt = ObservationDeliveryReceiptV1::from_refused_terminal(
+                        &item,
+                        started_at_unix_micros,
+                        finished_at_unix_micros,
+                    )?;
+                    let lease_released = self.persist_rejected_terminal(
+                        &mut report,
+                        &item,
+                        &refusal,
+                        &receipt,
+                        request
+                            .retry_backoff
+                            .next_attempt_at(request.lease.now_unix_micros, item.attempt_number),
+                    )?;
+                    report.failures.push(DeliveryFailureV1 {
+                        observation_id: item.observation_id.clone(),
+                        attempt_number: item.attempt_number,
+                        lease_released,
+                        cause,
+                    });
+                    continue;
+                }
                 DeliveryAttemptV1::Answered {
                     terminal,
                     started_at_unix_micros,
@@ -534,8 +608,7 @@ where
                         // attempt number it consumed is gone. Record the refusal
                         // durably first, then release, so a crash here cannot
                         // erase the fact that the provider answered.
-                        self.record_refusal(
-                            &mut report,
+                        let refusal = Self::refusal_record(
                             &item,
                             &terminal,
                             AttemptRefusalCategoryV1::TerminalIdentityMismatch,
@@ -545,15 +618,16 @@ where
                             &mismatch.to_string(),
                             started_at_unix_micros,
                             finished_at_unix_micros,
-                        )?;
+                        );
                         let receipt = ObservationDeliveryReceiptV1::from_refused_terminal(
                             &item,
                             started_at_unix_micros,
                             finished_at_unix_micros,
                         )?;
-                        let lease_released = self.record_unsettled(
+                        let lease_released = self.persist_rejected_terminal(
                             &mut report,
                             &item,
+                            &refusal,
                             &receipt,
                             request.retry_backoff.next_attempt_at(
                                 request.lease.now_unix_micros,
@@ -576,8 +650,7 @@ where
                     ) {
                         Ok(receipt) => receipt,
                         Err(cause) => {
-                            self.record_refusal(
-                                &mut report,
+                            let refusal = Self::refusal_record(
                                 &item,
                                 &terminal,
                                 AttemptRefusalCategoryV1::ReceiptNotAdmissible,
@@ -587,15 +660,16 @@ where
                                 &cause.to_string(),
                                 started_at_unix_micros,
                                 finished_at_unix_micros,
-                            )?;
+                            );
                             let receipt = ObservationDeliveryReceiptV1::from_refused_terminal(
                                 &item,
                                 started_at_unix_micros,
                                 finished_at_unix_micros,
                             )?;
-                            let lease_released = self.record_unsettled(
+                            let lease_released = self.persist_rejected_terminal(
                                 &mut report,
                                 &item,
+                                &refusal,
                                 &receipt,
                                 request.retry_backoff.next_attempt_at(
                                     request.lease.now_unix_micros,
@@ -763,23 +837,8 @@ where
         Ok(())
     }
 
-    /// Writes durable evidence that a provider answered this attempt and the
-    /// host refused the answer.
-    ///
-    /// This is the detailed companion to the attempt's host-owned
-    /// unknown-effect receipt: no provider effect is attributed, and the row
-    /// still goes back on the retry curve. It preserves the thing the in-memory
-    /// batch report cannot — that attempt number `n` of this observation was
-    /// spent on a terminal the host rejected, and why. Without it a crash
-    /// right after the refusal leaves a consumed attempt with no trace of what
-    /// consumed it.
-    ///
-    /// The runtime owns no clock, so the refusal is stamped with the attempt's
-    /// own finish instant rather than an invented one.
     #[allow(clippy::too_many_arguments)]
-    fn record_refusal(
-        &self,
-        report: &mut DeliveryBatchReportV1,
+    fn refusal_record(
         item: &LeasedObservationV1,
         terminal: &TerminalRecord,
         category: AttemptRefusalCategoryV1,
@@ -789,11 +848,9 @@ where
         detail: &str,
         started_at_unix_micros: i64,
         finished_at_unix_micros: i64,
-    ) -> Result<(), ObservationRuntimeError> {
-        // An adapter with a disagreeing clock must not turn a refusal into a
-        // lost record, so the window is ordered rather than rejected.
+    ) -> AttemptRefusalRecordV1 {
         let finished_at_unix_micros = finished_at_unix_micros.max(started_at_unix_micros);
-        let refusal = AttemptRefusalRecordV1 {
+        AttemptRefusalRecordV1 {
             observation_id: item.observation_id.clone(),
             attempt_number: item.attempt_number,
             idempotency_key: item.idempotency_key.clone(),
@@ -817,16 +874,33 @@ where
             started_at_unix_micros,
             finished_at_unix_micros,
             recorded_at_unix_micros: finished_at_unix_micros,
-        };
-        match self.reader.record_attempt_refusal(&refusal)? {
+        }
+    }
+
+    fn persist_rejected_terminal(
+        &self,
+        report: &mut DeliveryBatchReportV1,
+        item: &LeasedObservationV1,
+        refusal: &AttemptRefusalRecordV1,
+        receipt: &ObservationDeliveryReceiptV1,
+        retry_after_unix_micros: i64,
+    ) -> Result<bool, ObservationRuntimeError> {
+        let (refusal_outcome, attempt_outcome) = self.reader.record_refused_terminal_attempt(
+            refusal,
+            receipt,
+            &item.lease_id,
+            retry_after_unix_micros,
+        )?;
+        match refusal_outcome {
             AttemptRefusalOutcomeV1::Recorded => {
                 report.refusals_recorded = report.refusals_recorded.saturating_add(1);
             }
             AttemptRefusalOutcomeV1::AlreadyRecorded => {
                 report.duplicate_refusals = report.duplicate_refusals.saturating_add(1);
             }
+            AttemptRefusalOutcomeV1::LeaseLost => {}
         }
-        Ok(())
+        Ok(Self::account_unsettled_outcome(report, attempt_outcome))
     }
 
     fn record_cancelled(
@@ -846,18 +920,11 @@ where
         Ok(())
     }
 
-    fn record_unsettled(
-        &self,
+    fn account_unsettled_outcome(
         report: &mut DeliveryBatchReportV1,
-        item: &LeasedObservationV1,
-        receipt: &ObservationDeliveryReceiptV1,
-        retry_after_unix_micros: i64,
-    ) -> Result<bool, ObservationRuntimeError> {
-        match self.reader.record_unsettled_attempt(
-            receipt,
-            &item.lease_id,
-            retry_after_unix_micros,
-        )? {
+        outcome: AttemptOutcomeV1,
+    ) -> bool {
+        match outcome {
             AttemptOutcomeV1::Recorded {
                 state,
                 next_attempt_at_unix_micros,
@@ -870,19 +937,35 @@ where
                 if next_attempt_at_unix_micros.is_some() {
                     report.retry_scheduled = report.retry_scheduled.saturating_add(1);
                 }
-                return Ok(true);
+                true
             }
             AttemptOutcomeV1::DuplicateReceipt { state } => {
                 report.duplicate_receipts = report.duplicate_receipts.saturating_add(1);
                 if state.is_terminal() {
                     report.settled_terminal = report.settled_terminal.saturating_add(1);
                 }
+                false
             }
             AttemptOutcomeV1::LeaseLost { .. } => {
                 report.leases_lost = report.leases_lost.saturating_add(1);
+                false
             }
         }
-        Ok(false)
+    }
+
+    fn record_unsettled(
+        &self,
+        report: &mut DeliveryBatchReportV1,
+        item: &LeasedObservationV1,
+        receipt: &ObservationDeliveryReceiptV1,
+        retry_after_unix_micros: i64,
+    ) -> Result<bool, ObservationRuntimeError> {
+        let outcome = self.reader.record_unsettled_attempt(
+            receipt,
+            &item.lease_id,
+            retry_after_unix_micros,
+        )?;
+        Ok(Self::account_unsettled_outcome(report, outcome))
     }
 
     fn fail_attempt(

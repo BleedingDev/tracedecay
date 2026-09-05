@@ -2,9 +2,9 @@
 //! state identity, and the bounded repair counter.
 //!
 //! One row per `(provider registration, source authority, exact scope, source
-//! stream)`. The acknowledged watermark is written by the acknowledging
-//! receipt, in that receipt's own transaction, and the only statement that
-//! touches it carries `WHERE excluded.acknowledged_sequence >
+//! stream)`. The acknowledged watermark advances in bounded receipt and recovery
+//! transactions, and the only statement that touches it carries
+//! `WHERE excluded.acknowledged_sequence >
 //! tdmem_observation_recovery_v1.acknowledged_sequence`. There is no `UPDATE`
 //! anywhere in this crate that can lower it, which is how monotonicity is
 //! structural rather than a convention — a retention sweep or a privacy
@@ -56,6 +56,7 @@ WHERE j.provider_id = ?1 AND j.registration_revision = ?2 AND j.source_authority
   AND j.exact_scope_sha256 = ?4 AND j.source_stream = ?5
   AND (?6 IS NULL OR j.source_sequence > ?6)
 ORDER BY j.source_sequence
+LIMIT ?7
 "#;
 
 const SELECT_RECOVERY_STATE: &str = r#"
@@ -138,14 +139,32 @@ pub(super) struct AcknowledgedWriteV1<'a> {
     pub(super) source_stream: &'a str,
 }
 
+#[derive(Clone, Copy)]
+struct AcknowledgedGapScanBudgetV1(u32);
+
+impl AcknowledgedGapScanBudgetV1 {
+    fn new(rows: u32) -> Result<Self, ObservationJournalError> {
+        if rows == 0 {
+            return Err(ObservationJournalError::ValueOutOfRange {
+                field: "acknowledged_gap_scan_rows",
+            });
+        }
+        Ok(Self(rows))
+    }
+}
+
+const ACKNOWLEDGED_GAP_SCAN_ROWS: u32 = 8;
+
 /// Advances the durable watermark to the highest contiguous acknowledged prefix.
 ///
 /// Called inside the acknowledging receipt's own transaction, so the receipt
 /// that closes a gap and every later acknowledgement are visible together. The
-/// scan begins strictly after the already-durable watermark and stops at the
-/// first committed row without acknowledging evidence. The monotonic upsert is
-/// retained because acknowledged rows may later be deleted: deletion must not
-/// lower a position the host already proved.
+/// scan begins strictly after the already-durable watermark, reads at most one
+/// validated page per receipt or recovery transaction, and stops at the first
+/// committed row without acknowledging evidence. Recovery reads resume after
+/// the persisted watermark even when no further receipts arrive. The monotonic
+/// upsert is retained because acknowledged rows may later be deleted: deletion
+/// must not lower a position the host already proved.
 pub(super) fn advance_acknowledged_watermark(
     transaction: &Transaction<'_>,
     write: &AcknowledgedWriteV1<'_>,
@@ -167,6 +186,7 @@ pub(super) fn advance_acknowledged_watermark(
         .optional()?
         .flatten();
 
+    let budget = AcknowledgedGapScanBudgetV1::new(ACKNOWLEDGED_GAP_SCAN_ROWS)?;
     let mut statement = transaction.prepare(SELECT_ACKNOWLEDGED_SUFFIX)?;
     let mut rows = statement.query(params![
         write.provider_id,
@@ -175,6 +195,7 @@ pub(super) fn advance_acknowledged_watermark(
         write.exact_scope_sha256,
         write.source_stream,
         current,
+        i64::from(budget.0),
     ])?;
     let mut contiguous = None;
     while let Some(row) = rows.next()? {
@@ -186,8 +207,6 @@ pub(super) fn advance_acknowledged_watermark(
         };
         contiguous = Some((sequence, observation_id, acknowledged_at_unix_micros));
     }
-    drop(rows);
-    drop(statement);
 
     if let Some((sequence, observation_id, acknowledged_at_unix_micros)) = contiguous {
         transaction.execute(
@@ -219,8 +238,20 @@ impl ObservationRecoveryPortV1 for SqliteObservationJournal {
     ) -> Result<Option<HostRecoveryStateV1>, ObservationJournalError> {
         target.validate()?;
         let revision = sql_i64(target.registration_revision, "registration_revision")?;
-        self.with_bounded_connection("recovery_state", budget, |connection| {
-            let row = connection
+        self.with_bounded_transaction("recovery_state", budget, |transaction| {
+            // One recovery assessment refreshes one page, durably resuming a
+            // gap-closing receipt's unfinished suffix within the same budget.
+            advance_acknowledged_watermark(
+                transaction,
+                &AcknowledgedWriteV1 {
+                    provider_id: target.provider_id.as_str(),
+                    registration_revision: revision,
+                    source_authority: target.stream.source_authority.as_wire(),
+                    exact_scope_sha256: target.stream.exact_scope_sha256.as_str(),
+                    source_stream: target.stream.source_stream.as_str(),
+                },
+            )?;
+            let row = transaction
                 .query_row(
                     SELECT_RECOVERY_STATE,
                     params![

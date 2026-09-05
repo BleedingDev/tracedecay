@@ -143,10 +143,10 @@ pub use supervisor::{
 pub use tracedecay_memory_fabric::{
     ActiveCallPlan, ActiveRoutingPolicy, DegradationCause, DegradationDecision,
     DegradationDeclinedReason, DegradationRule, FabricConfig, FabricError, FallbackDecision,
-    FallbackDeclinedReason, FallbackRule, ObserverReceipt, PinnedDegradationPolicy,
-    ProviderCapabilityAvailability, ProviderMode, ProviderReadiness, ProviderStatus,
-    ReadyRouteTarget, RouteTarget, RoutedActiveReply, RoutedProviderIdentity, RoutingError,
-    RoutingPolicyError,
+    FallbackDeclinedReason, FallbackRule, ObserverDeliveryResult, ObserverReceipt,
+    PinnedDegradationPolicy, ProviderCapabilityAvailability, ProviderMode, ProviderReadiness,
+    ProviderStatus, ReadyRouteTarget, RouteTarget, RoutedActiveReply, RoutedProviderIdentity,
+    RoutingError, RoutingPolicyError,
 };
 // Re-export the narrow provider-neutral surface that product composition needs
 // to implement an application port. The product crate deliberately depends on
@@ -885,6 +885,14 @@ impl ProjectMemoryProviderRegistry {
     /// carry a provider result payload, opaque extensions, or warning text.
     pub fn deliver_observation(&self, call: &ProviderCall) -> Result<ObserverReceipt, FabricError> {
         self.fabric.deliver_observation(call)
+    }
+
+    /// Delivers an observation while retaining a rejected provider terminal.
+    pub fn deliver_observation_result(
+        &self,
+        call: &ProviderCall,
+    ) -> Result<ObserverDeliveryResult, FabricError> {
+        self.fabric.deliver_observation_result(call)
     }
 
     /// Registers the one selected adapter under the identity and the recall

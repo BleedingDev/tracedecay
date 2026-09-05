@@ -218,13 +218,18 @@ fn acknowledged_sequence_closes_gaps_and_is_monotonic_across_deletion() -> TestR
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("observation-journal.sqlite3");
     let store = journal(&path)?;
-    for sequence in 1..=3 {
+    for sequence in 1..=28 {
         store.append_admitted(&Builder::at_sequence(sequence).build()?)?;
     }
-    let leased = store.lease_pending(&lease_request(T0, 3))?;
+    let leased = store.lease_pending(&lease_request(T0, 28))?;
+    assert_eq!(leased.len(), 28, "fixture must span multiple gap-scan pages");
 
-    // Sequence three cannot authorize skipping the still-unacknowledged prefix.
-    store.record_attempt(&applied_receipt(&leased[2], T0))?;
+    // A suffix larger than the internal page budget cannot authorize skipping
+    // the still-unacknowledged prefix. Record it first so closing sequence one
+    // has to continue across more than one bounded scan round.
+    for item in leased.iter().skip(1) {
+        store.record_attempt(&applied_receipt(item, T0))?;
+    }
     assert_eq!(
         store
             .recovery_state(&target()?, open_budget())?
@@ -232,24 +237,44 @@ fn acknowledged_sequence_closes_gaps_and_is_monotonic_across_deletion() -> TestR
         None
     );
 
-    // Acknowledging one advances only through one; acknowledging two then
-    // closes the gap and incorporates the already-durable receipt for three.
+    // Observe the stored projection without starting another recovery round.
+    let stored_sequence = || -> Result<u64, Box<dyn std::error::Error>> {
+        Ok(u64::try_from(Connection::open(&path)?.query_row(
+            "SELECT acknowledged_sequence FROM tdmem_observation_recovery_v1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?)?)
+    };
+
+    // This is the final receipt write. Its transaction may inspect one page,
+    // even though all 28 rows now have acknowledging evidence.
     store.record_attempt(&applied_receipt(&leased[0], T0 + SECOND))?;
-    let after_one = store
-        .recovery_state(&target()?, open_budget())?
-        .ok_or("recovery state missing after acknowledging the prefix")?;
-    assert_eq!(
-        after_one.acknowledged.map(|position| position.sequence),
-        Some(SourceSequenceV1(1))
-    );
-    store.record_attempt(&applied_receipt(&leased[1], T0 + 2 * SECOND))?;
-    let closed = store
-        .recovery_state(&target()?, open_budget())?
-        .ok_or("recovery state missing after closing the gap")?;
-    assert_eq!(
-        closed.acknowledged.map(|position| position.sequence),
-        Some(SourceSequenceV1(3))
-    );
+    assert_eq!(stored_sequence()?, 8, "receipt exceeded its eight-row budget");
+    drop(store);
+
+    // Real recovery assessments must finish the projection without any new or
+    // duplicate receipt. Restart between rounds proves the resume is durable.
+    let mut previous = 8;
+    for expected in [16, 24, 28] {
+        let store = journal(&path)?;
+        assert_eq!(stored_sequence()?, previous);
+        let runtime = RecoveryRuntimeV1::new(&store, budget(3))?;
+        let now = T0 + 2 * SECOND;
+        assert_eq!(
+            runtime.assess(&checkpoint(SCHEMA_V1, 9, NO_POSITION)?, &control(now), now)?,
+            RecoveryPlanV1::Converged {
+                acknowledged_through: Some(SourceSequenceV1(expected)),
+                expected_state_generation: 9,
+            },
+            "one assessment must refresh at most one eight-row page"
+        );
+        assert_eq!(stored_sequence()?, expected);
+        for item in &leased {
+            assert_eq!(store.receipts_for(&item.observation_id)?.len(), 1);
+        }
+        previous = expected;
+    }
+    let store = journal(&path)?;
 
     // Privacy deletion removes the acknowledged rows, but cannot lower the
     // already-proved durable prefix and re-propose provider effects.
@@ -269,7 +294,7 @@ fn acknowledged_sequence_closes_gaps_and_is_monotonic_across_deletion() -> TestR
         after_deletion
             .acknowledged
             .map(|position| position.sequence),
-        Some(SourceSequenceV1(3))
+        Some(SourceSequenceV1(28))
     );
     Ok(())
 }
@@ -849,7 +874,7 @@ fn recovery_blocked_by_another_writer_reports_the_budget_spent() -> TestResult {
     match error {
         ObservationRuntimeError::Journal(ObservationJournalError::BudgetExhausted {
             operation,
-        }) => assert_eq!(operation, "accept_checkpoint"),
+        }) => assert_eq!(operation, "recovery_state"),
         other => return Err(format!("expected a spent budget, got {other:?}").into()),
     }
     assert!(

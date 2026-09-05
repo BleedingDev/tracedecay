@@ -8,6 +8,7 @@ description = "Bounded capability-driven orchestration for TraceDecay cognitive 
 repository = "https://github.com/BleedingDev/tracedecay"
 
 [dependencies]
+tracing = "0.1"
 tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
 
 [lints.rust]

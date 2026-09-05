@@ -570,6 +570,252 @@ fn insert_receipt_row(
     }
 }
 
+fn validate_attempt_refusal_binding(
+    transaction: &Transaction<'_>,
+    refusal: &AttemptRefusalRecordV1,
+) -> Result<(), ObservationJournalError> {
+    let bound: Option<(String, String, i64, String, i64, Option<String>)> = transaction
+        .query_row(
+            "SELECT d.idempotency_key, d.provider_id, d.registration_revision, \
+                    d.exact_scope_sha256, d.attempt_number, d.last_provider_instance_id \
+             FROM tdmem_observation_delivery_v1 d \
+             WHERE d.observation_id = ?1",
+            params![refusal.observation_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        idempotency_key,
+        provider_id,
+        registration_revision,
+        exact_scope_sha256,
+        attempt_number,
+        provider_instance_id,
+    )) = bound
+    else {
+        return Err(ObservationJournalError::UnknownObservation {
+            observation_id: refusal.observation_id.as_str().to_owned(),
+        });
+    };
+    for (matches, field) in [
+        (
+            idempotency_key == refusal.idempotency_key.as_str(),
+            "idempotency_key",
+        ),
+        (provider_id == refusal.provider_id, "provider_id"),
+        (
+            registration_revision
+                == sql_i64(refusal.registration_revision, "registration_revision")?,
+            "registration_revision",
+        ),
+        (
+            exact_scope_sha256 == refusal.exact_scope_sha256,
+            "exact_scope_sha256",
+        ),
+        (
+            attempt_number == i64::from(refusal.attempt_number),
+            "attempt_number",
+        ),
+        (
+            provider_instance_id.as_deref() == Some(refusal.provider_instance_id.as_str()),
+            "provider_instance_id",
+        ),
+    ] {
+        if !matches {
+            return Err(ObservationJournalError::AttemptRefusalBindingMismatch { field });
+        }
+    }
+    Ok(())
+}
+
+fn insert_attempt_refusal(
+    transaction: &Transaction<'_>,
+    refusal: &AttemptRefusalRecordV1,
+    registration: i64,
+) -> Result<AttemptRefusalOutcomeV1, ObservationJournalError> {
+    validate_attempt_refusal_binding(transaction, refusal)?;
+    match transaction.execute(
+        INSERT_ATTEMPT_REFUSAL,
+        params![
+            refusal.observation_id.as_str(),
+            i64::from(refusal.attempt_number),
+            refusal.idempotency_key.as_str(),
+            &refusal.provider_id,
+            &refusal.provider_instance_id,
+            registration,
+            &refusal.exact_scope_sha256,
+            refusal.category.as_wire(),
+            &refusal.refused_field,
+            refusal.expected.as_deref(),
+            refusal.provided.as_deref(),
+            &refusal.detail,
+            &refusal.terminal_operation,
+            &refusal.terminal_code,
+            &refusal.terminal_operation_id,
+            refusal.provider_receipt_digest.as_deref(),
+            refusal.started_at_unix_micros,
+            refusal.finished_at_unix_micros,
+            refusal.recorded_at_unix_micros,
+        ],
+    ) {
+        Ok(_) => Ok(AttemptRefusalOutcomeV1::Recorded),
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == ErrorCode::ConstraintViolation
+                && matches!(error.extended_code, 1555 | 2067) =>
+        {
+            Ok(AttemptRefusalOutcomeV1::AlreadyRecorded)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_unsettled_attempt_receipt(
+    receipt: &ObservationDeliveryReceiptV1,
+) -> Result<(), ObservationJournalError> {
+    receipt.validate()?;
+    if !matches!(
+        receipt.outcome,
+        ObservationOutcomeV1::Cancelled | ObservationOutcomeV1::EffectUnknown
+    ) || receipt.committed_effect != ObservationCommittedEffectV1::Unknown
+        || receipt.provider_instance_id.is_none()
+        || receipt.state_generation_before.is_some()
+        || receipt.state_generation_after.is_some()
+        || receipt.provider_receipt_digest.is_some()
+        || receipt.provider_effect_summary != ProviderEffectSummaryV1::default()
+        || !receipt.warnings.is_empty()
+    {
+        return Err(ObservationJournalError::Corrupt {
+            table: "tdmem_observation_receipt_v1",
+            field: "unsettled_attempt_evidence",
+        });
+    }
+    Ok(())
+}
+
+fn record_unsettled_attempt_in_transaction(
+    transaction: &Transaction<'_>,
+    receipt: &ObservationDeliveryReceiptV1,
+    lease: &DispatchLeaseIdV1,
+    retry_after_unix_micros: i64,
+) -> Result<AttemptOutcomeV1, ObservationJournalError> {
+    let journal = read_journal_row(transaction, receipt.observation_id.as_str())?;
+    if journal.payload_sha256 != receipt.payload_sha256 {
+        return Err(ObservationJournalError::ReceiptDigestMismatch {
+            field: "payload_sha256",
+        });
+    }
+    if journal.extensions_digest != receipt.extensions_digest {
+        return Err(ObservationJournalError::ReceiptDigestMismatch {
+            field: "extensions_digest",
+        });
+    }
+    if journal.provider_id != receipt.provider_id.as_str() {
+        return Err(ObservationJournalError::ReceiptDigestMismatch {
+            field: "provider_id",
+        });
+    }
+    if journal.registration_revision
+        != sql_i64(receipt.registration_revision, "registration_revision")?
+    {
+        return Err(ObservationJournalError::ReceiptDigestMismatch {
+            field: "registration_revision",
+        });
+    }
+    let stored_key: Option<String> = transaction
+        .query_row(
+            "SELECT idempotency_key FROM tdmem_observation_delivery_v1 \
+                     WHERE observation_id = ?1",
+            params![receipt.observation_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if stored_key.as_deref() != Some(receipt.idempotency_key.as_str()) {
+        return Err(ObservationJournalError::ReceiptDigestMismatch {
+            field: "idempotency_key",
+        });
+    }
+
+    // Release only the exact lease that produced this evidence. Do
+    // this before insertion so a stale dispatcher cannot commit a
+    // cancellation receipt after its lease was reaped or replaced;
+    // any later insertion failure rolls this update back.
+    let changed = transaction.execute(
+        RECORD_UNSETTLED_ATTEMPT,
+        params![
+            retry_after_unix_micros,
+            receipt.outcome.as_wire(),
+            receipt.committed_effect.as_wire(),
+            receipt.receipt_id.as_str(),
+            receipt.provider_instance_id.as_deref(),
+            receipt.finished_at_unix_micros,
+            receipt.observation_id.as_str(),
+            receipt.idempotency_key.as_str(),
+            lease.as_str(),
+            i64::from(receipt.attempt_number),
+            receipt.provider_instance_id.as_deref(),
+        ],
+    )?;
+    if changed != 1 {
+        return Ok(AttemptOutcomeV1::LeaseLost {
+            receipt_id: receipt.receipt_id.clone(),
+        });
+    }
+
+    let summary_json = encode_json(
+        &receipt.provider_effect_summary,
+        "provider_effect_summary_json",
+    )?;
+    let inserted = insert_receipt_row(
+        transaction,
+        receipt.observation_id.as_str(),
+        receipt.attempt_number,
+        receipt.receipt_id.as_str(),
+        receipt.idempotency_key.as_str(),
+        &receipt.payload_sha256,
+        &receipt.extensions_digest,
+        receipt.provider_id.as_str(),
+        receipt.provider_instance_id.as_deref(),
+        sql_i64(receipt.registration_revision, "registration_revision")?,
+        receipt
+            .state_generation_before
+            .map(|value| sql_i64(value, "state_generation_before"))
+            .transpose()?,
+        receipt
+            .state_generation_after
+            .map(|value| sql_i64(value, "state_generation_after"))
+            .transpose()?,
+        receipt.outcome,
+        receipt.committed_effect,
+        &summary_json,
+        receipt.provider_receipt_digest.as_deref(),
+        receipt.started_at_unix_micros,
+        receipt.finished_at_unix_micros,
+    )?;
+    if !inserted {
+        // A matching live lease cannot already have a receipt: normal
+        // settlement and cancellation both write receipt plus lease
+        // transition atomically. Fail closed so the preceding release
+        // is rolled back rather than binding it to unrelated evidence.
+        return Err(ObservationJournalError::Corrupt {
+            table: "tdmem_observation_receipt_v1",
+            field: "attempt_number",
+        });
+    }
+    Ok(AttemptOutcomeV1::Recorded {
+        state: DeliveryStateV1::Pending,
+        next_attempt_at_unix_micros: Some(retry_after_unix_micros),
+    })
+}
+
 impl ObservationJournalReaderV1 for SqliteObservationJournal {
     fn lease_pending(
         &self,
@@ -778,9 +1024,9 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
                 return Ok(AttemptOutcomeV1::DuplicateReceipt { state });
             }
 
-            // Written in the receipt's own transaction: a crash can never
-            // leave an acknowledgement without its watermark, or a watermark
-            // without the receipt that justifies it.
+            // Advance one bounded prefix page in the receipt's own transaction:
+            // no watermark can lack the evidence that justifies it. Recovery
+            // rounds finish any acknowledged suffix beyond this page.
             advance_watermark_for(transaction, &journal, receipt)?;
             let settled = settle_delivery(transaction, receipt, &policy)?;
             if !settled.advanced {
@@ -813,131 +1059,75 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
         lease: &DispatchLeaseIdV1,
         retry_after_unix_micros: i64,
     ) -> Result<AttemptOutcomeV1, ObservationJournalError> {
-        receipt.validate()?;
-        if !matches!(
-            receipt.outcome,
-            ObservationOutcomeV1::Cancelled | ObservationOutcomeV1::EffectUnknown
-        ) || receipt.committed_effect != ObservationCommittedEffectV1::Unknown
-            || receipt.provider_instance_id.is_none()
-            || receipt.state_generation_before.is_some()
-            || receipt.state_generation_after.is_some()
-            || receipt.provider_receipt_digest.is_some()
-            || receipt.provider_effect_summary != ProviderEffectSummaryV1::default()
-            || !receipt.warnings.is_empty()
-        {
+        validate_unsettled_attempt_receipt(receipt)?;
+        self.with_transaction(|transaction| {
+            record_unsettled_attempt_in_transaction(
+                transaction,
+                receipt,
+                lease,
+                retry_after_unix_micros,
+            )
+        })
+    }
+
+    fn record_refused_terminal_attempt(
+        &self,
+        refusal: &AttemptRefusalRecordV1,
+        receipt: &ObservationDeliveryReceiptV1,
+        lease: &DispatchLeaseIdV1,
+        retry_after_unix_micros: i64,
+    ) -> Result<(AttemptRefusalOutcomeV1, AttemptOutcomeV1), ObservationJournalError> {
+        refusal.validate()?;
+        validate_unsettled_attempt_receipt(receipt)?;
+        if receipt.outcome != ObservationOutcomeV1::EffectUnknown {
             return Err(ObservationJournalError::Corrupt {
                 table: "tdmem_observation_receipt_v1",
                 field: "unsettled_attempt_evidence",
             });
         }
+        // Independently valid evidence may still belong to two different
+        // attempts. Bind the pair before either can mutate durable state.
+        for (matches, field) in [
+            (
+                refusal.observation_id == receipt.observation_id,
+                "observation_id",
+            ),
+            (
+                refusal.idempotency_key == receipt.idempotency_key,
+                "idempotency_key",
+            ),
+            (
+                refusal.provider_id == receipt.provider_id.as_str(),
+                "provider_id",
+            ),
+            (
+                refusal.registration_revision == receipt.registration_revision,
+                "registration_revision",
+            ),
+            (
+                Some(refusal.provider_instance_id.as_str()) == receipt.provider_instance_id.as_deref(),
+                "provider_instance_id",
+            ),
+            (refusal.attempt_number == receipt.attempt_number, "attempt_number"),
+        ] {
+            if !matches {
+                return Err(ObservationJournalError::AttemptRefusalBindingMismatch { field });
+            }
+        }
+        let registration = sql_i64(refusal.registration_revision, "registration_revision")?;
         self.with_transaction(|transaction| {
-            let journal = read_journal_row(transaction, receipt.observation_id.as_str())?;
-            if journal.payload_sha256 != receipt.payload_sha256 {
-                return Err(ObservationJournalError::ReceiptDigestMismatch {
-                    field: "payload_sha256",
-                });
-            }
-            if journal.extensions_digest != receipt.extensions_digest {
-                return Err(ObservationJournalError::ReceiptDigestMismatch {
-                    field: "extensions_digest",
-                });
-            }
-            if journal.provider_id != receipt.provider_id.as_str() {
-                return Err(ObservationJournalError::ReceiptDigestMismatch {
-                    field: "provider_id",
-                });
-            }
-            if journal.registration_revision
-                != sql_i64(receipt.registration_revision, "registration_revision")?
-            {
-                return Err(ObservationJournalError::ReceiptDigestMismatch {
-                    field: "registration_revision",
-                });
-            }
-            let stored_key: Option<String> = transaction
-                .query_row(
-                    "SELECT idempotency_key FROM tdmem_observation_delivery_v1 \
-                     WHERE observation_id = ?1",
-                    params![receipt.observation_id.as_str()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if stored_key.as_deref() != Some(receipt.idempotency_key.as_str()) {
-                return Err(ObservationJournalError::ReceiptDigestMismatch {
-                    field: "idempotency_key",
-                });
-            }
-
-            // Release only the exact lease that produced this evidence. Do
-            // this before insertion so a stale dispatcher cannot commit a
-            // cancellation receipt after its lease was reaped or replaced;
-            // any later insertion failure rolls this update back.
-            let changed = transaction.execute(
-                RECORD_UNSETTLED_ATTEMPT,
-                params![
-                    retry_after_unix_micros,
-                    receipt.outcome.as_wire(),
-                    receipt.committed_effect.as_wire(),
-                    receipt.receipt_id.as_str(),
-                    receipt.provider_instance_id.as_deref(),
-                    receipt.finished_at_unix_micros,
-                    receipt.observation_id.as_str(),
-                    receipt.idempotency_key.as_str(),
-                    lease.as_str(),
-                    i64::from(receipt.attempt_number),
-                    receipt.provider_instance_id.as_deref(),
-                ],
-            )?;
-            if changed != 1 {
-                return Ok(AttemptOutcomeV1::LeaseLost {
-                    receipt_id: receipt.receipt_id.clone(),
-                });
-            }
-
-            let summary_json = encode_json(
-                &receipt.provider_effect_summary,
-                "provider_effect_summary_json",
-            )?;
-            let inserted = insert_receipt_row(
+            validate_attempt_refusal_binding(transaction, refusal)?;
+            let attempt_outcome = record_unsettled_attempt_in_transaction(
                 transaction,
-                receipt.observation_id.as_str(),
-                receipt.attempt_number,
-                receipt.receipt_id.as_str(),
-                receipt.idempotency_key.as_str(),
-                &receipt.payload_sha256,
-                &receipt.extensions_digest,
-                receipt.provider_id.as_str(),
-                receipt.provider_instance_id.as_deref(),
-                sql_i64(receipt.registration_revision, "registration_revision")?,
-                receipt
-                    .state_generation_before
-                    .map(|value| sql_i64(value, "state_generation_before"))
-                    .transpose()?,
-                receipt
-                    .state_generation_after
-                    .map(|value| sql_i64(value, "state_generation_after"))
-                    .transpose()?,
-                receipt.outcome,
-                receipt.committed_effect,
-                &summary_json,
-                receipt.provider_receipt_digest.as_deref(),
-                receipt.started_at_unix_micros,
-                receipt.finished_at_unix_micros,
+                receipt,
+                lease,
+                retry_after_unix_micros,
             )?;
-            if !inserted {
-                // A matching live lease cannot already have a receipt: normal
-                // settlement and cancellation both write receipt plus lease
-                // transition atomically. Fail closed so the preceding release
-                // is rolled back rather than binding it to unrelated evidence.
-                return Err(ObservationJournalError::Corrupt {
-                    table: "tdmem_observation_receipt_v1",
-                    field: "attempt_number",
-                });
+            if matches!(attempt_outcome, AttemptOutcomeV1::LeaseLost { .. }) {
+                return Ok((AttemptRefusalOutcomeV1::LeaseLost, attempt_outcome));
             }
-            Ok(AttemptOutcomeV1::Recorded {
-                state: DeliveryStateV1::Pending,
-                next_attempt_at_unix_micros: Some(retry_after_unix_micros),
-            })
+            let refusal_outcome = insert_attempt_refusal(transaction, refusal, registration)?;
+            Ok((refusal_outcome, attempt_outcome))
         })
     }
 
@@ -1141,55 +1331,7 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
         refusal.validate()?;
         let registration = sql_i64(refusal.registration_revision, "registration_revision")?;
         self.with_transaction(|transaction| {
-            // The observation must exist: a refusal about a delivery this store
-            // never admitted is evidence about nothing.
-            let known: Option<i64> = transaction
-                .query_row(
-                    "SELECT 1 FROM tdmem_observation_journal_v1 WHERE observation_id = ?1",
-                    params![refusal.observation_id.as_str()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if known.is_none() {
-                return Err(ObservationJournalError::UnknownObservation {
-                    observation_id: refusal.observation_id.as_str().to_owned(),
-                });
-            }
-            match transaction.execute(
-                INSERT_ATTEMPT_REFUSAL,
-                params![
-                    refusal.observation_id.as_str(),
-                    i64::from(refusal.attempt_number),
-                    refusal.idempotency_key.as_str(),
-                    &refusal.provider_id,
-                    &refusal.provider_instance_id,
-                    registration,
-                    &refusal.exact_scope_sha256,
-                    refusal.category.as_wire(),
-                    &refusal.refused_field,
-                    refusal.expected.as_deref(),
-                    refusal.provided.as_deref(),
-                    &refusal.detail,
-                    &refusal.terminal_operation,
-                    &refusal.terminal_code,
-                    &refusal.terminal_operation_id,
-                    refusal.provider_receipt_digest.as_deref(),
-                    refusal.started_at_unix_micros,
-                    refusal.finished_at_unix_micros,
-                    refusal.recorded_at_unix_micros,
-                ],
-            ) {
-                Ok(_) => Ok(AttemptRefusalOutcomeV1::Recorded),
-                // The standing refusal stands; refusals are never rewritten.
-                Err(rusqlite::Error::SqliteFailure(error, message))
-                    if error.code == ErrorCode::ConstraintViolation
-                        && matches!(error.extended_code, 1555 | 2067) =>
-                {
-                    let _ = message;
-                    Ok(AttemptRefusalOutcomeV1::AlreadyRecorded)
-                }
-                Err(error) => Err(error.into()),
-            }
+            insert_attempt_refusal(transaction, refusal, registration)
         })
     }
 

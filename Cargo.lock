@@ -6774,6 +6774,7 @@ name = "tracedecay-memory-fabric"
 version = "0.1.0-beta.37"
 dependencies = [
  "tracedecay-memory-provider-api",
+ "tracing",
 ]
 
 [[package]]
