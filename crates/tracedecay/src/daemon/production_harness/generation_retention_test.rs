@@ -257,6 +257,122 @@ async fn publish_code_edit(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mounted_daemon_maintenance_retains_leased_source_when_fresh_inventory_is_unavailable() {
+    let isolation = TempDir::new().expect("isolated production composition");
+    let project_root = isolation.path().join("project");
+    std::fs::create_dir_all(&project_root).expect("project root");
+    initialize_git_project(&project_root);
+
+    let harness =
+        ProductionProjectCompositionHarnessV1::open(isolation.path(), [project_root.clone()])
+            .await
+            .expect("mounted production composition");
+    let resources = harness.resources.as_ref().expect("live harness resources");
+    let schedulers = &resources.invocation.code_index_schedulers;
+    let graph = harness
+        .server(&project_root)
+        .expect("project server")
+        .cg()
+        .await;
+    let canonical_root = graph.project_root().to_path_buf();
+    let first_source = schedulers
+        .latest_generation_id(&canonical_root)
+        .await
+        .expect("initial sealed code generation");
+    let vector_generation =
+        publish_vector_generation(schedulers, &canonical_root, &first_source).await;
+    let provider = schedulers
+        .semantic_vector_graph_provider(&canonical_root)
+        .await
+        .expect("mounted vector provider");
+    let retained = provider
+        .graph_for_current()
+        .await
+        .expect("persistent vector graph");
+    let activation_lease =
+        GraphVectorGenerationStoreV1::read_only_generation(&retained, &vector_generation)
+            .expect("read exact activation generation")
+            .expect("published activation generation");
+    drop(retained);
+
+    // Evict the source from bounded pointer history using real publications,
+    // leaving the held old vector generation as its source-liveness authority.
+    let mut latest = first_source.clone();
+    for revision in 1..=MAX_DURABLE_GENERATION_INDEX_ENTRIES_V1 {
+        latest = publish_code_edit(schedulers, &canonical_root, &latest, revision).await;
+    }
+    let newer_vector_generation =
+        publish_vector_generation(schedulers, &canonical_root, &latest).await;
+    assert_ne!(newer_vector_generation, vector_generation);
+    let code_store_root =
+        tracedecay_code_index_runtime::code_index_scheduler::scoped_code_index_store_root(
+            &graph.store_layout().data_root.join("code-index-v1"),
+            &canonical_root,
+        );
+    let graph_replay_pool_root = graph.db().database_path().with_extension("graph-replay");
+    let plan = prepare_next_code_generation_retention_cancellable(
+        &code_store_root,
+        &BTreeSet::new(),
+        DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+        &|| false,
+        Some(&graph_replay_pool_root),
+    )
+    .expect("code generation retention plan");
+    let first_candidate = plan
+        .collectable_generations
+        .iter()
+        .find(|generation| generation.generation_id == first_source)
+        .expect("leased vector source is collectable without vector-source protection");
+    let first_source_file = code_store_root
+        .join("code-generations-v1")
+        .join(&first_candidate.generation_file);
+    assert!(first_source_file.is_file());
+
+    // The fresh route installs the authority but has not bootstrapped its
+    // durable inventory revision. Exercise that real failure, not a synthetic
+    // Offline result or the process-local known-empty configuration roots.
+    let configuration = graph
+        .configuration_runtime()
+        .semantic_configuration_inventory_authority()
+        .expect("fresh production composition installs the inventory authority");
+    let request = tracedecay_usecases::semantic_runtime::SemanticConfigurationInventoryPageRequestV1::first(
+        tracedecay_usecases::semantic_runtime::MAX_SEMANTIC_CONFIGURATION_INVENTORY_SCOPES_PER_PAGE,
+    )
+    .expect("first configuration inventory page");
+    assert!(
+        matches!(
+            configuration.configuration_inventory_page(&request).await,
+            Err(tracedecay_usecases::semantic_runtime::SemanticConfigurationBackendErrorV1::Unavailable)
+        ),
+        "the installed fresh inventory must actually refuse enumeration"
+    );
+
+    let observations = resources.store_administration.store_telemetry_sampling();
+    let cancellation = tracedecay_session_memory::context::CancellationToken::new();
+    assert!(
+        !crate::daemon::maintenance::generation::run_project_generation_maintenance(
+            graph.as_ref(),
+            schedulers,
+            &observations,
+            &cancellation,
+            &crate::config::RetentionConfig::default(),
+            None,
+        )
+        .await
+        .is_complete(),
+        "unavailable mounted inventory keeps maintenance retryable"
+    );
+    assert!(
+        first_source_file.is_file(),
+        "an unavailable inventory must not let the offline fallback collect a leased vector source"
+    );
+
+    drop(activation_lease);
+    drop(graph);
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after_restart() {
     let isolation = TempDir::new().expect("isolated production composition");
     let project_root = isolation.path().join("project");
