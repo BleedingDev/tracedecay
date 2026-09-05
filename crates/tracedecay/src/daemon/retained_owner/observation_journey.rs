@@ -466,6 +466,9 @@ pub(crate) enum ObservationJourneyError {
 /// unclean stop surfaces as `Failed` instead of hiding behind `Clean`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ObservationShutdownFailureV1 {
+    /// The initial backlog refresh exceeded the shared shutdown deadline.
+    #[error("observation backlog refresh did not finish within the daemon shutdown deadline")]
+    BacklogRefreshDeadline,
     /// The live replay task ended with something other than a cancellation.
     #[error("the canonical observation replay task did not exit cleanly: {0}")]
     LiveReplayJoin(#[source] tokio::task::JoinError),
@@ -3480,22 +3483,34 @@ impl ProjectObservationJourneyV1 {
         // Read the lane one last time rather than replaying whatever the last
         // admission happened to see: delivery may have drained rows since, and
         // a final admission may have crossed a threshold the remembered
-        // measurement was taken one row before. A handover that reported the
-        // stale figure would tell the next life the wrong thing.
-        let backlog = match self.refresh_backlog().await {
-            Ok(backlog) => Some(backlog),
-            Err(error) => {
-                // Reported, never swallowed: the handover then falls back to
-                // the last measurement ingress took, which is stale by
-                // construction and is labelled as such.
+        // measurement was taken one row before. If the shared deadline prevents
+        // a fresh reading, explicitly label the cached handover instead.
+        let (backlog, backlog_cached) = match tokio::time::timeout_at(
+            deadline,
+            self.refresh_backlog(),
+        )
+        .await
+        {
+            Ok(Ok(backlog)) => (Some(backlog), false),
+            Ok(Err(error)) => {
                 tracing::warn!(
                     event = "memory_observation_backlog_refresh_failed_at_shutdown",
                     error = %error,
                     journal = %self.journal_path.display(),
-                    "the observation lane could not be re-read at shutdown; the handover below \
-                     is the last measurement admission took, not the journal as it stands"
+                    "the observation lane could not be re-read at shutdown; using cached backlog"
                 );
-                self.backlog_metrics()
+                (self.backlog_metrics(), true)
+            }
+            Err(_) => {
+                // Dropping the wait does not abort SQLite work already running
+                // on the blocking pool. Continue teardown under the same deadline.
+                failures.push(ObservationShutdownFailureV1::BacklogRefreshDeadline);
+                tracing::warn!(
+                    event = "memory_observation_backlog_refresh_deadline_at_shutdown",
+                    journal = %self.journal_path.display(),
+                    "the observation backlog refresh exceeded the shutdown deadline; using cached backlog"
+                );
+                (self.backlog_metrics(), true)
             }
         };
         if let Some(backlog) = backlog {
@@ -3504,6 +3519,7 @@ impl ProjectObservationJourneyV1 {
             // operational handover, not a loss report.
             tracing::info!(
                 event = "memory_observation_backlog_at_shutdown",
+                backlog_cached,
                 state = backlog.state.as_wire(),
                 queue_items = backlog.queue_items,
                 queue_bytes = backlog.queue_bytes,
@@ -9779,34 +9795,64 @@ mod tests {
         .expect("mounted journey");
         let journal_path = journey.journal_path().to_path_buf();
 
-        // Held across the whole shutdown, so the pass's own `BEGIN IMMEDIATE`
-        // really cannot commit inside the deadline. Without the hold the
-        // blocking task would simply finish and the deadline would never be
-        // the thing under test.
-        let holder = hold_journal_write_lock(&journal_path, Duration::from_millis(1_500));
-        let started = std::time::Instant::now();
-        let failures = journey
-            .shutdown(tokio::time::Instant::now() + Duration::from_millis(50))
-            .await;
-        let elapsed = started.elapsed();
-        holder.join().unwrap();
-
-        // The assertion that carries the fix: the reap is bounded by the
-        // daemon's deadline and says so. Inline and undeadlined it would have
-        // sat on the connection's five-second busy timeout and then reported
-        // whatever it eventually managed, with the daemon's stop waiting on it.
+        // Release only after shutdown returns (or the scheduling guard fires),
+        // never after a sleep. Dropping the guard also releases and joins the
+        // writer on assertion failure or cancellation of this test future.
+        struct HeldWriter {
+            release: Option<std::sync::mpsc::Sender<()>>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for HeldWriter {
+            fn drop(&mut self) {
+                drop(self.release.take());
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+        }
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (ready, holding) = tokio::sync::oneshot::channel();
+        let mut holder = HeldWriter {
+            release: Some(release),
+            thread: Some(std::thread::spawn(move || {
+                let mut connection = rusqlite::Connection::open(&journal_path).unwrap();
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+                ready.send(()).unwrap();
+                let _ = released.recv();
+                transaction.rollback().unwrap();
+            })),
+        };
+        holding.await.expect("writer holds the transaction");
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            journey.shutdown(tokio::time::Instant::now() + Duration::from_millis(50)),
+        )
+        .await;
+        let writer_still_held = !holder.thread.as_ref().unwrap().is_finished();
+        // Cleanup before asserting even when the scheduling guard expired.
+        drop(holder.release.take());
+        holder.thread.take().unwrap().join().unwrap();
+        let failures = result.expect("shutdown must return while the writer remains held");
+        assert!(
+            writer_still_held,
+            "writer released before shutdown returned"
+        );
+        assert!(
+            failures.iter().any(|failure| matches!(
+                failure,
+                ObservationShutdownFailureV1::BacklogRefreshDeadline
+            )),
+            "the initial backlog refresh must report its deadline: {failures:?}"
+        );
+        // An expired initial refresh must not skip the later bounded reap.
         assert!(
             failures.iter().any(|failure| matches!(
                 failure,
                 ObservationShutdownFailureV1::ShutdownPassDeadline
             )),
             "a shutdown pass that could not finish inside the deadline must say so: {failures:?}"
-        );
-        // A hang guard, not the discriminator: shutdown must not outlive the
-        // contention that provoked it by any meaningful margin.
-        assert!(
-            elapsed < Duration::from_secs(4),
-            "shutdown took {elapsed:?} against a lock held for 1.5s"
         );
 
         // Nothing was stranded by giving up: the reap the deadline cut short
@@ -9815,10 +9861,7 @@ mod tests {
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
             .await;
         assert!(
-            !clean.iter().any(|failure| matches!(
-                failure,
-                ObservationShutdownFailureV1::ShutdownPassDeadline
-            )),
+            clean.is_empty(),
             "an uncontended shutdown pass must complete: {clean:?}"
         );
     }
