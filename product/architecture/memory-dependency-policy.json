@@ -58,6 +58,7 @@
       "allowed_direct_dependencies": [
         "serde_json",
         "sha2",
+        "tracedecay-memory-ncm-runtime",
         "tracedecay-memory-provider-api"
       ],
       "required_direct_dependencies": [
@@ -68,12 +69,13 @@
       "allowed_dependency_features": {
         "serde_json": [],
         "sha2": [],
-        "tracedecay-memory-provider-api": []
+        "tracedecay-memory-provider-api": [],
+        "tracedecay-memory-ncm-runtime": []
       },
       "allowed_dev_dependencies": [
         "tracedecay-memory-conformance"
       ],
-      "reason": "The NCM boundary may hash an opaque exact-scope namespace and validate canonical JSON payloads but cannot import TraceDecay internals. tracedecay-memory-conformance is admitted as a test-only edge so the adapter is judged by the canonical provider-neutral harness instead of by adapter-local assertions; it is provider-neutral, depends only on the provider API, and is not compiled into the shipped crate."
+      "reason": "The NCM boundary may hash an opaque exact-scope namespace and validate canonical JSON payloads but cannot import TraceDecay internals. tracedecay-memory-conformance is admitted as a test-only edge so the adapter is judged by the canonical provider-neutral harness instead of by adapter-local assertions; it is provider-neutral, depends only on the provider API, and is not compiled into the shipped crate. tracedecay-memory-ncm-runtime is the licensed Rust backend behind the default-off rust-backend feature (optional, default-features = false): the adapter uses only its worker client, wire types, engine outcome enum, and state-root port, pinned by the source contract below, to supervise the separate worker process. It is not a TraceDecay host internal and the edge does not widen what the adapter may reach in the host."
     },
     {
       "package": "tracedecay-memory-conformance",
@@ -316,6 +318,62 @@
         "tracedecay-runtime-core": []
       },
       "reason": "The hygiene pipeline mints into the provider API's receipt vocabulary, takes over the canonical JSON encoding owned by tracedecay-domain, and reuses the single vendored credential-detector corpus exposed through tracedecay-runtime-core's public surface instead of re-deriving it; both TraceDecay-internal edges are explicit, narrow, and reviewed rather than a general internals import."
+    },
+    {
+      "package": "tracedecay-memory-ncm-core",
+      "allowed_direct_dependencies": [
+        "serde"
+      ],
+      "required_direct_dependencies": [
+        "serde"
+      ],
+      "allowed_dependency_features": {
+        "serde": [
+          "derive"
+        ]
+      },
+      "allowed_dev_dependencies": [
+        "serde_json"
+      ],
+      "reason": "The Biomem-based NCM kernel (ncm-biomem-rs.v1) is pure f32 state and arithmetic. serde carries checkpoint and snapshot state; serde_json is test-only. It cannot name the TraceDecay host, any I/O, or any executor."
+    },
+    {
+      "package": "tracedecay-memory-ncm-runtime",
+      "allowed_direct_dependencies": [
+        "fastembed",
+        "rusqlite",
+        "serde",
+        "serde_json",
+        "sha2",
+        "tracedecay-memory-ncm-core"
+      ],
+      "required_direct_dependencies": [
+        "fastembed",
+        "rusqlite",
+        "serde",
+        "serde_json",
+        "sha2",
+        "tracedecay-memory-ncm-core"
+      ],
+      "allowed_dependency_features": {
+        "fastembed": [
+          "hf-hub-rustls-tls",
+          "ort-download-binaries-rustls-tls"
+        ],
+        "rusqlite": [
+          "bundled"
+        ],
+        "serde": [
+          "derive"
+        ],
+        "serde_json": [],
+        "sha2": [],
+        "tracedecay-memory-ncm-core": []
+      },
+      "allowed_dev_dependencies": [
+        "tempfile"
+      ],
+      "reason": "The NCM worker runtime owns the backend's durability (bundled SQLite, one file per namespace), pinned offline MiniLM inference (fastembed behind the default real-encoder feature; the worker refuses inference without it), and the stdio wire. It runs only inside the separate tracedecay-ncm-worker process, never inside the host, and cannot name the TraceDecay host crates."
     }
   ],
   "source_contracts": [
@@ -353,6 +411,24 @@
           "recall_port.rs::bridge_cancellation"
         ]
       }
+    },
+    {
+      "package": "tracedecay-memory-provider-ncm",
+      "reason": "tracedecay-memory-ncm-runtime declares an optional dependency (fastembed behind real-encoder), so Cargo feature unification could widen what it exports to the adapter regardless of this edge's default-features = false. The exact import allowlist below is the enforcement that holds: the adapter may name the worker client and its options and error, the state-root port, the wire operation/request/reply types, and the engine outcome and rejection enums, and nothing else. It never names the encoder, the store, the engine constructor, or any executor; the worker process is started and killed by WorkerClient inside the runtime crate, not by adapter code, and the forbidden-symbol floor keeps process, filesystem, socket, and embedded-store symbols out of the adapter itself.",
+      "allowed_imports": {
+        "tracedecay_memory_ncm_runtime": [
+          "tracedecay_memory_ncm_runtime::client::ClientError",
+          "tracedecay_memory_ncm_runtime::client::WorkerClient",
+          "tracedecay_memory_ncm_runtime::client::WorkerOptions",
+          "tracedecay_memory_ncm_runtime::engine::Outcome",
+          "tracedecay_memory_ncm_runtime::engine::RejectReason",
+          "tracedecay_memory_ncm_runtime::ports::StateRoot",
+          "tracedecay_memory_ncm_runtime::wire::Operation",
+          "tracedecay_memory_ncm_runtime::wire::Reply",
+          "tracedecay_memory_ncm_runtime::wire::Request"
+        ]
+      },
+      "executor_call_sites": {}
     }
   ],
   "rules": [
@@ -409,12 +485,13 @@
         "ocean*"
       ],
       "allowed_dependencies": [
+        "tracedecay-memory-ncm-runtime",
         "tracedecay-memory-provider-api"
       ],
       "allowed_dev_dependencies": [
         "tracedecay-memory-conformance"
       ],
-      "reason": "The licensed NCM boundary receives only provider-neutral values and an opaque namespace. The one test-only edge is tracedecay-memory-conformance: ADR-0009 requires handshake and failure conformance to be run against this adapter, and the canonical harness is provider-neutral, so the edge admits an evaluator rather than a TraceDecay internal. It is a dev-dependency only and never reaches the shipped crate."
+      "reason": "The licensed NCM boundary receives only provider-neutral values and an opaque namespace. The one test-only edge is tracedecay-memory-conformance: ADR-0009 requires handshake and failure conformance to be run against this adapter, and the canonical harness is provider-neutral, so the edge admits an evaluator rather than a TraceDecay internal. It is a dev-dependency only and never reaches the shipped crate. tracedecay-memory-ncm-runtime is admitted as the one production edge to the licensed Rust backend; it is itself host-blind under ncm-backend-is-host-blind, so the adapter still cannot reach TraceDecay internals through it."
     },
     {
       "id": "conformance-is-provider-neutral",
@@ -550,6 +627,23 @@
       ],
       "allowed_dependencies": [],
       "reason": "Public transports expose provider-neutral application contracts and never construct concrete providers."
+    },
+    {
+      "id": "ncm-backend-is-host-blind",
+      "from_packages": [
+        "tracedecay-memory-ncm-core",
+        "tracedecay-memory-ncm-runtime"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay",
+        "tracedecay-*",
+        "ocean*"
+      ],
+      "allowed_dependencies": [
+        "tracedecay-memory-ncm-core"
+      ],
+      "allowed_dev_dependencies": [],
+      "reason": "The Biomem-based backend crates are independently usable and know nothing about TraceDecay: not the provider API, not the fabric, not the host. The only in-workspace edge is runtime -> core. Every host-facing translation lives in tracedecay-memory-provider-ncm behind the provider-neutral surface."
     }
   ],
   "exception_contract": {

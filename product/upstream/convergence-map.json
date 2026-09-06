@@ -983,6 +983,41 @@
         "kind": "minimal_mount",
         "rationale": "Catching a project's own transcript up at the host lifecycle boundary is provider-neutral session-evidence freshness; upstream could adopt it, which would retire this area entirely."
       }
+    },
+    {
+      "id": "ncm_backend",
+      "status": "active",
+      "owner": "BleedingDev",
+      "ownership_class": "product_owned",
+      "feature": "ncm-rust-backend",
+      "path_patterns": [
+        "crates/tracedecay-memory-ncm-core/**",
+        "crates/tracedecay-memory-ncm-runtime/**",
+        "product/ncm/**"
+      ],
+      "touch_points": [
+        "workspace_wiring"
+      ],
+      "bead_ids": [
+        "tdmem-0304"
+      ],
+      "rationale": "Keep the Biomem-based Rust NCM backend (kernel, worker runtime, contract, reference oracle, plan, and receipts) in one removable product-owned boundary that the host reaches only through tracedecay-memory-provider-ncm's default-off rust-backend feature. The ncm-biomem-rs.v1 work package (product/ncm/plan) is imported into Beads at task ncm-rs-023; until then it hangs off the existing NCM bead.",
+      "semantic_invariants": [
+        "The backend crates never depend on TraceDecay host crates; the only in-workspace edge is runtime -> core.",
+        "The worker runs as a separate process, is offline-only, and refuses inference without the pinned real encoder.",
+        "Backend acceptance (scripts/product/ncm/check-backend.py) is standalone evidence; host mounting, active recall, usefulness, packaging, and release stay with tasks ncm-rs-023 to 026."
+      ],
+      "tests": [
+        "cargo test -p tracedecay-memory-ncm-core --locked",
+        "cargo test -p tracedecay-memory-ncm-runtime --locked --no-default-features",
+        "cargo test -p tracedecay-memory-provider-ncm --locked --features rust-backend",
+        "python3 scripts/product/ncm/check-backend.py"
+      ],
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "product_only",
+        "rationale": "The licensed Biomem-derived backend and its evidence remain isolated from the upstream host architecture."
+      }
     }
   ],
   "entries": [
@@ -1414,7 +1449,7 @@
       "rationale": "Gate the retained Native application authority and its direct parity module at the daemon composition boundary so provider behavior is opt-in and removable.",
       "semantic_invariants": [
         "Upstream behavior: retained project and profile operations continue to resolve through the owner-bound Native memory authority when the provider host feature is absent.",
-        "Enabled product behavior: memory-provider-host gates exactly four declarations in this file and nothing else — the cognitive_recall module, the native_provider adapter module, the observation_journey module, and the cfg(all(test, feature)) native_provider_parity_tests fixture; every unconditional module and re-export stays upstream's, provider calls remain behind registry composition, and none of them can replace canonical Native ownership.",
+        "Enabled product behavior: memory-provider-host gates exactly four declarations in this file and nothing else \u2014 the cognitive_recall module, the native_provider adapter module, the observation_journey module, and the cfg(all(test, feature)) native_provider_parity_tests fixture; every unconditional module and re-export stays upstream's, provider calls remain behind registry composition, and none of them can replace canonical Native ownership.",
         "The retained owner keeps exact project scope, request admission, cancellation, deadlines, receipts, and terminal mappings independent of provider availability.",
         "Enabled product behavior: the observation_journey module declaration is the only retained-owner seam for the durable observation journal; the journal is delivery-status authority only and never a second authority for Native facts."
       ],
@@ -1657,7 +1692,7 @@
         "Product behavior: shutdown consumes the caller's absolute deadline and mints no budget of its own.",
         "Product behavior: every captured task is cancelled before the first join, so one task that outlives its own join cannot leave its successors running uncancelled.",
         "Product behavior: a task still unfinished at the deadline is aborted before the registry releases its handle, rather than merely dropped: dropping a JoinHandle detaches the task instead of stopping it.",
-        "Product behavior: the guarantee abort buys is bounded and stated as such. Tokio abort is cooperative, so a task already executing inside its own poll — a lease body blocking a worker thread, for instance — keeps running until it reaches a suspension point, and it may still run that far after shutdown has returned. What is guaranteed is that an aborted task never resumes past that suspension point, so no lease effect sequenced after an await can execute once shutdown has abandoned the join.",
+        "Product behavior: the guarantee abort buys is bounded and stated as such. Tokio abort is cooperative, so a task already executing inside its own poll \u2014 a lease body blocking a worker thread, for instance \u2014 keeps running until it reaches a suspension point, and it may still run that far after shutdown has returned. What is guaranteed is that an aborted task never resumes past that suspension point, so no lease effect sequenced after an await can execute once shutdown has abandoned the join.",
         "Product behavior: an unfinished, aborted, or panicked join is reported as DaemonInvocationProblem::Unavailable, so an incomplete lease teardown is never hidden behind a successful terminal.",
         "Product behavior: a superseded hook cycle retains its permit and drives its cancelled work future under TASK_ABORT_DEADLINE; if the work remains unfinished at that deadline, the same bounded owner continues reaping it while holding the permit, so no detached-worker tail can grow and the receipt terminal is emitted only after settlement.",
         "Upstream behavior: owner-level retirement is unchanged - owner cancellation remains biased, drops the work future immediately, emits no terminal, and does not wait on work whose owner retired; only superseded work is reaped to settlement."

@@ -14,7 +14,7 @@ pub use tracedecay_memory_ncm_runtime::client::WorkerOptions;
 use tracedecay_memory_ncm_runtime::client::{ClientError, WorkerClient};
 use tracedecay_memory_ncm_runtime::engine::{Outcome, RejectReason};
 pub use tracedecay_memory_ncm_runtime::ports::StateRoot;
-use tracedecay_memory_ncm_runtime::wire::{Operation, Reply as WorkerReply, Request};
+use tracedecay_memory_ncm_runtime::wire::{Operation, Reply, Request};
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
     CanonicalPayload, CommittedEffectEvidence, FallbackDirective, OwnedProviderId,
@@ -204,7 +204,7 @@ impl RustNcmSurface {
         namespace: &NcmNamespace,
         payload: Value,
         millis: u64,
-    ) -> Result<WorkerReply, ClientError> {
+    ) -> Result<Reply, ClientError> {
         let request = Request::new(
             self.request_id(),
             millis,
@@ -224,7 +224,14 @@ impl NcmCognitiveSurface for RustNcmSurface {
     fn handshake(&self, request: &NcmSurfaceHandshakeRequest) -> NcmSurfaceHandshakeResponse {
         let control = match request.control.snapshot() {
             Ok(control) => control,
-            Err(code) => return handshake_failure(request, code, "ncm.rust.control_terminal"),
+            Err(code) => {
+                return handshake_failure(
+                    &self.fallback_descriptor.provider_id,
+                    request,
+                    code,
+                    "ncm.rust.control_terminal",
+                );
+            }
         };
         let expected_model = self.state.lock().ok().and_then(|state| {
             state
@@ -250,6 +257,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
             Ok(reply) => reply,
             Err(error) => {
                 return handshake_failure(
+                    &self.fallback_descriptor.provider_id,
                     request,
                     client_terminal_code(&error),
                     client_diagnostic(&error),
@@ -258,6 +266,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
         };
         if reply.outcome != Outcome::Success {
             return handshake_failure(
+                &self.fallback_descriptor.provider_id,
                 request,
                 outcome_terminal_code(&reply.outcome),
                 outcome_diagnostic(&reply.outcome),
@@ -267,6 +276,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
             Ok(identity) => identity,
             Err(error) => {
                 return handshake_failure(
+                    &self.fallback_descriptor.provider_id,
                     request,
                     TerminalCode::StateIncompatible,
                     error_diagnostic(&error),
@@ -277,6 +287,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
             Ok(descriptor) => descriptor,
             Err(error) => {
                 return handshake_failure(
+                    &self.fallback_descriptor.provider_id,
                     request,
                     TerminalCode::StateIncompatible,
                     error_diagnostic(&error),
@@ -289,6 +300,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
         {
             let _ = self.install_identity(identity, reply.state_generation);
             return handshake_failure(
+                &self.fallback_descriptor.provider_id,
                 request,
                 TerminalCode::StaleIdentity,
                 "ncm.rust.handshake_identity_refresh_required",
@@ -299,6 +311,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
             .is_err()
         {
             return handshake_failure(
+                &self.fallback_descriptor.provider_id,
                 request,
                 TerminalCode::ProviderUnavailable,
                 "ncm.rust.surface_state_unavailable",
@@ -310,6 +323,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
         let challenge =
             request.expected_challenge_response_sha256(&descriptor, &instance_id, &ready_receipt);
         let terminal = surface_terminal(
+            &self.fallback_descriptor.provider_id,
             ProviderOperation::Handshake,
             &request.request_id,
             request.namespace.as_str(),
@@ -334,12 +348,24 @@ impl NcmCognitiveSurface for RustNcmSurface {
     fn invoke(&self, call: &NcmSurfaceCall) -> ProviderReply {
         let control = match call.control.snapshot() {
             Ok(control) => control,
-            Err(code) => return pre_dispatch_reply(call, code, "ncm.rust.control_terminal"),
+            Err(code) => {
+                return pre_dispatch_reply(
+                    &self.fallback_descriptor.provider_id,
+                    call,
+                    code,
+                    "ncm.rust.control_terminal",
+                );
+            }
         };
         let payload = match translate_payload(call) {
             Ok(payload) => payload,
             Err(diagnostic) => {
-                return pre_dispatch_reply(call, TerminalCode::InvalidRequest, diagnostic);
+                return pre_dispatch_reply(
+                    &self.fallback_descriptor.provider_id,
+                    call,
+                    TerminalCode::InvalidRequest,
+                    diagnostic,
+                );
             }
         };
         let operation = wire_operation(call.operation);
@@ -350,14 +376,16 @@ impl NcmCognitiveSurface for RustNcmSurface {
             control.remaining_millis,
         ) {
             Ok(reply) => reply,
-            Err(error) => return client_error_reply(call, &error),
+            Err(error) => {
+                return client_error_reply(&self.fallback_descriptor.provider_id, call, &error);
+            }
         };
         if call.operation.mutates_provider_state()
             && reply.state_generation >= call.expected_state_generation
         {
             self.update_generation(reply.state_generation);
         }
-        worker_reply(call, reply)
+        worker_reply(&self.fallback_descriptor.provider_id, call, reply)
     }
 }
 
@@ -449,7 +477,7 @@ fn same_immutable_descriptor(left: &ProviderDescriptor, right: &ProviderDescript
         && left.limits == right.limits
 }
 
-fn parse_runtime_identity(reply: &WorkerReply) -> Result<RuntimeIdentity, RustNcmError> {
+fn parse_runtime_identity(reply: &Reply) -> Result<RuntimeIdentity, RustNcmError> {
     let payload = reply.payload.as_ref().ok_or_else(|| {
         RustNcmError::HandshakeIdentity("successful handshake omitted payload".to_owned())
     })?;
@@ -520,12 +548,14 @@ fn ready_receipt(namespace: &str, identity: &RuntimeIdentity) -> String {
 }
 
 fn handshake_failure(
+    provider: &OwnedProviderId,
     request: &NcmSurfaceHandshakeRequest,
     code: TerminalCode,
     diagnostic: &'static str,
 ) -> NcmSurfaceHandshakeResponse {
     NcmSurfaceHandshakeResponse {
         terminal: surface_terminal(
+            provider,
             ProviderOperation::Handshake,
             &request.request_id,
             request.namespace.as_str(),
@@ -543,7 +573,10 @@ fn handshake_failure(
     }
 }
 
+/// Builds a terminal record for the surface. The provider identity is the one
+/// validated at construction, so no fallible re-parse of the literal is needed.
 fn surface_terminal(
+    provider: &OwnedProviderId,
     operation: ProviderOperation,
     operation_id: &str,
     namespace: &str,
@@ -551,20 +584,7 @@ fn surface_terminal(
     effect: CommittedEffectEvidence,
     diagnostic: Option<&str>,
 ) -> TerminalRecord {
-    let provider = match OwnedProviderId::new(NCM_PROVIDER_ID) {
-        Ok(provider) => provider,
-        Err(_) => {
-            return TerminalRecord::failure_before_dispatch(
-                operation,
-                OwnedProviderId::new("ncm").unwrap_or_else(|_| unreachable_provider_id()),
-                TerminalCode::InternalFailure,
-                operation_id,
-                namespace,
-                effect.state_generation_before(),
-                "ncm.rust.provider_identity_invalid",
-            );
-        }
-    };
+    let provider = provider.clone();
     match TerminalRecord::new(
         operation,
         provider.clone(),
@@ -588,22 +608,15 @@ fn surface_terminal(
     }
 }
 
-fn unreachable_provider_id() -> OwnedProviderId {
-    // This branch is unreachable because the same literal is validated during
-    // descriptor construction. Keep the trait total without panicking.
-    match OwnedProviderId::new("ncm") {
-        Ok(provider) => provider,
-        Err(_) => std::process::abort(),
-    }
-}
-
 fn pre_dispatch_reply(
+    provider: &OwnedProviderId,
     call: &NcmSurfaceCall,
     code: TerminalCode,
     diagnostic: &'static str,
 ) -> ProviderReply {
     ProviderReply {
         terminal: surface_terminal(
+            provider,
             call.operation,
             &call.operation_id,
             call.namespace.as_str(),
@@ -618,7 +631,11 @@ fn pre_dispatch_reply(
     }
 }
 
-fn client_error_reply(call: &NcmSurfaceCall, error: &ClientError) -> ProviderReply {
+fn client_error_reply(
+    provider: &OwnedProviderId,
+    call: &NcmSurfaceCall,
+    error: &ClientError,
+) -> ProviderReply {
     if matches!(error, ClientError::EffectUnknown { .. }) && call.operation.mutates_provider_state()
     {
         let receipt = unknown_receipt(call, error);
@@ -628,6 +645,7 @@ fn client_error_reply(call: &NcmSurfaceCall, error: &ClientError) -> ProviderRep
         });
         return ProviderReply {
             terminal: surface_terminal(
+                provider,
                 call.operation,
                 &call.operation_id,
                 call.namespace.as_str(),
@@ -641,10 +659,15 @@ fn client_error_reply(call: &NcmSurfaceCall, error: &ClientError) -> ProviderRep
             state_generation: call.expected_state_generation,
         };
     }
-    pre_dispatch_reply(call, client_terminal_code(error), client_diagnostic(error))
+    pre_dispatch_reply(
+        provider,
+        call,
+        client_terminal_code(error),
+        client_diagnostic(error),
+    )
 }
 
-fn worker_reply(call: &NcmSurfaceCall, reply: WorkerReply) -> ProviderReply {
+fn worker_reply(provider: &OwnedProviderId, call: &NcmSurfaceCall, reply: Reply) -> ProviderReply {
     let terminal_code = outcome_terminal_code(&reply.outcome);
     let success = matches!(reply.outcome, Outcome::Success | Outcome::Empty);
     let replayed = reply
@@ -701,6 +724,7 @@ fn worker_reply(call: &NcmSurfaceCall, reply: WorkerReply) -> ProviderReply {
     let diagnostic = (!success).then(|| worker_diagnostic(&reply));
     ProviderReply {
         terminal: surface_terminal(
+            provider,
             call.operation,
             &call.operation_id,
             call.namespace.as_str(),
@@ -1049,7 +1073,7 @@ fn outcome_terminal_code(outcome: &Outcome) -> TerminalCode {
     }
 }
 
-fn worker_diagnostic(reply: &WorkerReply) -> &'static str {
+fn worker_diagnostic(reply: &Reply) -> &'static str {
     match reply.error.as_ref().map(|error| error.kind.as_str()) {
         Some("oversized_reply" | "oversized_frame") => "ncm.rust.worker_reply_oversized",
         Some("malformed_json") => "ncm.rust.worker_reply_malformed",
@@ -1115,7 +1139,7 @@ fn error_diagnostic(error: &RustNcmError) -> &'static str {
     }
 }
 
-fn worker_receipt(operation: ProviderOperation, reply: &WorkerReply) -> String {
+fn worker_receipt(operation: ProviderOperation, reply: &Reply) -> String {
     let mut payload = reply.payload.clone().unwrap_or(Value::Null);
     if let Some(object) = payload.as_object_mut() {
         object.remove("replayed");
