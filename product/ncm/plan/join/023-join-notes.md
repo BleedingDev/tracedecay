@@ -1,4 +1,14 @@
-# ncm-rs-023 join notes (prepared on the backend branch; HOST-STABLE not declared)
+# ncm-rs-023 join notes
+
+**Update 2026-09-06 (afternoon):** at the user's instruction the host head 3881741df
+(`origin/feat/pluggable-memory-providers-v2`, identical to the local branch) was merged into
+`feat/ncm-biomem-rust-v1` as dc0166d23 with no conflicts, the fixture patch below was applied to
+`tests/product_memory_dependency_direction_test.py`, and `scripts/product/ncm/check-backend.py`
+now fences the branch footprint against `host_base_commit` from `product/ncm/bootstrap/ownership.json`
+(the joined host head) instead of the product checkpoint. This is a merge the user asked for, not a
+HOST-STABLE declaration by the stabilization owner, and the Beads import is still pending. Verification
+of the joined tree is recorded in `product/ncm/receipts/integration/`.
+
 
 Prepared 2026-09-06 by the backend coordinator so the join owner can consume the
 backend branch without rediscovering the policy work. Nothing here claims task 023
