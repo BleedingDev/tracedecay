@@ -736,6 +736,7 @@ fn digest_file(path: &Path) -> Result<String, EncoderError> {
     Ok(output)
 }
 
+#[cfg(feature = "real-encoder")]
 fn write_manifest(models_dir: &Path, manifest: &PinnedEncoder) -> Result<(), EncoderError> {
     let path = models_dir.join(MANIFEST_FILENAME);
     let temporary = models_dir.join(format!(".{MANIFEST_FILENAME}.{}.tmp", std::process::id()));
