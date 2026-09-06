@@ -57,6 +57,10 @@ or any later task complete.
    `tracedecay_memory_ncm_runtime`).
 
 The host branch's own fixture changes (54 lines in the same test) merge cleanly with these.
+The exact deltas are in `023-direction-test-fixture.patch` next to this file. Verified on a
+rehearsal merge of the backend branch (54bdf0c1c) with host head 3881741df: with the patch
+applied the direction unit test passes 27/27, the real-graph checker reports
+"memory dependency direction verified", and the footprint checker mentions no NCM path.
 
 ## Still gated
 
