@@ -76,7 +76,4 @@ mailbox. The largest measured peak RSS was 1,294,073,856 bytes in the one-namesp
 trace. All checkpoint/compact/reopen digest, quota, capacity, wire, top-k, advance, LRU, mailbox, and
 cancellation controls passed.
 
-Acceptance remains environment-blocked for two required comparison populations: the pinned MiniLM
-manifest/artifacts are absent from the admitted model root, and the available Python interpreter has
-no PyTorch installation for the pinned Biomem `MemoryCenters.read` comparison. These are recorded in
-the raw result rather than waived. Consequently no warm production full-text recall number is claimed.
+Both comparison populations that were first captured as `blocked_environment` (no PyTorch in the system interpreter; no installed MiniLM artifacts) were rerun on the same host by the coordinator with the Biomem oracle venv and the pinned model installed under `target/ncm-backend-model-root`, and merged into the dated results file (`rerun_note`, `source_groups` = `group-real.json`). Measured: pinned Biomem `MemoryCenters.read` p50 4.8 µs empty / 135.6 µs sparse / 245.0 µs at 4096 active centers (10,000 samples each); real MiniLM open 728.7 ms, single encode p50 3.41 ms / p99 3.69 ms, batch-16 p50 19.45 ms / p99 21.10 ms (100 samples), encoder-process peak RSS 1,389 MB. The results file status is `complete`.

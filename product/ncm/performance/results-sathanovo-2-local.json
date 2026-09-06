@@ -1,15 +1,5 @@
 {
-  "blocked_populations": [
-    {
-      "detail": "PyTorch unavailable: No module named 'torch'",
-      "status": "blocked_environment"
-    },
-    {
-      "detail": "encoder artifacts missing: /Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/models/ncm-encoder-manifest.json",
-      "requirement": "Install the five pinned Xenova artifacts under <state-root>/models and rerun with default features. Missing model is not a waived population.",
-      "status": "blocked_environment"
-    }
-  ],
+  "blocked_populations": [],
   "branch": "feat/ncm-biomem-rust-v1",
   "captured_unix_seconds": 1788666786,
   "commit": "e3d36af35bb6a1fd8955ac9f0bb31a40e55f2539",
@@ -39,6 +29,7 @@
     "kernel_only": 100000
   },
   "profile": "ncm-biomem-rs.v1",
+  "rerun_note": "The reference and real-encoder populations were first captured as blocked_environment (no torch in the system interpreter, no installed model) and rerun by the coordinator on the same host with the Biomem oracle venv (~/.cache/ncm-oracle/venv) and the pinned model installed at target/ncm-backend-model-root; commit c48220b371159af00360978f9581833c0c2b3621.",
   "runs": [
     {
       "command": [
@@ -412,24 +403,70 @@
     },
     {
       "command": [
-        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "/Users/satan/.cache/ncm-oracle/venv/bin/python",
         "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/scripts/product/ncm/benchmark/reference_kernel.py",
         "--biomem-root",
         "/Users/satan/workspace/bleedingdev/projects/biomem/code/biomem",
         "--ops",
         "10000"
       ],
-      "peak_rss_bytes": 21348352,
+      "peak_rss_bytes": 219267072,
       "result": {
         "data": {
-          "detail": "PyTorch unavailable: No module named 'torch'",
-          "status": "blocked_environment"
+          "populations": [
+            {
+              "active_ltm_centers": 0,
+              "measurement": {
+                "distribution": {
+                  "elapsed_ms": 48.512042,
+                  "p50_us": 4.75,
+                  "p95_us": 5.0,
+                  "p99_us": 5.125,
+                  "samples": 10000
+                },
+                "name": "biomem_memory_centers_read",
+                "semantics": "Biomem MemoryCenters.read, same 64-D pre-embedded LTM capacity and top_k=16, increment_stats=False"
+              },
+              "population": "empty"
+            },
+            {
+              "active_ltm_centers": 512,
+              "measurement": {
+                "distribution": {
+                  "elapsed_ms": 1400.016458,
+                  "p50_us": 135.625,
+                  "p95_us": 209.792,
+                  "p99_us": 245.166,
+                  "samples": 10000
+                },
+                "name": "biomem_memory_centers_read",
+                "semantics": "Biomem MemoryCenters.read, same 64-D pre-embedded LTM capacity and top_k=16, increment_stats=False"
+              },
+              "population": "sparse"
+            },
+            {
+              "active_ltm_centers": 4096,
+              "measurement": {
+                "distribution": {
+                  "elapsed_ms": 2534.955084,
+                  "p50_us": 245.0,
+                  "p95_us": 334.25,
+                  "p99_us": 400.167,
+                  "samples": 10000
+                },
+                "name": "biomem_memory_centers_read",
+                "semantics": "Biomem MemoryCenters.read, same 64-D pre-embedded LTM capacity and top_k=16, increment_stats=False"
+              },
+              "population": "full"
+            }
+          ],
+          "status": "measured"
         },
         "population": "python_reference_kernel",
         "reference_commit": "500847ff65b5d9548b3826fa29bf3ccf8d221147",
         "schema_version": 1
       },
-      "wall_seconds": 0.03687529099988751
+      "wall_seconds": 4.841755333000037
     },
     {
       "command": [
@@ -1727,24 +1764,64 @@
         "--ops",
         "100",
         "--model-root",
-        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1"
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/ncm-backend-model-root"
       ],
-      "peak_rss_bytes": 8962048,
+      "peak_rss_bytes": 1389330432,
       "result": {
         "allocated_bytes": null,
         "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
-        "commit": "e3d36af35bb6a1fd8955ac9f0bb31a40e55f2539",
+        "commit": "c48220b371159af00360978f9581833c0c2b3621",
         "data": {
-          "detail": "encoder artifacts missing: /Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/models/ncm-encoder-manifest.json",
-          "requirement": "Install the five pinned Xenova artifacts under <state-root>/models and rerun with default features. Missing model is not a waived population.",
-          "status": "blocked_environment"
+          "identity": {
+            "artifact_sha256": "185ae63f47e17a7e8d30d0e6a3cde6a6e4b79bc5b81666ecffc279a6856ca113",
+            "max_length": 128,
+            "model": "paraphrase-multilingual-MiniLM-L12-v2"
+          },
+          "measurements": [
+            {
+              "distribution": {
+                "elapsed_ms": 335.19858400000004,
+                "max_us": 7129.459,
+                "mean_us": 3351.9574700000003,
+                "min_us": 2736.542,
+                "operations_per_second": 298.33061585964214,
+                "p50_us": 3409.458,
+                "p95_us": 3561.542,
+                "p99_us": 3692.5,
+                "samples": 100
+              },
+              "name": "real_encoder_single",
+              "outcomes": {
+                "batch": 1
+              }
+            },
+            {
+              "distribution": {
+                "elapsed_ms": 1757.38375,
+                "max_us": 21310.916,
+                "mean_us": 17573.74536,
+                "min_us": 10675.875,
+                "operations_per_second": 56.90276810628299,
+                "p50_us": 19451.792,
+                "p95_us": 20857.042,
+                "p99_us": 21098.667,
+                "samples": 100
+              },
+              "name": "real_encoder_batch16",
+              "outcomes": {
+                "batch": 16
+              }
+            }
+          ],
+          "open_ms": 728.691875,
+          "status": "measured"
         },
         "population": "encoder",
-        "process_rss_kib_snapshot": 8464,
+        "process_rss_kib_snapshot": 1138928,
         "profile": "ncm-biomem-rs.v1",
         "schema_version": 1
       },
-      "wall_seconds": 0.011975458000961225
+      "wall_seconds": 2.8914924589989823
     }
   ],
   "schema_version": 1,
@@ -1755,9 +1832,10 @@
     "group-core.json",
     "group-store.json",
     "group-engine.json",
-    "group-mixed.json"
+    "group-mixed.json",
+    "group-real.json"
   ],
-  "status": "blocked_environment",
+  "status": "complete",
   "task": "ncm-rs-020",
   "working_tree_clean_before_results": false
 }
