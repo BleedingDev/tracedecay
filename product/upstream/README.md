@@ -138,6 +138,14 @@ because its comparison starts at unaccepted U while the registry correctly
 stamps F; do not change those stamps to silence this diagnostic. The mandatory
 train remains blocked until ownership review and all runtime gates succeed.
 
+A newer observed head, `b8cbcaa6fec5062a3c74b828fa460f75b8eae6a3` (145 commits
+past U), was merged into the product branch at `5a7a3abae` on 2026-09-06 with
+the floor still pinned at F. That merge refreshed only
+`observed_pull_request` in `tracedecay-v2-pr707.json`; the U/P record above,
+its CI evidence, and the accepted floor are unchanged, and the merge carries no
+train receipt, gate evidence, or floor advancement. Its conflict resolutions
+are recorded in the merge commit message.
+
 ## Run an isolated sync train
 
 The train is reviewable and single-directional:
