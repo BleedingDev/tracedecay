@@ -11,6 +11,10 @@ repository = "https://github.com/BleedingDev/tracedecay"
 name = "tracedecay-ncm-worker"
 path = "src/bin/tracedecay-ncm-worker.rs"
 
+[[bench]]
+name = "ncm_scale"
+harness = false
+
 [dependencies]
 tracedecay-memory-ncm-core = { path = "../tracedecay-memory-ncm-core" }
 serde = { version = "1", features = ["derive"] }

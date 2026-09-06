@@ -1,0 +1,1763 @@
+{
+  "blocked_populations": [
+    {
+      "detail": "PyTorch unavailable: No module named 'torch'",
+      "status": "blocked_environment"
+    },
+    {
+      "detail": "encoder artifacts missing: /Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/models/ncm-encoder-manifest.json",
+      "requirement": "Install the five pinned Xenova artifacts under <state-root>/models and rerun with default features. Missing model is not a waived population.",
+      "status": "blocked_environment"
+    }
+  ],
+  "branch": "feat/ncm-biomem-rust-v1",
+  "captured_unix_seconds": 1788666786,
+  "commit": "e3d36af35bb6a1fd8955ac9f0bb31a40e55f2539",
+  "feature_sets": {
+    "non_encoder": "--no-default-features, HashEncoder where text is required",
+    "real_encoder": "default features, pinned MiniLmEncoder, offline-only"
+  },
+  "hardware": {
+    "cpu_brand": "Apple M5",
+    "hostname": "Sathanovo-2.local",
+    "logical_cpus": 10,
+    "machine": "arm64",
+    "physical_memory_bytes": 34359738368,
+    "platform": "macOS-26.7-arm64-arm-64bit-Mach-O",
+    "processor": "arm",
+    "python": "3.14.7",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+  },
+  "interpretation": {
+    "allocated_bytes": "Not measured: adding an allocator instrumentation dependency was not justified and no suitable dependency was already locked.",
+    "flat_baseline_scope": "The flat baseline scans the same normalized active LTM center keys and returns distance-only top-k; it excludes projection, record support, and hydration.",
+    "idempotency_limit": "Unique idempotency events remain durable until the 64 MiB source-basis quota rejects further ingestion. VACUUM/checkpoint compaction does not prune them.",
+    "kernel_only_warning": "Kernel-only latencies are pre-embedded and are not full-text recall latencies."
+  },
+  "operation_counts": {
+    "default": 10000,
+    "kernel_only": 100000
+  },
+  "profile": "ncm-biomem-rs.v1",
+  "runs": [
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "self-test",
+        "--worker",
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/tracedecay-ncm-worker"
+      ],
+      "peak_rss_bytes": 697876480,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "e3d36af35bb6a1fd8955ac9f0bb31a40e55f2539",
+        "data": {
+          "controls": [
+            {
+              "mutant_caught": "Removing the max_record_bytes check makes the expected BudgetExceeded assertion fail; mutating before validation changes the digest equality assertion.",
+              "name": "record_16k_pre_mutation",
+              "status": "pass"
+            },
+            {
+              "mutant_caught": "A dynamic-growth or silent-reinforcement mutant makes the CapacityExhausted assertion fail; a non-atomic mutant changes the record count.",
+              "name": "fixed_center_capacity",
+              "status": "pass"
+            },
+            {
+              "limits": {
+                "reply": 1048576,
+                "request": 262144
+              },
+              "mutant_caught": "Removing the encode-side frame check makes the expected Oversized assertion fail.",
+              "name": "wire_request_bound",
+              "status": "pass"
+            },
+            {
+              "mutant_caught": "Removing the preflight makes the second append succeed; checking after INSERT changes source_basis_bytes despite the rejected transaction assertion.",
+              "name": "source_basis_quota",
+              "quota": {
+                "controlled_bytes": 268435456,
+                "reserve_bytes": 16777216,
+                "source_basis_bytes": 67108864
+              },
+              "status": "pass",
+              "usage": {
+                "capsule_bytes": 0,
+                "checkpoint_bytes": 0,
+                "db_bytes": 66162688,
+                "event_bytes": 66060368,
+                "wal_bytes": 66595712
+              }
+            },
+            {
+              "digest": "61956ec95e527b66adbd8a56736d2e0ad09b616ac5a70ab94c874a265d67de49",
+              "mutant_caught": "Dropping events/checkpoint state during compaction or replay makes either post-compact or post-reopen digest equality fail.",
+              "name": "checkpoint_compact_reopen_retention",
+              "status": "pass"
+            },
+            {
+              "health": {
+                "catalog_limit": 32,
+                "catalog_namespaces": 6,
+                "encoder": {
+                  "artifact_sha256": "test-double/hash-v1",
+                  "max_length": 128,
+                  "model": "test-double/hash"
+                },
+                "quota_headroom": {
+                  "controlled_bytes": 1069127392,
+                  "source_basis_bytes": 268420220
+                },
+                "resident_limit": 4,
+                "resident_namespaces": 4
+              },
+              "mutant_caught": "Removing top_k, advance, or LRU bounds respectively changes the rejection outcomes or resident_namespaces == 4 assertion.",
+              "name": "engine_topk_advance_resident_bounds",
+              "status": "pass"
+            },
+            {
+              "cancellation_ms": 37.643708,
+              "mutant_caught": "An unbounded mailbox yields zero Busy results; removing kill escalation makes the <=400 ms cancellation assertion fail.",
+              "name": "ipc_mailbox_and_cancellation",
+              "queue": {
+                "busy": 9,
+                "capacity": 32,
+                "other": 0,
+                "submitted": 41,
+                "success": 32
+              },
+              "status": "pass"
+            }
+          ],
+          "negative_control_rule": "Each passing control names the assertion that a no-op or bound-removal mutant would fail.",
+          "status": "pass"
+        },
+        "population": "self-test",
+        "process_rss_kib_snapshot": 680832,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 2.4727542079999694
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "kernel",
+        "--ops",
+        "100000",
+        "--population",
+        "all"
+      ],
+      "peak_rss_bytes": 84312064,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "e3d36af35bb6a1fd8955ac9f0bb31a40e55f2539",
+        "data": {
+          "populations": [
+            {
+              "capacity": {
+                "ltm": 4096,
+                "stm": 512
+              },
+              "ltm_active_at_start": 0,
+              "measurements": [
+                {
+                  "distribution": {
+                    "elapsed_ms": 4556.395291000001,
+                    "max_us": 70.917,
+                    "mean_us": 45.54373568,
+                    "min_us": 43.208,
+                    "operations_per_second": 21947.173941980967,
+                    "p50_us": 45.334,
+                    "p95_us": 48.208,
+                    "p99_us": 52.541,
+                    "samples": 100000
+                  },
+                  "name": "kernel_recall",
+                  "outcomes": {
+                    "non_empty": 0
+                  }
+                },
+                {
+                  "distribution": {
+                    "elapsed_ms": 102.800708,
+                    "max_us": 15.625,
+                    "mean_us": 1.00957871,
+                    "min_us": 0.916,
+                    "operations_per_second": 972755.9463890073,
+                    "p50_us": 1.0,
+                    "p95_us": 1.042,
+                    "p99_us": 1.25,
+                    "samples": 100000
+                  },
+                  "name": "flat_vector_ltm_top16",
+                  "outcomes": {
+                    "representation": "same normalized LTM center keys",
+                    "semantics": "distance-only brute-force top-k; no hydration"
+                  }
+                },
+                {
+                  "distribution": {
+                    "elapsed_ms": 238.75566700000002,
+                    "max_us": 17375.875,
+                    "mean_us": 1865.206046875,
+                    "min_us": 1662.666,
+                    "operations_per_second": 536.1129292064091,
+                    "p50_us": 1707.416,
+                    "p95_us": 2027.375,
+                    "p99_us": 2577.333,
+                    "samples": 128
+                  },
+                  "name": "kernel_observe",
+                  "outcomes": {
+                    "capacity_rejected": 0,
+                    "success": 128
+                  }
+                },
+                {
+                  "distribution": {
+                    "elapsed_ms": 166.460792,
+                    "max_us": 12180.709,
+                    "mean_us": 10403.7345,
+                    "min_us": 9918.041,
+                    "operations_per_second": 96.11873046957508,
+                    "p50_us": 10183.375,
+                    "p95_us": 12180.709,
+                    "p99_us": 12180.709,
+                    "samples": 16
+                  },
+                  "name": "kernel_consolidate",
+                  "outcomes": {
+                    "stateful_trace": true
+                  }
+                }
+              ],
+              "population": "empty",
+              "stm_active_at_start": 0
+            },
+            {
+              "capacity": {
+                "ltm": 4096,
+                "stm": 512
+              },
+              "ltm_active_at_start": 512,
+              "measurements": [
+                {
+                  "distribution": {
+                    "elapsed_ms": 9070.43475,
+                    "max_us": 203.709,
+                    "mean_us": 90.68483413,
+                    "min_us": 86.5,
+                    "operations_per_second": 11024.829873783061,
+                    "p50_us": 90.208,
+                    "p95_us": 95.875,
+                    "p99_us": 100.209,
+                    "samples": 100000
+                  },
+                  "name": "kernel_recall",
+                  "outcomes": {
+                    "non_empty": 100000
+                  }
+                },
+                {
+                  "distribution": {
+                    "elapsed_ms": 1033.2027079999998,
+                    "max_us": 33.5,
+                    "mean_us": 10.310834000000002,
+                    "min_us": 10.0,
+                    "operations_per_second": 96786.42847691801,
+                    "p50_us": 10.25,
+                    "p95_us": 10.417,
+                    "p99_us": 12.709,
+                    "samples": 100000
+                  },
+                  "name": "flat_vector_ltm_top16",
+                  "outcomes": {
+                    "representation": "same normalized LTM center keys",
+                    "semantics": "distance-only brute-force top-k; no hydration"
+                  }
+                },
+                {
+                  "distribution": {
+                    "elapsed_ms": 285.044833,
+                    "max_us": 41916.459,
+                    "mean_us": 2226.8756953125,
+                    "min_us": 1823.583,
+                    "operations_per_second": 449.0521671725935,
+                    "p50_us": 1863.875,
+                    "p95_us": 2355.083,
+                    "p99_us": 2874.792,
+                    "samples": 128
+                  },
+                  "name": "kernel_observe",
+                  "outcomes": {
+                    "capacity_rejected": 0,
+                    "success": 128
+                  }
+                },
+                {
+                  "distribution": {
+                    "elapsed_ms": 198.74941600000002,
+                    "max_us": 20958.0,
+                    "mean_us": 12421.7863125,
+                    "min_us": 10244.042,
+                    "operations_per_second": 80.50338120238803,
+                    "p50_us": 10630.75,
+                    "p95_us": 20958.0,
+                    "p99_us": 20958.0,
+                    "samples": 16
+                  },
+                  "name": "kernel_consolidate",
+                  "outcomes": {
+                    "stateful_trace": true
+                  }
+                }
+              ],
+              "population": "sparse",
+              "stm_active_at_start": 64
+            },
+            {
+              "capacity": {
+                "ltm": 4096,
+                "stm": 512
+              },
+              "ltm_active_at_start": 4096,
+              "measurements": [
+                {
+                  "distribution": {
+                    "elapsed_ms": 41968.838124999995,
+                    "max_us": 1333.125,
+                    "mean_us": 419.6643101,
+                    "min_us": 377.917,
+                    "operations_per_second": 2382.720238815284,
+                    "p50_us": 419.958,
+                    "p95_us": 460.083,
+                    "p99_us": 507.167,
+                    "samples": 100000
+                  },
+                  "name": "kernel_recall",
+                  "outcomes": {
+                    "non_empty": 100000
+                  }
+                },
+                {
+                  "distribution": {
+                    "elapsed_ms": 9504.100166,
+                    "max_us": 879.0,
+                    "mean_us": 95.01508843,
+                    "min_us": 85.208,
+                    "operations_per_second": 10521.774629200598,
+                    "p50_us": 94.541,
+                    "p95_us": 102.375,
+                    "p99_us": 108.291,
+                    "samples": 100000
+                  },
+                  "name": "flat_vector_ltm_top16",
+                  "outcomes": {
+                    "representation": "same normalized LTM center keys",
+                    "semantics": "distance-only brute-force top-k; no hydration"
+                  }
+                },
+                {
+                  "distribution": {
+                    "elapsed_ms": 174.606167,
+                    "max_us": 2132.334,
+                    "mean_us": 1364.08334375,
+                    "min_us": 1283.416,
+                    "operations_per_second": 733.0783453942952,
+                    "p50_us": 1351.084,
+                    "p95_us": 1420.417,
+                    "p99_us": 1441.834,
+                    "samples": 128
+                  },
+                  "name": "kernel_observe",
+                  "outcomes": {
+                    "capacity_rejected": 128,
+                    "success": 0
+                  }
+                },
+                {
+                  "distribution": {
+                    "elapsed_ms": 1019.6700830000001,
+                    "max_us": 83246.917,
+                    "mean_us": 63729.2839375,
+                    "min_us": 12091.042,
+                    "operations_per_second": 15.691349846144304,
+                    "p50_us": 80438.792,
+                    "p95_us": 83246.917,
+                    "p99_us": 83246.917,
+                    "samples": 16
+                  },
+                  "name": "kernel_consolidate",
+                  "outcomes": {
+                    "stateful_trace": true
+                  }
+                }
+              ],
+              "population": "full",
+              "stm_active_at_start": 512
+            }
+          ],
+          "requested_ops": 100000,
+          "warning": "Pre-embedded kernel timings exclude tokenization, ONNX inference, IPC, SQLite commit, and text hydration. They are not full-text recall latencies."
+        },
+        "population": "kernel",
+        "process_rss_kib_snapshot": 82256,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 68.3605264580001
+    },
+    {
+      "command": [
+        "/opt/homebrew/opt/python@3.14/bin/python3.14",
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/scripts/product/ncm/benchmark/reference_kernel.py",
+        "--biomem-root",
+        "/Users/satan/workspace/bleedingdev/projects/biomem/code/biomem",
+        "--ops",
+        "10000"
+      ],
+      "peak_rss_bytes": 21348352,
+      "result": {
+        "data": {
+          "detail": "PyTorch unavailable: No module named 'torch'",
+          "status": "blocked_environment"
+        },
+        "population": "python_reference_kernel",
+        "reference_commit": "500847ff65b5d9548b3826fa29bf3ccf8d221147",
+        "schema_version": 1
+      },
+      "wall_seconds": 0.03687529099988751
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "store",
+        "--ops",
+        "10000",
+        "--record-bytes",
+        "64"
+      ],
+      "peak_rss_bytes": 53215232,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "c22824bd42f58cad46a4607ae7a56e13512c8ae8",
+        "data": {
+          "compact_us": 123953.0,
+          "idempotency_retention": "Unique idempotency rows are retained until the 64 MiB source-basis quota rejects new ingestion; checkpoint/VACUUM compaction does not prune event rows.",
+          "measurement": {
+            "distribution": {
+              "elapsed_ms": 79561.793042,
+              "max_us": 19777.791,
+              "mean_us": 7956.0978692,
+              "min_us": 106.333,
+              "operations_per_second": 125.68846952356998,
+              "p50_us": 7902.416,
+              "p95_us": 15332.041,
+              "p99_us": 16194.916,
+              "samples": 10000
+            },
+            "name": "durable_commit",
+            "outcomes": {
+              "budget_rejected_before_effect": 0,
+              "committed": 10000,
+              "other_rejected": 0
+            }
+          },
+          "quota": {
+            "controlled_bytes": 268435456,
+            "reserve_bytes": 16777216,
+            "source_basis_bytes": 67108864
+          },
+          "record_bytes": 64,
+          "reopen": {
+            "capsules": 10000,
+            "events": 10000
+          },
+          "requested_ops": 10000,
+          "usage_after_compact": {
+            "capsule_bytes": 34258890,
+            "checkpoint_bytes": 0,
+            "db_bytes": 42283008,
+            "event_bytes": 838890,
+            "wal_bytes": 0
+          },
+          "usage_before_compact": {
+            "capsule_bytes": 34258890,
+            "checkpoint_bytes": 0,
+            "db_bytes": 41934848,
+            "event_bytes": 838890,
+            "wal_bytes": 4152992
+          }
+        },
+        "population": "store",
+        "process_rss_kib_snapshot": 51936,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 79.81345512500047
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "store",
+        "--ops",
+        "10000",
+        "--record-bytes",
+        "4096"
+      ],
+      "peak_rss_bytes": 85557248,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "c22824bd42f58cad46a4607ae7a56e13512c8ae8",
+        "data": {
+          "compact_us": 229090.959,
+          "idempotency_retention": "Unique idempotency rows are retained until the 64 MiB source-basis quota rejects new ingestion; checkpoint/VACUUM compaction does not prune event rows.",
+          "measurement": {
+            "distribution": {
+              "elapsed_ms": 235750.514875,
+              "max_us": 53320.917,
+              "mean_us": 23574.9689694,
+              "min_us": 132.75,
+              "operations_per_second": 42.41772284273574,
+              "p50_us": 23995.792,
+              "p95_us": 43964.458,
+              "p99_us": 46357.25,
+              "samples": 10000
+            },
+            "name": "durable_commit",
+            "outcomes": {
+              "budget_rejected_before_effect": 1102,
+              "committed": 8898,
+              "other_rejected": 0
+            }
+          },
+          "quota": {
+            "controlled_bytes": 268435456,
+            "reserve_bytes": 16777216,
+            "source_basis_bytes": 67108864
+          },
+          "record_bytes": 4096,
+          "reopen": {
+            "capsules": 8898,
+            "events": 8898
+          },
+          "requested_ops": 10000,
+          "usage_after_compact": {
+            "capsule_bytes": 66360174,
+            "checkpoint_bytes": 0,
+            "db_bytes": 74072064,
+            "event_bytes": 746322,
+            "wal_bytes": 0
+          },
+          "usage_before_compact": {
+            "capsule_bytes": 66360174,
+            "checkpoint_bytes": 0,
+            "db_bytes": 73424896,
+            "event_bytes": 746322,
+            "wal_bytes": 4157112
+          }
+        },
+        "population": "store",
+        "process_rss_kib_snapshot": 83520,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 236.1882292909977
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "store",
+        "--ops",
+        "10000",
+        "--record-bytes",
+        "16384"
+      ],
+      "peak_rss_bytes": 82001920,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "c22824bd42f58cad46a4607ae7a56e13512c8ae8",
+        "data": {
+          "compact_us": 219611.5,
+          "idempotency_retention": "Unique idempotency rows are retained until the 64 MiB source-basis quota rejects new ingestion; checkpoint/VACUUM compaction does not prune event rows.",
+          "measurement": {
+            "distribution": {
+              "elapsed_ms": 246279.474709,
+              "max_us": 55624.792,
+              "mean_us": 24627.8781586,
+              "min_us": 178.792,
+              "operations_per_second": 40.604276957370665,
+              "p50_us": 24471.708,
+              "p95_us": 42240.833,
+              "p99_us": 48186.875,
+              "samples": 10000
+            },
+            "name": "durable_commit",
+            "outcomes": {
+              "budget_rejected_before_effect": 6616,
+              "committed": 3384,
+              "other_rejected": 0
+            }
+          },
+          "quota": {
+            "controlled_bytes": 268435456,
+            "reserve_bytes": 16777216,
+            "source_basis_bytes": 67108864
+          },
+          "record_bytes": 16384,
+          "reopen": {
+            "capsules": 3384,
+            "events": 3384
+          },
+          "requested_ops": 10000,
+          "usage_after_compact": {
+            "capsule_bytes": 66819354,
+            "checkpoint_bytes": 0,
+            "db_bytes": 69783552,
+            "event_bytes": 283146,
+            "wal_bytes": 0
+          },
+          "usage_before_compact": {
+            "capsule_bytes": 66819354,
+            "checkpoint_bytes": 0,
+            "db_bytes": 68694016,
+            "event_bytes": 283146,
+            "wal_bytes": 4165352
+          }
+        },
+        "population": "store",
+        "process_rss_kib_snapshot": 80048,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 246.68044145800013
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "ipc",
+        "--ops",
+        "10000",
+        "--worker",
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/tracedecay-ncm-worker"
+      ],
+      "peak_rss_bytes": 8896512,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "e3d36af35bb6a1fd8955ac9f0bb31a40e55f2539",
+        "data": {
+          "cancellation": {
+            "completion_ms": 37.568708,
+            "kill_escalation_limit_ms": 250,
+            "outcome": "cancelled"
+          },
+          "mailbox_limits": {
+            "bytes": 8388608,
+            "requests": 32
+          },
+          "measurement": {
+            "distribution": {
+              "elapsed_ms": 216.808042,
+              "max_us": 3365.792,
+              "mean_us": 21.6570339,
+              "min_us": 12.375,
+              "operations_per_second": 46123.75033579243,
+              "p50_us": 19.959,
+              "p95_us": 34.708,
+              "p99_us": 49.875,
+              "samples": 10000
+            },
+            "name": "ipc_health_round_trip",
+            "outcomes": {
+              "success": 10000
+            }
+          },
+          "queue": {
+            "busy": 8,
+            "capacity": 32,
+            "other": 0,
+            "submitted": 41,
+            "success": 33
+          },
+          "requested_ops": 10000,
+          "worker": "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/tracedecay-ncm-worker"
+        },
+        "population": "ipc",
+        "process_rss_kib_snapshot": 3168,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 0.2750616670018644
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "engine",
+        "--ops",
+        "10000",
+        "--namespaces",
+        "1",
+        "--record-bytes",
+        "64"
+      ],
+      "peak_rss_bytes": 902823936,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "e3d36af35bb6a1fd8955ac9f0bb31a40e55f2539",
+        "data": {
+          "encoder": "HashEncoder test double; ONNX inference measured separately",
+          "health": {
+            "catalog_limit": 32,
+            "catalog_namespaces": 1,
+            "encoder": {
+              "artifact_sha256": "test-double/hash-v1",
+              "max_length": 128,
+              "model": "test-double/hash"
+            },
+            "quota_headroom": {
+              "controlled_bytes": 807392,
+              "source_basis_bytes": 65521370
+            },
+            "resident_limit": 4,
+            "resident_namespaces": 1
+          },
+          "inspections": [
+            {
+              "commit_seq": 416,
+              "epoch": 1,
+              "fatigue": 2.948776960372925,
+              "ltm_active": 400,
+              "ltm_terrain_digest": 6979828976245359780,
+              "quota_usage": {
+                "capsule_bytes": 1433704,
+                "checkpoint_bytes": 241992745,
+                "db_bytes": 245215232,
+                "event_bytes": 153790,
+                "wal_bytes": 22412832
+              },
+              "records": 416,
+              "sources": 17,
+              "state_digest": "7ecbc0f314bcf459b093db8718e9e148b5758761d84fedd8ef59fc5994e2737f",
+              "steps_since_consolidation": 16,
+              "stm_active": 416,
+              "stm_terrain_digest": 14592908695484130160,
+              "tick": 416
+            }
+          ],
+          "measurements": [
+            {
+              "distribution": {
+                "elapsed_ms": 20109.518666,
+                "max_us": 130240.792,
+                "mean_us": 39276.32900585938,
+                "min_us": 33168.75,
+                "operations_per_second": 25.460579564525318,
+                "p50_us": 37273.541,
+                "p95_us": 39698.459,
+                "p99_us": 123502.709,
+                "samples": 512
+              },
+              "name": "end_to_end_hash_observe",
+              "outcomes": {
+                "rejected": 96,
+                "success": 416
+              }
+            },
+            {
+              "distribution": {
+                "elapsed_ms": 1060.397875,
+                "max_us": 145.917,
+                "mean_us": 111.74302403035414,
+                "min_us": 105.458,
+                "operations_per_second": 8947.584886474806,
+                "p50_us": 111.0,
+                "p95_us": 118.375,
+                "p99_us": 124.791,
+                "samples": 9488
+              },
+              "name": "end_to_end_hash_recall",
+              "outcomes": {
+                "success": 3868
+              }
+            }
+          ],
+          "observe_samples": 512,
+          "recall_samples": 9488,
+          "record_bytes": 64,
+          "requested_trace_ops": 10000,
+          "resident_namespaces": 1
+        },
+        "population": "engine",
+        "process_rss_kib_snapshot": 530496,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 21.227702833002695
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "engine",
+        "--ops",
+        "10000",
+        "--namespaces",
+        "1",
+        "--record-bytes",
+        "4096"
+      ],
+      "peak_rss_bytes": 946208768,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "c22824bd42f58cad46a4607ae7a56e13512c8ae8",
+        "data": {
+          "encoder": "HashEncoder test double; ONNX inference measured separately",
+          "health": {
+            "catalog_limit": 32,
+            "catalog_namespaces": 1,
+            "encoder": {
+              "artifact_sha256": "test-double/hash-v1",
+              "max_length": 128,
+              "model": "test-double/hash"
+            },
+            "quota_headroom": {
+              "controlled_bytes": 9692464,
+              "source_basis_bytes": 64095239
+            },
+            "resident_limit": 4,
+            "resident_namespaces": 1
+          },
+          "inspections": [
+            {
+              "commit_seq": 384,
+              "epoch": 1,
+              "fatigue": 7.253476619720459,
+              "ltm_active": 300,
+              "ltm_terrain_digest": 3686556214604488252,
+              "quota_usage": {
+                "capsule_bytes": 2871706,
+                "checkpoint_bytes": 230430177,
+                "db_bytes": 235069440,
+                "event_bytes": 141919,
+                "wal_bytes": 23673552
+              },
+              "records": 384,
+              "sources": 17,
+              "state_digest": "20b44cf4e0d681fd0f41679e51ee6f0adad5aabf53c3f4583250034ee24ba57c",
+              "steps_since_consolidation": 84,
+              "stm_active": 384,
+              "stm_terrain_digest": 1506005120006316151,
+              "tick": 384
+            }
+          ],
+          "measurements": [
+            {
+              "distribution": {
+                "elapsed_ms": 22124.716249999998,
+                "max_us": 156130.334,
+                "mean_us": 43212.248384765626,
+                "min_us": 33834.958,
+                "operations_per_second": 23.1415397248315,
+                "p50_us": 42298.708,
+                "p95_us": 46313.167,
+                "p99_us": 133159.625,
+                "samples": 512
+              },
+              "name": "end_to_end_hash_observe",
+              "outcomes": {
+                "rejected": 128,
+                "success": 384
+              }
+            },
+            {
+              "distribution": {
+                "elapsed_ms": 977.822458,
+                "max_us": 150.583,
+                "mean_us": 103.03928562394604,
+                "min_us": 96.916,
+                "operations_per_second": 9703.192969617803,
+                "p50_us": 101.875,
+                "p95_us": 110.958,
+                "p99_us": 117.75,
+                "samples": 9488
+              },
+              "name": "end_to_end_hash_recall",
+              "outcomes": {
+                "success": 5168
+              }
+            }
+          ],
+          "observe_samples": 512,
+          "recall_samples": 9488,
+          "record_bytes": 4096,
+          "requested_trace_ops": 10000,
+          "resident_namespaces": 1
+        },
+        "population": "engine",
+        "process_rss_kib_snapshot": 602240,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 23.16631170799883
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "engine",
+        "--ops",
+        "10000",
+        "--namespaces",
+        "1",
+        "--record-bytes",
+        "16384"
+      ],
+      "peak_rss_bytes": 1294073856,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "c22824bd42f58cad46a4607ae7a56e13512c8ae8",
+        "data": {
+          "encoder": "HashEncoder test double; ONNX inference measured separately",
+          "health": {
+            "catalog_limit": 32,
+            "catalog_namespaces": 1,
+            "encoder": {
+              "artifact_sha256": "test-double/hash-v1",
+              "max_length": 128,
+              "model": "test-double/hash"
+            },
+            "quota_headroom": {
+              "controlled_bytes": 0,
+              "source_basis_bytes": 60021043
+            },
+            "resident_limit": 4,
+            "resident_namespaces": 1
+          },
+          "inspections": [
+            {
+              "commit_seq": 352,
+              "epoch": 1,
+              "fatigue": 5.480963706970215,
+              "ltm_active": 300,
+              "ltm_terrain_digest": 4903077996119561329,
+              "quota_usage": {
+                "capsule_bytes": 6957774,
+                "checkpoint_bytes": 233844544,
+                "db_bytes": 242544640,
+                "event_bytes": 130047,
+                "wal_bytes": 28110792
+              },
+              "records": 352,
+              "sources": 17,
+              "state_digest": "355ed382377b61d770d4cc73d08a09e7fef797060bdb3aebf97d46feab6d7169",
+              "steps_since_consolidation": 52,
+              "stm_active": 352,
+              "stm_terrain_digest": 10997504458512069387,
+              "tick": 352
+            }
+          ],
+          "measurements": [
+            {
+              "distribution": {
+                "elapsed_ms": 27041.292625000002,
+                "max_us": 183061.792,
+                "mean_us": 52814.940005859375,
+                "min_us": 35548.625,
+                "operations_per_second": 18.934006117986012,
+                "p50_us": 54005.625,
+                "p95_us": 59365.834,
+                "p99_us": 145270.417,
+                "samples": 512
+              },
+              "name": "end_to_end_hash_observe",
+              "outcomes": {
+                "rejected": 160,
+                "success": 352
+              }
+            },
+            {
+              "distribution": {
+                "elapsed_ms": 969.707458,
+                "max_us": 144.0,
+                "mean_us": 102.18410634485666,
+                "min_us": 94.75,
+                "operations_per_second": 9784.394171381118,
+                "p50_us": 100.708,
+                "p95_us": 111.125,
+                "p99_us": 119.708,
+                "samples": 9488
+              },
+              "name": "end_to_end_hash_recall",
+              "outcomes": {
+                "success": 4879
+              }
+            }
+          ],
+          "observe_samples": 512,
+          "recall_samples": 9488,
+          "record_bytes": 16384,
+          "requested_trace_ops": 10000,
+          "resident_namespaces": 1
+        },
+        "population": "engine",
+        "process_rss_kib_snapshot": 925792,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 28.094228458001453
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "engine",
+        "--ops",
+        "10000",
+        "--namespaces",
+        "4",
+        "--record-bytes",
+        "64"
+      ],
+      "peak_rss_bytes": 926646272,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "c22824bd42f58cad46a4607ae7a56e13512c8ae8",
+        "data": {
+          "encoder": "HashEncoder test double; ONNX inference measured separately",
+          "health": {
+            "catalog_limit": 32,
+            "catalog_namespaces": 4,
+            "encoder": {
+              "artifact_sha256": "test-double/hash-v1",
+              "max_length": 128,
+              "model": "test-double/hash"
+            },
+            "quota_headroom": {
+              "controlled_bytes": 526311424,
+              "source_basis_bytes": 264619892
+            },
+            "resident_limit": 4,
+            "resident_namespaces": 4
+          },
+          "inspections": [
+            {
+              "commit_seq": 250,
+              "epoch": 1,
+              "fatigue": 5.346430778503418,
+              "ltm_active": 200,
+              "ltm_terrain_digest": 16904629894570335544,
+              "quota_usage": {
+                "capsule_bytes": 861603,
+                "checkpoint_bytes": 117936405,
+                "db_bytes": 120168448,
+                "event_bytes": 92288,
+                "wal_bytes": 16777216
+              },
+              "records": 250,
+              "sources": 17,
+              "state_digest": "23bdc37ae382955289f2f2577fc53982a3339bf658de2f806950c3bb93037366",
+              "steps_since_consolidation": 50,
+              "stm_active": 250,
+              "stm_terrain_digest": 16789365575120992365,
+              "tick": 250
+            },
+            {
+              "commit_seq": 250,
+              "epoch": 1,
+              "fatigue": 5.346430778503418,
+              "ltm_active": 200,
+              "ltm_terrain_digest": 16917988866902971736,
+              "quota_usage": {
+                "capsule_bytes": 861602,
+                "checkpoint_bytes": 117867457,
+                "db_bytes": 120102912,
+                "event_bytes": 92288,
+                "wal_bytes": 16777216
+              },
+              "records": 250,
+              "sources": 17,
+              "state_digest": "eace04dfd62a2721004e243cd72e60fa83b9b24fe9754590a5e359cf4d638c3e",
+              "steps_since_consolidation": 50,
+              "stm_active": 250,
+              "stm_terrain_digest": 14403877874337661995,
+              "tick": 250
+            },
+            {
+              "commit_seq": 250,
+              "epoch": 1,
+              "fatigue": 5.346430778503418,
+              "ltm_active": 200,
+              "ltm_terrain_digest": 245969163870916921,
+              "quota_usage": {
+                "capsule_bytes": 861602,
+                "checkpoint_bytes": 117949530,
+                "db_bytes": 120184832,
+                "event_bytes": 92289,
+                "wal_bytes": 16777216
+              },
+              "records": 250,
+              "sources": 17,
+              "state_digest": "8580b9f76c93657798509e1505f4db6bf63674c8803441d98669aeae52780103",
+              "steps_since_consolidation": 50,
+              "stm_active": 250,
+              "stm_terrain_digest": 2164988457463854233,
+              "tick": 250
+            },
+            {
+              "commit_seq": 250,
+              "epoch": 1,
+              "fatigue": 5.346430778503418,
+              "ltm_active": 200,
+              "ltm_terrain_digest": 2029198135381783917,
+              "quota_usage": {
+                "capsule_bytes": 861603,
+                "checkpoint_bytes": 117629063,
+                "db_bytes": 119865344,
+                "event_bytes": 92289,
+                "wal_bytes": 16777216
+              },
+              "records": 250,
+              "sources": 17,
+              "state_digest": "dd10f9ec860a8056dff4fe1e451fa297a1e6652a1ee3b456545ed1b19084ab61",
+              "steps_since_consolidation": 50,
+              "stm_active": 250,
+              "stm_terrain_digest": 8479525383288559345,
+              "tick": 250
+            }
+          ],
+          "measurements": [
+            {
+              "distribution": {
+                "elapsed_ms": 38462.221792000004,
+                "max_us": 125181.041,
+                "mean_us": 38462.160479000006,
+                "min_us": 32708.292,
+                "operations_per_second": 25.9995380768148,
+                "p50_us": 36330.292,
+                "p95_us": 38725.5,
+                "p99_us": 120501.834,
+                "samples": 1000
+              },
+              "name": "end_to_end_hash_observe",
+              "outcomes": {
+                "rejected": 0,
+                "success": 1000
+              }
+            },
+            {
+              "distribution": {
+                "elapsed_ms": 787.222,
+                "max_us": 119.042,
+                "mean_us": 87.45022177777778,
+                "min_us": 81.833,
+                "operations_per_second": 11432.607320425497,
+                "p50_us": 86.417,
+                "p95_us": 94.125,
+                "p99_us": 99.917,
+                "samples": 9000
+              },
+              "name": "end_to_end_hash_recall",
+              "outcomes": {
+                "success": 4643
+              }
+            }
+          ],
+          "observe_samples": 1000,
+          "recall_samples": 9000,
+          "record_bytes": 64,
+          "requested_trace_ops": 10000,
+          "resident_namespaces": 4
+        },
+        "population": "engine",
+        "process_rss_kib_snapshot": 463872,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 39.430184582997754
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "engine",
+        "--ops",
+        "10000",
+        "--namespaces",
+        "4",
+        "--record-bytes",
+        "4096"
+      ],
+      "peak_rss_bytes": 946290688,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "c22824bd42f58cad46a4607ae7a56e13512c8ae8",
+        "data": {
+          "encoder": "HashEncoder test double; ONNX inference measured separately",
+          "health": {
+            "catalog_limit": 32,
+            "catalog_namespaces": 4,
+            "encoder": {
+              "artifact_sha256": "test-double/hash-v1",
+              "max_length": 128,
+              "model": "test-double/hash"
+            },
+            "quota_headroom": {
+              "controlled_bytes": 508252160,
+              "source_basis_bytes": 260587892
+            },
+            "resident_limit": 4,
+            "resident_namespaces": 4
+          },
+          "inspections": [
+            {
+              "commit_seq": 250,
+              "epoch": 1,
+              "fatigue": 5.346430778503418,
+              "ltm_active": 200,
+              "ltm_terrain_digest": 16904629894570335544,
+              "quota_usage": {
+                "capsule_bytes": 1869603,
+                "checkpoint_bytes": 121488189,
+                "db_bytes": 124641280,
+                "event_bytes": 92288,
+                "wal_bytes": 16777216
+              },
+              "records": 250,
+              "sources": 17,
+              "state_digest": "92966309ab05b5b58057f263b570220c0724cb4cb639e5a76f156081954d3196",
+              "steps_since_consolidation": 50,
+              "stm_active": 250,
+              "stm_terrain_digest": 16789365575120992365,
+              "tick": 250
+            },
+            {
+              "commit_seq": 250,
+              "epoch": 1,
+              "fatigue": 5.346430778503418,
+              "ltm_active": 200,
+              "ltm_terrain_digest": 16917988866902971736,
+              "quota_usage": {
+                "capsule_bytes": 1869602,
+                "checkpoint_bytes": 121487867,
+                "db_bytes": 124641280,
+                "event_bytes": 92288,
+                "wal_bytes": 16777216
+              },
+              "records": 250,
+              "sources": 17,
+              "state_digest": "2873c32a489e36ced1e60f3c994ca7edcb7052402d0e59392246c71283ff0fcc",
+              "steps_since_consolidation": 50,
+              "stm_active": 250,
+              "stm_terrain_digest": 14403877874337661995,
+              "tick": 250
+            },
+            {
+              "commit_seq": 250,
+              "epoch": 1,
+              "fatigue": 5.346430778503418,
+              "ltm_active": 200,
+              "ltm_terrain_digest": 245969163870916921,
+              "quota_usage": {
+                "capsule_bytes": 1869602,
+                "checkpoint_bytes": 121526856,
+                "db_bytes": 124682240,
+                "event_bytes": 92289,
+                "wal_bytes": 16777216
+              },
+              "records": 250,
+              "sources": 17,
+              "state_digest": "0f543ead8dbbae9ae1b52c60d00d3fafbc7551eb9f973587ef79df5c1781dc27",
+              "steps_since_consolidation": 50,
+              "stm_active": 250,
+              "stm_terrain_digest": 2164988457463854233,
+              "tick": 250
+            },
+            {
+              "commit_seq": 250,
+              "epoch": 1,
+              "fatigue": 5.346430778503418,
+              "ltm_active": 200,
+              "ltm_terrain_digest": 2029198135381783917,
+              "quota_usage": {
+                "capsule_bytes": 1869603,
+                "checkpoint_bytes": 121259814,
+                "db_bytes": 124416000,
+                "event_bytes": 92289,
+                "wal_bytes": 16777216
+              },
+              "records": 250,
+              "sources": 17,
+              "state_digest": "01f972bc14a8c17e56ec9c2f2f69d3d401649d3d667f2a42a78af1aedc16934f",
+              "steps_since_consolidation": 50,
+              "stm_active": 250,
+              "stm_terrain_digest": 8479525383288559345,
+              "tick": 250
+            }
+          ],
+          "measurements": [
+            {
+              "distribution": {
+                "elapsed_ms": 41075.652291,
+                "max_us": 135723.417,
+                "mean_us": 41075.580425,
+                "min_us": 33729.917,
+                "operations_per_second": 24.34532245320199,
+                "p50_us": 38538.5,
+                "p95_us": 43913.541,
+                "p99_us": 125887.292,
+                "samples": 1000
+              },
+              "name": "end_to_end_hash_observe",
+              "outcomes": {
+                "rejected": 0,
+                "success": 1000
+              }
+            },
+            {
+              "distribution": {
+                "elapsed_ms": 794.6734170000001,
+                "max_us": 134.625,
+                "mean_us": 88.27754433333334,
+                "min_us": 82.125,
+                "operations_per_second": 11325.407151501582,
+                "p50_us": 87.042,
+                "p95_us": 95.75,
+                "p99_us": 101.375,
+                "samples": 9000
+              },
+              "name": "end_to_end_hash_recall",
+              "outcomes": {
+                "success": 4643
+              }
+            }
+          ],
+          "observe_samples": 1000,
+          "recall_samples": 9000,
+          "record_bytes": 4096,
+          "requested_trace_ops": 10000,
+          "resident_namespaces": 4
+        },
+        "population": "engine",
+        "process_rss_kib_snapshot": 233936,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 42.063099207996856
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "engine",
+        "--ops",
+        "10000",
+        "--namespaces",
+        "4",
+        "--record-bytes",
+        "16384"
+      ],
+      "peak_rss_bytes": 1168736256,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "c22824bd42f58cad46a4607ae7a56e13512c8ae8",
+        "data": {
+          "encoder": "HashEncoder test double; ONNX inference measured separately",
+          "health": {
+            "catalog_limit": 32,
+            "catalog_namespaces": 4,
+            "encoder": {
+              "artifact_sha256": "test-double/hash-v1",
+              "max_length": 128,
+              "model": "test-double/hash"
+            },
+            "quota_headroom": {
+              "controlled_bytes": 453181440,
+              "source_basis_bytes": 248299892
+            },
+            "resident_limit": 4,
+            "resident_namespaces": 4
+          },
+          "inspections": [
+            {
+              "commit_seq": 250,
+              "epoch": 1,
+              "fatigue": 5.346430778503418,
+              "ltm_active": 200,
+              "ltm_terrain_digest": 16904629894570335544,
+              "quota_usage": {
+                "capsule_bytes": 4941603,
+                "checkpoint_bytes": 132514312,
+                "db_bytes": 138428416,
+                "event_bytes": 92288,
+                "wal_bytes": 16777216
+              },
+              "records": 250,
+              "sources": 17,
+              "state_digest": "b1191b7e322aa5c1db3bf1c35609fa43077e5f6dc507b807a9ac0fb9efd2817e",
+              "steps_since_consolidation": 50,
+              "stm_active": 250,
+              "stm_terrain_digest": 16789365575120992365,
+              "tick": 250
+            },
+            {
+              "commit_seq": 250,
+              "epoch": 1,
+              "fatigue": 5.346430778503418,
+              "ltm_active": 200,
+              "ltm_terrain_digest": 16917988866902971736,
+              "quota_usage": {
+                "capsule_bytes": 4941602,
+                "checkpoint_bytes": 132469635,
+                "db_bytes": 138387456,
+                "event_bytes": 92288,
+                "wal_bytes": 16777216
+              },
+              "records": 250,
+              "sources": 17,
+              "state_digest": "99530659e3bfa325c64ec371b042babd5d85834076957866f6909cec6afa1064",
+              "steps_since_consolidation": 50,
+              "stm_active": 250,
+              "stm_terrain_digest": 14403877874337661995,
+              "tick": 250
+            },
+            {
+              "commit_seq": 250,
+              "epoch": 1,
+              "fatigue": 5.346430778503418,
+              "ltm_active": 200,
+              "ltm_terrain_digest": 245969163870916921,
+              "quota_usage": {
+                "capsule_bytes": 4941602,
+                "checkpoint_bytes": 132559822,
+                "db_bytes": 138481664,
+                "event_bytes": 92289,
+                "wal_bytes": 16777216
+              },
+              "records": 250,
+              "sources": 17,
+              "state_digest": "d4b6832d1af73f5cfec8b861656a039f51fbd60a0908ac46d5336a0fe01f29b6",
+              "steps_since_consolidation": 50,
+              "stm_active": 250,
+              "stm_terrain_digest": 2164988457463854233,
+              "tick": 250
+            },
+            {
+              "commit_seq": 250,
+              "epoch": 1,
+              "fatigue": 5.346430778503418,
+              "ltm_active": 200,
+              "ltm_terrain_digest": 2029198135381783917,
+              "quota_usage": {
+                "capsule_bytes": 4941603,
+                "checkpoint_bytes": 132236538,
+                "db_bytes": 138153984,
+                "event_bytes": 92289,
+                "wal_bytes": 16777216
+              },
+              "records": 250,
+              "sources": 17,
+              "state_digest": "85a1c236034e7ee5299136bcdf05d90633ad90d636bd851252b9d5527c329242",
+              "steps_since_consolidation": 50,
+              "stm_active": 250,
+              "stm_terrain_digest": 8479525383288559345,
+              "tick": 250
+            }
+          ],
+          "measurements": [
+            {
+              "distribution": {
+                "elapsed_ms": 47715.580959,
+                "max_us": 153704.375,
+                "mean_us": 47715.522376,
+                "min_us": 35280.25,
+                "operations_per_second": 20.957514922835333,
+                "p50_us": 45347.958,
+                "p95_us": 54469.209,
+                "p99_us": 142013.75,
+                "samples": 1000
+              },
+              "name": "end_to_end_hash_observe",
+              "outcomes": {
+                "rejected": 0,
+                "success": 1000
+              }
+            },
+            {
+              "distribution": {
+                "elapsed_ms": 801.700917,
+                "max_us": 130.459,
+                "mean_us": 89.05888455555557,
+                "min_us": 81.792,
+                "operations_per_second": 11226.131602391568,
+                "p50_us": 87.458,
+                "p95_us": 98.625,
+                "p99_us": 105.583,
+                "samples": 9000
+              },
+              "name": "end_to_end_hash_recall",
+              "outcomes": {
+                "success": 4643
+              }
+            }
+          ],
+          "observe_samples": 1000,
+          "recall_samples": 9000,
+          "record_bytes": 16384,
+          "requested_trace_ops": 10000,
+          "resident_namespaces": 4
+        },
+        "population": "engine",
+        "process_rss_kib_snapshot": 1141328,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 48.76801645800151
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "mixed",
+        "--ops",
+        "10000",
+        "--namespaces",
+        "1"
+      ],
+      "peak_rss_bytes": 898170880,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "c22824bd42f58cad46a4607ae7a56e13512c8ae8",
+        "data": {
+          "measurement": {
+            "distribution": {
+              "elapsed_ms": 22008.171083,
+              "max_us": 1221642.5,
+              "mean_us": 2200.7926353000003,
+              "min_us": 54.75,
+              "operations_per_second": 454.37669319666475,
+              "p50_us": 82.667,
+              "p95_us": 99.208,
+              "p99_us": 40078.458,
+              "samples": 10000
+            },
+            "name": "mixed_trace",
+            "outcomes": {
+              "compact:Success": 10,
+              "consolidate:Success": 40,
+              "delete:Success": 10,
+              "merge_prune:Success": 10,
+              "observe:Success": 200,
+              "recall:Empty": 9665,
+              "recall:Success": 55,
+              "restart:Success": 10
+            }
+          },
+          "namespaces": 1,
+          "profile": "frozen NcmConfig::default with HashEncoder; real encoder is a separate population",
+          "requested_ops": 10000
+        },
+        "population": "mixed",
+        "process_rss_kib_snapshot": 509376,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 22.07213304200195
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "mixed",
+        "--ops",
+        "10000",
+        "--namespaces",
+        "4"
+      ],
+      "peak_rss_bytes": 925745152,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "c22824bd42f58cad46a4607ae7a56e13512c8ae8",
+        "data": {
+          "measurement": {
+            "distribution": {
+              "elapsed_ms": 35438.836416,
+              "max_us": 1358144.791,
+              "mean_us": 3543.8596422,
+              "min_us": 54.0,
+              "operations_per_second": 282.1763074445971,
+              "p50_us": 68.459,
+              "p95_us": 100.5,
+              "p99_us": 40605.625,
+              "samples": 10000
+            },
+            "name": "mixed_trace",
+            "outcomes": {
+              "compact:Success": 10,
+              "consolidate:Success": 40,
+              "delete:Success": 10,
+              "merge_prune:Success": 10,
+              "observe:Success": 200,
+              "recall:Empty": 9030,
+              "recall:Success": 690,
+              "restart:Success": 10
+            }
+          },
+          "namespaces": 4,
+          "profile": "frozen NcmConfig::default with HashEncoder; real encoder is a separate population",
+          "requested_ops": 10000
+        },
+        "population": "mixed",
+        "process_rss_kib_snapshot": 388592,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 35.639004667002155
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-3262b0d92cffd8af",
+        "maintenance",
+        "--seed-records",
+        "128",
+        "--samples",
+        "10"
+      ],
+      "peak_rss_bytes": 875216896,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "c22824bd42f58cad46a4607ae7a56e13512c8ae8",
+        "data": {
+          "inspection": {
+            "commit_seq": 158,
+            "epoch": 1,
+            "fatigue": 3.824785039796552e-07,
+            "ltm_active": 128,
+            "ltm_terrain_digest": 197886858783289776,
+            "quota_usage": {
+              "capsule_bytes": 441088,
+              "checkpoint_bytes": 61985798,
+              "db_bytes": 63737856,
+              "event_bytes": 61042,
+              "wal_bytes": 12392
+            },
+            "records": 128,
+            "sources": 8,
+            "state_digest": "f9723cf2015471c61b88266c722516f6f31089e1a809d5a6be82562ccc97d13c",
+            "steps_since_consolidation": 0,
+            "stm_active": 128,
+            "stm_terrain_digest": 2403292363601268888,
+            "tick": 128
+          },
+          "measurements": [
+            {
+              "distribution": {
+                "elapsed_ms": 549.6840830000001,
+                "max_us": 70958.291,
+                "mean_us": 54968.3748,
+                "min_us": 47682.583,
+                "operations_per_second": 18.19226772116667,
+                "p50_us": 49143.375,
+                "p95_us": 70958.291,
+                "p99_us": 70958.291,
+                "samples": 10
+              },
+              "name": "maintenance_consolidate",
+              "outcomes": {
+                "success": 10
+              }
+            },
+            {
+              "distribution": {
+                "elapsed_ms": 390.446208,
+                "max_us": 40238.334,
+                "mean_us": 39044.5585,
+                "min_us": 38375.833,
+                "operations_per_second": 25.611722678069906,
+                "p50_us": 38840.542,
+                "p95_us": 40238.334,
+                "p99_us": 40238.334,
+                "samples": 10
+              },
+              "name": "maintenance_merge_prune",
+              "outcomes": {
+                "success": 10
+              }
+            },
+            {
+              "distribution": {
+                "elapsed_ms": 1957.328667,
+                "max_us": 202210.25,
+                "mean_us": 195732.8083,
+                "min_us": 190950.416,
+                "operations_per_second": 5.109004005610878,
+                "p50_us": 195492.042,
+                "p95_us": 202210.25,
+                "p99_us": 202210.25,
+                "samples": 10
+              },
+              "name": "maintenance_compact",
+              "outcomes": {
+                "success": 10
+              }
+            }
+          ],
+          "samples": 10,
+          "seed_records": 128
+        },
+        "population": "maintenance",
+        "process_rss_kib_snapshot": 843312,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 8.259461958998145
+    },
+    {
+      "command": [
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/release/deps/ncm_scale-1ca5030fca9bafd9",
+        "encoder",
+        "--ops",
+        "100",
+        "--model-root",
+        "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1"
+      ],
+      "peak_rss_bytes": 8962048,
+      "result": {
+        "allocated_bytes": null,
+        "allocated_bytes_note": "No allocator instrumentation dependency is present; /usr/bin/time -l peak RSS is attached by scripts/product/ncm/benchmark/run.sh.",
+        "commit": "e3d36af35bb6a1fd8955ac9f0bb31a40e55f2539",
+        "data": {
+          "detail": "encoder artifacts missing: /Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/models/ncm-encoder-manifest.json",
+          "requirement": "Install the five pinned Xenova artifacts under <state-root>/models and rerun with default features. Missing model is not a waived population.",
+          "status": "blocked_environment"
+        },
+        "population": "encoder",
+        "process_rss_kib_snapshot": 8464,
+        "profile": "ncm-biomem-rs.v1",
+        "schema_version": 1
+      },
+      "wall_seconds": 0.011975458000961225
+    }
+  ],
+  "schema_version": 1,
+  "selected_groups": [
+    "all"
+  ],
+  "source_groups": [
+    "group-core.json",
+    "group-store.json",
+    "group-engine.json",
+    "group-mixed.json"
+  ],
+  "status": "blocked_environment",
+  "task": "ncm-rs-020",
+  "working_tree_clean_before_results": false
+}
