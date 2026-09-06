@@ -38,7 +38,10 @@
       "product/architecture/memory-dependency-policy.json",
       "product/upstream/convergence-map.json",
       "product/ncm/plan/join/",
-      "product/ncm/receipts/integration/"
+      "product/ncm/receipts/integration/",
+      "tests/product_memory_dependency_direction_test.py"
     ]
-  }
+  },
+  "host_base_commit": "3881741df",
+  "host_base_note": "Head of feat/pluggable-memory-providers-v2 merged into the backend branch on 2026-09-06 at the user's instruction. The standalone gate fences the branch footprint against this tree (everything not inherited from the host must be backend-owned); the product checkpoint 25778c744 remains the fallback when this field is absent."
 }

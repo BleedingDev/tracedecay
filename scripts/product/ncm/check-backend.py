@@ -675,10 +675,29 @@ def path_allowed(path: str, allowed: Iterable[str]) -> bool:
     return False
 
 
+def footprint_base(repo: Path) -> str:
+    """The tree the branch footprint is measured against.
+
+    Before the host join this is the product checkpoint. Once the host branch
+    has been merged, ownership.json names that host head so inherited host
+    changes are not mistaken for backend footprint.
+    """
+    ownership = json.loads((repo / "product/ncm/bootstrap/ownership.json").read_text(encoding="utf-8"))
+    base = ownership.get("host_base_commit")
+    if isinstance(base, str) and base:
+        require(
+            git(repo, "merge-base", "--is-ancestor", base, "HEAD") == "",
+            f"host_base_commit {base} is not an ancestor of HEAD",
+        )
+        return git(repo, "rev-parse", base)
+    return BASE_COMMIT
+
+
 def allowed_diff(repo: Path) -> dict[str, Any]:
     """Review the complete branch and working-tree footprint against ownership."""
     allowed = owned_paths(repo)
-    committed = set(filter(None, git(repo, "diff", "--name-only", BASE_COMMIT).splitlines()))
+    base = footprint_base(repo)
+    committed = set(filter(None, git(repo, "diff", "--name-only", base).splitlines()))
     status = git(repo, "status", "--porcelain=v1", "--untracked-files=all")
     working = set()
     for line in status.splitlines():
@@ -688,9 +707,10 @@ def allowed_diff(repo: Path) -> dict[str, Any]:
         working.add(value)
     changed = sorted(committed | working)
     violations = [path for path in changed if not path_allowed(path, allowed)]
-    stat = git(repo, "diff", "--stat", BASE_COMMIT)
+    stat = git(repo, "diff", "--stat", base)
     return {
-        "base_commit": BASE_COMMIT,
+        "base_commit": base,
+        "product_checkpoint": BASE_COMMIT,
         "ownership_manifest": "product/ncm/bootstrap/ownership.json",
         "allowed_rules": allowed,
         "changed_paths": changed,
