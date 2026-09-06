@@ -6,8 +6,8 @@
 
 use crate::numeric::{validate_dimension, validate_finite};
 use crate::types::{
-    AffectVector, CenterSlot, CoreError, Layer, LogicalTick, NcmConfig, RecordId, SourceId,
-    LTM_KEY_DIM, STM_KEY_DIM, VALUE_DIM,
+    AffectVector, CenterSlot, CoreError, LTM_KEY_DIM, Layer, LogicalTick, NcmConfig, RecordId,
+    STM_KEY_DIM, SourceId, VALUE_DIM,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

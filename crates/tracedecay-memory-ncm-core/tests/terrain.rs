@@ -3,8 +3,8 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use serde_json::Value;
-use tracedecay_memory_ncm_core::terrain::{Terrain3D, DEFAULT_SPLAT_SIGMA};
-use tracedecay_memory_ncm_core::types::{CoreError, NcmConfig, AFFECT_DIM};
+use tracedecay_memory_ncm_core::terrain::{DEFAULT_SPLAT_SIGMA, Terrain3D};
+use tracedecay_memory_ncm_core::types::{AFFECT_DIM, CoreError, NcmConfig};
 
 const ORACLE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -127,20 +127,24 @@ fn construction_bounds_resolution_and_stability() {
     let config = NcmConfig::default();
     assert!(config.ltm.terrain_lambda + 6.0 * config.ltm.terrain_alpha_h <= 1.0);
     assert!(config.stm.terrain_lambda + 6.0 * config.stm.terrain_alpha_h <= 1.0);
-    assert!(Terrain3D::new(
-        config.terrain_resolution,
-        config.ltm.terrain_alpha_h,
-        config.ltm.terrain_alpha_e,
-        config.ltm.terrain_lambda,
-    )
-    .is_ok());
-    assert!(Terrain3D::new(
-        config.terrain_resolution,
-        config.stm.terrain_alpha_h,
-        config.stm.terrain_alpha_e,
-        config.stm.terrain_lambda,
-    )
-    .is_ok());
+    assert!(
+        Terrain3D::new(
+            config.terrain_resolution,
+            config.ltm.terrain_alpha_h,
+            config.ltm.terrain_alpha_e,
+            config.ltm.terrain_lambda,
+        )
+        .is_ok()
+    );
+    assert!(
+        Terrain3D::new(
+            config.terrain_resolution,
+            config.stm.terrain_alpha_h,
+            config.stm.terrain_alpha_e,
+            config.stm.terrain_lambda,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -171,9 +175,11 @@ fn real_blur_spreads_impulse_preserves_interior_mass_and_constants() {
     for channel in 0..AFFECT_DIM {
         let expected = 0.5 + channel as f32;
         let cells = g.pow(3);
-        assert!(constant_e[channel * cells..(channel + 1) * cells]
-            .iter()
-            .all(|value| (*value - expected).abs() <= 1e-6));
+        assert!(
+            constant_e[channel * cells..(channel + 1) * cells]
+                .iter()
+                .all(|value| (*value - expected).abs() <= 1e-6)
+        );
     }
 }
 
@@ -297,14 +303,18 @@ fn homeostasis_remains_finite_nonnegative_and_moves_toward_neutral() {
         .iter()
         .map(|value| (value - 1.0).abs())
         .sum::<f32>();
-    assert!(terrain
-        .h
-        .iter()
-        .all(|value| value.is_finite() && *value >= 0.0));
-    assert!(terrain
-        .e
-        .iter()
-        .all(|value| value.is_finite() && *value >= 0.0));
+    assert!(
+        terrain
+            .h
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+    );
+    assert!(
+        terrain
+            .e
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+    );
     assert!(final_h_sum < initial_h_sum);
     assert!(final_e_error < initial_e_error);
 }

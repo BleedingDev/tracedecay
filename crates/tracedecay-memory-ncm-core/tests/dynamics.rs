@@ -2,11 +2,11 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use tracedecay_memory_ncm_core::centers::read::ReadParams;
 use tracedecay_memory_ncm_core::centers::MemoryCenters;
+use tracedecay_memory_ncm_core::centers::read::ReadParams;
 use tracedecay_memory_ncm_core::dynamics::{
-    advance, emotion_after, homeostasis_step, intensity_after, observe_tick, sleep_due,
-    value_after, Scheduler, MAX_ADVANCE_TICKS,
+    MAX_ADVANCE_TICKS, Scheduler, advance, emotion_after, homeostasis_step, intensity_after,
+    observe_tick, sleep_due, value_after,
 };
 use tracedecay_memory_ncm_core::terrain::Terrain3D;
 use tracedecay_memory_ncm_core::{CoreError, LogicalTick, NcmConfig};

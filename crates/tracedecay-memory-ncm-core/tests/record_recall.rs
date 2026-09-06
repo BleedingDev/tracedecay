@@ -1,10 +1,10 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 //! Acceptance coverage for stable records, correction lineage, and read-only recall.
 
-use tracedecay_memory_ncm_core::centers::write::{WriteInput, WriteOutcome, WriteParams};
 use tracedecay_memory_ncm_core::centers::MemoryCenters;
+use tracedecay_memory_ncm_core::centers::write::{WriteInput, WriteOutcome, WriteParams};
 use tracedecay_memory_ncm_core::recall::{
-    recall, RecallCandidate, RecallConfidence, RecallLayer, RecallOutput, RecallPolicy,
+    RecallCandidate, RecallConfidence, RecallLayer, RecallOutput, RecallPolicy, recall,
 };
 use tracedecay_memory_ncm_core::records::{RecordInput, RecordState, RecordTable, Support};
 use tracedecay_memory_ncm_core::{
@@ -177,10 +177,12 @@ fn same_key_distinct_sources_remain_visible_and_correction_keeps_lineage() {
     for candidate in &found {
         assert!(candidate.activation > policy.min_activation);
         assert!(!candidate.support_slots.is_empty());
-        assert!(candidate.support_slots.iter().any(|slot| support
-            .support_for(*slot)
-            .expect("returned slot support")
-            .contains(&candidate.record_id)));
+        assert!(candidate.support_slots.iter().any(|slot| {
+            support
+                .support_for(*slot)
+                .expect("returned slot support")
+                .contains(&candidate.record_id)
+        }));
         assert!(candidate.distance_components.cosine_d2.abs() < 1e-6);
         assert_eq!(candidate.distance_components.minkowski, None);
         let RecallConfidence::Uncalibrated(confidence) = candidate.confidence;

@@ -7,9 +7,9 @@ use tracedecay_memory_ncm_core::centers::MemoryCenters;
 use tracedecay_memory_ncm_core::signals::affect::{
     extract_keyword_affect, from_dict, from_name, neutral, validated,
 };
-use tracedecay_memory_ncm_core::signals::{novelty_from_ltm, write_strength, SignalSource};
+use tracedecay_memory_ncm_core::signals::{SignalSource, novelty_from_ltm, write_strength};
 use tracedecay_memory_ncm_core::types::{
-    AffectVector, CoreError, NcmConfig, AFFECT_DIM, LTM_KEY_DIM,
+    AFFECT_DIM, AffectVector, CoreError, LTM_KEY_DIM, NcmConfig,
 };
 
 #[derive(Clone, Copy, Deserialize)]

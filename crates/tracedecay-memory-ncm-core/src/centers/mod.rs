@@ -7,7 +7,7 @@ pub mod read;
 pub mod write;
 
 use crate::types::{
-    CenterSlot, LayerConfig, RecordId, AFFECT_DIM, CONTEXT_DIM, LTM_KEY_DIM, TERRAIN_DIM, VALUE_DIM,
+    AFFECT_DIM, CONTEXT_DIM, CenterSlot, LTM_KEY_DIM, LayerConfig, RecordId, TERRAIN_DIM, VALUE_DIM,
 };
 use serde::{Deserialize, Serialize};
 

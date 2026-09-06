@@ -11,7 +11,7 @@ use crate::numeric::{
     validate_dimension, validate_finite,
 };
 use crate::types::{
-    CenterSlot, CoreError, RecordId, AFFECT_DIM, CONTEXT_DIM, TERRAIN_DIM, VALUE_DIM,
+    AFFECT_DIM, CONTEXT_DIM, CenterSlot, CoreError, RecordId, TERRAIN_DIM, VALUE_DIM,
 };
 
 /// Hybrid-selection settings and operation budget for a plain center read.

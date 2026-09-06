@@ -1,10 +1,10 @@
 //! Fixed-capacity center allocation and incarnation-safe slot lifecycle.
 
-use super::write::WriteInput;
 use super::MemoryCenters;
-use crate::numeric::{l2_norm, normalize, validate_dimension, validate_finite, DeterministicRng};
+use super::write::WriteInput;
+use crate::numeric::{DeterministicRng, l2_norm, normalize, validate_dimension, validate_finite};
 use crate::types::{
-    CenterSlot, CoreError, LayerConfig, AFFECT_DIM, CONTEXT_DIM, LTM_KEY_DIM, TERRAIN_DIM,
+    AFFECT_DIM, CONTEXT_DIM, CenterSlot, CoreError, LTM_KEY_DIM, LayerConfig, TERRAIN_DIM,
     VALUE_DIM,
 };
 

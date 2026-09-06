@@ -2,8 +2,8 @@
 
 mod digest;
 
-use crate::centers::write::{WriteInput, WriteOutcome, WriteParams};
 use crate::centers::MemoryCenters;
+use crate::centers::write::{WriteInput, WriteOutcome, WriteParams};
 use crate::consolidation::{self, ConsolidationReport, MergePruneReport};
 use crate::dynamics::{self, AdvanceReport, Scheduler};
 use crate::projections::ProjectionBundle;
@@ -12,8 +12,8 @@ use crate::records::{RecordInput, RecordTable, Support};
 use crate::signals::{novelty_from_ltm, write_strength};
 use crate::terrain::{Terrain3D, TerrainStats};
 use crate::types::{
-    AffectVector, CenterSlot, CoreError, Layer, LogicalTick, NcmConfig, RecordId, SourceId,
-    CONTEXT_DIM, LTM_KEY_DIM, TERRAIN_DIM, VALUE_DIM,
+    AffectVector, CONTEXT_DIM, CenterSlot, CoreError, LTM_KEY_DIM, Layer, LogicalTick, NcmConfig,
+    RecordId, SourceId, TERRAIN_DIM, VALUE_DIM,
 };
 use serde::{Deserialize, Serialize};
 

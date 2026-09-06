@@ -2,11 +2,11 @@
 //! Behavioral and executable-oracle tests for center writes and allocation.
 
 use serde::Deserialize;
-use tracedecay_memory_ncm_core::centers::write::{WriteInput, WriteOutcome, WriteParams};
 use tracedecay_memory_ncm_core::centers::MemoryCenters;
+use tracedecay_memory_ncm_core::centers::write::{WriteInput, WriteOutcome, WriteParams};
 use tracedecay_memory_ncm_core::types::{
-    AffectVector, CoreError, LayerConfig, NcmConfig, RecordId, AFFECT_DIM, CONTEXT_DIM,
-    LTM_KEY_DIM, TERRAIN_DIM, VALUE_DIM,
+    AFFECT_DIM, AffectVector, CONTEXT_DIM, CoreError, LTM_KEY_DIM, LayerConfig, NcmConfig,
+    RecordId, TERRAIN_DIM, VALUE_DIM,
 };
 
 #[derive(Clone, Copy, Deserialize)]

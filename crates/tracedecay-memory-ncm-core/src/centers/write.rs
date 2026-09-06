@@ -3,7 +3,7 @@
 use super::MemoryCenters;
 use crate::numeric::{l2_norm, normalize, validate_dimension, validate_finite};
 use crate::types::{
-    AffectVector, CenterSlot, CoreError, Layer, NcmConfig, RecordId, CONTEXT_DIM, LTM_KEY_DIM,
+    AffectVector, CONTEXT_DIM, CenterSlot, CoreError, LTM_KEY_DIM, Layer, NcmConfig, RecordId,
     TERRAIN_DIM, VALUE_DIM,
 };
 

@@ -4,7 +4,7 @@
 //! Affect is channel-major, matching the reference's `[1, 4, G, G, G]` tensor.
 //! D01 applies a real normalized separable Gaussian before consolidation pours.
 
-use crate::types::{AffectVector, CoreError, AFFECT_DIM, TERRAIN_DIM};
+use crate::types::{AFFECT_DIM, AffectVector, CoreError, TERRAIN_DIM};
 use serde::{Deserialize, Serialize};
 
 /// Reference splat width in normalized position units.

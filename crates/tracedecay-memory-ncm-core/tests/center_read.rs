@@ -2,10 +2,10 @@
 //! Behavioral and executable-oracle tests for immutable center reads.
 
 use serde::Deserialize;
-use tracedecay_memory_ncm_core::centers::read::{CompoundWeights, ReadParams};
 use tracedecay_memory_ncm_core::centers::MemoryCenters;
+use tracedecay_memory_ncm_core::centers::read::{CompoundWeights, ReadParams};
 use tracedecay_memory_ncm_core::types::{
-    LayerConfig, NcmConfig, RecordId, AFFECT_DIM, CONTEXT_DIM, TERRAIN_DIM, VALUE_DIM,
+    AFFECT_DIM, CONTEXT_DIM, LayerConfig, NcmConfig, RecordId, TERRAIN_DIM, VALUE_DIM,
 };
 
 #[derive(Clone, Copy, Deserialize)]
@@ -380,11 +380,13 @@ fn compound_context_and_terrain_perturb_selection_and_none_is_zero() {
         )
         .expect("zero terrain read should succeed");
     assert_eq!(terrain_none, terrain_zeros);
-    assert!(terrain_none
-        .selection
-        .centers
-        .iter()
-        .all(|trace| trace.terrain_cosine == 0.0));
+    assert!(
+        terrain_none
+            .selection
+            .centers
+            .iter()
+            .all(|trace| trace.terrain_cosine == 0.0)
+    );
 }
 
 #[test]

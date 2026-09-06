@@ -17,6 +17,6 @@ pub mod terrain;
 pub mod types;
 
 pub use types::{
-    AffectVector, AlgorithmIdentity, CenterSlot, CoreError, LogicalTick, NcmConfig, RecordId,
-    SourceId, ALGORITHM_PROFILE,
+    ALGORITHM_PROFILE, AffectVector, AlgorithmIdentity, CenterSlot, CoreError, LogicalTick,
+    NcmConfig, RecordId, SourceId,
 };

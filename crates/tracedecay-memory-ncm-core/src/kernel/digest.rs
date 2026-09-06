@@ -1,10 +1,10 @@
 //! Canonical serde traversal and dependency-free SHA-256.
 
+use serde::Serialize;
 use serde::ser::{
     Error as SerError, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant,
     SerializeTuple, SerializeTupleStruct, SerializeTupleVariant,
 };
-use serde::Serialize;
 use std::fmt;
 
 pub(super) fn digest<T: Serialize>(value: &T) -> [u8; 32] {

@@ -6,7 +6,7 @@
 
 use crate::centers::MemoryCenters;
 use crate::terrain::Terrain3D;
-use crate::types::{CoreError, LayerConfig, LogicalTick, NcmConfig, AFFECT_DIM, VALUE_DIM};
+use crate::types::{AFFECT_DIM, CoreError, LayerConfig, LogicalTick, NcmConfig, VALUE_DIM};
 use serde::{Deserialize, Serialize};
 
 /// Frozen v1 budget for one explicit maintenance advance (contract D10).
