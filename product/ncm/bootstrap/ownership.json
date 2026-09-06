@@ -27,12 +27,18 @@
       "crates/tracedecay-memory-ncm-core/src/kernel/",
       "crates/tracedecay-memory-ncm-core/tests/kernel.rs"
     ],
-    "note": "kernel/ composes centers+terrain+projections+scheduler into the pure NcmKernel (observe/recall/advance/consolidate/serialize); owned by the consolidation task because it is the first task that needs the whole composition. tests/kernel.rs is the kernel suite of task 010. Task 018 was granted the pre-existing adapter suite tests/ncm_adapter.rs for the snapshot_bytes limit tests and a clippy allowance (coordinator decisions 7-9). Task 019 owns the conformance receipt generator under scripts/product/ncm/conformance/.",
+    "note": "kernel/ composes centers+terrain+projections+scheduler into the pure NcmKernel (observe/recall/advance/consolidate/serialize); owned by the consolidation task because it is the first task that needs the whole composition. tests/kernel.rs is the kernel suite of task 010. Task 018 was granted the pre-existing adapter suite tests/ncm_adapter.rs for the snapshot_bytes limit tests and a clippy allowance (coordinator decisions 7-9). Task 019 owns the conformance receipt generator under scripts/product/ncm/conformance/. Task 023's policy files were prepared by the backend coordinator before the join (see product/ncm/plan/join/); they are listed so the standalone gate's ownership fence admits exactly those files.",
     "ncm-rs-018": [
       "crates/tracedecay-memory-provider-ncm/tests/ncm_adapter.rs"
     ],
     "ncm-rs-019": [
       "scripts/product/ncm/conformance/"
+    ],
+    "ncm-rs-023": [
+      "product/architecture/memory-dependency-policy.json",
+      "product/upstream/convergence-map.json",
+      "product/ncm/plan/join/",
+      "product/ncm/receipts/integration/"
     ]
   }
 }
