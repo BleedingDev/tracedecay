@@ -192,6 +192,7 @@ pub(super) fn maintenance_name(kind: &MaintenanceKind) -> &'static str {
         MaintenanceKind::Consolidate => "consolidate",
         MaintenanceKind::MergePrune => "merge_prune",
         MaintenanceKind::Checkpoint => "checkpoint",
+        MaintenanceKind::Compact => "compact",
     }
 }
 
@@ -248,7 +249,7 @@ pub(super) fn catalog_count(root: &StateRoot) -> Result<usize, EngineReply> {
 
 pub(super) fn unavailable_recovery(commit_seq: u64) -> EngineReply {
     EngineReply::new(
-        Outcome::Unavailable("namespace recovery required".to_owned()),
+        Outcome::Unavailable("rebuilding".to_owned()),
         commit_seq,
         Value::Null,
     )

@@ -233,15 +233,28 @@ impl NcmEngine {
         )
     }
 
-    /// Task 015 extension point; deletion-by-rebuild is deliberately unsupported here.
+    /// Deletes one admitted source by fencing and rebuilding the namespace from retained inputs.
     pub fn delete_by_source(
         &self,
-        _namespace: &str,
-        _source: &SourceId,
-        _idempotency_key: &str,
-        _deadline: Deadline,
+        namespace: &str,
+        source: &SourceId,
+        idempotency_key: &str,
+        deadline: Deadline,
     ) -> EngineReply {
-        EngineReply::new(Outcome::Unsupported, 0, Value::Null)
+        crate::privacy::delete_by_source(
+            self,
+            namespace,
+            crate::privacy::DeleteRequest {
+                idempotency_key: idempotency_key.to_owned(),
+                source: source.clone(),
+                deadline,
+            },
+        )
+    }
+
+    /// Returns the durable source revocation authority for snapshot sanitization.
+    pub fn revoked_sources(&self, namespace: &str) -> Result<Vec<SourceId>, EngineReply> {
+        crate::privacy::revoked_sources(self, namespace)
     }
 
     /// Task 016 extension point; snapshot export is deliberately unsupported here.
@@ -265,7 +278,7 @@ impl NcmEngine {
         EngineReply::new(Outcome::Unsupported, 0, Value::Null)
     }
 
-    pub(super) fn namespace_lock(
+    pub(crate) fn namespace_lock(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<String, NamespaceHandle>>, EngineReply> {
         self.namespaces
@@ -273,7 +286,7 @@ impl NcmEngine {
             .map_err(|_| util::corrupt_reply(0, "namespace mutex poisoned"))
     }
 
-    pub(super) fn ensure_handle<'a>(
+    pub(crate) fn ensure_handle<'a>(
         &self,
         namespaces: &'a mut BTreeMap<String, NamespaceHandle>,
         namespace: &str,
@@ -314,15 +327,20 @@ impl NcmEngine {
         }
         let prepared = self.prepare_identity(namespace)?;
         let (store, kernel, meta, fenced) = if exists {
-            let store = NamespaceStore::open(&self.root, namespace, &prepared)
+            let mut store = NamespaceStore::open(&self.root, namespace, &prepared)
                 .map_err(|error| store_reply(error, 0))?;
-            let fenced = store
-                .fenced()
-                .map_err(|error| store_reply(error, 0))?
-                .is_some();
-            let meta = store.meta().map_err(|error| store_reply(error, 0))?;
-            let kernel = recover_kernel(&store, &self.config, prepared.seed, &meta)?;
-            (store, kernel, meta, fenced)
+            if let Some(resumed) = crate::privacy::resume_pending_rebuild(&mut store, &self.config)?
+            {
+                (store, resumed.kernel, resumed.meta, false)
+            } else {
+                let fenced = store
+                    .fenced()
+                    .map_err(|error| store_reply(error, 0))?
+                    .is_some();
+                let meta = store.meta().map_err(|error| store_reply(error, 0))?;
+                let kernel = recover_kernel(&store, &self.config, prepared.seed, &meta)?;
+                (store, kernel, meta, fenced)
+            }
         } else {
             let kernel = NcmKernel::new(prepared.seed, self.config.clone())
                 .map_err(|error| util::core_reply(error, 0))?;
@@ -382,7 +400,7 @@ impl NcmEngine {
         })
     }
 
-    pub(super) fn consume_fault(&self, point: FaultPoint) -> bool {
+    pub(crate) fn consume_fault(&self, point: FaultPoint) -> bool {
         let Ok(mut fault) = self.fault_once.lock() else {
             return false;
         };

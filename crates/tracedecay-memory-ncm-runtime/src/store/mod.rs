@@ -683,6 +683,40 @@ impl NamespaceStore {
     pub fn usage(&self) -> Result<StorageUsage, StoreError> {
         query_usage(&self.conn, &self.db_path)
     }
+
+    /// Truncates the WAL and rebuilds the SQLite file while preserving the privacy reserve.
+    ///
+    /// Ordinary maintenance passes `false`; privacy erasure may pass `true` after a deletion
+    /// fence is durable. The preflight includes one additional database-file copy because
+    /// SQLite `VACUUM` constructs a replacement database before publishing it.
+    pub fn compact(&mut self, allow_privacy_reserve: bool) -> Result<StorageUsage, StoreError> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(map_sqlite_error)?;
+        let checkpointed = query_usage(&self.conn, &self.db_path)?;
+        let current = physical_bytes(&self.db_path)?;
+        let limit = if allow_privacy_reserve {
+            self.quota.controlled_bytes
+        } else {
+            self.quota
+                .controlled_bytes
+                .saturating_sub(self.quota.reserve_bytes)
+        };
+        if current
+            .checked_add(checkpointed.db_bytes)
+            .is_none_or(|required| required > limit)
+        {
+            return Err(StoreError::BudgetExceeded);
+        }
+        self.conn
+            .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(map_sqlite_error)?;
+        let after = query_usage(&self.conn, &self.db_path)?;
+        if after.physical_bytes() > limit {
+            return Err(StoreError::BudgetExceeded);
+        }
+        Ok(after)
+    }
 }
 
 /// A mutation transaction. Dropping it rolls the SQLite transaction back.
@@ -990,6 +1024,11 @@ impl<'a> Mutation<'a> {
     /// Reads scheduler and generation metadata inside this transaction.
     pub fn get_meta(&self) -> Result<StoreMeta, StoreError> {
         read_store_meta(&self.tx)
+    }
+
+    /// Measures durable payload and controlled-file bytes including uncommitted writes.
+    pub fn usage(&self) -> Result<StorageUsage, StoreError> {
+        query_usage(&self.tx, &self.db_path)
     }
 
     /// Sets one raw non-identity metadata value for forward-compatible callers.

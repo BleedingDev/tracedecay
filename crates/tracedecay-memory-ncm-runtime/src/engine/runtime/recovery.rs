@@ -181,6 +181,19 @@ fn replay_event(
             }
             apply_maintenance(kernel, kind).map_err(|error| core_reply(error, commit_seq))?;
         }
+        DurableOperation::DeletionFence { .. } => {
+            if event.kind != "deletion_fence" {
+                return Err(corrupt_reply(
+                    commit_seq,
+                    "deletion fence receipt kind mismatch",
+                ));
+            }
+        }
+        DurableOperation::DeleteBySource { .. } => {
+            if event.kind != "delete_by_source" {
+                return Err(corrupt_reply(commit_seq, "deletion receipt kind mismatch"));
+            }
+        }
     }
     if kernel.scheduler.tick.0 != event.created_tick {
         return Err(corrupt_reply(commit_seq, "event logical tick mismatch"));
@@ -202,7 +215,7 @@ pub(super) fn apply_maintenance(
         MaintenanceKind::MergePrune => {
             kernel.merge_prune()?;
         }
-        MaintenanceKind::Checkpoint => {}
+        MaintenanceKind::Checkpoint | MaintenanceKind::Compact => {}
     }
     Ok(())
 }

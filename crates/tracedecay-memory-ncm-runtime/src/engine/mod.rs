@@ -200,6 +200,8 @@ pub enum MaintenanceKind {
     MergePrune,
     /// Persist the current kernel without changing its mathematical state.
     Checkpoint,
+    /// Reclaim SQLite free pages and truncate the WAL within the normal maintenance budget.
+    Compact,
 }
 
 /// Idempotent maintenance request.
@@ -224,6 +226,8 @@ pub enum FaultPoint {
     AfterPublishBeforeAck,
     /// Abort while preparing a checkpoint, before SQLite commit.
     DuringCheckpoint,
+    /// Stop after the durable deletion fence commit, before the sanitized rebuild publishes.
+    AfterDeletionFenceCommit,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -255,6 +259,18 @@ pub(crate) enum DurableOperation {
     },
     Maintenance {
         kind: MaintenanceKind,
+    },
+    DeletionFence {
+        source: SourceId,
+        target_epoch: u64,
+        idempotency_key: String,
+        payload_sha256: String,
+        deleted_records: u64,
+    },
+    DeleteBySource {
+        source: SourceId,
+        target_epoch: u64,
+        deleted_records: u64,
     },
 }
 
