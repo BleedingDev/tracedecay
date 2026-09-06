@@ -71,6 +71,73 @@ product head and floor SHA, resolved candidate upstream ref/SHA, isolated sync
 branch and strategy, every conflict's exact path/source/owner/resolution and
 rationale, ordered gate results, terminal state, and final ref/commit outcome.
 
+## Diagnose an already-integrated candidate
+
+An upstream commit being an ancestor of the product checkpoint is not floor
+acceptance. Before reconciling ownership, pin the candidate as `U` and the
+product checkpoint as `P`, and inspect imports separately from product residue:
+
+```bash
+# U and P must be the full immutable SHAs selected for this review, not refs.
+: "${U:?set the integrated upstream candidate SHA}"
+: "${P:?set the product checkpoint SHA}"
+F=$(python3 -c 'import json; print(json.load(open("product/upstream/tracedecay-v2-pr707.json"))["pinned_floor"]["sha"])')
+git merge-base "$F" "$U"  # report common ancestry; U may diverge from F
+git merge-base --is-ancestor "$F" "$P"
+git merge-base --is-ancestor "$U" "$P"
+git diff --stat "$F" "$U"  # imported upstream changes
+git diff --stat "$U" "$P"  # residual product changes
+```
+
+Review individual patches with `git diff "$F" "$U" -- <path>` and
+`git diff "$U" "$P" -- <path>`, including paths changed in both ranges.
+The split explains diagnostics; it grants no ownership exemption. The registry
+continues checking the accepted floor through the working tree, including
+untracked paths. Do not turn imported files into blanket product touch points,
+copy candidate SHAs into verified-floor stamps, or advance the derived floor
+receipt merely to clear diagnostics. Reconcile actual residual product patches
+with exact owners, invariants, touch points, removal plans, and declared test
+lanes. Candidate floor advancement still requires the isolated train below,
+all canonical pins moving together, and its tree-bound mandatory gates. If
+branch/ref mutation or those gates are unavailable, leave acceptance blocked;
+independent CI diagnostics remain useful evidence, not approval.
+
+### Current unaccepted integration
+
+`sync-policy.json` `workflow.integrated_candidate_review` records the pinned
+observation, not an accepted train receipt:
+
+- `U = 9bc7dedf9b96dbd6ff6d39522d42ee1ed9b071fc`.
+- `P = 25778c7443cd0cfe257da363da01a56ea1d45d3f` (tree `de895a36`).
+- The accepted floor and U diverge at
+  `b6cdc66277598d1c07d335e895908397e9763636`; both are ancestors of P.
+- Endpoint comparisons are 854 imported paths (F to U) and 555 residual
+  product paths (U to P). These are not disjoint ownership sets.
+- At P, run `33987477041`, job `101363606732` passed floor ancestry, then
+  failed ownership before Rust workspace execution. Native parity, conformance,
+  product contracts, scope/crash/security and generated drift were not run.
+  Registry diagnostics are not runtime defects or passing runtime evidence.
+
+Reproduce both ownership-impact reports using the existing classifier, without
+moving refs or treating its upstream repository attribution as patch authority:
+
+```bash
+U=9bc7dedf9b96dbd6ff6d39522d42ee1ed9b071fc
+P=25778c7443cd0cfe257da363da01a56ea1d45d3f
+F=$(python3 -c 'import json; print(json.load(open("product/upstream/tracedecay-v2-pr707.json"))["pinned_floor"]["sha"])')
+python3 scripts/product/classify-upstream-changes.py --repo . --old-floor "$F" --candidate-floor "$U"
+python3 scripts/product/classify-upstream-changes.py --repo . --old-floor "$U" --candidate-floor "$P"
+```
+
+This candidate remains **unaccepted**. Exact ownership reconciliation is still
+incomplete; no new accepted-floor stamps or derived receipt have been issued.
+Changes in forbidden exception zones still require their ADR evidence, not an
+import label. Run the two classifier commands independently: each currently
+returns a failing review gate. The residual report also flags stale authority
+because its comparison starts at unaccepted U while the registry correctly
+stamps F; do not change those stamps to silence this diagnostic. The mandatory
+train remains blocked until ownership review and all runtime gates succeed.
+
 ## Run an isolated sync train
 
 The train is reviewable and single-directional:
@@ -210,9 +277,18 @@ new floor needs a re-measured baseline in a follow-up commit.
 ## Gate lanes are the proof
 
 `sync-policy.json` `gates.lanes.<gate_id>` names the workflow file, the job
-id, and the exact command lines (the `for` loop of `product_contracts`
-expanded to one `python3 <test>` line each) for all six required gates. The
-binding is checked in both directions:
+id, and the exact command lines for all six required gates. Each diagnostic
+command has its own CI step, so an ownership or architecture failure cannot
+suppress runtime or other diagnostic results. The job dependency chain bounds
+execution to one required lane at a time; `!cancelled()` lets subsequent lanes
+run after a failure, but respects cancellation. Commands still require a
+successful checkout, and Rust commands require successful toolchain setup.
+Failed steps remain failed: there is no required `continue-on-error` lane.
+`convergence_result` rejects any failed, cancelled, or skipped mandatory lane.
+This diagnostic scheduling does not relax the ordered, fail-closed
+`record-gate`/`publish` procedure or confer promotion eligibility.
+
+The binding is checked in both directions:
 
 - `record-gate` reads the workflow file from the candidate commit and refuses
   a gate whose declared commands are not lines of the bound job, so the policy
@@ -237,6 +313,14 @@ Reconciling the convergence map with the lanes is therefore part of the
 train, not prose: a map command that no lane runs verbatim (`kache cargo --`
 wrappers, alternate flag orders) blocks `advance-floor` until either the map
 or the workflow and policy are changed in a reviewed commit.
+
+Map-obligation coverage is enforced by `advance-floor`. At this checkpoint it
+was measured as uncovered for most stamped commands and remains outstanding
+for the next floor train; these diagnostics do not establish that coverage.
+
+Build concurrency is capped at two compiler jobs, libtest at two threads, and
+nextest uses the bounded CI profile. Required lanes remain serial with their
+existing job timeouts; fixtures use the checkout's disposable test profile.
 
 ## Rehearsal records
 

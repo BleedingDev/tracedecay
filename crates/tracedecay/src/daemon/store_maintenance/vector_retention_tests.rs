@@ -1,5 +1,5 @@
 //! Isolated daemon tests for the vector-retention inventory states that
-//! drive the code-generation retention pass: the quiet default-off journey,
+//! drive the code-generation retention pass: default-off authority deferral,
 //! census paging, the degraded offline inventory, and the fail-closed
 //! refusals. Fixtures pin the user data dir and stay inside `TempDir`s.
 
@@ -161,15 +161,6 @@ fn sealed_generation_files(store_root: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-fn active_generation_file(store_root: &Path) -> String {
-    let pointer: DurablePublicationPointerV1 = serde_json::from_slice(
-        &std::fs::read(store_root.join("active-code-generation-v1.json"))
-            .expect("read active pointer"),
-    )
-    .expect("decode active pointer");
-    pointer.generation_file
-}
-
 fn fixture_census_shard() -> (
     tracedecay_store::StoreShardIdV1,
     tracedecay_store::SemanticVectorStageCensusRevision,
@@ -269,7 +260,7 @@ fn committed_retrieval_profiles_keep_the_unseated_state_retryable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unseated_semantic_runtime_sweeps_quietly_without_a_degraded_loop() {
+async fn unseated_semantic_runtime_defers_without_inventory_authority() {
     let fixture = open_unseated_graph_fixture().await;
     let root = fixture.graph.project_root();
 
@@ -315,68 +306,28 @@ async fn unseated_semantic_runtime_sweeps_quietly_without_a_degraded_loop() {
                 &fixture.cancellation,
             )
             .await,
-            CodeGenerationRetentionOutcomeV1::MoreWork,
-            "pass {pass}: the unseated offline sweep succeeds quietly and reports its backlog"
+            CodeGenerationRetentionOutcomeV1::SemanticUnseated,
+            "pass {pass}: an unseated runtime defers deletion without entering retry cadence"
         );
     }
 
-    // The quiet pin still sweeps: one bounded superseded generation per pass
-    // is collected under the offline protection set, and the active head
-    // survives. Semantic-off profiles must not grow without bound.
-    let remaining = sealed_generation_files(&fixture.store_root);
-    assert_eq!(
-        remaining.len(),
-        FIXTURE_GENERATION_COUNT - 2,
-        "each pass collects exactly one bounded superseded generation"
-    );
     assert!(
-        remaining.contains(&active_generation_file(&fixture.store_root)),
-        "the active publication head is never collected"
-    );
-
-    // The full per-project maintenance unit drains the remaining backlog on
-    // the bounded code-generation continuation — one collection unit per
-    // tick — and converges to a success once a census proves the store
-    // holds only the active head. That convergence is what returns the
-    // cadence to its ordinary interval instead of the short retry loop.
-    let mut continuation = None;
-    let mut ticks = 0_usize;
-    loop {
-        ticks += 1;
-        assert!(
-            ticks <= FIXTURE_GENERATION_COUNT + 2,
-            "the generation-maintenance unit must converge instead of continuing forever"
-        );
-        let outcome = crate::daemon::maintenance::generation::run_project_generation_maintenance(
+        crate::daemon::maintenance::generation::run_project_generation_maintenance(
             &fixture.graph,
             &fixture.schedulers,
             &fixture.observations,
             &fixture.cancellation,
             &crate::config::RetentionConfig::default(),
-            continuation,
+            None,
         )
-        .await;
-        match outcome {
-            crate::daemon::maintenance::MaintenanceTickOutcome::Complete => break,
-            crate::daemon::maintenance::MaintenanceTickOutcome::Continue(
-                crate::daemon::maintenance::MaintenanceContinuation::CodeGenerationRetention,
-            ) => {
-                continuation = Some(
-                    crate::daemon::maintenance::MaintenanceContinuation::CodeGenerationRetention,
-                );
-            }
-            other => panic!("unexpected generation-maintenance outcome: {other:?}"),
-        }
-    }
-    let converged = sealed_generation_files(&fixture.store_root);
-    assert_eq!(
-        converged.len(),
-        1,
-        "the continuation cadence drains every superseded generation"
+        .await
+        .is_complete(),
+        "the maintenance owner keeps the quiet unseated deferral off retry cadence"
     );
-    assert!(
-        converged.contains(&active_generation_file(&fixture.store_root)),
-        "only the active publication head survives the drain"
+    assert_eq!(
+        sealed_generation_files(&fixture.store_root).len(),
+        FIXTURE_GENERATION_COUNT,
+        "default-off configuration is not authority to delete historical sources"
     );
 }
 
@@ -466,8 +417,7 @@ async fn unknown_census_still_degrades_to_the_offline_inventory() {
         Some("vector_inventory_offline:vector_census_incomplete"),
     );
 
-    // The degraded offline pass still sweeps under the offline protection
-    // set so sealed files cannot grow without bound while the graph is dark.
+    // Unknown coverage is not evidence that historical readers are absent.
     assert_eq!(
         run_code_generation_retention(
             &fixture.graph,
@@ -476,11 +426,11 @@ async fn unknown_census_still_degrades_to_the_offline_inventory() {
             &fixture.cancellation,
         )
         .await,
-        CodeGenerationRetentionOutcomeV1::MoreWork,
+        CodeGenerationRetentionOutcomeV1::VectorInventoryUnproven,
     );
     assert_eq!(
         sealed_generation_files(&fixture.store_root).len(),
-        FIXTURE_GENERATION_COUNT - 1,
+        FIXTURE_GENERATION_COUNT,
     );
 }
 
@@ -604,16 +554,11 @@ async fn held_replay_pool_defers_then_backs_off_then_recovers() {
         .expect("probe the replay pool lock")
         .expect("acquire the replay pool lock");
 
-    // Pass A: the probe sees the held pool and defers the pass before any
-    // collection or release work starts; nothing blocks on the holder.
+    // Exercise the replay owner independently of vector inventory admission.
+    // An unseated daemon no longer manufactures empty vector authority.
+    assert!(super::graph_replay::replay_pool_is_held(&replay_root));
     assert_eq!(
-        run_code_generation_retention(
-            &fixture.graph,
-            &fixture.schedulers,
-            &fixture.observations,
-            &fixture.cancellation,
-        )
-        .await,
+        super::defer_graph_replay_pool_busy(&fixture.observations, &project_root),
         CodeGenerationRetentionOutcomeV1::Failed,
         "a held replay pool defers the pass without blocking on the holder"
     );
@@ -630,21 +575,33 @@ async fn held_replay_pool_defers_then_backs_off_then_recovers() {
 
     drop(held_pool);
 
-    // Pass B: the pool is free again, so collection makes bounded progress,
-    // but the backoff window from the busy attempt skips this tick's release
-    // reconcile — no lock traffic, no graph probe — leaving the fresh release
-    // evidence durably queued.
-    assert_eq!(
-        run_code_generation_retention(
+    // Seed one real release event in this empty sealed-store fixture through
+    // the canonical executor, then prove the replay owner's bounded backoff.
+    let plan = tracedecay_code_index_retention::code_index_generations::prepare_next_code_generation_retention_cancellable(
+        &fixture.store_root,
+        &BTreeSet::new(),
+        DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+        &|| false,
+        Some(&replay_root),
+    ).expect("bounded empty-store retention plan");
+    execute_code_generation_retention(
+        &fixture.store_root,
+        plan,
+        CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(130),
+        Some(&replay_root),
+    )
+    .expect("publish one durable release event");
+    assert!(matches!(
+        super::graph_replay::reconcile_graph_replay_releases(
             &fixture.graph,
-            &fixture.schedulers,
+            &fixture.store_root,
             &fixture.observations,
             &fixture.cancellation,
         )
         .await,
-        CodeGenerationRetentionOutcomeV1::Failed,
-        "the backoff window defers the reconcile for one tick after the busy attempt"
-    );
+        super::graph_replay::ReconcileOutcome::Deferred
+    ));
     assert_eq!(
         sealed_generation_files(&fixture.store_root).len(),
         FIXTURE_GENERATION_COUNT - 1,
@@ -656,20 +613,17 @@ async fn held_replay_pool_defers_then_backs_off_then_recovers() {
         "the deferred tick's release evidence stays durably queued"
     );
 
-    // Pass C: the window is spent, the reconcile drains the queued release
-    // plus this tick's own, and the pass reports its remaining collectable
-    // backlog as bounded progress.
-    assert_eq!(
-        run_code_generation_retention(
+    // The window is spent; the graph owner drains the queued release.
+    assert!(matches!(
+        super::graph_replay::reconcile_graph_replay_releases(
             &fixture.graph,
-            &fixture.schedulers,
+            &fixture.store_root,
             &fixture.observations,
             &fixture.cancellation,
         )
         .await,
-        CodeGenerationRetentionOutcomeV1::MoreWork,
-        "a recovered pool drains the queue and reports the remaining backlog"
-    );
+        super::graph_replay::ReconcileOutcome::Complete
+    ));
     assert_eq!(
         release_queue_files(&fixture.store_root),
         0,

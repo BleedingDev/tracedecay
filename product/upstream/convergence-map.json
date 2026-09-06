@@ -754,8 +754,7 @@
         "A superseded hook receipt terminal is never emitted while work it reports remains in flight; if the shared abort deadline expires, the runtime retains truthful ownership or suppresses that terminal until settlement."
       ],
       "tests": [
-        "cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification",
-        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline",
+        "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests",
         "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::lsp_lease_tests::state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep",
         "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::types_tests::superseded_blocking_work_is_joined_before_its_receipt_terminal"
       ],
@@ -1532,10 +1531,10 @@
       ],
       "verification": [
         "git diff --check",
-        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+        "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests"
       ],
       "tests": [
-        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+        "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests"
       ],
       "bead_ids": [
         "tdmem-0404",
@@ -1563,10 +1562,10 @@
       ],
       "verification": [
         "git diff --check",
-        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+        "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests"
       ],
       "tests": [
-        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+        "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests"
       ],
       "bead_ids": [
         "tdmem-0404",
@@ -1594,10 +1593,10 @@
       ],
       "verification": [
         "git diff --check",
-        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+        "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests"
       ],
       "tests": [
-        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+        "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests"
       ],
       "bead_ids": [
         "tdmem-0404",
@@ -1732,12 +1731,10 @@
       ],
       "verification": [
         "git diff --check",
-        "cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification",
-        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+        "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests"
       ],
       "tests": [
-        "cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification",
-        "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline"
+        "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests"
       ],
       "bead_ids": [
         "tdmem-0404",
