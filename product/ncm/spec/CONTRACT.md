@@ -151,6 +151,14 @@ mutations become `effect-unknown` (resolved by idempotent replay). Worker valida
 before allocation. No model download inside the worker; `embedding::install` is an explicit
 separate step.
 
+Snapshot transport (task 018 finding, 2026-09-06): a one-record `ncm-snapshot.v1` already exceeds the
+1 MiB reply frame, and the frame bound is frozen. Snapshot bytes therefore never travel inside a
+frame: `SnapshotExport` replies with `{snapshot_file, byte_length, content_sha256, state_generation}`
+pointing at a file the worker wrote atomically under the namespace's state root; the client reads,
+verifies and deletes it. `SnapshotRestore` sends bytes inline only when they fit, otherwise the client
+writes them to the same directory and sends the same descriptor for the worker to read, verify and
+delete. The adapter validates snapshot replies against `effective_limits.snapshot_bytes`.
+
 ## 9. Encoder (runtime `embedding/`)
 
 fastembed `EmbeddingModel::ParaphraseMLMiniLML12V2` (`Xenova/paraphrase-multilingual-MiniLM-L12-v2`,
