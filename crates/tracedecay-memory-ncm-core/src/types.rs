@@ -53,6 +53,8 @@ pub struct SourceId(pub String);
 /// Center slot handle with incarnation so stale handles never resolve.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CenterSlot {
+    /// Owning layer; STM and LTM slot indices overlap, so handles are only unique per layer.
+    pub layer: Layer,
     /// Fixed-capacity slot index.
     pub index: u32,
     /// Incremented on every (re)activation of the slot.
@@ -60,7 +62,9 @@ pub struct CenterSlot {
 }
 
 /// Logical learning tick (contract §4 D10).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct LogicalTick(pub u64);
 
 /// Algorithm identity = profile + canonical config digest (computed by the runtime).
@@ -73,7 +77,7 @@ pub struct AlgorithmIdentity {
 }
 
 /// Memory layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Layer {
     /// Short-term memory (16-D keys).
     Stm,
@@ -84,6 +88,8 @@ pub enum Layer {
 /// Per-layer center parameters (reference `MemoryCenters` constructor arguments).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayerConfig {
+    /// Which layer this configuration describes (stamped into every CenterSlot handle).
+    pub layer: Layer,
     /// Fixed center capacity.
     pub n_centers: usize,
     /// Key dimensionality.
@@ -205,6 +211,7 @@ impl Default for NcmConfig {
     fn default() -> Self {
         Self {
             ltm: LayerConfig {
+                layer: Layer::Ltm,
                 n_centers: 4096,
                 d_key: LTM_KEY_DIM,
                 sigma_read: 0.5,
@@ -224,6 +231,7 @@ impl Default for NcmConfig {
                 terrain_alpha_e: 0.001,
             },
             stm: LayerConfig {
+                layer: Layer::Stm,
                 n_centers: 512,
                 d_key: STM_KEY_DIM,
                 sigma_read: 0.4,
@@ -313,8 +321,15 @@ pub enum CoreError {
 impl fmt::Display for CoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DimensionMismatch { what, expected, actual } => {
-                write!(formatter, "{what}: expected {expected} elements, got {actual}")
+            Self::DimensionMismatch {
+                what,
+                expected,
+                actual,
+            } => {
+                write!(
+                    formatter,
+                    "{what}: expected {expected} elements, got {actual}"
+                )
             }
             Self::NonFinite(what) => write!(formatter, "{what}: non-finite value"),
             Self::BudgetExceeded(what) => write!(formatter, "{what}: budget exceeded"),

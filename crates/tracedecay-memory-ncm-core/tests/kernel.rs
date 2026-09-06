@@ -45,10 +45,11 @@ fn observe_advances_exactly_one_tick_and_reports_layer_effects() {
         report.created_or_reinforced.stm,
         LayerWriteKind::Created | LayerWriteKind::Reinforced
     ));
-    assert!(matches!(
-        report.created_or_reinforced.ltm,
-        LayerWriteKind::Created | LayerWriteKind::Reinforced
-    ));
+    assert_eq!(
+        kernel.inspect().ltm_active,
+        0,
+        "observe must not write LTM directly"
+    );
     assert!(!report.consolidated);
 }
 

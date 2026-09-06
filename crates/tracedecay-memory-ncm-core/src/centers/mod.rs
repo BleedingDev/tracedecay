@@ -6,7 +6,9 @@ pub mod allocation;
 pub mod read;
 pub mod write;
 
-use crate::types::{CenterSlot, LayerConfig, RecordId, AFFECT_DIM, CONTEXT_DIM, LTM_KEY_DIM, TERRAIN_DIM, VALUE_DIM};
+use crate::types::{
+    CenterSlot, LayerConfig, RecordId, AFFECT_DIM, CONTEXT_DIM, LTM_KEY_DIM, TERRAIN_DIM, VALUE_DIM,
+};
 use serde::{Deserialize, Serialize};
 
 /// Fixed-capacity center bank. Vectors are stored row-major and flattened:
@@ -83,6 +85,7 @@ impl MemoryCenters {
     pub fn slot(&self, index: usize) -> Option<CenterSlot> {
         let incarnation = *self.incarnation.get(index)?;
         Some(CenterSlot {
+            layer: self.config.layer,
             index: u32::try_from(index).ok()?,
             incarnation,
         })

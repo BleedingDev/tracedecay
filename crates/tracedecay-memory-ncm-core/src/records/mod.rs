@@ -6,8 +6,8 @@
 
 use crate::numeric::{validate_dimension, validate_finite};
 use crate::types::{
-    AffectVector, CenterSlot, CoreError, LogicalTick, NcmConfig, RecordId, SourceId, LTM_KEY_DIM,
-    STM_KEY_DIM, VALUE_DIM,
+    AffectVector, CenterSlot, CoreError, Layer, LogicalTick, NcmConfig, RecordId, SourceId,
+    LTM_KEY_DIM, STM_KEY_DIM, VALUE_DIM,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -268,7 +268,7 @@ struct SlotSupport {
 /// Incarnation-aware record support retained separately from latent center data.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Support {
-    by_index: BTreeMap<u32, SlotSupport>,
+    by_layer: BTreeMap<Layer, BTreeMap<u32, SlotSupport>>,
     max_center_support: usize,
 }
 
@@ -277,7 +277,7 @@ impl Support {
     #[must_use]
     pub fn new(config: &NcmConfig) -> Self {
         Self {
-            by_index: BTreeMap::new(),
+            by_layer: BTreeMap::new(),
             max_center_support: config.max_center_support,
         }
     }
@@ -327,7 +327,11 @@ impl Support {
 
     /// Resolves support only for the exact current slot incarnation.
     pub fn support_for(&self, slot: CenterSlot) -> Result<&[RecordId], CoreError> {
-        match self.by_index.get(&slot.index) {
+        match self
+            .by_layer
+            .get(&slot.layer)
+            .and_then(|m| m.get(&slot.index))
+        {
             Some(entry) if entry.incarnation == slot.incarnation => Ok(&entry.records),
             _ => Err(CoreError::StaleHandle),
         }
@@ -354,8 +358,9 @@ impl Support {
             return Err(CoreError::BudgetExceeded("merged center support"));
         }
         let entry = self
-            .by_index
-            .get_mut(&kept.index)
+            .by_layer
+            .get_mut(&kept.layer)
+            .and_then(|m| m.get_mut(&kept.index))
             .ok_or(CoreError::StaleHandle)?;
         if entry.incarnation != kept.incarnation {
             return Err(CoreError::StaleHandle);
@@ -365,13 +370,17 @@ impl Support {
     }
 
     fn entry_for_write(&mut self, slot: CenterSlot) -> Result<&mut SlotSupport, CoreError> {
-        match self.by_index.get(&slot.index) {
+        match self
+            .by_layer
+            .get(&slot.layer)
+            .and_then(|m| m.get(&slot.index))
+        {
             Some(entry) if entry.incarnation > slot.incarnation => {
                 return Err(CoreError::StaleHandle);
             }
             Some(entry) if entry.incarnation == slot.incarnation => {}
             Some(_) | None => {
-                self.by_index.insert(
+                self.by_layer.entry(slot.layer).or_default().insert(
                     slot.index,
                     SlotSupport {
                         incarnation: slot.incarnation,
@@ -380,8 +389,9 @@ impl Support {
                 );
             }
         }
-        self.by_index
-            .get_mut(&slot.index)
+        self.by_layer
+            .get_mut(&slot.layer)
+            .and_then(|m| m.get_mut(&slot.index))
             .ok_or_else(|| CoreError::InvalidState("support insertion failed".to_owned()))
     }
 }

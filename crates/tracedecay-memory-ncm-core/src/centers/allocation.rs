@@ -70,6 +70,7 @@ impl MemoryCenters {
         self.active[index] = true;
 
         Ok(CenterSlot {
+            layer: self.config.layer,
             index: u32::try_from(index).map_err(|_| {
                 CoreError::InvalidState("center index does not fit CenterSlot".to_owned())
             })?,

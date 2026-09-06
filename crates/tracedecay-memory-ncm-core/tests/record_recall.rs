@@ -358,10 +358,12 @@ fn merge_support_unions_both_sides_without_dropping_ids() {
     let config = config();
     let mut support = Support::new(&config);
     let kept = CenterSlot {
+        layer: tracedecay_memory_ncm_core::types::Layer::Stm,
         index: 0,
         incarnation: 1,
     };
     let removed = CenterSlot {
+        layer: tracedecay_memory_ncm_core::types::Layer::Stm,
         index: 1,
         incarnation: 1,
     };

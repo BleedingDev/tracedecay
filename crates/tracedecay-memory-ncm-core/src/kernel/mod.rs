@@ -2,8 +2,8 @@
 
 mod digest;
 
-use crate::centers::MemoryCenters;
 use crate::centers::write::{WriteInput, WriteOutcome, WriteParams};
+use crate::centers::MemoryCenters;
 use crate::consolidation::{self, ConsolidationReport, MergePruneReport};
 use crate::dynamics::{self, AdvanceReport, Scheduler};
 use crate::projections::ProjectionBundle;
@@ -12,8 +12,8 @@ use crate::records::{RecordInput, RecordTable, Support};
 use crate::signals::{novelty_from_ltm, write_strength};
 use crate::terrain::{Terrain3D, TerrainStats};
 use crate::types::{
-    AffectVector, CONTEXT_DIM, CenterSlot, CoreError, LTM_KEY_DIM, Layer, LogicalTick, NcmConfig,
-    RecordId, SourceId, TERRAIN_DIM, VALUE_DIM,
+    AffectVector, CenterSlot, CoreError, Layer, LogicalTick, NcmConfig, RecordId, SourceId,
+    CONTEXT_DIM, LTM_KEY_DIM, TERRAIN_DIM, VALUE_DIM,
 };
 use serde::{Deserialize, Serialize};
 
@@ -60,10 +60,8 @@ pub enum LayerWriteKind {
 /// Layer-specific write effects for one observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreatedOrReinforced {
-    /// STM write effect.
+    /// STM write effect. Observe writes STM only (reference text_memory.py store_record); LTM is populated by consolidation.
     pub stm: LayerWriteKind,
-    /// LTM write effect.
-    pub ltm: LayerWriteKind,
 }
 
 /// Result of one atomic observation.
@@ -230,7 +228,6 @@ impl NcmKernel {
         let context = array::<CONTEXT_DIM>(&projected.context, "projected context")?;
         let ltm_key = array::<LTM_KEY_DIM>(&projected.ltm_key, "projected LTM key")?;
         let stm_terrain = array::<TERRAIN_DIM>(&projected.stm_terrain, "STM terrain")?;
-        let ltm_terrain = array::<TERRAIN_DIM>(&projected.ltm_terrain, "LTM terrain")?;
         let stm_outcome = staged.stm.write(
             WriteInput {
                 key: &projected.stm_key,
@@ -247,35 +244,12 @@ impl NcmKernel {
         )?;
         check_capacity(&stm_outcome, Layer::Stm)?;
         sync_write_support(&mut staged.support, &staged.stm, &stm_outcome)?;
-        let ltm_outcome = staged.ltm.write(
-            WriteInput {
-                key: &projected.ltm_key,
-                ltm_key,
-                value,
-                affect: record.affect,
-                intensity: omega,
-                context,
-                terrain: ltm_terrain,
-                record: record_id,
-                age: 0,
-            },
-            &WriteParams::for_layer(&staged.config, Layer::Ltm),
-        )?;
-        check_capacity(&ltm_outcome, Layer::Ltm)?;
-        sync_write_support(&mut staged.support, &staged.ltm, &ltm_outcome)?;
         staged.terrain.stm.splat(
             stm_terrain,
             omega,
             Some(record.affect.0),
             staged.config.terrain_splat_sigma,
             staged.config.stm.terrain_eta,
-        )?;
-        staged.terrain.ltm.splat(
-            ltm_terrain,
-            omega,
-            Some(record.affect.0),
-            staged.config.terrain_splat_sigma,
-            staged.config.ltm.terrain_eta,
         )?;
         dynamics::observe_tick(&mut staged.scheduler, record.intensity, &staged.config);
         dynamics::homeostasis_step(&mut staged.stm, &staged.config.stm);
@@ -292,7 +266,6 @@ impl NcmKernel {
             record_id,
             created_or_reinforced: CreatedOrReinforced {
                 stm: write_kind(&stm_outcome),
-                ltm: write_kind(&ltm_outcome),
             },
             tick: staged.scheduler.tick,
             consolidated,
