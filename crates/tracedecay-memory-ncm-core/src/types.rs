@@ -195,6 +195,8 @@ pub struct NcmConfig {
     pub write_strength_scale: f32,
     /// Maximum UTF-8 bytes of key+value per record.
     pub max_record_bytes: usize,
+    /// Maximum serialized UTF-8 text bytes hydrated into one recall output (CONTRACT §5 reply budget).
+    pub max_recall_bytes: usize,
     /// Maximum retained sources per center support set.
     pub max_center_support: usize,
 }
@@ -274,6 +276,7 @@ impl Default for NcmConfig {
             write_bias: -1.0,
             write_strength_scale: 3.0,
             max_record_bytes: 16 * 1024,
+            max_recall_bytes: 1024 * 1024,
             max_center_support: 32,
         }
     }
