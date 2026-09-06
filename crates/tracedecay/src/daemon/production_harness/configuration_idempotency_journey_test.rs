@@ -241,11 +241,14 @@ async fn configuration_batch_via_surface(
             tracedecay_daemon_protocol::RequestedOutputFormat::Json,
         )
         .expect("configuration batch dispatch");
-    let result =
-        crate::application_surface::execute_application_surface(operation, dispatched, Some(&executor))
-            .await
-            .expect("configuration batch application invocation")
-            .result;
+    let result = crate::application_surface::execute_application_surface(
+        operation,
+        dispatched,
+        Some(&executor),
+    )
+    .await
+    .expect("configuration batch application invocation")
+    .result;
     let response_request_id = match &result {
         Ok(envelope) => &envelope.request_id,
         Err(envelope) => &envelope.request_id,

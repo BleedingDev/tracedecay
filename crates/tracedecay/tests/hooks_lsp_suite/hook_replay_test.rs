@@ -106,11 +106,24 @@ fn replays(root: &str) -> Vec<Replay> {
             })),
             tool_input_env: None,
         },
+        // Capture-only callbacks are decoded by the production native decoder,
+        // so their payloads must carry the host's documented Stop shape rather
+        // than the identity subset the response-capable hooks read.
         Replay {
             subcommand: "hook-codex-stop",
             agent: "codex",
             hook_name: "Stop",
-            stdin: Some(json!({ "session_id": "codex-s1", "cwd": root })),
+            stdin: Some(json!({
+                "session_id": "codex-s1",
+                "turn_id": "codex-t1",
+                "transcript_path": null,
+                "cwd": root,
+                "hook_event_name": "Stop",
+                "model": "gpt-5-codex",
+                "permission_mode": "acceptEdits",
+                "stop_hook_active": false,
+                "last_assistant_message": "done",
+            })),
             tool_input_env: None,
         },
         Replay {
@@ -136,7 +149,15 @@ fn replays(root: &str) -> Vec<Replay> {
             subcommand: "hook-cursor-stop",
             agent: "cursor",
             hook_name: "stop",
-            stdin: Some(json!({ "conversation_id": "cursor-s1", "cwd": root })),
+            stdin: Some(json!({
+                "hook_event_name": "stop",
+                "conversation_id": "cursor-s1",
+                "generation_id": "cursor-g1",
+                "model": "auto",
+                "status": "completed",
+                "loop_count": 1,
+                "cwd": root,
+            })),
             tool_input_env: None,
         },
         Replay {
@@ -144,6 +165,7 @@ fn replays(root: &str) -> Vec<Replay> {
             agent: "kiro",
             hook_name: "preToolUse",
             stdin: Some(json!({
+                "hook_event_name": "preToolUse",
                 "session_id": "kiro-s1",
                 "cwd": root,
                 "tool_name": "fsWrite",
@@ -166,6 +188,7 @@ fn replays(root: &str) -> Vec<Replay> {
             agent: "kiro",
             hook_name: "postToolUse",
             stdin: Some(json!({
+                "hook_event_name": "postToolUse",
                 "session_id": "kiro-s1",
                 "cwd": root,
                 "tool_name": "fsWrite",
@@ -321,6 +344,10 @@ async fn replayed_provider_hooks_record_attributed_rows_and_bridge_to_analytics_
     );
 
     // Bridge: `analytics sync` imports the JSONL rows into the durable table.
+    // Hook callbacks already advance the same per-file import cursor while the
+    // daemon settles hint outcomes after a project-scope transcript ingest, so
+    // the explicit sync only ever imports the tail written since the last one.
+    // The durable table below is the completeness authority.
     let sync = enable_profile_accounting(&mut tracedecay_command_with_home(&home_root))
         .args(["analytics", "sync"])
         .current_dir(&project_root)
@@ -338,10 +365,20 @@ async fn replayed_provider_hooks_record_attributed_rows_and_bridge_to_analytics_
             String::from_utf8_lossy(&sync.stdout)
         )
     });
-    assert_eq!(
-        sync_outcome.get("imported").and_then(Value::as_u64),
-        Some(store_rows.len() as u64),
-        "analytics sync must import every emitted hook analytics row: {sync_outcome:#}"
+    assert!(
+        sync_outcome
+            .get("imported")
+            .and_then(Value::as_u64)
+            .is_some_and(|imported| imported <= store_rows.len() as u64),
+        "analytics sync must report the imported tail: {sync_outcome:#}"
+    );
+    assert!(
+        sync_outcome["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|source| source["error"].is_null() && source["skipped"] == 0),
+        "analytics sync must map every remaining row: {sync_outcome:#}"
     );
     drop(daemon);
 
@@ -353,7 +390,7 @@ async fn replayed_provider_hooks_record_attributed_rows_and_bridge_to_analytics_
             provider: None,
             project_id: None,
             session_id: None,
-            event_kind: Some("hook_invoked".to_string()),
+            event_kind: None,
             since: None,
             until: None,
             before_id: None,
@@ -361,6 +398,19 @@ async fn replayed_provider_hooks_record_attributed_rows_and_bridge_to_analytics_
         })
         .await
         .expect("query analytics events");
+    let hook_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.provider.starts_with("hook_"))
+        .collect();
+    assert_eq!(
+        hook_events.len(),
+        store_rows.len(),
+        "every emitted hook analytics row must be durable exactly once"
+    );
+    let events: Vec<_> = hook_events
+        .into_iter()
+        .filter(|event| event.event_kind == "hook_invoked")
+        .collect();
     assert_eq!(
         events.len(),
         replays.len(),

@@ -7,16 +7,15 @@ use crate::daemon::store_maintenance::CodeGenerationRetentionOutcomeV1;
 ///
 /// Vector generations converge before their source code generations can be
 /// collected. Scope deletion is admitted only from a complete
-/// post-convergence vector census. Code-generation retention runs only in a
-/// tick whose vector pass converged; a paging, retiring, or degraded vector
-/// pass skips it and its own continuation or retry drives the next tick. The
-/// code pass then resolves its own vector protection inventory, deferring
-/// destructive collection when the authority is unavailable. Current
-/// default-off configuration does not prove historical vector state empty.
-/// Complete authoritative inventory (including an empty one) enables bounded
-/// collection; an in-progress census waits until its exact pin set completes.
-/// A fresh full tick preserves this ordered journey, including independent
-/// compaction. A semantic continuation
+/// post-convergence vector census. Code-generation retention still runs when
+/// vector retention failed: it resolves its own vector protection inventory,
+/// and an unreadable inventory reports its degradation and collects nothing
+/// so a mounted activation lease keeps its exact source generation. A daemon
+/// without a seated semantic runtime (the default-off state) defers the sweep
+/// quietly — as an ordinary success, not a degraded retry loop — because the
+/// current configuration does not prove historical vector state empty, and an
+/// in-progress census defers the sweep until its exact pin set completes. A fresh full tick intentionally preserves this
+/// ordered journey, including independent compaction. A semantic continuation
 /// returns after its owning phase, while a code-generation continuation runs
 /// the bounded semantic-vector page and the bounded code-generation unit —
 /// draining a superseded backlog on the short cadence without re-running
@@ -47,15 +46,10 @@ pub(in crate::daemon) async fn run_project_generation_maintenance(
         return outcome;
     }
     let semantic_collection_complete = outcome.is_complete();
-    // Source-code deletion never runs ahead of vector cleanup: a tick whose
-    // semantic-vector pass is still paging, retiring, or degraded skips the
-    // code-generation pass entirely and lets that pass's own continuation or
-    // retry drive the next tick. Only a converged vector inventory admits a
-    // sweep, so the tick that deletes a source is the tick that converged.
     let code_generation = if cancellation.is_cancelled() {
-        Some(CodeGenerationRetentionOutcomeV1::Failed)
-    } else if semantic_collection_complete {
-        Some(hotpath::measure_block!(
+        CodeGenerationRetentionOutcomeV1::Failed
+    } else {
+        hotpath::measure_block!(
             "daemon.maintenance.code_generation_retention",
             crate::daemon::store_maintenance::run_code_generation_retention(
                 graph,
@@ -64,23 +58,17 @@ pub(in crate::daemon) async fn run_project_generation_maintenance(
                 cancellation,
             )
             .await
-        ))
-    } else {
-        None
+        )
     };
     match code_generation {
-        None
-        | Some(CodeGenerationRetentionOutcomeV1::Complete)
-        | Some(CodeGenerationRetentionOutcomeV1::SemanticUnseated) => {}
-        Some(CodeGenerationRetentionOutcomeV1::MoreWork) => {
+        CodeGenerationRetentionOutcomeV1::Complete
+        | CodeGenerationRetentionOutcomeV1::SemanticUnseated => {}
+        CodeGenerationRetentionOutcomeV1::MoreWork => {
             outcome = outcome.combine(MaintenanceTickOutcome::Continue(
                 MaintenanceContinuation::CodeGenerationRetention,
             ));
         }
-        Some(
-            CodeGenerationRetentionOutcomeV1::VectorInventoryUnproven
-            | CodeGenerationRetentionOutcomeV1::Failed,
-        ) => {
+        CodeGenerationRetentionOutcomeV1::Failed => {
             if !cancellation.is_cancelled() {
                 outcome = MaintenanceTickOutcome::Retry;
             }
@@ -90,7 +78,7 @@ pub(in crate::daemon) async fn run_project_generation_maintenance(
         return finalize_generation_outcome(outcome, cancellation);
     }
     if semantic_collection_complete
-        && code_generation == Some(CodeGenerationRetentionOutcomeV1::Complete)
+        && code_generation == CodeGenerationRetentionOutcomeV1::Complete
         && !cancellation.is_cancelled()
         && maintenance_observations.semantic_vector_scope_collection_ready(graph.project_root())
     {

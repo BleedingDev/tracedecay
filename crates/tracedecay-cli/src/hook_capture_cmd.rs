@@ -124,10 +124,21 @@ pub(crate) fn try_run(args: &[OsString]) -> Option<i32> {
     // lifecycle maintenance and may open product state before the daemon has
     // admitted the observation.
     if command == "hook-pre-tool-use" {
+        if args.len() != 2 {
+            return Some(1);
+        }
         // Claude's pre-tool callback has no replay-safe native observation.
         // An empty successful response preserves the host's normal allow path
-        // without reviving the removed hook-local policy authority.
-        return (args.len() == 2).then_some(0).or(Some(1));
+        // without reviving the removed hook-local policy authority. The
+        // invocation itself is still adoption telemetry, and `TOOL_INPUT`
+        // carries no event name, so the hook name is supplied here.
+        tracedecay_agent_hosts::hooks::record_native_capture_invoked(
+            std::env::current_dir().ok().as_deref(),
+            HookHostV1::ClaudeCode,
+            Some("preToolUse"),
+            &std::env::var("TOOL_INPUT").unwrap_or_default(),
+        );
+        return Some(0);
     }
     // Hooks with a provider-supported synchronous response must enter the
     // async composition root: their existing handlers perform the canonical
@@ -218,12 +229,25 @@ fn capture_command_name(command: &Commands) -> Option<&'static str> {
 pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
     let payload = match read_bounded_stdin() {
         Ok(payload) => payload,
-        Err(()) => return 1,
+        Err(()) => {
+            eprintln!("tracedecay hook: stdin was unreadable or exceeded the payload bound");
+            return 1;
+        }
     };
     let mut delivery_writer = None;
     let mut delivery_open_error = None;
     let mut delivery_material = None;
-    let outcome = match std::env::current_dir() {
+    let working_directory = std::env::current_dir();
+    // The invocation is analytics-visible whatever the capture outcome: an
+    // unbound, unsupported, or rejected callback still proves the host fired
+    // the hook, which is the one thing adoption telemetry must not lose.
+    tracedecay_agent_hosts::hooks::record_native_capture_invoked(
+        working_directory.as_deref().ok(),
+        source.host(),
+        None,
+        &String::from_utf8_lossy(&payload),
+    );
+    let outcome = match working_directory {
         Ok(project_root) => {
             match tracedecay_runtime_core::storage::resolve_enrolled_layout_for_current_profile(
                 &project_root,
@@ -291,19 +315,26 @@ pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
             return 1;
         };
         let (Some(material), Some(delivered_at)) = (delivery_material, current_time()) else {
+            eprintln!("tracedecay hook: delivery receipt material unavailable");
             return 1;
         };
         let Some(settlement) = native_hook_delivery_settlement(source, material, delivered_at)
         else {
+            eprintln!("tracedecay hook: delivery settlement identity could not be derived");
             return 1;
         };
         let Ok(receipt) = tracedecay_hooks::HookDeliverySourceReceiptV1::new(settlement) else {
+            eprintln!("tracedecay hook: delivery receipt is invalid");
             return 1;
         };
-        if writer.append(&receipt).is_err() {
+        if let Err(error) = writer.append(&receipt) {
+            eprintln!("tracedecay hook: delivery receipt could not be retained: {error}");
             return 1;
         }
     }
+    // Hooks are silent on stderr by contract (the host shows every byte to
+    // the user), so the outcome goes to tracing, which the hook lane keeps
+    // off unless the operator opts in.
     match outcome {
         NativeHookCaptureOutcomeV1::Captured
         | NativeHookCaptureOutcomeV1::Unsupported
@@ -311,7 +342,10 @@ pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
         NativeHookCaptureOutcomeV1::Rejected
         | NativeHookCaptureOutcomeV1::Full
         | NativeHookCaptureOutcomeV1::ResetRequired
-        | NativeHookCaptureOutcomeV1::Unavailable => 1,
+        | NativeHookCaptureOutcomeV1::Unavailable => {
+            tracing::warn!(?outcome, "native capture did not land");
+            1
+        }
     }
 }
 

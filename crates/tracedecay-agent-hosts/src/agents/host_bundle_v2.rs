@@ -11,7 +11,7 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use fs2::FileExt;
@@ -2566,6 +2566,7 @@ impl HostBundleWriterV1 {
                 sync_cap_dir(&parent)?;
             }
         }
+        drop(backup_dir);
         match journal.previous_receipt {
             Some(receipt) => self.write_receipt(&receipt)?,
             None => self.remove_receipt(journal.host, journal.component)?,
@@ -2731,6 +2732,7 @@ impl HostBundleWriterV1 {
                 }
             }
         }
+        drop(backup_dir);
 
         let receipt = HostBundleInstallReceiptV1 {
             schema_version: HOST_BUNDLE_RECEIPT_SCHEMA_VERSION,
@@ -2941,6 +2943,7 @@ impl HostBundleWriterV1 {
 
             let backup_dir = self.open_or_create_backup_dir(request.operation_id)?;
             self.backup_component_set_entries(&prepared, &mut journal, &backup_dir)?;
+            drop(backup_dir);
             self.write_component_set_entries(&prepared, &mut journal)?;
 
             // Mark this before calling into host registration: a failing
@@ -3821,6 +3824,12 @@ impl HostBundleWriterV1 {
         Ok(())
     }
 
+    /// Retires an operation's rollback backups once no receipt still names it.
+    ///
+    /// Every caller must drop its `Dir` capability on the operation's backup
+    /// directory first: `cap_std` opens directories without `FILE_SHARE_DELETE`,
+    /// so on Windows a live handle makes the removal below fail with a sharing
+    /// violation and turns a completed transaction into a storage failure.
     fn cleanup_unreferenced_backup_dir(
         &self,
         operation_id: [u8; 16],
@@ -4468,11 +4477,15 @@ fn atomic_write_nofollow(
     Err(host_bundle_storage_failure!())
 }
 
+/// Flushes the deploy parent so a preceding rename, hard link, or unlink is
+/// durable.
+///
+/// Delegates to the shared capability-directory primitive rather than issuing
+/// the fsync here: Windows has no directory flush, and `FlushFileBuffers` on a
+/// directory handle fails with `ERROR_ACCESS_DENIED`, which turned every
+/// atomic host-bundle publication into a storage failure.
 fn sync_cap_dir(dir: &Dir) -> Result<(), HostBundleError> {
-    let mut options = CapOpenOptions::new();
-    options.read(true).maybe_dir(true);
-    dir.open_with(".", &options)
-        .and_then(|file| file.sync_all())
+    tracedecay_private_fs::capability_dir::sync_directory(dir)
         .map_err(|_| host_bundle_storage_failure!())
 }
 

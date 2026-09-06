@@ -86,6 +86,20 @@ use tracedecay_runtime_core::resident_memory::{
 mod noop_reconcile_tests;
 mod semantic_schedule_order_tests;
 
+/// Base directory for fixture temporary roots, resolved through every symlink.
+///
+/// macOS puts `TempDir` under `/var/folders/...`, and `/var` is a symlink to
+/// `/private/var`. Production canonicalizes a project root before it hashes
+/// the code-index scope and before it decides whether a dependency escaped the
+/// worktree, so a fixture path that still carries the symlink names a
+/// different scope than the one the scheduler writes and reads. Create the
+/// fixture inside the canonical temporary directory so every path taken from
+/// it is already canonical.
+fn canonical_temp_root() -> std::path::PathBuf {
+    let base = std::env::temp_dir();
+    base.canonicalize().unwrap_or(base)
+}
+
 struct GitFixture {
     root: TempDir,
 }
@@ -109,7 +123,7 @@ impl GitFixture {
     }
 
     fn build_fresh(files: &[(&str, &str)]) -> Self {
-        let root = TempDir::new().expect("fixture root");
+        let root = TempDir::new_in(canonical_temp_root()).expect("fixture root");
         git(root.path(), &["init", "-q", "-b", "main"]);
         git(root.path(), &["config", "user.name", "TraceDecay Test"]);
         git(
@@ -135,7 +149,7 @@ impl GitFixture {
     }
 
     fn from_template(template: &Path) -> Self {
-        let root = TempDir::new().expect("fixture root");
+        let root = TempDir::new_in(canonical_temp_root()).expect("fixture root");
         copy_dir_recursive(template, root.path());
         Self { root }
     }
@@ -1111,10 +1125,12 @@ fn partitioned_publication_reuses_unchanged_file_segments() {
     let orphan_digest = hex::encode(Sha256::digest(orphan_bytes));
     let orphan_pack = segment_root.join(format!("segment-{orphan_digest}.json"));
     std::fs::write(&orphan_pack, orphan_bytes).expect("write committed orphan evidence pack");
+    // A rollback reserve of one holds the single superseded generation; the
+    // pointer index it is still named by would not.
     let orphan_report = tracedecay_code_index_retention::code_index_generations::run_code_generation_retention(
         store.path(),
         &BTreeSet::new(),
-        tracedecay_code_index_retention::code_index_generations::DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+        1,
         tracedecay_code_index_retention::code_index_generations::CodeGenerationRetentionModeV1::Apply,
         UtcMicros(8_000_000),
         None,
@@ -1122,7 +1138,7 @@ fn partitioned_publication_reuses_unchanged_file_segments() {
     .expect("sweep committed orphan without collecting a generation");
     assert!(
         orphan_report.deleted_generations.is_empty(),
-        "both pointer-addressable generations must remain retained"
+        "the rollback reserve must retain the superseded generation"
     );
     assert!(
         !orphan_pack.exists(),
@@ -1142,7 +1158,9 @@ fn partitioned_publication_reuses_unchanged_file_segments() {
         );
     }
 
-    remove_historical_pointer_entries(store.path());
+    // Without that reserve the same generation is collectable while the
+    // pointer still names it, and its segments part by whether the active
+    // generation reuses them.
     let report = tracedecay_code_index_retention::code_index_generations::run_code_generation_retention(
         store.path(),
         &BTreeSet::new(),
@@ -1557,12 +1575,17 @@ fn evidence_pack_failure_after_pages_never_publishes_manifest_or_pointer() {
     );
 }
 
+/// Membership of the durable `generation_index` is a referential-integrity
+/// check, not a liveness mark: a published store keeps the active generation
+/// and the newest `rollback_floor` superseded generations, and everything older
+/// is collectable while the pointer still names it.
 #[test]
-fn code_generation_retention_preserves_every_pointer_addressable_generation() {
+fn code_generation_retention_keeps_only_the_rollback_floor_reserve() {
     use tracedecay_code_index_retention::code_index_generations::{
-        CodeGenerationRetentionModeV1, DEFAULT_SUPERSEDED_GENERATION_FLOOR,
-        run_code_generation_retention,
+        CodeGenerationRetentionModeV1, run_code_generation_retention,
     };
+
+    const ROLLBACK_FLOOR: usize = 2;
 
     let fixture = GitFixture::new(&[("src/lib.rs", "pub fn retained_revision() -> usize { 0 }\n")]);
     let store = TempDir::new().expect("store root");
@@ -1571,28 +1594,44 @@ fn code_generation_retention_preserves_every_pointer_addressable_generation() {
     let report = run_code_generation_retention(
         store.path(),
         &BTreeSet::new(),
-        DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+        ROLLBACK_FLOOR,
         CodeGenerationRetentionModeV1::Apply,
         UtcMicros(49),
         None,
     )
     .expect("apply retention");
 
-    assert!(report.plan.collectable_generations.is_empty());
-    assert!(report.deleted_generations.is_empty());
+    let (collected, reserved) = generations.split_at(generations.len() - ROLLBACK_FLOOR - 1);
+    assert_eq!(
+        report
+            .deleted_generations
+            .iter()
+            .map(|generation| generation.generation_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        collected
+            .iter()
+            .map(CodeGenerationId::as_str)
+            .collect::<BTreeSet<_>>(),
+        "everything older than the active generation and its rollback reserve is collectable"
+    );
+    let reserved = reserved
+        .iter()
+        .map(CodeGenerationId::as_str)
+        .collect::<BTreeSet<_>>();
     let reopened = scheduler(
         &fixture,
         store.path().to_path_buf(),
         Arc::new(SharedCodeIndexBytePoolV1::default()),
     );
-    for generation in generations {
-        assert!(
+    for generation in &generations {
+        assert_eq!(
             reopened
                 .publication
-                .load_generation(&generation)
-                .expect("read pointer-addressable generation")
+                .load_generation(generation)
+                .expect("read retained generation")
                 .is_some(),
-            "retention must preserve every generation still named by the pointer"
+            reserved.contains(generation.as_str()),
+            "only the active generation and the rollback reserve survive collection"
         );
     }
 }
@@ -1640,12 +1679,17 @@ fn sealed_replay_binding_resolves_an_exact_superseded_generation() {
     ));
 }
 
+/// The durable index bounds the pointer's own history, and a collection pass
+/// bounds its batch; neither bound is the other's. One pass takes its whole
+/// batch from the oldest end no matter which of those generations the index
+/// still names, and every collected id leaves the index with them.
 #[test]
-fn bounded_pointer_history_collects_evicted_clean_and_dirty_generations() {
+fn one_bounded_pass_collects_clean_and_dirty_superseded_generations() {
     use tracedecay_code_index_retention::code_index_generations::{
         CodeGenerationRetentionModeV1, DEFAULT_SUPERSEDED_GENERATION_FLOOR,
-        DurablePublicationPointerV1, MAX_DURABLE_GENERATION_INDEX_BYTES_V1,
-        MAX_DURABLE_GENERATION_INDEX_ENTRIES_V1, run_code_generation_retention,
+        DurablePublicationPointerV1, MAX_CODE_GENERATION_RETENTION_BATCH_V1,
+        MAX_DURABLE_GENERATION_INDEX_BYTES_V1, MAX_DURABLE_GENERATION_INDEX_ENTRIES_V1,
+        run_code_generation_retention,
     };
 
     let fixture = GitFixture::new(&[("src/lib.rs", "pub fn retained_revision() -> usize { 0 }\n")]);
@@ -1690,21 +1734,23 @@ fn bounded_pointer_history_collects_evicted_clean_and_dirty_generations() {
         UtcMicros(50),
         None,
     )
-    .expect("collect generations evicted from bounded history");
-    assert_eq!(
-        report.deleted_generations.len(),
-        generations.len() - pointer.generation_index.len()
-    );
+    .expect("collect superseded generations in one bounded pass");
+    let collected = report
+        .deleted_generations
+        .iter()
+        .map(|generation| generation.generation_id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(collected.len(), MAX_CODE_GENERATION_RETENTION_BATCH_V1);
 
     let reopened = scheduler(
         &fixture,
         store.path().to_path_buf(),
         Arc::new(SharedCodeIndexBytePoolV1::default()),
     );
-    let retained = pointer
-        .generation_index
+    let retained = generations
         .iter()
-        .map(|entry| entry.generation_id.as_str())
+        .map(CodeGenerationId::as_str)
+        .filter(|generation| !collected.contains(generation))
         .collect::<BTreeSet<_>>();
     for generation in &generations {
         assert_eq!(
@@ -1714,14 +1760,26 @@ fn bounded_pointer_history_collects_evicted_clean_and_dirty_generations() {
                 .expect("read bounded generation")
                 .is_some(),
             retained.contains(generation.as_str()),
-            "only pointer-addressable generations may survive collection"
+            "one bounded pass collects its whole batch and nothing else"
         );
     }
     assert_eq!(
         std::fs::read_dir(store.path().join("code-generations-v1"))
             .expect("list retained generations")
             .count(),
-        pointer.generation_index.len()
+        retained.len()
+    );
+    let rewritten: DurablePublicationPointerV1 = serde_json::from_slice(
+        &std::fs::read(store.path().join("active-code-generation-v1.json"))
+            .expect("read rewritten publication pointer"),
+    )
+    .expect("decode rewritten publication pointer");
+    assert!(
+        rewritten
+            .generation_index
+            .iter()
+            .all(|entry| retained.contains(entry.generation_id.as_str())),
+        "the durable index may never name a generation this pass unlinked"
     );
 }
 
@@ -2254,9 +2312,9 @@ fn oversized_generations_still_produce_a_complete_retention_finding() {
     let mut pointer: tracedecay_code_index_retention::code_index_generations::DurablePublicationPointerV1 =
         serde_json::from_slice(&std::fs::read(&pointer_path).expect("read publication pointer"))
             .expect("decode publication pointer");
-    // Every generation stays pointer-addressable — this test is about census
-    // cost at scale, not about a collectable backlog — so each index entry's
-    // recorded size must match its sparsely grown file.
+    // The pointer's index is a referential-integrity check the census still
+    // validates, so each entry's recorded size must match its sparsely grown
+    // file even though membership no longer holds a generation live.
     for entry in &mut pointer.generation_index {
         entry.size_bytes = ONE_GIB;
     }
@@ -2282,9 +2340,14 @@ fn oversized_generations_still_produce_a_complete_retention_finding() {
     .expect("metadata-only census must not depend on re-hashing gigabytes");
 
     assert_eq!(plan.superseded_generations.len(), 3);
+    assert_eq!(plan.collectable_generations.len(), 3);
     assert!(
         plan.superseded_generation_bytes() >= 3 * ONE_GIB,
         "the census must report the real footprint, not a budgeted subset"
+    );
+    assert!(
+        plan.collectable_generation_bytes() >= 3 * ONE_GIB,
+        "the backlog the finding reports is the real footprint too"
     );
 
     let record = CodeGenerationRetentionRecordV1 {
@@ -2304,7 +2367,13 @@ fn oversized_generations_still_produce_a_complete_retention_finding() {
         finding.finding().coverage().is_complete(),
         "a byte budget must not downgrade coverage the census actually achieved"
     );
-    assert!(finding.finding().state().is_healthy_complete());
+    // Complete coverage of a real backlog, not health: pointer membership no
+    // longer holds these three superseded generations live, so the finding a
+    // complete census produces at this size is the backlog itself.
+    assert_eq!(
+        finding.finding().state(),
+        tracedecay_application::doctor::DoctorEvidenceStateV1::Stale
+    );
 }
 
 struct MixedAnchorReverseRerankExecutorV1;
@@ -3780,7 +3849,7 @@ async fn retirement_parks_the_incumbent_while_a_same_root_remount_waits_on_its_s
             if reconciling {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
     .await
@@ -5896,6 +5965,95 @@ fn ordinary_background_reconcile_does_not_supersede_in_flight_text_work() {
 }
 
 #[test]
+fn observed_change_after_neutral_wake_supersedes_in_flight_text_work() {
+    let fixture = GitFixture::new(&[(
+        "src/lib.rs",
+        "pub fn neutral_then_observed_change() -> u32 { 1 }\n",
+    )]);
+    let store = TempDir::new().expect("store root");
+    let scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    let control = tracedecay_usecases::code_index::DaemonCodeIndexControlV1::new(
+        Arc::clone(&scheduler.epoch),
+        Arc::clone(&scheduler.shutting_down),
+    );
+
+    scheduler.request_background_reconcile();
+    assert!(
+        !control.is_cancelled(),
+        "the neutral wake must preserve work admitted for unchanged source state"
+    );
+
+    fixture.edit(
+        "src/lib.rs",
+        "pub fn neutral_then_observed_change() -> u32 { 2 }\n",
+    );
+    scheduler.request_background_reconcile_for_observed_change();
+
+    assert!(
+        control.is_cancelled(),
+        "a source change observed before the neutral wake drains must still supersede stale work"
+    );
+    let observed_change_epoch = scheduler.epoch.load(std::sync::atomic::Ordering::Acquire);
+
+    scheduler.request_background_reconcile_for_observed_change();
+
+    assert_eq!(
+        scheduler.epoch.load(std::sync::atomic::Ordering::Acquire),
+        observed_change_epoch,
+        "repeated reads of the same pending drift must keep the cancellation epoch stable"
+    );
+}
+
+#[test]
+fn observed_change_during_capture_retries_before_publication() {
+    let fixture = GitFixture::new(&[(
+        "src/lib.rs",
+        "pub fn changed_during_capture() -> u32 { 1 }\n",
+    )]);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    published(scheduler.reconcile_now().expect("publish initial source"));
+    scheduler.request_background_reconcile();
+    let mut capture_attempts = 0;
+
+    let outcome = scheduler
+        .reconcile_now_with_capture(|scheduler, control| {
+            let captured = scheduler.capture_authoritative_snapshot(Some(control))?;
+            capture_attempts += 1;
+            if capture_attempts == 1 {
+                fixture.edit(
+                    "src/lib.rs",
+                    "pub fn changed_during_capture() -> u32 { 2 }\n",
+                );
+                scheduler.request_background_reconcile_for_observed_change();
+            }
+            Ok(captured)
+        })
+        .expect("reconcile source changed during capture");
+    let published = published(outcome);
+    let current = scheduler
+        .capture_authoritative_snapshot(None)
+        .expect("capture current source after publication");
+
+    assert_eq!(
+        capture_attempts, 2,
+        "the capture superseded by the observed change must be retried exactly once"
+    );
+    assert_eq!(
+        published.snapshot_content_identity, current.snapshot.content_identity,
+        "the published generation must describe the source captured after the observed change"
+    );
+}
+
+#[test]
 fn same_daemon_scheduler_retire_remount_mints_new_progress_producer() {
     let fixture = GitFixture::new(&[("src/lib.rs", "pub fn producer_epoch() {}\n")]);
     let store = TempDir::new().expect("store root");
@@ -6780,7 +6938,7 @@ async fn unchanged_git_watcher_probe_does_not_enqueue_authoritative_capture() {
             Instant::now() <= settled_deadline,
             "retained graph-off owner never established initial freshness"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
     let admission = registry
         .background_reconcile_admission()
@@ -7434,7 +7592,7 @@ async fn verified_empty_source_remains_observable_while_scheduler_is_busy() {
             .reconciled_without_generation_for_scope(&scope)
             .await
         {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
     .await
@@ -7608,7 +7766,7 @@ async fn ignored_dependency_waits_for_global_admission_before_publication_gate()
     });
     tokio::time::timeout(Duration::from_millis(100), async {
         while global_admission.available_permits() != 0 {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
     .await
@@ -8659,7 +8817,7 @@ async fn dashboard_progress_does_not_wait_for_the_scheduler_mutex() {
             if let Some(progress) = progress_slot.read().expect("progress slot").snapshot() {
                 break progress;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
     .await
@@ -12061,34 +12219,29 @@ fn reparse_matches_full_parse_chunks() {
 // is served generation-bound and read-only, bypassing freshness entirely.
 // ---------------------------------------------------------------------------
 
-fn canonical_fixture_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// Wait for the registry-mounted worktree to publish its first generation.
-/// Prefers the existing generation-publication broadcast over sleep polling.
+/// Wait until the registry-mounted worktree seats its first generation.
+///
+/// This must not join the generation-publication broadcast. Publication is an
+/// edge the background worker emits the moment reconcile seals, while
+/// [`CodeIndexSchedulerRegistryV1::latest_generation_id`] — the value returned
+/// here — answers only from a serving or text seat installed strictly later.
+/// A waiter that subscribes after that edge has already fired never hears it
+/// again, and no second publication follows a quiet mount, so the guard-then-
+/// subscribe pattern deadlocked for the whole timeout. Poll the seat itself.
 async fn wait_for_initial_generation(
     registry: &CodeIndexSchedulerRegistryV1,
     path: &Path,
 ) -> tracedecay_domain::CodeGenerationId {
-    if let Some(generation) = registry.latest_generation_id(path).await {
-        return generation;
-    }
-    let mut publications = registry.subscribe_generation_publications();
-    if let Some(generation) = registry.latest_generation_id(path).await {
-        return generation;
-    }
-    let canonical = canonical_fixture_path(path);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let event = publications.recv().await.expect("generation publication");
-            if event.project_root == canonical {
-                break event.generation_id;
+            if let Some(generation) = registry.latest_generation_id(path).await {
+                break generation;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("initial generation published")
+    .expect("initial generation seated")
 }
 
 /// Publication now broadcasts as soon as reconcile publishes, before graph
@@ -12114,6 +12267,40 @@ async fn wait_for_live_complete_generation(
     }
 }
 
+/// Publication is broadcast when reconcile seals, before the sealed generation
+/// takes the serving slot, so `branch_add`'s exact-branch wait had no event for
+/// the seat and polled the slot every 10ms for up to thirty minutes instead.
+/// The seating counter replaces that poll, and it only can if a wake means the
+/// slot already holds the generation.
+#[tokio::test]
+async fn serving_seat_wake_arrives_only_after_the_slot_is_seated() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    let mut seats = registry.subscribe_serving_seats();
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("mount scheduler");
+    tokio::time::timeout(Duration::from_secs(30), seats.changed())
+        .await
+        .expect("seating wakes its waiters instead of leaving them to poll")
+        .expect("the seating channel stays open while the registry lives");
+    assert!(
+        registry
+            .latest_complete_serving_for_test(fixture.path())
+            .await
+            .is_some(),
+        "a seat wake must not fire before the serving slot holds the generation"
+    );
+    registry.shutdown().await;
+}
+
 async fn wait_for_dashboard_ready(registry: &CodeIndexSchedulerRegistryV1, path: &Path) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -12127,7 +12314,7 @@ async fn wait_for_dashboard_ready(registry: &CodeIndexSchedulerRegistryV1, path:
             if ready {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
     .await
@@ -12148,7 +12335,7 @@ async fn wait_for_queryable_text_generation(
             if let Some(text) = registry.latest_text_serving_for_root(path).await {
                 break text;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
     .await
@@ -12169,41 +12356,35 @@ async fn wait_for_queryable_text_generation_change(
                     break text;
                 }
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
     .await
     .expect("changed queryable text generation seated")
 }
 
-/// Wait until the mounted worktree publishes a generation distinct from `previous`.
+/// Wait until the mounted worktree seats a generation distinct from `previous`.
+///
+/// Same seat-not-edge rule as [`wait_for_initial_generation`]: the successor's
+/// publication can land before this wait subscribes, and a caller that then
+/// read the serving slot would still be handed `previous`.
 async fn wait_for_generation_change(
     registry: &CodeIndexSchedulerRegistryV1,
     path: &Path,
     previous: &tracedecay_domain::CodeGenerationId,
 ) -> tracedecay_domain::CodeGenerationId {
-    if let Some(generation) = registry.latest_generation_id(path).await
-        && &generation != previous
-    {
-        return generation;
-    }
-    let mut publications = registry.subscribe_generation_publications();
-    if let Some(generation) = registry.latest_generation_id(path).await
-        && &generation != previous
-    {
-        return generation;
-    }
-    let canonical = canonical_fixture_path(path);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let event = publications.recv().await.expect("generation publication");
-            if event.project_root == canonical && &event.generation_id != previous {
-                break event.generation_id;
+            if let Some(generation) = registry.latest_generation_id(path).await
+                && &generation != previous
+            {
+                break generation;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("changed generation published")
+    .expect("changed generation seated")
 }
 
 #[tokio::test]
@@ -13995,7 +14176,7 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
             std::time::Instant::now() <= progress_deadline,
             "text projection completed before exposing bounded live progress"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     };
     let status_poll_admission = registry
         .background_reconcile_admission()
@@ -14084,7 +14265,7 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
                     std::time::Instant::now() <= query_deadline,
                     "graph-off text projection never became queryable: {error}"
                 );
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
     };
@@ -14112,7 +14293,7 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
             std::time::Instant::now() <= overflow_deadline,
             "graph-off overflow did not settle through a real no-op reconcile"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
     let (owner_epoch_after_overflow, progress_after_overflow, decode_count) = {
         let scheduler = scheduler
@@ -14435,6 +14616,81 @@ fn graph_off_stale_witness_reconciles_unchanged_source_without_full_decode() {
     );
 }
 
+#[test]
+fn graph_off_change_after_capture_refuses_stale_publication() {
+    let fixture = GitFixture::new(&[(
+        "src/lib.rs",
+        "pub fn retained_capture_race() -> u32 { 1 }\n",
+    )]);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    published(scheduler.reconcile_now().expect("publish generation A"));
+    let pointer_a = scheduler
+        .publication
+        .read_publication_pointer()
+        .expect("read generation A pointer")
+        .expect("generation A pointer");
+    let metadata_a = scheduler
+        .servable_retained_text_generation()
+        .expect("verified generation A text handle")
+        .metadata()
+        .clone();
+
+    fixture.edit(
+        "src/lib.rs",
+        "pub fn retained_capture_race() -> u32 { 2 }\n",
+    );
+    scheduler.request_background_reconcile_for_observed_change();
+    let stale_capture = scheduler
+        .capture_retained_reconcile_attempt()
+        .expect("capture generation B source")
+        .expect("generation B capture remains current");
+
+    fixture.edit(
+        "src/lib.rs",
+        "pub fn retained_capture_race() -> u32 { 3 }\n",
+    );
+    scheduler.request_background_reconcile_for_observed_change();
+    let refused = scheduler
+        .finish_retained_reconcile(
+            &metadata_a,
+            super::RestoreFreshnessWitnessV1::load(store.path()),
+            stale_capture,
+        )
+        .expect("refuse superseded retained capture");
+
+    assert!(
+        refused.is_none(),
+        "a retained capture superseded after hint drain must not publish"
+    );
+    assert_eq!(
+        scheduler
+            .publication
+            .read_publication_pointer()
+            .expect("read pointer after refusal")
+            .expect("active pointer after refusal"),
+        pointer_a,
+        "refusing the stale capture must preserve generation A"
+    );
+
+    let outcome = scheduler
+        .reconcile_retained_text_generation_with(&metadata_a, true)
+        .expect("retry retained reconcile")
+        .expect("retry outcome");
+    let published = published(outcome);
+    let current = scheduler
+        .capture_authoritative_snapshot_without_active_generation_reuse(None)
+        .expect("capture current generation C source");
+    assert_eq!(
+        published.snapshot_content_identity, current.snapshot.content_identity,
+        "the retry must publish the source state that superseded generation B"
+    );
+}
+
 /// A graph-off changed-source rebuild must use the same canonical worker-memory
 /// admission as the complete reconcile path. A denial occurs before capture,
 /// leaves the durable pointer and hint authority intact, and releases its RAII
@@ -14543,7 +14799,7 @@ fn graph_off_changed_source_worker_memory_denial_retries_without_decode() {
 /// source.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graph_off_changed_source_advances_text_authority_without_full_decode() {
-    let sources = (0..256)
+    let mut sources = (0..256)
         .map(|index| {
             (
                 format!("src/file_{index:04}.rs"),
@@ -14551,6 +14807,7 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
             )
         })
         .collect::<Vec<_>>();
+    sources.push(("revision.marker".to_owned(), "generation A\n".to_owned()));
     let source_refs = sources
         .iter()
         .map(|(path, source)| (path.as_str(), source.as_str()))
@@ -14619,7 +14876,7 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
                     std::time::Instant::now() <= ready_deadline,
                     "generation A never became text-queryable: {error}"
                 );
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
     };
@@ -14678,7 +14935,7 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
             std::time::Instant::now() <= attempt_deadline,
             "transient publication failure was never attempted"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
     let restore_deadline = std::time::Instant::now() + Duration::from_secs(10);
     while reconcile_in_progress.load(std::sync::atomic::Ordering::Acquire) != 0 {
@@ -14686,9 +14943,9 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
             std::time::Instant::now() <= restore_deadline,
             "transient publication failure did not terminate"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    {
+    let unpublished_b_generation = {
         let mut scheduler = scheduler
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -14712,6 +14969,48 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
         );
         assert_eq!(scheduler.sealed_decode_count(), 0);
         scheduler.publication.generations_root = durable_generations_root;
+        scheduler
+            .publication
+            .unpublished_candidate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("generation B remains available for a publication-only retry")
+            .manifest()
+            .generation_id
+            .clone()
+    };
+
+    fixture.edit(
+        "revision.marker",
+        "generation C leaves indexed source unchanged\n",
+    );
+    git(
+        fixture.path(),
+        &["commit", "-qam", "advance to generation C"],
+    );
+    {
+        let mut scheduler = scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        scheduler.request_background_reconcile_for_observed_change();
+        assert!(
+            scheduler
+                .republish_unpublished_retained_generation()
+                .expect("validate publication-only retry against generation C")
+                .is_none(),
+            "the unpublished generation B must not publish after source advances to C"
+        );
+        assert_eq!(
+            scheduler
+                .publication
+                .read_publication_pointer()
+                .expect("read pointer after stale candidate refusal")
+                .expect("generation A remains durable")
+                .generation_id,
+            generation_a.as_str(),
+            "refusing unpublished B must preserve generation A"
+        );
     }
     assert!(
         registry
@@ -14721,7 +15020,7 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
     );
 
     let publication_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let generation_b = loop {
+    let generation_c = loop {
         let durable = match scheduler.try_lock() {
             Ok(scheduler) => scheduler
                 .publication
@@ -14739,17 +15038,17 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
         if let Some(durable) = durable
             && durable != generation_a.as_str()
         {
-            break CodeGenerationId::new(durable).expect("generation B id");
+            break CodeGenerationId::new(durable).expect("generation C id");
         }
         assert!(
             std::time::Instant::now() <= publication_deadline,
-            "changed graph-off source never published durable generation B"
+            "changed graph-off source never published durable generation C"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
 
     let progress_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let progress_b = loop {
+    let progress_c = loop {
         let progress = match scheduler.try_lock() {
             Ok(scheduler) => {
                 let progress = scheduler.build_progress_slot();
@@ -14769,7 +15068,7 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
             }
         };
         if let Some((owner_epoch, Some(progress))) = progress
-            && progress.generation_id == generation_b.as_str()
+            && progress.generation_id == generation_c.as_str()
             && progress.committed_pages > 0
         {
             assert!(owner_epoch > owner_epoch_a);
@@ -14777,14 +15076,14 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
         }
         assert!(
             std::time::Instant::now() <= progress_deadline,
-            "durable generation B never acquired advancing text authority"
+            "durable generation C never acquired advancing text authority"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
-    assert!(progress_b.progress_epoch > 0);
+    assert!(progress_c.progress_epoch > 0);
     assert_eq!(
         registry.latest_generation_id(fixture.path()).await,
-        Some(generation_b.clone()),
+        Some(generation_c.clone()),
         "generation A stops owning the graph-off query route"
     );
     if let Ok(executed) = registry
@@ -14793,32 +15092,32 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
     {
         assert_ne!(
             executed.generation, generation_a,
-            "generation A must not serve after B owns text progress"
+            "generation A must not serve after C owns text progress"
         );
     }
 
     let query_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let executed_b = loop {
+    let executed_c = loop {
         match registry
             .execute_query_search(&scope, core_search_request("beta_0000"))
             .await
         {
-            Ok(executed) if executed.generation == generation_b => break executed,
+            Ok(executed) if executed.generation == generation_c => break executed,
             Ok(executed) => panic!(
-                "stale generation {} served after durable B",
+                "stale generation {} served after durable C",
                 executed.generation
             ),
             Err(error) => {
                 assert!(
                     std::time::Instant::now() <= query_deadline,
-                    "generation B never became text-queryable: {error}"
+                    "generation C never became text-queryable: {error}"
                 );
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
     };
     assert_eq!(
-        executed_b
+        executed_c
             .authorized
             .fallback
             .public_fallback_lane_coverage
@@ -14826,7 +15125,7 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
         Some(&PublicRetrieverStatus::Complete)
     );
     assert_eq!(
-        executed_b
+        executed_c
             .authorized
             .fallback
             .public_fallback_lane_coverage
@@ -14834,21 +15133,41 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
         Some(&PublicRetrieverStatus::Complete)
     );
     assert_eq!(
-        executed_b
+        executed_c
             .authorized
             .fallback
             .public_fallback_lane_coverage
             .get(&RetrieverKind::Graph),
         Some(&PublicRetrieverStatus::Unavailable)
     );
-    assert_eq!(
-        scheduler
+    {
+        let scheduler = scheduler
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .sealed_decode_count(),
-        0,
-        "graph-off A-to-B publication must not decode a sealed generation"
-    );
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active = scheduler
+            .publication
+            .load_active_shared()
+            .expect("load generation C from the in-memory publication authority")
+            .expect("generation C is active");
+        let current = scheduler
+            .capture_authoritative_snapshot_without_active_generation_reuse(None)
+            .expect("capture current generation C revision");
+        assert_ne!(
+            active.manifest().generation_id,
+            unpublished_b_generation,
+            "generation B must never become active after generation C is observed"
+        );
+        assert_eq!(
+            active.snapshot().source_revision,
+            current.snapshot.source_revision,
+            "the successor must record the allow-empty generation C revision"
+        );
+        assert_eq!(
+            scheduler.sealed_decode_count(),
+            0,
+            "graph-off A-to-C publication must not decode a sealed generation"
+        );
+    }
     registry.shutdown().await;
 }
 
@@ -15150,7 +15469,7 @@ async fn graph_off_remount_preserves_an_unhinted_source_reconcile() {
             Instant::now() <= settled_deadline,
             "graph-off retained generation never settled"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 
     let admission = registry
@@ -15197,7 +15516,7 @@ async fn graph_off_remount_preserves_an_unhinted_source_reconcile() {
             Instant::now() <= reconcile_deadline,
             "the remount wake never reconciled the unhinted edit"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
     registry.shutdown().await;
 }
@@ -15303,7 +15622,7 @@ async fn retryable_graph_activation_does_not_block_changed_text_generation() {
             std::time::Instant::now() <= progress_deadline,
             "graph-on text projection never exposed bounded live progress"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     };
     assert_eq!(
         progress_mid_build.generation_id,
@@ -15332,7 +15651,7 @@ async fn retryable_graph_activation_does_not_block_changed_text_generation() {
             std::time::Instant::now() <= progress_deadline,
             "graph retries withheld retained exact and lexical readiness"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     };
     assert_eq!(
         text_owner_before_retry.metadata().manifest().generation_id,
@@ -15579,7 +15898,7 @@ async fn terminal_graph_activation_failure_is_typed_for_current_text_generation(
             Instant::now() <= deadline,
             "terminal graph activation failure remained pending: {freshness:?}"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     };
     assert!(
         reason.contains("injected terminal graph activation failure"),
@@ -15645,7 +15964,7 @@ async fn graph_decode_does_not_block_text_freshness() {
             {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
     .await
@@ -15678,7 +15997,7 @@ async fn graph_decode_does_not_block_text_freshness() {
             if held_decode.waiter_count() > 0 {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
     .await
@@ -15860,7 +16179,7 @@ async fn blocked_observability_store_does_not_hold_reconcile_readiness() {
             std::time::Instant::now() <= deadline,
             "optional telemetry held successful reconcile readiness: {freshness:?}"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 
     blocked_writer
@@ -16306,12 +16625,14 @@ fn serving_swap_seats_a_generation_whose_publication_moved_while_it_activated() 
     assert_eq!(
         ServingSwapOutcomeV1::decide(false, false, true),
         ServingSwapOutcomeV1::SeatedStale,
-        "an activated generation whose pointer moved must seat when nothing serves"
+        "an activated generation whose pointer moved must seat when no active \
+         publication holds the slot — empty, or an incumbent the store \
+         superseded as well"
     );
     assert_eq!(
         ServingSwapOutcomeV1::decide(false, true, true),
         ServingSwapOutcomeV1::Superseded,
-        "a superseded generation must not displace one that already serves"
+        "a superseded generation must not displace the active durable publication"
     );
     assert_eq!(
         ServingSwapOutcomeV1::decide(true, false, true),

@@ -8,7 +8,8 @@ fn twelve_mcp_cli_and_hook_clients_share_one_daemon_profile_store_owner() {
     let socket_path = common::daemon_socket_path(&home_path);
     let daemon_stderr_path = home_path.join("daemon.stderr.log");
     let daemon_stderr = std::fs::File::create(&daemon_stderr_path).expect("create daemon stderr");
-    let mut daemon = spawn_daemon_with_stderr(&home_path, &socket_path, daemon_stderr);
+    let mut daemon =
+        spawn_daemon_with_stderr(&home_path, &socket_path, &daemon_stderr_path, daemon_stderr);
     let profile_db_path = init_project(&home_path, &project_path, &socket_path);
 
     let mut clients = (0..CLIENT_COUNT)
@@ -49,10 +50,22 @@ fn twelve_mcp_cli_and_hook_clients_share_one_daemon_profile_store_owner() {
     );
 
     let db_identity = file_identity(&profile_db_path).expect("profile database identity");
+    // `hook-cursor-after-file-edit` is a capture-only callback: the native
+    // decoder reads Cursor's documented `afterFileEdit` shape and rejects an
+    // identity subset as a malformed payload (exit 1), the contract
+    // `cursor_after_file_edit_hook_captures_bound_spool_record` pins. Send the
+    // recorded host shape, not just the fields this test reads.
     let hook_event = json!({
         "hook_event_name": "afterFileEdit",
+        "conversation_id": "ownership-conversation",
+        "generation_id": "ownership-generation",
+        "model": "fixture-model",
         "file_path": project_path.join("src/lib.rs"),
+        "edits": [{ "old_string": "", "new_string": "pub fn owned() {}\n" }],
+        "session_id": "ownership-session",
+        "cursor_version": "fixture",
         "workspace_roots": [&project_path],
+        "transcript_path": null,
     })
     .to_string();
     std::thread::scope(|scope| {
@@ -100,9 +113,17 @@ fn twelve_mcp_cli_and_hook_clients_share_one_daemon_profile_store_owner() {
                         .spawn()
                         .expect("spawn brokered tool status"),
                 );
-                let status = wait_for_exit(&mut tool)
-                    .unwrap_or_else(|| panic!("tool client exceeded {PROCESS_TIMEOUT:?}"));
-                assert!(status.success(), "brokered tool status failed");
+                let status = wait_for_exit(&mut tool).unwrap_or_else(|| {
+                    panic!(
+                        "tool client exceeded {PROCESS_TIMEOUT:?}\ndaemon stderr:\n{}",
+                        daemon_stderr_tail()
+                    )
+                });
+                assert!(
+                    status.success(),
+                    "brokered tool status failed\ndaemon stderr:\n{}",
+                    daemon_stderr_tail()
+                );
             }));
         }
         for _ in 0..CONCURRENT_CLIENTS_PER_PATH {
@@ -120,7 +141,7 @@ fn twelve_mcp_cli_and_hook_clients_share_one_daemon_profile_store_owner() {
                         .current_dir(project_path)
                         .stdin(Stdio::piped())
                         .stdout(Stdio::null())
-                        .stderr(Stdio::null())
+                        .stderr(Stdio::piped())
                         .spawn()
                         .expect("spawn hook client"),
                 );
@@ -129,9 +150,21 @@ fn twelve_mcp_cli_and_hook_clients_share_one_daemon_profile_store_owner() {
                     .write_all(hook_event.as_bytes())
                     .expect("write hook event");
                 drop(stdin);
-                let status = wait_for_exit(&mut hook)
-                    .unwrap_or_else(|| panic!("hook client exceeded {PROCESS_TIMEOUT:?}"));
-                assert!(status.success(), "hook client failed");
+                let mut hook_stderr = hook.stderr.take().expect("hook stderr");
+                let status = wait_for_exit(&mut hook).unwrap_or_else(|| {
+                    panic!(
+                        "hook client exceeded {PROCESS_TIMEOUT:?}\ndaemon stderr:\n{}",
+                        daemon_stderr_tail()
+                    )
+                });
+                let mut stderr = String::new();
+                let _ = std::io::Read::read_to_string(&mut hook_stderr, &mut stderr);
+                assert!(
+                    status.success(),
+                    "hook client failed with {:?}\nhook stderr:\n{stderr}\ndaemon stderr:\n{}",
+                    status.code(),
+                    daemon_stderr_tail()
+                );
             }));
         }
         start.wait();
@@ -142,12 +175,19 @@ fn twelve_mcp_cli_and_hook_clients_share_one_daemon_profile_store_owner() {
 
     let doctor = common::tracedecay_command_with_home(&home_path)
         .env("TRACEDECAY_DAEMON_SOCKET", &socket_path)
+        // `doctor` takes no arguments: it checks every agent integration in one
+        // pass, so the retired `--agent` selector is a hard parse failure.
         .arg("doctor")
-        .args(["--agent", "claude"])
         .current_dir(&project_path)
         .output()
         .expect("run doctor probe");
-    assert_command_success("brokered doctor", &doctor);
+    assert!(
+        doctor.status.success(),
+        "brokered doctor failed\nstdout:\n{}\nstderr:\n{}\ndaemon stderr:\n{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr),
+        daemon_stderr_tail()
+    );
     assert_eq!(
         file_identity(&profile_db_path),
         Some(db_identity),
