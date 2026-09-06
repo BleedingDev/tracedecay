@@ -1,0 +1,119 @@
+name: Product NCM Backend
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/product-ncm-backend.yml"
+      - "crates/tracedecay-memory-ncm-core/**"
+      - "crates/tracedecay-memory-ncm-runtime/**"
+      - "crates/tracedecay-memory-provider-ncm/**"
+      - "product/ncm/**"
+      - "scripts/product/ncm/**"
+  push:
+    paths:
+      - ".github/workflows/product-ncm-backend.yml"
+      - "crates/tracedecay-memory-ncm-core/**"
+      - "crates/tracedecay-memory-ncm-runtime/**"
+      - "crates/tracedecay-memory-provider-ncm/**"
+      - "product/ncm/**"
+      - "scripts/product/ncm/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: product-ncm-backend-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  backend-no-default:
+    name: Core, runtime, and adapter without native model
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/tracedecay-cargo-target
+      TRACEDECAY_DATA_DIR: ${{ runner.temp }}/tracedecay-test-profile/.tracedecay
+      RUSTC_WRAPPER: ""
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show pinned Rust toolchain
+        run: rustc --version --verbose
+
+      - name: Discover nonempty backend populations
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-memory-ncm-core --no-default-features -- --list | tee core-tests.txt
+          cargo test --locked -p tracedecay-memory-ncm-runtime --no-default-features -- --list | tee runtime-tests.txt
+          cargo test --locked -p tracedecay-memory-provider-ncm --no-default-features --features rust-backend -- --list | tee adapter-tests.txt
+          grep -q ': test$' core-tests.txt
+          grep -q ': test$' runtime-tests.txt
+          grep -q ': test$' adapter-tests.txt
+
+      - name: Run backend populations without native inference
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-memory-ncm-core --no-default-features
+          cargo test --locked -p tracedecay-memory-ncm-runtime --no-default-features
+          cargo test --locked -p tracedecay-memory-provider-ncm --no-default-features --features rust-backend
+
+      - name: Clippy backend populations without native inference
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p tracedecay-memory-ncm-core --all-targets --no-default-features
+          cargo clippy --locked -p tracedecay-memory-ncm-runtime --all-targets --no-default-features
+          cargo clippy --locked -p tracedecay-memory-provider-ncm --all-targets --no-default-features --features rust-backend
+
+  backend-real-encoder:
+    name: Pinned MiniLM artifact and isolated text journey
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/tracedecay-cargo-target
+      TRACEDECAY_DATA_DIR: ${{ runner.temp }}/tracedecay-test-profile/.tracedecay
+      TRACEDECAY_NCM_REAL_MODEL_ROOT: ${{ runner.temp }}/ncm-real-model-root
+      RUSTC_WRAPPER: ""
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pinned Xenova MiniLM bytes
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ncm-real-model-root/models
+          key: ${{ runner.os }}-ncm-minilm-185ae63f47e17a7e8d30d0e6a3cde6a6e4b79bc5b81666ecffc279a6856ca113
+
+      - name: Run standalone backend acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/product/ncm/check-backend.py \
+            --repo . \
+            --model-root "$TRACEDECAY_NCM_REAL_MODEL_ROOT" \
+            --state-root "${RUNNER_TEMP}/ncm-isolated-journey" \
+            --install-model
+
+      - name: Upload backend receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncm-backend-receipt-${{ github.sha }}
+          path: product/ncm/receipts/backend/*.json
+          if-no-files-found: error
