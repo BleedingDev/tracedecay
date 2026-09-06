@@ -19,6 +19,11 @@
 //! conservatively, and retains responsibility for reattaching public identity
 //! and inert extensions to validated responses.
 
+#[cfg(feature = "rust-backend")]
+pub mod rust_backend;
+#[cfg(feature = "rust-backend")]
+pub use rust_backend::{RustNcmConfig, RustNcmError, RustNcmSurface, StateRoot, WorkerOptions};
+
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
@@ -480,7 +485,19 @@ impl NcmProviderAdapter {
         }
     }
 
+    /// Symmetric to `valid_surface_reply`: a snapshot travels inside the
+    /// SnapshotRestore request the way it travels inside the SnapshotExport
+    /// reply, so that one operation is measured against `snapshot_bytes`.
+    fn request_limit(operation: ProviderOperation, limits: ProviderLimits) -> u64 {
+        if operation == ProviderOperation::SnapshotRestore {
+            limits.snapshot_bytes
+        } else {
+            limits.request_bytes
+        }
+    }
+
     fn valid_request(call: &ProviderCall, limits: ProviderLimits) -> bool {
+        let request_limit = Self::request_limit(call.operation, limits);
         let extension_bytes = call.extensions.iter().fold(0_u64, |total, extension| {
             total.saturating_add(
                 u64::try_from(extension.canonical_payload.len()).unwrap_or(u64::MAX),
@@ -503,14 +520,14 @@ impl NcmProviderAdapter {
                 .iter()
                 .any(|capability| capability.as_str() == call.operation.capability_id())
             && Self::valid_sha256(&call.ready_receipt_sha256)
-            && Self::valid_payload(&call.payload, limits.request_bytes)
+            && Self::valid_payload(&call.payload, request_limit)
             && call.extensions.len() <= Self::maximum_extensions(call.operation)
             && (call.operation != ProviderOperation::Observe
                 || extension_bytes <= MAX_OBSERVATION_TOTAL_EXTENSION_BYTES)
             && u64::try_from(call.payload.bytes.len())
                 .unwrap_or(u64::MAX)
                 .saturating_add(extension_bytes)
-                <= limits.request_bytes
+                <= request_limit
             && call.extensions.iter().all(|extension| {
                 !extension.required
                     && extension.extension_version > 0
@@ -524,7 +541,7 @@ impl NcmProviderAdapter {
             // by an adapter-local copy of it: the fabric admits a call against
             // exactly this count, so a private encoder that drifts from it would
             // reject an admitted call as an unexplained invalid request.
-            && call.validate_request_bytes(limits.request_bytes).is_ok()
+            && call.validate_request_bytes(request_limit).is_ok()
     }
 
     fn success_terminal(code: TerminalCode) -> bool {
@@ -829,18 +846,23 @@ impl NcmProviderAdapter {
         reply: &ProviderReply,
         limits: ProviderLimits,
     ) -> bool {
+        let response_limit = if call.operation == ProviderOperation::SnapshotExport {
+            limits.snapshot_bytes
+        } else {
+            limits.response_bytes
+        };
         reply.terminal.operation() == call.operation
             && reply.terminal.provider_id().as_str() == NCM_PROVIDER_ID
             && reply.terminal.operation_id() == surface_call.operation_id
             && reply.terminal.exact_scope_sha256() == surface_call.namespace.as_str()
             && reply.terminal.fallback().eligibility() == FallbackEligibility::Forbidden
             && reply.warnings.len() <= MAX_WARNINGS
-            && encoded_response_bytes(call, reply) <= limits.response_bytes
+            && encoded_response_bytes(call, reply) <= response_limit
             && reply.state_generation >= call.expected_state_generation
             && reply.extensions.is_empty()
             && Self::surface_metadata_is_scope_safe(call, surface_call, reply)
             && reply.payload.as_ref().is_none_or(|payload| {
-                Self::valid_payload(payload, limits.response_bytes)
+                Self::valid_payload(payload, response_limit)
                     && payload.contract_id == surface_call.payload.contract_id
                     && serde_json::from_slice::<Value>(&payload.bytes).is_ok_and(|value| {
                         value.is_object()
@@ -1248,7 +1270,7 @@ impl MemoryProvider for NcmProviderAdapter {
             }
         };
         if encoded_surface_request_bytes(&surface_call, projected_control)
-            > readiness.effective_limits.request_bytes
+            > Self::request_limit(call.operation, readiness.effective_limits)
         {
             return Self::invoke_failure(
                 call,

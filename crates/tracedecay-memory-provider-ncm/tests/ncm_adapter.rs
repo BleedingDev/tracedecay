@@ -305,6 +305,7 @@ impl MockSurface {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn terminal(
         &self,
         operation_id: &str,
@@ -2455,4 +2456,67 @@ fn handshake_surface_contract_mismatch_is_fail_closed() {
     );
     assert!(response.descriptor.is_none());
     assert!(response.accepted_scope.is_none());
+}
+
+/// A syntactically empty JSON object padded with interior whitespace to the
+/// requested size, so a payload can cross a byte limit without changing shape.
+fn padded_object(padding: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(padding + 2);
+    bytes.push(b'{');
+    bytes.resize(padding + 1, b' ');
+    bytes.push(b'}');
+    bytes
+}
+
+#[test]
+fn snapshot_restore_request_is_measured_against_snapshot_bytes() {
+    // A restored snapshot travels inside the SnapshotRestore request, so that
+    // one operation is admitted against `snapshot_bytes`, mirroring how a
+    // SnapshotExport reply is admitted. Every other request keeps
+    // `request_bytes`, and a snapshot above `snapshot_bytes` still fails
+    // closed before dispatch.
+    let surface = Arc::new(MockSurface::new(
+        NCM_PROVIDER_ID,
+        &["snapshot.restore.v1"],
+        false,
+    ));
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+    let negotiated = limits();
+    let between = padded_object(20_000);
+    assert!(u64::try_from(between.len()).expect("len") > negotiated.request_bytes);
+    assert!(u64::try_from(between.len()).expect("len") < negotiated.snapshot_bytes);
+
+    let mut restore = ready_call(&provider, ProviderOperation::SnapshotRestore);
+    restore.payload = canonical_payload(ProviderOperation::SnapshotRestore, &between);
+    let reply = provider.invoke(&restore);
+    assert_eq!(
+        reply.terminal.terminal_code(),
+        TerminalCode::Success,
+        "restore within snapshot_bytes refused: {:?}",
+        reply.terminal.diagnostic_id()
+    );
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 1);
+
+    let mut observe = ready_call(&provider, ProviderOperation::Observe);
+    observe.payload = canonical_payload(ProviderOperation::Observe, &between);
+    let observe = admitted(observe);
+    let reply = provider.invoke(&observe);
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some("ncm.request_payload_or_extension_invalid")
+    );
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 1);
+
+    let above = padded_object(70_000);
+    assert!(u64::try_from(above.len()).expect("len") > negotiated.snapshot_bytes);
+    let mut oversized = ready_call(&provider, ProviderOperation::SnapshotRestore);
+    oversized.payload = canonical_payload(ProviderOperation::SnapshotRestore, &above);
+    let reply = provider.invoke(&oversized);
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some("ncm.request_payload_or_extension_invalid")
+    );
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 1);
 }

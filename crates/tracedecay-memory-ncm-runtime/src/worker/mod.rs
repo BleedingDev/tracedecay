@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -203,15 +204,38 @@ fn dispatch(engine: &NcmEngine, request: Request, options: ServeOptions) -> Engi
                 )
             })
         }
-        Operation::SnapshotExport => engine.snapshot_export(&request.namespace, deadline),
+        Operation::SnapshotExport => {
+            crate::snapshot::export_to_file(engine, &request.namespace, deadline)
+        }
         Operation::SnapshotRestore => parse_payload::<SnapshotRestorePayload>(&request.payload)
             .map_or_else(rejected, |payload| {
-                engine.snapshot_restore(
-                    &request.namespace,
-                    &payload.snapshot,
-                    &payload.idempotency_key,
-                    deadline,
-                )
+                match (
+                    payload.snapshot,
+                    payload.snapshot_file,
+                    payload.byte_length,
+                    payload.content_sha256,
+                ) {
+                    (Some(snapshot), None, None, None) => engine.snapshot_restore(
+                        &request.namespace,
+                        &snapshot,
+                        &payload.idempotency_key,
+                        deadline,
+                    ),
+                    (None, Some(snapshot_file), Some(byte_length), Some(content_sha256)) => {
+                        crate::snapshot::restore_from_file(
+                            engine,
+                            &request.namespace,
+                            &payload.idempotency_key,
+                            &snapshot_file,
+                            byte_length,
+                            &content_sha256,
+                            deadline,
+                        )
+                    }
+                    _ => rejected(
+                        "snapshot restore requires exactly one complete inline or file transport",
+                    ),
+                }
             }),
         Operation::Replay => engine.replay(&request.namespace, deadline),
     };
@@ -364,5 +388,12 @@ struct DeletePayload {
 #[derive(Deserialize)]
 struct SnapshotRestorePayload {
     idempotency_key: String,
-    snapshot: Vec<u8>,
+    #[serde(default)]
+    snapshot: Option<Vec<u8>>,
+    #[serde(default)]
+    snapshot_file: Option<PathBuf>,
+    #[serde(default)]
+    byte_length: Option<u64>,
+    #[serde(default)]
+    content_sha256: Option<String>,
 }

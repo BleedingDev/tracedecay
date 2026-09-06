@@ -406,6 +406,66 @@ fn engine_export_delegates_and_envelope_omits_revocation_authority() {
 }
 
 #[test]
+fn file_transport_exports_atomically_and_restore_consumes_the_file() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = engine(&tempdir);
+    observe(
+        &engine,
+        &namespace,
+        "source-file",
+        "file transport",
+        "snapshot value",
+        "file-observe",
+    );
+
+    let exported = snapshot::export_to_file(&engine, &namespace, DEADLINE);
+    assert_eq!(exported.outcome, Outcome::Success, "{exported:?}");
+    let metadata = exported.payload.as_object().expect("file metadata object");
+    let snapshot_file = metadata["snapshot_file"]
+        .as_str()
+        .map(std::path::PathBuf::from)
+        .expect("snapshot file path");
+    assert!(snapshot_file.is_absolute());
+    assert_eq!(
+        snapshot_file.parent(),
+        Some(
+            namespace_dir(&tempdir, &namespace)
+                .join("snapshots")
+                .as_path()
+        )
+    );
+    assert!(snapshot_file.is_file());
+    assert!(
+        fs::read_dir(snapshot_file.parent().expect("snapshot directory"))
+            .expect("read snapshot directory")
+            .all(|entry| !entry
+                .expect("snapshot entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")),
+        "atomic export must not leave a temporary file"
+    );
+
+    let restored = snapshot::restore_from_file(
+        &engine,
+        &namespace,
+        "file-restore",
+        &snapshot_file,
+        metadata["byte_length"].as_u64().expect("snapshot length"),
+        metadata["content_sha256"]
+            .as_str()
+            .expect("snapshot digest"),
+        DEADLINE,
+    );
+    assert_eq!(restored.outcome, Outcome::Success, "{restored:?}");
+    assert!(
+        !snapshot_file.exists(),
+        "restore must consume its transport file"
+    );
+}
+
+#[test]
 fn restore_refuses_a_durably_fenced_namespace() {
     let source_dir = TempDir::new().expect("source tempdir creates");
     let target_dir = TempDir::new().expect("target tempdir creates");

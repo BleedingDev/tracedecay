@@ -1,12 +1,15 @@
 //! Bounded single-owner client for the supervised NCM worker process.
 
-use crate::wire::{self, Reply, Request};
+use crate::wire::{self, Operation, Reply, Request};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -18,6 +21,8 @@ pub const MAX_QUEUED_REQUESTS: usize = 32;
 pub const MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
 /// Hard worker termination escalation budget after a deadline.
 pub const KILL_ESCALATION: Duration = Duration::from_millis(250);
+const MAX_SNAPSHOT_TRANSPORT_BYTES: usize = 256 * 1024 * 1024;
+static NEXT_SNAPSHOT_FILE: AtomicU64 = AtomicU64::new(1);
 
 /// Process launch and restart controls.
 #[derive(Clone, Debug)]
@@ -110,6 +115,7 @@ pub struct WorkerClient {
     owner: Mutex<Option<JoinHandle<()>>>,
     pid: Arc<AtomicU32>,
     reconciliation_deadline: Duration,
+    root: PathBuf,
 }
 
 impl WorkerClient {
@@ -159,6 +165,7 @@ impl WorkerClient {
             owner: Mutex::new(Some(owner)),
             pid,
             reconciliation_deadline: options.reconciliation_deadline,
+            root: root.as_ref().to_path_buf(),
         })
     }
 
@@ -166,12 +173,32 @@ impl WorkerClient {
     pub fn call(&self, mut request: Request, deadline: Duration) -> Result<Reply, ClientError> {
         let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
         request.deadline_ms = deadline_ms;
+        let logical_request = request.clone();
+        let mut restore_file = None;
         let frame_bytes = match wire::encode_request(&request) {
             Ok(frame) => frame.len(),
+            Err(wire::FrameError::Oversized { .. }) if request.op == Operation::SnapshotRestore => {
+                let path = self.externalize_snapshot_restore(&mut request)?;
+                restore_file = Some(path);
+                match wire::encode_request(&request) {
+                    Ok(frame) => frame.len(),
+                    Err(wire::FrameError::Oversized { .. }) => {
+                        remove_transport_file(restore_file.as_deref());
+                        return Err(ClientError::RequestTooLarge);
+                    }
+                    Err(error) => {
+                        remove_transport_file(restore_file.as_deref());
+                        return Err(ClientError::Transport(error.to_string()));
+                    }
+                }
+            }
             Err(wire::FrameError::Oversized { .. }) => return Err(ClientError::RequestTooLarge),
             Err(error) => return Err(ClientError::Transport(error.to_string())),
         };
-        self.reserve_bytes(frame_bytes)?;
+        if let Err(error) = self.reserve_bytes(frame_bytes) {
+            remove_transport_file(restore_file.as_deref());
+            return Err(error);
+        }
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         let expires = Instant::now()
             .checked_add(deadline)
@@ -186,22 +213,28 @@ impl WorkerClient {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.queued_bytes.fetch_sub(frame_bytes, Ordering::AcqRel);
+                remove_transport_file(restore_file.as_deref());
                 return Err(ClientError::Busy);
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.queued_bytes.fetch_sub(frame_bytes, Ordering::AcqRel);
+                remove_transport_file(restore_file.as_deref());
                 return Err(ClientError::OwnerStopped);
             }
         }
         let wait = deadline
             .saturating_add(KILL_ESCALATION)
             .saturating_add(Duration::from_millis(100));
-        let result = match response_rx.recv_timeout(wait) {
+        let mut result = match response_rx.recv_timeout(wait) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => Err(ClientError::Cancelled),
             Err(RecvTimeoutError::Disconnected) => Err(ClientError::OwnerStopped),
         };
-        self.update_unknown(&request, &result);
+        if let Ok(reply) = result {
+            result = self.hydrate_snapshot_export(&request, reply);
+        }
+        self.update_unknown(&logical_request, &result);
+        remove_transport_file(restore_file.as_deref());
         result
     }
 
@@ -224,6 +257,110 @@ impl WorkerClient {
             0 => None,
             pid => Some(pid),
         }
+    }
+
+    fn externalize_snapshot_restore(&self, request: &mut Request) -> Result<PathBuf, ClientError> {
+        let snapshot = request
+            .payload
+            .get("snapshot")
+            .cloned()
+            .ok_or(ClientError::RequestTooLarge)?;
+        let bytes: Vec<u8> = serde_json::from_value(snapshot)
+            .map_err(|error| ClientError::Transport(format!("snapshot payload: {error}")))?;
+        if bytes.is_empty() || bytes.len() > MAX_SNAPSHOT_TRANSPORT_BYTES {
+            return Err(ClientError::RequestTooLarge);
+        }
+        let directory =
+            snapshot_directory(&self.root, &request.namespace).map_err(ClientError::Transport)?;
+        fs::create_dir_all(&directory).map_err(|error| {
+            ClientError::Transport(format!("create snapshot directory: {error}"))
+        })?;
+        let serial = NEXT_SNAPSHOT_FILE.fetch_add(1, Ordering::Relaxed);
+        let file_name = format!(
+            "restore-{}-{}-{serial}.json",
+            std::process::id(),
+            request.id
+        );
+        let snapshot_file = directory.join(file_name);
+        let temporary_file = directory.join(format!(
+            ".restore-{}-{}-{serial}.tmp",
+            std::process::id(),
+            request.id
+        ));
+        atomic_write(&temporary_file, &snapshot_file, &bytes).map_err(ClientError::Transport)?;
+        let byte_length = u64::try_from(bytes.len()).map_err(|_| ClientError::RequestTooLarge)?;
+        let content_sha256 = sha256_hex(&bytes);
+        let object = request.payload.as_object_mut().ok_or_else(|| {
+            ClientError::Transport("snapshot restore payload must be an object".to_owned())
+        })?;
+        object.remove("snapshot");
+        object.insert(
+            "snapshot_file".to_owned(),
+            Value::String(snapshot_file.to_string_lossy().into_owned()),
+        );
+        object.insert("byte_length".to_owned(), Value::from(byte_length));
+        object.insert("content_sha256".to_owned(), Value::String(content_sha256));
+        Ok(snapshot_file)
+    }
+
+    fn hydrate_snapshot_export(
+        &self,
+        request: &Request,
+        mut reply: Reply,
+    ) -> Result<Reply, ClientError> {
+        if request.op != Operation::SnapshotExport
+            || !matches!(reply.outcome, crate::engine::Outcome::Success)
+        {
+            return Ok(reply);
+        }
+        let payload = reply.payload.as_ref().ok_or_else(|| {
+            ClientError::MalformedReply("snapshot export omitted file metadata".to_owned())
+        })?;
+        let snapshot_file = payload
+            .get("snapshot_file")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                ClientError::MalformedReply("snapshot export omitted snapshot_file".to_owned())
+            })?;
+        let byte_length = payload
+            .get("byte_length")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ClientError::MalformedReply("snapshot export omitted byte_length".to_owned())
+            })?;
+        let content_sha256 = payload
+            .get("content_sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ClientError::MalformedReply("snapshot export omitted content_sha256".to_owned())
+            })?;
+        let payload_generation = payload
+            .get("state_generation")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ClientError::MalformedReply("snapshot export omitted state_generation".to_owned())
+            })?;
+        if payload_generation != reply.state_generation {
+            return Err(ClientError::MalformedReply(
+                "snapshot export generation mismatch".to_owned(),
+            ));
+        }
+        let bytes = read_verified_snapshot_file(
+            &self.root,
+            &request.namespace,
+            &snapshot_file,
+            byte_length,
+            content_sha256,
+        )?;
+        reply.payload = Some(json!({
+            "format": "ncm-snapshot.v1",
+            "bytes": bytes,
+            "byte_length": byte_length,
+            "content_sha256": content_sha256,
+            "state_generation": reply.state_generation
+        }));
+        Ok(reply)
     }
 
     fn reserve_bytes(&self, bytes: usize) -> Result<(), ClientError> {
@@ -249,6 +386,134 @@ impl WorkerClient {
         } else if result.is_ok() {
             unknown.remove(key);
         }
+    }
+}
+
+fn snapshot_directory(root: &Path, namespace: &str) -> Result<PathBuf, String> {
+    if namespace.len() != 64
+        || !namespace
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err("snapshot namespace must be lowercase sha256 hex".to_owned());
+    }
+    Ok(root.join("namespaces").join(namespace).join("snapshots"))
+}
+
+fn atomic_write(temporary_file: &Path, destination: &Path, bytes: &[u8]) -> Result<(), String> {
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temporary_file)
+            .map_err(|error| format!("create snapshot transport file: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("write snapshot transport file: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("sync snapshot transport file: {error}"))?;
+        fs::rename(temporary_file, destination)
+            .map_err(|error| format!("publish snapshot transport file: {error}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary_file);
+    }
+    result
+}
+
+fn read_verified_snapshot_file(
+    root: &Path,
+    namespace: &str,
+    snapshot_file: &Path,
+    byte_length: u64,
+    content_sha256: &str,
+) -> Result<Vec<u8>, ClientError> {
+    if !snapshot_file.is_absolute() || !is_sha256_hex(content_sha256) {
+        return Err(ClientError::MalformedReply(
+            "invalid snapshot export file metadata".to_owned(),
+        ));
+    }
+    let expected_length = usize::try_from(byte_length)
+        .map_err(|_| ClientError::MalformedReply("snapshot export length overflow".to_owned()))?;
+    if expected_length == 0 || expected_length > MAX_SNAPSHOT_TRANSPORT_BYTES {
+        return Err(ClientError::MalformedReply(
+            "snapshot export length is outside the snapshot budget".to_owned(),
+        ));
+    }
+    let directory = snapshot_directory(root, namespace).map_err(ClientError::MalformedReply)?;
+    let canonical_directory = fs::canonicalize(&directory).map_err(|error| {
+        ClientError::MalformedReply(format!("open snapshot export directory: {error}"))
+    })?;
+    let canonical_file = fs::canonicalize(snapshot_file).map_err(|error| {
+        ClientError::MalformedReply(format!("open snapshot export file: {error}"))
+    })?;
+    if !canonical_file.starts_with(&canonical_directory)
+        || canonical_file.parent() != Some(canonical_directory.as_path())
+    {
+        return Err(ClientError::MalformedReply(
+            "snapshot export file escapes namespace directory".to_owned(),
+        ));
+    }
+    let _guard = SnapshotFileGuard {
+        path: canonical_file.clone(),
+    };
+    let file = File::open(&canonical_file).map_err(|error| {
+        ClientError::MalformedReply(format!("open snapshot export file: {error}"))
+    })?;
+    let actual_length = file
+        .metadata()
+        .map_err(|error| {
+            ClientError::MalformedReply(format!("inspect snapshot export file: {error}"))
+        })?
+        .len();
+    if actual_length != byte_length {
+        return Err(ClientError::MalformedReply(
+            "snapshot export byte length mismatch".to_owned(),
+        ));
+    }
+    let read_limit = byte_length.checked_add(1).ok_or_else(|| {
+        ClientError::MalformedReply("snapshot export read limit overflow".to_owned())
+    })?;
+    let mut bytes = Vec::with_capacity(expected_length);
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ClientError::MalformedReply(format!("read snapshot export file: {error}"))
+        })?;
+    if bytes.len() != expected_length || sha256_hex(&bytes) != content_sha256 {
+        return Err(ClientError::MalformedReply(
+            "snapshot export content verification failed".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn remove_transport_file(path: Option<&Path>) {
+    if let Some(path) = path {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+struct SnapshotFileGuard {
+    path: PathBuf,
+}
+
+impl Drop for SnapshotFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 

@@ -17,9 +17,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tracedecay_memory_ncm_core::centers::MemoryCenters;
 use tracedecay_memory_ncm_core::kernel::NcmKernel;
@@ -33,12 +34,14 @@ use tracedecay_memory_ncm_core::types::{
 const FORMAT: &str = "ncm-snapshot.v1";
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 const STAGING_PREFIX: &str = ".ncm-snapshot-staging";
+static NEXT_TRANSPORT_FILE: AtomicU64 = AtomicU64::new(1);
 
 /// Owned bytes in the `ncm-snapshot.v1` JSON envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotBytes {
     bytes: Vec<u8>,
     state_generation: u64,
+    state_epoch: u64,
 }
 
 impl SnapshotBytes {
@@ -52,6 +55,10 @@ impl SnapshotBytes {
     #[must_use]
     pub const fn state_generation(&self) -> u64 {
         self.state_generation
+    }
+
+    const fn state_epoch(&self) -> u64 {
+        self.state_epoch
     }
 
     /// Consumes the wrapper and returns the serialized envelope.
@@ -227,7 +234,183 @@ pub fn export(
     Ok(SnapshotBytes {
         bytes,
         state_generation: meta.commit_seq,
+        state_epoch: meta.epoch,
     })
+}
+
+/// Exports one snapshot through an atomically published namespace-local file.
+///
+/// The reply contains only bounded file metadata; the supervising client reads,
+/// verifies, deletes, and hydrates the snapshot bytes before returning upstream.
+#[must_use]
+pub fn export_to_file(engine: &NcmEngine, namespace: &str, deadline: Deadline) -> EngineReply {
+    let snapshot = match export(engine, namespace, deadline) {
+        Ok(snapshot) => snapshot,
+        Err(reply) => return reply,
+    };
+    let state_generation = snapshot.state_generation();
+    let state_epoch = snapshot.state_epoch();
+    let byte_length = match u64::try_from(snapshot.as_slice().len()) {
+        Ok(length) => length,
+        Err(_) => return unavailable_reply(state_generation, "snapshot length overflow"),
+    };
+    let content_sha256 = sha256_hex(snapshot.as_slice());
+    let directory = match transport_directory(&engine.root, namespace) {
+        Ok(directory) => directory,
+        Err(reason) => return rejected(&reason),
+    };
+    if let Err(error) = fs::create_dir_all(&directory) {
+        return unavailable_reply(
+            state_generation,
+            &format!("create snapshot transport directory: {error}"),
+        );
+    }
+    let serial = NEXT_TRANSPORT_FILE.fetch_add(1, Ordering::Relaxed);
+    let file_name = format!("{state_epoch}-{state_generation}-{serial}.ncm-snapshot.v1.json");
+    let snapshot_file = directory.join(file_name);
+    let temporary_file = directory.join(format!(
+        ".snapshot-{state_epoch}-{state_generation}-{serial}.tmp"
+    ));
+    if let Err(reason) = atomic_write(&temporary_file, &snapshot_file, snapshot.as_slice()) {
+        return unavailable_reply(state_generation, &reason);
+    }
+    EngineReply::new(
+        Outcome::Success,
+        state_generation,
+        json!({
+            "format": FORMAT,
+            "snapshot_file": snapshot_file,
+            "byte_length": byte_length,
+            "content_sha256": content_sha256,
+            "state_generation": state_generation
+        }),
+    )
+}
+
+/// Restores a snapshot from a verified namespace-local transport file.
+///
+/// An admitted file is deleted after the read attempt, including digest or
+/// length failures, so transport artifacts do not accumulate.
+#[must_use]
+pub fn restore_from_file(
+    engine: &NcmEngine,
+    namespace: &str,
+    idempotency_key: &str,
+    snapshot_file: &Path,
+    byte_length: u64,
+    content_sha256: &str,
+    deadline: Deadline,
+) -> EngineReply {
+    let bytes = match read_transport_file(
+        &engine.root,
+        namespace,
+        snapshot_file,
+        byte_length,
+        content_sha256,
+    ) {
+        Ok(bytes) => bytes,
+        Err(reason) => return rejected(&reason),
+    };
+    restore(
+        engine,
+        namespace,
+        RestoreRequest {
+            idempotency_key: idempotency_key.to_owned(),
+            bytes,
+        },
+        deadline,
+    )
+}
+
+fn transport_directory(root: &StateRoot, namespace: &str) -> Result<PathBuf, String> {
+    root.namespace_dir(namespace)
+        .map(|path| path.join("snapshots"))
+}
+
+fn atomic_write(temporary_file: &Path, destination: &Path, bytes: &[u8]) -> Result<(), String> {
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temporary_file)
+            .map_err(|error| format!("create snapshot transport file: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("write snapshot transport file: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("sync snapshot transport file: {error}"))?;
+        fs::rename(temporary_file, destination)
+            .map_err(|error| format!("publish snapshot transport file: {error}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary_file);
+    }
+    result
+}
+
+fn read_transport_file(
+    root: &StateRoot,
+    namespace: &str,
+    snapshot_file: &Path,
+    byte_length: u64,
+    content_sha256: &str,
+) -> Result<Vec<u8>, String> {
+    if !snapshot_file.is_absolute() {
+        return Err("snapshot transport file must be absolute".to_owned());
+    }
+    if !is_sha256_hex(content_sha256) {
+        return Err("snapshot transport digest must be lowercase sha256 hex".to_owned());
+    }
+    let expected_length = usize::try_from(byte_length)
+        .map_err(|_| "snapshot transport length overflow".to_owned())?;
+    if expected_length == 0 || expected_length > MAX_SNAPSHOT_BYTES {
+        return Err("snapshot transport length is outside the snapshot budget".to_owned());
+    }
+    let directory = transport_directory(root, namespace)?;
+    let canonical_directory = fs::canonicalize(&directory)
+        .map_err(|error| format!("open snapshot transport directory: {error}"))?;
+    let canonical_file = fs::canonicalize(snapshot_file)
+        .map_err(|error| format!("open snapshot transport file: {error}"))?;
+    if !canonical_file.starts_with(&canonical_directory)
+        || canonical_file.parent() != Some(canonical_directory.as_path())
+    {
+        return Err("snapshot transport file escapes the namespace snapshot directory".to_owned());
+    }
+    let _guard = TransportFileGuard {
+        path: canonical_file.clone(),
+    };
+    let file = File::open(&canonical_file)
+        .map_err(|error| format!("open snapshot transport file: {error}"))?;
+    let actual_length = file
+        .metadata()
+        .map_err(|error| format!("inspect snapshot transport file: {error}"))?
+        .len();
+    if actual_length != byte_length {
+        return Err("snapshot transport byte length mismatch".to_owned());
+    }
+    let read_limit = byte_length
+        .checked_add(1)
+        .ok_or_else(|| "snapshot transport read limit overflow".to_owned())?;
+    let mut bytes = Vec::with_capacity(expected_length);
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read snapshot transport file: {error}"))?;
+    if bytes.len() != expected_length {
+        return Err("snapshot transport byte length changed during read".to_owned());
+    }
+    if sha256_hex(&bytes) != content_sha256 {
+        return Err("snapshot transport content digest mismatch".to_owned());
+    }
+    Ok(bytes)
+}
+
+struct TransportFileGuard {
+    path: PathBuf,
+}
+
+impl Drop for TransportFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 /// Restores through a staging store, applying destination-authoritative revocations.

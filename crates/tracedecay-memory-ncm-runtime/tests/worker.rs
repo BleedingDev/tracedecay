@@ -2,6 +2,7 @@
 #![doc = "Process-level acceptance tests for the bounded NCM worker transport."]
 
 use serde_json::{Value, json};
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -14,7 +15,7 @@ use tracedecay_memory_ncm_runtime::client::{ClientError, WorkerClient, WorkerOpt
 use tracedecay_memory_ncm_runtime::engine::{ObserveRequest, Outcome};
 use tracedecay_memory_ncm_runtime::ports::Deadline;
 use tracedecay_memory_ncm_runtime::wire::{
-    self, MAX_REQUEST_BYTES, Operation, PROTOCOL_VERSION, Reply, Request,
+    self, MAX_REPLY_BYTES, MAX_REQUEST_BYTES, Operation, PROTOCOL_VERSION, Reply, Request,
 };
 
 const BINARY: &str = env!("CARGO_BIN_EXE_tracedecay-ncm-worker");
@@ -158,6 +159,82 @@ fn handshake_observe_and_recall_round_trip() {
         .expect("recall succeeds");
     assert_eq!(recall.outcome, Outcome::Success);
     assert!(recall.payload.is_some());
+}
+
+#[test]
+fn snapshot_file_transport_crosses_bounded_frames_and_cleans_files() {
+    let root = TempDir::new().expect("temp root");
+    let source_client = client(&root);
+    let ns = namespace(12);
+    let observe = source_client
+        .call(
+            Request::new(
+                1,
+                0,
+                Operation::Observe,
+                &ns,
+                observe_payload("snapshot-file", "large snapshot", "transport value"),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("observe succeeds");
+    assert_eq!(observe.outcome, Outcome::Success);
+
+    let exported = source_client
+        .call(
+            Request::new(2, 0, Operation::SnapshotExport, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("snapshot export succeeds through file transport");
+    assert_eq!(exported.outcome, Outcome::Success);
+    let payload = exported.payload.expect("hydrated snapshot payload");
+    assert!(payload.get("snapshot_file").is_none());
+    let snapshot = payload["bytes"]
+        .as_array()
+        .expect("snapshot byte array")
+        .clone();
+    assert!(
+        snapshot.len() > MAX_REPLY_BYTES,
+        "negative control: direct JSON bytes cannot fit the 1 MiB reply frame"
+    );
+
+    let target_root = TempDir::new().expect("target temp root");
+    let target = client(&target_root);
+    let restored = target
+        .call(
+            Request::new(
+                3,
+                0,
+                Operation::SnapshotRestore,
+                &ns,
+                json!({"idempotency_key": "snapshot-file-restore", "snapshot": snapshot}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("snapshot restore succeeds through file transport");
+    assert_eq!(restored.outcome, Outcome::Success, "{restored:?}");
+    let snapshot_dir = target_root
+        .path()
+        .join("namespaces")
+        .join(&ns)
+        .join("snapshots");
+    let remaining = fs::read_dir(snapshot_dir)
+        .expect("read snapshot transport directory")
+        .count();
+    assert_eq!(remaining, 0, "transport files must be consumed");
+    let recall = target
+        .call(
+            Request::new(
+                4,
+                0,
+                Operation::Recall,
+                &ns,
+                json!({"query_text": "large snapshot", "top_k": 4}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("restored namespace recalls");
+    assert_eq!(recall.outcome, Outcome::Success);
 }
 
 #[test]
