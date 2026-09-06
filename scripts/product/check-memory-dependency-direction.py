@@ -594,7 +594,7 @@ def check_source_contracts(
                 for path, line in extract_crate_paths(source, root):
                     if path not in allowed_set:
                         errors.append(
-                            f"forbidden source import in {package_name}:"
+                            f"[source-import-not-allowed] forbidden source import in {package_name}:"
                             f" {relative}:{line} names {path}, which is outside the"
                             " exact reviewed import allowlist"
                         )
@@ -605,7 +605,7 @@ def check_source_contracts(
                         seen_sites[path].add(site)
                         if site not in call_sites[path]:
                             errors.append(
-                                f"unreviewed executor call site in {package_name}:"
+                                f"[executor-site-not-reviewed] unreviewed executor call site in {package_name}:"
                                 f" {path} at {relative}:{line} is in {site}, which is"
                                 " not a pinned call site"
                             )
@@ -851,7 +851,7 @@ def check_policy(
             unreviewed = sorted(set(entry["features"]) - permitted)
             if unreviewed:
                 errors.append(
-                    f"unreviewed dependency feature: {package_name} -> "
+                    f"[dependency-feature-not-allowed] unreviewed dependency feature: {package_name} -> "
                     f"{entry['name']} enables {', '.join(unreviewed)}"
                 )
             if entry["name"] in default_features_off and entry["uses_default_features"]:

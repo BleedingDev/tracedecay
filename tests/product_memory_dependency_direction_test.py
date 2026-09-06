@@ -145,17 +145,22 @@ def registry_package() -> dict[str, Any]:
             dependency("getrandom"),
             dependency("hex"),
             dependency("serde", features=["derive"]),
-            dependency("serde_json"),
+            dependency("serde_json", features=["raw_value"]),
             dependency("sha2"),
             dependency("thiserror"),
             dependency("tiktoken-rs"),
-            dependency("tokio", features=["rt"], uses_default_features=False),
+            dependency(
+                "tokio", features=["macros", "rt", "sync", "time"], uses_default_features=False
+            ),
             dependency(APPLICATION, features=[], uses_default_features=False),
             dependency("tracedecay-memory-fabric"),
             dependency("tracedecay-memory-provider-api"),
             dependency("tracedecay-memory-provider-native"),
-            dependency("tokio", kind="dev", features=["macros", "rt"]),
+            dependency(
+                "tokio", kind="dev", features=["macros", "rt", "rt-multi-thread", "sync", "time"]
+            ),
             dependency("tracedecay-domain", kind="dev"),
+            dependency("tracedecay-memory-conformance", kind="dev"),
         ],
     )
 
@@ -195,7 +200,7 @@ def valid_metadata() -> dict[str, Any]:
             package("tracedecay-memory-provider-api", ["sha2"]),
             package(
                 "tracedecay-memory-fabric",
-                ["tracedecay-memory-provider-api"],
+                ["tracing", "tracedecay-memory-provider-api"],
             ),
             package(
                 "tracedecay-memory-provider-native",
@@ -391,6 +396,22 @@ class MemoryDependencyDirectionTest(unittest.TestCase):
             errors,
         )
 
+    def test_reviewed_registry_features_pass(self) -> None:
+        """Exercise every reviewed feature, not just a minimal feature subset."""
+        registry_contract = next(
+            contract for contract in self.policy["package_contracts"]
+            if contract["package"] == REGISTRY
+        )
+        metadata = valid_metadata()
+        for entry in find(metadata, REGISTRY)["dependencies"]:
+            if entry.get("kind") is None:
+                self.assertEqual(
+                    set(entry.get("features", [])),
+                    set(registry_contract["allowed_dependency_features"][entry["name"]]),
+                    entry["name"],
+                )
+        self.assertEqual(CHECKER.check_policy(REPO, self.policy, metadata), [])
+
     def test_dependency_features_are_an_exact_allowlist_not_a_denylist(self) -> None:
         """An unlisted feature is refused even when nobody predicted its name.
 
@@ -410,7 +431,7 @@ class MemoryDependencyDirectionTest(unittest.TestCase):
             ("tokio", "signal"),
             ("tokio", "rt-multi-thread"),
             ("tokio", "full"),
-            ("tokio", "time"),
+            ("tokio", "io-util"),
             ("getrandom", "js"),
             ("serde_json", "arbitrary_precision"),
         )
@@ -423,8 +444,8 @@ class MemoryDependencyDirectionTest(unittest.TestCase):
                 errors = CHECKER.check_policy(REPO, self.policy, metadata)
                 self.assertTrue(
                     any(
-                        f"unreviewed dependency feature: {REGISTRY} -> {name} enables"
-                        f" {feature}" in error
+                        error.startswith("[dependency-feature-not-allowed]")
+                        and f"{REGISTRY} -> {name} enables {feature}" in error
                         for error in errors
                     ),
                     errors,
@@ -579,8 +600,18 @@ class MemoryDependencyDirectionTest(unittest.TestCase):
             errors,
         )
 
+    def test_blocking_offload_import_is_refused(self) -> None:
+        errors = self.check_with_source(
+            self.append_source(
+                "fn dormant_offload() { let _ = tokio::task::spawn_blocking(|| ()); }"
+            )
+        )
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(errors[0].startswith("[source-import-not-allowed]"), errors)
+        self.assertIn("tokio::task::spawn_blocking", errors[0])
+
     def test_new_executor_call_site_is_refused_anywhere_in_the_crate(self) -> None:
-        """No new task-spawning or blocking-offload site may appear unreviewed.
+        """An allowed executor import still needs a reviewed call site.
 
         This is the dormancy bound the gate can actually enforce: a spawn added
         on any path -- including one reachable while the composition is
@@ -589,15 +620,16 @@ class MemoryDependencyDirectionTest(unittest.TestCase):
         """
         for snippet in (
             "fn dormant_background_sweeper() { let _ = tokio::spawn(async {}); }",
-            "fn dormant_offload() { let _ = tokio::task::spawn_blocking(|| ()); }",
             "impl Anything { fn poll_forever(&self) { let _ = tokio::spawn(async {}); } }",
         ):
             with self.subTest(snippet=snippet):
                 errors = self.check_with_source(self.append_source(snippet))
+                self.assertEqual(len(errors), 1, errors)
                 self.assertTrue(
-                    any("unreviewed executor call site" in error for error in errors),
-                    f"{snippet} was admitted: {errors}",
+                    errors[0].startswith("[executor-site-not-reviewed]"),
+                    f"expected executor-site rejection for {snippet}: {errors}",
                 )
+                self.assertIn("tokio::spawn", errors[0])
 
     def test_executor_item_must_be_pinned_to_call_sites(self) -> None:
         policy = copy.deepcopy(self.policy)
