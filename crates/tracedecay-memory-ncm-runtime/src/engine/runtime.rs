@@ -259,7 +259,17 @@ impl NcmEngine {
 
     /// Task 016 extension point; snapshot export is deliberately unsupported here.
     pub fn snapshot_export(&self, _namespace: &str, _deadline: Deadline) -> EngineReply {
-        EngineReply::new(Outcome::Unsupported, 0, Value::Null)
+        match crate::snapshot::export(self, _namespace, _deadline) {
+            Ok(snapshot) => {
+                let state_generation = snapshot.state_generation();
+                EngineReply::new(
+                    Outcome::Success,
+                    state_generation,
+                    json!({"format": "ncm-snapshot.v1", "bytes": snapshot.into_vec()}),
+                )
+            }
+            Err(reply) => reply,
+        }
     }
 
     /// Task 016 extension point; snapshot restore is deliberately unsupported here.
@@ -270,7 +280,15 @@ impl NcmEngine {
         _idempotency_key: &str,
         _deadline: Deadline,
     ) -> EngineReply {
-        EngineReply::new(Outcome::Unsupported, 0, Value::Null)
+        crate::snapshot::restore(
+            self,
+            _namespace,
+            crate::snapshot::RestoreRequest {
+                idempotency_key: _idempotency_key.to_owned(),
+                bytes: _snapshot.to_vec(),
+            },
+            _deadline,
+        )
     }
 
     /// Contract v1 extension point; provider replay remains unsupported.
