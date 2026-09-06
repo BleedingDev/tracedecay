@@ -1,0 +1,2081 @@
+{
+  "ablations": {
+    "consolidation": {
+      "invoked": true,
+      "measured_delta": "LTM-only retention changed from empty to successful recall",
+      "off": {
+        "ltm_active": 0,
+        "recall": "empty"
+      },
+      "on": {
+        "ltm_active": 1,
+        "recall": "success"
+      }
+    },
+    "corrected_blur": {
+      "conclusion": "spatial kernel corrected; no measured text-recall benefit because D03 disables terrain reads",
+      "corrected_neighbor": 0.0070256805047392845,
+      "feature_invoked": true,
+      "reference_noop_neighbor": 0.0,
+      "rust_ltm_terrain_digest_changed": true,
+      "task_recall_delta": 0
+    },
+    "terrain_read_contribution": {
+      "conclusion": "no measured benefit in text recall; terrain writes occur but are not read",
+      "measured_recall_delta": 0,
+      "read_influence": "none (D03)",
+      "stm_terrain_peak_after_observe": 0.04206909,
+      "write_path_invoked": true
+    }
+  },
+  "acceptance": {
+    "corrupt_rejected_with_reason": true,
+    "cross_scope_rejected_with_reason": true,
+    "deleted_rejected_with_reason": true,
+    "four_result_blocks_separate": true,
+    "improved_agent_outcomes_claimed": false,
+    "real_encoder_ltm_only_without_fallback": true,
+    "stale_rejected_with_reason": true
+  },
+  "algorithm_corrections": {
+    "D01": {
+      "classification": "expected_difference",
+      "component": "terrain.blur",
+      "not_a_fidelity_failure": true,
+      "status": "corrected"
+    },
+    "D02": {
+      "classification": "reference_compatible",
+      "component": "centers.write sigma",
+      "not_a_fidelity_failure": true,
+      "status": "reference_compatible_documented"
+    },
+    "D03": {
+      "classification": "reference_compatible",
+      "component": "text recall terrain",
+      "not_a_fidelity_failure": true,
+      "status": "reference_compatible_documented"
+    },
+    "D04": {
+      "classification": "expected_difference",
+      "component": "recall dedup",
+      "not_a_fidelity_failure": true,
+      "status": "corrected"
+    },
+    "D05": {
+      "classification": "expected_difference",
+      "component": "read side effects",
+      "not_a_fidelity_failure": true,
+      "status": "corrected"
+    },
+    "D06": {
+      "classification": "expected_difference",
+      "component": "load failure",
+      "not_a_fidelity_failure": true,
+      "status": "corrected"
+    },
+    "D07": {
+      "classification": "expected_difference",
+      "component": "scheduler persistence",
+      "not_a_fidelity_failure": true,
+      "status": "corrected"
+    },
+    "D08": {
+      "classification": "expected_difference",
+      "component": "STM\u2192LTM key alignment",
+      "not_a_fidelity_failure": true,
+      "status": "corrected_pending_alignment_measurement"
+    },
+    "D09": {
+      "classification": "expected_difference",
+      "component": "terrain axis order",
+      "not_a_fidelity_failure": true,
+      "status": "corrected_confirmed_by_executable_oracle"
+    },
+    "D10": {
+      "classification": "expected_difference",
+      "component": "tick schedule",
+      "not_a_fidelity_failure": true,
+      "status": "corrected_schedule_frozen"
+    },
+    "D11": {
+      "classification": "reference_compatible",
+      "component": "namespace",
+      "not_a_fidelity_failure": true,
+      "status": "reference_compatible"
+    },
+    "D12": {
+      "classification": "expected_difference",
+      "component": "centers.merge tensor aliasing",
+      "not_a_fidelity_failure": true,
+      "status": "corrected"
+    },
+    "D13": {
+      "classification": "expected_difference",
+      "component": "top-k tie order",
+      "not_a_fidelity_failure": true,
+      "status": "corrected_tie_policy"
+    }
+  },
+  "corpus_sha256": "2126a57514e09b8f525c41260d3b25a944bcb10f543a070c3046052f921f55bc",
+  "kernel_fidelity": {
+    "full_capacity_interference": {
+      "attempts": 417,
+      "biomem_active_after_matched_inputs": 416,
+      "fill_terminal": "budget_exceeded",
+      "overflow_outcome": "not_run",
+      "passed": false,
+      "stm_active": 416,
+      "stm_active_after": 416,
+      "visible_failure": "storage budget prevented reaching configured STM capacity"
+    },
+    "paraphrase_recall": {
+      "biomem_top_value": "A successful reply is emitted only after COMMIT; transport loss may be effect-unknown.",
+      "passed": true,
+      "rust_top_record": 1
+    },
+    "passed": false,
+    "real_text_store_recall": {
+      "biomem_top_value": "A successful reply is emitted only after COMMIT; transport loss may be effect-unknown.",
+      "passed": true,
+      "projected_stm_key": {
+        "atol": 0.0005,
+        "max_abs_error": 1.0090693664532857e-06,
+        "passed": true,
+        "rtol": 0.0005
+      },
+      "projection_seed": 16679234583690838207,
+      "raw_activation": {
+        "abs_error": 1.0810977911501762e-07,
+        "biomem_matched_kernel": 0.11754616730100607,
+        "rust": 0.11754605919122696,
+        "tolerance": 0.005
+      },
+      "rust_record_id": 1,
+      "rust_top_value": "A successful reply is emitted only after COMMIT; transport loss may be effect-unknown."
+    }
+  },
+  "latency": {
+    "budgets_ms": {
+      "observe_p95": 500,
+      "recall_p95": 250
+    },
+    "observe_ms": {
+      "count": 421,
+      "max": 660.6778749992372,
+      "p50": 53.510209001615294,
+      "p95": 58.86941599965212
+    },
+    "recall_ms": {
+      "count": 4,
+      "max": 5696.492916002171,
+      "p50": 3.492292000373709,
+      "p95": 5696.492916002171
+    }
+  },
+  "limitations": [
+    "Observer-mode retrieval and admission only; no decoder or agent outcome was measured.",
+    "Python Biomem has no native exact-scope namespace bridge, supersession lineage, or source-revocation authority; wrapper-emulated behavior is labeled.",
+    "Estimated tokens use ceil(UTF-8 bytes/4), not the production o200k_base estimator.",
+    "Projection comparison injects persisted Rust matrices because torch RNG byte parity is outside the frozen contract."
+  ],
+  "metric_catalog_safety_ceilings": {
+    "corrupt_state_recall": 0.0,
+    "deleted_source_recall": 0.0,
+    "harmful_stale_recall_rate": 0.0,
+    "scope_leakage": 0.0
+  },
+  "metrics_sha256": "ea6afc33f71f26d2b4eb21d200bcf783f63f76813c5613b176addc780eec255a",
+  "negative_controls": [
+    {
+      "caught_by": "LTM-only ltm_active>0 and recall layer Ltm assertions",
+      "mutation": "omit consolidation"
+    },
+    {
+      "caught_by": "asymmetric impulse neighbor must be >0",
+      "mutation": "replace corrected blur with identity"
+    },
+    {
+      "caught_by": "superseded record excluded from admitted list",
+      "mutation": "admit superseded content"
+    },
+    {
+      "caught_by": "handshake encoder model must equal paraphrase-multilingual-MiniLM-L12-v2",
+      "mutation": "substitute HashEncoder"
+    },
+    {
+      "caught_by": "scope_leakage ceiling 0",
+      "mutation": "admit cross-scope candidate"
+    },
+    {
+      "caught_by": "deleted_source_recall ceiling 0",
+      "mutation": "admit deleted candidate"
+    },
+    {
+      "caught_by": "indeterminate safety gate for no-memory lane",
+      "mutation": "treat empty evidence as safety pass"
+    }
+  ],
+  "pending_baselines": [
+    {
+      "lane_id": "native_provider",
+      "reason": "joined host baseline not run in ncm-rs-021",
+      "status": "pending"
+    },
+    {
+      "lane_id": "tracedecay_joined_host",
+      "reason": "active-mode integration belongs to ncm-rs-025",
+      "status": "pending"
+    }
+  ],
+  "protocol_sha256": "1bf9cd0ed208ed35907d7c0ca6a6aafb5537cbac0beb867168d6a6e40135ee94",
+  "provider_behavior": {
+    "coding_memory_lanes": [
+      {
+        "aggregate_task_score": 0.8888888888888888,
+        "estimated_context_tokens": 896,
+        "indeterminate_scenarios": 0,
+        "lane_id": "rust_ncm",
+        "latency": {
+          "observe_ms": {
+            "count": 16,
+            "max": 1163.1749580010364,
+            "p50": 50.69954200007487,
+            "p95": 1163.1749580010364
+          },
+          "recall_ms": {
+            "count": 11,
+            "max": 737.1181249982328,
+            "p50": 3.6720419993798714,
+            "p95": 737.1181249982328
+          }
+        },
+        "minimum_relevance_met": true,
+        "resolved_scenarios": 9,
+        "safety_gate": "pass",
+        "scenarios": [
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 1,
+            "admitted_record_ids": [
+              2
+            ],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "advance_code"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "correction",
+                "reply": {
+                  "id": 3,
+                  "outcome": "success",
+                  "payload": {
+                    "replayed": false,
+                    "superseded": 1,
+                    "superseding": 2
+                  },
+                  "state_generation": 3
+                }
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [
+              {
+                "reason": "superseded",
+                "record_id": 1
+              }
+            ],
+            "returned_candidates": 2,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "stale_project_change",
+            "split": "development",
+            "task_outcome": "pass",
+            "terminal_outcomes": [
+              "success"
+            ],
+            "useful_recall_precision": 1.0
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 3,
+            "admitted_record_ids": [
+              3,
+              4,
+              5
+            ],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "advance_code"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 3,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "failed_approach",
+            "split": "development",
+            "task_outcome": "pass",
+            "terminal_outcomes": [
+              "success"
+            ],
+            "useful_recall_precision": 1.0
+          },
+          {
+            "adjudication_reason": "host-authorized cross-session replay/share is deferred to ncm-rs-024",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "open_new_agent_session"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "cross_agent_reuse",
+            "split": "held_out",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "empty"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 1,
+            "admitted_record_ids": [
+              1
+            ],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 1,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "project_worktree_scope",
+            "split": "held_out",
+            "task_outcome": "pass",
+            "terminal_outcomes": [
+              "success",
+              "scope_mismatch"
+            ],
+            "useful_recall_precision": 1.0
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 6,
+            "admitted_record_ids": [
+              9,
+              10,
+              3,
+              4,
+              5,
+              2
+            ],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "advance_code"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [
+              {
+                "reason": "superseded",
+                "record_id": 1
+              }
+            ],
+            "returned_candidates": 7,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "contradiction",
+            "split": "held_out",
+            "task_outcome": "pass",
+            "terminal_outcomes": [
+              "success"
+            ],
+            "useful_recall_precision": 1.0
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 3,
+            "admitted_record_ids": [
+              11,
+              6,
+              10
+            ],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "restart_provider",
+                "outcome": "restarted"
+              },
+              {
+                "action": "replay",
+                "reply": {
+                  "id": 20,
+                  "outcome": "success",
+                  "payload": {
+                    "consolidated": false,
+                    "created_or_reinforced": "created",
+                    "record_id": 11,
+                    "replayed": true,
+                    "tick": 11
+                  },
+                  "state_generation": 12
+                }
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 3,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "restart",
+            "split": "development",
+            "task_outcome": "pass",
+            "terminal_outcomes": [
+              "success"
+            ],
+            "useful_recall_precision": 1.0
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "begin_observation_batch"
+              },
+              {
+                "action": "commit_item",
+                "committed_items": 1
+              },
+              {
+                "action": "cancel",
+                "committed_items": 1,
+                "remaining_items": 2,
+                "terminal": "cancelled"
+              },
+              {
+                "action": "resume"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "cancellation",
+            "split": "development",
+            "task_outcome": "pass",
+            "terminal_outcomes": [],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "load_provider_state",
+                "visible": true
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "provider_corruption",
+            "split": "held_out",
+            "task_outcome": "pass",
+            "terminal_outcomes": [
+              "success",
+              "corrupt"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "delete_by_source",
+                "reply": {
+                  "id": 29,
+                  "outcome": "success",
+                  "payload": {
+                    "deleted_records": 1,
+                    "epoch": 2,
+                    "replayed": false,
+                    "sanitized_replay": {
+                      "digest": [
+                        214,
+                        101,
+                        94,
+                        187,
+                        97,
+                        115,
+                        124,
+                        55,
+                        87,
+                        14,
+                        23,
+                        215,
+                        48,
+                        8,
+                        118,
+                        141,
+                        61,
+                        221,
+                        150,
+                        249,
+                        10,
+                        59,
+                        140,
+                        224,
+                        242,
+                        83,
+                        11,
+                        34,
+                        26,
+                        231,
+                        111,
+                        166
+                      ],
+                      "excluded_records": 1,
+                      "replayed_records": 0,
+                      "tick_after": 0,
+                      "tick_before": 1
+                    },
+                    "source": "source_session_privacy_note_001"
+                  },
+                  "state_generation": 3
+                }
+              },
+              {
+                "action": "restart_provider",
+                "outcome": "restarted"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [
+              {
+                "reason": "deleted_source",
+                "record_id": 1
+              },
+              {
+                "reason": "deleted_source",
+                "source": "source_session_privacy_note_001"
+              }
+            ],
+            "returned_candidates": 1,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "privacy_deletion",
+            "split": "held_out",
+            "task_outcome": "pass",
+            "terminal_outcomes": [
+              "success",
+              "empty",
+              "empty"
+            ],
+            "useful_recall_precision": null
+          }
+        ],
+        "useful_recall_precision": 1.0,
+        "verdict": "fail"
+      },
+      {
+        "aggregate_task_score": 0.5555555555555556,
+        "estimated_context_tokens": 896,
+        "indeterminate_scenarios": 0,
+        "lane_id": "python_biomem",
+        "latency": {
+          "observe_ms": {
+            "count": 15,
+            "max": 3510.8477079993463,
+            "p50": 12.201000001368811,
+            "p95": 3510.8477079993463
+          },
+          "recall_ms": {
+            "count": 10,
+            "max": 5.510415998287499,
+            "p50": 4.823374998522922,
+            "p95": 5.510415998287499
+          }
+        },
+        "minimum_relevance_met": true,
+        "resolved_scenarios": 9,
+        "safety_gate": "fail",
+        "scenarios": [
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 1,
+            "admitted_record_ids": [
+              "obs_stale_001"
+            ],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "advance_code"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "correction",
+                "reply": {
+                  "outcome": "unsupported",
+                  "visible_lineage": false
+                }
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 1,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "indeterminate",
+            "scenario_id": "stale_project_change",
+            "split": "development",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success"
+            ],
+            "useful_recall_precision": 1.0
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 2,
+            "admitted_record_ids": [
+              "obs_failed_001",
+              "obs_stale_001"
+            ],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "advance_code"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 2,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "failed_approach",
+            "split": "development",
+            "task_outcome": "pass",
+            "terminal_outcomes": [
+              "success"
+            ],
+            "useful_recall_precision": 1.0
+          },
+          {
+            "adjudication_reason": "host-authorized cross-session replay/share is deferred to ncm-rs-024",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "open_new_agent_session"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "cross_agent_reuse",
+            "split": "held_out",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "empty"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 1,
+            "admitted_record_ids": [
+              "obs_scope_002"
+            ],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 1,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "project_worktree_scope",
+            "split": "held_out",
+            "task_outcome": "pass",
+            "terminal_outcomes": [
+              "success",
+              "scope_mismatch"
+            ],
+            "useful_recall_precision": 1.0
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 5,
+            "admitted_record_ids": [
+              "obs_contradiction_001",
+              "obs_failed_001",
+              "obs_stale_001",
+              "obs_cross_agent_002",
+              "obs_scope_001"
+            ],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "advance_code"
+              },
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 5,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "contradiction",
+            "split": "held_out",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success"
+            ],
+            "useful_recall_precision": 1.0
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 5,
+            "admitted_record_ids": [
+              "obs_restart_001",
+              "obs_scope_001",
+              "obs_cross_agent_001",
+              "obs_cross_agent_002",
+              "obs_stale_001"
+            ],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "restart_provider",
+                "outcome": "restarted"
+              },
+              {
+                "action": "replay",
+                "reply": {
+                  "outcome": "success",
+                  "replayed": true
+                }
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 5,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "restart",
+            "split": "development",
+            "task_outcome": "pass",
+            "terminal_outcomes": [
+              "success"
+            ],
+            "useful_recall_precision": 1.0
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "begin_observation_batch"
+              },
+              {
+                "action": "commit_item",
+                "committed_items": 1
+              },
+              {
+                "action": "cancel",
+                "committed_items": 1,
+                "remaining_items": 2,
+                "terminal": "cancelled"
+              },
+              {
+                "action": "resume"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "cancellation",
+            "split": "development",
+            "task_outcome": "pass",
+            "terminal_outcomes": [],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "load_provider_state",
+                "visible": false
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "indeterminate",
+            "scenario_id": "provider_corruption",
+            "split": "held_out",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success",
+              "empty"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "Biomem deletion was emulated by key scrub; no native source revocation authority",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "success"
+              },
+              {
+                "action": "delete_by_source",
+                "reply": {
+                  "capability": "emulated_key_scrub_not_native_source_revocation",
+                  "deleted": 1,
+                  "outcome": "success"
+                }
+              },
+              {
+                "action": "restart_provider",
+                "outcome": "restarted"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [
+              {
+                "reason": "deleted_source",
+                "record_id": "obs_privacy_001"
+              },
+              {
+                "reason": "deleted_source",
+                "source": "source_session_privacy_note_001"
+              }
+            ],
+            "returned_candidates": 1,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "indeterminate",
+            "scenario_id": "privacy_deletion",
+            "split": "held_out",
+            "task_outcome": "pass",
+            "terminal_outcomes": [
+              "success",
+              "empty",
+              "empty"
+            ],
+            "useful_recall_precision": null
+          }
+        ],
+        "useful_recall_precision": 1.0,
+        "verdict": "fail"
+      },
+      {
+        "aggregate_task_score": 0.2222222222222222,
+        "estimated_context_tokens": 0,
+        "indeterminate_scenarios": 0,
+        "lane_id": "no_memory",
+        "latency": {
+          "observe_ms": {
+            "count": 0
+          },
+          "recall_ms": {
+            "count": 0
+          }
+        },
+        "minimum_relevance_met": false,
+        "resolved_scenarios": 9,
+        "safety_gate": "fail",
+        "scenarios": [
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "advance_code"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "correction",
+                "reply": {
+                  "outcome": "not_contacted"
+                }
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "indeterminate",
+            "scenario_id": "stale_project_change",
+            "split": "development",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success_zero_results"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "advance_code"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "failed_approach",
+            "split": "development",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success_zero_results"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "host-authorized cross-session replay/share is deferred to ncm-rs-024",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "open_new_agent_session"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "cross_agent_reuse",
+            "split": "held_out",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success_zero_results"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "indeterminate",
+            "scenario_id": "project_worktree_scope",
+            "split": "held_out",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success_zero_results",
+              "scope_mismatch"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "advance_code"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "contradiction",
+            "split": "held_out",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success_zero_results"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "restart_provider",
+                "outcome": "restarted"
+              },
+              {
+                "action": "replay",
+                "reply": {
+                  "outcome": "not_contacted"
+                }
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "restart",
+            "split": "development",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success_zero_results"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "begin_observation_batch"
+              },
+              {
+                "action": "commit_item",
+                "committed_items": 1
+              },
+              {
+                "action": "cancel",
+                "committed_items": 1,
+                "remaining_items": 2,
+                "terminal": "cancelled"
+              },
+              {
+                "action": "resume"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "cancellation",
+            "split": "development",
+            "task_outcome": "pass",
+            "terminal_outcomes": [],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "load_provider_state",
+                "visible": false
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "indeterminate",
+            "scenario_id": "provider_corruption",
+            "split": "held_out",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "not_contacted",
+              "success_zero_results"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "zero provider admission does not prove deletion",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "delete_by_source",
+                "reply": {
+                  "outcome": "not_contacted"
+                }
+              },
+              {
+                "action": "restart_provider",
+                "outcome": "restarted"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [
+              {
+                "reason": "deleted_source",
+                "source": "source_session_privacy_note_001"
+              }
+            ],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "indeterminate",
+            "scenario_id": "privacy_deletion",
+            "split": "held_out",
+            "task_outcome": "pass",
+            "terminal_outcomes": [
+              "success_zero_results",
+              "success_zero_results",
+              "success_zero_results"
+            ],
+            "useful_recall_precision": null
+          }
+        ],
+        "useful_recall_precision": null,
+        "verdict": "fail"
+      },
+      {
+        "aggregate_task_score": 0.2222222222222222,
+        "estimated_context_tokens": 256,
+        "indeterminate_scenarios": 0,
+        "lane_id": "explicit_documentation",
+        "latency": {
+          "observe_ms": {
+            "count": 0
+          },
+          "recall_ms": {
+            "count": 0
+          }
+        },
+        "minimum_relevance_met": true,
+        "resolved_scenarios": 9,
+        "safety_gate": "fail",
+        "scenarios": [
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "advance_code"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "correction",
+                "reply": {
+                  "outcome": "not_contacted"
+                }
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "indeterminate",
+            "scenario_id": "stale_project_change",
+            "split": "development",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success_zero_results"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 1,
+            "admitted_record_ids": [
+              "runbook_r2"
+            ],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "advance_code"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 1,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "failed_approach",
+            "split": "development",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success"
+            ],
+            "useful_recall_precision": 1.0
+          },
+          {
+            "adjudication_reason": "host-authorized cross-session replay/share is deferred to ncm-rs-024",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "open_new_agent_session"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "cross_agent_reuse",
+            "split": "held_out",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success_zero_results"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "project_worktree_scope",
+            "split": "held_out",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success_zero_results",
+              "scope_mismatch"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "advance_code"
+              },
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "contradiction",
+            "split": "held_out",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success_zero_results"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "restart_provider",
+                "outcome": "restarted"
+              },
+              {
+                "action": "replay",
+                "reply": {
+                  "outcome": "not_contacted"
+                }
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "restart",
+            "split": "development",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "success_zero_results"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "begin_observation_batch"
+              },
+              {
+                "action": "commit_item",
+                "committed_items": 1
+              },
+              {
+                "action": "cancel",
+                "committed_items": 1,
+                "remaining_items": 2,
+                "terminal": "cancelled"
+              },
+              {
+                "action": "resume"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "pass",
+            "scenario_id": "cancellation",
+            "split": "development",
+            "task_outcome": "pass",
+            "terminal_outcomes": [],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "mechanical rubric",
+            "admitted_candidates": 0,
+            "admitted_record_ids": [],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "load_provider_state",
+                "visible": false
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [],
+            "returned_candidates": 0,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "indeterminate",
+            "scenario_id": "provider_corruption",
+            "split": "held_out",
+            "task_outcome": "fail",
+            "terminal_outcomes": [
+              "not_contacted",
+              "success_zero_results"
+            ],
+            "useful_recall_precision": null
+          },
+          {
+            "adjudication_reason": "zero provider admission does not prove deletion",
+            "admitted_candidates": 3,
+            "admitted_record_ids": [
+              "personal_fixture_r2",
+              "personal_fixture_r2",
+              "personal_fixture_r2"
+            ],
+            "events": [
+              {
+                "action": "observe",
+                "outcome": "not_contacted"
+              },
+              {
+                "action": "delete_by_source",
+                "reply": {
+                  "outcome": "not_contacted"
+                }
+              },
+              {
+                "action": "restart_provider",
+                "outcome": "restarted"
+              },
+              {
+                "action": "adjudicate"
+              }
+            ],
+            "rejected": [
+              {
+                "reason": "deleted_source",
+                "source": "source_session_privacy_note_001"
+              }
+            ],
+            "returned_candidates": 3,
+            "safety_counts": {
+              "corrupt_state_recall": 0,
+              "deleted_source_recall": 0,
+              "harmful_stale_admitted": 0,
+              "scope_leakage": 0
+            },
+            "safety_gate": "indeterminate",
+            "scenario_id": "privacy_deletion",
+            "split": "held_out",
+            "task_outcome": "pass",
+            "terminal_outcomes": [
+              "success",
+              "success",
+              "success"
+            ],
+            "useful_recall_precision": 1.0
+          }
+        ],
+        "useful_recall_precision": 1.0,
+        "verdict": "fail"
+      }
+    ],
+    "reference_cases": {
+      "ltm_only_retention": {
+        "after_consolidation": {
+          "commit_seq": 2,
+          "epoch": 1,
+          "fatigue": 0.020000001415610313,
+          "ltm_active": 1,
+          "ltm_terrain_digest": 1282906130330256895,
+          "quota_usage": {
+            "capsule_bytes": 3507,
+            "checkpoint_bytes": 0,
+            "db_bytes": 4096,
+            "event_bytes": 851,
+            "wal_bytes": 1161872
+          },
+          "records": 1,
+          "sources": 1,
+          "state_digest": "fb77665a89cbedaf751dd7878e9089b6213d793df6c736fbffe3f3602ab433a0",
+          "steps_since_consolidation": 0,
+          "stm_active": 1,
+          "stm_terrain_digest": 11928482884399842834,
+          "tick": 1
+        },
+        "after_stm_prune": {
+          "commit_seq": 4,
+          "epoch": 1,
+          "fatigue": 1.5830767807756274e-08,
+          "ltm_active": 1,
+          "ltm_terrain_digest": 14159675868630036923,
+          "quota_usage": {
+            "capsule_bytes": 3507,
+            "checkpoint_bytes": 0,
+            "db_bytes": 4096,
+            "event_bytes": 1765,
+            "wal_bytes": 1186592
+          },
+          "records": 1,
+          "sources": 1,
+          "state_digest": "ba492a5ea4687f20377bb3d61a900f4c921e3b857ecdb3f6b3969fd6722e479f",
+          "steps_since_consolidation": 2000,
+          "stm_active": 0,
+          "stm_terrain_digest": 10996486744605904958,
+          "tick": 2001
+        },
+        "before": {
+          "commit_seq": 1,
+          "epoch": 1,
+          "fatigue": 0.10000000149011612,
+          "ltm_active": 0,
+          "ltm_terrain_digest": 1099760484784481061,
+          "quota_usage": {
+            "capsule_bytes": 3507,
+            "checkpoint_bytes": 0,
+            "db_bytes": 4096,
+            "event_bytes": 363,
+            "wal_bytes": 1149512
+          },
+          "records": 1,
+          "sources": 1,
+          "state_digest": "497e8d0d72d35d4db02775c9343d787addf8ad4f5379a9b2586f8afeccf45383",
+          "steps_since_consolidation": 1,
+          "stm_active": 1,
+          "stm_terrain_digest": 11928482884399842834,
+          "tick": 1
+        },
+        "candidate_layer": "Ltm",
+        "encoder_model": "paraphrase-multilingual-MiniLM-L12-v2",
+        "fallbacks_used": [],
+        "passed": true,
+        "restart_outcome": "success"
+      },
+      "passed": true,
+      "stale_correction": {
+        "admitted": [
+          2
+        ],
+        "new_record": 2,
+        "old_record": 1,
+        "passed": true,
+        "rejection_reason": "superseded",
+        "returned_for_lineage": [
+          1,
+          2
+        ]
+      }
+    }
+  },
+  "run_date": "2026-09-06",
+  "schema_version": 1,
+  "task": "ncm-rs-021",
+  "task_benefit": {
+    "claim": "No improved-agent-outcomes claim; joined active-mode benefit is deferred to ncm-rs-025.",
+    "lanes": [
+      {
+        "aggregate_task_score": 0.8888888888888888,
+        "estimated_context_tokens": 896,
+        "indeterminate_scenarios": 0,
+        "lane_id": "rust_ncm",
+        "latency": {
+          "observe_ms": {
+            "count": 16,
+            "max": 1163.1749580010364,
+            "p50": 50.69954200007487,
+            "p95": 1163.1749580010364
+          },
+          "recall_ms": {
+            "count": 11,
+            "max": 737.1181249982328,
+            "p50": 3.6720419993798714,
+            "p95": 737.1181249982328
+          }
+        },
+        "minimum_relevance_met": true,
+        "resolved_scenarios": 9,
+        "safety_gate": "pass",
+        "useful_recall_precision": 1.0,
+        "verdict": "fail"
+      },
+      {
+        "aggregate_task_score": 0.5555555555555556,
+        "estimated_context_tokens": 896,
+        "indeterminate_scenarios": 0,
+        "lane_id": "python_biomem",
+        "latency": {
+          "observe_ms": {
+            "count": 15,
+            "max": 3510.8477079993463,
+            "p50": 12.201000001368811,
+            "p95": 3510.8477079993463
+          },
+          "recall_ms": {
+            "count": 10,
+            "max": 5.510415998287499,
+            "p50": 4.823374998522922,
+            "p95": 5.510415998287499
+          }
+        },
+        "minimum_relevance_met": true,
+        "resolved_scenarios": 9,
+        "safety_gate": "fail",
+        "useful_recall_precision": 1.0,
+        "verdict": "fail"
+      },
+      {
+        "aggregate_task_score": 0.2222222222222222,
+        "estimated_context_tokens": 0,
+        "indeterminate_scenarios": 0,
+        "lane_id": "no_memory",
+        "latency": {
+          "observe_ms": {
+            "count": 0
+          },
+          "recall_ms": {
+            "count": 0
+          }
+        },
+        "minimum_relevance_met": false,
+        "resolved_scenarios": 9,
+        "safety_gate": "fail",
+        "useful_recall_precision": null,
+        "verdict": "fail"
+      },
+      {
+        "aggregate_task_score": 0.2222222222222222,
+        "estimated_context_tokens": 256,
+        "indeterminate_scenarios": 0,
+        "lane_id": "explicit_documentation",
+        "latency": {
+          "observe_ms": {
+            "count": 0
+          },
+          "recall_ms": {
+            "count": 0
+          }
+        },
+        "minimum_relevance_met": true,
+        "resolved_scenarios": 9,
+        "safety_gate": "fail",
+        "useful_recall_precision": 1.0,
+        "verdict": "fail"
+      }
+    ],
+    "mode": "observer-only"
+  }
+}
