@@ -309,14 +309,11 @@ fn log_semantic_vector_retention_degraded(
 ///
 /// `Online` carries the exact vector pin set read from the mounted code
 /// graph plus the authorities needed to re-verify it under the writer freeze.
-/// `SemanticUnseated` is the ordinary default-off state: no semantic runtime
-/// is seated, no census will ever exist, and the pass sweeps under the
-/// offline protection set without reporting a degradation. `CensusScanning`
-/// is in-progress: the bounded census is still paging toward its exact pin
-/// set, so the pass defers instead of planning against a mid-scan inventory.
-/// `Offline` is a typed degradation, not proof that vector readers are absent.
-/// Only a genuinely unmounted, default-off runtime may use the offline
-/// protection set; mounted or unprovable fallback states refuse collection.
+/// `SemanticUnseated` and `Offline` lack authority over historical vector
+/// dependencies and readers; neither authorizes deletion, even when the
+/// current configuration is default-off. `CensusScanning` is in-progress:
+/// the bounded census is still paging toward its exact pin set, so the pass
+/// defers instead of planning against a mid-scan inventory.
 /// `Refused` is fail-closed: the vector authority reported reset/corrupt/denied
 /// and no sweep may run.
 pub(super) enum VectorRetentionInventoryV1 {
@@ -443,6 +440,11 @@ fn classify_vector_readable_sources(
 pub(in crate::daemon) enum CodeGenerationRetentionOutcomeV1 {
     Complete,
     MoreWork,
+    /// Transient loss of authoritative inventory; retry the census.
+    VectorInventoryUnproven,
+    /// No semantic owner is seated. Defer deletion on the ordinary cadence,
+    /// without treating the shipped default-off state as a recurring failure.
+    SemanticUnseated,
     Failed,
 }
 
@@ -454,16 +456,11 @@ pub(in crate::daemon) enum CodeGenerationRetentionOutcomeV1 {
 /// sat inside legacy vector migration, so a profile with semantic search
 /// disabled never collected anything and grew without bound.
 ///
-/// Vector-readable source generations are pinned through the mounted code
-/// graph when it is resolvable. A daemon without a seated semantic runtime
-/// (the default-off state) sweeps under the offline protection set as its
-/// ordinary quiet journey, and an in-progress census defers the sweep until
-/// its exact pin set is complete. An unavailable vector inventory is not an
-/// empty inventory: mounted or unprovable vector sources defer collection.
-/// Only a genuinely unmounted, default-off runtime may sweep under the offline
-/// protection set (active pointer head, durable pointer index, rollback floor,
-/// and the serving generation). Reset, corrupt, and denied vector authorities
-/// stay fail-closed and collect nothing.
+/// Vector-readable source generations are pinned through exact mounted
+/// authorities and rechecked under their publication fence. An unavailable
+/// inventory is not an empty inventory: unseated and offline states defer
+/// deletion, while a complete authoritative empty inventory still collects.
+/// Reset, corrupt, and denied authorities stay fail-closed.
 #[hotpath::measure(
     label = "daemon.git.maintenance.code_generation_retention",
     future = true
@@ -505,25 +502,6 @@ pub(in crate::daemon) async fn run_code_generation_retention(
     .await
 }
 
-/// The offline protection pin: the generation the mounted scheduler is
-/// currently serving, when one is mounted at all.
-#[hotpath::measure(
-    label = "daemon.git.maintenance.serving_generation_pins",
-    future = true
-)]
-async fn serving_generation_pins(
-    schedulers: &CodeIndexSchedulerRegistryV1,
-    project_root: &Path,
-) -> std::collections::BTreeSet<tracedecay_domain::CodeGenerationId> {
-    let mut pins = std::collections::BTreeSet::new();
-    if let Some(scope) = schedulers.serving_code_scope(project_root).await
-        && let Some(serving) = scope.serving_generation
-    {
-        pins.insert(serving.manifest().generation_id.clone());
-    }
-    pins
-}
-
 /// Execute one code-generation retention pass against a resolved vector
 /// inventory. Emitting `retention_degraded` is decided exclusively by
 /// [`VectorRetentionInventoryV1::degraded_reason`], so quiet states cannot be
@@ -554,60 +532,21 @@ async fn apply_code_generation_retention(
     if let Some(failure) = vector_inventory.degraded_reason() {
         log_code_generation_retention_degraded(observations, graph.project_root(), &failure);
     }
-    // A failed census is not an empty vector inventory. Installed authorities,
-    // a mounted provider/runtime, or prior census coverage can still own source
-    // leases even when configuration is currently disabled. Only the genuinely
-    // unmounted default-off state may fall back to serving-generation pins.
-    if matches!(
-        &vector_inventory,
-        VectorRetentionInventoryV1::SemanticUnseated | VectorRetentionInventoryV1::Offline { .. }
-    ) {
-        let vector_authority_present = graph
-            .configuration_runtime()
-            .semantic_configuration_inventory_authority()
-            .is_some()
-            || schedulers
-                .semantic_vector_graph_provider(&layout.project_root)
-                .await
-                .is_some()
-            || tracedecay_usecases::semantic_runtime::project_semantic_production_runtime(
-                &layout.project_root,
-            )
-            .is_some()
-            || matches!(
-                observations.semantic_vector_retention_read(graph.project_root()),
-                crate::daemon::maintenance::SemanticVectorRetentionReadV1::Observed { .. }
-                    | crate::daemon::maintenance::SemanticVectorRetentionReadV1::Scanning
-            );
-        if vector_authority_present
-            || !matches!(
-                graph.configuration_runtime().client().current().await,
-                Ok(configuration) if semantic_retrieval_profiles_disabled(&configuration.config.semantic)
-            )
-        {
-            log_code_generation_retention_degraded(
-                observations,
-                graph.project_root(),
-                "vector_inventory_unproven",
-            );
-            return CodeGenerationRetentionOutcomeV1::Failed;
-        }
-    }
-    // An online census supplies exact vector pins; a paging census defers.
-    // Reset, corrupt, and denied authorities always refuse collection.
+    // Missing authorities and current default-off configuration say nothing
+    // about historical vector dependencies or outstanding readers. Only exact
+    // inventory evidence can authorize the destructive executor below; its
+    // empty source set is valid evidence too, and still makes bounded progress.
     let (vector_readable_sources, inventory_mode) = match &vector_inventory {
         VectorRetentionInventoryV1::Online { sources, .. } => (sources.clone(), "online"),
-        VectorRetentionInventoryV1::SemanticUnseated => (
-            serving_generation_pins(schedulers, &layout.project_root).await,
-            "semantic_unseated",
-        ),
+        VectorRetentionInventoryV1::SemanticUnseated => {
+            return CodeGenerationRetentionOutcomeV1::SemanticUnseated;
+        }
+        VectorRetentionInventoryV1::Offline { .. } => {
+            return CodeGenerationRetentionOutcomeV1::VectorInventoryUnproven;
+        }
         VectorRetentionInventoryV1::CensusScanning => {
             return CodeGenerationRetentionOutcomeV1::Complete;
         }
-        VectorRetentionInventoryV1::Offline { .. } => (
-            serving_generation_pins(schedulers, &layout.project_root).await,
-            "offline",
-        ),
         VectorRetentionInventoryV1::Refused { .. } => {
             return CodeGenerationRetentionOutcomeV1::Failed;
         }
@@ -678,17 +617,11 @@ async fn apply_code_generation_retention(
         }
     };
     // A failed, deferred, or retained replay reconcile keeps its durable
-    // release evidence for a later graph-available pass. Deleting newly
-    // planned files stays safe in every inventory mode — retention hard-links
-    // each retired generation into the replay pool before its release event
-    // becomes durable, so the graph can always finish its retirement later.
-    // The pass therefore keeps collecting instead of letting sealed
-    // generations and their multi-GiB text artifacts accumulate without bound
-    // whenever the graph is dark, wedged, or busy (a recurring
-    // `graph_replay_release_failed` used to abort every pass here and grew
-    // one store by tens of GiB in a single crash-rebuild night). A failure
-    // still reports degraded and fails the pass so the retry cadence stays
-    // short; a deferral fails the pass quietly under the bounded backoff.
+    // release evidence for a later pass. With authoritative vector inventory,
+    // collection may still progress: retention hard-links each retired
+    // generation into the replay pool before publishing its release event.
+    // The graph can finish retirement later through its ownership protocol.
+    // Failure keeps the retry cadence short; deferral uses bounded backoff.
     let mut replay_reconcile_failed = false;
     let mut release_backlog_remains = false;
     let replay_reconcile_attemptable = match graph_replay::reconcile_graph_replay_releases(
@@ -733,9 +666,8 @@ async fn apply_code_generation_retention(
     // Freeze the vector writer, then re-read the committed active+rollback
     // identities and their exact source generations. Graph head order is not
     // retention authority: a newer unactivated candidate must not displace
-    // the configured generation from this fence. The offline protection set
-    // is only eligible after the unmounted/default-off guard above, so no
-    // vector freeze is taken there.
+    // the configured generation from this fence. Offline/unseated inventories
+    // have already deferred: every destructive executor owns this freeze.
     let vector_writer_freeze = if let VectorRetentionInventoryV1::Online {
         configuration,
         expected_vector_revision,
@@ -868,9 +800,9 @@ async fn apply_code_generation_retention(
                 }
             }
         }
-        Some(vector_writer_freeze)
+        vector_writer_freeze
     } else {
-        None
+        return CodeGenerationRetentionOutcomeV1::VectorInventoryUnproven;
     };
     if cancellation.is_cancelled() {
         log_code_generation_retention_degraded(
@@ -889,6 +821,9 @@ async fn apply_code_generation_retention(
     let execution_pool_root = graph_replay_pool_root.clone();
     let execution_cancellation = cancellation.clone();
     let report = tokio::task::spawn_blocking(move || {
+        // The blocking deletion owns the fence. Dropping/cancelling its async
+        // awaiter must not admit a publisher while filesystem work continues.
+        let _vector_writer_freeze = vector_writer_freeze;
         execute_code_generation_retention_cancellable(
             &execution_root,
             plan,
@@ -899,7 +834,6 @@ async fn apply_code_generation_retention(
         )
     })
     .await;
-    drop(vector_writer_freeze);
 
     match report {
         Ok(Ok(report)) => {
@@ -967,19 +901,69 @@ async fn apply_code_generation_retention(
                     }
                 }
             }
+            let collected =
+                !report.deleted_generations.is_empty() || !report.deleted_text_artifacts.is_empty();
             if release_reconcile_failed {
                 CodeGenerationRetentionOutcomeV1::Failed
-            } else if release_backlog_remains
-                || !report.deleted_generations.is_empty()
-                || !report.deleted_text_artifacts.is_empty()
-            {
-                // Something was collected, so the next bounded census may find
-                // another collectable unit; stay on the short cadence until a
-                // pass proves the store converged. A census that finds nothing
-                // returns Complete one tick later at metadata cost only.
+            } else if release_backlog_remains {
                 CodeGenerationRetentionOutcomeV1::MoreWork
-            } else {
+            } else if !collected {
                 CodeGenerationRetentionOutcomeV1::Complete
+            } else {
+                // Prove whether the bounded collection was the final unit before
+                // reporting a continuation. This keeps the last source deletion
+                // and the maintenance convergence result in the same tick.
+                let convergence_root = store_root.clone();
+                let convergence_sources = vector_readable_sources.clone();
+                let convergence_pool_root = graph_replay_pool_root.clone();
+                let convergence_cancellation = cancellation.clone();
+                match tokio::task::spawn_blocking(move || {
+                    prepare_next_code_generation_retention_cancellable(
+                        &convergence_root,
+                        &convergence_sources,
+                        DEFAULT_SUPERSEDED_GENERATION_FLOOR,
+                        &|| convergence_cancellation.is_cancelled(),
+                        Some(&convergence_pool_root),
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(plan)) if plan.has_collectable_work() => {
+                        CodeGenerationRetentionOutcomeV1::MoreWork
+                    }
+                    Ok(Ok(_)) => CodeGenerationRetentionOutcomeV1::Complete,
+                    Ok(Err(CodeGenerationRetentionErrorV1::GraphReplayPoolBusy)) => {
+                        defer_graph_replay_pool_busy(observations, graph.project_root())
+                    }
+                    Ok(Err(CodeGenerationRetentionErrorV1::Cancelled)) => {
+                        log_code_generation_retention_degraded(
+                            observations,
+                            graph.project_root(),
+                            "retention_cancelled",
+                        );
+                        CodeGenerationRetentionOutcomeV1::Failed
+                    }
+                    Ok(Err(error)) => {
+                        observations.mark_loud_retention_log();
+                        log_daemon_event(
+                            "retention_degraded",
+                            &[
+                                ("pass", "code_generations".to_string()),
+                                ("failure", "retention_convergence_plan_failed".to_string()),
+                                ("error", error.to_string()),
+                            ],
+                        );
+                        CodeGenerationRetentionOutcomeV1::Failed
+                    }
+                    Err(_) => {
+                        log_code_generation_retention_degraded(
+                            observations,
+                            graph.project_root(),
+                            "retention_convergence_task_panicked",
+                        );
+                        CodeGenerationRetentionOutcomeV1::Failed
+                    }
+                }
             }
         }
         Ok(Err(CodeGenerationRetentionErrorV1::Cancelled)) => {

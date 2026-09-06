@@ -27,9 +27,7 @@ use tracedecay_code_index_retention::code_index_generations::{
     DEFAULT_SUPERSEDED_GENERATION_FLOOR, MAX_DURABLE_GENERATION_INDEX_ENTRIES_V1,
     prepare_next_code_generation_retention_cancellable,
 };
-use tracedecay_usecases::semantic_runtime::{
-    ProjectSemanticActivationExt, project_semantic_retained_vector_generations,
-};
+use tracedecay_usecases::semantic_runtime::ProjectSemanticActivationExt;
 use tracedecay_usecases::store::vector_generations::{
     GraphVectorGenerationStoreV1, SemanticVectorStageDescriptorV1, VectorGenerationPlanV1,
 };
@@ -349,6 +347,7 @@ async fn mounted_daemon_maintenance_retains_leased_source_when_fresh_inventory_i
 
     let observations = resources.store_administration.store_telemetry_sampling();
     let cancellation = tracedecay_session_memory::context::CancellationToken::new();
+    let source_bytes = std::fs::read(&first_source_file).expect("read retained source bytes");
     assert!(
         !crate::daemon::maintenance::generation::run_project_generation_maintenance(
             graph.as_ref(),
@@ -362,6 +361,35 @@ async fn mounted_daemon_maintenance_retains_leased_source_when_fresh_inventory_i
         .is_complete(),
         "unavailable mounted inventory keeps maintenance retryable"
     );
+    let inventory = crate::daemon::store_maintenance::resolve_vector_retention_inventory(
+        graph.as_ref(),
+        schedulers,
+        &observations,
+    )
+    .await;
+    assert!(
+        matches!(
+            inventory,
+            crate::daemon::store_maintenance::VectorRetentionInventoryV1::Offline { ref reason }
+                if reason == "vector_census_incomplete"
+        ),
+        "the fresh authority fixture must remain genuinely Offline before its first census"
+    );
+    assert_eq!(
+        crate::daemon::store_maintenance::run_code_generation_retention(
+            graph.as_ref(),
+            schedulers,
+            &observations,
+            &cancellation,
+        )
+        .await,
+        crate::daemon::store_maintenance::CodeGenerationRetentionOutcomeV1::VectorInventoryUnproven,
+    );
+    assert_leased_vector_source(&activation_lease, &vector_generation, &first_source).await;
+    assert_eq!(
+        std::fs::read(&first_source_file).expect("retained source bytes"),
+        source_bytes
+    );
     assert!(
         first_source_file.is_file(),
         "an unavailable inventory must not let the offline fallback collect a leased vector source"
@@ -370,6 +398,19 @@ async fn mounted_daemon_maintenance_retains_leased_source_when_fresh_inventory_i
     drop(activation_lease);
     drop(graph);
     harness.shutdown().await;
+}
+
+async fn assert_leased_vector_source(
+    lease: &GraphVectorGenerationStoreV1,
+    generation: &tracedecay_domain::VectorGenerationIdV1,
+    source: &CodeGenerationId,
+) {
+    let published = lease
+        .generation(generation, Arc::new(NeverCancelled))
+        .await
+        .expect("read through the retained activation lease")
+        .expect("leased vector generation remains readable");
+    assert_eq!(published.source_generation(), source);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -395,12 +436,36 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
         .latest_generation_id(&canonical_root)
         .await
         .expect("initial sealed code generation");
-
-    assert!(
-        project_semantic_retained_vector_generations(&canonical_root)
-            .is_some_and(|roots| roots.generation_ids().is_empty()),
-        "the exact committed query-only profile is known-empty retention authority"
+    let accepted_query = crate::daemon::query_authority_provider::tests::accepted_profile(
+        "generation-retention",
+        &tracedecay_domain::RetrieverKind::QUERY_FALLBACK_LANES,
     );
+    let runtime = crate::config::retrieval::RetrievalRuntimeCompatibilityV1 {
+        retrieval_ceiling: accepted_query.profile().retrieval_budget,
+        semantic: None,
+        semantic_ceiling: None,
+        rerank: None,
+        rerank_ceiling: None,
+    };
+    let current = graph
+        .configuration_runtime()
+        .client()
+        .current()
+        .await
+        .expect("current production configuration");
+    graph
+        .configuration_runtime()
+        .bootstrap_query_retrieval_profile(
+            tracedecay_configuration::ConfigurationCurrentStateV1 {
+                revision_id: current.revision_id,
+                snapshot: current.snapshot,
+            },
+            accepted_query,
+            &runtime,
+        )
+        .await
+        .expect("durable query-only retention authority");
+
     let vector_generation =
         publish_vector_generation(schedulers, &canonical_root, &first_source).await;
     let provider = schedulers
@@ -519,6 +584,91 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
         None,
         "the online inventory reports no degradation"
     );
+    assert_leased_vector_source(&activation_lease, &vector_generation, &first_source).await;
+    let source_bytes = std::fs::read(&first_source_file).expect("retained sealed source bytes");
+    // Invalidate a real Online observation while its source lease remains live.
+    // Offline retries; the ordinary unseated state defers quietly. Neither may
+    // delete, and the mounted authority must be able to rebuild an Online census.
+    for unseated in [false, true] {
+        if unseated {
+            observations.record_semantic_vector_retention_unseated(&canonical_root);
+        } else {
+            observations.record_semantic_vector_retention_failure(&canonical_root);
+        }
+        let inventory = crate::daemon::store_maintenance::resolve_vector_retention_inventory(
+            graph.as_ref(),
+            schedulers,
+            &observations,
+        )
+        .await;
+        assert!(
+            match inventory {
+                crate::daemon::store_maintenance::VectorRetentionInventoryV1::SemanticUnseated => {
+                    unseated
+                }
+                crate::daemon::store_maintenance::VectorRetentionInventoryV1::Offline {
+                    ..
+                } => {
+                    !unseated
+                }
+                _ => false,
+            },
+            "the requested unavailable census state must actually be reached"
+        );
+        let expected = if unseated {
+            crate::daemon::store_maintenance::CodeGenerationRetentionOutcomeV1::SemanticUnseated
+        } else {
+            crate::daemon::store_maintenance::CodeGenerationRetentionOutcomeV1::VectorInventoryUnproven
+        };
+        assert_eq!(
+            crate::daemon::store_maintenance::run_code_generation_retention(
+                graph.as_ref(),
+                schedulers,
+                &observations,
+                &cancellation,
+            )
+            .await,
+            expected,
+        );
+        assert_eq!(
+            std::fs::read(&first_source_file).expect("deferred source stays present"),
+            source_bytes
+        );
+        assert_leased_vector_source(&activation_lease, &vector_generation, &first_source).await;
+
+        let mut census_restored = false;
+        for _ in 0..4 {
+            census_restored =
+                crate::daemon::store_maintenance::run_semantic_vector_generation_retention(
+                    graph.as_ref(),
+                    schedulers,
+                    &observations,
+                    &cancellation,
+                )
+                .await
+                .is_complete();
+            assert_eq!(
+                std::fs::read(&first_source_file).expect("leased source survives census recovery"),
+                source_bytes
+            );
+            if census_restored {
+                break;
+            }
+        }
+        assert!(
+            census_restored,
+            "authoritative census recovers without releasing the lease"
+        );
+        assert!(matches!(
+            crate::daemon::store_maintenance::resolve_vector_retention_inventory(
+                graph.as_ref(),
+                schedulers,
+                &observations,
+            )
+            .await,
+            crate::daemon::store_maintenance::VectorRetentionInventoryV1::Online { .. }
+        ));
+    }
     assert!(matches!(
         crate::daemon::doctor_kernel::collect_code_generation_retention_findings(
             schedulers,
@@ -572,7 +722,7 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
     let restarted_cancellation = tracedecay_session_memory::context::CancellationToken::new();
     let mut converged = false;
     for _ in 0..4 {
-        converged = crate::daemon::maintenance::generation::run_project_generation_maintenance(
+        let tick = crate::daemon::maintenance::generation::run_project_generation_maintenance(
             restarted_graph.as_ref(),
             restarted_schedulers,
             &restarted_observations,
@@ -580,14 +730,40 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
             &crate::config::RetentionConfig::default(),
             None,
         )
-        .await
-        .is_complete();
-        if converged {
-            break;
+        .await;
+        converged = tick.is_complete();
+        if converged || first_source_file.is_file() {
+            if converged {
+                break;
+            }
+            continue;
         }
-        assert!(
-            first_source_file.is_file(),
+        // The source is gone before the journey reports complete. Only a
+        // converged vector pass admits that sweep, so the sole continuation a
+        // deleting tick may carry is its own post-sweep release backlog: the
+        // graph consumes the queued release evidence on the short cadence.
+        assert_eq!(
+            tick,
+            crate::daemon::maintenance::MaintenanceTickOutcome::Continue(
+                crate::daemon::maintenance::MaintenanceContinuation::CodeGenerationRetention
+            ),
             "cleanup convergence must finish before source-code deletion"
+        );
+        let inventory = crate::daemon::store_maintenance::resolve_vector_retention_inventory(
+            restarted_graph.as_ref(),
+            restarted_schedulers,
+            &restarted_observations,
+        )
+        .await;
+        assert!(
+            matches!(
+                &inventory,
+                crate::daemon::store_maintenance::VectorRetentionInventoryV1::Online {
+                    sources,
+                    ..
+                } if !sources.contains(&first_source)
+            ),
+            "exact vector-source liveness must veto the source-code deletion plan"
         );
     }
     assert!(converged, "replayed cleanup converges after restart");

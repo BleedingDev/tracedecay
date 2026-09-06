@@ -415,6 +415,52 @@ fn commit_current_observation_and_then(
     committed
 }
 
+// The writer lane belongs to the durable code scope, not one mounted runtime.
+// A retention/publication lease can outlive unmount (including a cancelled
+// async awaiter whose blocking work is still running). Remount must join that
+// same lane until its last owner releases it.
+fn vector_writer_for_store(store_root: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    type Writer = tokio::sync::Mutex<()>;
+    static WRITERS: OnceLock<Mutex<BTreeMap<PathBuf, std::sync::Weak<Writer>>>> = OnceLock::new();
+    let mut writers = WRITERS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    writers.retain(|_, writer| writer.strong_count() > 0);
+    if let Some(writer) = writers.get(store_root).and_then(std::sync::Weak::upgrade) {
+        return writer;
+    }
+    let writer = Arc::new(tokio::sync::Mutex::new(()));
+    writers.insert(store_root.to_path_buf(), Arc::downgrade(&writer));
+    writer
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn vector_writer_fence_survives_runtime_remount() {
+    let isolation = tempfile::tempdir().expect("isolated writer scopes");
+    let scope = isolation.path().join("code-index");
+    let mounted = vector_writer_for_store(&scope);
+    let lease = Arc::clone(&mounted).lock_owned().await;
+    drop(mounted);
+
+    let remounted = vector_writer_for_store(&scope);
+    assert!(
+        remounted.try_lock().is_err(),
+        "remount cannot bypass a live deletion/publication fence"
+    );
+    let other_scope = vector_writer_for_store(&isolation.path().join("other"));
+    assert!(
+        other_scope.try_lock().is_ok(),
+        "unrelated code scopes remain independent"
+    );
+    drop(lease);
+    assert!(
+        remounted.try_lock().is_ok(),
+        "release makes the remounted writer eligible"
+    );
+}
+
 impl ProductionSemanticRuntimeV1 {
     pub fn new(
         handle: DaemonSemanticRuntimeHandleV1,
@@ -450,7 +496,7 @@ impl ProductionSemanticRuntimeV1 {
         Self {
             handle,
             graph,
-            vector_writer: Arc::new(tokio::sync::Mutex::new(())),
+            vector_writer: vector_writer_for_store(&code_index_store_root),
             code_index_store_root,
             lifecycle,
             resources,

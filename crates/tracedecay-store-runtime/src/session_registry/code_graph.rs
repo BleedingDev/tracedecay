@@ -2580,6 +2580,22 @@ impl DaemonSessionRuntimeRegistryV1 {
         let replay_root = project_database
             .database_path()
             .with_extension("graph-replay");
+        // Mount the sealed replay source now, not at the first publication:
+        // retention and recovery after a restart hydrate sealed generations
+        // through the manifest provider before anything is published again,
+        // and an unbound shard refused them as "replay source is not mounted".
+        // The bind is idempotent for the same project identity.
+        self.graph_manifest_provider
+            .bind(
+                authority.binding().shard_id.clone(),
+                project_id.clone(),
+                repository_id.clone(),
+                replay_binding.generations_root.clone(),
+                replay_root.clone(),
+            )
+            .map_err(|error| {
+                session_registry_error("bind code generation replay source", error.to_string())
+            })?;
         let publication_locks = self.retain_project_publication_locks(&project_shard);
         Ok(RetainedCodeGraphRuntimeV1 {
             graph_registry: self.graph_registry.clone(),
