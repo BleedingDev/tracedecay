@@ -17,6 +17,9 @@ sha2 = "0.11"
 tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
 tracedecay-memory-ncm-runtime = { path = "../tracedecay-memory-ncm-runtime", optional = true, default-features = false }
 
+[dev-dependencies]
+tracedecay-memory-conformance = { path = "../tracedecay-memory-conformance" }
+
 [lints.rust]
 missing_docs = "deny"
 unsafe_code = "forbid"

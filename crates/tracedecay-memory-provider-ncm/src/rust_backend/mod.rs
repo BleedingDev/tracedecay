@@ -314,7 +314,9 @@ impl NcmCognitiveSurface for RustNcmSurface {
             &request.request_id,
             request.namespace.as_str(),
             TerminalCode::Success,
-            CommittedEffectEvidence::none(None),
+            // A handshake commits nothing, but its evidence anchors to the
+            // descriptor generation the host is about to bind readiness to.
+            CommittedEffectEvidence::none(Some(descriptor.state_generation)),
             None,
         );
         NcmSurfaceHandshakeResponse {
