@@ -35,9 +35,17 @@ provider-registry → provider-ncm (existing adapter, + opt-in `rust-backend` fe
 | `LogicalTick` | `u64` learning ticks (see §5). |
 
 Public `state_generation` (ProviderReply / `expected_state_generation`) = `CommitSequence`.
-`StateEpoch` and identities are folded into the ready-receipt digest, so a reset/rebuild
-invalidates readiness while ordinary commits do not. Task 018 must prove this with sequential
-mutations against `AcceptedReadiness` before relying on it.
+`StateEpoch` and identities are folded into the ready-receipt digest.
+
+Readiness lifetime is owned by the existing `NcmProviderAdapter` and is unchanged in v1 (task 018
+finding, 2026-09-06): `AcceptedReadiness` admits a call only while `expected_state_generation`
+equals the handshake generation, and the adapter retires readiness before every mutation
+(`mutation_dispatch_retires_the_accepted_ready_receipt`). Consequently the host re-handshakes after
+each committed mutation; the surface reports the new `CommitSequence` in the reply and answers the
+next handshake with it. Relaxing this (advance the accepted generation on a validated mutation reply)
+is a host-side change deferred to task 023. Descriptor `provider_id` stays the reserved `ncm`; the
+implementation identity `ncm-biomem-rs.v1` is carried in the descriptor version/receipt, never as
+the provider id.
 
 ## 3. Operations (map to existing `ProviderOperation` only)
 
