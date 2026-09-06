@@ -160,7 +160,33 @@
     "candidate_must_be_immutable_sha": true,
     "moving_refs_are_discovery_only": true,
     "conflict_receipt_required": true,
-    "first_floor_advancement_bead": "tdmem-1208"
+    "first_floor_advancement_bead": "tdmem-1208",
+    "integrated_candidate_review": {
+      "status": "unaccepted",
+      "accepted_floor_authority": "product/upstream/tracedecay-v2-pr707.json#/pinned_floor/sha",
+      "candidate_upstream_sha": "9bc7dedf9b96dbd6ff6d39522d42ee1ed9b071fc",
+      "product_checkpoint_sha": "25778c7443cd0cfe257da363da01a56ea1d45d3f",
+      "product_checkpoint_tree_sha": "de895a3685dfba8757a2c2062918d7ca326fbe8b",
+      "floor_candidate_relationship": "diverged",
+      "floor_candidate_merge_base_sha": "b6cdc66277598d1c07d335e895908397e9763636",
+      "floor_is_ancestor_of_checkpoint": true,
+      "candidate_is_ancestor_of_checkpoint": true,
+      "comparison_semantics": "Endpoint tree diffs: accepted floor to candidate for imports; candidate to checkpoint for product residue. Paths may appear in both; neither comparison authorizes patches.",
+      "ci_evidence": {
+        "run_id": 33987477041,
+        "job_id": 101363606732,
+        "checkpoint_sha": "25778c7443cd0cfe257da363da01a56ea1d45d3f",
+        "floor_ancestry": "passed",
+        "ownership": "failed",
+        "rust_workspace": "not_run",
+        "native_parity": "not_run",
+        "provider_conformance": "not_run",
+        "product_contracts": "not_run",
+        "scope_crash_security": "not_run",
+        "generated_drift": "not_run"
+      },
+      "acceptance": "Blocked pending exact ownership reconciliation and an authorized isolated train passing every mandatory tree-bound gate. This observation cannot advance canonical metadata or its derived receipt."
+    }
   },
   "conflicts": {
     "path_format": "repo-relative-posix",
@@ -197,7 +223,7 @@
           "python3 tests/product_upstream_change_classification_test.py",
           "python3 tests/product_upstream_ownership_registry_test.py",
           "python3 scripts/product/check-upstream-ownership-registry.py --repo .",
-          "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers",
+          "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail",
           "cargo check --workspace --all-targets --features test-transport --locked",
           "cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked"
         ]
@@ -252,9 +278,9 @@
         "workflow": ".github/workflows/product-upstream.yml",
         "job": "scope_crash_security",
         "commands": [
-          "cargo test --locked -p tracedecay blocking_drain_deadline_reports_incomplete_without_a_notification",
-          "cargo test --locked -p tracedecay runtime_finish_does_not_refresh_an_exhausted_deadline",
+          "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests",
           "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1",
+          "cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants",
           "cargo test --locked -p tracedecay --features memory-provider-host --lib crash_restart_fuzz",
           "cargo test --locked -p tracedecay --features memory-provider-host --lib -- --ignored --exact daemon::retained_owner::observation_journey::tests::crash_restart_fuzz::mounted_crash_restart_soak_holds_every_invariant_across_two_hundred_seeds --nocapture",
           "python3 tests/product_memory_fabric_disabled_mode_test.py"

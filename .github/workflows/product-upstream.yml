@@ -17,35 +17,85 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  RUST_TEST_THREADS: 2
+  TRACEDECAY_DATA_DIR: ${{ github.workspace }}/target/test-profile/.tracedecay
 
+# Diagnostic lanes remain serial to bound runner/build pressure. Failure does
+# not suppress later evidence; convergence_result alone decides eligibility.
 jobs:
   upstream_required:
     name: "[tdmem-1206][required][upstream_required]"
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Check out the exact candidate
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install the pinned Rust toolchain
+        id: rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - name: Install pinned cargo-nextest
+        id: nextest
         uses: taiki-e/install-action@acdba816b0980ba6b63f1109f89a046e15fc301a # nextest
-      - name: Verify upstream floor and change ownership
+      - name: "bash tests/product_upstream_floor_test.sh"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           bash tests/product_upstream_floor_test.sh
+      - name: "python3 scripts/check-product-upstream-floor.py --repo . --metadata product/upstream/tracedecay-v2-pr707.json"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 scripts/check-product-upstream-floor.py --repo . --metadata product/upstream/tracedecay-v2-pr707.json
+      - name: "python3 tests/product_upstream_vendor_floor_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 tests/product_upstream_vendor_floor_test.py
+      - name: "python3 tests/product_upstream_change_classification_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 tests/product_upstream_change_classification_test.py
+      - name: "python3 tests/product_upstream_ownership_registry_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 tests/product_upstream_ownership_registry_test.py
+      - name: "python3 scripts/product/check-upstream-ownership-registry.py --repo ."
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 scripts/product/check-upstream-ownership-registry.py --repo .
-          cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers
+      - name: "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' && steps.nextest.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail
+      - name: "cargo check --workspace --all-targets --features test-transport --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo check --workspace --all-targets --features test-transport --locked
+      - name: "cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked
       - name: Record upstream gate ownership
         if: always()
@@ -55,38 +105,112 @@ jobs:
   product_contracts:
     name: "[tdmem-1206][required][product_contracts]"
     needs: upstream_required
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Check out the exact candidate
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify provider contracts and architecture rules
+      - name: "python3 tests/product_provider_registry_contract_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
-          for test_file in \
-            tests/product_provider_registry_contract_test.py \
-            tests/product_provider_handshake_contract_test.py \
-            tests/product_provider_observation_contract_test.py \
-            tests/product_provider_recall_contract_test.py \
-            tests/product_provider_lifecycle_contract_test.py \
-            tests/product_provider_terminal_contract_test.py \
-            tests/product_memory_provider_contract_set_test.py \
-            tests/product_memory_provider_rust_bindings_test.py \
-            tests/product_memory_dependency_policy_test.py \
-            tests/product_memory_dependency_direction_test.py \
-            tests/product_patch_footprint_policy_test.py
-          do
-            python3 "$test_file"
-          done
+          python3 tests/product_provider_registry_contract_test.py
+      - name: "python3 tests/product_provider_handshake_contract_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_provider_handshake_contract_test.py
+      - name: "python3 tests/product_provider_observation_contract_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_provider_observation_contract_test.py
+      - name: "python3 tests/product_provider_recall_contract_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_provider_recall_contract_test.py
+      - name: "python3 tests/product_provider_lifecycle_contract_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_provider_lifecycle_contract_test.py
+      - name: "python3 tests/product_provider_terminal_contract_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_provider_terminal_contract_test.py
+      - name: "python3 tests/product_memory_provider_contract_set_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_memory_provider_contract_set_test.py
+      - name: "python3 tests/product_memory_provider_rust_bindings_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_memory_provider_rust_bindings_test.py
+      - name: "python3 tests/product_memory_dependency_policy_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_memory_dependency_policy_test.py
+      - name: "python3 tests/product_memory_dependency_direction_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_memory_dependency_direction_test.py
+      - name: "python3 tests/product_patch_footprint_policy_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_patch_footprint_policy_test.py
+      - name: "python3 scripts/product/check-memory-provider-contract-set.py --repo ."
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 scripts/product/check-memory-provider-contract-set.py --repo .
+      - name: "python3 scripts/product/check-memory-provider-rust-bindings.py --repo ."
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 scripts/product/check-memory-provider-rust-bindings.py --repo .
+      - name: "python3 scripts/product/check-memory-dependency-policy.py --repo . --policy product/upstream/patch-footprint-policy.json"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 scripts/product/check-memory-dependency-policy.py --repo . --policy product/upstream/patch-footprint-policy.json
+      - name: "python3 scripts/product/check-memory-dependency-direction.py --repo . --policy product/architecture/memory-dependency-policy.json"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 scripts/product/check-memory-dependency-direction.py --repo . --policy product/architecture/memory-dependency-policy.json
+      - name: "python3 scripts/product/check-patch-footprint-policy.py --repo . --policy product/upstream/patch-footprint-policy.json --map product/upstream/convergence-map.json"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 scripts/product/check-patch-footprint-policy.py --repo . --policy product/upstream/patch-footprint-policy.json --map product/upstream/convergence-map.json
       - name: Record product contract ownership
         if: always()
@@ -96,25 +220,49 @@ jobs:
   native_parity:
     name: "[tdmem-1206][required][native_parity]"
     needs: product_contracts
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
       - name: Check out the exact candidate
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install the pinned Rust toolchain
+        id: rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - name: Verify Native adapter and direct-provider parity
+      - name: "cargo test -p tracedecay-memory-provider-native --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p tracedecay-memory-provider-native --locked
+      - name: "cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_recall_ -- --nocapture"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_recall_ -- --nocapture
+      - name: "cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_baseline -- --nocapture"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_baseline -- --nocapture
+      - name: "python3 tests/product_memory_composition_feature_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 tests/product_memory_composition_feature_test.py
+      - name: "python3 scripts/product/check-memory-composition-feature.py --repo ."
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 scripts/product/check-memory-composition-feature.py --repo .
       - name: Record Native parity ownership
         if: always()
@@ -124,27 +272,61 @@ jobs:
   provider_conformance:
     name: "[tdmem-1206][required][provider_conformance]"
     needs: native_parity
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Check out the exact candidate
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install the pinned Rust toolchain
+        id: rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - name: Verify common fabric and provider conformance
+      - name: "cargo test -p tracedecay-memory-provider-api --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p tracedecay-memory-provider-api --locked
+      - name: "cargo test -p tracedecay-memory-fabric --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo test -p tracedecay-memory-fabric --locked
+      - name: "cargo test -p tracedecay-memory-provider-registry --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo test -p tracedecay-memory-provider-registry --locked
+      - name: "cargo test -p tracedecay-memory-conformance --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo test -p tracedecay-memory-conformance --locked
+      - name: "cargo test --manifest-path product/conformance/dummy-provider/Cargo.toml --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo test --manifest-path product/conformance/dummy-provider/Cargo.toml --locked
+      - name: "python3 scripts/product/check-dummy-provider-conformance.py --repo ."
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 scripts/product/check-dummy-provider-conformance.py --repo .
+      - name: "python3 tests/product_dummy_provider_conformance_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 tests/product_dummy_provider_conformance_test.py
       - name: Record provider conformance ownership
         if: always()
@@ -154,34 +336,55 @@ jobs:
   scope_crash_security:
     name: "[tdmem-1206][required][scope_crash_security]"
     needs: provider_conformance
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
       - name: Check out the exact candidate
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install the pinned Rust toolchain
+        id: rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - name: Verify scope, crash, restart, and shutdown behavior
+      - name: "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
-          # Both deadline regressions live in tracedecay-daemon-service, so
-          # `-p tracedecay` selected nothing and this gate passed vacuously.
           cargo test --locked -p tracedecay-daemon-service --lib deadline_tests
+      - name: "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1
+      - name: "cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants
-          # tdmem-5lc: the mounted crash/restart soak. Two hundred deterministic
-          # seeds and every one of them spends real process kills between the
-          # canonical commit and the provider acknowledgement, so this is the
-          # gate that keeps the hundreds-seed result reproduced rather than
-          # claimed. The short developer tier runs in the same binary and is
-          # covered by the filter above it.
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host --lib crash_restart_fuzz"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo test --locked -p tracedecay --features memory-provider-host --lib crash_restart_fuzz
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host --lib -- --ignored --exact daemon::retained_owner::observation_journey::tests::crash_restart_fuzz::mounted_crash_restart_soak_holds_every_invariant_across_two_hundred_seeds --nocapture"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo test --locked -p tracedecay --features memory-provider-host --lib -- --ignored --exact daemon::retained_owner::observation_journey::tests::crash_restart_fuzz::mounted_crash_restart_soak_holds_every_invariant_across_two_hundred_seeds --nocapture
+      - name: "python3 tests/product_memory_fabric_disabled_mode_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 tests/product_memory_fabric_disabled_mode_test.py
       - name: Record scope and reliability ownership
         if: always()
@@ -191,28 +394,67 @@ jobs:
   generated_drift:
     name: "[tdmem-1206][required][generated_drift]"
     needs: scope_crash_security
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Check out the exact candidate
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install the pinned Rust toolchain
+        id: rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - name: Verify generated contracts and clean output
+      - name: "python3 scripts/product/generate-memory-provider-goldens.py --repo . --check"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/product/generate-memory-provider-goldens.py --repo . --check
+      - name: "python3 scripts/product/check-memory-provider-contract-set.py --repo ."
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 scripts/product/check-memory-provider-contract-set.py --repo .
+      - name: "python3 scripts/product/generate-memory-provider-rust.py --repo . --check"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 scripts/product/generate-memory-provider-rust.py --repo . --check
+      - name: "python3 scripts/product/check-memory-provider-rust-bindings.py --repo ."
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           python3 scripts/product/check-memory-provider-rust-bindings.py --repo .
+      - name: "cargo metadata --locked --format-version 1 --no-deps"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo metadata --locked --format-version 1 --no-deps
+      - name: "git diff --check"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           git diff --check
+      - name: "git diff --exit-code"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           git diff --exit-code
+      - name: "test -z \"$(git status --porcelain)\""
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           test -z "$(git status --porcelain)"
       - name: Record generated-drift ownership
         if: always()
@@ -226,6 +468,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out the exact candidate
+        id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
