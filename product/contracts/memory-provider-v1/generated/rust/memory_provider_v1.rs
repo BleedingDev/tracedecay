@@ -204,7 +204,7 @@ pub const CONTRACTS: &[ContractSpec] = &[
     ContractSpec {
         contract_id: "tracedecay.memory.provider.recall.v1",
         bead_id: "tdmem-0204",
-        contract_sha256: "fa16df29a8f4b90193cdd294f8631536a256eb7c55898f8876b6a0f836c0c72e",
+        contract_sha256: "1a8a55d0855a918fe4b02ec3835218b93062563c4280415a89f5f3f1b7ed2e00",
         schema_sha256: "5be720cdd34cc0546f134ecb1bb4a0f2fef0761535629248c7f35bf9a7da8ba3",
     },
     ContractSpec {
@@ -464,6 +464,7 @@ pub const RECALL_CANDIDATE_REQUIRED_FIELDS: &[&str] = &[
     "content_ref",
     "content_sha256",
     "native_score",
+    "confidence",
     "exact_scope_identity",
     "validity",
     "provenance",

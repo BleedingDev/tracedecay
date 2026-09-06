@@ -139,15 +139,19 @@ class MemoryFabricDisabledModeTest(unittest.TestCase):
         # refusing a routing gate that names a provider with the host off.
         calls = re.findall(
             r"let memory_provider_host_mount\s*=\s*"
-            r"mount_project_memory_provider_host\((.*?)\)\?;",
+            r"mount_project_memory_provider_host\((.*?)\)\s*(?:\.await)?\?;",
             self.composition,
             flags=re.DOTALL,
         )
         self.assertEqual(len(calls), 1)
+        # The only extra argument is the caller-owned Native port
+        # interposition, and it exists solely under `#[cfg(test)]`: production
+        # builds pass exactly the resolved activation and the project identity.
         self.assertEqual(
             _compact(calls[0]),
             "memory_provider_activation,&cg,canonical_project_path,"
-            "profile_identity.profile_id(),",
+            "profile_identity.profile_id(),"
+            "#[cfg(test)]native_port_interposition,",
         )
 
         production_entry = _rust_body(
@@ -204,9 +208,21 @@ class MemoryFabricDisabledModeTest(unittest.TestCase):
         variants = [
             line.strip()
             for line in selector.splitlines()
-            if line.strip() and not line.strip().startswith(("///", "//", "#["))
+            if line.strip() and not line.strip().startswith(("///", "//"))
         ]
-        self.assertEqual(variants, ["FromRuntimeConfiguration,"])
+        # The second variant carries a caller-owned Native port interposition
+        # for the Claude host journey; it resolves activation exactly as the
+        # production variant does and exists only in test builds. No variant
+        # may name an activation.
+        self.assertEqual(
+            variants,
+            [
+                "FromRuntimeConfiguration,",
+                '#[cfg(all(test, feature = "memory-provider-host"))]',
+                "FromRuntimeConfigurationWithNativePortInterposition("
+                "NativeApplicationPortInterpositionV1),",
+            ],
+        )
 
         mount = _rust_body(
             self.composition,
