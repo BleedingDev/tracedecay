@@ -19,13 +19,13 @@
     "must_be_ancestor_of_product_head": true
   },
   "observed_pull_request": {
-    "retrieved_at": "2026-09-02",
+    "retrieved_at": "2026-09-06",
     "state": "open",
     "base_ref": "master",
     "base_sha": "b9204dcf7de8faac4ef05af367a546aa29c32e9f",
     "head_ref": "codex/tracedecay-total-redesign-plan-reopened",
-    "head_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
-    "pinned_floor_is_current_head": true
+    "head_sha": "b8cbcaa6fec5062a3c74b828fa460f75b8eae6a3",
+    "pinned_floor_is_current_head": false
   },
   "update_procedure": {
     "observed_pull_request": "Refresh only the observed snapshot after reading PR #707 metadata, then run the verifier and focused test.",

@@ -397,7 +397,7 @@ async fn scanning_census_defers_the_sweep_without_the_degraded_reason() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unknown_census_still_degrades_to_the_offline_inventory() {
+async fn unknown_census_reports_offline_and_retains_every_source() {
     let fixture = open_unseated_graph_fixture().await;
 
     // Unknown (no progress recorded at all) stays a reported degradation:
@@ -415,23 +415,31 @@ async fn unknown_census_still_degrades_to_the_offline_inventory() {
     assert_eq!(
         inventory.degraded_reason().as_deref(),
         Some("vector_inventory_offline:vector_census_incomplete"),
+        "the CI-facing degraded event still reports the exact offline reason"
     );
 
-    // Unknown coverage is not evidence that historical readers are absent.
-    assert_eq!(
-        run_code_generation_retention(
-            &fixture.graph,
-            &fixture.schedulers,
-            &fixture.observations,
-            &fixture.cancellation,
-        )
-        .await,
-        CodeGenerationRetentionOutcomeV1::VectorInventoryUnproven,
-    );
-    assert_eq!(
-        sealed_generation_files(&fixture.store_root).len(),
-        FIXTURE_GENERATION_COUNT,
-    );
+    // Issue #879: the offline protection set names the serving generation,
+    // never the exact sources a mounted vector activation lease binds. An
+    // unknown inventory therefore fails closed — it reports and collects
+    // nothing — instead of sweeping a live vector source away.
+    for pass in 0..2_usize {
+        assert_eq!(
+            run_code_generation_retention(
+                &fixture.graph,
+                &fixture.schedulers,
+                &fixture.observations,
+                &fixture.cancellation,
+            )
+            .await,
+            CodeGenerationRetentionOutcomeV1::Failed,
+            "pass {pass}: an unreadable vector inventory fails the pass for a retry"
+        );
+        assert_eq!(
+            sealed_generation_files(&fixture.store_root).len(),
+            FIXTURE_GENERATION_COUNT,
+            "pass {pass}: an unreadable vector inventory collects nothing"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -543,6 +551,13 @@ fn release_queue_files(store_root: &Path) -> usize {
 async fn held_replay_pool_defers_then_backs_off_then_recovers() {
     let fixture = open_unseated_graph_fixture().await;
     let project_root = fixture.graph.project_root().to_path_buf();
+    // Pin the quiet default-off read the vector-retention phase publishes on
+    // every real tick. Without it the inventory would be the fail-closed
+    // unknown state, which retains everything and never reaches the replay
+    // pool this test exercises.
+    fixture
+        .observations
+        .record_semantic_vector_retention_unseated(&project_root);
     let replay_root = fixture
         .graph
         .db()

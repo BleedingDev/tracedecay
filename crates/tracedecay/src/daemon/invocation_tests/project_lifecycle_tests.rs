@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -25,8 +25,8 @@ use tracedecay_usecases::lsp_runtime::DaemonLspSessionFactory;
 
 use super::{
     RecordingFeedbackCycleObservations, UnavailableCancellationAuthority,
-    UnavailableContextAuthority, UnavailableDiagnosticAuthority, unavailable_feedback_cycle,
-    unavailable_lsp_session_factory,
+    UnavailableContextAuthority, UnavailableDiagnosticAuthority, admitted_root_fixture,
+    unavailable_feedback_cycle, unavailable_lsp_session_factory,
 };
 
 fn recovery_deadline() -> Deadline {
@@ -134,8 +134,8 @@ async fn recovery_quiescence_retires_only_the_selected_projects_lsp_owners() {
     let project_id = ProjectId::new("project.recovery-shared").expect("shared project");
     let profile_a = UserProfileId::new("profile.recovery-a").expect("profile A");
     let profile_b = UserProfileId::new("profile.recovery-b").expect("profile B");
-    let root_a = PathBuf::from("/projects/recovery-a");
-    let root_b = PathBuf::from("/projects/recovery-b");
+    let (root_a, root_a_uri) = admitted_root_fixture("projects/recovery-a");
+    let (root_b, root_b_uri) = admitted_root_fixture("projects/recovery-b");
     let session_a = open_detached_session(
         &service,
         &registry,
@@ -163,7 +163,9 @@ async fn recovery_quiescence_retires_only_the_selected_projects_lsp_owners() {
         &registry,
         &session_b,
         "request.initialize-b",
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"workspaceFolders":[{"uri":"file:///projects/recovery-b","name":"B"}],"capabilities":{"workspace":{"workspaceFolders":true}}}}"#,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"workspaceFolders":[{{"uri":"{root_b_uri}","name":"B"}}],"capabilities":{{"workspace":{{"workspaceFolders":true}}}}}}}}"#
+        ),
         1,
     )
     .await;
@@ -181,7 +183,9 @@ async fn recovery_quiescence_retires_only_the_selected_projects_lsp_owners() {
         &registry,
         &session_b,
         "request.add-a-to-b",
-        r#"{"jsonrpc":"2.0","method":"workspace/didChangeWorkspaceFolders","params":{"event":{"added":[{"uri":"file:///projects/recovery-a","name":"A"}],"removed":[]}}}"#,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"workspace/didChangeWorkspaceFolders","params":{{"event":{{"added":[{{"uri":"{root_a_uri}","name":"A"}}],"removed":[]}}}}}}"#
+        ),
         3,
     )
     .await;
@@ -231,7 +235,7 @@ async fn recovery_quiescence_retires_only_the_selected_projects_lsp_owners() {
             problem: DaemonInvocationProblem::NotFoundOrNotAuthorized
         }
     ));
-    let root_c = PathBuf::from("/projects/recovery-c");
+    let (root_c, _root_c_uri) = admitted_root_fixture("projects/recovery-c");
     let session_c = open_detached_session(
         &service,
         &registry,
@@ -257,7 +261,7 @@ async fn recovery_quiescence_retires_only_the_selected_projects_lsp_owners() {
         .open_lsp_session(
             &registry,
             Some(AuthorizedLspWorkspace::single(AdmittedRoot::new(
-                "file:///projects/recovery-a",
+                root_a_uri.clone(),
             ))),
             "request.recovery-a-stale-owner".to_owned(),
             env!("CARGO_PKG_VERSION").to_owned(),
@@ -313,10 +317,14 @@ async fn recovery_quiescence_retires_only_the_selected_projects_lsp_owners() {
                 CancellationContext::active(format!("cancel.{suffix}")).expect("cancellation"),
             )
             .expect("request context");
+            // A profile store locator is (profile id, store id): both halves
+            // must match for the roots to share one locator. These roots are
+            // two worktrees of the same project in one profile, so they are
+            // registered under that project's one store, not a per-root store.
             let locator = RegisteredRootLocatorV1::new(
                 scope.project_id.clone(),
                 profile_id.clone(),
-                format!("store.{suffix}"),
+                "store.recovery",
                 root,
             )
             .expect("locator");
@@ -339,10 +347,8 @@ async fn recovery_quiescence_retires_only_the_selected_projects_lsp_owners() {
         UtcMicros(1),
     )
     .expect("scope set");
-    let root_a_admission =
-        AdmittedRoot::authorized("file:///projects/recovery-a", scope_a.scope_digest);
-    let root_b_admission =
-        AdmittedRoot::authorized("file:///projects/recovery-b", scope_b.scope_digest);
+    let root_a_admission = AdmittedRoot::authorized(root_a_uri.clone(), scope_a.scope_digest);
+    let root_b_admission = AdmittedRoot::authorized(root_b_uri.clone(), scope_b.scope_digest);
     let stale_federated_workspace = AuthorizedLspWorkspace::new(
         Some(scope_set.digest().clone()),
         vec![root_a_admission.clone(), root_b_admission.clone()],
@@ -398,9 +404,14 @@ async fn recovery_quiescence_retires_only_the_selected_projects_lsp_owners() {
         .actor
         .workspace();
     assert_eq!(workspace_after_settlement.roots().len(), 1);
+    // The session opened with the directory URI `Url::from_directory_path`
+    // builds (trailing slash); the fixture spells the same root without one.
+    // Root identity is the folder, not that spelling, so compare it trimmed.
     assert_eq!(
-        workspace_after_settlement.roots()[0].uri(),
-        "file:///projects/recovery-b"
+        workspace_after_settlement.roots()[0]
+            .uri()
+            .trim_end_matches('/'),
+        root_b_uri
     );
     drop(sessions_after_settlement);
 

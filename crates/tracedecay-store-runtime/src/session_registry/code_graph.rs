@@ -2580,11 +2580,18 @@ impl DaemonSessionRuntimeRegistryV1 {
         let replay_root = project_database
             .database_path()
             .with_extension("graph-replay");
-        // Mount the sealed replay source now, not at the first publication:
-        // retention and recovery after a restart hydrate sealed generations
-        // through the manifest provider before anything is published again,
-        // and an unbound shard refused them as "replay source is not mounted".
-        // The bind is idempotent for the same project identity.
+        // Bind the sealed replay source at seat time, not only when a sealed
+        // publication classifies. Every replay-hydrating path -- verified-head
+        // recovery, and the staging release the semantic-vector retirement
+        // drives -- resolves its source through this binding, so a daemon that
+        // restarts and serves an existing generation without publishing a new
+        // one answered every one of them with "sealed code generation replay
+        // source is not mounted for this projection". That left the vector
+        // census permanently incomplete, and with a fail-closed vector
+        // inventory code-generation retention then collected nothing for the
+        // rest of the process lifetime. The bind is idempotent and additive,
+        // so the publication-time bind stays correct for a route this seat
+        // never covered.
         self.graph_manifest_provider
             .bind(
                 authority.binding().shard_id.clone(),
@@ -2594,7 +2601,10 @@ impl DaemonSessionRuntimeRegistryV1 {
                 replay_root.clone(),
             )
             .map_err(|error| {
-                session_registry_error("bind code generation replay source", error.to_string())
+                session_registry_error(
+                    "bind sealed code generation replay source",
+                    error.to_string(),
+                )
             })?;
         let publication_locks = self.retain_project_publication_locks(&project_shard);
         Ok(RetainedCodeGraphRuntimeV1 {
@@ -3155,15 +3165,16 @@ mod sealed_projection_deadline_tests {
 
     #[test]
     fn sealed_projection_has_no_wall_clock_bail_out() {
-        // Background projection is bounded by cancellation, not wall clock,
-        // regardless of artifact size. The live incident shape (a ~1.6 GB
-        // sealed generation died at a 30-second wall, then at a size-scaled
-        // wall) must never be budgeted below hours again.
+        // Background projection shares the finite corpus-scaled authority
+        // (316e8e73f: 15 minutes, matching the isolated 10x-corpus ceiling)
+        // and is reclaimed by lifecycle cancellation before that. The live
+        // incident shape (a ~1.6 GB sealed generation died at a 30-second
+        // wall, then at a size-scaled wall) must never return.
         assert_eq!(
             sealed_projection_deadline(),
             GRAPH_BACKGROUND_OPERATION_BUDGET
         );
-        assert!(GRAPH_BACKGROUND_OPERATION_BUDGET >= std::time::Duration::from_hours(24));
+        assert!(GRAPH_BACKGROUND_OPERATION_BUDGET >= std::time::Duration::from_mins(10));
     }
 
     #[test]
