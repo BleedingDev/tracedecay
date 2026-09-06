@@ -21,8 +21,12 @@ pub enum EncoderError {
 impl std::fmt::Display for EncoderError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ArtifactsMissing(detail) => write!(formatter, "encoder artifacts missing: {detail}"),
-            Self::ArtifactMismatch(detail) => write!(formatter, "encoder artifact mismatch: {detail}"),
+            Self::ArtifactsMissing(detail) => {
+                write!(formatter, "encoder artifacts missing: {detail}")
+            }
+            Self::ArtifactMismatch(detail) => {
+                write!(formatter, "encoder artifact mismatch: {detail}")
+            }
             Self::Inference(detail) => write!(formatter, "encoder inference failed: {detail}"),
             Self::Cancelled => formatter.write_str("encoder cancelled"),
             Self::InputTooLarge => formatter.write_str("encoder input too large"),
@@ -101,7 +105,11 @@ impl StateRoot {
 
     /// Per-namespace directory; the namespace must be a lowercase sha256 hex.
     pub fn namespace_dir(&self, namespace: &str) -> Result<PathBuf, String> {
-        if namespace.len() != 64 || !namespace.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
+        if namespace.len() != 64
+            || !namespace
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
             return Err("namespace must be lowercase sha256 hex".to_owned());
         }
         Ok(self.0.join("namespaces").join(namespace))
