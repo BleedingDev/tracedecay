@@ -42,6 +42,6 @@
       "tests/product_memory_dependency_direction_test.py"
     ]
   },
-  "host_base_commit": "3881741df",
-  "host_base_note": "Head of feat/pluggable-memory-providers-v2 merged into the backend branch on 2026-09-06 at the user's instruction. The standalone gate fences the branch footprint against this tree (everything not inherited from the host must be backend-owned); the product checkpoint 25778c744 remains the fallback when this field is absent."
+  "host_base_commit": "c6d89e251",
+  "host_base_note": "Host branch head merged into the backend branch on 2026-09-06 (feat/pluggable-memory-providers-v2 @ c6d89e251, includes the upstream PR #707 head). The standalone gate fences the diff from this commit, so host-owned changes are not reported as backend ownership violations."
 }
