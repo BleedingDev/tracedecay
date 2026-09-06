@@ -77,4 +77,14 @@ applied the direction unit test passes 27/27, the real-graph checker reports
 - HOST-STABLE has not been declared by the stabilization agent; 3881741df is the candidate
   host head at the time of writing, not an accepted tree.
 - Beads import of the `ncm-biomem-rs.v1` work package (`product/ncm/plan/task_dag.json`).
-- Rerunning `scripts/product/ncm/check-backend.py` and the host gates on the joined tree.
+- Task 024 mount; the host has no reference to `tracedecay-memory-provider-ncm` yet, so
+  host-level NCM behaviour is unreachable on the joined tree.
+
+## Join verification (ce4b8fb20)
+
+The actual merge (dc0166d23, host head 3881741df) landed with the fixture patch and the
+scoped footprint fence in f94a67076. On ce4b8fb20: workspace `cargo check --all-targets
+--locked` ok, all five host lanes pass (hygiene, registry-contract, provider-neutral crates,
+retention nextest lane, Claude host journey), and `check-backend.py` passes with zero
+blockers (six populations green, journey pass, ownership fence clean). Receipt:
+`product/ncm/receipts/integration/join-verification-ce4b8fb20.json`.
