@@ -1,0 +1,42 @@
+{
+  "task": "ncm-rs-023",
+  "status": "join-verified-not-accepted",
+  "claim": "No task 023 acceptance is claimed. HOST-STABLE is not declared: the upstream floor is still 5749e4fc and the ownership/footprint lanes fail until the sync train advances it. This receipt records that the joined product tree (upstream PR #707 head b8cbcaa6f + NCM backend + regenerated recall contract artifacts) passes every host lane and the standalone backend gate.",
+  "joined_tree": {
+    "head": "9e3a0bd50",
+    "product_branch": "feat/pluggable-memory-providers-v2",
+    "ncm_merge_head": "919b18c14",
+    "upstream_merge_commit": "5a7a3abae",
+    "upstream_head": "b8cbcaa6fec5062a3c74b828fa460f75b8eae6a3"
+  },
+  "workspace": {
+    "cargo check --workspace --all-targets --locked": "ok (pre-existing host warnings only)"
+  },
+  "host_lanes_on_joined_tree": {
+    "hygiene (tracedecay-memory-hygiene)": "pass (cc-1091)",
+    "registry-contract (tracedecay-memory-provider-registry)": "pass (cc-1092)",
+    "provider-neutral crates (provider-api, fabric, provider-native, conformance, evaluation)": "pass (cc-1095)",
+    "retention lane (vector_retention_tests, generation_retention_test, vector_writer_fence_survives_runtime_remount, code-index-runtime retention/vector_source)": "pass (18 run, 18 passed; cc-1098)",
+    "claude host journey (tracedecay-cli product_memory_provider_claude_host_journey)": "pass (1 run, 1 passed; cc-1105)"
+  },
+  "policy_checks_on_joined_tree": {
+    "check-memory-dependency-direction.py (real graph)": "memory dependency direction verified",
+    "tests/product_memory_dependency_direction_test.py": "OK",
+    "tests/product_memory_dependency_policy_test.py": "OK",
+    "tests/product_ncm_surface_audit_test.py": "OK",
+    "check-provider-registry-contract.py": "OK",
+    "check-product-upstream-floor.py": "verified",
+    "sync-policy gate lane python commands": "26 of 29 pass; the three failures are check-upstream-ownership-registry.py, tests/product_patch_footprint_policy_test.py and check-patch-footprint-policy.py, all pending the floor advance; zero diagnostics mention NCM paths",
+    "generated_drift": "regenerated recall contract goldens and Rust bindings at 9e3a0bd50 (drift predated both merges: checkpoint 4c34bb0be added the confidence capability without regenerating)",
+    "tests/product_memory_fabric_disabled_mode_test.py": "OK after restating the mount-selector policy for the cfg(test) Native port interposition variant (commit 9e3a0bd50)"
+  },
+  "backend_gate_on_joined_tree": {
+    "receipt": "../backend/9e3a0bd5019cc15804c955f9f83d0bac3ecd76d4.json",
+    "status": "pass",
+    "populations": "six populations green",
+    "journey": "pass",
+    "ownership_fence": "scoped to host_base_commit 9e3a0bd50 via product/ncm/bootstrap/ownership.json; no allowed-path violations"
+  },
+  "host_integration_state": "The host still does not mount the NCM provider; task 024 is next. HOST-STABLE additionally requires the upstream sync train to advance the floor to b8cbcaa6f.",
+  "notes": "product/ncm/plan/join/023-join-notes.md"
+}

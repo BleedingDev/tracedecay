@@ -42,6 +42,6 @@
       "tests/product_memory_dependency_direction_test.py"
     ]
   },
-  "host_base_commit": "c6d89e251",
-  "host_base_note": "Host branch head merged into the backend branch on 2026-09-06 (feat/pluggable-memory-providers-v2 @ c6d89e251, includes the upstream PR #707 head). The standalone gate fences the diff from this commit, so host-owned changes are not reported as backend ownership violations."
+  "host_base_commit": "9e3a0bd50",
+  "host_base_note": "Joined product branch head on 2026-09-06 (feat/pluggable-memory-providers-v2 @ 9e3a0bd50: upstream PR #707 head b8cbcaa6f, the NCM backend join, and the regenerated recall contract artifacts). The standalone gate fences the diff from this commit, so host-owned changes are not reported as backend ownership violations."
 }
