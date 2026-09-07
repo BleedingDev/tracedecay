@@ -1417,7 +1417,7 @@
         "tdmem-0503",
         "tdmem-0702"
       ],
-      "line_budget": 831,
+      "line_budget": 830,
       "rebase_or_removal_plan": "Remove the typed mount helper, disabled activation, and two construction-context injections as one bounded patch.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
