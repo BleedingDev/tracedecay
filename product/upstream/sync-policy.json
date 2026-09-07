@@ -108,7 +108,8 @@
     ],
     "pins_contract": "Every tracked file that hard-pins floor.sha is either the canonical metadata, declared here as a structured pin (exact JSON pointers or one anchored line, with its exact occurrence count), declared under archival_provenance, or lives under a historical_record_prefixes directory. prepare sweeps the product head with git grep and refuses any unclassified hit; advance-floor rewrites only the declared targets of every pin (fixed pointers, wildcard per-entry stamps, or one anchored line) inside the candidate tree and re-sweeps the candidate tree for both floors; publish repeats the sweep on the published tree. Prose must reference the canonical metadata instead of quoting the floor. The canonical metadata file is advanced separately and must not be listed.",
     "historical_record_prefixes": [
-      ".beads/"
+      ".beads/",
+      "product/architecture/adr/"
     ],
     "archival_provenance": [
       {
