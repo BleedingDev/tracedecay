@@ -146,7 +146,7 @@ its CI evidence, and the accepted floor are unchanged, and the merge carries no
 train receipt, gate evidence, or floor advancement. Its conflict resolutions
 are recorded in the merge commit message.
 
-A further observed head, `3b59bb7eb0b10b4e7a8efc668e793ef7a1d11072` (604
+A further observed head, `3b59bb7eb` (604
 commits past b8cbcaa6f), was merged into the product branch at `18e521acb`
 on 2026-09-07, still with the floor pinned at F. Its conflict resolutions
 are recorded in that merge commit message. Because this head is not a
