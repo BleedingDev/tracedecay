@@ -247,6 +247,18 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked -p tracedecay-agent-hosts hooks::
+      - name: "cargo test --locked -p tracedecay-cli --lib tool_command::"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-cli --lib tool_command::
+      - name: "cargo test --locked -p tracedecay --features test-helpers,test-transport --test daemon_suite cold_registered_project_hook_ack_preserves_route_and_terminal_receipt"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features test-helpers,test-transport --test daemon_suite cold_registered_project_hook_ack_preserves_route_and_terminal_receipt
       - name: Record upstream gate ownership
         if: always()
         shell: bash
@@ -564,6 +576,30 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked -p tracedecay --features memory-provider-host a_provider_that_ignores_its_deadline_cannot_block_the_host_answer
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib daemon::tests::projectless::"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib daemon::tests::projectless::
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::project_route::"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::project_route::
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::server::host_admission_tests::"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::server::host_admission_tests::
+      - name: "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'
       - name: Record Native parity ownership
         if: always()
         shell: bash

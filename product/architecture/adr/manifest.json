@@ -447,6 +447,30 @@
         "ADR-0011",
         "ADR-0015"
       ]
+    },
+    {
+      "id": "ADR-0017",
+      "topic": "patch_footprint_revision_v4",
+      "title": "Revise the patch-footprint policy to v4 for the hook-route bridge and the online-only retention authority",
+      "path": "product/architecture/adr/ADR-0017-patch-footprint-revision-v4.md",
+      "status": "accepted",
+      "decision_summary": "Adopt patch-footprint.v4: re-measure every aggregate cap against the tree that carries the hook-route bridge, the online-only retention authority, the feature-gated build repair, and the executable Codex fixture at upstream head 3b59bb7eb (production files 37 -> 56, test/fixture files 9 -> 18, total lines 3500 -> 6430, per-file lines 560 -> 830, exception-zone files 4 -> 5), add the hook_route_bridge, vector_retention_authority, and feature_gated_build_repair touch points, widen host_hook_ingest to the Codex fixture, admit agents/claude.rs as one more host_specific_adapters exception, and restate the ADR-0016 cap_revision block under v4 unchanged.",
+      "required_rejections": [
+        "Register the bridge and retention work as fresh per-touch-point cap revisions under v3",
+        "Move the bridge, retention, and repair code product-side to stay inside the v3 caps",
+        "Keep deciding Claude readiness from the marketplace source to avoid a fifth exception-zone file"
+      ],
+      "verification_beads": [
+        "tdmem-1001",
+        "tdmem-1206",
+        "tdmem-1208"
+      ],
+      "depends_on_adrs": [
+        "ADR-0008",
+        "ADR-0011",
+        "ADR-0014",
+        "ADR-0016"
+      ]
     }
   ]
 }

@@ -13,7 +13,7 @@
         "hand-editing Cargo.lock"
       ],
       "id": "workspace_wiring",
-      "max_changed_lines": 140,
+      "max_changed_lines": 163,
       "max_files": 2,
       "paths": [
         "Cargo.toml",
@@ -90,7 +90,7 @@
         "provider authority over source, sessions, Native facts, or configuration"
       ],
       "id": "daemon_composition_mount",
-      "max_changed_lines": 810,
+      "max_changed_lines": 1094,
       "max_files": 15,
       "paths": [
         "crates/tracedecay/Cargo.toml",
@@ -128,7 +128,7 @@
         "adr": "product/architecture/adr/ADR-0016-daemon-shutdown-receipt-ordering-headroom.md",
         "measured_changed_lines": 416,
         "measured_files": 8,
-        "policy_revision": "patch-footprint.v3",
+        "policy_revision": "patch-footprint.v4",
         "previous_max_changed_lines": 360,
         "previous_max_files": 8
       },
@@ -174,7 +174,7 @@
         "adding provider or memory integration logic"
       ],
       "id": "production_harness_shutdown",
-      "max_changed_lines": 62,
+      "max_changed_lines": 106,
       "max_files": 1,
       "paths": [
         "crates/tracedecay/src/daemon/production_harness.rs"
@@ -309,7 +309,7 @@
         "configuration bypassing transactional revision and audit"
       ],
       "id": "configuration_registry_mount",
-      "max_changed_lines": 540,
+      "max_changed_lines": 718,
       "max_files": 5,
       "paths": [
         "crates/tracedecay/src/config.rs",
@@ -330,7 +330,8 @@
         "call the existing host-neutral transcript ingest route from a host lifecycle event under an explicit, bounded time budget",
         "register an additional project-scoped transcript-capture kernel for a host that already has a profile-scoped kernel, reusing the session-sync ingest pass",
         "declare an opt-in, default-off product test target and the feature it requires in the tracedecay-cli manifest",
-        "extend the existing host lifecycle acceptance test with repeated-install idempotence and interrupted-reinstall rollback assertions"
+        "extend the existing host lifecycle acceptance test with repeated-install idempotence and interrupted-reinstall rollback assertions",
+        "provide an executable fake Codex CLI fixture that models the exact non-interactive plugin grammar so the acceptance test drives the production Codex invocation path"
       ],
       "category": "host_hook_ingest",
       "forbidden_changes": [
@@ -341,16 +342,108 @@
         "turning the product test target or its feature on by default"
       ],
       "id": "host_hook_ingest",
-      "max_changed_lines": 200,
-      "max_files": 3,
+      "max_changed_lines": 486,
+      "max_files": 4,
       "paths": [
         "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest/kernels.rs",
         "crates/tracedecay-cli/Cargo.toml",
-        "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance.rs"
+        "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance.rs",
+        "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance/native_plugin_fixture.rs"
       ],
       "required_verification": [
         "cargo test --locked -p tracedecay --features memory-provider-host hook_runtime",
         "cargo test --locked -p tracedecay-cli --features test-transport --test host_lifecycle_cli_acceptance",
+        "python3 scripts/product/check-patch-footprint-policy.py"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "acknowledge a hook event carrying a request id only after its canonical effect completed, leaving id-less notifications response-free",
+        "strip route-only host metadata from handler arguments after routing while preserving the original identity view",
+        "select the retained project server a published private route names for a projectless reader socket, under the projectless profile admission",
+        "forward route-only metadata through the CLI validation gate without weakening declared tool fields",
+        "test the bridge in process and through the shipped binary over the real broker socket"
+      ],
+      "category": "hook_route_bridge",
+      "forbidden_changes": [
+        "creating or mutating a project route anywhere but the hook publication path",
+        "serving a private route to a socket authenticated for another profile",
+        "stripping a field the called tool declares in its input schema",
+        "naming a provider, registry, or fabric type on the bridge path",
+        "blocking a hook client beyond the existing hook timeout"
+      ],
+      "id": "hook_route_bridge",
+      "max_changed_lines": 1046,
+      "max_files": 12,
+      "paths": [
+        "crates/tracedecay/src/daemon/projectless.rs",
+        "crates/tracedecay/src/daemon/connection_serving.rs",
+        "crates/tracedecay/src/daemon/core_hooks.rs",
+        "crates/tracedecay/src/mcp/server/requests.rs",
+        "crates/tracedecay/src/mcp/project_route.rs",
+        "crates/tracedecay/src/mcp/server/host_admission_tests.rs",
+        "crates/tracedecay/src/daemon/tests.rs",
+        "crates/tracedecay/src/daemon/tests/projectless.rs",
+        "crates/tracedecay-cli/src/tool_command/args.rs",
+        "crates/tracedecay-cli/src/tool_command/tests.rs",
+        "crates/tracedecay/tests/daemon_suite/indexing_lifecycle_test.rs",
+        "crates/tracedecay/tests/daemon_suite/code_index_journey.rs"
+      ],
+      "required_verification": [
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib daemon::tests::projectless::",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::project_route::",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::server::host_admission_tests::",
+        "cargo test --locked -p tracedecay-cli --lib tool_command::",
+        "cargo test --locked -p tracedecay --features test-helpers,test-transport --test daemon_suite cold_registered_project_hook_ack_preserves_route_and_terminal_receipt",
+        "python3 scripts/product/check-patch-footprint-policy.py"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "return a typed SemanticUnseated outcome from code-generation retention and treat it as an ordinary quiet completion",
+        "delete the offline protection set and its serving-generation pin helper",
+        "bind the vector writer lane to the durable code scope and let the blocking deletion own the writer freeze",
+        "replace or add retention tests and harness helpers that prove the online-only authority"
+      ],
+      "category": "vector_retention_authority",
+      "forbidden_changes": [
+        "deleting a source generation without an exact, complete vector inventory",
+        "treating a missing or offline inventory as empty",
+        "introducing a new lock, sleep, or fixed poll count as synchronization",
+        "changing the fail-closed handling of reset, corrupt, or denied vector authorities"
+      ],
+      "id": "vector_retention_authority",
+      "max_changed_lines": 517,
+      "max_files": 5,
+      "paths": [
+        "crates/tracedecay/src/daemon/store_maintenance/mod.rs",
+        "crates/tracedecay/src/daemon/maintenance/generation.rs",
+        "crates/tracedecay/src/daemon/store_maintenance/vector_retention_tests.rs",
+        "crates/tracedecay/src/daemon/production_harness/generation_retention_test.rs",
+        "crates/tracedecay-usecases/src/semantic_runtime/production.rs"
+      ],
+      "required_verification": [
+        "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'",
+        "python3 scripts/product/check-patch-footprint-policy.py"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "replace a private field access with the public accessor upstream introduced for it, inside a file upstream only compiles under a feature"
+      ],
+      "category": "feature_gated_build_repair",
+      "forbidden_changes": [
+        "changing what a repaired expression reads or the behavior of the feature",
+        "touching a file that compiles without the repair"
+      ],
+      "id": "feature_gated_build_repair",
+      "max_changed_lines": 11,
+      "max_files": 1,
+      "paths": [
+        "crates/tracedecay/src/dashboard.rs"
+      ],
+      "required_verification": [
+        "cargo check --workspace --all-targets --features test-transport --locked",
         "python3 scripts/product/check-patch-footprint-policy.py"
       ]
     }
@@ -672,19 +765,20 @@
     }
   ],
   "initial_budget": {
-    "default_max_exception_zone_files": 4,
+    "default_max_exception_zone_files": 5,
     "manual_generated_file_edits": 0,
     "max_allowed_touch_point_files_per_category": 15,
-    "max_changed_lines_per_upstream_file": 560,
+    "max_changed_lines_per_upstream_file": 830,
     "max_composition_root_files": 15,
     "max_exception_files_per_adr": 2,
-    "max_total_upstream_changed_lines": 3500,
-    "max_upstream_existing_production_files": 37,
-    "max_upstream_existing_test_or_fixture_files": 9,
+    "max_total_upstream_changed_lines": 6430,
+    "max_upstream_existing_production_files": 56,
+    "max_upstream_existing_test_or_fixture_files": 18,
     "max_workspace_manifest_files": 2,
     "notes": [
       "Revision patch-footprint.v2 is approved by product/architecture/adr/ADR-0011-patch-footprint-revision-v2.md: every cap equals the M4 observation-journey mount, M5 cognitive-recall port, Native configuration registration, and session-sync exact-scope footprint measured at that revision's tree plus at most roughly fifteen percent headroom. Per-entry line_budget values in the convergence map remain the binding limit for an individual file.",
       "Revision patch-footprint.v3 is approved by product/architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md: it carries every v2 cap forward unchanged except the three the Claude Code host hook ingest journey moves - upstream existing production files 34 -> 37, total upstream changed lines 3300 -> 3500, and exception-zone files 2 -> 4 - each set from the footprint measured at this revision's tree (37 production files, 3393 total changed lines, 4 exception-zone files) plus at most roughly fifteen percent headroom.",
+      "Revision patch-footprint.v4 is approved by product/architecture/adr/ADR-0017-patch-footprint-revision-v4.md: it re-measures every aggregate cap against the tree that carries the hook-route bridge, the online-only retention authority, the feature-gated build repair, and the executable Codex fixture at upstream head 3b59bb7eb - upstream existing production files 37 -> 56, test/fixture files 9 -> 18, total upstream changed lines 3500 -> 6430, changed lines per upstream file 560 -> 830, and exception-zone files 4 -> 5 - each the measurement plus at most roughly fifteen percent headroom. It adds the hook_route_bridge, vector_retention_authority, and feature_gated_build_repair touch points, widens host_hook_ingest to the Codex fixture, and admits one more host_specific_adapters file (agents/claude.rs) under this ADR.",
       "ADR-0016 supersedes only ADR-0015 as the approving decision for the daemon_shutdown_deadline touch point, retaining 8 files and raising only its line cap from 360 to 420 against a measured 8 files and 416 lines for the deterministic types_tests.rs supersession receipt-ordering regression. Root commits this policy slice before the implementation slice. It changes no aggregate cap and keeps patch-footprint.v3.",
       "Added files under product_owned_paths are excluded from the upstream footprint totals.",
       "Renaming or copying an upstream file counts as touching the destination and source.",
@@ -692,7 +786,7 @@
       "Cargo.lock is a generated dependency-resolution output: it may change only with a workspace-manifest touch and a focused cargo metadata/build receipt; it is not a manually editable contract."
     ]
   },
-  "policy_revision": "patch-footprint.v3",
+  "policy_revision": "patch-footprint.v4",
   "principles": [
     "Add product-owned crates and tests instead of embedding provider logic in Zack-owned crates.",
     "Mount product behavior only at narrow application, daemon-composition, observation, recall, feedback, and configuration seams.",
@@ -736,7 +830,7 @@
     "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs"
   ],
   "schema_version": 1,
-  "scope": "Pluggable-memory implementation through Native parity, NCM observer admission, the mounted observation journey (M4), cognitive recall integration (M5), and evaluation baselines (M8). Revision patch-footprint.v2 (ADR-0011) replaced the v1 caps with the footprint measured at its revision tree plus bounded headroom, and revision patch-footprint.v3 (ADR-0014) does the same for the Claude Code host hook ingest journey, which also adds the host_hook_ingest touch point and a two-file host-adapter exception. Later phases must either remain inside these caps or approve a new policy revision by ADR.",
+  "scope": "Pluggable-memory implementation through Native parity, NCM observer admission, the mounted observation journey (M4), cognitive recall integration (M5), and evaluation baselines (M8). Revision patch-footprint.v2 (ADR-0011) replaced the v1 caps with the footprint measured at its revision tree plus bounded headroom, and revision patch-footprint.v3 (ADR-0014) does the same for the Claude Code host hook ingest journey, which also adds the host_hook_ingest touch point and a two-file host-adapter exception. Later phases must either remain inside these caps or approve a new policy revision by ADR. Revision patch-footprint.v4 (ADR-0017) re-measures every cap for the hook-route bridge, the online-only retention authority, the feature-gated build repair, and the executable Codex fixture at upstream head 3b59bb7eb.",
   "title": "TraceDecay V2 provider patch-footprint policy",
   "upstream_floor": {
     "metadata": "product/upstream/tracedecay-v2-pr707.json",

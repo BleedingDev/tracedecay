@@ -24,7 +24,7 @@ Root will commit this policy slice before the implementation slice containing th
 - Approved max changed lines: `420`
 - Measured files: `8`
 - Measured changed lines: `416`
-- Policy revision: `patch-footprint.v3`
+- Policy revision: `patch-footprint.v4`
 - Supersedes: `product/architecture/adr/ADR-0015-daemon-shutdown-test-fence-and-supersession-headroom.md`
 
 ## Consequences
@@ -44,7 +44,7 @@ Root will commit this policy slice before the implementation slice containing th
 
 1. `daemon_shutdown_deadline` is capped at 8 files and 420 changed lines, derived from a measured 8 files and 416 lines.
 2. The touch point adds only the exact `types_tests.rs` allowlist path and raises its changed-line cap; its file cap and every aggregate cap remain unchanged.
-3. The policy revision remains `patch-footprint.v3`, and ADR-0016 supersedes only ADR-0015's approving role for this touch point.
+3. The policy revision was `patch-footprint.v3` when this cap was approved; ADR-0017 restates the block under `patch-footprint.v4` with the numbers unchanged, and ADR-0016 supersedes only ADR-0015's approving role for this touch point.
 4. Root commits this policy slice before the implementation slice containing the deterministic `types_tests.rs` regression.
 5. Existing convergence entries and their semantic content remain unchanged.
 

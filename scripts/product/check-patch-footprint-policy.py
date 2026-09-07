@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 EXPECTED_FLOOR = "5749e4fcfe268e17bd19a0e6ef90c646f7b37289"
-EXPECTED_POLICY_REVISION = "patch-footprint.v3"
+EXPECTED_POLICY_REVISION = "patch-footprint.v4"
 EXPECTED_CONVERGENCE_SCHEMA = "product/upstream/convergence-map.schema.json"
 EXPECTED_CONVERGENCE_SCHEMA_VERSION = 2
 EXPECTED_CLASSIFICATION_PRECEDENCE = [
@@ -33,14 +33,17 @@ BEAD_ID_RE = re.compile(r"^tdmem-[0-9]{4}$")
 # is the footprint measured at the revision tree plus at most ~15% headroom.
 # v2 (ADR-0011) sized the M4 journey mount, M5 recall port, Native
 # configuration, and session-sync scope; v3 adds the Claude Code host hook
-# ingest journey, which measures 37 upstream production files and 3393 total
-# upstream changed lines. Per-entry line budgets in the convergence map remain
+# ingest journey. Revision patch-footprint.v4 (ADR-0017) re-measures every cap at
+# the tree carrying the hook-route bridge, the online-only retention authority,
+# the feature-gated build repair, and the executable Codex fixture against
+# upstream head 3b59bb7eb: 49 upstream production files, 16 test/fixture
+# files, 5594 total upstream changed lines, and 723 lines in the largest file. Per-entry line budgets in the convergence map remain
 # the binding per-file limit.
 EXPECTED_BUDGET = {
-    "max_upstream_existing_production_files": 37,
-    "max_upstream_existing_test_or_fixture_files": 9,
-    "max_total_upstream_changed_lines": 3500,
-    "max_changed_lines_per_upstream_file": 560,
+    "max_upstream_existing_production_files": 56,
+    "max_upstream_existing_test_or_fixture_files": 18,
+    "max_total_upstream_changed_lines": 6430,
+    "max_changed_lines_per_upstream_file": 830,
     "max_composition_root_files": 15,
     # 15 covers the daemon composition mount once the observation journey,
     # cognitive recall, and Native configuration seams are live; every other
@@ -50,7 +53,7 @@ EXPECTED_BUDGET = {
     # configuration-registry files approved by ADR-0012; revision v3 raises it
     # to four for the two host-adapter hook files approved by ADR-0014. The
     # per-ADR cap of 2 keeps either ADR from being stretched to a third file.
-    "default_max_exception_zone_files": 4,
+    "default_max_exception_zone_files": 5,
     "max_exception_files_per_adr": 2,
     "max_workspace_manifest_files": 2,
     "manual_generated_file_edits": 0,
@@ -103,6 +106,9 @@ EXPECTED_TOUCH_POINTS = {
     "post_settlement_feedback_mount",
     "configuration_registry_mount",
     "host_hook_ingest",
+    "hook_route_bridge",
+    "vector_retention_authority",
+    "feature_gated_build_repair",
 }
 # Touch-point-local caps are the tight per-seam limit behind the ADR-0011
 # aggregate caps, so they are pinned here too: a category cannot widen its own
@@ -110,18 +116,21 @@ EXPECTED_TOUCH_POINTS = {
 # approved by ADR before the change that needs it, and is never bundled into
 # the change that exceeds the previous cap") binds these caps as well.
 EXPECTED_TOUCH_POINT_CAPS = {
-    "workspace_wiring": (2, 140),
+    "workspace_wiring": (2, 163),
     "application_contract_mount": (3, 220),
     "cognitive_recall_contract": (4, 940),
-    "daemon_composition_mount": (15, 810),
+    "daemon_composition_mount": (15, 1094),
     "daemon_shutdown_deadline": (8, 420),
-    "production_harness_shutdown": (1, 62),
+    "production_harness_shutdown": (1, 106),
     "integration_test_runtime_isolation": (3, 240),
     "normalized_observation_mount": (2, 160),
     "recall_context_mount": (5, 340),
     "post_settlement_feedback_mount": (2, 160),
-    "configuration_registry_mount": (5, 540),
-    "host_hook_ingest": (3, 200),
+    "configuration_registry_mount": (5, 718),
+    "host_hook_ingest": (4, 486),
+    "hook_route_bridge": (12, 1046),
+    "vector_retention_authority": (5, 517),
+    "feature_gated_build_repair": (1, 11),
 }
 # Categories whose local caps were revised above the value this policy revision
 # shipped with, and the ADR that approved the exact numbers pinned above. A

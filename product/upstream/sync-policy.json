@@ -251,7 +251,9 @@
           "cargo test --locked -p tracedecay-usecases config",
           "cargo check --workspace --all-targets --locked",
           "cargo test --locked -p tracedecay-agent-hosts hooks::claude",
-          "cargo test --locked -p tracedecay-agent-hosts hooks::"
+          "cargo test --locked -p tracedecay-agent-hosts hooks::",
+          "cargo test --locked -p tracedecay-cli --lib tool_command::",
+          "cargo test --locked -p tracedecay --features test-helpers,test-transport --test daemon_suite cold_registered_project_hook_ack_preserves_route_and_terminal_receipt"
         ]
       },
       "product_contracts": {
@@ -309,7 +311,11 @@
           "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::cognitive_recall::tests::a_wedged_provider_strands_one_accounted_worker_and_capacity_is_reclaimed",
           "cargo test --locked -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss",
           "cargo test --locked -p tracedecay --features memory-provider-host an_ordinary_mcp_context_call_returns_the_routed_advisory_lane",
-          "cargo test --locked -p tracedecay --features memory-provider-host a_provider_that_ignores_its_deadline_cannot_block_the_host_answer"
+          "cargo test --locked -p tracedecay --features memory-provider-host a_provider_that_ignores_its_deadline_cannot_block_the_host_answer",
+          "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib daemon::tests::projectless::",
+          "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::project_route::",
+          "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::server::host_admission_tests::",
+          "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'"
         ]
       },
       "provider_conformance": {

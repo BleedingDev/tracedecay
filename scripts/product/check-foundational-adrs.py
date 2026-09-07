@@ -27,6 +27,7 @@ EXPECTED_DECISIONS = {
     "ADR-0014": "host_hook_ingest_footprint_revision_v3",
     "ADR-0015": "daemon_shutdown_test_fence_and_supersession_headroom",
     "ADR-0016": "daemon_shutdown_receipt_ordering_headroom",
+    "ADR-0017": "patch_footprint_revision_v4",
 }
 
 EXPECTED_PATHS = {
@@ -52,6 +53,10 @@ EXPECTED_PATHS = {
         "product/architecture/adr/"
         "ADR-0016-daemon-shutdown-receipt-ordering-headroom.md"
     ),
+    "ADR-0017": (
+        "product/architecture/adr/"
+        "ADR-0017-patch-footprint-revision-v4.md"
+    ),
 }
 
 EXPECTED_STATUSES = {
@@ -71,6 +76,7 @@ EXPECTED_STATUSES = {
     "ADR-0014": "accepted",
     "ADR-0015": "accepted",
     "ADR-0016": "accepted",
+    "ADR-0017": "accepted",
 }
 
 REQUIRED_SECTIONS = [
@@ -165,9 +171,19 @@ REQUIRED_GLOBAL_PHRASES = {
         "Approved max changed lines: `420`",
         "Measured files: `8`",
         "Measured changed lines: `416`",
-        "Policy revision: `patch-footprint.v3`",
+        "Policy revision: `patch-footprint.v4`",
         "Root will commit this policy slice before the implementation slice",
         "Every aggregate cap",
+    ],
+    "ADR-0017": [
+        "`patch-footprint.v4`",
+        "| upstream existing production files | 37 | 56 | 49 |",
+        "| total upstream changed lines | 3500 | 6430 | 5594 |",
+        "| exception-zone files without ADR/policy revision | 4 | 5 | 5 |",
+        "`hook_route_bridge` touch point is capped at 12 files and 1046 changed",
+        "`vector_retention_authority` touch point is capped at 5 files and 517 changed",
+        "crates/tracedecay-agent-hosts/src/agents/claude.rs",
+        "never bundled into the change that exceeds the previous cap",
     ],
     "ADR-0009": [
         "supervised isolated local process",

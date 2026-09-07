@@ -206,9 +206,9 @@ class PatchFootprintPolicyTest(unittest.TestCase):
 
     def test_budget_cannot_be_silently_loosened(self) -> None:
         policy = copy.deepcopy(self.policy)
-        policy["initial_budget"]["max_total_upstream_changed_lines"] = 3501
+        policy["initial_budget"]["max_total_upstream_changed_lines"] = 6431
         self.assert_rejected(
-            "initial_budget.max_total_upstream_changed_lines must be 3500",
+            "initial_budget.max_total_upstream_changed_lines must be 6430",
             policy=policy,
         )
 
@@ -1861,7 +1861,7 @@ class PatchFootprintPolicyTest(unittest.TestCase):
             - Approved max changed lines: `420`
             - Measured files: `8`
             - Measured changed lines: `416`
-            - Policy revision: `patch-footprint.v3`
+            - Policy revision: `patch-footprint.v4`
 
             ## Decision
 

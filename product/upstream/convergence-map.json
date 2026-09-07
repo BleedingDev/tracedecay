@@ -2,7 +2,7 @@
   "$schema": "product/upstream/convergence-map.schema.json",
   "schema_version": 2,
   "bead_id": "tdmem-0308",
-  "policy_revision": "patch-footprint.v3",
+  "policy_revision": "patch-footprint.v4",
   "upstream_floor_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
   "owners": {
     "product": {
@@ -954,7 +954,9 @@
         "crates/tracedecay-agent-hosts/src/hooks/mod.rs",
         "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest/kernels.rs",
         "crates/tracedecay-cli/Cargo.toml",
-        "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance.rs"
+        "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance.rs",
+        "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance/native_plugin_fixture.rs",
+        "crates/tracedecay-agent-hosts/src/agents/claude.rs"
       ],
       "touch_points": [
         "host_hook_ingest",
@@ -1015,6 +1017,119 @@
       "upstreamability": {
         "kind": "product_only",
         "rationale": "The licensed Biomem-derived backend and its evidence remain isolated from the upstream host architecture."
+      }
+    },
+    {
+      "id": "hook_route_bridge",
+      "status": "active",
+      "owner": "ScriptedAlchemy",
+      "ownership_class": "upstream_owned",
+      "feature": "hook-route-bridge",
+      "path_patterns": [
+        "crates/tracedecay/src/daemon/projectless.rs",
+        "crates/tracedecay/src/daemon/connection_serving.rs",
+        "crates/tracedecay/src/daemon/core_hooks.rs",
+        "crates/tracedecay/src/mcp/server/requests.rs",
+        "crates/tracedecay/src/mcp/project_route.rs",
+        "crates/tracedecay/src/mcp/server/host_admission_tests.rs",
+        "crates/tracedecay/src/daemon/tests.rs",
+        "crates/tracedecay/src/daemon/tests/projectless.rs",
+        "crates/tracedecay-cli/src/tool_command/args.rs",
+        "crates/tracedecay-cli/src/tool_command/tests.rs",
+        "crates/tracedecay/tests/daemon_suite/indexing_lifecycle_test.rs",
+        "crates/tracedecay/tests/daemon_suite/code_index_journey.rs"
+      ],
+      "touch_points": [
+        "hook_route_bridge"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "rationale": "Hold the hook-route bridge: a hook event is acknowledged by the daemon only after its private project route is published, route-only host metadata is stripped from strict tool arguments while the identity view survives, the CLI forwards that metadata, and a projectless socket carrying explicit session or thread identity is served by the published project instead of the profile-only dispatcher.",
+      "semantic_invariants": [
+        "Route publication is acknowledged, never assumed: a hook client waits for {processed: true} before it closes the socket.",
+        "Handler arguments never contain host envelopes the tool did not declare, and the pre-strip view still binds the exact caller session for routing and analytics.",
+        "Every bridge selection passes the same profile admission as the projectless dispatcher and fails closed on unmatched identity, dead servers, and cached failures.",
+        "All bridge behavior is host-neutral daemon and CLI code; no provider, registry, or fabric type is named on the path."
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib daemon::tests::projectless::",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::project_route::",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::server::host_admission_tests::",
+        "cargo test --locked -p tracedecay-cli --lib tool_command::",
+        "cargo test --locked -p tracedecay --features test-helpers,test-transport --test daemon_suite cold_registered_project_hook_ack_preserves_route_and_terminal_receipt"
+      ],
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Acknowledged hook delivery and route-only metadata stripping fix shipped defects in host-neutral code; upstream adoption would retire this area."
+      }
+    },
+    {
+      "id": "vector_retention_authority",
+      "status": "active",
+      "owner": "ScriptedAlchemy",
+      "ownership_class": "upstream_owned",
+      "feature": "vector-retention-authority",
+      "path_patterns": [
+        "crates/tracedecay/src/daemon/store_maintenance/mod.rs",
+        "crates/tracedecay/src/daemon/maintenance/generation.rs",
+        "crates/tracedecay/src/daemon/store_maintenance/vector_retention_tests.rs",
+        "crates/tracedecay/src/daemon/production_harness/generation_retention_test.rs",
+        "crates/tracedecay-usecases/src/semantic_runtime/production.rs"
+      ],
+      "touch_points": [
+        "vector_retention_authority"
+      ],
+      "bead_ids": [
+        "tdmem-1100",
+        "tdmem-1200"
+      ],
+      "rationale": "Hold the online-only deletion authority for code-generation retention: deletion is authorized only by an exact vector inventory, the default-off unseated state defers quietly, the vector writer lane is bound to the durable code scope so remount cannot bypass a live fence, and the blocking deletion owns that fence.",
+      "semantic_invariants": [
+        "No source generation is deleted while the vector inventory is unseated, offline, scanning, reset, corrupt, or denied.",
+        "A complete empty inventory is valid evidence and still collects, so retention makes bounded progress.",
+        "A mounted activation lease keeps its exact source generation across daemon restart.",
+        "The unseated default-off daemon reports an ordinary completion rather than a degraded retry loop."
+      ],
+      "tests": [
+        "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'"
+      ],
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A retention pass that never deletes without inventory authority is a safety property upstream can adopt unchanged."
+      }
+    },
+    {
+      "id": "feature_gated_build_repair",
+      "status": "active",
+      "owner": "ScriptedAlchemy",
+      "ownership_class": "upstream_owned",
+      "feature": "feature-gated-build-repair",
+      "path_patterns": [
+        "crates/tracedecay/src/dashboard.rs"
+      ],
+      "touch_points": [
+        "feature_gated_build_repair"
+      ],
+      "bead_ids": [
+        "tdmem-1200",
+        "tdmem-1208"
+      ],
+      "rationale": "Hold build repairs for upstream files that only compile under a feature upstream CI does not build, so the product tree checks cleanly with every feature it ships.",
+      "semantic_invariants": [
+        "A repair changes how a value is read, never what is read or what the feature does.",
+        "Each repair is deleted the moment the upstream file compiles on its own."
+      ],
+      "tests": [
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ],
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "These are upstream build fixes by definition."
       }
     }
   ],
@@ -1302,7 +1417,7 @@
         "tdmem-0503",
         "tdmem-0702"
       ],
-      "line_budget": 560,
+      "line_budget": 831,
       "rebase_or_removal_plan": "Remove the typed mount helper, disabled activation, and two construction-context injections as one bounded patch.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -1633,7 +1748,7 @@
         "tdmem-0404",
         "tdmem-1204"
       ],
-      "line_budget": 16,
+      "line_budget": 106,
       "rebase_or_removal_plan": "Drop this caller adaptation when upstream exposes the same bounded production-harness shutdown path or removes the cfg(test)-only convenience method.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -1829,7 +1944,7 @@
           "Hard-code the provider composition as always-on and drop the settings",
           "Gate the provider on an environment variable or build feature only"
         ],
-        "policy_revision": "patch-footprint.v3",
+        "policy_revision": "patch-footprint.v4",
         "rollback_plan": "Delete the two setting registrations and the validated routing default from register_project_settings; the surrounding settings vector and every other key are untouched, so the file returns to its upstream shape."
       },
       "rationale": "Declare memory.provider_native_enabled.v1 (Boolean, default false) and the recall-routing setting (validated MemoryProviderRecallRoutingV1 document) beside the settings the registry already owns, both Public and DaemonRestart.",
@@ -1874,7 +1989,7 @@
           "Hard-code the provider composition as always-on and drop the settings",
           "Gate the provider on an environment variable or build feature only"
         ],
-        "policy_revision": "patch-footprint.v3",
+        "policy_revision": "patch-footprint.v4",
         "rollback_plan": "Remove the two keys from the additive-key list; the list returns to its single upstream entry and pre-existing stored values become inert rows the registry ignores."
       },
       "rationale": "Add the two memory-provider setting keys to the existing additive-key reconciliation list next to INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY so existing profiles gain them on reconciliation.",
@@ -1922,7 +2037,7 @@
       "bead_ids": [
         "tdmem-0607"
       ],
-      "line_budget": 90,
+      "line_budget": 172,
       "rebase_or_removal_plan": "Remove the two key constants and the routing document type as one additive patch if upstream adopts equivalent settings.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -1978,7 +2093,7 @@
       "bead_ids": [
         "tdmem-0607"
       ],
-      "line_budget": 250,
+      "line_budget": 289,
       "rebase_or_removal_plan": "Delete the two fields and the routing reader together with the composition-root consumer. Follow the config module if upstream relocates it again; the previous location is kept as a retired row.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -2035,7 +2150,7 @@
       "bead_ids": [
         "tdmem-0607"
       ],
-      "line_budget": 175,
+      "line_budget": 234,
       "rebase_or_removal_plan": "Delete the two tests with the fields.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -2350,7 +2465,7 @@
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "integration_test_runtime_isolation",
-      "rationale": "Un-gate the ServiceRunner import in the daemon-control service test module so the crate's lib tests compile on non-Linux hosts. Upstream gates the import with #[cfg(target_os = \"linux\")] while its own released_windows_replacement_lease_is_reacquired_shared_before_restore test names ServiceRunner::WindowsTask unconditionally, so cargo check --workspace --all-targets cannot compile on macOS at floor 5749e4fc. The file is otherwise byte-identical to upstream.",
+      "rationale": "Un-gate the ServiceRunner import in the daemon-control service test module so the crate's lib tests compile on non-Linux hosts. Upstream gates the import with #[cfg(target_os = \"linux\")] while its own released_windows_replacement_lease_is_reacquired_shared_before_restore test names ServiceRunner::WindowsTask unconditionally, so cargo check --workspace --all-targets cannot compile on macOS at floor 5749e4fc. The file is otherwise byte-identical to upstream. Retired at upstream head 3b59bb7eb: the file no longer differs from upstream.",
       "semantic_invariants": [
         "No test body, assertion, fixture, or production path in tracedecay-daemon-control changes; only the import's platform gate is removed.",
         "The import becomes unconditional, which is correct on every platform because the test that consumes ServiceRunner is itself unconditional.",
@@ -2368,7 +2483,7 @@
       ],
       "line_budget": 4,
       "rebase_or_removal_plan": "Delete this entry and restore upstream's file verbatim as soon as upstream either gates the consuming test to Linux as well or drops the cfg from the import itself; the change is a single deleted attribute line and carries no product semantics.",
-      "status": "active",
+      "status": "retired",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
         "kind": "upstream_candidate",
@@ -2391,7 +2506,7 @@
           "Widen the profile-scoped Claude kernel to also cover registered projects",
           "Make the catch-up ingest blocking or unbounded so no frame can be missed"
         ],
-        "policy_revision": "patch-footprint.v3",
+        "policy_revision": "patch-footprint.v4",
         "rollback_plan": "Delete the two call sites, the ingest_claude_project_transcript helper, and the three budget constants; the handlers return to their upstream profile-scoped-only shape and nothing else in the file is touched."
       },
       "rationale": "Run one bounded, fail-open project-scoped Claude transcript catch-up on SessionStart (5s budget) and Stop (25s budget) through the existing super::ingest_transcript_for_event route, so a Claude session inside a registered project becomes canonical project observations at the hook boundary instead of waiting for the daemon's session-sync sweep.",
@@ -2413,7 +2528,7 @@
       "bead_ids": [
         "tdmem-1001"
       ],
-      "line_budget": 85,
+      "line_budget": 129,
       "rebase_or_removal_plan": "Re-apply two call sites plus one private helper and three constants onto the upstream handlers; delete them outright if upstream's own hook path gains a project-scoped catch-up or if the daemon sweep becomes turn-synchronous.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -2438,7 +2553,7 @@
           "Widen the profile-scoped Claude kernel to also cover registered projects",
           "Make the catch-up ingest blocking or unbounded so no frame can be missed"
         ],
-        "policy_revision": "patch-footprint.v3",
+        "policy_revision": "patch-footprint.v4",
         "rollback_plan": "Delete the failure_reason method; the struct, its fields, and every existing reader are untouched, so the file returns to its upstream shape."
       },
       "rationale": "Add TranscriptIngestOutcome::failure_reason(), a stable label for an ingest that did not complete, so the fail-open Claude caller can report what it lost instead of discarding the outcome.",
@@ -2458,7 +2573,7 @@
       "bead_ids": [
         "tdmem-1001"
       ],
-      "line_budget": 20,
+      "line_budget": 50,
       "rebase_or_removal_plan": "Re-apply one private method onto the upstream impl block, or delete it with the Claude call sites it exists for.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -2558,7 +2673,7 @@
       "bead_ids": [
         "tdmem-1001"
       ],
-      "line_budget": 140,
+      "line_budget": 297,
       "rebase_or_removal_plan": "Re-apply three appended assertion blocks inside the existing Claude lifecycle case; delete them if upstream adds equivalent idempotence and rollback coverage of its own.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -2630,6 +2745,645 @@
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "Replacing a fixed yield count with a bounded wait on an observable shutdown effect is a provider-neutral test-determinism fix upstream would carry as it stands."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/projectless.rs",
+      "area_id": "hook_route_bridge",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "hook_route_bridge",
+      "rationale": "Add projectless_registered_project_reader_server, which lets a projectless daemon socket whose first request is a registered-project reader call carrying explicit session or thread identity select the retained project server that a hook already published, instead of falling into the profile-only dispatcher that rejects every code reader.",
+      "semantic_invariants": [
+        "The bridge runs the same profile admission as the projectless dispatcher, so a private route is never handed to a socket authenticated for another profile.",
+        "It fails closed: a request without structural route identity, a non-reader tool, a dead retained server, or a cached failed route yields None or the typed route error rather than a guess.",
+        "No route is created here; only routes the hook path already published through the shared route cache are consulted."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib daemon::tests::projectless::"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib daemon::tests::projectless::"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "line_budget": 108,
+      "rebase_or_removal_plan": "Re-apply one selector function and its admission test beside the projectless dispatcher, or delete them if upstream lets the transport consult the shared hook route cache before choosing a server.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Selecting a published private route before server selection is host-neutral daemon behavior that upstream could adopt as is."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/connection_serving.rs",
+      "area_id": "hook_route_bridge",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "hook_route_bridge",
+      "rationale": "Consult the projectless registered-project reader bridge when a broker socket has no project of its own, and report a route failure through the existing project-open error path.",
+      "semantic_invariants": [
+        "A socket that the bridge does not claim keeps the exact upstream projectless behavior.",
+        "A bridge error is written as a project-open error on the same transport and closes the connection; it never escalates into the daemon lifecycle.",
+        "The call site is the only change: no admission, replay, or lease code in this file moves."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib daemon::tests::projectless::"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib daemon::tests::projectless::"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "line_budget": 23,
+      "rebase_or_removal_plan": "Re-apply the one match arm at transport server selection, or delete it together with the projectless bridge.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "One call into a host-neutral selector at the existing server-selection seam."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/core_hooks.rs",
+      "area_id": "hook_route_bridge",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "hook_route_bridge",
+      "rationale": "Send the hook event as a JSON-RPC request with an id and wait for the daemon acknowledgement {processed: true} before closing the socket, so route publication is durable before the next session-bound tool call races it.",
+      "semantic_invariants": [
+        "The hook payload and method are unchanged; only the id and the acknowledgement read are added.",
+        "An absent, malformed, or mismatched acknowledgement maps onto the existing Unavailable or Malformed outcomes; no new outcome variant is introduced.",
+        "The client never blocks longer than the existing hook timeout because the read sits inside the same timed connection."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::server::host_admission_tests::"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::server::host_admission_tests::",
+        "cargo test --locked -p tracedecay --features test-helpers,test-transport --test daemon_suite cold_registered_project_hook_ack_preserves_route_and_terminal_receipt"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "line_budget": 34,
+      "rebase_or_removal_plan": "Re-apply the request id and acknowledgement read onto the notifier, or delete them if upstream makes hook delivery request-response itself.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Acknowledged hook delivery fixes a real peer-disconnect race in the shipped notifier."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/mcp/server/requests.rs",
+      "area_id": "hook_route_bridge",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "hook_route_bridge",
+      "rationale": "Answer a hook event that carries a request id with {processed: true} after processing, keep ordinary notifications response-free, and record the pre-strip identity view of routed tool arguments beside the handler arguments.",
+      "semantic_invariants": [
+        "A hook event without an id remains a response-free notification exactly as upstream ships it.",
+        "The acknowledgement is sent only after the canonical hook effect completed, so a caller that waited can rely on the published route.",
+        "route_identity_arguments is None when nothing identity-bearing was stripped, so routing and analytics see the same view as before."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::server::host_admission_tests::"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::server::host_admission_tests::"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "line_budget": 18,
+      "rebase_or_removal_plan": "Re-apply the struct field and the acknowledgement branch, or delete both with the route-only metadata stripping.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Request-id acknowledgement of hook events is protocol-level daemon behavior upstream can adopt."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/mcp/project_route.rs",
+      "area_id": "hook_route_bridge",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "hook_route_bridge",
+      "rationale": "Strip route-only host metadata (_meta and undeclared top-level session or thread spellings) from handler arguments after routing while preserving the original identity view, and classify which tools declare session_id as a semantic field.",
+      "semantic_invariants": [
+        "Routing and private-route authorization run before stripping, so no caller loses its route by this change.",
+        "A field the called tool declares in its input schema is never stripped; the catalog lockstep test fails when a new top-level session or thread field is left unclassified.",
+        "The preserved identity view yields the same analytics session id and query text as the original arguments."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::project_route::"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::project_route::"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "line_budget": 180,
+      "rebase_or_removal_plan": "Re-apply the two functions and their four tests, or delete them if upstream strips host envelopes before strict request decoding.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Fixes the shipped defect where a hook-routed tracedecay_context call failed on an unknown _meta field."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/mcp/server/host_admission_tests.rs",
+      "area_id": "hook_route_bridge",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "hook_route_bridge",
+      "rationale": "Prove that a hook request with an id is acknowledged only after the canonical effect finished and leaves the session route published, and that an id-less hook notification stays response-free.",
+      "semantic_invariants": [
+        "The acknowledgement test blocks the reconcile sink and asserts the request is still pending, so ordering is observed rather than assumed.",
+        "Both tests drive the real McpServer request path with the shared route cache; no mock of the hook handler is introduced."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::server::host_admission_tests::"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::server::host_admission_tests::"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "line_budget": 120,
+      "rebase_or_removal_plan": "Re-apply two test functions beside the existing admission tests, or delete them with the acknowledgement branch they cover.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Test-only file asserting the acknowledged hook contract."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/tests.rs",
+      "area_id": "hook_route_bridge",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "hook_route_bridge",
+      "rationale": "Declare the projectless bridge test module beside the other daemon test modules.",
+      "semantic_invariants": [
+        "A single mod declaration; no existing test module or ordering changes."
+      ],
+      "verification": [
+        "git diff --check"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib daemon::tests::projectless::"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "line_budget": 2,
+      "rebase_or_removal_plan": "Re-apply one mod line, or delete it with the projectless bridge tests.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "generated_resolution",
+        "rationale": "Mechanical module declaration for a sibling test file."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/tests/projectless.rs",
+      "area_id": "hook_route_bridge",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "hook_route_bridge",
+      "rationale": "Exercise the projectless reader bridge end to end: it requires a reader tool with explicit matching identity, refuses a foreign profile before consulting routes, selects the exact published route and rejects a dead retained server, and propagates a cached route failure.",
+      "semantic_invariants": [
+        "Every fixture builds a real registered project route through the shared hook route cache rather than a synthetic server handle.",
+        "The fixture identity is canonicalized only inside these tests, so the shared test_client_identity_for helper keeps its upstream behavior.",
+        "Each refusal asserts the exact typed reason code and retryability."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib daemon::tests::projectless::"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib daemon::tests::projectless::"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "line_budget": 341,
+      "rebase_or_removal_plan": "Re-apply the test module as one file, or delete it with the projectless bridge.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Test-only file that travels with the bridge."
+      }
+    },
+    {
+      "path": "crates/tracedecay-cli/src/tool_command/args.rs",
+      "area_id": "hook_route_bridge",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "hook_route_bridge",
+      "rationale": "Let the CLI validation gate pass _meta and the top-level session and thread spellings through as transport metadata, so a hook-routed tool call reaches the daemon with its private route identity intact.",
+      "semantic_invariants": [
+        "A key the selected tool declares is still validated against its schema before the allowlist is consulted, so a semantic session_id stays strict.",
+        "Every other unknown key remains a hard error exactly as upstream ships."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay-cli --lib tool_command::"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-cli --lib tool_command::"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "line_budget": 19,
+      "rebase_or_removal_plan": "Re-apply five entries in DISPATCH_ROUTING_KEYS and the doc comment, or delete them if upstream forwards host envelopes itself.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "The CLI must forward the same route metadata the daemon strips; upstream can adopt the allowlist unchanged."
+      }
+    },
+    {
+      "path": "crates/tracedecay-cli/src/tool_command/tests.rs",
+      "area_id": "hook_route_bridge",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "hook_route_bridge",
+      "rationale": "Assert that route metadata is preserved byte for byte through the CLI gate and that a semantic session_id still fails schema validation when it is not a string.",
+      "semantic_invariants": [
+        "The pass-through test covers every allowlisted spelling in one payload.",
+        "The strict test proves the allowlist does not weaken a declared field."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay-cli --lib tool_command::"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-cli --lib tool_command::"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "line_budget": 43,
+      "rebase_or_removal_plan": "Re-apply the two test bodies, or delete them with the allowlist entries.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Test-only file for the allowlist."
+      }
+    },
+    {
+      "path": "crates/tracedecay/tests/daemon_suite/indexing_lifecycle_test.rs",
+      "area_id": "hook_route_bridge",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "hook_route_bridge",
+      "rationale": "Add the physical cold journey: a registered project, a hook event acknowledged by a cold daemon, and a session-routed grep from a projectless socket that answers from the published route and leaves the terminal receipt intact.",
+      "semantic_invariants": [
+        "The journey drives the shipped tracedecay binary over the real broker socket; no in-process shortcut replaces the transport.",
+        "The helpers find_file and grep_for_hook_session only read results; they create no state the daemon does not already publish.",
+        "The existing upstream lifecycle tests in this file are unchanged."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features test-helpers,test-transport --test daemon_suite cold_registered_project_hook_ack_preserves_route_and_terminal_receipt"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features test-helpers,test-transport --test daemon_suite cold_registered_project_hook_ack_preserves_route_and_terminal_receipt"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "line_budget": 148,
+      "rebase_or_removal_plan": "Re-apply one test function and two helpers onto the shared code_index_journey helpers, or delete them with the bridge.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "An end-to-end proof of hook-acknowledged routing that upstream could keep."
+      }
+    },
+    {
+      "path": "crates/tracedecay/tests/daemon_suite/code_index_journey.rs",
+      "area_id": "hook_route_bridge",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "hook_route_bridge",
+      "rationale": "Let result_paths read the file field of a grep row when a result has no display path, so the cold journey can assert on grep results with the shared helper.",
+      "semantic_invariants": [
+        "Search results with a display path resolve exactly as before; the fallback applies only when that path is absent."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features test-helpers,test-transport --test daemon_suite cold_registered_project_hook_ack_preserves_route_and_terminal_receipt"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features test-helpers,test-transport --test daemon_suite cold_registered_project_hook_ack_preserves_route_and_terminal_receipt"
+      ],
+      "bead_ids": [
+        "tdmem-1001",
+        "tdmem-0308"
+      ],
+      "line_budget": 7,
+      "rebase_or_removal_plan": "Re-apply one or_else on the helper, or delete it if grep rows gain a display path upstream.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A total fallback in a shared test helper."
+      }
+    },
+    {
+      "path": "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance/native_plugin_fixture.rs",
+      "area_id": "host_hook_ingest_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "host_hook_ingest",
+      "rationale": "Replace the in-process remediation shim with an executable fake Codex CLI that models the exact non-interactive plugin grammar (plugin add tracedecay@personal --json), records its invocations, and installs the plugin cache the way Codex 0.147+ does, so the lifecycle acceptance test drives the production code path that invokes Codex itself.",
+      "semantic_invariants": [
+        "The fake CLI is written in python3, the only interpreter the isolated PATH provisions, and refuses every command outside the modelled grammar with a non-zero exit.",
+        "Production drives the binary through the same require_codex_plugin_cli and codex_plugin_add_with path a real Codex install uses; the test no longer edits config.toml on production's behalf.",
+        "Recorded invocations are read back verbatim so the test can assert the exact command Codex received."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay-cli --features test-transport --test host_lifecycle_cli_acceptance"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-cli --features test-transport --test host_lifecycle_cli_acceptance"
+      ],
+      "bead_ids": [
+        "tdmem-1001"
+      ],
+      "line_budget": 109,
+      "rebase_or_removal_plan": "Re-apply the fixture installer and the invocation reader, or delete them if upstream ships its own executable Codex fixture.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A deterministic fixture for the host lifecycle grammar upstream also targets."
+      }
+    },
+    {
+      "path": "crates/tracedecay-agent-hosts/src/agents/claude.rs",
+      "area_id": "host_hook_ingest_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "exception",
+      "exception": {
+        "zone": "host_specific_adapters",
+        "adr": "product/architecture/adr/ADR-0017-patch-footprint-revision-v4.md",
+        "why_unavoidable": "Non-interactive install readiness for Claude Code is decided only inside this host adapter: it is the one place that knows the loaded plugin cache root, the rendered bundle, and the registration state. No composition or application seam sees Claude's cache, so the readiness decision cannot be moved above the adapter.",
+        "alternatives_rejected": [
+          "Keep deciding readiness from the deployed marketplace source, which reported Ready while Claude was still loading a stale cache",
+          "Add a product-owned Claude adapter beside the upstream one and duplicate the plugin rendering",
+          "Always defer to the user with a plugin update command even when the loaded cache already matches"
+        ],
+        "policy_revision": "patch-footprint.v4",
+        "rollback_plan": "Delete claude_loaded_cache_matches_expected_bundle and restore the original three-way branch on claude_plugin_is_natively_active; no other function in the file changes."
+      },
+      "rationale": "Decide non-interactive install readiness from Claude's loaded plugin cache instead of the deployed marketplace source: registration must be active, and the cache must match the rendered bundle digest and pass the discovery validator, otherwise the existing plugin update remediation is returned.",
+      "semantic_invariants": [
+        "Source drift is still repaired by the receipt-backed component transaction; readiness never rewrites the marketplace source.",
+        "The remediation text and staged paths returned to the user are unchanged.",
+        "The cache comparison reuses the existing bundle digest and discovery validators; no new file format or host behavior is introduced."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay-cli --features test-transport --test host_lifecycle_cli_acceptance"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay-cli --features test-transport --test host_lifecycle_cli_acceptance"
+      ],
+      "bead_ids": [
+        "tdmem-1001"
+      ],
+      "line_budget": 58,
+      "rebase_or_removal_plan": "Re-apply one helper and the reordered branch, or delete them if upstream compares the loaded cache itself.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Fixes a false Ready on a stale loaded cache; host-specific but provider-neutral."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/store_maintenance/mod.rs",
+      "area_id": "vector_retention_authority",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "vector_retention_authority",
+      "rationale": "Make code-generation retention an online-only deletion authority: a daemon without a seated semantic runtime returns the typed SemanticUnseated outcome instead of sweeping under an offline protection set, the serving-generation pin helper is deleted, and the blocking deletion owns the vector writer freeze so a cancelled awaiter cannot admit a publisher while filesystem work continues.",
+      "semantic_invariants": [
+        "Only an exact, complete vector inventory authorizes deletion; unseated and offline inventories defer and collect nothing.",
+        "An empty authoritative inventory remains valid evidence and still makes bounded progress.",
+        "The writer freeze is moved into the blocking executor rather than dropped at the async boundary; no new lock is introduced.",
+        "Reset, corrupt, and denied vector authorities stay fail-closed exactly as upstream ships."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'"
+      ],
+      "tests": [
+        "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'"
+      ],
+      "bead_ids": [
+        "tdmem-1100",
+        "tdmem-1200"
+      ],
+      "line_budget": 140,
+      "rebase_or_removal_plan": "Re-apply the SemanticUnseated outcome, the freeze ownership move, and the deleted helper, or drop them if upstream retires the offline protection set itself.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Retention that never deletes without inventory authority is a safety fix upstream can adopt."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/maintenance/generation.rs",
+      "area_id": "vector_retention_authority",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "vector_retention_authority",
+      "rationale": "Treat the SemanticUnseated retention outcome as an ordinary quiet completion so the default-off daemon does not enter a degraded retry loop.",
+      "semantic_invariants": [
+        "Complete and SemanticUnseated take the same branch; MoreWork, Failed, and cancellation are unchanged.",
+        "The doc comment states the deferral rule so the default-off journey is documented where it is scheduled."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'"
+      ],
+      "tests": [
+        "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'"
+      ],
+      "bead_ids": [
+        "tdmem-1100",
+        "tdmem-1200"
+      ],
+      "line_budget": 12,
+      "rebase_or_removal_plan": "Re-apply one match arm and the comment, or delete them with the SemanticUnseated outcome.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Travels with the retention authority change."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/store_maintenance/vector_retention_tests.rs",
+      "area_id": "vector_retention_authority",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "vector_retention_authority",
+      "rationale": "Replace the test that expected an unseated runtime to sweep quietly with one proving it defers without inventory authority, and drop the active-generation fixture that only the deleted offline sweep used.",
+      "semantic_invariants": [
+        "The remaining tests keep asserting that offline inventories retain every source and that a complete inventory collects.",
+        "No production behavior is asserted through a mock authority; the tests drive the real retention pass."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'"
+      ],
+      "tests": [
+        "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'"
+      ],
+      "bead_ids": [
+        "tdmem-1100",
+        "tdmem-1200"
+      ],
+      "line_budget": 155,
+      "rebase_or_removal_plan": "Re-apply the replaced test, or delete it with the retention authority change.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Test-only file for the retention authority."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/production_harness/generation_retention_test.rs",
+      "area_id": "vector_retention_authority",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "vector_retention_authority",
+      "rationale": "Add the assert_leased_vector_source helper and align the restart journey with the online-only authority so the harness proves a mounted activation lease keeps its exact source generation across restart.",
+      "semantic_invariants": [
+        "The helper reads the leased vector source through the real retained runtime; it creates no state of its own.",
+        "Upstream's writer-contention journey in this file is unchanged and runs beside the product helper."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'"
+      ],
+      "tests": [
+        "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'"
+      ],
+      "bead_ids": [
+        "tdmem-1100",
+        "tdmem-1200"
+      ],
+      "line_budget": 154,
+      "rebase_or_removal_plan": "Re-apply the helper and the fixture adjustments, or delete them with the retention authority change.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Harness assertions for the retention safety property."
+      }
+    },
+    {
+      "path": "crates/tracedecay-usecases/src/semantic_runtime/production.rs",
+      "area_id": "vector_retention_authority",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "vector_retention_authority",
+      "rationale": "Bind the vector writer lane to the durable code scope instead of one mounted runtime, so a retention or publication lease can outlive an unmount and a remount joins the same lane until its last owner releases it.",
+      "semantic_invariants": [
+        "Writer lanes are keyed by the code-index store root and weakly held, so unrelated scopes stay independent and released lanes are reclaimed.",
+        "The in-module test proves a remount cannot bypass a live fence and becomes eligible only after release."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'"
+      ],
+      "tests": [
+        "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'"
+      ],
+      "bead_ids": [
+        "tdmem-1100",
+        "tdmem-1200"
+      ],
+      "line_budget": 55,
+      "rebase_or_removal_plan": "Re-apply vector_writer_for_store and its test, or delete them if upstream scopes the writer lane by store itself.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Closes a real fence bypass on remount."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/dashboard.rs",
+      "area_id": "feature_gated_build_repair",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "feature_gated_build_repair",
+      "rationale": "Call the accessor methods PinnedRuntimeConfiguration now exposes (target, snapshot) instead of the fields upstream made private, so the dashboard feature compiles against the 3b59bb7eb configuration crate.",
+      "semantic_invariants": [
+        "Behavior is identical: the same values are read through their public accessors.",
+        "Only the feature-gated dashboard fixture path changes; no dashboard logic moves."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo check --workspace --all-targets --features test-transport --locked"
+      ],
+      "tests": [
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ],
+      "bead_ids": [
+        "tdmem-1200",
+        "tdmem-1208"
+      ],
+      "line_budget": 11,
+      "rebase_or_removal_plan": "Delete the five accessor calls when upstream compiles its dashboard feature against the private fields itself.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A build repair upstream needs for its own feature-gated file."
       }
     }
   ],
