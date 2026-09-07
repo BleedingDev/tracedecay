@@ -152,6 +152,8 @@ def base_policy() -> dict[str, Any]:
         "crates/tracedecay-memory-provider-registry/**",
         "crates/tracedecay-memory-provider-native/**",
         "crates/tracedecay-memory-provider-ncm/**",
+        "crates/tracedecay-memory-ncm-core/**",
+        "crates/tracedecay-memory-ncm-runtime/**",
         "crates/tracedecay-memory-observation/**",
         "crates/tracedecay-memory-hygiene/**",
         "crates/tracedecay-memory-context/**",

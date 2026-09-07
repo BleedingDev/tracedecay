@@ -28,7 +28,7 @@ jobs:
     name: "[tdmem-1206][required][upstream_required]"
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Check out the exact candidate
         id: checkout
@@ -97,6 +97,156 @@ jobs:
         run: |
           set -euo pipefail
           cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked
+      - name: "cargo test -p tracedecay-application --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-application --locked
+      - name: "cargo test -p tracedecay --features test-helpers --test runtime_acceptance_suite application_production_reachability --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay --features test-helpers --test runtime_acceptance_suite application_production_reachability --locked
+      - name: "cargo test --locked -p tracedecay-daemon-control --lib"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-daemon-control --lib
+      - name: "cargo test --locked -p tracedecay-configuration config::memory_provider_snapshot_tests"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-configuration config::memory_provider_snapshot_tests
+      - name: "cargo test --locked -p tracedecay-global-db configuration"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-global-db configuration
+      - name: "cargo test --locked -p tracedecay daemon::session_runtime_tests::session_sync_tests"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay daemon::session_runtime_tests::session_sync_tests
+      - name: "cargo test --locked -p tracedecay daemon::session_runtime_tests::project_lifecycle_tests"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay daemon::session_runtime_tests::project_lifecycle_tests
+      - name: "cargo test --locked -p tracedecay-usecases diagnostics_query"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-usecases diagnostics_query
+      - name: "cargo test --locked -p tracedecay-usecases diagnostics_store"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-usecases diagnostics_store
+      - name: "cargo test --locked -p tracedecay-usecases primitives::production"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-usecases primitives::production
+      - name: "cargo test --locked -p tracedecay-usecases primitives::runtime"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-usecases primitives::runtime
+      - name: "cargo test --locked -p tracedecay-cli --features test-transport --test host_lifecycle_cli_acceptance"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-cli --features test-transport --test host_lifecycle_cli_acceptance
+      - name: "cargo check -p tracedecay-application --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p tracedecay-application --locked
+      - name: "cargo clippy -p tracedecay-application --all-targets --locked -- -D warnings"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p tracedecay-application --all-targets --locked -- -D warnings
+      - name: "cargo test -p tracedecay-application --test cognitive_recall_port --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-application --test cognitive_recall_port --locked
+      - name: "cargo test -p tracedecay fresh_profile_first_reconcile_makes_query_authority_ready_within_existing_bound --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay fresh_profile_first_reconcile_makes_query_authority_ready_within_existing_bound --locked
+      - name: "cargo check -p tracedecay --lib --features test-transport --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p tracedecay --lib --features test-transport --locked
+      - name: "cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants lsp_shutdown_"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants lsp_shutdown_
+      - name: "cargo test --locked -p tracedecay --lib lsp_lease_tests"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --lib lsp_lease_tests
+      - name: "cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants build_tree"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants build_tree
+      - name: "cargo test --locked -p tracedecay-domain configuration"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-domain configuration
+      - name: "cargo test --locked -p tracedecay-usecases config"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-usecases config
+      - name: "cargo check --workspace --all-targets --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --workspace --all-targets --locked
+      - name: "cargo test --locked -p tracedecay-agent-hosts hooks::claude"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-agent-hosts hooks::claude
+      - name: "cargo test --locked -p tracedecay-agent-hosts hooks::"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-agent-hosts hooks::
       - name: Record upstream gate ownership
         if: always()
         shell: bash
@@ -107,7 +257,7 @@ jobs:
     needs: upstream_required
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 90
     steps:
       - name: Check out the exact candidate
         id: checkout
@@ -212,6 +362,30 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/product/check-patch-footprint-policy.py --repo . --policy product/upstream/patch-footprint-policy.json --map product/upstream/convergence-map.json
+      - name: "python3 tests/product_ncm_surface_audit_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_ncm_surface_audit_test.py
+      - name: "python3 tests/product_tdmem_0904_metric_catalog_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_tdmem_0904_metric_catalog_test.py
+      - name: "python3 tests/product_observation_hygiene_policy_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_observation_hygiene_policy_test.py
+      - name: "python3 tests/product_tdmem_0901_scenario_corpus_test.py"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/product_tdmem_0901_scenario_corpus_test.py
       - name: Record product contract ownership
         if: always()
         shell: bash
@@ -222,7 +396,7 @@ jobs:
     needs: product_contracts
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 90
     steps:
       - name: Check out the exact candidate
         id: checkout
@@ -264,6 +438,132 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/product/check-memory-composition-feature.py --repo .
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host native_baseline"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host native_baseline
+      - name: "cargo test --locked -p tracedecay-cli --features memory-provider-host,test-transport --test product_memory_provider_claude_host_journey"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-cli --features memory-provider-host,test-transport --test product_memory_provider_claude_host_journey
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::observation_journey::tests"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::observation_journey::tests
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host remount_sweeps_rows_that_expired_while_the_journey_was_down"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host remount_sweeps_rows_that_expired_while_the_journey_was_down
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host --lib claude_host_journey_tests"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host --lib claude_host_journey_tests
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::cognitive_recall::tests"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::cognitive_recall::tests
+      - name: "cargo test -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss --locked
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host native_observe_verifies_real_store_without_writing"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host native_observe_verifies_real_store_without_writing
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host native_recall_current_preserves_order_and_projects_native_score_explain_provenance"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host native_recall_current_preserves_order_and_projects_native_score_explain_provenance
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host native_recall_does_not_mutate_authoritative_fact_telemetry_or_history"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host native_recall_does_not_mutate_authoritative_fact_telemetry_or_history
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host native_recall_matches_direct_search_semantically_on_identical_stores"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host native_recall_matches_direct_search_semantically_on_identical_stores
+      - name: "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::lsp_lease_tests::state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::lsp_lease_tests::state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep
+      - name: "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::types_tests::superseded_blocking_work_is_joined_before_its_receipt_terminal"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::types_tests::superseded_blocking_work_is_joined_before_its_receipt_terminal
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host config::tests::memory_provider_recall_routing_defaults_to_no_active_provider_and_validates"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host config::tests::memory_provider_recall_routing_defaults_to_no_active_provider_and_validates
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host config::tests::memory_provider_native_enabled_round_trips_and_defaults_off"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host config::tests::memory_provider_native_enabled_round_trips_and_defaults_off
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host hook_runtime"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host hook_runtime
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers daemon::project_composition::memory_provider_routing_tests"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host,test-helpers daemon::project_composition::memory_provider_routing_tests
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::cognitive_recall::tests::a_wedged_provider_strands_one_accounted_worker_and_capacity_is_reclaimed"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::cognitive_recall::tests::a_wedged_provider_strands_one_accounted_worker_and_capacity_is_reclaimed
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host an_ordinary_mcp_context_call_returns_the_routed_advisory_lane"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host an_ordinary_mcp_context_call_returns_the_routed_advisory_lane
+      - name: "cargo test --locked -p tracedecay --features memory-provider-host a_provider_that_ignores_its_deadline_cannot_block_the_host_answer"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay --features memory-provider-host a_provider_that_ignores_its_deadline_cannot_block_the_host_answer
       - name: Record Native parity ownership
         if: always()
         shell: bash
@@ -274,7 +574,7 @@ jobs:
     needs: native_parity
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: Check out the exact candidate
         id: checkout
@@ -328,6 +628,102 @@ jobs:
         run: |
           set -euo pipefail
           python3 tests/product_dummy_provider_conformance_test.py
+      - name: "cargo test -p tracedecay-memory-provider-registry --test recall_admission --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-provider-registry --test recall_admission --locked
+      - name: "cargo test -p tracedecay-memory-provider-registry --test recall_context_pack --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-provider-registry --test recall_context_pack --locked
+      - name: "cargo test -p tracedecay-memory-provider-registry --test recall_normalization --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-provider-registry --test recall_normalization --locked
+      - name: "cargo test -p tracedecay-memory-provider-registry --test recall_port --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-provider-registry --test recall_port --locked
+      - name: "cargo test -p tracedecay-memory-provider-registry --test recall_selection --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-provider-registry --test recall_selection --locked
+      - name: "cargo test -p tracedecay-memory-provider-ncm --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-provider-ncm --locked
+      - name: "cargo test -p tracedecay-memory-conformance --test baseline --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-conformance --test baseline --locked
+      - name: "cargo test -p tracedecay-memory-evaluation --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-evaluation --locked
+      - name: "cargo test -p tracedecay-memory-observation --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-observation --locked
+      - name: "cargo test -p tracedecay-memory-hygiene --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-hygiene --locked
+      - name: "cargo test -p tracedecay-memory-observation --test retention_sweep_cadence --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-observation --test retention_sweep_cadence --locked
+      - name: "cargo test --locked -p tracedecay-memory-provider-registry --test recall_port"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-memory-provider-registry --test recall_port
+      - name: "cargo test -p tracedecay-memory-ncm-core --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-ncm-core --locked
+      - name: "cargo test -p tracedecay-memory-ncm-runtime --locked --no-default-features"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-ncm-runtime --locked --no-default-features
+      - name: "cargo test -p tracedecay-memory-provider-ncm --locked --features rust-backend"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-provider-ncm --locked --features rust-backend
+      - name: "cargo test -p tracedecay-memory-provider-registry --test registry --locked"
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && steps.rust.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tracedecay-memory-provider-registry --test registry --locked
       - name: Record provider conformance ownership
         if: always()
         shell: bash

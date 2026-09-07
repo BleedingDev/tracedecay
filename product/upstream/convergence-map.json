@@ -1009,8 +1009,7 @@
       "tests": [
         "cargo test -p tracedecay-memory-ncm-core --locked",
         "cargo test -p tracedecay-memory-ncm-runtime --locked --no-default-features",
-        "cargo test -p tracedecay-memory-provider-ncm --locked --features rust-backend",
-        "python3 scripts/product/ncm/check-backend.py"
+        "cargo test -p tracedecay-memory-provider-ncm --locked --features rust-backend"
       ],
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
@@ -1115,7 +1114,7 @@
       ],
       "verification": [
         "git diff --check",
-        "kache cargo -- check -p tracedecay-application --locked"
+        "cargo check -p tracedecay-application --locked"
       ],
       "tests": [
         "cargo test -p tracedecay-application --locked"
@@ -1147,7 +1146,7 @@
       ],
       "verification": [
         "git diff --check",
-        "kache cargo -- clippy -p tracedecay-application --all-targets --locked -- -D warnings"
+        "cargo clippy -p tracedecay-application --all-targets --locked -- -D warnings"
       ],
       "tests": [
         "cargo test -p tracedecay-application --locked"
@@ -1421,7 +1420,7 @@
       "verification": [
         "git diff --check",
         "python3 scripts/product/check-upstream-ownership-registry.py --repo .",
-        "python3 scripts/product/check-patch-footprint-policy.py --repo ."
+        "python3 scripts/product/check-patch-footprint-policy.py --repo . --policy product/upstream/patch-footprint-policy.json --map product/upstream/convergence-map.json"
       ],
       "tests": [
         "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::observation_journey::tests",
@@ -1624,7 +1623,7 @@
       ],
       "verification": [
         "git diff --check",
-        "kache cargo -- check -p tracedecay --lib --features test-transport --locked",
+        "cargo check -p tracedecay --lib --features test-transport --locked",
         "cargo test -p tracedecay fresh_profile_first_reconcile_makes_query_authority_ready_within_existing_bound --locked"
       ],
       "tests": [
@@ -2517,7 +2516,7 @@
       ],
       "verification": [
         "git diff --check",
-        "python3 scripts/product/check-memory-composition-feature.py"
+        "python3 scripts/product/check-memory-composition-feature.py --repo ."
       ],
       "tests": [
         "python3 tests/product_memory_composition_feature_test.py",

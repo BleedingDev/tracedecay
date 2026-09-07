@@ -226,7 +226,32 @@
           "python3 scripts/product/check-upstream-ownership-registry.py --repo .",
           "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail",
           "cargo check --workspace --all-targets --features test-transport --locked",
-          "cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked"
+          "cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked",
+          "cargo test -p tracedecay-application --locked",
+          "cargo test -p tracedecay --features test-helpers --test runtime_acceptance_suite application_production_reachability --locked",
+          "cargo test --locked -p tracedecay-daemon-control --lib",
+          "cargo test --locked -p tracedecay-configuration config::memory_provider_snapshot_tests",
+          "cargo test --locked -p tracedecay-global-db configuration",
+          "cargo test --locked -p tracedecay daemon::session_runtime_tests::session_sync_tests",
+          "cargo test --locked -p tracedecay daemon::session_runtime_tests::project_lifecycle_tests",
+          "cargo test --locked -p tracedecay-usecases diagnostics_query",
+          "cargo test --locked -p tracedecay-usecases diagnostics_store",
+          "cargo test --locked -p tracedecay-usecases primitives::production",
+          "cargo test --locked -p tracedecay-usecases primitives::runtime",
+          "cargo test --locked -p tracedecay-cli --features test-transport --test host_lifecycle_cli_acceptance",
+          "cargo check -p tracedecay-application --locked",
+          "cargo clippy -p tracedecay-application --all-targets --locked -- -D warnings",
+          "cargo test -p tracedecay-application --test cognitive_recall_port --locked",
+          "cargo test -p tracedecay fresh_profile_first_reconcile_makes_query_authority_ready_within_existing_bound --locked",
+          "cargo check -p tracedecay --lib --features test-transport --locked",
+          "cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants lsp_shutdown_",
+          "cargo test --locked -p tracedecay --lib lsp_lease_tests",
+          "cargo test --locked -p tracedecay --test product_memory_provider_convergence_invariants build_tree",
+          "cargo test --locked -p tracedecay-domain configuration",
+          "cargo test --locked -p tracedecay-usecases config",
+          "cargo check --workspace --all-targets --locked",
+          "cargo test --locked -p tracedecay-agent-hosts hooks::claude",
+          "cargo test --locked -p tracedecay-agent-hosts hooks::"
         ]
       },
       "product_contracts": {
@@ -248,7 +273,11 @@
           "python3 scripts/product/check-memory-provider-rust-bindings.py --repo .",
           "python3 scripts/product/check-memory-dependency-policy.py --repo . --policy product/upstream/patch-footprint-policy.json",
           "python3 scripts/product/check-memory-dependency-direction.py --repo . --policy product/architecture/memory-dependency-policy.json",
-          "python3 scripts/product/check-patch-footprint-policy.py --repo . --policy product/upstream/patch-footprint-policy.json --map product/upstream/convergence-map.json"
+          "python3 scripts/product/check-patch-footprint-policy.py --repo . --policy product/upstream/patch-footprint-policy.json --map product/upstream/convergence-map.json",
+          "python3 tests/product_ncm_surface_audit_test.py",
+          "python3 tests/product_tdmem_0904_metric_catalog_test.py",
+          "python3 tests/product_observation_hygiene_policy_test.py",
+          "python3 tests/product_tdmem_0901_scenario_corpus_test.py"
         ]
       },
       "native_parity": {
@@ -259,7 +288,28 @@
           "cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_recall_ -- --nocapture",
           "cargo test --profile bounded-test -p tracedecay --lib --features memory-provider-host native_baseline -- --nocapture",
           "python3 tests/product_memory_composition_feature_test.py",
-          "python3 scripts/product/check-memory-composition-feature.py --repo ."
+          "python3 scripts/product/check-memory-composition-feature.py --repo .",
+          "cargo test --locked -p tracedecay --features memory-provider-host native_baseline",
+          "cargo test --locked -p tracedecay-cli --features memory-provider-host,test-transport --test product_memory_provider_claude_host_journey",
+          "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::observation_journey::tests",
+          "cargo test --locked -p tracedecay --features memory-provider-host remount_sweeps_rows_that_expired_while_the_journey_was_down",
+          "cargo test --locked -p tracedecay --features memory-provider-host --lib claude_host_journey_tests",
+          "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::cognitive_recall::tests",
+          "cargo test -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss --locked",
+          "cargo test --locked -p tracedecay --features memory-provider-host native_observe_verifies_real_store_without_writing",
+          "cargo test --locked -p tracedecay --features memory-provider-host native_recall_current_preserves_order_and_projects_native_score_explain_provenance",
+          "cargo test --locked -p tracedecay --features memory-provider-host native_recall_does_not_mutate_authoritative_fact_telemetry_or_history",
+          "cargo test --locked -p tracedecay --features memory-provider-host native_recall_matches_direct_search_semantically_on_identical_stores",
+          "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::lsp_lease_tests::state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep",
+          "cargo test -p tracedecay --features memory-provider-host --lib -- --exact daemon::invocation_tests::types_tests::superseded_blocking_work_is_joined_before_its_receipt_terminal",
+          "cargo test --locked -p tracedecay --features memory-provider-host config::tests::memory_provider_recall_routing_defaults_to_no_active_provider_and_validates",
+          "cargo test --locked -p tracedecay --features memory-provider-host config::tests::memory_provider_native_enabled_round_trips_and_defaults_off",
+          "cargo test --locked -p tracedecay --features memory-provider-host hook_runtime",
+          "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers daemon::project_composition::memory_provider_routing_tests",
+          "cargo test --locked -p tracedecay --features memory-provider-host daemon::retained_owner::cognitive_recall::tests::a_wedged_provider_strands_one_accounted_worker_and_capacity_is_reclaimed",
+          "cargo test --locked -p tracedecay --features memory-provider-host project_server_cache_hit_skips_open_and_singleflights_first_miss",
+          "cargo test --locked -p tracedecay --features memory-provider-host an_ordinary_mcp_context_call_returns_the_routed_advisory_lane",
+          "cargo test --locked -p tracedecay --features memory-provider-host a_provider_that_ignores_its_deadline_cannot_block_the_host_answer"
         ]
       },
       "provider_conformance": {
@@ -272,7 +322,23 @@
           "cargo test -p tracedecay-memory-conformance --locked",
           "cargo test --manifest-path product/conformance/dummy-provider/Cargo.toml --locked",
           "python3 scripts/product/check-dummy-provider-conformance.py --repo .",
-          "python3 tests/product_dummy_provider_conformance_test.py"
+          "python3 tests/product_dummy_provider_conformance_test.py",
+          "cargo test -p tracedecay-memory-provider-registry --test recall_admission --locked",
+          "cargo test -p tracedecay-memory-provider-registry --test recall_context_pack --locked",
+          "cargo test -p tracedecay-memory-provider-registry --test recall_normalization --locked",
+          "cargo test -p tracedecay-memory-provider-registry --test recall_port --locked",
+          "cargo test -p tracedecay-memory-provider-registry --test recall_selection --locked",
+          "cargo test -p tracedecay-memory-provider-ncm --locked",
+          "cargo test -p tracedecay-memory-conformance --test baseline --locked",
+          "cargo test -p tracedecay-memory-evaluation --locked",
+          "cargo test -p tracedecay-memory-observation --locked",
+          "cargo test -p tracedecay-memory-hygiene --locked",
+          "cargo test -p tracedecay-memory-observation --test retention_sweep_cadence --locked",
+          "cargo test --locked -p tracedecay-memory-provider-registry --test recall_port",
+          "cargo test -p tracedecay-memory-ncm-core --locked",
+          "cargo test -p tracedecay-memory-ncm-runtime --locked --no-default-features",
+          "cargo test -p tracedecay-memory-provider-ncm --locked --features rust-backend",
+          "cargo test -p tracedecay-memory-provider-registry --test registry --locked"
         ]
       },
       "scope_crash_security": {
