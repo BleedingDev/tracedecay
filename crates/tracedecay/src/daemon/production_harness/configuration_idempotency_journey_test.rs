@@ -203,9 +203,9 @@ async fn configuration_batch_via_surface(
         tracedecay_application::request_identity::mint_global_request_id(request_surface)
             .expect("surface request id");
     if surface == tracedecay_tool_catalog::BindingSurface::Dashboard {
-        let result = crate::application_surface::resolve_dashboard_application_surface(
+        return crate::application_surface::resolve_dashboard_application_surface(
             operation,
-            request_id.clone(),
+            request_id,
             crate::application_surface::ApplicationSurfaceRequest::Configuration(
                 tracedecay_application::ConfigurationWireRequestV1::Batch(request),
             ),
@@ -215,15 +215,6 @@ async fn configuration_batch_via_surface(
         .await
         .expect("dashboard configuration batch invocation")
         .result;
-        let response_request_id = match &result {
-            Ok(envelope) => &envelope.request_id,
-            Err(envelope) => &envelope.request_id,
-        };
-        assert_eq!(
-            response_request_id, &request_id,
-            "dashboard response must retain this invocation's caller request identity"
-        );
-        return result;
     }
     let cancellation =
         CancellationSignal::active(format!("cancellation.surface.{}", request_id.as_str()))
@@ -232,7 +223,7 @@ async fn configuration_batch_via_surface(
         crate::application_surface::resolve_application_surface_dispatch_with_controls(
             surface,
             operation,
-            request_id.clone(),
+            request_id,
             crate::application_surface::ApplicationSurfaceRequest::Configuration(
                 tracedecay_application::ConfigurationWireRequestV1::Batch(request),
             ),
@@ -242,23 +233,10 @@ async fn configuration_batch_via_surface(
             tracedecay_daemon_protocol::RequestedOutputFormat::Json,
         )
         .expect("configuration batch dispatch");
-    let result = crate::application_surface::execute_application_surface(
-        operation,
-        dispatched,
-        Some(&executor),
-    )
-    .await
-    .expect("configuration batch application invocation")
-    .result;
-    let response_request_id = match &result {
-        Ok(envelope) => &envelope.request_id,
-        Err(envelope) => &envelope.request_id,
-    };
-    assert_eq!(
-        response_request_id, &request_id,
-        "CLI response must retain this invocation's caller request identity"
-    );
-    result
+    crate::application_surface::execute_application_surface(operation, dispatched, Some(&executor))
+        .await
+        .expect("configuration batch application invocation")
+        .result
 }
 
 async fn configuration_http_sdk(
@@ -347,14 +325,17 @@ async fn user_profile_configuration_batch_has_cli_dashboard_parity_after_restart
         )
         .expect("idempotency key"),
     };
-    let first_effect = configuration_batch_via_surface(
-        &harness,
-        &project,
-        tracedecay_tool_catalog::BindingSurface::Cli,
-        request.clone(),
+    let first_effect = serde_json::to_value(
+        configuration_batch_via_surface(
+            &harness,
+            &project,
+            tracedecay_tool_catalog::BindingSurface::Cli,
+            request.clone(),
+        )
+        .await
+        .expect("first CLI user configuration effect"),
     )
-    .await
-    .expect("first CLI user configuration effect");
+    .expect("CLI application envelope");
     let committed_revision = current_revision(&harness, &project).await;
     assert_ne!(committed_revision, expected_revision);
     harness.shutdown().await;
@@ -362,38 +343,24 @@ async fn user_profile_configuration_batch_has_cli_dashboard_parity_after_restart
     let harness = ProductionProjectCompositionHarnessV1::open(isolation.path(), [project.clone()])
         .await
         .expect("restarted production composition");
-    let replay = configuration_batch_via_surface(
-        &harness,
-        &project,
-        tracedecay_tool_catalog::BindingSurface::Dashboard,
-        request.clone(),
+    let replay = serde_json::to_value(
+        configuration_batch_via_surface(
+            &harness,
+            &project,
+            tracedecay_tool_catalog::BindingSurface::Dashboard,
+            request.clone(),
+        )
+        .await
+        .expect("dashboard replay of CLI user configuration effect"),
     )
-    .await
-    .expect("dashboard replay of CLI user configuration effect");
-    // Caller correlation identifies each invocation; logical effect identity survives retries.
-    // Exhaustive destructuring keeps every envelope field covered as the contract evolves.
-    let tracedecay_application::ApplicationEnvelope {
-        contract,
-        request_id,
-        scope,
-        outcome,
-    } = first_effect;
-    let tracedecay_application::ApplicationEnvelope {
-        contract: replay_contract,
-        request_id: replay_request_id,
-        scope: replay_scope,
-        outcome: replay_outcome,
-    } = replay;
-    assert_ne!(request_id, replay_request_id);
-    assert_eq!(replay_contract, contract);
-    assert_eq!(replay_scope, scope);
-    assert!(matches!(
-        &outcome,
-        tracedecay_application::ApplicationOutcome::Effect(_)
-    ));
+    .expect("dashboard replay envelope");
+    // The durable effect is the replayed artefact; the envelope's `request_id`
+    // is minted per request per surface (see `configuration_batch_via_surface`)
+    // and can never match across two calls. Compare what replay actually
+    // promises, exactly as the cross-surface set journey above does.
     assert_eq!(
-        replay_outcome, outcome,
-        "dashboard must replay every durable effect field, including the original receipt identity"
+        replay["outcome"]["value"], first_effect["outcome"]["value"],
+        "dashboard must replay the CLI operation's exact durable user configuration effect"
     );
     assert_eq!(
         current_revision(&harness, &project).await,

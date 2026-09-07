@@ -20,19 +20,6 @@ pub enum ObservationIdentityCollisionDispositionV1 {
     RetryWithAlternateIdentity,
 }
 
-/// Which repository attachment is authoritative on an exact observation replay.
-///
-/// Direct writes require the candidate attachment to match by default. Fresh
-/// admission may capture new repository evidence before another writer commits
-/// the same observation; it explicitly retains that winner's attachment instead.
-/// This disposition is command behavior, never persisted observation metadata.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ObservationProvenanceDispositionV1 {
-    #[default]
-    RequireExact,
-    RetainCommittedOnReplay,
-}
-
 pub(super) fn validate_retrieval_anchor_binding(
     observation: &DurableObservationV1,
     retrieval_anchor: &RetrievalAnchorRecordV2,
@@ -175,11 +162,11 @@ impl Default for RepositoryProvenanceAttachmentV1 {
 }
 
 /// One observation write, its stable V2 retrieval anchor, and the caller's
-/// typed identity-collision and provenance dispositions.
+/// typed identity-collision disposition.
 ///
 /// Stores commit every durable observation and anchor part in one
-/// authoritative transaction. Dispositions control collision and replay
-/// behavior in that transaction; they are not retained as observation data.
+/// authoritative transaction. The disposition controls whether a collision
+/// is settled in that transaction; it is not retained as observation data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnchoredObservationWrite {
     write: ObservationWrite,
@@ -187,7 +174,6 @@ pub struct AnchoredObservationWrite {
     projection_generation: ProjectionGenerationId,
     repository_provenance: RepositoryProvenanceAttachmentV1,
     identity_collision_disposition: ObservationIdentityCollisionDispositionV1,
-    provenance_disposition: ObservationProvenanceDispositionV1,
 }
 
 impl AnchoredObservationWrite {
@@ -208,7 +194,6 @@ impl AnchoredObservationWrite {
             repository_provenance: RepositoryProvenanceAttachmentV1::unavailable(),
             identity_collision_disposition:
                 ObservationIdentityCollisionDispositionV1::SettleTerminal,
-            provenance_disposition: ObservationProvenanceDispositionV1::RequireExact,
         })
     }
 
@@ -223,19 +208,6 @@ impl AnchoredObservationWrite {
 
     pub fn identity_collision_disposition(&self) -> ObservationIdentityCollisionDispositionV1 {
         self.identity_collision_disposition
-    }
-
-    #[must_use]
-    pub fn with_provenance_disposition(
-        mut self,
-        disposition: ObservationProvenanceDispositionV1,
-    ) -> Self {
-        self.provenance_disposition = disposition;
-        self
-    }
-
-    pub fn provenance_disposition(&self) -> ObservationProvenanceDispositionV1 {
-        self.provenance_disposition
     }
 
     pub fn with_repository_provenance_attachment(

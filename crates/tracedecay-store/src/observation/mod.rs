@@ -22,7 +22,7 @@ mod anchored_write;
 use anchored_write::validate_retrieval_anchor_binding;
 pub use anchored_write::{
     AnchoredObservationWrite, ObservationIdentityCollisionDispositionV1,
-    ObservationProvenanceDispositionV1, RepositoryProvenanceAttachmentV1,
+    RepositoryProvenanceAttachmentV1,
 };
 
 const MAX_REPLAY_LIMIT: usize = 1_000;
