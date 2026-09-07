@@ -148,11 +148,11 @@ impl ProjectMemoryProviderActivationSelector {
     ) -> Result<ProjectMemoryProviderActivation> {
         match self {
             Self::FromRuntimeConfiguration => {
-                resolve_memory_provider_activation(&runtime_configuration.config)
+                resolve_memory_provider_activation(runtime_configuration.config())
             }
             #[cfg(all(test, feature = "memory-provider-host"))]
             Self::FromRuntimeConfigurationWithNativePortInterposition(_) => {
-                resolve_memory_provider_activation(&runtime_configuration.config)
+                resolve_memory_provider_activation(runtime_configuration.config())
             }
         }
     }
@@ -878,11 +878,17 @@ async fn production_project_server_inner(
         canonical_project_path.to_path_buf(),
     ));
     let route_registered = Arc::new(AtomicBool::new(true));
+    // Route-owned cancellation lifetime. Terminal route revocation (a failed
+    // owner rekey) must end this route's activation and query waiters without
+    // touching the caller's project-open token, so they hang off a child:
+    // cancelling a child never propagates to its parent.
+    let route_cancellation = cancellation.child_token();
     let database_owner_reconciler = runtime.database_owner_reconciler(
         store_administration,
         Arc::clone(&current_key),
         Arc::clone(&current_project_path),
         Arc::clone(&route_registered),
+        route_cancellation.clone(),
         handshake.clone(),
     );
     let automation_scheduler_reconciler = runtime.automation_scheduler_reconciler(
@@ -952,7 +958,7 @@ async fn production_project_server_inner(
     #[cfg(feature = "memory-provider-host")]
     let cognitive_recall_mount = match (
         memory_provider_host_mount.registry().is_some(),
-        project_recall_routing_policy(memory_provider_activation, &runtime_configuration.config)?,
+        project_recall_routing_policy(memory_provider_activation, runtime_configuration.config())?,
     ) {
         (true, Some(routing)) => {
             let mount = super::retained_owner::cognitive_recall::mount_project_cognitive_recall(
@@ -997,6 +1003,7 @@ async fn production_project_server_inner(
         _ => None,
     };
 
+    let (semantic_runtime_ready, semantic_runtime_readiness) = tokio::sync::watch::channel(false);
     let code_index_mount = code_index_activation_mount(CodeIndexActivationMountInputs {
         invocation: invocation.clone(),
         project_id: code_search_project_id.clone(),
@@ -1006,13 +1013,13 @@ async fn production_project_server_inner(
         semantic_lifecycle: semantic_lifecycle.clone(),
         semantic_resources,
         semantic_document_composition,
-        native_graph_activation: runtime_configuration.config.native_graph_activation,
+        native_graph_activation: runtime_configuration.config().native_graph_activation,
         scope: code_search_scope.clone(),
         route_registered: Arc::clone(&route_registered),
-        cancellation: cancellation.clone(),
+        cancellation: route_cancellation.clone(),
         graph_runtime: Arc::clone(&graph_runtime),
         graph_publication_database: Arc::new(cg.db().clone()),
-        configuration_runtime: Arc::clone(cg.configuration_runtime()),
+        semantic_runtime_ready,
         profile_id: cg.store_runtime_registry().profile_id().clone(),
     });
     let code_index_hint_sink = code_index_activation_hint_sink(
@@ -1031,7 +1038,7 @@ async fn production_project_server_inner(
         code_index_scheduler::CodeIndexActivationV1::new_with_admission(
             canonical_project_path,
             Arc::clone(&route_registered),
-            cancellation.clone(),
+            route_cancellation.clone(),
             code_index_automatic_admission,
             code_index_mount,
             code_index_hint_sink,
@@ -1085,10 +1092,7 @@ async fn production_project_server_inner(
                     .ok()
                     .and_then(|pinned| {
                         tracedecay_usecases::semantic_runtime::SemanticConfigurationPinV1::from_current(
-                            &tracedecay_configuration::ConfigurationCurrentStateV1 {
-                                revision_id: pinned.revision_id,
-                                snapshot: pinned.snapshot,
-                            },
+                            &pinned.into_current_state(),
                         )
                         .ok()
                     });
@@ -1254,6 +1258,16 @@ async fn production_project_server_inner(
                 message: "code-index activation scope does not match the project route".to_owned(),
             });
         }
+        let publication_attempt = Box::pin(project_open_owners::spawn_semantic_owner_registration(
+            invocation.clone(),
+            canonical_project_path.to_path_buf(),
+            Arc::clone(cg.configuration_runtime()),
+            code_search_scope.clone(),
+            semantic_runtime_readiness,
+            Arc::clone(&route_registered),
+            route_cancellation.clone(),
+        ))
+        .await?;
         // The core's own lane never opens: only the full server reaches a Git
         // transaction authority. Its gate is kept so a rolled-back publication
         // can report a terminal failure instead of warming forever.
@@ -1352,14 +1366,12 @@ async fn production_project_server_inner(
                         Box::pin(store_administration.registered_profile_session_database()).await?;
                     Ok((database, started.elapsed()))
                 };
-            let (
-                (registered_project_session_db, project_sessions_elapsed),
-                (registered_user_session_db, profile_sessions_elapsed),
-            ) = Box::pin(join_independent_session_opens(
-                project_session_open,
-                profile_session_open,
-            ))
-            .await?;
+            let ((session_db, project_sessions_elapsed), (user_session_db, profile_sessions_elapsed)) =
+                Box::pin(join_independent_session_opens(
+                    project_session_open,
+                    profile_session_open,
+                ))
+                .await?;
             let session_runtime_registry =
                 Box::pin(store_administration.session_runtime_registry()).await?;
             tokio::select! {
@@ -1375,7 +1387,7 @@ async fn production_project_server_inner(
             if !project_database_is_read_only {
                 Box::pin(bind_verified_project_graph_runtime(
                     cg.db(),
-                    registered_project_session_db.as_ref(),
+                    session_db.as_ref(),
                 ))
                 .await?;
             }
@@ -1384,8 +1396,6 @@ async fn production_project_server_inner(
                 project_sessions_elapsed,
                 profile_sessions_elapsed,
             );
-            let session_db = registered_project_session_db.clone();
-            let user_session_db = registered_user_session_db.clone();
             #[cfg(feature = "memory-provider-host")]
             let observation_journey_mount = if memory_provider_host_mount.registry().is_some() {
                 Some(
@@ -1400,7 +1410,7 @@ async fn production_project_server_inner(
                             host_limits: super::retained_owner::native_provider::native_provider_limits(),
                             policy: super::retained_owner::observation_journey::ObservationJourneyPolicyV1::project_default(),
                         },
-                        registered_project_session_db.observation_store(),
+                        session_db.observation_store(),
                         cancellation,
                     ))
                     .await
@@ -1541,6 +1551,7 @@ async fn production_project_server_inner(
                 invocation.code_index_schedulers.clone(),
                 Arc::clone(&diagnostic_broker),
                 invocation.feedback_runtime_registrar(),
+                invocation.semantic_owner_runtime_registrar(),
                 store_telemetry_sampling,
                 Arc::clone(cg.configuration_runtime()),
             );
@@ -1556,10 +1567,8 @@ async fn production_project_server_inner(
                     databases: crate::mcp::server::McpServerDaemonDatabases {
                         accounting: accounting_db,
                         registry: registry_db,
-                        project_sessions: session_db,
-                        user_sessions: user_session_db,
-                        registered_project_sessions: registered_project_session_db.clone(),
-                        registered_user_sessions: registered_user_session_db,
+                        project_sessions: session_db.clone(),
+                        profile_sessions: user_session_db,
                     },
                     host_admission_broker,
                     project_session_refresh_wake,
@@ -1708,7 +1717,7 @@ async fn production_project_server_inner(
                 log_full_setup_phase("source_edit_preview_ready");
                 Box::pin(ensure_git_index_transactions_for_mutation_owners(
                     store_administration,
-                    registered_project_session_db.clone(),
+                    session_db,
                     canonical_project_path,
                     key.owner.project_id.as_deref(),
                 ))
@@ -1788,6 +1797,15 @@ async fn production_project_server_inner(
                     message: "project changed branch during full capability admission".to_owned(),
                 });
             }
+            if !invocation
+                .service
+                .project_runtimes
+                .mark_publication_ready(&publication_attempt)
+            {
+                return Err(TraceDecayError::Config {
+                    message: "project runtime publication attempt was superseded".to_owned(),
+                });
+            }
             // The registry cutover prevents new core leases. Existing core
             // requests may finish while dependent owners warm, then the
             // displaced server is drained without closing the shared graph.
@@ -1861,6 +1879,10 @@ async fn production_project_server_inner(
                     mutation.mark_failed();
                 }
                 if core_retained {
+                    invocation
+                        .service
+                        .project_runtimes
+                        .mark_publication_failed(&publication_attempt);
                     if let Some(failed_full_server) = failed_full_server {
                         failed_full_server.revoke_project_server_responses();
                         schedule_project_server_retirement(
@@ -1963,7 +1985,7 @@ fn semantic_project_runtime(
     runtime_configuration: &tracedecay_configuration::config::PinnedRuntimeConfiguration,
     runtime: &ProductionProjectCompositionRuntime,
 ) -> Result<SemanticProjectRuntime> {
-    let semantic_config = &runtime_configuration.config.semantic;
+    let semantic_config = &runtime_configuration.config().semantic;
     let semantic_resources = &semantic_config.resources;
     // The configured ceiling still caps concurrency; this only narrows it to
     // what the serving reservation leaves room for and adds one slot so an

@@ -51,6 +51,55 @@ pub(crate) fn register_test_schema_installer() {
     tracedecay_global_db::register_test_schema_installer();
 }
 
+/// Fixtures for states this crate's tests build without a project runtime.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    use tracedecay_automation_runtime::automation::host_io::{
+        HostIo, ManagedSkillExportReport, PluginFile,
+    };
+    use tracedecay_domain::errors::Result;
+
+    /// A host I/O bundle with no agent hosts behind it: writes land on disk
+    /// plainly, export sweeps report nothing, and the managed-agent bundle is
+    /// empty.
+    pub(crate) fn fixture_host_io() -> HostIo {
+        fn export_to_agents(_: &Path, _: &Path) -> Vec<ManagedSkillExportReport> {
+            Vec::new()
+        }
+
+        fn export_to_agent_hosts(_: &Path, _: &Path, _: &Path) -> Vec<ManagedSkillExportReport> {
+            Vec::new()
+        }
+
+        fn write_text(path: &Path, contents: &str, _: Option<&Path>) -> Result<()> {
+            Ok(std::fs::write(path, contents)?)
+        }
+
+        fn write_json(path: &Path, value: &serde_json::Value, _: Option<&Path>) -> Result<()> {
+            Ok(std::fs::write(path, serde_json::to_vec_pretty(value)?)?)
+        }
+
+        fn remove_host_file(path: &Path) -> std::io::Result<()> {
+            std::fs::remove_file(path)
+        }
+
+        fn codex_agent_files() -> &'static [PluginFile] {
+            &[]
+        }
+
+        HostIo {
+            export_to_agents,
+            export_to_agent_hosts,
+            write_text,
+            write_json,
+            remove_host_file,
+            codex_agent_files,
+        }
+    }
+}
+
 pub mod analytics_api;
 pub mod application_surface;
 mod automation_authority;
@@ -161,6 +210,7 @@ use tracedecay_api::{WorkOperation, WorkflowOperation};
 use crate::tracedecay::TraceDecay;
 use tracedecay_automation_runtime::automation::backend;
 use tracedecay_automation_runtime::automation::config::{AutomationBackend, AutomationHostMode};
+use tracedecay_automation_runtime::automation::host_io::HostIo;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{FactOwnerV1, ProjectId};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
@@ -346,6 +396,9 @@ impl AdmittedDoctorReportV1 {
 pub struct DashboardState {
     /// The owning binary's composed build version, from the composition.
     pub build_version: &'static str,
+    /// Host-install I/O from the project runtime; analytics reads the embedded
+    /// managed-agent bundle through it to label subagent sessions.
+    pub host_io: HostIo,
     /// Registered project id for profile-backed stores, when known.
     pub project_id: Option<String>,
     /// Exact application scope resolved ONCE when this state was constructed.
@@ -436,6 +489,10 @@ pub struct DashboardState {
         Option<Arc<dyn DashboardProfileCodeIndexWorkerSettingsPort>>,
     /// Process-local derived BPE token-count cache for the Savings & Cost tab.
     pub token_counts: Arc<token_count::TokenCountCache>,
+    /// Derived snapshots (PCA projection, similarity pairs, dependency strata)
+    /// computed from this state's own stores. Owned here, shared by clones,
+    /// and released with the state instead of accumulating process-wide.
+    pub(crate) derived_snapshots: Arc<snapshot_cache::DerivedSnapshotCaches>,
     /// Admitted daemon/application diagnostics authority. `None` keeps all
     /// diagnostics controls typed unavailable; the dashboard never constructs
     /// a broker or analyzer runtime.
@@ -563,17 +620,6 @@ impl DashboardHostAdmissionTestAuthorityV1 {
         git_correlation_read_authority: Arc<dyn DashboardGitCorrelationReadPortV1>,
     ) -> Self {
         self.git_correlation_read_authority = Some(git_correlation_read_authority);
-        self
-    }
-
-    /// Attaches the daemon-owned Delivery read adapter used by the production
-    /// route. Tests retain the same request-control and admission boundary.
-    #[must_use]
-    pub fn with_delivery_read_authority(
-        mut self,
-        delivery_read_authority: Arc<dyn DashboardDeliveryReadPortV1>,
-    ) -> Self {
-        self.delivery_read_authority = Some(delivery_read_authority);
         self
     }
 
@@ -775,6 +821,7 @@ async fn build_state_inner(
     );
     let mut state = DashboardState {
         build_version,
+        host_io: cg.automation_runtime().host_io(),
         project_id: cg.store_layout().identity.project_id.clone(),
         resolved_scope: scope::resolve_dashboard_scope(
             cg.project_root(),
@@ -814,6 +861,7 @@ async fn build_state_inner(
         user_settings: cg.user_settings_client(),
         profile_code_index_worker_settings,
         token_counts: Arc::new(token_count::TokenCountCache::new()),
+        derived_snapshots: Arc::new(snapshot_cache::DerivedSnapshotCaches::new()),
         code_diagnostics_authority: None,
         automation_authority,
         automation_observation,
@@ -2321,6 +2369,7 @@ mod authority_tests {
                 project_memory_owner_for_layout(&layout).expect("dashboard project memory owner");
             let state = DashboardState {
                 build_version: "0.0.0-fixture+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                host_io: crate::test_support::fixture_host_io(),
                 project_id: layout.identity.project_id.clone(),
                 resolved_scope: scope::resolve_dashboard_scope(
                     &project_root,
@@ -2359,6 +2408,7 @@ mod authority_tests {
                 ),
                 profile_code_index_worker_settings: None,
                 token_counts: Arc::new(token_count::TokenCountCache::new()),
+                derived_snapshots: Arc::new(snapshot_cache::DerivedSnapshotCaches::new()),
                 code_diagnostics_authority: None,
                 automation_authority: None,
                 automation_observation: None,
@@ -2547,6 +2597,45 @@ mod authority_tests {
         assert_eq!(projection_warm["scan"]["vector_rows_read"], 0);
         assert_eq!(similarity_warm["scan"]["cache_state"], "hit");
         assert_eq!(similarity_warm["scan"]["vector_rows_read"], 0);
+    }
+
+    #[tokio::test]
+    async fn retiring_the_dashboard_state_releases_its_derived_snapshots() {
+        let fixture = DashboardStateFixture::open("project.dashboard-derived-retirement").await;
+        let control = tracedecay_store::FactReadControl::new(Arc::new(|| false));
+        fixture.add_vector_facts(3).await;
+
+        let projection =
+            memory_service::projection_payload(&fixture.state, "", 2_000, &control).await;
+        let similarity =
+            memory_service::similarity_payload(&fixture.state, 0.5, 100, &control).await;
+        assert_eq!(projection["scan"]["cache_state"], "miss");
+        assert_eq!(projection["points"].as_array().unwrap().len(), 3);
+        assert_eq!(similarity["scan"]["cache_state"], "miss");
+        assert_eq!(similarity["count"], 3);
+
+        // The populated caches are owned by the state (and its clones), not by
+        // the process: once the last handle to this store's dashboard state is
+        // gone, the derived snapshots are gone with it.
+        let DashboardStateFixture {
+            state,
+            layout: _,
+            _database_authority,
+            _temporary,
+        } = fixture;
+        let retained = Arc::downgrade(&state.derived_snapshots);
+        let clone = state.clone();
+        drop(state);
+        assert!(
+            retained.upgrade().is_some(),
+            "a live clone of the state still owns the derived snapshots"
+        );
+        drop(clone);
+        assert!(
+            retained.upgrade().is_none(),
+            "retiring the last dashboard state must release its derived snapshots"
+        );
+        drop((_database_authority, _temporary));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

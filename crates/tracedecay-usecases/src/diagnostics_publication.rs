@@ -255,20 +255,56 @@ pub trait CodeIndexPublicationIdentityPortV1: Send + Sync {
 /// logical identity in this generation and must not be resolved to one.
 #[must_use]
 pub fn code_index_logical_path(project_root: &Path, reported: &str) -> Option<String> {
-    let candidate = Path::new(reported);
-    let relative = if candidate.is_absolute() {
-        candidate.strip_prefix(project_root).ok()?
-    } else {
-        candidate
-    };
-    if relative
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
+    if reported.contains('\0') {
+        return None;
+    }
+    let reported_logical = reported.replace('\\', "/");
+    if logical_path_components(&reported_logical)
+        .any(|component| !is_normal_logical_component(component))
     {
         return None;
     }
-    let logical = relative.to_str()?.replace('\\', "/");
-    (!logical.is_empty()).then_some(logical)
+    let relative = if is_logical_absolute(&reported_logical) {
+        let root_logical = project_root.to_str()?.replace('\\', "/");
+        strip_logical_prefix(&reported_logical, &root_logical)?
+    } else {
+        reported_logical.as_str()
+    };
+    if relative.is_empty()
+        || logical_path_components(relative)
+            .any(|component| !is_normal_logical_component(component))
+    {
+        return None;
+    }
+    Some(relative.to_string())
+}
+
+fn is_logical_absolute(path: &str) -> bool {
+    path.starts_with('/') || logical_drive_absolute(path)
+}
+
+fn logical_drive_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
+}
+
+fn strip_logical_prefix<'a>(reported: &'a str, root: &str) -> Option<&'a str> {
+    let reported = reported.trim_end_matches('/');
+    let root = root.trim_end_matches('/');
+    if reported == root {
+        return None;
+    }
+    reported
+        .strip_prefix(root)
+        .and_then(|rest| rest.strip_prefix('/'))
+}
+
+fn logical_path_components(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/').filter(|component| !component.is_empty())
+}
+
+fn is_normal_logical_component(component: &str) -> bool {
+    component != "." && component != ".."
 }
 
 /// One producer's finding, addressed exactly.
@@ -512,40 +548,6 @@ pub fn github_review_contribution_v1(
         severity,
         message: bounded_notice(notice),
     })
-}
-
-/// Builds an advisory contribution for a pillar whose anchor identity is
-/// assembled by the caller (CI localization, proximity).
-///
-/// Unlike GitHub review anchors, `CiExactCodeEvidenceV1` and proximity
-/// candidates do not carry a `(file, content_digest, span)` triple directly;
-/// the caller resolves those from its own generation evidence and passes them
-/// here so no identity is invented inside the publication layer.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DiagnosticContributionAnchorV1 {
-    pub anchor: RetrievalAnchorId,
-    pub file_occurrence_id: FileOccurrenceId,
-    pub content_digest: ContentDigest,
-    pub span: SourceSpan,
-    pub symbol_occurrence_id: Option<SymbolOccurrenceId>,
-}
-
-pub fn advisory_contribution_v1(
-    anchor: DiagnosticContributionAnchorV1,
-    code: &str,
-    severity: DiagnosticSeverityV1,
-    notice: &str,
-) -> DiagnosticContributionV1 {
-    DiagnosticContributionV1 {
-        anchor: anchor.anchor,
-        file_occurrence_id: anchor.file_occurrence_id,
-        content_digest: anchor.content_digest,
-        span: anchor.span,
-        symbol_occurrence_id: anchor.symbol_occurrence_id,
-        code: code.to_owned(),
-        severity,
-        message: bounded_notice(notice),
-    }
 }
 
 /// A parsed compiler diagnostic resolved against real file content.
@@ -1402,6 +1404,22 @@ mod tests {
         );
         assert!(code_index_logical_path(root, "../outside.rs").is_none());
         assert!(code_index_logical_path(root, "/elsewhere/lib.rs").is_none());
+        assert_eq!(
+            code_index_logical_path(Path::new(r"C:\project"), r"C:\project\src\lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            code_index_logical_path(Path::new(r"C:\project"), "src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert!(
+            code_index_logical_path(Path::new(r"C:\project"), r"C:\elsewhere\lib.rs").is_none()
+        );
+        assert!(
+            code_index_logical_path(Path::new(r"C:\project"), r"C:\project\..\outside.rs")
+                .is_none()
+        );
+        assert!(code_index_logical_path(Path::new("/project"), "/project-other/lib.rs").is_none());
     }
 
     #[test]

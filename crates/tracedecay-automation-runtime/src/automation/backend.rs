@@ -63,7 +63,7 @@ fn executable_resolution(bin: &str) -> Result<bool> {
         return Ok(path.is_file());
     }
     Ok(
-        crate::agents::host_cli::resolve_on_path(bin, std::env::var_os("PATH").as_deref())?
+        super::executable_lookup::resolve_on_path(bin, std::env::var_os("PATH").as_deref())?
             .is_some(),
     )
 }
@@ -101,7 +101,9 @@ impl CodexAppServerBackend {
 
     pub fn new(model: Option<String>, timeout_secs: u64) -> Self {
         let mut config = CodexAppServerSummaryConfig::from_env();
-        config.model = model.filter(|model| !model.trim().is_empty());
+        if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
+            config.model = Some(model);
+        }
         config.timeout = Duration::from_secs(timeout_secs.clamp(5, 300));
         Self { config }
     }
@@ -134,6 +136,11 @@ impl AgentTaskBackend for CodexAppServerBackend {
             &backend_message,
             &self.config,
             "tracedecay_automation",
+            matches!(
+                request.task,
+                AgentTaskKind::SkillWriter | AgentTaskKind::CombinedReview
+            )
+            .then_some(&request.contract.response_schema),
         )
         .map_err(AgentTaskError::from_backend_message)?;
         let output_json = request

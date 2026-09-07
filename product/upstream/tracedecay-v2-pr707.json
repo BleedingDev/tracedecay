@@ -19,12 +19,12 @@
     "must_be_ancestor_of_product_head": true
   },
   "observed_pull_request": {
-    "retrieved_at": "2026-09-06",
+    "retrieved_at": "2026-09-07",
     "state": "open",
     "base_ref": "master",
     "base_sha": "b9204dcf7de8faac4ef05af367a546aa29c32e9f",
     "head_ref": "codex/tracedecay-total-redesign-plan-reopened",
-    "head_sha": "b8cbcaa6fec5062a3c74b828fa460f75b8eae6a3",
+    "head_sha": "3b59bb7eb0b10b4e7a8efc668e793ef7a1d11072",
     "pinned_floor_is_current_head": false
   },
   "update_procedure": {

@@ -740,7 +740,7 @@ def check_composition_mount(text: str, errors: list[str]) -> None:
     if selector_body is not None:
         for fragment in (
             "Self::FromRuntimeConfiguration => {",
-            "resolve_memory_provider_activation(&runtime_configuration.config)",
+            "resolve_memory_provider_activation(runtime_configuration.config())",
         ):
             if fragment not in selector_body:
                 errors.append(

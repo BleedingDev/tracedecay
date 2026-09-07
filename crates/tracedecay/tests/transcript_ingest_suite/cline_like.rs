@@ -14,7 +14,8 @@ use crate::restart_atomicity::durable_table_count;
 use crate::restart_atomicity::{
     ProjectSessionTestRuntime, assert_secret_absent_from_observation_sinks,
     ingest_global_sources_for_provider, mark_test_project, observation_source_cursor,
-    open_project_session_db, set_projection_failure, try_ingest_source,
+    observation_source_cursor_for_key, open_project_session_db, set_projection_failure,
+    try_ingest_source,
 };
 use crate::support::{
     assert_metadata_path_eq, create_git_repo_with_linked_worktree, init_git_repo, setup,
@@ -24,8 +25,11 @@ pub(super) fn vscode_storage_root(
     home: &std::path::Path,
     extension_id: &str,
 ) -> std::path::PathBuf {
+    // Joined per component to match the source's native spelling; the task
+    // paths derived from this root are compared against stored cursor keys.
     tracedecay::agents::vscode_data_dir(home)
-        .join("User/globalStorage")
+        .join("User")
+        .join("globalStorage")
         .join(extension_id)
         .join("tasks")
 }
@@ -34,24 +38,9 @@ async fn parse_offset_for_path(
     db: &ProjectSessionTestRuntime,
     path: &std::path::Path,
 ) -> Option<ParseOffset> {
-    let path = path.to_string_lossy();
-    if let Some(offset) = db.get_parse_offset(path.as_ref()).await {
-        return Some(offset);
-    }
-
-    #[cfg(windows)]
-    {
-        let alternate = if path.contains('/') {
-            path.replace('/', "\\")
-        } else {
-            path.replace('\\', "/")
-        };
-        if alternate != path {
-            return db.get_parse_offset(&alternate).await;
-        }
-    }
-
-    None
+    // `get_parse_offset` normalises to the canonical stored form itself, so
+    // the display path is the lookup.
+    db.get_parse_offset(path.to_string_lossy().as_ref()).await
 }
 
 pub(super) async fn parse_offset_for_task_history(
@@ -808,6 +797,7 @@ async fn cline_like_replacement_projection_replay_is_deterministic() {
         mark_test_project(&project);
         let root = vscode_storage_root(&home, extension_id);
         let session_id = format!("{provider}-fault");
+        let ui_source_key = format!("{session_id}:ui_messages");
         let history = write_task(&root, &project, &session_id);
 
         let db = open_project_session_db(&project).await.unwrap();
@@ -820,10 +810,24 @@ async fn cline_like_replacement_projection_replay_is_deterministic() {
             2,
             "{provider}: initial durable message cardinality"
         );
+        let usage_fact_count = db.observation_fact_count("uncorrelated_usage").await;
+        assert_eq!(
+            usage_fact_count, 1,
+            "{provider}: initial usage fact cardinality"
+        );
         let prefix_cursor = observation_source_cursor(&db, provider, &session_id, &project)
             .await
             .unwrap_or_else(|| panic!("{provider}: committed observation cursor"));
-        assert_eq!(prefix_cursor.position(), 3, "{provider}: initial frontier");
+        // The API history and `ui_messages.json` are appended independently, so
+        // each is its own source: two API entries here, and the uncorrelated
+        // usage event sits at position 1 of the UI stream rather than extending
+        // the API frontier.
+        assert_eq!(prefix_cursor.position(), 2, "{provider}: initial frontier");
+        let ui_cursor =
+            observation_source_cursor_for_key(&db, provider, &session_id, &ui_source_key)
+                .await
+                .unwrap_or_else(|| panic!("{provider}: committed UI observation cursor"));
+        assert_eq!(ui_cursor.position(), 1, "{provider}: initial UI frontier");
         drop(db);
 
         // Exact restart is a no-op.
@@ -839,6 +843,11 @@ async fn cline_like_replacement_projection_replay_is_deterministic() {
             observation_source_cursor(&replay, provider, &session_id, &project).await,
             Some(prefix_cursor.clone()),
             "{provider}: frontier unchanged on restart"
+        );
+        assert_eq!(
+            replay.observation_fact_count("uncorrelated_usage").await,
+            usage_fact_count,
+            "{provider}: exact restart must not duplicate usage"
         );
 
         // Replacement with an extra durable turn, interrupted by projection failure.
@@ -875,14 +884,24 @@ async fn cline_like_replacement_projection_replay_is_deterministic() {
             prefix_cursor.generation(),
             "{provider}: replacement starts a new snapshot generation"
         );
-        // Full coverage of the replacement snapshot — three conversation rows
-        // plus the uncorrelated ui_messages usage record — commits before
-        // projection acknowledgement; the failed projection replays from the
-        // durable queue rather than wedging the observation frontier.
+        // Full coverage of the replacement snapshot — three conversation rows —
+        // commits before projection acknowledgement; the failed projection
+        // replays from the durable queue rather than wedging the observation
+        // frontier. The unchanged UI stream keeps its own frontier.
         assert_eq!(
             committed_cursor.position(),
-            4,
+            3,
             "{provider}: observation frontier commits before projection acknowledgement"
+        );
+        assert_eq!(
+            observation_source_cursor_for_key(&replay, provider, &session_id, &ui_source_key).await,
+            Some(ui_cursor.clone()),
+            "{provider}: API replacement leaves the UI stream frontier untouched"
+        );
+        assert_eq!(
+            replay.observation_fact_count("uncorrelated_usage").await,
+            usage_fact_count,
+            "{provider}: covered API replacement must not duplicate UI usage"
         );
         assert_eq!(
             replay.session_message_count().await.unwrap(),
@@ -925,6 +944,11 @@ async fn cline_like_replacement_projection_replay_is_deterministic() {
                 .messages_upserted,
             0,
             "{provider}: post-recovery replay"
+        );
+        assert_eq!(
+            recovered.observation_fact_count("uncorrelated_usage").await,
+            usage_fact_count,
+            "{provider}: recovery replay must not duplicate usage"
         );
     }
 }
@@ -1136,5 +1160,139 @@ async fn cline_like_unknown_project_membership_defers_persistence_and_offset() {
     crate::vibe::run_unknown_membership_child(
         CHILD_ENV,
         "cline_like::cline_like_unknown_project_membership_defers_persistence_and_offset",
+    );
+}
+
+/// Rebuild boundary for the native-source scheme change (#880).
+///
+/// Before `ff5c895ae` a Cline/Roo/Kilo task committed its `ui_messages.json`
+/// events under the API history's combined `<task>` source. They now carry
+/// their own `<task>:ui_messages` source, so a store still holding the old
+/// rows would re-admit every one of those native UI events once more under
+/// the new key and silently double-count the usage facts derived from them.
+/// Admission must refuse such a store with the typed `ResetRequired` reason
+/// instead, and the scoped rebuild must clear the derived usage together with
+/// the admission cursors so the same unchanged native event is admitted
+/// exactly once afterwards.
+#[cfg(not(windows))]
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn cline_ui_source_scheme_refuses_old_stores_until_rebuilt() {
+    let _env_lock = GLOBAL_DB_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let (home, project) = setup(&tmp);
+    let _home = EnvVarGuard::set("HOME", &home);
+    init_git_repo(&project);
+    let project_id = mark_test_project(&project);
+    let session_id = "cline-scheme-boundary";
+    let ui_source_key = format!("{session_id}:ui_messages");
+    write_task(
+        &vscode_storage_root(&home, "saoudrizwan.claude-dev"),
+        &project,
+        session_id,
+    );
+    let profile_root = project.parent().unwrap().join("tracedecay-test-profile");
+
+    let (database_path, committed_observations, ui_cursor) = {
+        let db = open_project_session_db(&project).await.unwrap();
+        ingest_global_sources_for_provider(&db, &project, Some(SessionProvider::Cline)).await;
+        let ui_cursor = observation_source_cursor_for_key(&db, "cline", session_id, &ui_source_key)
+            .await
+            .expect("committed UI observation cursor");
+        assert_eq!(
+            ui_cursor.position(),
+            1,
+            "one native UI event on first ingest"
+        );
+        let committed = durable_table_count(&db, "observations").await;
+        assert!(committed > 0);
+        let path = db
+            .runtime()
+            .database_path(tracedecay_sessions::admission::HostAdmissionScope::Project)
+            .expect("project sessions database path")
+            .to_path_buf();
+        (path, committed, ui_cursor)
+    };
+
+    // Make the store look like one recorded under the superseded scheme: every
+    // row stays exactly as committed, only the scheme enrollment is absent.
+    {
+        let raw = rusqlite::Connection::open(&database_path).unwrap();
+        assert_eq!(
+            raw.execute(
+                "DELETE FROM global_schema_migrations WHERE migration = ?1",
+                [tracedecay_global_db::observation::OBSERVATION_NATIVE_SOURCE_SCHEME_MIGRATION],
+            )
+            .unwrap(),
+            1,
+            "a healthy store must record the current native-source scheme"
+        );
+    }
+
+    let refusal = tracedecay::host_admission::HostAdmissionTestRuntimeV1::project(
+        &profile_root,
+        &project,
+        project_id.clone(),
+    )
+    .await
+    .err()
+    .expect("an old-scheme store must refuse admission");
+    let (authority, reason) = refusal
+        .reset_required_context()
+        .unwrap_or_else(|| panic!("expected the typed ResetRequired state, got: {refusal}"));
+    assert_eq!(authority, "observations");
+    assert!(
+        reason.contains("ui_messages") && reason.contains("double-count"),
+        "the refusal must name the scheme change it refuses: {reason}"
+    );
+    {
+        let raw = rusqlite::Connection::open(&database_path).unwrap();
+        assert_eq!(
+            u64::try_from(
+                raw.query_row("SELECT COUNT(*) FROM observations", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap()
+            )
+            .unwrap(),
+            committed_observations,
+            "a refused store must not ingest anything"
+        );
+    }
+
+    let report = {
+        let mut raw = rusqlite::Connection::open(&database_path).unwrap();
+        tracedecay_global_db::observation::reset_refused_observation_authority(&mut raw)
+            .expect("scoped rebuild of the refused authority")
+    };
+    for table in [
+        "observations",
+        "source_cursors",
+        "source_cursor_advances",
+        "observation_provider_usage",
+    ] {
+        assert!(
+            report.reset_tables.iter().any(|reset| reset == table),
+            "the rebuild must reset the derived usage and its admission cursors \
+             together; {table} was missing from {:?}",
+            report.reset_tables
+        );
+    }
+
+    let db = open_project_session_db(&project).await.unwrap();
+    ingest_global_sources_for_provider(&db, &project, Some(SessionProvider::Cline)).await;
+    assert_eq!(
+        observation_source_cursor_for_key(&db, "cline", session_id, &ui_source_key)
+            .await
+            .map(|cursor| cursor.position()),
+        Some(ui_cursor.position()),
+        "the same native UI event must be admitted exactly once after the rebuild"
+    );
+    assert_eq!(
+        durable_table_count(&db, "observations").await,
+        committed_observations,
+        "the rebuilt authority must re-admit the unchanged native events exactly \
+         once, not once more on top of what the old scheme committed"
     );
 }

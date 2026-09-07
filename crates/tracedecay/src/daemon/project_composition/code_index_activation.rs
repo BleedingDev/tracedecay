@@ -27,7 +27,7 @@ pub(super) struct CodeIndexActivationMountInputs {
     pub(super) cancellation: CancellationToken,
     pub(super) graph_runtime: Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>,
     pub(super) graph_publication_database: Arc<tracedecay_runtime_core::db::Database>,
-    pub(super) configuration_runtime: Arc<tracedecay_configuration::ProjectConfigurationRuntime>,
+    pub(super) semantic_runtime_ready: tokio::sync::watch::Sender<bool>,
     pub(super) profile_id: tracedecay_domain::configuration::UserProfileId,
 }
 
@@ -53,7 +53,7 @@ pub(super) fn code_index_activation_mount(
         cancellation,
         graph_runtime,
         graph_publication_database,
-        configuration_runtime,
+        semantic_runtime_ready,
         profile_id,
     } = inputs;
     let mount: code_index_scheduler::CodeIndexActivationMountV1 = Arc::new(move || {
@@ -70,7 +70,7 @@ pub(super) fn code_index_activation_mount(
         let cancellation = cancellation.clone();
         let graph_runtime = Arc::clone(&graph_runtime);
         let graph_publication_database = Arc::clone(&graph_publication_database);
-        let configuration_runtime = Arc::clone(&configuration_runtime);
+        let semantic_runtime_ready = semantic_runtime_ready.clone();
         let profile_id = profile_id.clone();
         Box::pin(hotpath::future!(
             async move {
@@ -103,16 +103,15 @@ pub(super) fn code_index_activation_mount(
                     }
                     outcome = mount => outcome.map_err(|error| error.to_string())?,
                 }
-                project_open_owners::install_semantic_activation_runtime_owner(
-                    &invocation,
-                    &project_root,
-                    configuration_runtime,
-                    scope.clone(),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
                 if cancellation.is_cancelled() || !route_registered.load(Ordering::Acquire) {
                     return Err("project route was revoked after code-index mount".to_owned());
+                }
+                if tracedecay_usecases::semantic_runtime::project_semantic_production_runtime(
+                    &project_root,
+                )
+                .is_some()
+                {
+                    semantic_runtime_ready.send_replace(true);
                 }
 
                 // Query authority depends on the first sealed generation, but
@@ -152,10 +151,15 @@ struct QueryAuthorityWaitInputs {
 }
 
 /// Wait for this project's first sealed generation, then mount its query
-/// authority. Route revocation, cancellation, and a closed publication channel
-/// each end the wait without mounting; a lagged channel or the route poll
-/// re-reads the serving slot, because a retained `Noop` restore does not
-/// republish.
+/// authority. Route revocation (which cancels this route's own token) and a
+/// closed publication channel each end the wait without mounting.
+///
+/// A publication is announced before its generation is seated, and a retained
+/// `Noop` restore seats without announcing at all, so the subscription alone
+/// can miss the first serving generation. The serving-seat signal covers both:
+/// every slot write records a seat, and the loop re-reads the exact state
+/// (`latest_generation_id`) on each wake. Subscribing before the first read is
+/// what keeps a seat that lands during it observable.
 fn spawn_query_authority_when_generation_ready(inputs: QueryAuthorityWaitInputs) {
     let QueryAuthorityWaitInputs {
         invocation: authority_invocation,
@@ -170,56 +174,29 @@ fn spawn_query_authority_when_generation_ready(inputs: QueryAuthorityWaitInputs)
     } = inputs;
     tokio::spawn(hotpath::future!(
         async move {
-            let mut route_poll = tokio::time::interval(std::time::Duration::from_secs(1));
-            route_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let generation_ready = if authority_invocation
+            // Order-sensitive: subscribe before the first exact-state read.
+            let mut seats = authority_invocation
                 .code_index_schedulers
-                .latest_generation_id(&authority_project)
-                .await
-                .is_some()
-            {
-                true
-            } else {
-                loop {
-                    if !authority_route_registered.load(Ordering::Acquire) {
-                        break false;
-                    }
-                    tokio::select! {
-                        () = authority_cancellation.cancelled() => break false,
-                        _ = route_poll.tick() => {
-                            if !authority_route_registered.load(Ordering::Acquire) {
-                                break false;
-                            }
-                            if authority_invocation
-                                .code_index_schedulers
-                                .latest_generation_id(&authority_project)
-                                .await
-                                .is_some()
-                            {
-                                break true;
-                            }
+                .subscribe_serving_seats();
+            let generation_ready = loop {
+                if authority_invocation
+                    .code_index_schedulers
+                    .latest_generation_id(&authority_project)
+                    .await
+                    .is_some()
+                {
+                    break true;
+                }
+                tokio::select! {
+                    () = authority_cancellation.cancelled() => break false,
+                    Ok(()) = seats.changed() => {}
+                    publication = publications.recv() => match publication {
+                        Ok(publication) if publication.project_root == authority_project => {
+                            break true;
                         }
-                        publication = publications.recv() => match publication {
-                            Ok(publication)
-                                if publication.project_root == authority_project =>
-                            {
-                                break true;
-                            }
-                            Ok(_) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                if authority_invocation
-                                    .code_index_schedulers
-                                    .latest_generation_id(&authority_project)
-                                    .await
-                                    .is_some()
-                                {
-                                    break true;
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                break false;
-                            }
-                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break false,
                     }
                 }
             };
@@ -288,7 +265,7 @@ fn spawn_query_authority_when_generation_ready(inputs: QueryAuthorityWaitInputs)
                         }
                         tokio::select! {
                             () = authority_cancellation.cancelled() => return,
-                            _ = route_poll.tick() => {},
+                            Ok(()) = seats.changed() => {}
                             publication = publications.recv() => match publication {
                                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,

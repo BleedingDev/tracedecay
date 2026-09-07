@@ -319,17 +319,15 @@ impl ProductionSemanticRetrievalConfigurationStoreV1 {
         now: UtcMicros,
     ) -> Result<SemanticConfigurationTransitionV1, SemanticConfigurationBackendErrorV1> {
         let stored = self.current_record().await?;
-        let restored = stored
-            .state
-            .rollback_profile()
-            .cloned()
-            .ok_or(SemanticConfigurationBackendErrorV1::Rejected)?;
+        let restored = stored.state.rollback_profile().cloned().ok_or(
+            SemanticConfigurationBackendErrorV1::RejectedAt("stage_rollback.no_rollback_profile"),
+        )?;
         let prior_active = stored.state.active().clone();
-        let prior_active_semantic = prior_active
-            .compatibility()
-            .semantic
-            .clone()
-            .ok_or(SemanticConfigurationBackendErrorV1::Rejected)?;
+        let prior_active_semantic = prior_active.compatibility().semantic.clone().ok_or(
+            SemanticConfigurationBackendErrorV1::RejectedAt(
+                "stage_rollback.active_profile_has_no_semantic_pin",
+            ),
+        )?;
         let prior_rollback_semantic = restored.compatibility().semantic.clone();
         let mut resulting = stored.state.clone();
         resulting
@@ -344,7 +342,9 @@ impl ProductionSemanticRetrievalConfigurationStoreV1 {
                     now,
                 ),
             )
-            .map_err(|_| SemanticConfigurationBackendErrorV1::Rejected)?;
+            .map_err(|_| {
+                SemanticConfigurationBackendErrorV1::RejectedAt("stage_rollback.state_rollback")
+            })?;
         let transition = SemanticConfigurationTransitionV1::rollback(
             base_configuration,
             result_configuration,
@@ -357,7 +357,9 @@ impl ProductionSemanticRetrievalConfigurationStoreV1 {
             trigger,
             now,
         )
-        .map_err(|_| SemanticConfigurationBackendErrorV1::Rejected)?;
+        .map_err(|_| {
+            SemanticConfigurationBackendErrorV1::RejectedAt("stage_rollback.transition")
+        })?;
         self.remember_central_commit(
             &transition,
             capability.authority().clone(),
@@ -386,11 +388,12 @@ impl ProductionSemanticRetrievalConfigurationStoreV1 {
         transition: &SemanticConfigurationTransitionV1,
         resulting: &RetrievalProfileStateV1,
     ) -> Result<(), SemanticConfigurationBackendErrorV1> {
-        transition
-            .validate()
-            .map_err(|_| SemanticConfigurationBackendErrorV1::Rejected)?;
-        let transition_json = serde_json::to_string(transition)
-            .map_err(|_| SemanticConfigurationBackendErrorV1::Rejected)?;
+        transition.validate().map_err(|_| {
+            SemanticConfigurationBackendErrorV1::RejectedAt("persist_pending.transition")
+        })?;
+        let transition_json = serde_json::to_string(transition).map_err(|_| {
+            SemanticConfigurationBackendErrorV1::RejectedAt("persist_pending.encode_transition")
+        })?;
         let scope_json = encode_scope(&self.scope)?;
         let resulting_state_json = encode_state(resulting)?;
         let transaction = self
@@ -537,7 +540,9 @@ impl SemanticRetrievalConfigurationPortV1 for ProductionSemanticRetrievalConfigu
                 .map_err(|_| SemanticConfigurationBackendErrorV1::Unavailable)?
                 .get(transition.transition_digest.as_str())
                 .cloned()
-                .ok_or(SemanticConfigurationBackendErrorV1::Rejected)?;
+                .ok_or(SemanticConfigurationBackendErrorV1::RejectedAt(
+                    "commit_linked_transition.no_prepared_central_commit",
+                ))?;
             let transaction = self
                 .database
                 .begin_write_transaction()
@@ -569,23 +574,29 @@ impl SemanticRetrievalConfigurationPortV1 for ProductionSemanticRetrievalConfigu
                 tracedecay_configuration::ConfigurationError::Unavailable => {
                     SemanticConfigurationBackendErrorV1::Unavailable
                 }
-                _ => SemanticConfigurationBackendErrorV1::Rejected,
+                _ => SemanticConfigurationBackendErrorV1::RejectedAt(
+                    "commit_linked_transition.central_commit",
+                ),
             })?;
             let committed_configuration =
-                SemanticConfigurationPinV1::from_current(&central.current)
-                    .map_err(|_| SemanticConfigurationBackendErrorV1::Rejected)?;
+                SemanticConfigurationPinV1::from_current(&central.current).map_err(|_| {
+                    SemanticConfigurationBackendErrorV1::RejectedAt(
+                        "commit_linked_transition.committed_configuration",
+                    )
+                })?;
             if committed_configuration != transition.result_configuration
                 || central.receipt.base_revision_id != transition.base_configuration.revision_id
                 || central.receipt.result_revision_id != transition.result_configuration.revision_id
             {
-                return Err(SemanticConfigurationBackendErrorV1::Rejected);
+                return Err(SemanticConfigurationBackendErrorV1::RejectedAt(
+                    "commit_linked_transition.committed_configuration_mismatch",
+                ));
             }
-            let audit = pending
-                .resulting_state
-                .audit()
-                .last()
-                .cloned()
-                .ok_or(SemanticConfigurationBackendErrorV1::Rejected)?;
+            let audit = pending.resulting_state.audit().last().cloned().ok_or(
+                SemanticConfigurationBackendErrorV1::RejectedAt(
+                    "commit_linked_transition.no_audit_event",
+                ),
+            )?;
             let result_epoch = current
                 .epoch
                 .checked_add(1)

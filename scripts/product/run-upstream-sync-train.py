@@ -2211,9 +2211,17 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         raise SyncTrainError("floor metadata SHA differs from sync policy")
     is_ancestor(repo, floor_sha, product_sha, "floor ancestry check failed")
     relationship, source_base = source_relationship(repo, floor_sha, source_sha)
-    if relationship != "descendant_of_floor":
+    if relationship == "diverged_from_floor" and args.transplant:
+        # A deliberate transplant: the upstream branch was rewritten, so no
+        # candidate can descend from the pinned floor any more. The train
+        # records the old floor and the common merge base so the receipt says
+        # exactly which history was abandoned; every gate still runs against
+        # the candidate tree, and the floor pins advance together as usual.
+        pass
+    elif relationship != "descendant_of_floor":
         raise SyncTrainError(
             "upstream source must descend from the pinned floor before a sync train can start"
+            " (pass --transplant to accept a diverged candidate deliberately)"
         )
 
     short_sha = source_sha[:12]
@@ -2306,6 +2314,11 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         "source_sha": source_sha,
         "source_relationship": relationship,
         "source_merge_base": source_base,
+        "floor_transplant": (
+            {"abandoned_floor_sha": floor_sha, "merge_base_sha": source_base}
+            if relationship == "diverged_from_floor"
+            else None
+        ),
         "sync_ref": sync_ref,
         "sync_base_sha": product_sha,
         "floor_metadata": floor_path,
@@ -3433,6 +3446,11 @@ def parser_for() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--sync-prefix")
     prepare_parser.add_argument("--policy", default=DEFAULT_POLICY)
     prepare_parser.add_argument("--bead-id")
+    prepare_parser.add_argument(
+        "--transplant",
+        action="store_true",
+        help="accept a candidate that diverged from the pinned floor (deliberate transplant)",
+    )
 
     conflict_parser = subparsers.add_parser("record-conflict", help="record an owned conflict resolution")
     add_repo_argument(conflict_parser)

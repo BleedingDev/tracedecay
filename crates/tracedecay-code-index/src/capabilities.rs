@@ -14,9 +14,9 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use thiserror::Error;
 use tracedecay_domain::{
-    ChunkerRevision, CodeGenerationId, CodeGenerationManifestV1, CodeIndexCapabilityManifestV1,
-    CodeSearchChunkGrainV1, CoverageSummaryV1, DomainError, EdgeAuthorityV1,
-    ExactTechnicalTermKindV1, ExtractorRevision, GrammarRevision, LanguageId,
+    ChunkerRevision, CodeGenerationId, CodeGenerationManifestV1, CodeGenerationSourceCommitmentsV1,
+    CodeIndexCapabilityManifestV1, CodeSearchChunkGrainV1, CoverageSummaryV1, DomainError,
+    EdgeAuthorityV1, ExactTechnicalTermKindV1, ExtractorRevision, GrammarRevision, LanguageId,
     LanguageRegistryRevision, ManifestDigest, PrivacyDomainId, ProjectionKeyV1, ProjectionKindV1,
     SanitizationReceiptId, SanitizerRevision, canonical_sha256,
 };
@@ -103,6 +103,7 @@ struct SealPayload<'a> {
     privacy_domain: &'a PrivacyDomainId,
     privacy_key_epoch: u64,
     parent_generation: &'a Option<CodeGenerationId>,
+    source_commitments: &'a Option<CodeGenerationSourceCommitmentsV1>,
 }
 
 #[derive(Serialize)]
@@ -118,6 +119,7 @@ struct LegacySealPayload<'a> {
     privacy_domain: &'a PrivacyDomainId,
     privacy_key_epoch: u64,
     parent_generation: &'a Option<CodeGenerationId>,
+    source_commitments: &'a Option<CodeGenerationSourceCommitmentsV1>,
 }
 
 /// The canonical expected digest a generation planner must seal before handing
@@ -139,6 +141,7 @@ pub fn expected_seal_digest(
             privacy_domain: &generation.privacy_domain,
             privacy_key_epoch: generation.privacy_key_epoch,
             parent_generation: &generation.parent_generation,
+            source_commitments: &generation.source_commitments,
         });
     }
     canonical_sha256(&SealPayload {
@@ -154,6 +157,7 @@ pub fn expected_seal_digest(
         privacy_domain: &generation.privacy_domain,
         privacy_key_epoch: generation.privacy_key_epoch,
         parent_generation: &generation.parent_generation,
+        source_commitments: &generation.source_commitments,
     })
 }
 
@@ -198,20 +202,6 @@ impl<R: LanguageRegistry> BaseCapabilityEmitter<R> {
             source_coverage,
             sanitization_receipts,
         }
-    }
-
-    /// Override the declared exact-term kinds (must match chunker output).
-    #[must_use]
-    pub fn with_exact_term_kinds(mut self, kinds: Vec<ExactTechnicalTermKindV1>) -> Self {
-        self.exact_term_kinds = kinds;
-        self
-    }
-
-    /// Override the declared edge-authority classes.
-    #[must_use]
-    pub fn with_edge_authority_classes(mut self, classes: Vec<EdgeAuthorityV1>) -> Self {
-        self.edge_authority_classes = classes;
-        self
     }
 }
 
@@ -436,6 +426,7 @@ mod tests {
             privacy_domain: PrivacyDomainId::new("privacy.fixture").expect("valid id"),
             privacy_key_epoch: 7,
             parent_generation: None,
+            source_commitments: None,
             seal: GenerationSealV1 {
                 expected_digest: digest('b'),
                 sealed_at: UtcMicros(1_000_000),

@@ -378,7 +378,7 @@ pub(super) async fn execute_configuration(
                     None,
                     ConfigurationMutationOperationV1::RollbackDryRun,
                     registered.scope.scope_digest.clone(),
-                    current.revision_id.clone(),
+                    current.revision_id().clone(),
                     ConfigurationMutationSinkV1::ConfigurationStore,
                     ConfigurationMutationEffectV1::CreateProtectedChangePlan,
                     deadline.expires_at,
@@ -397,7 +397,7 @@ pub(super) async fn execute_configuration(
                     authority,
                     plan.plan_id.as_str(),
                     plan.operation_digest,
-                    &current.revision_id,
+                    current.revision_id(),
                     observed_at,
                     deadline,
                 )
@@ -480,13 +480,13 @@ pub(super) async fn apply_configuration_or_semantic_transition(
     let current = Box::pin(registered.runtime.client().current()).await?;
     let semantic_profile = requested_semantic_profile.filter(|requested| {
         requires_coordinated_semantic_profile_transition(
-            current.config.semantic.active_profile.is_some(),
+            current.config().semantic.active_profile.is_some(),
             requested.is_some(),
         )
     });
     let coordinated_semantic_transition = semantic_profile.is_some();
     let receipt =
-        if current.revision_id != expected_revision {
+        if current.revision_id() != &expected_revision {
             Box::pin(registered.runtime.client().mutate_direct(
                 authority,
                 mutation,
@@ -598,10 +598,19 @@ fn map_semantic_configuration_error(
     match error {
         SemanticActivationCoordinationErrorV1::Unavailable => ConfigurationError::Unavailable,
         SemanticActivationCoordinationErrorV1::Conflict => ConfigurationError::RevisionConflict,
-        SemanticActivationCoordinationErrorV1::Rejected
-        | SemanticActivationCoordinationErrorV1::RejectedDetail(_)
-        | SemanticActivationCoordinationErrorV1::Runtime(_) => {
+        // The coordinator builds `RejectedDetail` by chaining the context of
+        // each refusing stage (see `SemanticActivationCoordinationErrorV1`
+        // context wrapping in `semantic_runtime::configuration_operation`).
+        // Collapsing every arm onto the bare sentence discarded that chain, so
+        // a refused transition told the operator only that something refused.
+        SemanticActivationCoordinationErrorV1::Rejected => {
             ConfigurationError::validation_message("semantic configuration transition rejected")
+        }
+        SemanticActivationCoordinationErrorV1::RejectedDetail(detail)
+        | SemanticActivationCoordinationErrorV1::Runtime(detail) => {
+            ConfigurationError::validation_message(format!(
+                "semantic configuration transition rejected: {detail}"
+            ))
         }
     }
 }
@@ -1037,6 +1046,39 @@ impl DaemonSemanticRuntimeRegistrar {
 #[cfg(test)]
 mod terminal_problem_tests {
     use super::*;
+
+    #[test]
+    fn refused_semantic_transitions_keep_the_stage_that_refused() {
+        let bare =
+            map_semantic_configuration_error(SemanticActivationCoordinationErrorV1::Rejected);
+        assert_eq!(
+            bare,
+            ConfigurationError::validation_message("semantic configuration transition rejected")
+        );
+
+        let detailed = map_semantic_configuration_error(
+            SemanticActivationCoordinationErrorV1::RejectedDetail(
+                "stage_and_rollback: no rollback profile is staged".to_owned(),
+            ),
+        );
+        assert_eq!(
+            detailed,
+            ConfigurationError::validation_message(
+                "semantic configuration transition rejected: stage_and_rollback: no rollback \
+                 profile is staged"
+            )
+        );
+
+        let runtime = map_semantic_configuration_error(
+            SemanticActivationCoordinationErrorV1::Runtime("artifact is not installed".to_owned()),
+        );
+        assert_eq!(
+            runtime,
+            ConfigurationError::validation_message(
+                "semantic configuration transition rejected: artifact is not installed"
+            )
+        );
+    }
 
     #[test]
     fn configuration_reset_preserves_its_terminal_category() {

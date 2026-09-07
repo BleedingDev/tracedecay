@@ -111,7 +111,7 @@ impl ProjectMemoryProviderActivationSelector {
     ) -> Result<ProjectMemoryProviderActivation> {
         match self {
             Self::FromRuntimeConfiguration => {
-                resolve_memory_provider_activation(&runtime_configuration.config)
+                resolve_memory_provider_activation(runtime_configuration.config())
             }
             #[cfg(any(test, feature = "test-transport"))]
             Self::Pinned(activation) => Ok(activation),

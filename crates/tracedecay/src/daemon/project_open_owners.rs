@@ -61,7 +61,9 @@ mod source_edit_owner;
 mod work_grant_tests;
 
 pub(crate) use advisory_runtime::ProjectOpenDependentOwnerState;
-pub(super) use advisory_runtime::register_project_open_dependent_owners;
+pub(super) use advisory_runtime::{
+    register_project_open_dependent_owners, spawn_semantic_owner_registration,
+};
 pub(crate) use automation_effect_recovery::reconcile_project_open_automation_effects;
 pub(crate) use code_index_reads::{
     project_code_graph_projection_read_port, project_code_index_generation_census_reader,
@@ -74,6 +76,32 @@ use source_edit_owner::{
     install_project_open_source_edit_rollback_owner, source_edit_authority_error,
     source_edit_contract_error, source_edit_request_context, source_edit_surface_result,
 };
+
+/// Whether this route's code index is disabled by contract, so no generation
+/// will ever be published for it.
+///
+/// `f347a0a46` gates project-open code-index activation for a linked worktree
+/// behind `sync.watch_linked_worktrees`, which defaults off. Such a route
+/// serves, but never indexes: a deferred owner that waits for its first
+/// generation waits for the daemon's whole life. That wait is not idle. Both
+/// deferred owners also wake on the *global* serving-seat signal, so every
+/// publication another route makes re-enters their mount attempt, and each
+/// attempt takes the project store writer lane this route shares with the
+/// admitted one — the lane a concurrently opening sibling and Context Scout
+/// durable startup are both waiting on. Answer that wait with the typed
+/// disabled state at spawn time instead of parking a task that can only ever
+/// contend.
+fn code_index_disabled_for_scope(
+    invocation: &DaemonInvocationState,
+    scope: &ResolvedScope,
+) -> bool {
+    invocation
+        .code_index_schedulers
+        .automatic_admission_for_scope(scope)
+        == Some(
+            tracedecay_code_index_runtime::code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled,
+        )
+}
 
 const DAEMON_REQUESTER: &str = "actor.tracedecay-daemon.project-open";
 const DAEMON_BINDING: &str = "binding.tracedecay-daemon.project-open";
@@ -664,8 +692,8 @@ pub(super) async fn register_project_open_production_owners(
     );
     owner_phase_started = Instant::now();
     let scout_configuration = tracedecay_configuration::ConfigurationCurrentStateV1 {
-        revision_id: configuration.revision_id.clone(),
-        snapshot: configuration.snapshot.clone(),
+        revision_id: configuration.revision_id().clone(),
+        snapshot: configuration.snapshot().clone(),
     };
     let _scout_registry = match hotpath::future!(
         invocation
@@ -855,7 +883,7 @@ pub(super) async fn register_project_open_production_owners(
     })?;
     let work_topology_policy =
         tracedecay_configuration::config::topology::resolved_work_topology_policy(
-            &configuration.snapshot,
+            configuration.snapshot(),
         )
         .map_err(|error| TraceDecayError::Config {
             message: format!("project-open work topology policy is unavailable: {error}"),
@@ -863,8 +891,8 @@ pub(super) async fn register_project_open_production_owners(
         .clone();
     let work_proposal_routing = DaemonWorkProposalRoutingAuthorityV1::mount(
         scope.clone(),
-        configuration.revision_id.clone(),
-        &configuration.snapshot,
+        configuration.revision_id().clone(),
+        configuration.snapshot(),
         &access.configuration_digest,
     )
     .map_err(|error| TraceDecayError::Config {
@@ -1208,7 +1236,7 @@ fn classify_initial_semantic_activation_restore(
 }
 
 #[hotpath::measure(label = "daemon.project.activate.semantic", future = true)]
-async fn register_semantic_activation_owner(
+async fn register_semantic_configuration_owners(
     invocation: &DaemonInvocationState,
     project_root: &Path,
     server: &McpServer,
@@ -1513,36 +1541,54 @@ async fn register_semantic_activation_owner(
             "no genuinely evaluated optional-stage profile is published"
         );
     }
-    install_semantic_activation_runtime_owner(
-        invocation,
-        project_root,
-        Arc::clone(graph.configuration_runtime()),
-        scope,
-    )
-    .await
+    Ok(())
 }
 
-/// Complete activation ownership after the deferred code-index mount creates
-/// the production semantic runtime on a fresh store.
+pub(super) struct SemanticOwnerInstallFailureV1 {
+    reason: tracedecay_application::doctor::SemanticOwnerDegradedReasonV1,
+    detail: String,
+}
+
+impl SemanticOwnerInstallFailureV1 {
+    fn new(
+        reason: tracedecay_application::doctor::SemanticOwnerDegradedReasonV1,
+        detail: String,
+    ) -> Self {
+        Self { reason, detail }
+    }
+
+    pub(super) fn into_state(self) -> tracedecay_application::doctor::SemanticOwnerStateV1 {
+        tracedecay_application::doctor::SemanticOwnerStateV1::Degraded {
+            reason: self.reason,
+            detail: self.detail,
+        }
+    }
+}
+
+/// Complete activation ownership after the production semantic runtime and
+/// canonical configuration runtime are both registered.
 #[hotpath::measure(label = "daemon.project.activate.semantic_runtime", future = true)]
 pub(super) async fn install_semantic_activation_runtime_owner(
     invocation: &DaemonInvocationState,
     project_root: &Path,
     configuration_runtime: Arc<tracedecay_configuration::ProjectConfigurationRuntime>,
     scope: ResolvedScope,
-) -> Result<()> {
+) -> std::result::Result<bool, SemanticOwnerInstallFailureV1> {
     let Some(inspector) =
         tracedecay_usecases::semantic_runtime::project_semantic_production_runtime(project_root)
     else {
-        return Ok(());
+        return Ok(false);
     };
     let configuration_store =
         tracedecay_usecases::semantic_runtime::ProductionSemanticRetrievalConfigurationStoreV1::open(
             configuration_runtime.registered_database(),
             scope,
         )
-        .map_err(|error| TraceDecayError::Config {
-            message: format!("semantic retrieval configuration store unavailable: {error}"),
+        .map_err(|error| {
+            SemanticOwnerInstallFailureV1::new(
+                tracedecay_application::doctor::SemanticOwnerDegradedReasonV1::ConfigurationStoreUnavailable,
+                format!("semantic retrieval configuration store unavailable: {error}"),
+            )
         })?;
     let observer = invocation
         .query_activation_registrar(project_root, configuration_runtime.registered_database());
@@ -1557,10 +1603,38 @@ pub(super) async fn install_semantic_activation_runtime_owner(
     );
     let owner = invocation
         .configuration_runtime_registrar()
-        .install_semantic_activation_owner(project_root, candidate, lifecycle_events)
-        .await?;
-    configuration_runtime.install_semantic_runtime(owner)?;
-    Ok(())
+        .install_semantic_activation_owner(
+            project_root,
+            Arc::clone(&candidate),
+            lifecycle_events,
+        )
+        .await
+        .map_err(|error| {
+            SemanticOwnerInstallFailureV1::new(
+                tracedecay_application::doctor::SemanticOwnerDegradedReasonV1::ActivationOwnerRegistrationRefused,
+                error.to_string(),
+            )
+        })?;
+    if let Err(error) = configuration_runtime.install_semantic_runtime(Arc::clone(&owner)) {
+        if Arc::ptr_eq(&owner, &candidate)
+            && !invocation
+                .configuration_runtime_registrar()
+                .remove_semantic_activation_owner_if_current(project_root, &candidate)
+                .await
+        {
+            return Err(SemanticOwnerInstallFailureV1::new(
+                tracedecay_application::doctor::SemanticOwnerDegradedReasonV1::PartialRegistrationCleanupFailed,
+                format!(
+                    "semantic activation coordinator installation failed and its partial owner could not be removed: {error}"
+                ),
+            ));
+        }
+        return Err(SemanticOwnerInstallFailureV1::new(
+            tracedecay_application::doctor::SemanticOwnerDegradedReasonV1::ConfigurationRuntimeInstallationRefused,
+            error.to_string(),
+        ));
+    }
+    Ok(true)
 }
 
 #[hotpath::measure(label = "daemon.project.activate.lsp", future = true)]
@@ -1661,13 +1735,13 @@ pub(super) fn daemon_owned_project_source_access_at(
     .map_err(|_| ApplicationContractError::Inconsistent {
         field: "project-open source binding",
     })?;
-    if configuration.target.project_id != scope.project_id {
+    if configuration.target().project_id != scope.project_id {
         return Err(ApplicationContractError::Inconsistent {
             field: "project-open configuration project",
         });
     }
     configuration
-        .snapshot
+        .snapshot()
         .validate()
         .map_err(|_| ApplicationContractError::Inconsistent {
             field: "project-open configuration snapshot",
@@ -1684,7 +1758,7 @@ pub(super) fn daemon_owned_project_source_access_at(
         }
     })?;
     let Some(ConfigurationValueV1::SourceBindings(bindings)) =
-        configuration.snapshot.effective_values.get(&bindings_key)
+        configuration.snapshot().effective_values.get(&bindings_key)
     else {
         return Err(ApplicationContractError::Inconsistent {
             field: "project-open source bindings",
@@ -1717,7 +1791,7 @@ pub(super) fn daemon_owned_project_source_access_at(
         }
     })?;
     let Some(ConfigurationValueV1::AccessRules(access_rules)) = configuration
-        .snapshot
+        .snapshot()
         .effective_values
         .get(&access_rules_key)
     else {
@@ -1758,10 +1832,10 @@ pub(super) fn daemon_owned_project_source_access_at(
         scope: scope.clone(),
         requester,
         binding,
-        configuration_revision: configuration.revision_id.clone(),
-        configuration_digest: configuration.snapshot.effective_behavior_digest.clone(),
+        configuration_revision: configuration.revision_id().clone(),
+        configuration_digest: configuration.snapshot().effective_behavior_digest.clone(),
         configuration_provenance_digest: configuration
-            .snapshot
+            .snapshot()
             .resolution_provenance_digest
             .clone(),
         effective_capabilities,

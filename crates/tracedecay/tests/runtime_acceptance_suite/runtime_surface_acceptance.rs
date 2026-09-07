@@ -84,12 +84,37 @@ impl RuntimeFixture {
     fn home(&self) -> &Path {
         self._environment.home()
     }
+
+    /// The path an LSP client addresses the admitted project through.
+    ///
+    /// Daemon admission canonicalizes the root, while a client spells it the
+    /// way its host does: macOS hands out `/var/folders/...` for a directory
+    /// that canonicalizes to `/private/var/...`, and a linked worktree is
+    /// reached through its symlink. On Unix the fixture therefore addresses
+    /// the project through a real filesystem alias, so every request in the
+    /// journey — initialize, document routing, feedback reads — has to
+    /// preserve the admitted identity across the spelling difference rather
+    /// than only on hosts whose temp directory happens to be an alias.
+    fn client_project_path(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            let alias = self._environment.scratch().join("project-alias");
+            std::os::unix::fs::symlink(&self.project, &alias)
+                .expect("alias the admitted project root");
+            alias
+        }
+        #[cfg(not(unix))]
+        {
+            self.project.clone()
+        }
+    }
 }
 
 async fn runtime_fixture() -> RuntimeFixture {
     let (environment, project) = common::IsolatedEnv::acquire().await;
     let daemon = common::spawn_tracedecay_daemon(environment.home());
     initialize_project(environment.home(), &project);
+    await_published_code_index(environment.home(), &project);
     let handshake =
         tracedecay::daemon::handshake_for_current_client(Some(project.clone()), None, false, false)
             .expect("daemon handshake");
@@ -128,10 +153,16 @@ async fn lsp_runtime_fixture() -> RuntimeFixture {
     );
     git(&project, &["add", "."]);
     git(&project, &["commit", "--quiet", "-m", "base"]);
-    let daemon = common::spawn_tracedecay_daemon_with(environment.home(), |command| {
+    // The daemon's own event stream is the only evidence that the analyzer-
+    // backed LSP owner replaced the warming one, so capture it instead of
+    // inheriting it. `await_analyzer_backed_lsp_owner` prints the whole file
+    // when it gives up, so nothing that inheriting used to show is lost.
+    let daemon_events = environment.home().join("daemon-events.log");
+    let daemon_event_sink = std::fs::File::create(&daemon_events).expect("daemon event log");
+    let daemon = common::spawn_tracedecay_daemon_with(environment.home(), move |command| {
         // Keep TraceDecay state under the isolated home while allowing a rustup
         // proxy on PATH to resolve the host's already-installed analyzer.
-        command.stderr(Stdio::inherit());
+        command.stderr(Stdio::from(daemon_event_sink));
         if let Some(rustup_home) = host_rustup_home {
             command.env("RUSTUP_HOME", rustup_home);
             if let Some(rustup_toolchain) = host_rustup_toolchain {
@@ -148,6 +179,8 @@ async fn lsp_runtime_fixture() -> RuntimeFixture {
     assert_command_success("tracedecay init", &output);
     let storage = run_storage_status(environment.home(), &project, true);
     assert_command_success("open indexed LSP project", &storage);
+    await_published_code_index(environment.home(), &project);
+    await_analyzer_backed_lsp_owner(&daemon_events);
     let handshake =
         tracedecay::daemon::handshake_for_current_client(Some(project.clone()), None, false, false)
             .expect("daemon handshake");
@@ -159,6 +192,45 @@ async fn lsp_runtime_fixture() -> RuntimeFixture {
         handshake,
         project,
         _environment: environment,
+    }
+}
+
+/// Blocks until the daemon has replaced the warming LSP owner with the
+/// analyzer-backed one.
+///
+/// A serving code index is a strictly earlier boundary: project open registers
+/// an LSP owner with no providers at all while the census is unavailable
+/// (`crates/tracedecay/src/daemon/project_open_owners.rs`, reason
+/// `warming_without_sealed_generation`), and the deferred owner
+/// (`.../advisory_runtime/deferred.rs`) upgrades it after the first generation
+/// seals — measured here at one to two seconds *after* `status` already reports
+/// `code_graph_serving: ready`. Waiting on the index alone therefore still
+/// negotiates against the warming owner.
+///
+/// The mount is observable only on the daemon event stream, which
+/// `log_deferred_attempt` exists to carry ("Record every attempt outcome on the
+/// daemon event stream so that state is diagnosable"). Waiting on it keeps the
+/// negotiation assertions themselves untouched: a daemon that never upgrades
+/// fails here with the whole stream, and one that upgrades to a provider set
+/// the gateway then refuses still fails on the assertions.
+fn await_analyzer_backed_lsp_owner(daemon_events: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let events = std::fs::read_to_string(daemon_events).unwrap_or_default();
+        let mounted = events.lines().any(|line| {
+            (line.contains("event=advisory_deferred_attempt") && line.contains("phase=mounted"))
+                || (line.contains("phase=lsp_owner_registered")
+                    && !line.contains("warming_without_sealed_generation"))
+        });
+        if mounted {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never upgraded the warming LSP owner to an analyzer-backed one; \
+             daemon events:\n{events}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
@@ -408,6 +480,21 @@ fn initialize_project(home: &Path, project: &Path) {
         &common::repository_path("tests/fixtures/managed_run_overlay"),
         project,
     );
+    // The V2 code index is Git-authority-based end to end: candidate paths come
+    // from the gix worktree classification, generations are minted from Git tree
+    // captures, and `worktree_stat_signature_for` opens the repository to prove
+    // freshness. A plain directory therefore never seats a serving generation —
+    // `mount_worktree_inner` documents that missing Git authority leaves it
+    // empty — so every code-graph-backed route reads `failed` here. Enrol the
+    // fixture as a repository before `tracedecay init`, exactly as this file's
+    // `lsp_runtime_fixture` and `git_runtime_fixture` already do; initializing
+    // Git afterwards would re-key the project onto a different worktree
+    // identity than the one the daemon already registered.
+    git(project, &["init", "--quiet"]);
+    git(project, &["config", "user.name", "TraceDecay Test"]);
+    git(project, &["config", "user.email", "tracedecay@example.com"]);
+    git(project, &["add", "."]);
+    git(project, &["commit", "--quiet", "-m", "base"]);
     common::initialize_tracedecay_cli_project(home, project);
 }
 
@@ -450,6 +537,61 @@ fn run_storage_status(home: &Path, project: &Path, json_output: bool) -> Output 
         command.arg("--json");
     }
     command.output().expect("run storage_status")
+}
+
+/// Blocks until the daemon has published the sealed code-index generation that
+/// every steady-state assertion in this suite reads.
+///
+/// `tracedecay init` deliberately returns once reconciliation is *requested*:
+/// `handle_admin_sync` answers `"status": "queued"`
+/// (`crates/tracedecay/src/mcp/tools/handlers/info/status.rs`) and the CLI
+/// reports "daemon code-index reconciliation requested"
+/// (`crates/tracedecay-cli/src/commands/index.rs`). Project open publishes the
+/// route immediately and, with no sealed generation yet, registers a warming
+/// LSP owner carrying no analyzer providers at all
+/// (`crates/tracedecay/src/daemon/project_open_owners.rs`, "warming_without_\
+/// sealed_generation"); the deferred advisory owner replaces it once the first
+/// generation seals. A fixture that hands back the client before that boundary
+/// therefore races the daemon: graph primitives answer `termination: failed`
+/// and `initialize` negotiates none of the routed analyzer's methods.
+///
+/// The wait polls the product's own readiness evidence rather than sleeping —
+/// the same `code_index_freshness` boundary `mcp_suite::support::\
+/// wait_for_current_graph` observes.
+fn await_published_code_index(home: &Path, project: &Path) {
+    let project_arg = project.to_string_lossy().into_owned();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        let output = common::tracedecay_command_with_home(home)
+            .current_dir(project)
+            .args([
+                "tool",
+                "--project",
+                project_arg.as_str(),
+                "status",
+                "--args",
+                r#"{"format":"json"}"#,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run status");
+        if output.status.success()
+            && let Ok(status) = serde_json::from_slice::<Value>(&output.stdout)
+        {
+            let freshness = &status["code_index_freshness"];
+            if freshness["status"] == "current"
+                && freshness["worktree"]["code_graph_serving"]["state"] == "ready"
+            {
+                return;
+            }
+            last = freshness.to_string();
+        } else {
+            last = String::from_utf8_lossy(&output.stderr).into_owned();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    panic!("daemon never published a serving code-index generation; last status: {last}");
 }
 
 fn run_feedback_diagnostics(home: &Path, project: &Path, request_handle: &str) -> Output {
@@ -1887,10 +2029,11 @@ async fn stdio_bridge_exits_successfully_after_client_shutdown_and_exit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn production_lsp_negotiates_and_projects_canonical_context() {
     let fixture = lsp_runtime_fixture().await;
-    let root_uri = url::Url::from_directory_path(&fixture.project)
+    let client_project = fixture.client_project_path();
+    let root_uri = url::Url::from_directory_path(&client_project)
         .expect("project root URI")
         .to_string();
-    let document_uri = url::Url::from_file_path(fixture.project.join("src/auth/login.rs"))
+    let document_uri = url::Url::from_file_path(client_project.join("src/auth/login.rs"))
         .expect("document URI")
         .to_string();
     let source = std::fs::read_to_string(fixture.project.join("src/auth/login.rs"))
@@ -2017,7 +2160,9 @@ async fn production_lsp_negotiates_and_projects_canonical_context() {
     let projection = poll_lsp_context(&mut session, &document_uri, "diagnostics", 2).await;
     // The gateway compares roots by parsed path rather than by raw string,
     // because a directory URI legitimately arrives with or without a trailing
-    // slash, so the projection is checked the same way it is admitted.
+    // slash, so the projection is checked the same way it is admitted. The
+    // projection names the root the daemon admitted — the canonical directory
+    // — not the alias the client spelled it through.
     let projected_root = projection["result"]["rootUri"]
         .as_str()
         .expect("projected root URI");
@@ -2025,7 +2170,12 @@ async fn production_lsp_negotiates_and_projects_canonical_context() {
         url::Url::parse(projected_root)
             .ok()
             .and_then(|url| url.to_file_path().ok()),
-        Some(fixture.project.clone()),
+        Some(
+            fixture
+                .project
+                .canonicalize()
+                .expect("canonical admitted project root")
+        ),
         "the projection must name the admitted root, got {projected_root}"
     );
     assert_eq!(projection["result"]["documentUri"], document_uri);

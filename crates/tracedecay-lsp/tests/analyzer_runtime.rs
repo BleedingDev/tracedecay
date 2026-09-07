@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -135,12 +136,40 @@ impl SemanticProviderPort for UnavailableSemanticProvider {
     }
 }
 
-struct FixedCancellation(bool);
+/// Records every fan-out call so short-circuiting after a successful
+/// cancellation is observable, not just the aggregated boolean.
+struct RecordingCancellation {
+    cancels: bool,
+    invoked: AtomicBool,
+}
 
-impl AnalyzerCancellationPort for FixedCancellation {
-    fn cancel_upstream(&self, _root: &AdmittedRoot, _request_id: &LspRequestId) -> bool {
-        self.0
+impl RecordingCancellation {
+    fn new(cancels: bool) -> Arc<Self> {
+        Arc::new(Self {
+            cancels,
+            invoked: AtomicBool::new(false),
+        })
     }
+}
+
+impl AnalyzerCancellationPort for RecordingCancellation {
+    fn cancel_upstream(&self, _root: &AdmittedRoot, _request_id: &LspRequestId) -> bool {
+        self.invoked.store(true, Ordering::SeqCst);
+        self.cancels
+    }
+}
+
+/// A host-absolute lexical path converted through `Url`; routing only reads
+/// the URL's extension, so nothing is created on disk.
+fn lexical_file_uri(relative: &str) -> String {
+    let base = if cfg!(windows) {
+        std::path::PathBuf::from(r"C:\project")
+    } else {
+        std::path::PathBuf::from("/project")
+    };
+    url::Url::from_file_path(base.join(relative))
+        .expect("host-absolute lexical path converts to a file URL")
+        .to_string()
 }
 
 fn bounded_fake_lsp_timeouts() -> lsp::client::LspRefreshTimeouts {
@@ -167,6 +196,22 @@ fn loaded_runner_fake_lsp_timeouts() -> lsp::client::LspRefreshTimeouts {
         FAKE_LSP_START_TIMEOUT,
         FAKE_LSP_START_TIMEOUT,
         FAKE_LSP_TIMEOUT,
+    )
+}
+
+// A phase-gated refresh must outlive the spawn its barrier waits on. The
+// default budget derived from a 500ms quiet window gives initialize 3s, and a
+// starved macOS runner can take longer than that to start /usr/bin/python3;
+// a refresh that gave up there killed the fake before it could reach its
+// phase, so the barrier then waited out its own deadline (#896). The quiet
+// window itself stays short.
+fn phase_gated_fake_lsp_timeouts() -> lsp::client::LspRefreshTimeouts {
+    let quiet = std::time::Duration::from_millis(500);
+    lsp::client::LspRefreshTimeouts::new(
+        quiet + FAKE_LSP_START_TIMEOUT,
+        FAKE_LSP_START_TIMEOUT,
+        FAKE_LSP_START_TIMEOUT,
+        quiet,
     )
 }
 
@@ -204,48 +249,108 @@ fn analyzer_lifecycle_is_project_scoped_and_preserves_failure_evidence() {
 }
 
 #[test]
-fn polyglot_semantics_route_unique_extensions_and_fall_back_on_ambiguity() {
+fn polyglot_semantics_route_by_lexical_extension_and_fall_back_when_not_unique() {
     let routed: Arc<dyn SemanticProviderPort + Send + Sync> = Arc::new(PendingSemanticProvider);
     let fallback: Arc<dyn SemanticProviderPort + Send + Sync> =
         Arc::new(UnavailableSemanticProvider);
     let root = AdmittedRoot::new("file:///project");
     let request_id = LspRequestId::Number(1);
-    let request = SemanticRequest::DocumentSymbols {
-        document_uri: "file:///project/src/app.TS".to_string(),
-    };
+    let document = |document_uri: String| SemanticRequest::DocumentSymbols { document_uri };
 
-    let unique = lsp::PolyglotSemanticProvider::new(
-        vec![lsp::LanguageSemanticRoute::new(["ts"], Arc::clone(&routed))],
-        Arc::clone(&fallback),
-    );
-    assert!(matches!(
-        unique.request(&root, &request_id, &request),
-        SemanticProviderOutcome::Pending
-    ));
+    // (case, routes, request, routed provider expected)
+    let cases: [(&str, &[&[&str]], SemanticRequest, bool); 5] = [
+        (
+            "unique route folds request extension case",
+            &[&["ts"]],
+            document(lexical_file_uri("src/app.TS")),
+            true,
+        ),
+        (
+            "ambiguous routes fall back even when only case differs",
+            &[&["ts"], &["TS"]],
+            document(lexical_file_uri("src/app.ts")),
+            false,
+        ),
+        (
+            "unknown extension falls back",
+            &[&["ts"], &["rs"]],
+            document(lexical_file_uri("src/app.py")),
+            false,
+        ),
+        (
+            "non-file scheme falls back",
+            &[&["ts"]],
+            document("untitled:app.ts".to_string()),
+            false,
+        ),
+        (
+            "requests without a document fall back",
+            &[&["ts"]],
+            SemanticRequest::WorkspaceSymbols {
+                query: "ts".to_string(),
+            },
+            false,
+        ),
+    ];
 
-    let ambiguous = lsp::PolyglotSemanticProvider::new(
-        vec![
-            lsp::LanguageSemanticRoute::new(["ts"], Arc::clone(&routed)),
-            lsp::LanguageSemanticRoute::new(["TS"], routed),
-        ],
-        fallback,
-    );
-    assert!(matches!(
-        ambiguous.request(&root, &request_id, &request),
-        SemanticProviderOutcome::Unavailable
-    ));
+    for (case, routes, request, expect_routed) in cases {
+        let provider = lsp::PolyglotSemanticProvider::new(
+            routes
+                .iter()
+                .map(|extensions| {
+                    lsp::LanguageSemanticRoute::new(extensions.iter().copied(), Arc::clone(&routed))
+                })
+                .collect(),
+            Arc::clone(&fallback),
+        );
+        let outcome = provider.request(&root, &request_id, &request);
+        assert_eq!(
+            matches!(outcome, SemanticProviderOutcome::Pending),
+            expect_routed,
+            "{case}: unexpected routing"
+        );
+        assert_eq!(
+            matches!(outcome, SemanticProviderOutcome::Unavailable),
+            !expect_routed,
+            "{case}: fallback must answer non-unique routes"
+        );
+    }
 }
 
 #[test]
-fn composite_analyzer_cancellation_fans_out() {
-    let cancellation = lsp::CompositeAnalyzerCancellation::new(vec![
-        Arc::new(FixedCancellation(false)),
-        Arc::new(FixedCancellation(true)),
-    ]);
+fn composite_analyzer_cancellation_reaches_every_authority_after_a_success() {
+    let authorities = [
+        RecordingCancellation::new(false),
+        RecordingCancellation::new(true),
+        RecordingCancellation::new(false),
+        RecordingCancellation::new(true),
+    ];
+    let cancellation = lsp::CompositeAnalyzerCancellation::new(
+        authorities
+            .iter()
+            .map(|authority| {
+                Arc::clone(authority) as Arc<dyn AnalyzerCancellationPort + Send + Sync>
+            })
+            .collect(),
+    );
 
     assert!(cancellation.cancel_upstream(
         &AdmittedRoot::new("file:///project"),
         &LspRequestId::Number(2)
+    ));
+    for (index, authority) in authorities.iter().enumerate() {
+        assert!(
+            authority.invoked.load(Ordering::SeqCst),
+            "authority {index} must be cancelled even after an earlier success"
+        );
+    }
+
+    let none = lsp::CompositeAnalyzerCancellation::new(vec![
+        RecordingCancellation::new(false) as Arc<dyn AnalyzerCancellationPort + Send + Sync>
+    ]);
+    assert!(!none.cancel_upstream(
+        &AdmittedRoot::new("file:///project"),
+        &LspRequestId::Number(3)
     ));
 }
 
@@ -266,14 +371,22 @@ fn broker_exposes_project_scoped_readiness_without_lsp_transport() {
         .semantic_authority_if_available(
             FAKE_LANGUAGE,
             project.path().to_path_buf(),
-            root_uri.clone(),
+            root_uri,
             bounded_fake_lsp_timeouts(),
         )
         .unwrap()
         .expect("fake analyzer is executable");
     let readiness = authority.analyzer_readiness();
 
-    assert_eq!(readiness.root().uri(), root_uri);
+    // The slot is keyed by the canonical project root, so its supervisor names
+    // that root; compare by path, as the gateway admits roots.
+    assert_eq!(
+        url::Url::parse(readiness.root().uri())
+            .unwrap()
+            .to_file_path()
+            .unwrap(),
+        project.path().canonicalize().unwrap()
+    );
     assert_eq!(readiness.state(), AnalyzerState::AwaitingStart);
     assert_eq!(readiness.failure_evidence(), None);
 }

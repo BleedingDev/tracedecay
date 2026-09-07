@@ -4,7 +4,7 @@ use std::path::Path;
 use tracedecay_domain::{
     ObservationId, ObservationIdentityMaterialV1, ObservationOrderingDomainV1, ObservationScopeV1,
     ObservationSourceCursorV1, ObservationSourceGenerationV1, ObservationSourceIdentityV1,
-    ObservationSourceRangeV1, ProviderId, RetentionClass, SessionId,
+    ObservationSourceRangeV1, RetentionClass,
 };
 use tracedecay_store::ObservationPersistOutcome;
 use tracedecay_store::observation::{ObservationCoverageReason, ObservationCursorAdvance};
@@ -37,6 +37,18 @@ pub trait SnapshotAdmissionRecord {
     fn native_record_id(&self) -> &str;
     fn order(&self) -> u64;
     fn payload(&self) -> &[u8];
+    /// Distinct native stream inside one session. A task that persists several
+    /// independently appended files gives each file its own source, so growth
+    /// in one cannot renumber the records of another. `None` keeps the session
+    /// itself as the single source.
+    fn source_key(&self) -> Option<&str> {
+        None
+    }
+    /// Generation of this record's own stream. `None` uses the batch generation,
+    /// which is correct only when the batch came from one physical file.
+    fn generation(&self) -> Option<ObservationSourceGenerationV1> {
+        None
+    }
     fn capture_request(
         &self,
         scope: ObservationScopeV1,
@@ -59,6 +71,7 @@ where
     R: SnapshotAdmissionRecord + ?Sized,
 {
     let provider = record.provider();
+    let generation = record.generation().unwrap_or(generation);
     let range = ObservationSourceRangeV1::new(record.order(), record.order() + 1)?;
     let parsed = tracedecay_runtime_core::privacy::parse_normalized_observation_record_v1(
         record.payload(),
@@ -80,7 +93,7 @@ where
         end_offset: range.end(),
         reason: "normalized observation record is not durable",
     })?;
-    let source = snapshot_source_identity(provider, record.session_id())?;
+    let source = snapshot_source_identity_for(provider, record.session_id(), record.source_key())?;
     let identity = ObservationIdentityMaterialV1::for_native_record(
         source,
         scope,
@@ -103,12 +116,13 @@ where
 pub fn snapshot_cursor_after(
     provider: &'static str,
     session_id: &str,
+    source_key: Option<&str>,
     order: u64,
     scope: ObservationScopeV1,
     generation: ObservationSourceGenerationV1,
 ) -> TranscriptIngestResult<ObservationSourceCursorV1> {
     Ok(ObservationSourceCursorV1::for_ordering(
-        snapshot_source_identity(provider, session_id)?,
+        snapshot_source_identity_for(provider, session_id, source_key)?,
         scope,
         generation,
         ObservationOrderingDomainV1::SnapshotOrder,
@@ -221,42 +235,43 @@ impl SnapshotAdmissionRunner {
             return Ok(());
         };
 
-        let mut cursors: BTreeMap<String, Option<ObservationSourceCursorV1>> = BTreeMap::new();
+        let mut cursors: BTreeMap<ObservationSourceIdentityV1, Option<ObservationSourceCursorV1>> =
+            BTreeMap::new();
         let mut pending = Vec::new();
         for record in records {
             let provider = record.provider();
             ensure_snapshot_admission_active(provider, cancellation)?;
-            let source_identity = snapshot_source_identity(provider, record.session_id())?;
+            let source_identity =
+                snapshot_source_identity_for(provider, record.session_id(), record.source_key())?;
+            let record_generation = record.generation().unwrap_or(generation);
             let range = ObservationSourceRangeV1::new(record.order(), record.order() + 1)?;
             ensure_snapshot_admission_active(provider, cancellation)?;
             let expected_cursor = session_cursor(
                 facade,
                 &mut cursors,
                 provider,
-                record.session_id(),
                 &source_identity,
                 scope,
                 cancellation,
             )
             .await?;
             ensure_snapshot_admission_active(provider, cancellation)?;
-            if snapshot_cursor_covers_range(expected_cursor.as_ref(), generation, range) {
+            if snapshot_cursor_covers_range(expected_cursor.as_ref(), record_generation, range) {
                 continue;
             }
-            pending.push((record, source_identity, range));
+            pending.push((record, source_identity, range, record_generation));
         }
 
         for window in pending.chunks(SNAPSHOT_CAPTURE_WINDOW_RECORDS) {
             ensure_snapshot_admission_active(self.provider, cancellation)?;
             let mut chained_cursors = cursors.clone();
             let mut requests = Vec::with_capacity(window.len());
-            for (record, source_identity, range) in window {
+            for (record, source_identity, range, record_generation) in window {
                 let provider = record.provider();
                 let expected_cursor = session_cursor(
                     facade,
                     &mut chained_cursors,
                     provider,
-                    record.session_id(),
                     source_identity,
                     scope,
                     cancellation,
@@ -264,16 +279,16 @@ impl SnapshotAdmissionRunner {
                 .await?;
                 requests.push(record.capture_request(
                     scope.clone(),
-                    generation,
+                    *record_generation,
                     expected_cursor,
                     cancellation.clone(),
                 )?);
                 chained_cursors.insert(
-                    record.session_id().to_owned(),
+                    source_identity.clone(),
                     Some(ObservationSourceCursorV1::for_ordering(
                         source_identity.clone(),
                         scope.clone(),
-                        generation,
+                        *record_generation,
                         ObservationOrderingDomainV1::SnapshotOrder,
                         range.end(),
                     )?),
@@ -299,7 +314,7 @@ impl SnapshotAdmissionRunner {
                     true
                 }
                 Ok(outcomes) => {
-                    for ((record, _, _), outcome) in window.iter().zip(outcomes) {
+                    for ((record, source_identity, _, _), outcome) in window.iter().zip(outcomes) {
                         let outcome = match outcome {
                             CaptureObservationOutcome::Persisted { outcome, .. }
                             | CaptureObservationOutcome::AcceptedForReplay { outcome, .. } => {
@@ -312,14 +327,33 @@ impl SnapshotAdmissionRunner {
                                 });
                             }
                         };
-                        if matches!(outcome.as_ref(), ObservationPersistOutcome::Committed(_)) {
-                            self.stats.messages_upserted =
-                                self.stats.messages_upserted.saturating_add(1);
+                        match outcome.as_ref() {
+                            ObservationPersistOutcome::Committed(_) => {
+                                self.stats.messages_upserted =
+                                    self.stats.messages_upserted.saturating_add(1);
+                                cursors.insert(
+                                    source_identity.clone(),
+                                    Some(outcome.receipt().committed_cursor().clone()),
+                                );
+                            }
+                            ObservationPersistOutcome::CoveredDuplicate(_) => {
+                                // Covered duplicates keep exactly-once derived
+                                // effects but still advance the stream cursor
+                                // to the candidate frontier the write named.
+                                cursors.insert(
+                                    source_identity.clone(),
+                                    Some(outcome.receipt().committed_cursor().clone()),
+                                );
+                            }
+                            _ => {
+                                // Exact duplicates answer with the retained
+                                // receipt, whose cursor is the one the original
+                                // commit wrote rather than where the source now
+                                // stands. Re-read it instead of caching a stale
+                                // chain link.
+                                cursors.remove(source_identity);
+                            }
                         }
-                        cursors.insert(
-                            record.session_id().to_owned(),
-                            Some(outcome.receipt().committed_cursor().clone()),
-                        );
                         self.sessions.insert(record.session_id().to_owned());
                     }
                     false
@@ -337,10 +371,10 @@ impl SnapshotAdmissionRunner {
                 // surfacing a non-durable record. Re-read every affected
                 // source cursor before scalar replay so that prefix is
                 // classified as duplicate instead of violating the chain.
-                for (record, _, _) in window {
-                    cursors.remove(record.session_id());
+                for (_, source_identity, _, _) in window {
+                    cursors.remove(source_identity);
                 }
-                for (record, source_identity, range) in window {
+                for (record, source_identity, range, record_generation) in window {
                     self.capture_scalar_record(
                         facade,
                         record,
@@ -348,7 +382,7 @@ impl SnapshotAdmissionRunner {
                         *range,
                         &mut cursors,
                         scope,
-                        generation,
+                        *record_generation,
                         cancellation,
                     )
                     .await?;
@@ -365,7 +399,7 @@ impl SnapshotAdmissionRunner {
         record: &R,
         source_identity: &ObservationSourceIdentityV1,
         range: ObservationSourceRangeV1,
-        cursors: &mut BTreeMap<String, Option<ObservationSourceCursorV1>>,
+        cursors: &mut BTreeMap<ObservationSourceIdentityV1, Option<ObservationSourceCursorV1>>,
         scope: &ObservationScopeV1,
         generation: ObservationSourceGenerationV1,
         cancellation: &ObservationCancellation,
@@ -376,7 +410,6 @@ impl SnapshotAdmissionRunner {
             facade,
             cursors,
             provider,
-            record.session_id(),
             source_identity,
             scope,
             cancellation,
@@ -407,7 +440,7 @@ impl SnapshotAdmissionRunner {
                     return Err(host_admission_error(provider, error));
                 }
                 if committed {
-                    cursors.remove(record.session_id());
+                    cursors.remove(source_identity);
                     return Ok(());
                 }
                 return Err(host_admission_error(provider, error));
@@ -417,13 +450,25 @@ impl SnapshotAdmissionRunner {
         match outcome {
             CaptureObservationOutcome::Persisted { outcome, .. }
             | CaptureObservationOutcome::AcceptedForReplay { outcome, .. } => {
-                if matches!(outcome.as_ref(), ObservationPersistOutcome::Committed(_)) {
-                    self.stats.messages_upserted = self.stats.messages_upserted.saturating_add(1);
+                match outcome.as_ref() {
+                    ObservationPersistOutcome::Committed(_) => {
+                        self.stats.messages_upserted =
+                            self.stats.messages_upserted.saturating_add(1);
+                        cursors.insert(
+                            source_identity.clone(),
+                            Some(outcome.receipt().committed_cursor().clone()),
+                        );
+                    }
+                    ObservationPersistOutcome::CoveredDuplicate(_) => {
+                        cursors.insert(
+                            source_identity.clone(),
+                            Some(outcome.receipt().committed_cursor().clone()),
+                        );
+                    }
+                    _ => {
+                        cursors.remove(source_identity);
+                    }
                 }
-                cursors.insert(
-                    record.session_id().to_owned(),
-                    Some(outcome.receipt().committed_cursor().clone()),
-                );
                 self.sessions.insert(record.session_id().to_owned());
             }
             CaptureObservationOutcome::Rejected { receipt, .. } => {
@@ -440,7 +485,7 @@ impl SnapshotAdmissionRunner {
                     cancellation,
                 )
                 .await?;
-                cursors.remove(record.session_id());
+                cursors.remove(source_identity);
             }
             CaptureObservationOutcome::Quarantined { receipt, .. } => {
                 advance_snapshot_coverage(
@@ -456,7 +501,7 @@ impl SnapshotAdmissionRunner {
                     cancellation,
                 )
                 .await?;
-                cursors.remove(record.session_id());
+                cursors.remove(source_identity);
             }
         }
         Ok(())
@@ -482,18 +527,20 @@ fn ensure_snapshot_admission_active(
     Ok(())
 }
 
-/// Reads a session's durable cursor once per sweep, reusing the committed cursor
+/// Reads a source's durable cursor once per sweep, reusing the committed cursor
 /// carried by each capture receipt instead of re-selecting it per record.
+///
+/// The cache is keyed by the full source identity, not the session: one session
+/// may own several independently appended sources, each with its own cursor.
 async fn session_cursor(
     facade: &dyn HostAdmission,
-    cursors: &mut BTreeMap<String, Option<ObservationSourceCursorV1>>,
+    cursors: &mut BTreeMap<ObservationSourceIdentityV1, Option<ObservationSourceCursorV1>>,
     provider: &'static str,
-    session_id: &str,
     source: &ObservationSourceIdentityV1,
     scope: &ObservationScopeV1,
     cancellation: &ObservationCancellation,
 ) -> TranscriptIngestResult<Option<ObservationSourceCursorV1>> {
-    if let Some(cursor) = cursors.get(session_id) {
+    if let Some(cursor) = cursors.get(source) {
         return Ok(cursor.clone());
     }
     let cursor = facade
@@ -507,7 +554,7 @@ async fn session_cursor(
             }
         })?;
     ensure_snapshot_admission_active(provider, cancellation)?;
-    cursors.insert(session_id.to_owned(), cursor.clone());
+    cursors.insert(source.clone(), cursor.clone());
     Ok(cursor)
 }
 
@@ -515,10 +562,20 @@ pub fn snapshot_source_identity(
     provider: &'static str,
     session_id: &str,
 ) -> TranscriptIngestResult<ObservationSourceIdentityV1> {
-    Ok(ObservationSourceIdentityV1::for_provider(
-        ProviderId::new(provider)?,
-        SessionId::new(session_id.to_string())?,
-    )?)
+    snapshot_source_identity_for(provider, session_id, None)
+}
+
+/// Source identity of one native stream inside a session.
+///
+/// `source_key` names a stream that is appended independently of the session's
+/// other streams; `None` keeps the session's own single-source identity, which
+/// is what every previously committed cursor and receipt was written under.
+pub fn snapshot_source_identity_for(
+    provider: &'static str,
+    session_id: &str,
+    source_key: Option<&str>,
+) -> TranscriptIngestResult<ObservationSourceIdentityV1> {
+    crate::runtime::native_ingest_source_identity(provider, session_id, source_key)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -903,6 +960,61 @@ mod tests {
             .unwrap()
             .expect("windowed source cursor");
         assert_eq!(cursor.generation(), generation);
+        assert_eq!(cursor.position(), 65);
+    }
+
+    /// Pins the contract the in-batch cursor cache depends on: a covered
+    /// duplicate's receipt names the *candidate* frontier the coverage
+    /// reached, not the cursor the retained commit wrote. Re-offering a whole
+    /// committed window under a later generation makes every record a covered
+    /// duplicate, so each one chains the next from a cached receipt cursor. A
+    /// receipt carrying the retained frontier would leave the second record
+    /// expecting a cursor the store has already moved past and fail the sweep
+    /// with a cursor conflict.
+    #[tokio::test]
+    async fn covered_duplicates_chain_the_next_record_from_the_candidate_frontier() {
+        let admission = MemoryHostAdmission::default();
+        let records = (0..65).map(test_record_at).collect::<Vec<_>>();
+        let sweep = |generation: ObservationSourceGenerationV1| {
+            let admission = &admission;
+            let records = records.clone();
+            async move {
+                capture_snapshot_observations(
+                    admission,
+                    "test",
+                    ObservationScopeV1::Profile,
+                    &ObservationCancellation::default(),
+                    None,
+                    || discovery(vec![PathBuf::from("session-window.snapshot")]),
+                    |_| Ok(1),
+                    |_| Ok(Some((generation, records.clone()))),
+                )
+                .await
+            }
+        };
+
+        let committed = sweep(ObservationSourceGenerationV1::new(7).unwrap())
+            .await
+            .expect("first snapshot capture");
+        assert_eq!(committed.stats.messages_upserted, 65);
+
+        let later = ObservationSourceGenerationV1::new(8).unwrap();
+        let recovered = sweep(later)
+            .await
+            .expect("re-offering the committed window under a later generation must not conflict");
+
+        assert_eq!(
+            recovered.stats.messages_upserted, 0,
+            "covered duplicates write no new rows"
+        );
+        assert_eq!(admission.observations().len(), 65);
+        let source = snapshot_source_identity("test", "session-window").unwrap();
+        let cursor = admission
+            .get_source_cursor(&source, &ObservationScopeV1::Profile)
+            .await
+            .unwrap()
+            .expect("windowed source cursor");
+        assert_eq!(cursor.generation(), later);
         assert_eq!(cursor.position(), 65);
     }
 

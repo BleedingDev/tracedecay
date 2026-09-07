@@ -1055,6 +1055,16 @@ mod semantic_runtime_payload_tests {
         SettingKey::new(SEMANTIC_RUNTIME_SETTING_KEY).expect("semantic runtime key")
     }
 
+    /// Host-absolute fixture path: `artifact_path` validation requires
+    /// `Path::is_absolute`, which a bare `/...` literal fails on Windows.
+    fn absolute_fixture_path(posix: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{}", posix.replace('/', "\\")))
+        } else {
+            PathBuf::from(posix)
+        }
+    }
+
     fn realistic_activation_config() -> SemanticConfig {
         let artifact_digest = "ab".repeat(32);
         SemanticConfig {
@@ -1065,7 +1075,7 @@ mod semantic_runtime_payload_tests {
                 accepted_profile_digest: ManifestDigest::new(format!("sha256:{artifact_digest}"))
                     .expect("accepted profile digest"),
                 artifact_digest,
-                artifact_path: PathBuf::from(concat!(
+                artifact_path: absolute_fixture_path(concat!(
                     "/var/lib/tracedecay/semantic-models/",
                     "jina-embeddings-v2-base-code/",
                     "revision-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",

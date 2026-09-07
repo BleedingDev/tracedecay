@@ -166,6 +166,12 @@ fn clone_production_error(error: &CodeIndexProductionErrorV1) -> CodeIndexProduc
         CodeIndexProductionErrorV1::Publication(error) => {
             CodeIndexProductionErrorV1::Publication(error.clone())
         }
+        CodeIndexProductionErrorV1::SupersededSealedGenerationRevision(revision) => {
+            CodeIndexProductionErrorV1::SupersededSealedGenerationRevision(*revision)
+        }
+        CodeIndexProductionErrorV1::SourceCommitmentsUnavailable => {
+            CodeIndexProductionErrorV1::SourceCommitmentsUnavailable
+        }
         CodeIndexProductionErrorV1::Contract(error) => {
             CodeIndexProductionErrorV1::Contract(error.clone())
         }

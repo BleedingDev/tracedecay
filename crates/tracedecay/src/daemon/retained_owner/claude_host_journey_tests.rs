@@ -231,7 +231,8 @@ async fn current_revision(
         .current()
         .await
         .expect("current configuration")
-        .revision_id
+        .revision_id()
+        .clone()
 }
 
 async fn project_identity(

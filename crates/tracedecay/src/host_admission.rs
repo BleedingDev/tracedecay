@@ -441,16 +441,6 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
-    #[hotpath::skip]
-    pub async fn session_domain_sha256_for_test(
-        &self,
-        scope: HostAdmissionScope,
-    ) -> Result<[u8; 32]> {
-        self.checkpoint_session_database_for_test(scope).await?;
-        canonical_session_domain_sha256(self.session_database_for_test(scope)?.db_path())
-    }
-
-    #[doc(hidden)]
     pub fn observation_store(
         &self,
         scope: HostAdmissionScope,
@@ -894,25 +884,6 @@ impl HostAdmissionTestRuntimeV1 {
             self.project_registered.as_ref(),
             Some(&self.profile_registered),
         )
-        .with_registered_databases(
-            self.project_registered.as_ref(),
-            Some(&self.profile_registered),
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn unregistered_mcp_session_authorities_for_test(
-        &self,
-        scope: HostAdmissionScope,
-    ) -> crate::mcp::tools::SessionAuthorities<'_> {
-        match scope {
-            HostAdmissionScope::Project => {
-                crate::mcp::tools::SessionAuthorities::new(self.project_registered.as_ref(), None)
-            }
-            HostAdmissionScope::Profile => {
-                crate::mcp::tools::SessionAuthorities::new(None, Some(&self.profile_registered))
-            }
-        }
     }
 
     #[cfg(test)]
@@ -1003,12 +974,13 @@ impl HostAdmissionTestRuntimeV1 {
         project_root: &Path,
         layout: &tracedecay_runtime_core::storage::StoreLayout,
     ) -> Result<crate::config::PinnedRuntimeConfiguration> {
-        crate::config::load_runtime_configuration_for_registered_database_read_only(
+        crate::config::open_runtime_configuration_for_registered_database_read_only(
             project_root,
             layout,
             self.project_configuration_database_for_test()?,
         )
         .await
+        .map(|opened| opened.configuration)
     }
 
     #[cfg(test)]
@@ -1223,15 +1195,6 @@ impl HostAdmissionTestRuntimeV1 {
         }
         Ok((store_layout, project_database))
     }
-}
-
-fn canonical_session_domain_sha256(path: &Path) -> Result<[u8; 32]> {
-    tracedecay_rusqlite_runtime::canonical_session_domain_content_sha256(path).map_err(|error| {
-        TraceDecayError::Database {
-            operation: error.operation.to_owned(),
-            message: error.message,
-        }
-    })
 }
 
 const fn registered_authority_unavailable_outcome() -> HostAdmissionOutcome {

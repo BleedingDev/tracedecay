@@ -7,16 +7,14 @@ use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock};
 
 use crate::config::{
-    install_usecase_runtime_configuration_authority, materialize_root_runtime_configuration,
+    install_usecase_runtime_configuration_authority,
+    open_runtime_configuration_for_registered_database,
+    open_runtime_configuration_for_registered_database_read_only,
 };
 use crate::project_store_runtime::{ProjectStoreRuntimeHandle, join_standalone_session_registry};
 #[cfg(any(test, feature = "test-transport"))]
 use tokio::sync::Mutex as AsyncMutex;
 use tracedecay_configuration::ProjectConfigurationRuntime;
-use tracedecay_configuration::config::{
-    open_runtime_configuration_for_registered_database,
-    open_runtime_configuration_for_registered_database_read_only,
-};
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_runtime_core::branch;
@@ -327,16 +325,15 @@ impl TraceDecay {
         )
         .await?;
         install_usecase_runtime_configuration_authority()?;
-        let (configuration_runtime, configuration) = ProjectConfigurationRuntime::open(
-            open_runtime_configuration_for_registered_database(
-                project_root,
-                &store_layout,
-                configuration_database,
-            )
-            .await?,
-        )?;
+        let (config, opened) = open_runtime_configuration_for_registered_database(
+            project_root,
+            &store_layout,
+            configuration_database,
+        )
+        .await?
+        .into_parts();
+        let (configuration_runtime, _) = ProjectConfigurationRuntime::open(opened)?;
         let configuration_runtime = Arc::new(configuration_runtime);
-        let config = materialize_root_runtime_configuration(&configuration)?;
         if store_layout.storage_mode == storage::StorageMode::ProfileSharded {
             storage::write_store_manifest(&store_layout)?;
         }
@@ -373,7 +370,10 @@ impl TraceDecay {
         // First-touch parity with the registered open path: daemon warm-up
         // refuses to advertise an identity-bearing project whose Context
         // Scout owner is absent, so init must start it too.
-        tracedecay_agent_hosts::hooks::publish_hook_bindings(&ts.store_layout)?;
+        tracedecay_agent_hosts::hooks::publish_hook_bindings(
+            &crate::runtime_ports::hook_runtime(),
+            &ts.store_layout,
+        )?;
         if let Some(project_id) =
             tracedecay_agent_hosts::hooks::hook_project_id_for_layout(&ts.store_layout)
         {
@@ -578,16 +578,15 @@ impl TraceDecay {
         .await?;
 
         install_usecase_runtime_configuration_authority()?;
-        let (configuration_runtime, configuration) = ProjectConfigurationRuntime::open(
-            open_runtime_configuration_for_registered_database(
-                project_root,
-                &store_layout,
-                configuration_database,
-            )
-            .await?,
-        )?;
+        let (config, opened) = open_runtime_configuration_for_registered_database(
+            project_root,
+            &store_layout,
+            configuration_database,
+        )
+        .await?
+        .into_parts();
+        let (configuration_runtime, _) = ProjectConfigurationRuntime::open(opened)?;
         let configuration_runtime = Arc::new(configuration_runtime);
-        let config = materialize_root_runtime_configuration(&configuration)?;
         let mut ts = Self {
             db,
             profile_database,
@@ -609,7 +608,10 @@ impl TraceDecay {
             _standalone_maintenance_scope: None,
         };
 
-        tracedecay_agent_hosts::hooks::publish_hook_bindings(&ts.store_layout)?;
+        tracedecay_agent_hosts::hooks::publish_hook_bindings(
+            &crate::runtime_ports::hook_runtime(),
+            &ts.store_layout,
+        )?;
         if let Some(project_id) =
             tracedecay_agent_hosts::hooks::hook_project_id_for_layout(&ts.store_layout)
         {
@@ -788,16 +790,15 @@ impl TraceDecay {
         // hooks, or any other normal project-open work can observe it.
         Self::ensure_database_schema_current(&db).await?;
         install_usecase_runtime_configuration_authority()?;
-        let (configuration_runtime, configuration) = ProjectConfigurationRuntime::open(
-            open_runtime_configuration_for_registered_database_read_only(
-                project_root,
-                &store_layout,
-                configuration_database,
-            )
-            .await?,
-        )?;
+        let (config, opened) = open_runtime_configuration_for_registered_database_read_only(
+            project_root,
+            &store_layout,
+            configuration_database,
+        )
+        .await?
+        .into_parts();
+        let (configuration_runtime, _) = ProjectConfigurationRuntime::open(opened)?;
         let configuration_runtime = Arc::new(configuration_runtime);
-        let config = materialize_root_runtime_configuration(&configuration)?;
         Ok(Self {
             db,
             profile_database,

@@ -72,7 +72,7 @@ use tracedecay_usecases::operation_stream::OperationKind;
 
 use super::{
     DaemonInvocationState, POLICY_REVISION_V1, daemon_owned_project_source_access_at,
-    register_semantic_activation_owner,
+    register_semantic_configuration_owners,
 };
 use crate::agents::context_scout_owner::ProjectContextScoutOwnerV1;
 use crate::agents::context_scout_ports::{
@@ -102,6 +102,7 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 
 mod deferred;
 mod model;
+pub(in crate::daemon) use deferred::spawn_semantic_owner_registration;
 pub(crate) use model::ProjectOpenDependentOwnerState;
 use model::advisory_monotonic_deadline;
 #[cfg(test)]
@@ -567,10 +568,7 @@ async fn current_feedback_lsp_input(
         .current()
         .await
         .map_err(|_| LspRuntimeFailure::new("feedback-cycle-current-configuration"))?;
-    let current_configuration = tracedecay_configuration::ConfigurationCurrentStateV1 {
-        revision_id: pinned_configuration.revision_id,
-        snapshot: pinned_configuration.snapshot,
-    };
+    let current_configuration = pinned_configuration.into_current_state();
     let configuration_digest = current_configuration
         .snapshot
         .effective_behavior_digest
@@ -702,8 +700,8 @@ async fn run_production_hook_cycle(
         return HookOrchestrationWorkOutcomeV1::RetryableFailure;
     };
     let current_configuration = tracedecay_configuration::ConfigurationCurrentStateV1 {
-        revision_id: pinned_configuration.revision_id.clone(),
-        snapshot: pinned_configuration.snapshot.clone(),
+        revision_id: pinned_configuration.revision_id().clone(),
+        snapshot: pinned_configuration.snapshot().clone(),
     };
     let Some(scout_configuration) =
         ContextScoutConfigurationPinV1::from_current(&current_configuration)
@@ -715,7 +713,7 @@ async fn run_production_hook_cycle(
     }
     let Ok(model_config) =
         tracedecay_automation_runtime::automation::config::from_configuration_snapshot(
-            &pinned_configuration.snapshot,
+            pinned_configuration.snapshot(),
         )
     else {
         return HookOrchestrationWorkOutcomeV1::RetryableFailure;
@@ -968,7 +966,7 @@ pub(in crate::daemon) async fn register_project_open_dependent_owners(
         .head(),
         Ok(GitHeadStateV1::Attached { .. })
     ) {
-        register_semantic_activation_owner(
+        register_semantic_configuration_owners(
             invocation,
             project_root,
             server,
@@ -1003,7 +1001,7 @@ pub(in crate::daemon) async fn register_project_open_dependent_owners(
                 reason = %error,
                 "initial advisory mount raced its generation authority"
             );
-            register_semantic_activation_owner(
+            register_semantic_configuration_owners(
                 invocation,
                 project_root,
                 server,
@@ -1026,8 +1024,8 @@ pub(in crate::daemon) async fn register_project_open_dependent_owners(
             project = %project_root.display(),
             phase = "feedback_advisory_registered",
         );
-        let semantic_activation_started = Instant::now();
-        register_semantic_activation_owner(
+        let semantic_configuration_started = Instant::now();
+        register_semantic_configuration_owners(
             invocation,
             project_root,
             server,
@@ -1040,14 +1038,14 @@ pub(in crate::daemon) async fn register_project_open_dependent_owners(
         tracing::info!(
             event = "project_open_owner_phase",
             project = %project_root.display(),
-            phase = "semantic_activation_resolved",
-            elapsed_ms = semantic_activation_started.elapsed().as_millis(),
+            phase = "semantic_configuration_resolved",
+            elapsed_ms = semantic_configuration_started.elapsed().as_millis(),
         );
         return Ok(());
     }
 
-    let semantic_activation_started = Instant::now();
-    register_semantic_activation_owner(
+    let semantic_configuration_started = Instant::now();
+    register_semantic_configuration_owners(
         invocation,
         project_root,
         server,
@@ -1060,8 +1058,8 @@ pub(in crate::daemon) async fn register_project_open_dependent_owners(
     tracing::info!(
         event = "project_open_owner_phase",
         project = %project_root.display(),
-        phase = "semantic_activation_resolved",
-        elapsed_ms = semantic_activation_started.elapsed().as_millis(),
+        phase = "semantic_configuration_resolved",
+        elapsed_ms = semantic_configuration_started.elapsed().as_millis(),
     );
     tracing::info!(
         event = "project_open_owner_phase",
@@ -1177,8 +1175,8 @@ async fn register_production_advisory_owner(
             message: format!("project-open automation configuration is unavailable: {error}"),
         })?;
     let current_configuration = tracedecay_configuration::ConfigurationCurrentStateV1 {
-        revision_id: configuration.revision_id.clone(),
-        snapshot: configuration.snapshot.clone(),
+        revision_id: configuration.revision_id().clone(),
+        snapshot: configuration.snapshot().clone(),
     };
     // The control pin and the model configuration are read from the same
     // current snapshot: a settings PATCH that landed after project open (a
@@ -1190,7 +1188,7 @@ async fn register_production_advisory_owner(
         })?;
     let model_config =
         tracedecay_automation_runtime::automation::config::from_configuration_snapshot(
-            &configuration.snapshot,
+            configuration.snapshot(),
         )?;
     install_project_open_context_scout_configuration(
         scout_owner.as_ref(),

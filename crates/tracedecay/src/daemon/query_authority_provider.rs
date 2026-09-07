@@ -26,10 +26,14 @@ use tracedecay_code_index_runtime::code_index_scheduler::query_runtime::{
 use tracedecay_query::retrieval::QueryAuthorityV1;
 use tracedecay_usecases::semantic_runtime::{
     CommittedRetrievalProfileStateV1, RetrievalProfileActivationObserverErrorV1,
-    RetrievalProfileActivationObserverV1, SemanticRuntimeFuture,
+    RetrievalProfileActivationObserverV1, SemanticRuntimeFuture, SemanticSourceCoherenceOutcomeV1,
     prepare_project_semantic_redundancy_authority, project_semantic_production_runtime,
-    project_semantic_retained_code_generation,
+    semantic_source_coherence,
 };
+
+/// Observation step that refuses a committed activation the serving
+/// generation has moved past.
+const SUPERSEDED_COMMITTED_ACTIVATION: &str = "superseded_committed_activation";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QueryAuthorityUnavailableReasonV1 {
@@ -89,6 +93,14 @@ struct ActivatedQueryStateV1 {
     profile_id: UserProfileId,
     scope: ResolvedScope,
     state: RetrievalProfileStateV1,
+    /// The exact evaluated query profile serving this scope's fallback lanes.
+    ///
+    /// Activation moves the profile it displaced into the rollback slot, so
+    /// the evaluated fallback survives in the state only until the second
+    /// activation displaces it out of both slots. It is not superseded by
+    /// that: it is pinned here when the state still names it, and carried
+    /// forward otherwise.
+    query_profile: AcceptedRetrievalProfileV1,
     cursor_keys: Arc<tracedecay_session_temporal_store::GlobalDbCursorKeyProvider>,
 }
 
@@ -102,6 +114,7 @@ pub(crate) struct PreparedQueryActivationV1 {
     profile_id: UserProfileId,
     scope: ResolvedScope,
     activated: RetrievalProfileStateV1,
+    query_profile: AcceptedRetrievalProfileV1,
     cursor_keys: Arc<tracedecay_session_temporal_store::GlobalDbCursorKeyProvider>,
     query_authority: Arc<QueryAuthorityV1>,
 }
@@ -187,6 +200,28 @@ impl RetrievalProfileActivationObserverV1 for DaemonQueryActivationRegistrarV1 {
                 .map(|pins| pins.vector_generation_id.clone());
             let prepared_redundancy = prepare_project_semantic_redundancy_authority(&committed);
             let failed_redundancy = prepared_redundancy.clone();
+            // The committed pair is fenced on the mounted worktree. Project
+            // open restores a committed activation before the demand-driven
+            // code-index mount (a daemon restart is the common case), and the
+            // reconciler may wake on the verified model before it as well.
+            // With no worktree there is no serving state to be compatible
+            // with yet: that is `Unavailable`, which the caller defers and the
+            // reconciler retries once the index seats. It is not a stale or
+            // conflicting committed state, and reporting it as one used to
+            // fail the whole full-capability upgrade, leaving the index
+            // unactivated and every lane unavailable until the next restart.
+            if !registry.is_worktree_mounted(&project_root).await {
+                tracing::info!(
+                    event = "semantic_query_activation",
+                    outcome = "deferred",
+                    step = "code_index_worktree",
+                    project_root = %project_root.display(),
+                    semantic_enabled,
+                    epoch = committed_epoch,
+                    "committed activation awaits the code-index worktree mount"
+                );
+                return Err(RetrievalProfileActivationObserverErrorV1::Unavailable);
+            }
             let attempt = registry
                 .begin_committed_query_activation(
                     &project_root,
@@ -197,25 +232,33 @@ impl RetrievalProfileActivationObserverV1 for DaemonQueryActivationRegistrarV1 {
                     &prepared_redundancy,
                 )
                 .await
-                .map_err(|_| RetrievalProfileActivationObserverErrorV1::Conflict)?;
+                .map_err(|error| {
+                    tracing::warn!(
+                        event = "semantic_query_activation",
+                        outcome = "failed",
+                        step = "begin_committed_query_activation",
+                        error = %error,
+                        semantic_enabled,
+                        epoch = committed_epoch,
+                        "the query activation fence refused the committed activation"
+                    );
+                    RetrievalProfileActivationObserverErrorV1::Conflict
+                })?;
             type ObserverError = RetrievalProfileActivationObserverErrorV1;
             let observed = async {
                 let redundancy_ready = prepared_redundancy.has_active_authority();
                 if semantic_enabled && !redundancy_ready {
                     return Err(("semantic_redundancy_authority", ObserverError::Rejected));
                 }
-                let serving = registry
-                    .serving_code_scope(&project_root)
+                // Semantic readiness observes the exact text generation strict
+                // queries pin. A complete graph seat may legitimately lag it,
+                // and the sealed text metadata already carries every source
+                // commitment needed for this decision.
+                let generation = registry
+                    .latest_text_fresh_for_scope(&scope)
                     .await
-                    .ok_or(("serving_code_scope", ObserverError::Unavailable))?;
-                if serving.repository_id != scope.repository_id
-                    || serving.worktree_id != scope.worktree_id
-                {
-                    return Err(("serving_scope_mismatch", ObserverError::Rejected));
-                }
-                let generation = serving
-                    .serving_generation
-                    .ok_or(("serving_generation", ObserverError::Unavailable))?;
+                    .ok_or(("serving_text_generation", ObserverError::Unavailable))?;
+                let manifest = generation.metadata().manifest();
                 let cursor_keys = Arc::new(
                     session_db
                         .load_session_cursor_key_provider_result()
@@ -228,7 +271,7 @@ impl RetrievalProfileActivationObserverV1 for DaemonQueryActivationRegistrarV1 {
                         scope.clone(),
                         committed.state.clone(),
                         cursor_keys,
-                        &generation.manifest().privacy_domain,
+                        &manifest.privacy_domain,
                     )
                     .map_err(|error| {
                         (
@@ -238,9 +281,12 @@ impl RetrievalProfileActivationObserverV1 for DaemonQueryActivationRegistrarV1 {
                     })?;
                 let semantic_authority = if semantic_enabled {
                     let committed = committed.clone();
+                    let query_profile_id =
+                        prepared.query_authority().profile().profile_id.clone();
                     let authority = task::spawn_blocking(move || {
                         tracedecay_code_index_runtime::code_index_scheduler::semantic_query_runtime::SemanticQueryAuthorityV1::from_committed(
                             committed,
+                            query_profile_id,
                         )
                     })
                     .await
@@ -250,11 +296,10 @@ impl RetrievalProfileActivationObserverV1 for DaemonQueryActivationRegistrarV1 {
                 } else {
                     None
                 };
-                // Cache observations are an exact CAS over the live semantic
-                // pointer and query-runtime binding. All of the preparation
-                // above may await or warm shared state, so observe only when
-                // the coherent install is ready to consume this snapshot.
-                let prepared_cache = if semantic_enabled {
+                // Runtime observations are an exact CAS over the live semantic
+                // pointer and query-runtime binding. The vector read port is
+                // hydrated lazily by the strict query that consumes it.
+                let prepared_runtime = if semantic_enabled {
                     let pins = committed
                         .current_activation
                         .as_ref()
@@ -266,62 +311,75 @@ impl RetrievalProfileActivationObserverV1 for DaemonQueryActivationRegistrarV1 {
                         .active_vector_generation(pins)
                         .await
                         .ok_or(("active_vector_generation", ObserverError::Unavailable))?;
-                    let source_generation = vectors.source_generation().clone();
-                    if !runtime.cache_ready_for(pins, &source_generation) {
-                        let code = match project_semantic_retained_code_generation(
-                            &project_root,
-                            &source_generation,
-                        ) {
-                            Some(code) => code,
-                            None => match classify_published_generation_lookup(
-                                registry
-                                    .published_generation(&project_root, &source_generation)
-                                    .await,
-                            ) {
-                                Ok(Some(code)) => code,
-                                Ok(None) => {
-                                    tracing::warn!(
-                                        event = "semantic_query_activation",
-                                        step = "retained_code_generation",
-                                        project_root = %project_root.display(),
-                                        source_generation = %source_generation,
-                                        vector_generation = ?pins.vector_generation_id,
-                                        "the activated vector generation cites a source code generation that is neither retained in this process nor published in its store"
-                                    );
-                                    return Err((
-                                        "retained_code_generation",
-                                        ObserverError::Unavailable,
-                                    ));
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        event = "semantic_query_activation",
-                                        step = "published_code_generation_read",
-                                        error = %error,
-                                        project_root = %project_root.display(),
-                                        source_generation = %source_generation,
-                                        vector_generation = ?pins.vector_generation_id,
-                                        "the activated vector generation's durable source code generation could not be read"
-                                    );
-                                    return Err((
-                                        "published_code_generation_read",
-                                        ObserverError::Unavailable,
-                                    ));
-                                }
-                            },
-                        };
+                    // Readiness is source compatibility, not generation
+                    // identity. Reinstalling a committed activation whose
+                    // vectors were projected from a superseded corpus un-seats
+                    // the projection that does serve the live generation, and
+                    // then reports Ready for vectors no query can use. Refuse
+                    // instead: the activation stays committed and the runtime
+                    // keeps the newer pointer until the operator activates it.
+                    // `semantic_source_coherence` is the one authority on that
+                    // question; this gate never re-derives its own.
+                    match semantic_source_coherence(&vectors, manifest) {
+                        SemanticSourceCoherenceOutcomeV1::Mismatch(mismatch) => {
+                            tracing::warn!(
+                                event = "semantic_query_activation",
+                                step = SUPERSEDED_COMMITTED_ACTIVATION,
+                                project_root = %project_root.display(),
+                                serving_generation = %mismatch.serving_generation,
+                                serving_incremental_manifest_digest =
+                                    %mismatch.serving_incremental_manifest_digest,
+                                serving_source_full_replay_digest =
+                                    %mismatch.serving_source_full_replay_digest,
+                                vector_source_generation = %mismatch.vector_source_generation,
+                                vector_source_manifest_digest =
+                                    %mismatch.vector_source_manifest_digest,
+                                vector_source_full_replay_digest =
+                                    %mismatch.vector_source_full_replay_digest,
+                                vector_generation = ?pins.vector_generation_id,
+                                "the committed activation projected a superseded source; it is not \
+                                 reinstalled over the generation now being served"
+                            );
+                            return Err((
+                                SUPERSEDED_COMMITTED_ACTIVATION,
+                                ObserverError::Rejected,
+                            ));
+                        }
+                        SemanticSourceCoherenceOutcomeV1::Unavailable(reason) => {
+                            tracing::warn!(
+                                event = "semantic_query_activation",
+                                step = "source_commitments_unavailable",
+                                project_root = %project_root.display(),
+                                serving_generation = %manifest.generation_id,
+                                vector_generation = ?pins.vector_generation_id,
+                                reason = ?reason,
+                                "semantic readiness could not compare independently authenticated \
+                                 source commitments"
+                            );
+                            return Err((
+                                "source_commitments_unavailable",
+                                ObserverError::Unavailable,
+                            ));
+                        }
+                        SemanticSourceCoherenceOutcomeV1::Coherent(_) => {}
+                    }
+                    // The activation is coherent with the serving
+                    // generation, so restore binds the pointer to it. The
+                    // activation's own historical source is never restored
+                    // over the publication queries pin.
+                    if !runtime.runtime_ready_for(pins, &manifest.generation_id) {
                         Some(
                             runtime
-                                .prepare_restore_current(&code, &pins.vector_generation_id)
+                                .prepare_restore_current(manifest, &pins.vector_generation_id)
                                 .await
                                 .map_err(|error| {
                                     tracing::warn!(
                                         event = "semantic_query_activation",
                                         step = "prepare_restore_current",
                                         error = ?error,
-                                        source_generation = %source_generation,
+                                        serving_generation = %manifest.generation_id,
                                         vector_generation = ?pins.vector_generation_id,
-                                        "the activated vector generation's cache could not be restored"
+                                        "the activated vector generation's runtime could not be restored"
                                     );
                                     ("prepare_restore_current", ObserverError::Unavailable)
                                 })?
@@ -333,9 +391,9 @@ impl RetrievalProfileActivationObserverV1 for DaemonQueryActivationRegistrarV1 {
                     } else {
                         Some(
                             runtime
-                                .prepare_current_cache_observation(pins, &source_generation)
+                                .prepare_current_runtime_observation(pins, &manifest.generation_id)
                                 .ok_or((
-                                    "prepare_current_cache_observation",
+                                    "prepare_current_runtime_observation",
                                     ObserverError::Unavailable,
                                 ))?,
                         )
@@ -343,6 +401,20 @@ impl RetrievalProfileActivationObserverV1 for DaemonQueryActivationRegistrarV1 {
                 } else {
                     None
                 };
+                // Everything above may await. Revalidate the pin the whole
+                // preparation was proven against before it is installed: if
+                // the scope started serving a different generation meanwhile,
+                // this snapshot is stale, not mismatched, and the reconciler
+                // re-observes against the newer one.
+                if registry
+                    .latest_text_fresh_for_scope(&scope)
+                    .await
+                    .map(|current| current.metadata().manifest().generation_id.clone())
+                    .as_ref()
+                    != Some(&manifest.generation_id)
+                {
+                    return Err(("serving_generation_moved", ObserverError::Unavailable));
+                }
                 let prepared_view =
                     tracedecay_code_index_runtime::PreparedQueryActivationViewV1 {
                         scope: prepared.scope().clone(),
@@ -360,7 +432,7 @@ impl RetrievalProfileActivationObserverV1 for DaemonQueryActivationRegistrarV1 {
                         },
                         prepared_view,
                         semantic_authority,
-                        prepared_cache,
+                        prepared_runtime,
                         rollback_semantic_generation.as_ref(),
                         prepared_redundancy,
                         &attempt,
@@ -377,8 +449,17 @@ impl RetrievalProfileActivationObserverV1 for DaemonQueryActivationRegistrarV1 {
                     })?;
                 Ok(())
             }
-            .await
-            .map_err(|(step, error)| {
+            .await;
+            // A superseded activation did not fail: it is simply not
+            // applicable to the generation now being served. Tearing down the
+            // query activation the previous successful observation installed
+            // would strand the still-committed profile, so only real failures
+            // reach the clearing path below.
+            let superseded = matches!(
+                &observed,
+                Err((step, _)) if *step == SUPERSEDED_COMMITTED_ACTIVATION
+            );
+            let observed = observed.map_err(|(step, error)| {
                 tracing::warn!(
                     event = "semantic_query_activation",
                     outcome = "failed",
@@ -390,7 +471,7 @@ impl RetrievalProfileActivationObserverV1 for DaemonQueryActivationRegistrarV1 {
                 );
                 error
             });
-            if observed.is_err() {
+            if observed.is_err() && !superseded {
                 let cache_generation = active_semantic_generation
                     .as_ref()
                     .or(rollback_semantic_generation.as_ref());
@@ -484,17 +565,21 @@ impl DaemonQueryAuthorityProviderV1 {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = Self::profile_key(&profile_id, &scope);
-        if !current.get(&key).is_some_and(|installed| {
+        let installed = current.get(&key);
+        if !installed.is_some_and(|installed| {
             installed.profile_id == profile_id
                 && installed.scope == scope
                 && installed.state == activated
         }) {
             validate_successful_activation_update(&current, &key, &scope, &activated)?;
         }
+        let query_profile =
+            resolved_query_profile(installed, &activated).map_err(map_unavailable_update_error)?;
         let candidate = ActivatedQueryStateV1 {
             profile_id: profile_id.clone(),
             scope: scope.clone(),
             state: activated.clone(),
+            query_profile: query_profile.clone(),
             cursor_keys: Arc::clone(&cursor_keys),
         };
         let material = query_material_for_activated(&candidate, privacy_domain)
@@ -514,6 +599,7 @@ impl DaemonQueryAuthorityProviderV1 {
             profile_id,
             scope,
             activated,
+            query_profile,
             cursor_keys,
             query_authority,
         })
@@ -548,6 +634,7 @@ impl DaemonQueryAuthorityProviderV1 {
                 profile_id: prepared.profile_id.clone(),
                 scope: prepared.scope.clone(),
                 state: prepared.activated.clone(),
+                query_profile: prepared.query_profile.clone(),
                 cursor_keys: Arc::clone(&prepared.cursor_keys),
             },
         );
@@ -569,12 +656,12 @@ impl DaemonQueryAuthorityProviderV1 {
         scope
             .validate()
             .map_err(|_| QueryAuthorityUpdateErrorV1::InvalidScope)?;
-        if !initial.audit().is_empty()
-            || initial.rollback_profile().is_some()
-            || exact_query_profile(&initial).is_err()
-        {
+        if !initial.audit().is_empty() || initial.rollback_profile().is_some() {
             return Err(QueryAuthorityUpdateErrorV1::InvalidInitialState);
         }
+        let query_profile = exact_query_profile(&initial)
+            .map_err(|_| QueryAuthorityUpdateErrorV1::InvalidInitialState)?
+            .clone();
         let mut current = self
             .activated
             .write()
@@ -594,6 +681,7 @@ impl DaemonQueryAuthorityProviderV1 {
                 profile_id: profile_id.clone(),
                 scope: scope.clone(),
                 state: initial,
+                query_profile,
                 cursor_keys,
             },
         );
@@ -769,11 +857,30 @@ fn validate_successful_activation_update(
     Ok(())
 }
 
+/// Resolve the exact evaluated query profile a committed activation serves.
+///
+/// The state names it while it still occupies the active or rollback slot.
+/// Once a second activation displaces it out of both, the profile already
+/// pinned for this scope is still the one the fallback lanes execute, so it is
+/// carried forward rather than treated as a broken activation.
+fn resolved_query_profile(
+    installed: Option<&ActivatedQueryStateV1>,
+    state: &RetrievalProfileStateV1,
+) -> Result<AcceptedRetrievalProfileV1, QueryAuthorityUnavailableReasonV1> {
+    match exact_query_profile(state) {
+        Ok(profile) => Ok(profile.clone()),
+        Err(QueryAuthorityUnavailableReasonV1::InvalidActivatedProfile) => installed
+            .map(|installed| installed.query_profile.clone())
+            .ok_or(QueryAuthorityUnavailableReasonV1::InvalidActivatedProfile),
+        Err(reason) => Err(reason),
+    }
+}
+
 fn query_material_for_activated(
     activated: &ActivatedQueryStateV1,
     privacy_domain: &PrivacyDomainId,
 ) -> Result<QueryAuthorityMaterialV1, QueryAuthorityUnavailableReasonV1> {
-    let query = exact_query_profile(&activated.state)?;
+    let query = &activated.query_profile;
     let ranking_revision =
         ComponentRevision::new(tracedecay_query::retrieval::QUERY_RANKING_REVISION_V1)
             .map_err(|_| QueryAuthorityUnavailableReasonV1::InvalidActivatedProfile)?;
@@ -806,10 +913,7 @@ fn status_for_activated(
     if !has_current_query_authority(&activated.state) {
         return unavailable(QueryAuthorityUnavailableReasonV1::ActivationNotCurrent);
     }
-    let profile = match exact_query_profile(&activated.state) {
-        Ok(profile) => profile,
-        Err(reason) => return unavailable(reason),
-    };
+    let profile = &activated.query_profile;
     QueryAuthorityProviderStatusV1::Available {
         scope_digest: activated.scope.scope_digest.clone(),
         profile_id: profile.profile().profile_id.clone(),
@@ -1007,20 +1111,6 @@ fn map_update_observer_error(
             RetrievalProfileActivationObserverErrorV1::Conflict
         }
     }
-}
-
-fn classify_published_generation_lookup(
-    lookup: Option<
-        Result<
-            Option<Arc<tracedecay_code_index::production::CodeIndexPublishedGenerationV1>>,
-            tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerErrorV1,
-        >,
-    >,
-) -> Result<
-    Option<Arc<tracedecay_code_index::production::CodeIndexPublishedGenerationV1>>,
-    tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerErrorV1,
-> {
-    lookup.unwrap_or(Ok(None))
 }
 
 #[cfg(test)]

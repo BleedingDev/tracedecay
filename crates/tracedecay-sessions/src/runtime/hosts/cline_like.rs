@@ -40,7 +40,7 @@ use crate::runtime::snapshot_observation::{
 use crate::runtime::snapshot_observation::{canonical_snapshot_envelope, host_admission_error};
 use crate::runtime::source::{
     ParsedTranscript, SessionDraft, TranscriptDiscoveryBounds, TranscriptIngestError,
-    TranscriptIngestResult, TranscriptSource, read_changed_with_companion,
+    TranscriptIngestResult, TranscriptSource, content_hash64, read_changed_with_companion,
 };
 use serde_json::{Map, Value};
 #[cfg(test)]
@@ -64,6 +64,11 @@ const TASK_METADATA_FILES: [&str; 3] = ["task_metadata.json", "history_item.json
 const DELIMITED_NATIVE_MESSAGE_ID_DOMAIN: &[u8] =
     b"tracedecay.cline-like-delimited-native-message.v2";
 const DERIVED_MESSAGE_ID_DOMAIN: &[u8] = b"tracedecay.cline-like-derived-message.v3";
+/// Source key of the UI-message stream. `ui_messages.json` and the API history
+/// are appended independently, so each is its own observation source; the API
+/// history keeps the task's own identity, under which every prior cursor and
+/// receipt was committed.
+const UI_MESSAGES_SOURCE_SUFFIX: &str = ":ui_messages";
 const CLINE_LIKE_LOCATION_KEYS: TranscriptLocationMetadataKeys =
     TranscriptLocationMetadataKeys::new(
         "cline_like_task_cwd",
@@ -108,6 +113,20 @@ pub struct ClineLikeSource {
     task_metadata: TaskMetadataCache,
 }
 
+/// `<VS Code data dir>/User/globalStorage/<extension>/tasks`, joined per
+/// component. Discovered task paths descend from this root and their text is
+/// the durable transcript cursor key and `transcript_path`, so the root must
+/// carry the host's native spelling: a `/`-joined literal leaves a mixed
+/// `\...\User/globalStorage/...` spelling on Windows that names the same
+/// file under a different key than any natively built path.
+fn vscode_global_storage_tasks(home: &Path, extension_id: &str) -> PathBuf {
+    crate::host_ports::vscode_data_dir(home)
+        .join("User")
+        .join("globalStorage")
+        .join(extension_id)
+        .join("tasks")
+}
+
 impl ClineLikeSource {
     /// Cline VS Code extension storage:
     /// `Code/User/globalStorage/saoudrizwan.claude-dev/tasks`.
@@ -133,10 +152,7 @@ impl ClineLikeSource {
     pub fn cline_with_home(home: &Path) -> Self {
         Self {
             provider: "cline",
-            storage_roots: vec![
-                crate::host_ports::vscode_data_dir(home)
-                    .join("User/globalStorage/saoudrizwan.claude-dev/tasks"),
-            ],
+            storage_roots: vec![vscode_global_storage_tasks(home, "saoudrizwan.claude-dev")],
             user_registered_roots: None,
             project_matchers: ProjectRootMatcherCache::default(),
             task_metadata: TaskMetadataCache::default(),
@@ -146,10 +162,10 @@ impl ClineLikeSource {
     pub fn roo_code_with_home(home: &Path) -> Self {
         Self {
             provider: "roo-code",
-            storage_roots: vec![
-                crate::host_ports::vscode_data_dir(home)
-                    .join("User/globalStorage/rooveterinaryinc.roo-cline/tasks"),
-            ],
+            storage_roots: vec![vscode_global_storage_tasks(
+                home,
+                "rooveterinaryinc.roo-cline",
+            )],
             user_registered_roots: None,
             project_matchers: ProjectRootMatcherCache::default(),
             task_metadata: TaskMetadataCache::default(),
@@ -160,9 +176,11 @@ impl ClineLikeSource {
         Self {
             provider: "kilo",
             storage_roots: vec![
-                crate::host_ports::vscode_data_dir(home)
-                    .join("User/globalStorage/kilocode.kilo-code/tasks"),
-                home.join(".kilocode/cli/global/tasks"),
+                vscode_global_storage_tasks(home, "kilocode.kilo-code"),
+                home.join(".kilocode")
+                    .join("cli")
+                    .join("global")
+                    .join("tasks"),
             ],
             user_registered_roots: None,
             project_matchers: ProjectRootMatcherCache::default(),
@@ -273,6 +291,18 @@ impl ClineLikeSource {
         project_root: &Path,
         max_new_bytes: Option<u64>,
     ) -> TranscriptIngestResult<Option<ParsedTranscript>> {
+        Ok(self
+            .parse_task_snapshot(path, prev, project_root, max_new_bytes)?
+            .map(|snapshot| snapshot.parsed))
+    }
+
+    fn parse_task_snapshot(
+        &self,
+        path: &Path,
+        prev: StoredCursor,
+        project_root: &Path,
+        max_new_bytes: Option<u64>,
+    ) -> TranscriptIngestResult<Option<ParsedTaskSnapshot>> {
         let Some(task_dir) = path.parent() else {
             return Ok(None);
         };
@@ -334,18 +364,31 @@ impl ClineLikeSource {
                 messages.push(message);
             }
         }
-        let Some(usage) = usage_records(
-            self.provider,
-            task_id,
-            &ui_path,
-            changed.companion_contents.as_deref(),
-            entries.len(),
-            &location_cwd,
-        )?
-        else {
-            return Ok(None);
+        let ui_contents = if ui_path.is_file() {
+            match changed.companion_contents {
+                Some(contents) => Some(contents),
+                // An unreadable companion defers the whole task rather than
+                // publishing an API-only view of it.
+                None => match read_snapshot_text_bounded(
+                    self.provider,
+                    &ui_path,
+                    MAX_SNAPSHOT_FILE_BYTES,
+                ) {
+                    Ok(Some(contents)) => Some(contents),
+                    _ => return Ok(None),
+                },
+            }
+        } else {
+            None
         };
-        messages.extend(usage);
+        if let Some(contents) = ui_contents.as_deref() {
+            let Some(usage) =
+                usage_records(self.provider, task_id, &ui_path, contents, &location_cwd)?
+            else {
+                return Ok(None);
+            };
+            messages.extend(usage);
+        }
 
         let project = self.user_registered_roots.as_ref().map_or_else(
             || project_root.to_string_lossy().to_string(),
@@ -368,12 +411,41 @@ impl ClineLikeSource {
             parent_tool_use_id: None,
         };
 
-        Ok(Some(ParsedTranscript {
-            draft,
-            messages,
-            new_cursor: changed.new_cursor,
+        let api_generation = snapshot_generation(&changed.contents)?;
+        Ok(Some(ParsedTaskSnapshot {
+            ui_generation: match ui_contents.as_deref() {
+                Some(contents) => snapshot_generation(contents)?,
+                None => api_generation,
+            },
+            api_generation,
+            parsed: ParsedTranscript {
+                draft,
+                messages,
+                new_cursor: changed.new_cursor,
+            },
         }))
     }
+}
+
+/// One parsed Cline-family task: the shared transcript plus the generation of
+/// each independently appended native stream.
+struct ParsedTaskSnapshot {
+    parsed: ParsedTranscript,
+    api_generation: ObservationSourceGenerationV1,
+    ui_generation: ObservationSourceGenerationV1,
+}
+
+fn snapshot_generation(contents: &str) -> TranscriptIngestResult<ObservationSourceGenerationV1> {
+    Ok(ObservationSourceGenerationV1::new(
+        content_hash64(contents).max(1),
+    )?)
+}
+
+/// The native source key of a task's `ui_messages.json` stream, which is
+/// ordered independently of the task's API conversation history.
+#[must_use]
+pub fn ui_messages_source_key(task_id: &str) -> String {
+    format!("{task_id}{UI_MESSAGES_SOURCE_SUFFIX}")
 }
 
 /// Captures bounded Cline-family snapshots through the daemon-owned observation authority.
@@ -404,15 +476,20 @@ pub async fn capture_cline_like_snapshot_observations(
         },
         |path| snapshot_input_bytes(source.provider, path),
         |path| {
-            let Some(parsed) =
-                source.parse_snapshot(path, StoredCursor::default(), project_root, None)?
+            let Some(snapshot) =
+                source.parse_task_snapshot(path, StoredCursor::default(), project_root, None)?
             else {
                 return Ok(None);
             };
-            let generation = ObservationSourceGenerationV1::new(parsed.new_cursor.position.max(1))?;
-            let records =
-                normalize_cline_like_snapshot_observations(source.provider, &parsed.messages)?;
-            Ok(Some((generation, records)))
+            let records = normalize_cline_like_snapshot_observations(
+                source.provider,
+                &snapshot.parsed.messages,
+                snapshot.api_generation,
+                snapshot.ui_generation,
+            )?;
+            // Every record carries its own stream generation; this batch value
+            // is only the fallback the shared runner never reaches here.
+            Ok(Some((snapshot.api_generation, records)))
         },
     )
     .await
@@ -553,25 +630,9 @@ fn usage_records(
     provider: &'static str,
     task_id: &str,
     ui_path: &Path,
-    companion_contents: Option<&str>,
-    ordinal_base: usize,
+    contents: &str,
     location_cwd: &Path,
 ) -> TranscriptIngestResult<Option<Vec<SessionMessageRecord>>> {
-    if !ui_path.is_file() {
-        return Ok(Some(Vec::new()));
-    }
-    let owned;
-    let contents = if let Some(contents) = companion_contents {
-        contents
-    } else {
-        match read_snapshot_text_bounded(provider, ui_path, MAX_SNAPSHOT_FILE_BYTES) {
-            Ok(Some(contents)) => {
-                owned = contents;
-                owned.as_str()
-            }
-            _ => return Ok(None),
-        }
-    };
     let document: Value = match serde_json::from_str(contents) {
         Ok(document) => document,
         Err(error) if error.is_eof() => return Ok(None),
@@ -658,7 +719,9 @@ fn usage_records(
             session_id: task_id.to_string(),
             role: "assistant".to_string(),
             timestamp,
-            ordinal: (ordinal_base + index) as i64,
+            // Source-local: the UI stream is ordered by its own file, never by
+            // how many API entries the task happens to hold.
+            ordinal: index as i64,
             text: content,
             kind: Some("usage".to_string()),
             model: None,
@@ -807,6 +870,8 @@ fn native_record_id(entry: &Value) -> Option<&str> {
 pub fn normalize_cline_like_snapshot_observations(
     provider: &'static str,
     messages: &[SessionMessageRecord],
+    api_generation: ObservationSourceGenerationV1,
+    ui_generation: ObservationSourceGenerationV1,
 ) -> TranscriptIngestResult<Vec<ClineLikeSnapshotObservationRecord>> {
     messages
         .iter()
@@ -820,9 +885,16 @@ pub fn normalize_cline_like_snapshot_observations(
             let payload = snapshot_native_payload(provider, message, metadata.as_ref())
                 .to_string()
                 .into_bytes();
+            let from_ui_messages = message.kind.as_deref() == Some("usage");
             Ok(ClineLikeSnapshotObservationRecord {
                 provider,
                 session_id: message.session_id.clone(),
+                source_key: from_ui_messages.then(|| ui_messages_source_key(&message.session_id)),
+                generation: if from_ui_messages {
+                    ui_generation
+                } else {
+                    api_generation
+                },
                 native_record_id: message.message_id.clone(),
                 order,
                 payload,

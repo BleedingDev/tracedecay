@@ -56,8 +56,16 @@ struct ConfiguredRerankAuthorityV1 {
 }
 
 impl SemanticQueryAuthorityV1 {
+    /// Bind a committed semantic activation to the exact query profile the
+    /// scope's fallback lanes execute.
+    ///
+    /// The serving query profile is supplied by the query authority that owns
+    /// it. It cannot be re-derived from the committed state: activation moves
+    /// the profile it displaced into the rollback slot, so the evaluated query
+    /// profile occupies neither slot once a second activation commits.
     pub fn from_committed(
         committed: CommittedRetrievalProfileStateV1,
+        query_profile_id: tracedecay_domain::FusionProfileId,
     ) -> Result<Self, SemanticQueryAuthorityErrorV1> {
         let activation = committed
             .current_activation
@@ -79,33 +87,6 @@ impl SemanticQueryAuthorityV1 {
         let rerank_policy = accepted.rerank().cloned();
         let rerank_pins = accepted.compatibility().rerank.clone();
         let profile_digest = accepted.profile_digest().clone();
-        let query_lanes = BTreeSet::from(RetrieverKind::QUERY_FALLBACK_LANES);
-        let mut query_profiles = [
-            Some(committed.state.active()),
-            committed.state.rollback_profile(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|profile| {
-            profile
-                .profile()
-                .calibrations
-                .keys()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                == query_lanes
-                && profile
-                    .profile()
-                    .weights_micros
-                    .keys()
-                    .copied()
-                    .collect::<BTreeSet<_>>()
-                    == query_lanes
-        });
-        let query_profile_id = query_profiles
-            .next()
-            .map(|profile| profile.profile().profile_id.clone())
-            .ok_or(SemanticQueryAuthorityErrorV1::IncompatibleActivation)?;
         if activation.receipt.activated_generation != pins.vector_generation_id
             || pins.calibration.projection_key != *pins.projection.projection_key()
             || pins.calibration.vector_generation != pins.vector_generation_id
@@ -125,7 +106,6 @@ impl SemanticQueryAuthorityV1 {
                 policy.evaluation_result_anchor != accepted.profile().evaluation_result_anchor
             })
             || accepted.compatibility().semantic.as_ref() != Some(pins)
-            || query_profiles.next().is_some()
         {
             return Err(SemanticQueryAuthorityErrorV1::IncompatibleActivation);
         }
@@ -290,10 +270,20 @@ impl CodeIndexSchedulerRegistryV1 {
         if committed.scope != *scope {
             return Err(SemanticQueryAuthorityErrorV1::ScopeMismatch);
         }
-        let authority =
-            task::spawn_blocking(move || SemanticQueryAuthorityV1::from_committed(committed))
-                .await
-                .map_err(|error| SemanticQueryAuthorityErrorV1::Mount(error.to_string()))??;
+        // The semantic authority binds to the query profile this scope is
+        // actually serving, which only the mounted query authority knows.
+        let query_profile_id = self
+            .query_authority_for_scope(scope)
+            .await
+            .ok_or(SemanticQueryAuthorityErrorV1::Unavailable)?
+            .profile()
+            .profile_id
+            .clone();
+        let authority = task::spawn_blocking(move || {
+            SemanticQueryAuthorityV1::from_committed(committed, query_profile_id)
+        })
+        .await
+        .map_err(|error| SemanticQueryAuthorityErrorV1::Mount(error.to_string()))??;
         let authority = Arc::new(authority);
         self.mount_semantic_query_authority(project_root, scope, authority)
             .await
@@ -330,29 +320,49 @@ impl CodeIndexSchedulerRegistryV1 {
         Ok(())
     }
 
+    /// The installed semantic route for one exact admitted scope.
+    ///
+    /// Worktree isolation is `unique_mounted_for_scope`, exactly as in
+    /// `query_authority_for_scope`, and for the reason
+    /// `ResolvedScope::identifies_same_checkout` documents: the scope digest
+    /// also binds `reference`, the branch label HEAD happened to carry when
+    /// the activation was sealed, and that label moves under a fixed worktree
+    /// on every ordinary commit, branch switch, or detached checkout.
+    /// Comparing it here denied the committed semantic authority the moment
+    /// HEAD moved -- an explicit profile rollback installs coherently against
+    /// the restored source and then every strict query abstained
+    /// `CalibrationUnavailable` with nothing to point at. Serving eligibility
+    /// is checkout identity plus the per-query source-coherence gates; the
+    /// stored digest stays on the entry as the label the route was sealed
+    /// under.
     async fn semantic_query_authority_for_scope(
         &self,
         scope: &ResolvedScope,
     ) -> Option<Arc<SemanticQueryAuthorityV1>> {
-        let (project_root, scope_digest, authority) = {
-            let mounted = self.mounted.lock().await;
-            let (project_root, worktree) = unique_mounted_for_scope(&mounted, scope).unique()?;
-            let (scope_digest, authority) = worktree.semantic_query_authority.as_ref()?;
-            (
-                project_root.clone(),
-                scope_digest.clone(),
-                Arc::clone(authority),
-            )
-        };
-        let activation =
-            tracedecay_usecases::semantic_runtime::project_semantic_activation_gate(&project_root);
-        let _activation = activation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if scope_digest != scope.scope_digest {
-            return None;
-        }
-        Some(authority)
+        let mounted = self.mounted.lock().await;
+        unique_mounted_for_scope(&mounted, scope)
+            .unique()
+            .and_then(|(_root, worktree)| {
+                worktree
+                    .semantic_query_authority
+                    .as_ref()
+                    .map(|(_scope_digest, authority)| Arc::clone(authority))
+            })
+    }
+
+    /// The semantic compatibility pins a query on `scope` would serve, or
+    /// `None` when no committed semantic route is reachable from it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn served_semantic_pins_for_scope(
+        &self,
+        scope: &ResolvedScope,
+    ) -> Option<SemanticCompatibilityPinsV1> {
+        Some(
+            self.semantic_query_authority_for_scope(scope)
+                .await?
+                .pins()
+                .clone(),
+        )
     }
 
     /// Run canonical query first, then attempt semantic influence against the
@@ -507,7 +517,35 @@ impl CodeIndexSchedulerRegistryV1 {
             code_generation: code_generation.manifest().generation_id.clone(),
             budget: authority.execution.profile().retrieval_budget,
         };
-        if request.validate().is_err() {
+        if let Err(refusal) = request.validate() {
+            // Every predicate collapses into one public abstention, so the
+            // named predicate and its non-secret privacy tuple are the only
+            // way an operator can tell a budget bug from a privacy split.
+            let manifest = code_generation.manifest();
+            tracing::warn!(
+                event = "semantic_query_request_refused",
+                predicate = refusal.predicate.as_str(),
+                error = %refusal.error,
+                scope_privacy_domain = %request.base.scope.privacy_domain,
+                serving_privacy_domain = %manifest.privacy_domain,
+                serving_privacy_key_epoch = manifest.privacy_key_epoch,
+                projection_privacy_domain = %pins.projection.privacy_domain(),
+                projection_privacy_key_epoch = pins.projection.privacy_key_epoch(),
+                query_digest_privacy_domain = %authorized_query.query_digest.privacy_domain,
+                query_digest_key_epoch = authorized_query.query_digest.key_epoch,
+                cursor_key_id = ?authorized_query
+                    .request_cursor
+                    .as_ref()
+                    .map(|cursor| cursor.key_id.as_str()),
+                cursor_key_epoch = ?authorized_query
+                    .request_cursor
+                    .as_ref()
+                    .map(|cursor| cursor.key_epoch),
+                code_generation = %manifest.generation_id,
+                vector_generation = ?pins.vector_generation_id,
+                "the semantic lane request failed its own contract, so the query abstained \
+                 as generation-incompatible"
+            );
             return semantic_abstention(
                 mode,
                 SemanticAbstentionV1::IndexIncompatible,

@@ -106,6 +106,17 @@ fn configuration_revision() -> ConfigurationRevisionId {
     ConfigurationRevisionId::new("config.user-automation-test.v1").expect("configuration revision")
 }
 
+fn no_skill_needed_output() -> Value {
+    json!({
+        "skills": [],
+        "outcome": "no_skill_needed",
+        "decision": {
+            "reason": "No repeated user-scoped evidence warrants a managed skill mutation.",
+            "remedy": "insufficient_repeated_evidence"
+        }
+    })
+}
+
 fn test_run_control() -> AutomationRunControl {
     let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     AutomationRunControl::from_interrupted({
@@ -326,7 +337,7 @@ async fn projectless_reflection_uses_caller_supplied_automation_configuration() 
 #[tokio::test]
 async fn projectless_skill_writer_uses_user_ledger() {
     let harness = UserRuntimeHarness::open("user-skill-writer").await;
-    let backend = JsonBackend::new(AgentTaskKind::SkillWriter, json!({ "skills": [] }));
+    let backend = JsonBackend::new(AgentTaskKind::SkillWriter, no_skill_needed_output());
     let retrieval = TestRetrieval::message(
         "hermes",
         "user-session-1",
@@ -335,6 +346,7 @@ async fn projectless_skill_writer_uses_user_ledger() {
     );
 
     let run = run_user_skill_writer_with_backend_and_retrieval(
+        crate::automation::host_io::plain_file_host_io(),
         &harness.profile_root,
         Arc::clone(&harness.registry),
         &enabled_user_config(),
@@ -376,7 +388,7 @@ async fn terminal_evidence_rejections_do_not_run_user_backends() {
         let retrieval = TestRetrieval::rejected(reason);
         let reflector_backend =
             JsonBackend::new(AgentTaskKind::SessionReflector, json!({ "facts": [] }));
-        let skill_backend = JsonBackend::new(AgentTaskKind::SkillWriter, json!({ "skills": [] }));
+        let skill_backend = JsonBackend::new(AgentTaskKind::SkillWriter, no_skill_needed_output());
         let config = enabled_user_config();
 
         let reflector = run_user_session_reflector_with_backend_and_retrieval(
@@ -394,6 +406,7 @@ async fn terminal_evidence_rejections_do_not_run_user_backends() {
         .await
         .expect("rejected reflector");
         let skill = run_user_skill_writer_with_backend_and_retrieval(
+            crate::automation::host_io::plain_file_host_io(),
             &harness.profile_root,
             Arc::clone(&harness.registry),
             &config,
@@ -416,7 +429,7 @@ async fn terminal_evidence_rejections_do_not_run_user_backends() {
     let retrieval = TestRetrieval::empty();
     let reflector_backend =
         JsonBackend::new(AgentTaskKind::SessionReflector, json!({ "facts": [] }));
-    let skill_backend = JsonBackend::new(AgentTaskKind::SkillWriter, json!({ "skills": [] }));
+    let skill_backend = JsonBackend::new(AgentTaskKind::SkillWriter, no_skill_needed_output());
     let config = enabled_user_config();
     let reflector = run_user_session_reflector_with_backend_and_retrieval(
         &harness.profile_root,
@@ -433,6 +446,7 @@ async fn terminal_evidence_rejections_do_not_run_user_backends() {
     .await
     .expect("empty reflector");
     let skill = run_user_skill_writer_with_backend_and_retrieval(
+        crate::automation::host_io::plain_file_host_io(),
         &harness.profile_root,
         Arc::clone(&harness.registry),
         &config,

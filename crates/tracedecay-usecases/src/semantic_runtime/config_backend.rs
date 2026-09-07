@@ -9,7 +9,8 @@ use super::ports::{
     SemanticConfigurationTransitionV1, SemanticLinkedTransitionV1,
     SemanticRetrievalConfigurationPortV1, SemanticRollbackCommandV1, SemanticRollbackReceiptV1,
     SemanticRuntimeBackendErrorV1, SemanticRuntimeBackendV1, SemanticRuntimeContractErrorV1,
-    SemanticRuntimeFuture, SemanticRuntimeGenerationInspectorV1, SemanticRuntimeStateV1,
+    SemanticRuntimeFuture, SemanticRuntimeGenerationInspectorV1, SemanticRuntimeRefusalV1,
+    SemanticRuntimeStateV1,
 };
 
 /// Production-semantic lifecycle backend over the PASS-only retrieval
@@ -182,7 +183,7 @@ where
                 .configuration
                 .current_activation(configuration)
                 .await
-                .map_err(map_configuration_error)?;
+                .map_err(configuration_error_at("status.current_activation"))?;
             let Some(current) = current else {
                 return Ok(SemanticRuntimeStateV1::Unavailable {
                     reason: SemanticFallbackReasonV1::ArtifactUnavailable,
@@ -191,7 +192,7 @@ where
             current
                 .receipt
                 .validate()
-                .map_err(|_| SemanticRuntimeBackendErrorV1::Rejected)?;
+                .map_err(contract_error_at("status.receipt"))?;
             if current.receipt.configuration != *configuration {
                 return Err(SemanticRuntimeBackendErrorV1::Conflict);
             }
@@ -213,11 +214,12 @@ where
             let evidence = self
                 .generations
                 .inspect_generation(&current.compatibility)
-                .await?;
+                .await
+                .map_err(refuse_at("status.inspect_generation"))?;
             evidence
                 .evidence()
                 .validate_for(&current.compatibility, false)
-                .map_err(map_contract_error)?;
+                .map_err(contract_error_at("status.generation_evidence"))?;
             Ok(SemanticRuntimeStateV1::Current {
                 receipt: current.receipt,
             })
@@ -233,22 +235,27 @@ where
             command
                 .request
                 .validate()
-                .map_err(|_| SemanticRuntimeBackendErrorV1::Rejected)?;
+                .map_err(contract_error_at("activate.request"))?;
             let transition = self
                 .configuration
                 .prepare_activation(command)
                 .await
-                .map_err(map_configuration_error)?;
-            validate_activation_transition(command, &transition).map_err(map_contract_error)?;
-            let result_active_semantic = transition
-                .result_active_semantic
-                .as_ref()
-                .ok_or(SemanticRuntimeBackendErrorV1::Rejected)?;
+                .map_err(configuration_error_at("activate.prepare"))?;
+            validate_activation_transition(command, &transition)
+                .map_err(contract_error_at("activate.transition"))?;
+            let result_active_semantic = transition.result_active_semantic.as_ref().ok_or(
+                SemanticRuntimeBackendErrorV1::RejectedAt(SemanticRuntimeRefusalV1::at(
+                    "activate.result_active_semantic",
+                )),
+            )?;
             let active_lease = self
-                .verify_generation(result_active_semantic, false)
+                .verify_generation(result_active_semantic, false, "activate.active_generation")
                 .await?;
             let rollback_lease = match transition.result_rollback_semantic.as_ref() {
-                Some(rollback) => Some(self.verify_generation(rollback, true).await?),
+                Some(rollback) => Some(
+                    self.verify_generation(rollback, true, "activate.rollback_generation")
+                        .await?,
+                ),
                 None => None,
             };
             let receipt = SemanticActivationReceiptV1::issue_transition(
@@ -256,15 +263,15 @@ where
                 transition.result_configuration.clone(),
                 transition.transition_at,
             )
-            .map_err(map_contract_error)?;
+            .map_err(contract_error_at("activate.receipt"))?;
             let linked = self
                 .configuration
                 .commit_linked_transition(&transition, Some(&receipt))
                 .await
-                .map_err(map_configuration_error)?;
+                .map_err(configuration_error_at("activate.commit"))?;
             linked
                 .validate_for(&transition, Some(&receipt))
-                .map_err(map_contract_error)?;
+                .map_err(contract_error_at("activate.committed_transition"))?;
             if let Some((observation_ticket, observed)) =
                 self.observe_committed_activation(&linked).await
             {
@@ -289,13 +296,14 @@ where
             command
                 .request
                 .validate()
-                .map_err(|_| SemanticRuntimeBackendErrorV1::Rejected)?;
+                .map_err(contract_error_at("rollback.request"))?;
             let transition = self
                 .configuration
                 .prepare_rollback(command)
                 .await
-                .map_err(map_configuration_error)?;
-            validate_rollback_transition(command, &transition).map_err(map_contract_error)?;
+                .map_err(configuration_error_at("rollback.prepare"))?;
+            validate_rollback_transition(command, &transition)
+                .map_err(contract_error_at("rollback.transition"))?;
             let generation_leases = self
                 .verify_rollback_generations(
                     transition.result_active_semantic.as_ref(),
@@ -307,15 +315,15 @@ where
                 transition.result_configuration.clone(),
                 transition.transition_at,
             )
-            .map_err(map_contract_error)?;
+            .map_err(contract_error_at("rollback.receipt"))?;
             let linked = self
                 .configuration
                 .commit_linked_transition(&transition, receipt.restored_activation.as_ref())
                 .await
-                .map_err(map_configuration_error)?;
+                .map_err(configuration_error_at("rollback.commit"))?;
             linked
                 .validate_for(&transition, receipt.restored_activation.as_ref())
-                .map_err(map_contract_error)?;
+                .map_err(contract_error_at("rollback.committed_transition"))?;
             if let Some((observation_ticket, observed)) =
                 self.observe_committed_activation(&linked).await
             {
@@ -343,12 +351,17 @@ where
         &self,
         required: &crate::config::retrieval::SemanticCompatibilityPinsV1,
         require_cold_offline_rollback: bool,
+        stage: &'static str,
     ) -> Result<super::SemanticExecutableGenerationLeaseV1, SemanticRuntimeBackendErrorV1> {
-        let evidence = self.generations.inspect_generation(required).await?;
+        let evidence = self
+            .generations
+            .inspect_generation(required)
+            .await
+            .map_err(refuse_at(stage))?;
         evidence
             .evidence()
             .validate_for(required, require_cold_offline_rollback)
-            .map_err(map_contract_error)?;
+            .map_err(contract_error_at(stage))?;
         Ok(evidence)
     }
 
@@ -361,7 +374,10 @@ where
         let requirements = unique_rollback_requirements(result_active, result_rollback);
         let mut leases = Vec::with_capacity(requirements.len());
         for required in requirements {
-            leases.push(self.verify_generation(required, true).await?);
+            leases.push(
+                self.verify_generation(required, true, "rollback.restored_generation")
+                    .await?,
+            );
         }
         Ok(leases)
     }
@@ -405,24 +421,89 @@ where
         &self,
         linked: &SemanticLinkedTransitionV1,
     ) -> Option<(ActivationObservationTicketV1, bool)> {
-        let observer = self.activation_observer.as_ref()?;
-        let ticket = self.reserve_observation(
+        let Some(observer) = self.activation_observer.as_ref() else {
+            tracing::warn!(
+                event = "semantic_activation_observation",
+                step = "activation_observer",
+                outcome = "skipped",
+                epoch = linked.epoch,
+                result_revision = %linked.audit.result_revision,
+                "the backend has no activation observer, so the committed transition never \
+                 reaches the query authority"
+            );
+            return None;
+        };
+        let Some(ticket) = self.reserve_observation(
             linked.epoch,
             &linked.audit.result_revision,
             &linked.transition_digest,
-        )?;
+        ) else {
+            tracing::warn!(
+                event = "semantic_activation_observation",
+                step = "reserve_observation",
+                outcome = "skipped",
+                epoch = linked.epoch,
+                result_revision = %linked.audit.result_revision,
+                "a newer or conflicting transition already holds the observation fence"
+            );
+            return None;
+        };
+        // Both skips below leave a durably committed transition uninstalled in
+        // live serving, and neither carried a reason: the caller sees only that
+        // nothing was observed. Name them.
         let committed = match self.configuration.committed_profile_state(linked).await {
             Ok(committed) => committed,
-            Err(SemanticConfigurationBackendErrorV1::Conflict) => return None,
-            Err(
-                SemanticConfigurationBackendErrorV1::Unavailable
-                | SemanticConfigurationBackendErrorV1::Rejected,
-            ) => return Some((ticket, false)),
+            Err(SemanticConfigurationBackendErrorV1::Conflict) => {
+                tracing::warn!(
+                    event = "semantic_activation_observation",
+                    step = "committed_profile_state",
+                    outcome = "skipped",
+                    epoch = linked.epoch,
+                    result_revision = %linked.audit.result_revision,
+                    "the committed state moved before the transition could be observed"
+                );
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "semantic_activation_observation",
+                    step = "committed_profile_state",
+                    outcome = "failed",
+                    epoch = linked.epoch,
+                    error = %error,
+                    "the committed state could not be read back for observation"
+                );
+                return Some((ticket, false));
+            }
         };
-        if committed.validate_for(linked).is_err() {
+        if let Err(error) = committed.validate_for(linked) {
+            tracing::warn!(
+                event = "semantic_activation_observation",
+                step = "committed_state_validation",
+                outcome = "failed",
+                epoch = linked.epoch,
+                error = %error,
+                activation_receipt_digest = ?linked.activation_receipt_digest,
+                "the committed state did not match the transition that produced it"
+            );
             return Some((ticket, false));
         }
-        let observed = observer.activation_committed(committed).await.is_ok();
+        let observed = match observer.activation_committed(committed).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    event = "semantic_activation_observation",
+                    step = "activation_committed",
+                    outcome = "refused",
+                    epoch = linked.epoch,
+                    result_revision = %linked.audit.result_revision,
+                    error = ?error,
+                    "the observer refused to install the committed transition as the query \
+                     authority"
+                );
+                false
+            }
+        };
         Some((ticket, observed))
     }
 }
@@ -491,20 +572,32 @@ fn unique_rollback_requirements<'a, T: Eq>(
     required
 }
 
-fn map_configuration_error(
-    error: SemanticConfigurationBackendErrorV1,
-) -> SemanticRuntimeBackendErrorV1 {
-    match error {
+/// Every refusing stage of a linked transition answers with the same
+/// `Rejected` category, so a refusal that reaches an operator has to carry the
+/// stage that produced it. These map the typed cause of one named stage; the
+/// unavailable and conflict categories keep their existing meaning because
+/// callers route on them.
+fn configuration_error_at(
+    stage: &'static str,
+) -> impl Fn(SemanticConfigurationBackendErrorV1) -> SemanticRuntimeBackendErrorV1 {
+    move |error| match error {
         SemanticConfigurationBackendErrorV1::Unavailable => {
             SemanticRuntimeBackendErrorV1::Unavailable
         }
-        SemanticConfigurationBackendErrorV1::Rejected => SemanticRuntimeBackendErrorV1::Rejected,
+        SemanticConfigurationBackendErrorV1::Rejected => {
+            SemanticRuntimeBackendErrorV1::RejectedAt(SemanticRuntimeRefusalV1::at(stage))
+        }
+        SemanticConfigurationBackendErrorV1::RejectedAt(inner) => {
+            SemanticRuntimeBackendErrorV1::RejectedAt(SemanticRuntimeRefusalV1::at(inner))
+        }
         SemanticConfigurationBackendErrorV1::Conflict => SemanticRuntimeBackendErrorV1::Conflict,
     }
 }
 
-fn map_contract_error(error: SemanticRuntimeContractErrorV1) -> SemanticRuntimeBackendErrorV1 {
-    match error {
+fn contract_error_at(
+    stage: &'static str,
+) -> impl Fn(SemanticRuntimeContractErrorV1) -> SemanticRuntimeBackendErrorV1 {
+    move |error| match error {
         SemanticRuntimeContractErrorV1::ResourceCeilingExceeded
         | SemanticRuntimeContractErrorV1::RollbackNotExecutable => {
             SemanticRuntimeBackendErrorV1::Unavailable
@@ -513,7 +606,22 @@ fn map_contract_error(error: SemanticRuntimeContractErrorV1) -> SemanticRuntimeB
         | SemanticRuntimeContractErrorV1::InvalidTransition => {
             SemanticRuntimeBackendErrorV1::Conflict
         }
-        _ => SemanticRuntimeBackendErrorV1::Rejected,
+        cause => SemanticRuntimeBackendErrorV1::RejectedAt(SemanticRuntimeRefusalV1::contract(
+            stage, cause,
+        )),
+    }
+}
+
+/// Name the stage on a refusal that arrived detail-free from the generation
+/// inspector; a refusal that already names its stage keeps it.
+fn refuse_at(
+    stage: &'static str,
+) -> impl Fn(SemanticRuntimeBackendErrorV1) -> SemanticRuntimeBackendErrorV1 {
+    move |error| match error {
+        SemanticRuntimeBackendErrorV1::Rejected => {
+            SemanticRuntimeBackendErrorV1::RejectedAt(SemanticRuntimeRefusalV1::at(stage))
+        }
+        error => error,
     }
 }
 
