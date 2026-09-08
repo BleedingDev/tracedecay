@@ -34,6 +34,45 @@ use tracedecay_sessions::admission::HostAdmissionScope;
 const OBSERVED_AT: UtcMicros = UtcMicros(100);
 const EXPIRES_AT: UtcMicros = UtcMicros(10_000);
 
+// gix deliberately ignores GIT_CONFIG_* overrides. Isolate its normal home
+// config lookup in a child instead of changing HOME in the threaded test runner.
+fn run_in_fixture_home(test_name: &str) -> bool {
+    const CHILD_TEST: &str = "TRACEDECAY_NATIVE_GIT_JOURNEY_CHILD";
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
+        return false;
+    }
+
+    let home = tempfile::tempdir().expect("isolated Git fixture home");
+    let mut command = Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD_TEST, test_name)
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"));
+    // Keep fixture Git commands on the same repository/config authority as gix.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let output = command.output().expect("run isolated native Git journey");
+    assert!(
+        output.status.success(),
+        "{test_name} failed in isolated HOME: {}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    // libtest succeeds when --exact matches nothing; reject a vacuous green.
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed;"),
+        "child did not run the exact test: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    true
+}
+
 fn digest(byte: char) -> ManifestDigest {
     ManifestDigest::new(format!("sha256:{}", byte.to_string().repeat(64))).expect("digest")
 }
@@ -290,6 +329,11 @@ async fn stack_snapshot(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn independent_pair_applies_supported_modes_and_survives_daemon_restart() {
+    if run_in_fixture_home(
+        "native_integration::journey_tests::independent_pair_applies_supported_modes_and_survives_daemon_restart",
+    ) {
+        return;
+    }
     for (index, mode) in [
         MechanicalIntegrationModeV1::FastForward,
         MechanicalIntegrationModeV1::TwoParentMerge,
@@ -430,6 +474,11 @@ async fn independent_pair_applies_supported_modes_and_survives_daemon_restart() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn foreign_destination_ref_drift_terminates_without_mutating_the_foreign_tip() {
+    if run_in_fixture_home(
+        "native_integration::journey_tests::foreign_destination_ref_drift_terminates_without_mutating_the_foreign_tip",
+    ) {
+        return;
+    }
     let directory = tempfile::tempdir().expect("temporary project directory");
     let repository_root = directory.path().join("repo");
     std::fs::create_dir_all(&repository_root).expect("repository root");
@@ -511,6 +560,58 @@ async fn foreign_destination_ref_drift_terminates_without_mutating_the_foreign_t
         tracedecay_domain::NativeIntegrationPreviewDispositionV1::MechanicalIntegrationEligible(
             MechanicalIntegrationModeV1::TwoParentMerge
         )
+    );
+    registry.shutdown().await.expect("shutdown owner registry");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fixture_home_hooks_configuration_is_still_refused() {
+    if run_in_fixture_home(
+        "native_integration::journey_tests::fixture_home_hooks_configuration_is_still_refused",
+    ) {
+        return;
+    }
+    let directory = tempfile::tempdir().expect("temporary project directory");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir_all(&repository_root).expect("repository root");
+    prepare_pair(&repository_root, MechanicalIntegrationModeV1::FastForward);
+    let destination_tip = git(&repository_root, &["rev-parse", "refs/heads/destination"]);
+    // Install no executable hook: the configured path alone must remain refused.
+    let home = std::env::var_os("HOME").expect("fixture HOME");
+    std::fs::write(
+        Path::new(&home).join(".gitconfig"),
+        "[core]\n\thooksPath = fixture-hooks\n",
+    )
+    .expect("write fixture global hooks configuration");
+    let runtime = HostAdmissionTestRuntimeV1::project(
+        directory.path().join("profile"),
+        &repository_root,
+        ProjectId::new("project.native.journey").expect("project id"),
+    )
+    .await
+    .expect("canonical project test runtime");
+    let database = runtime
+        .registered_database_lease(HostAdmissionScope::Project)
+        .expect("registered project database");
+    let (registry, owner) = mount(database, repository_root.clone()).await;
+    let preview = preflight(
+        owner,
+        preflight_request(
+            MechanicalIntegrationModeV1::FastForward,
+            "request.native.journey.hooks",
+        ),
+    )
+    .await;
+    assert_eq!(
+        preview.disposition,
+        tracedecay_domain::NativeIntegrationPreviewDispositionV1::Unavailable {
+            reason: tracedecay_domain::NativeIntegrationUnavailabilityV1::UnsupportedHooks,
+        }
+    );
+    assert!(preview.candidate_tree.is_none());
+    assert_eq!(
+        git(&repository_root, &["rev-parse", "refs/heads/destination"]),
+        destination_tip
     );
     registry.shutdown().await.expect("shutdown owner registry");
 }
