@@ -484,7 +484,11 @@ fn semantic_structural_identity_fields(tool_name: &str) -> &'static [&'static st
         | "tracedecay_lcm_expand"
         | "tracedecay_lcm_expand_query"
         | "tracedecay_session_lookup"
-        | "tracedecay_workflows" => &["session_id"],
+        | "tracedecay_workflows"
+        // The hook runtime consumes the caller's session as business input:
+        // transcript ingest, terminal receipts, and the Hermes callback all
+        // read it from the arguments after routing.
+        | "tracedecay_hook_runtime" => &["session_id"],
         _ => &[],
     }
 }

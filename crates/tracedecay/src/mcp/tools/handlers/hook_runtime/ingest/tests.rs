@@ -180,6 +180,10 @@ fn capture_registry_owns_every_supported_transcript_route() {
         ("cursor", false, SourceScan),
         ("hermes", false, SourceScan),
         ("kiro", false, SourceScan),
+        // Project-scoped Claude catch-up is a registered route (kernels.rs
+        // `ClaudeProjectKernelV1`): the profile kernel keeps only rows that
+        // belong to no registered project.
+        ("claude", false, SourceScan),
         // The Hermes turn callback inlines its messages; it is a registered
         // capture route, not a branch above the lookup.
         ("hermes", true, InlineMessages),
@@ -193,7 +197,6 @@ fn capture_registry_owns_every_supported_transcript_route() {
     // Routes with no registered kernel are reported through the typed
     // `unknown_provider` admission status rather than a generic config error.
     for route in [
-        ("claude", false, SourceScan),
         ("claude", true, InlineMessages),
         ("codex", false, InlineMessages),
         ("unknown-provider-v99", true, SourceScan),

@@ -356,25 +356,14 @@ impl BoundedHookOrchestratorV1 {
                 Some(HookOrchestrationWorkOutcomeV1::Completed) => true,
                 Some(HookOrchestrationWorkOutcomeV1::RetryableFailure) => false,
                 None => {
-                    let superseded = operation
+                    // The supersede join above already reaped this future while
+                    // holding the permit, so it is settled or was preempted by
+                    // owner retirement. Never poll it again here: a completed
+                    // `async fn` panics on resume.
+                    drop(work_future);
+                    operation
                         .superseded
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    // Keep the permit while reaping past the abort deadline; only
-                    // owner retirement may drop the future without a terminal.
-                    superseded
-                        && tokio::select! {
-                            biased;
-                            () = cancellation.cancelled() => false,
-                            _ = async {
-                                if tokio::time::timeout(
-                                    crate::TASK_ABORT_DEADLINE,
-                                    &mut work_future,
-                                ).await.is_err()
-                                {
-                                    (&mut work_future).await;
-                                }
-                            } => true,
-                        }
+                        .load(std::sync::atomic::Ordering::Acquire)
                 }
             };
             Self::settle_operation(&in_flight, &address, &operation, emit_terminal);
