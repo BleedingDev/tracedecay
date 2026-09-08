@@ -56,8 +56,12 @@ const DEVIN_CONFIGS: &[(&str, &[u8])] = &[(
     br#"{"mcpServers":{"foreign":{"command":"foreign-bin","args":["serve"]}},"ui":{"theme":"dark"}}
 "#,
 )];
+#[cfg(target_os = "macos")]
+const ZED_SETTINGS: &str = "Library/Application Support/Zed/settings.json";
+#[cfg(not(target_os = "macos"))]
+const ZED_SETTINGS: &str = ".config/zed/settings.json";
 const ZED_CONFIGS: &[(&str, &[u8])] = &[(
-    ".config/zed/settings.json",
+    ZED_SETTINGS,
     br#"{
   // preserve through the byte-exact uninstall snapshot
   "context_servers": {"foreign": {"command": "foreign-bin"}},
@@ -342,7 +346,7 @@ fn assert_documented_mcp_registration(case: HostCase, cli: &IsolatedCli) {
     let (relative, root) = match case.host {
         HostKindV1::Cline => (".cline/mcp.json", "mcpServers"),
         HostKindV1::Devin => (".config/devin/mcp_config.json", "mcpServers"),
-        HostKindV1::Zed => (".config/zed/settings.json", "context_servers"),
+        HostKindV1::Zed => (ZED_SETTINGS, "context_servers"),
         HostKindV1::Antigravity => (".gemini/antigravity/mcp_config.json", "mcpServers"),
         HostKindV1::RooCode => (
             ".config/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/cline_mcp_settings.json",
@@ -351,8 +355,12 @@ fn assert_documented_mcp_registration(case: HostCase, cli: &IsolatedCli) {
         HostKindV1::Kilo => (".config/kilo/kilo.jsonc", "mcp"),
         _ => return,
     };
-    let config: serde_json::Value =
-        serde_json::from_slice(&fs::read(cli.home.path().join(relative)).unwrap()).unwrap();
+    let path = cli.home.path().join(relative);
+    let config: serde_json::Value = if matches!(case.host, HostKindV1::Zed | HostKindV1::Kilo) {
+        tracedecay::agents::load_jsonc_file_strict(&path).unwrap()
+    } else {
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap()
+    };
     assert!(
         config[root].get("foreign").is_some(),
         "{} install discarded a sibling MCP server",
