@@ -23,8 +23,8 @@ use std::sync::Mutex;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tracedecay_application::memory::{CognitiveRecallRequest, CognitiveRecallResult};
-use tracedecay_application::{
+use tracedecay_contracts::memory::{CognitiveRecallRequest, CognitiveRecallResult};
+use tracedecay_contracts::{
     CancellationContext, CancellationSignal, Deadline, RequestId, ResolvedScope, now_micros,
 };
 use tracedecay_domain::{ProjectId, RefId, RepositoryId, UtcMicros, WorktreeId};

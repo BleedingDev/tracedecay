@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adversarial_fixture::*;
-use tracedecay_application::memory::CognitiveRecallDegradation;
-use tracedecay_application::now_micros;
+use tracedecay_contracts::memory::CognitiveRecallDegradation;
+use tracedecay_contracts::now_micros;
 use tracedecay_memory_conformance::{
     AdversarialProviderV1, AdversarialScriptV1, HandshakeMisbehaviourV1, MisbehaviourV1,
     ReleaseLatchV1,

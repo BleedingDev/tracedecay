@@ -209,7 +209,7 @@ fn resolve_project_root_with_identity(
 fn resolve_hook_scope(
     project_root: &Path,
     project_id: &tracedecay_domain::ProjectId,
-) -> std::result::Result<tracedecay_application::ResolvedScope, String> {
+) -> std::result::Result<tracedecay_contracts::ResolvedScope, String> {
     tracedecay_code_index_runtime::resolved_scope_for_project(project_root, project_id)
         .map_err(|error| error.to_string())
 }
@@ -336,26 +336,30 @@ mod tests {
         let _pinned = registered();
         let runtime = hook_runtime();
         let unregistered = tempfile::tempdir().expect("tempdir");
+        // The layout keeps the caller's spelling of the root, so hand it the
+        // canonical form up front: macOS temp roots live behind the
+        // `/var` -> `/private/var` symlink.
+        let checkout = unregistered
+            .path()
+            .canonicalize()
+            .expect("canonical checkout");
 
-        assert!(!runtime.is_project_initialized(unregistered.path()));
+        assert!(!runtime.is_project_initialized(&checkout));
         assert!(
             runtime
-                .resolve_project_root_with_identity(unregistered.path())
+                .resolve_project_root_with_identity(&checkout)
                 .await
                 .is_none()
         );
         assert!(
-            runtime.hook_timings_enabled(unregistered.path()).is_none(),
+            runtime.hook_timings_enabled(&checkout).is_none(),
             "an unregistered checkout has no published telemetry override"
         );
         let layout = runtime
-            .resolve_store_layout(unregistered.path())
+            .resolve_store_layout(&checkout)
             .await
             .expect("the root resolves a canonical layout for any checkout");
-        assert!(tracedecay_runtime_core::path_safety::same_canonical_path(
-            &layout.project_root,
-            unregistered.path(),
-        ));
+        assert_eq!(layout.project_root, checkout);
         assert!(layout.identity.project_id.is_some());
     }
 

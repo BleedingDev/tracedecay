@@ -148,15 +148,15 @@ impl McpServer {
                 application_invocation_executor,
                 application_invocation_target,
                 Some(
-                    tracedecay_application::RequestId::new("request.mcp.test-transport")
+                    tracedecay_contracts::RequestId::new("request.mcp.test-transport")
                         .expect("static test-transport request identity"),
                 ),
                 Some(
-                    tracedecay_application::Deadline::new(tracedecay_domain::UtcMicros(i64::MAX))
+                    tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(i64::MAX))
                         .expect("static test-transport deadline"),
                 ),
                 Some(
-                    tracedecay_application::CancellationSignal::active(
+                    tracedecay_contracts::CancellationSignal::active(
                         "cancellation.mcp.test-transport",
                     )
                     .expect("static test-transport cancellation"),
@@ -173,7 +173,7 @@ impl McpServer {
         routed: RoutedToolCall,
         timings_enabled: bool,
         publish_activity: bool,
-        application_request_id: Option<tracedecay_application::RequestId>,
+        application_request_id: Option<tracedecay_contracts::RequestId>,
         dispatch_control: DispatchControl,
     ) -> DispatchedToolCall {
         let handler_start = timings_enabled.then(std::time::Instant::now);
@@ -268,10 +268,10 @@ impl McpServer {
         application_invocation_executor: Option<
             &dyn tracedecay_daemon_protocol::DaemonInvocationExecutor,
         >,
-        application_invocation_target: tracedecay_application::InvocationTarget,
-        application_request_id: Option<tracedecay_application::RequestId>,
-        application_deadline: Option<tracedecay_application::Deadline>,
-        application_cancellation: Option<tracedecay_application::CancellationSignal>,
+        application_invocation_target: tracedecay_contracts::InvocationTarget,
+        application_request_id: Option<tracedecay_contracts::RequestId>,
+        application_deadline: Option<tracedecay_contracts::Deadline>,
+        application_cancellation: Option<tracedecay_contracts::CancellationSignal>,
     ) -> Result<ToolResult> {
         // Only the advisory recall lane consults the preserved identity view.
         #[cfg(not(feature = "memory-provider-host"))]
@@ -382,6 +382,7 @@ impl McpServer {
                     self.profile_session_db.as_ref(),
                 )
                 .with_profile_identity(self.profile_identity.clone())
+                .with_background_cpu(self.background_cpu.clone())
                 .with_profile_retained_authority(self.profile_retained_authority.as_ref())
                 .with_lcm_authorities(
                     self.project_lcm_authority.as_deref(),

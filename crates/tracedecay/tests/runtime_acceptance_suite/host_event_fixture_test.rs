@@ -5,6 +5,7 @@ use std::process::{Command, Output, Stdio};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tracedecay::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_application::observation::{CaptureObservationRequest, ObservationCancellation};
 use tracedecay_domain::{
     CanonicalMessageRoleV1, CanonicalObservationEnvelopeV1, CanonicalObservationEvidenceV1,
     CanonicalObservationFactV1, CanonicalObservationRelationsV1, DurableObservationV1,
@@ -31,7 +32,6 @@ use tracedecay_sessions::runtime::source::try_stream_new_jsonl_raw_strict_with_r
 use tracedecay_sessions::runtime::{claude, codex, cursor, hermes};
 use tracedecay_store::ObservationReplayRequest;
 use tracedecay_store::observation::{ObservationCoverageReason, ObservationCursorAdvance};
-use tracedecay_usecases::observation::{CaptureObservationRequest, ObservationCancellation};
 
 use crate::common::{
     EnvVarGuard, GLOBAL_DB_ENV_LOCK, git_program, spawn_tracedecay_daemon,
@@ -2084,7 +2084,7 @@ fn encode_workspace_path(path: &Path) -> String {
 }
 
 fn write_kiro_native_fixture(home: &Path, project: &Path) {
-    let directory = tracedecay::agents::kiro_data_dir(home)
+    let directory = tracedecay_agent_hosts::agents::kiro_data_dir(home)
         .join("User/globalStorage/kiro.kiroagent/workspace-sessions")
         .join(encode_workspace_path(project));
     std::fs::create_dir_all(&directory).unwrap();

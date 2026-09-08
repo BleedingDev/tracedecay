@@ -8,13 +8,13 @@ use std::future::Future;
 use std::path::Path;
 
 use serde_json::{Value, json};
-use tracedecay_application::retrieval::{
+use tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1;
+use tracedecay_contracts::retrieval::{
     ContextCodeBlockV1, ContextModeV1, ContextResultV1, ContextSearchMatchV1,
     ContextSurfaceRequestV1, RenamePreviewNodeV1, RenamePreviewPrimitiveRequestV1,
     RenamePreviewPrimitiveResultV1, RenamePreviewReferenceV1, RenamePreviewTextOnlyMatchV1,
     SimilarSurfaceRequestV1, SimilarSymbolV1,
 };
-use tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1;
 use tracedecay_domain::ExactClass;
 
 use crate::tracedecay::TraceDecay;
@@ -231,11 +231,11 @@ pub(super) async fn handle_search<F>(
     search_executor: Option<&crate::mcp::server::CodeIndexSearchExecutor>,
     search_authority: Option<&crate::mcp::server::CodeIndexSearchAuthorityV1>,
     ignored_dependency_admission: Option<
-        &dyn tracedecay_usecases::code_index::CodeIndexIgnoredDependencyAdmissionPortV1,
+        &dyn tracedecay_application::code_index::CodeIndexIgnoredDependencyAdmissionPortV1,
     >,
     freshness_reader: Option<&CodeIndexFreshnessReader>,
-    deadline: Option<tracedecay_application::Deadline>,
-    cancellation: Option<tracedecay_application::CancellationSignal>,
+    deadline: Option<tracedecay_contracts::Deadline>,
+    cancellation: Option<tracedecay_contracts::CancellationSignal>,
 ) -> Result<ToolResult>
 where
     F: Future<Output = Result<tracedecay_graph_query::VerifiedGraphQuery>>,
@@ -797,8 +797,8 @@ pub(super) async fn handle_context<F>(
     search_executor: Option<&crate::mcp::server::CodeIndexSearchExecutor>,
     search_authority: Option<&crate::mcp::server::CodeIndexSearchAuthorityV1>,
     freshness_reader: Option<&CodeIndexFreshnessReader>,
-    deadline: Option<tracedecay_application::Deadline>,
-    cancellation: Option<tracedecay_application::CancellationSignal>,
+    deadline: Option<tracedecay_contracts::Deadline>,
+    cancellation: Option<tracedecay_contracts::CancellationSignal>,
 ) -> Result<ToolResult>
 where
     F: Future<Output = Result<tracedecay_graph_query::VerifiedGraphQuery>>,
@@ -1044,10 +1044,10 @@ pub(super) async fn handle_find_exact_symbol(
     args: Value,
     scope_prefix: Option<&str>,
     ignored_dependency_admission: Option<
-        &dyn tracedecay_usecases::code_index::CodeIndexIgnoredDependencyAdmissionPortV1,
+        &dyn tracedecay_application::code_index::CodeIndexIgnoredDependencyAdmissionPortV1,
     >,
-    deadline: Option<&tracedecay_application::Deadline>,
-    cancellation: Option<&tracedecay_application::CancellationSignal>,
+    deadline: Option<&tracedecay_contracts::Deadline>,
+    cancellation: Option<&tracedecay_contracts::CancellationSignal>,
 ) -> Result<ToolResult> {
     let name =
         args.get("name")
@@ -1118,8 +1118,8 @@ pub(super) async fn handle_similar(
     args: Value,
     search_executor: Option<&crate::mcp::server::CodeIndexSearchExecutor>,
     search_authority: Option<&crate::mcp::server::CodeIndexSearchAuthorityV1>,
-    deadline: Option<tracedecay_application::Deadline>,
-    cancellation: Option<tracedecay_application::CancellationSignal>,
+    deadline: Option<tracedecay_contracts::Deadline>,
+    cancellation: Option<tracedecay_contracts::CancellationSignal>,
 ) -> Result<ToolResult> {
     let request: SimilarSurfaceRequestV1 = decode_primitive_request(&args, "tracedecay_similar")?;
     let limit = request.limit.map_or(10, |value| value.min(100) as usize);
@@ -1468,7 +1468,7 @@ pub(super) async fn handle_rename_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tracedecay_application::memory::FactSearchHitV1;
+    use tracedecay_contracts::memory::FactSearchHitV1;
 
     #[test]
     fn complete_search_preserves_generation_advance_but_not_stale_admission() {
@@ -1677,6 +1677,109 @@ mod tests {
             "SparseLexicalWidget"
         );
         assert!(payload["status"].is_null());
+        cg.close();
+    }
+
+    /// A strict-semantic request the runtime cannot honour is refused: the
+    /// payload stays typed (`status: "unavailable"`, the reason, the semantic
+    /// lane's own status) and the call is flagged as a tool-level error — not
+    /// a JSON-RPC failure, and not an empty page passed off as success. The
+    /// same outcome under `fallback_allowed` is a degraded answer, not a
+    /// refusal.
+    #[test]
+    fn strict_semantic_unavailability_is_a_typed_refusal() {
+        run_with_locked_user_data_dir(strict_semantic_unavailability_is_a_typed_refusal_case());
+    }
+
+    async fn strict_semantic_unavailability_is_a_typed_refusal_case() {
+        let dir = tempfile::TempDir::new().expect("strict refusal isolation");
+        let _env = crate::mcp::tools::handlers::dispatch_test_support::SelectorEnv::new(dir.path());
+        let project = dir.path().join("strict-semantic-refusal");
+        std::fs::create_dir_all(project.join("src")).expect("create strict refusal sources");
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "pub fn SparseLexicalWidget() {}\n",
+        )
+        .expect("write strict refusal fixture");
+        let (cg, _runtime) = TraceDecay::init_test_fixture_with_registered_runtime(
+            &project,
+            "project.strict-semantic-refusal",
+        )
+        .await
+        .expect("registered strict refusal fixture");
+
+        let executor: crate::mcp::server::CodeIndexSearchExecutor = std::sync::Arc::new(
+            move |_| {
+                Box::pin(async {
+                    crate::mcp::server::CodeIndexSearchOutcomeV1::Unavailable(
+                        crate::mcp::server::CodeIndexSearchUnavailableV1 {
+                            code_generation: Some(
+                                "generation.mcp-verified-graph-fixture.1".to_owned(),
+                            ),
+                            reason: crate::mcp::server::CodeIndexSearchUnavailableReasonV1::SemanticUnavailable,
+                            semantic: crate::mcp::server::CodeIndexSemanticStatusV1::Unavailable {
+                                reason: "calibration_unavailable",
+                            },
+                            coverage: crate::mcp::server::CodeIndexSearchCoverageV1::unavailable(
+                                "calibration_unavailable",
+                            ),
+                        },
+                    )
+                })
+            },
+        );
+
+        for (semantic_mode, refused) in [("strict_semantic", true), ("fallback_allowed", false)] {
+            let result = crate::mcp::tools::handlers::handle_tool_call_with_registry_options(
+                &cg,
+                "tracedecay_search",
+                json!({
+                    "query": "SparseLexicalWidget",
+                    "limit": 5,
+                    "format": "json",
+                    "semantic_mode": semantic_mode,
+                }),
+                None,
+                None,
+                search_test_options(&cg, std::sync::Arc::clone(&executor)),
+            )
+            .await
+            .expect("an unavailable search answers with a typed result, not a hard error");
+            let payload: Value = serde_json::from_str(
+                result.value["content"][0]["text"]
+                    .as_str()
+                    .expect("unavailable search JSON text"),
+            )
+            .expect("unavailable search JSON payload");
+
+            assert_eq!(
+                result.semantic_error() == Some(true),
+                refused,
+                "{semantic_mode}: refusal flag mismatch for {payload}"
+            );
+            assert_eq!(payload["status"], "unavailable", "{semantic_mode}");
+            assert_eq!(payload["reason"], "semantic_unavailable", "{semantic_mode}");
+            assert_eq!(payload["semantic"]["mode"], semantic_mode);
+            assert_eq!(
+                payload["semantic"]["status"], "unavailable",
+                "{semantic_mode}"
+            );
+            assert_eq!(
+                payload["semantic"]["reason"], "calibration_unavailable",
+                "{semantic_mode}"
+            );
+            assert_eq!(payload["results"], json!([]), "{semantic_mode}");
+            assert_eq!(
+                payload["query_fallback_digest"],
+                Value::Null,
+                "{semantic_mode}"
+            );
+            assert_eq!(
+                result.failure_message(),
+                Some("code-index search unavailable: semantic_unavailable"),
+                "{semantic_mode}"
+            );
+        }
         cg.close();
     }
 

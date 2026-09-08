@@ -5,21 +5,21 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use tracedecay_application::session_sync::{
+use tracedecay_code_index::git_projection::{
+    GIT_TOPOLOGY_PROJECTOR_REVISION_V1, GitBranchStackBindingV1, GitTopologyProjectionStore,
+    GitWorktreeOccupancyV1, build_git_topology_manifest_checked, git_topology_idempotency_key,
+    git_topology_namespace, git_topology_projection_identity,
+};
+use tracedecay_contracts::session_sync::{
     SessionSyncCommandV1, SessionSyncCompletionReceiptV1, SessionSyncCoverageV1,
     SessionSyncJournalStatusV1, SessionSyncJournalV1, SessionSyncOutcomeV1, SessionSyncRequestV1,
     SessionSyncScopeV1, SessionSyncServicePort, SessionSyncSourceCoverageV1, SessionSyncStatsV1,
     SessionTranscriptImportV1,
 };
-use tracedecay_application::{
+use tracedecay_contracts::{
     AuthorizedRootAdmission, AuthorizedScopeSetAuthority, CancellationContext, CancellationSignal,
     CapabilityGrantSnapshot, Deadline, DisclosureClass, IdempotencyKey, OperationTermination,
-    RegisteredRootLocatorV1, RequestContext, RequestId, ResolvedScope,
-};
-use tracedecay_code_index::git_projection::{
-    GIT_TOPOLOGY_PROJECTOR_REVISION_V1, GitBranchStackBindingV1, GitTopologyProjectionStore,
-    GitWorktreeOccupancyV1, build_git_topology_manifest_checked, git_topology_idempotency_key,
-    git_topology_namespace, git_topology_projection_identity,
+    RegisteredRootLocatorV1, RequestContext, RequestId, ResolvedScope, SharedProfileStoreLocatorV1,
 };
 use tracedecay_domain::{
     ActorId, BranchStackEdgeV1, BranchStackId, BranchStackNodeV1, BranchStackRevisionId,
@@ -58,7 +58,7 @@ impl GraphCancellation for NeverCancelled {
 
 fn active_session_sync_deadline() -> Deadline {
     Deadline::new(UtcMicros(
-        tracedecay_application::now_micros()
+        tracedecay_contracts::now_micros()
             .0
             .saturating_add(60_000_000),
     ))
@@ -81,7 +81,7 @@ async fn session_sync_interruption_wait_wakes_on_request_cancellation() {
     });
     tokio::task::yield_now().await;
 
-    cancellation.cancel(tracedecay_application::now_micros());
+    cancellation.cancel(tracedecay_contracts::now_micros());
 
     let interruption = tokio::time::timeout(Duration::from_secs(1), waiter)
         .await
@@ -119,9 +119,7 @@ async fn session_sync_interruption_wait_uses_the_request_deadline() {
     let service = DaemonSessionSyncService::default();
     let cancellation = CancellationSignal::active("session-sync.event-deadline").unwrap();
     let deadline = Deadline::new(UtcMicros(
-        tracedecay_application::now_micros()
-            .0
-            .saturating_add(20_000),
+        tracedecay_contracts::now_micros().0.saturating_add(20_000),
     ))
     .unwrap();
 
@@ -380,7 +378,7 @@ fn native_topology_context(
     use_case: &UseCaseId,
 ) -> RequestContext {
     let grant = CapabilityGrantSnapshot::new(
-        tracedecay_application::CapabilityGrantId::new(format!("grant.session-sync.{suffix}"))
+        tracedecay_contracts::CapabilityGrantId::new(format!("grant.session-sync.{suffix}"))
             .expect("grant"),
         1,
         native_topology_digest('c'),
@@ -463,6 +461,13 @@ async fn persisted_declared_topology_survives_registry_restart_and_session_sync_
         tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity.clone())
             .await
             .expect("first session registry");
+    let first_profile_store_id = first_registry
+        .profile_database()
+        .await
+        .expect("first verified profile database")
+        .verified_locator()
+        .locator_digest
+        .clone();
     let first_project_database = first_registry
         .project_memory(project.clone(), roots.clone())
         .await
@@ -511,8 +516,12 @@ async fn persisted_declared_topology_survives_registry_restart_and_session_sync_
                 native_topology_context(main_scope.clone(), "main.1", &capability, &use_case),
                 RegisteredRootLocatorV1::new(
                     project.clone(),
-                    identity.profile_id().clone(),
-                    "store.session-sync.native-topology",
+                    SharedProfileStoreLocatorV1::new(
+                        identity.brain_id().clone(),
+                        identity.profile_id().clone(),
+                        first_profile_store_id.as_str(),
+                    )
+                    .expect("profile shard locator"),
                     roots[0].clone(),
                 )
                 .expect("main locator"),
@@ -522,8 +531,12 @@ async fn persisted_declared_topology_survives_registry_restart_and_session_sync_
                 native_topology_context(feature_scope.clone(), "feature.1", &capability, &use_case),
                 RegisteredRootLocatorV1::new(
                     project.clone(),
-                    identity.profile_id().clone(),
-                    "store.session-sync.native-topology",
+                    SharedProfileStoreLocatorV1::new(
+                        identity.brain_id().clone(),
+                        identity.profile_id().clone(),
+                        first_profile_store_id.as_str(),
+                    )
+                    .expect("profile shard locator"),
                     roots[1].clone(),
                 )
                 .expect("feature locator"),
@@ -615,12 +628,12 @@ async fn persisted_declared_topology_survives_registry_restart_and_session_sync_
             reference: Some(feature_ref),
         },
     ];
-    let projection = tracedecay_usecases::git_intelligence::NativeGitIntelligence::new(
+    let projection = tracedecay_application::git_intelligence::NativeGitIntelligence::new(
         roots[0].clone(),
         repository.clone(),
         main_worktree.clone(),
     )
-    .topology_projection(tracedecay_usecases::git_intelligence::GIT_HISTORY_MAX_COUNT_LIMIT)
+    .topology_projection(tracedecay_application::git_intelligence::GIT_HISTORY_MAX_COUNT_LIMIT)
     .expect("native topology projection")
     .with_declared_topology(vec![branch_binding], occupancies)
     .expect("declared topology projection");
@@ -657,6 +670,14 @@ async fn persisted_declared_topology_survives_registry_restart_and_session_sync_
         tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity.clone())
             .await
             .expect("restarted session registry");
+    let restarted_profile_store_id = restarted_registry
+        .profile_database()
+        .await
+        .expect("restarted verified profile database")
+        .verified_locator()
+        .locator_digest
+        .clone();
+    assert_eq!(restarted_profile_store_id, first_profile_store_id);
     let restarted_project_database = restarted_registry
         .project_memory(project.clone(), roots.clone())
         .await
@@ -710,8 +731,12 @@ async fn persisted_declared_topology_survives_registry_restart_and_session_sync_
                 native_topology_context(main_scope, "main.2", &capability, &use_case),
                 RegisteredRootLocatorV1::new(
                     project.clone(),
-                    identity.profile_id().clone(),
-                    "store.session-sync.native-topology",
+                    SharedProfileStoreLocatorV1::new(
+                        identity.brain_id().clone(),
+                        identity.profile_id().clone(),
+                        restarted_profile_store_id.as_str(),
+                    )
+                    .expect("profile shard locator"),
                     roots[0].clone(),
                 )
                 .expect("replacement main locator"),
@@ -721,8 +746,12 @@ async fn persisted_declared_topology_survives_registry_restart_and_session_sync_
                 native_topology_context(feature_scope, "feature.2", &capability, &use_case),
                 RegisteredRootLocatorV1::new(
                     project,
-                    identity.profile_id().clone(),
-                    "store.session-sync.native-topology",
+                    SharedProfileStoreLocatorV1::new(
+                        identity.brain_id().clone(),
+                        identity.profile_id().clone(),
+                        restarted_profile_store_id.as_str(),
+                    )
+                    .expect("profile shard locator"),
                     roots[1].clone(),
                 )
                 .expect("replacement feature locator"),
@@ -873,6 +902,8 @@ async fn cancel_in_alias_activation_gap_mirrors_primary_terminal_receipt() {
             project_sessions,
             user_sessions: profile_sessions.clone(),
             registry: profile_sessions.clone(),
+            background_cpu: crate::host_admission::ensure_process_background_cpu_authority()
+                .expect("install fixture worker plan authority"),
             startup_import: false,
             project_refresh: SessionTemporalRefreshWake::unavailable(),
             user_refresh: SessionTemporalRefreshWake::unavailable(),
@@ -924,7 +955,7 @@ async fn cancel_in_alias_activation_gap_mirrors_primary_terminal_receipt() {
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let cancel_service = service.clone();
     let cancel_barrier = Arc::clone(&barrier);
-    let control = tracedecay_application::session_sync::SessionSyncControlV1::new(
+    let control = tracedecay_contracts::session_sync::SessionSyncControlV1::new(
         scope,
         alias_request.idempotency_key().clone(),
     );

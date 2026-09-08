@@ -66,7 +66,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use tracedecay_application::ResolvedScope;
+use tracedecay_contracts::ResolvedScope;
 use tracedecay_domain::{
     CanonicalMessageRoleV1, CanonicalObservationEnvelopeV1, CanonicalObservationFactV1,
     DurableObservationV1, ObservationContractError, ObservationScopeV1, ProjectId, UserProfileId,
@@ -1257,7 +1257,7 @@ impl ObservationAdmissionAdapterV1 for CanonicalObservationAdmissionAdapterV1 {
                     source_event_id: source_event_id.clone(),
                     source,
                 })?;
-                let admitted_at_unix_micros = tracedecay_application::now_micros().0;
+                let admitted_at_unix_micros = tracedecay_contracts::now_micros().0;
                 let occurred_at_unix_micros = settlement.settled_at_unix_micros;
                 let privacy = ObservationPrivacyV1 {
                     classification: PrivacyClassificationV1::Sensitive,
@@ -1933,7 +1933,7 @@ impl ProviderDeliveryAdapterV1 for RegistryObservationDeliveryAdapterV1 {
         // worker rechecks the same cancellation token before every provider
         // effect; if it answers after cancellation, `call_within` discards the
         // answer and this method records only host-owned cancellation evidence.
-        let started_at_unix_micros = tracedecay_application::now_micros().0;
+        let started_at_unix_micros = tracedecay_contracts::now_micros().0;
         let budget_millis = u64::try_from(control.remaining_micros(started_at_unix_micros) / 1_000)
             .unwrap_or(u64::MAX);
         let cancellation = control.cancellation();
@@ -1954,7 +1954,7 @@ impl ProviderDeliveryAdapterV1 for RegistryObservationDeliveryAdapterV1 {
             Err(BoundedCallRefusalV1::Cancelled) if cancellation.is_cancelled() => {
                 Ok(DeliveryAttemptV1::CancelledByShutdown {
                     started_at_unix_micros,
-                    finished_at_unix_micros: tracedecay_application::now_micros().0,
+                    finished_at_unix_micros: tracedecay_contracts::now_micros().0,
                 })
             }
             Err(refusal) => Err(DeliveryAdapterError::Isolation(refusal)),
@@ -1974,7 +1974,7 @@ impl RegistryObservationDeliveryAdapterV1 {
         // wake edge's, cancelled at shutdown. Readiness and the observation
         // call both run under it, so a shutdown reaches a provider that is
         // inside either.
-        let started_at_unix_micros = tracedecay_application::now_micros().0;
+        let started_at_unix_micros = tracedecay_contracts::now_micros().0;
         let operation_control = |now: i64| {
             OperationControl::new(
                 control.deadline_unix_micros(),
@@ -1993,10 +1993,10 @@ impl RegistryObservationDeliveryAdapterV1 {
         // Keep registration-wide dispatch ownership from this handshake through
         // the observation call. Admission also obtains readiness through this
         // owner, so it cannot rotate the fabric's current receipt in the gap.
-        let readiness_dispatch = match self.readiness.ready_dispatch_with_evidence(
-            &readiness_request,
-            tracedecay_application::now_micros().0,
-        ) {
+        let readiness_dispatch = match self
+            .readiness
+            .ready_dispatch_with_evidence(&readiness_request, tracedecay_contracts::now_micros().0)
+        {
             Ok(dispatch) => dispatch,
             // Classify this result at the instant readiness answers. A
             // shutdown already visible here owns the attempt and must leave
@@ -2005,7 +2005,7 @@ impl RegistryObservationDeliveryAdapterV1 {
             Err(_cause) if control.is_cancelled() => {
                 return Ok(DeliveryAttemptV1::CancelledByShutdown {
                     started_at_unix_micros,
-                    finished_at_unix_micros: tracedecay_application::now_micros().0,
+                    finished_at_unix_micros: tracedecay_contracts::now_micros().0,
                 });
             }
             Err(cause) => {
@@ -2017,7 +2017,7 @@ impl RegistryObservationDeliveryAdapterV1 {
         if control.is_cancelled() {
             return Ok(DeliveryAttemptV1::CancelledByShutdown {
                 started_at_unix_micros,
-                finished_at_unix_micros: tracedecay_application::now_micros().0,
+                finished_at_unix_micros: tracedecay_contracts::now_micros().0,
             });
         }
         // The recovery gate runs on the evidence of the very handshake above,
@@ -2028,7 +2028,7 @@ impl RegistryObservationDeliveryAdapterV1 {
             &leased.exact_scope_sha256,
             readiness_dispatch.evidence(),
             control,
-            tracedecay_application::now_micros().0,
+            tracedecay_contracts::now_micros().0,
         ) {
             Ok(generation) => generation,
             // A recovery pass stopped by the shutdown that owns this attempt is
@@ -2038,7 +2038,7 @@ impl RegistryObservationDeliveryAdapterV1 {
             Err(RecoveryRefusalV1::Cancelled(_)) if control.is_cancelled() => {
                 return Ok(DeliveryAttemptV1::CancelledByShutdown {
                     started_at_unix_micros,
-                    finished_at_unix_micros: tracedecay_application::now_micros().0,
+                    finished_at_unix_micros: tracedecay_contracts::now_micros().0,
                 });
             }
             Err(refusal) => return Err(DeliveryAdapterError::Recovery(refusal)),
@@ -2046,7 +2046,7 @@ impl RegistryObservationDeliveryAdapterV1 {
         // Fail fast and typed when the composition is disabled: no worker is
         // borrowed for a provider that is not there.
         self.registry()?;
-        let control = operation_control(tracedecay_application::now_micros().0);
+        let control = operation_control(tracedecay_contracts::now_micros().0);
         // The persisted receipt is reattached verbatim so the boundary check
         // runs against the exact hygiene evidence that admitted these bytes.
         let sanitization = PayloadSanitizationReceipt::from_json(&leased.sanitization.receipt_json)
@@ -2093,7 +2093,7 @@ impl RegistryObservationDeliveryAdapterV1 {
             .deliver_observation_result(&call)
             .map_err(DeliveryAdapterError::Fabric)?;
         drop(readiness_dispatch);
-        let finished_at_unix_micros = tracedecay_application::now_micros().0;
+        let finished_at_unix_micros = tracedecay_contracts::now_micros().0;
         match answered {
             ObserverDeliveryResult::Accepted(receipt) => Ok(DeliveryAttemptV1::Answered {
                 terminal: Box::new(receipt.terminal),
@@ -2152,7 +2152,7 @@ impl ReplayIngestControlV1 {
         if self.caller.is_cancelled() || self.stopping.is_cancelled() {
             self.cancellation.cancel();
         }
-        let now = tracedecay_application::now_micros().0;
+        let now = tracedecay_contracts::now_micros().0;
         let deadline = now
             .saturating_add(budget_micros)
             .min(self.deadline_unix_micros);
@@ -2167,7 +2167,7 @@ impl ReplayIngestControlV1 {
 
 impl IngressControlV1 for ReplayIngestControlV1 {
     fn now_unix_micros(&self) -> i64 {
-        tracedecay_application::now_micros().0
+        tracedecay_contracts::now_micros().0
     }
 
     fn deadline_unix_micros(&self) -> i64 {
@@ -2189,7 +2189,7 @@ impl IngressControlV1 for ReplayIngestControlV1 {
 fn wall_deadline_micros(deadline: tokio::time::Instant) -> i64 {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     let remaining = i64::try_from(remaining.as_micros()).unwrap_or(i64::MAX);
-    tracedecay_application::now_micros()
+    tracedecay_contracts::now_micros()
         .0
         .saturating_add(remaining)
 }
@@ -2743,7 +2743,7 @@ fn readiness_target_and_evidence_for_scope(
         control,
     )?;
     let (readiness, evidence) = supervised
-        .ready_target_with_evidence(&request, tracedecay_application::now_micros().0)
+        .ready_target_with_evidence(&request, tracedecay_contracts::now_micros().0)
         .map_err(ObservationJourneyError::SupervisedReadiness)?;
     let target = ProviderTargetV1 {
         provider_id: readiness.provider_id().clone(),
@@ -3250,7 +3250,7 @@ impl ProjectObservationJourneyV1 {
         let journal = Arc::clone(&self.journal);
         let backpressure = Arc::clone(&self.backpressure);
         let lane = self.provider_lane.clone();
-        let now_unix_micros = tracedecay_application::now_micros().0;
+        let now_unix_micros = tracedecay_contracts::now_micros().0;
         tokio::task::spawn_blocking(move || {
             journal
                 .lane_pressure(&lane)
@@ -3690,7 +3690,7 @@ impl ProjectObservationJourneyV1 {
         let wake = Arc::clone(&self.wake);
         let request = ShutdownRequestV1 {
             provider_id: self.provider_id.clone(),
-            now_unix_micros: tracedecay_application::now_micros().0,
+            now_unix_micros: tracedecay_contracts::now_micros().0,
             reap_budget: self.dispatch_policy.reap_budget,
         };
         let pass = tokio::task::spawn_blocking(move || {
@@ -3740,7 +3740,7 @@ impl ProjectObservationJourneyV1 {
                 let mut sweeper = RetentionSweeperV1::new(
                     journal.as_ref(),
                     retention_sweep_schedule,
-                    tracedecay_application::now_micros().0,
+                    tracedecay_contracts::now_micros().0,
                 );
                 // Open validated one page; whatever is left is walked here.
                 let mut withheld_audit_complete = false;
@@ -3748,7 +3748,7 @@ impl ProjectObservationJourneyV1 {
                     if runtime.wait_for_work(delivery_park) == WakeOutcomeV1::ShutdownRequested {
                         break;
                     }
-                    let now = tracedecay_application::now_micros().0;
+                    let now = tracedecay_contracts::now_micros().0;
                     let request = DispatchRequestV1 {
                         lease: LeaseRequestV1 {
                             provider_id: provider_id.clone(),
@@ -3784,7 +3784,7 @@ impl ProjectObservationJourneyV1 {
                         .map_err(ObservationRuntimeError::from)
                         .and_then(|bounds| {
                             runtime.drain(&request, &bounds, || {
-                                tracedecay_application::now_micros().0
+                                tracedecay_contracts::now_micros().0
                             })
                         }) {
                         Ok(report) => {
@@ -3834,7 +3834,7 @@ impl ProjectObservationJourneyV1 {
                                         .as_str()
                                         .to_owned(),
                                     attempt_number: failure.attempt_number,
-                                    at_unix_micros: tracedecay_application::now_micros().0,
+                                    at_unix_micros: tracedecay_contracts::now_micros().0,
                                     class,
                                     detail: failure.cause.to_string(),
                                 });
@@ -3875,7 +3875,7 @@ impl ProjectObservationJourneyV1 {
                     // visible so a waiter reads one coherent result.
                     delivery_changed.publish();
                     if let Err(error) = runtime.reap(
-                        tracedecay_application::now_micros().0,
+                        tracedecay_contracts::now_micros().0,
                         dispatch_policy.reap_budget,
                     ) {
                         tracing::warn!(
@@ -3889,7 +3889,7 @@ impl ProjectObservationJourneyV1 {
                     // purged by a mounted path — never left to a sweep nobody
                     // calls. The sweeper owns the cadence; a failure here is
                     // logged and waits out its backoff rather than looping.
-                    match sweeper.tick(tracedecay_application::now_micros().0) {
+                    match sweeper.tick(tracedecay_contracts::now_micros().0) {
                         Ok(RetentionTickV1::NotDue { .. }) => {}
                         Ok(RetentionTickV1::Swept {
                             receipt,
@@ -4589,7 +4589,7 @@ mod tests {
 
     use serde_json::json;
     use tempfile::TempDir;
-    use tracedecay_application::ResolvedScope;
+    use tracedecay_contracts::ResolvedScope;
     use tracedecay_domain::{
         CanonicalMessageRoleV1, CanonicalObservationEnvelopeV1, CanonicalObservationEvidenceV1,
         CanonicalObservationFactV1, CanonicalObservationIdV1, CanonicalObservationRelationsV1,
@@ -9461,7 +9461,7 @@ mod tests {
                 )
                 .unwrap();
             assert!(present, "content was purged before expiry");
-            let aged = tracedecay_application::now_micros().0 - 3_600_000_000;
+            let aged = tracedecay_contracts::now_micros().0 - 3_600_000_000;
             connection
                 .execute(
                     "UPDATE tdmem_observation_journal_v1 SET expires_at_micros = ?1",

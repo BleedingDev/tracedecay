@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
-use tracedecay_application::retained_surfaces::{
+use tracedecay_contracts::retained_surfaces::{
     FactFeedbackRequestV1, FactRetrievalTelemetryV1, FactStoreAddRequestV1,
     FactStoreContradictRequestV1, FactStoreGetRequestV1, FactStoreListRequestV1,
     FactStoreProbeRequestV1, FactStoreReasonRequestV1, FactStoreRelatedRequestV1,
@@ -10,7 +10,7 @@ use tracedecay_application::retained_surfaces::{
     FactStoreUpdateRequestV1, MemoryScopeV1, MemoryStatusRequestV1, RetainedProjectSelectorV1,
     RetainedSurfaceOperation, RetainedSurfaceResultV1,
 };
-use tracedecay_application::{
+use tracedecay_contracts::{
     ApplicationOutcome, RetainedMemoryExecutionPortV1, RetainedMemoryRequestV1,
     RetainedSurfaceExecutionContextV1, RetainedSurfaceExecutionErrorV1,
     RetainedSurfaceExecutionFutureV1, now_micros,
@@ -391,7 +391,7 @@ async fn execute_add_on_db(
     prepared.complete_with_digest(
         context,
         &committed_state,
-        tracedecay_application::ReconciliationState::Reconciled,
+        tracedecay_contracts::ReconciliationState::Reconciled,
         result,
         memory_expiry_partial(settled_after_expiry),
     )
@@ -405,8 +405,10 @@ async fn execute_update_on_db(
     configuration_digest: &ManifestDigest,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
     let memory = memory_application(database, owner.clone())?;
-    let logical_effect = memory_mapping::update_logical_effect(&owner, request)?;
-    let operation_context = memory_operation_context(context, &owner, "update", &logical_effect)?;
+    let update = memory_mapping::PreparedFactUpdate::new(owner, request)?;
+    let logical_effect = update.logical_effect()?;
+    let operation_context =
+        memory_operation_context(context, update.owner(), "update", &logical_effect)?;
     let operation_id = operation_context.operation_id().as_str().to_owned();
     let prepared = prepare_retained_effect(
         context,
@@ -415,9 +417,7 @@ async fn execute_update_on_db(
         &logical_effect,
         &operation_id,
     )?;
-    let command = memory_mapping::update_command(
-        owner,
-        request,
+    let command = update.into_command(
         operation_context.operation_id().clone(),
         context.request_context.actor().clone(),
     )?;
@@ -443,7 +443,7 @@ async fn execute_update_on_db(
     prepared.complete_with_digest(
         context,
         commit.committed_state_digest(),
-        tracedecay_application::ReconciliationState::Reconciled,
+        tracedecay_contracts::ReconciliationState::Reconciled,
         result,
         memory_expiry_partial(settled_after_expiry),
     )
@@ -457,8 +457,10 @@ async fn execute_remove_on_db(
     configuration_digest: &ManifestDigest,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
     let memory = memory_application(database, owner.clone())?;
-    let logical_effect = memory_mapping::remove_logical_effect(&owner, request)?;
-    let operation_context = memory_operation_context(context, &owner, "remove", &logical_effect)?;
+    let remove = memory_mapping::PreparedFactRemove::new(owner, request)?;
+    let logical_effect = remove.logical_effect()?;
+    let operation_context =
+        memory_operation_context(context, remove.owner(), "remove", &logical_effect)?;
     let operation_id = operation_context.operation_id().as_str().to_owned();
     let prepared = prepare_retained_effect(
         context,
@@ -467,9 +469,7 @@ async fn execute_remove_on_db(
         &logical_effect,
         &operation_id,
     )?;
-    let command = memory_mapping::remove_command(
-        owner,
-        request,
+    let command = remove.into_command(
         operation_context.operation_id().clone(),
         context.request_context.actor().clone(),
     )?;
@@ -503,7 +503,7 @@ async fn execute_remove_on_db(
         return prepared.complete_with_digest(
             context,
             commit.committed_state_digest(),
-            tracedecay_application::ReconciliationState::Reconciled,
+            tracedecay_contracts::ReconciliationState::Reconciled,
             result,
             partial,
         );
@@ -511,7 +511,7 @@ async fn execute_remove_on_db(
     prepared.complete(
         context,
         &public,
-        tracedecay_application::ReconciliationState::Reconciled,
+        tracedecay_contracts::ReconciliationState::Reconciled,
         result,
         partial,
     )
@@ -525,9 +525,10 @@ async fn execute_supersede_on_db(
     configuration_digest: &ManifestDigest,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
     let memory = memory_application(database, owner.clone())?;
-    let logical_effect = memory_mapping::supersede_logical_effect(&owner, request)?;
+    let supersede = memory_mapping::PreparedFactSupersede::new(owner, request)?;
+    let logical_effect = supersede.logical_effect()?;
     let operation_context =
-        memory_operation_context(context, &owner, "supersede", &logical_effect)?;
+        memory_operation_context(context, supersede.owner(), "supersede", &logical_effect)?;
     let operation_id = operation_context.operation_id().as_str().to_owned();
     let prepared = prepare_retained_effect(
         context,
@@ -536,9 +537,7 @@ async fn execute_supersede_on_db(
         &logical_effect,
         &operation_id,
     )?;
-    let command = memory_mapping::supersede_command(
-        owner,
-        request,
+    let command = supersede.into_command(
         operation_context.operation_id().clone(),
         context.request_context.actor().clone(),
     )?;
@@ -564,7 +563,7 @@ async fn execute_supersede_on_db(
         return prepared.complete_with_digest(
             context,
             commit.committed_state_digest(),
-            tracedecay_application::ReconciliationState::Reconciled,
+            tracedecay_contracts::ReconciliationState::Reconciled,
             result,
             partial,
         );
@@ -572,7 +571,7 @@ async fn execute_supersede_on_db(
     prepared.complete(
         context,
         &public,
-        tracedecay_application::ReconciliationState::Reconciled,
+        tracedecay_contracts::ReconciliationState::Reconciled,
         result,
         partial,
     )
@@ -586,8 +585,10 @@ async fn execute_feedback_on_db(
     configuration_digest: &ManifestDigest,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
     let memory = memory_application(database, owner.clone())?;
-    let logical_effect = memory_mapping::feedback_logical_effect(&owner, request)?;
-    let operation_context = memory_operation_context(context, &owner, "feedback", &logical_effect)?;
+    let feedback = memory_mapping::PreparedFactFeedback::new(owner, request)?;
+    let logical_effect = feedback.logical_effect()?;
+    let operation_context =
+        memory_operation_context(context, feedback.owner(), "feedback", &logical_effect)?;
     let operation_id = operation_context.operation_id().as_str().to_owned();
     let prepared = prepare_retained_effect(
         context,
@@ -596,9 +597,7 @@ async fn execute_feedback_on_db(
         &logical_effect,
         &operation_id,
     )?;
-    let command = memory_mapping::feedback_command(
-        owner,
-        request,
+    let command = feedback.into_command(
         operation_context.operation_id().clone(),
         context.request_context.actor().clone(),
     )?;
@@ -624,7 +623,7 @@ async fn execute_feedback_on_db(
     prepared.complete_with_digest(
         context,
         commit.committed_state_digest(),
-        tracedecay_application::ReconciliationState::Reconciled,
+        tracedecay_contracts::ReconciliationState::Reconciled,
         result,
         memory_expiry_partial(settled_after_expiry),
     )
@@ -664,14 +663,9 @@ async fn search_on_db(
     configuration_digest: &ManifestDigest,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
     let memory = memory_application(database, owner.clone())?;
-    let query = memory_mapping::search_query(
-        owner.clone(),
-        ProjectMemoryFactSearchKindV1::Search,
-        Some(request.query.clone()),
-        &request.options,
-        request.after.as_ref(),
-    )?;
-    let logical_effect = memory_mapping::search_logical_effect(&owner, request)?;
+    let search = memory_mapping::PreparedFactSearch::new(owner.clone(), request)?;
+    let logical_effect = search.logical_effect()?;
+    let query = search.into_query();
     let request_id = context.request_context.request_id().as_str();
     let actor = Some(context.request_context.actor().clone());
     let operation_context =
@@ -792,7 +786,7 @@ async fn search_on_db(
     if tracked.settled_after_expiry {
         let Some(committed_state) = tracked.committed_state() else {
             return Err(RetainedSurfaceExecutionErrorV1::TimedOut(
-                tracedecay_application::CancellationStage::DuringRead,
+                tracedecay_contracts::CancellationStage::DuringRead,
             ));
         };
         let prepared = prepared.as_ref().ok_or_else(|| {
@@ -810,11 +804,11 @@ async fn search_on_db(
     match evidence_outcome(context, RetainedSurfaceOperation::FactStoreSearch, result) {
         Ok(outcome) => Ok(outcome),
         Err(RetainedSurfaceExecutionErrorV1::TimedOut(
-            tracedecay_application::CancellationStage::DuringRead,
+            tracedecay_contracts::CancellationStage::DuringRead,
         )) => {
             let Some(committed_state) = tracked.committed_state() else {
                 return Err(RetainedSurfaceExecutionErrorV1::TimedOut(
-                    tracedecay_application::CancellationStage::DuringRead,
+                    tracedecay_contracts::CancellationStage::DuringRead,
                 ));
             };
             let prepared = prepared.as_ref().ok_or_else(|| {

@@ -129,7 +129,7 @@ pub(super) async fn serve_projectless_client(
         let Some(_activity) = lifecycle.try_enter() else {
             break;
         };
-        let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
+        let response = match JsonRpcRequest::decode(&line) {
             Ok(request) => {
                 boxed_projectless_phase(projectless_response(
                     &request,
@@ -138,11 +138,7 @@ pub(super) async fn serve_projectless_client(
                 ))
                 .await
             }
-            Err(e) => Some(JsonRpcResponse::error(
-                json!(null),
-                ErrorCode::ParseError,
-                format!("Parse error: {e}"),
-            )),
+            Err(error) => Some(error.into_response()),
         };
         if let Some(response) = response {
             write_json_rpc_response(transport, &response).await?;
@@ -233,7 +229,7 @@ async fn projectless_tools_call_response_with_connection(
             tool_name,
             "tracedecay_admin_project" | "tracedecay_hook_runtime" | "tracedecay_admin_cli"
         )
-            || tracedecay_application::RetainedSurfaceOperation::from_tool_name(tool_name).is_some()
+            || tracedecay_contracts::RetainedSurfaceOperation::from_tool_name(tool_name).is_some()
         {
             tool_name
         } else {
@@ -407,7 +403,12 @@ async fn projectless_hook_runtime_response(
         session_runtime_registry,
         global_db.as_ref(),
         crate::mcp::tools::SessionAuthorities::new(None, Some(&user_session_db))
-            .with_profile_identity(Some(std::sync::Arc::new(profile_identity.clone()))),
+            .with_profile_identity(Some(std::sync::Arc::new(profile_identity.clone())))
+            .with_background_cpu(
+                store_administration
+                    .session_temporal_refresh_schedulers()
+                    .background_cpu(),
+            ),
         host_admission_broker,
     ))
     .await
@@ -476,7 +477,7 @@ async fn projectless_admin_cli_response(
 async fn projectless_profile_retained_response(
     id: serde_json::Value,
     tool_name: &str,
-    operation: tracedecay_application::RetainedSurfaceOperation,
+    operation: tracedecay_contracts::RetainedSurfaceOperation,
     arguments: serde_json::Value,
     connection: &ProjectlessConnectionStateV1,
     store_administration: &StoreAdministration,

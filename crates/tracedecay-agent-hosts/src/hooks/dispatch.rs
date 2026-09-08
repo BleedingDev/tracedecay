@@ -3,10 +3,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracedecay_application::ResolvedScope;
+use tracedecay_contracts::ResolvedScope;
 #[cfg(test)]
-use tracedecay_application::context_scout::ContextScoutFeedbackV1;
-use tracedecay_application::context_scout::{
+use tracedecay_contracts::context_scout::ContextScoutFeedbackV1;
+use tracedecay_contracts::context_scout::{
     ContextScoutDeliveryOutcomeV1, ContextScoutDeliveryReceiptV1,
 };
 use tracedecay_domain::{ObservationId, ProjectId, SessionId, UtcMicros};
@@ -86,7 +86,9 @@ pub const NATIVE_HOOK_HOSTS: &[HookHostV1] = &[
     HookHostV1::OpenCode,
 ];
 
-pub fn project_id_for_layout(layout: &crate::storage::StoreLayout) -> Option<[u8; 16]> {
+pub fn project_id_for_layout(
+    layout: &tracedecay_runtime_core::storage::StoreLayout,
+) -> Option<[u8; 16]> {
     layout
         .identity
         .project_id
@@ -96,21 +98,21 @@ pub fn project_id_for_layout(layout: &crate::storage::StoreLayout) -> Option<[u8
 
 pub fn publish_daemon_bindings(
     runtime: &HookRuntimeV1,
-    layout: &crate::storage::StoreLayout,
-) -> crate::errors::Result<()> {
+    layout: &tracedecay_runtime_core::storage::StoreLayout,
+) -> tracedecay_domain::errors::Result<()> {
     let project_key = layout.identity.project_id.as_deref().ok_or_else(|| {
-        crate::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: "cannot publish Hook binding without typed project identity".to_owned(),
         }
     })?;
     let typed_project_id = ProjectId::new(project_key.to_owned()).map_err(|error| {
-        crate::errors::TraceDecayError::Config {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: format!("cannot validate Hook project identity: {error}"),
         }
     })?;
     let scope = runtime
         .resolve_hook_scope(&layout.project_root, &typed_project_id)
-        .map_err(|error| crate::errors::TraceDecayError::Config {
+        .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
             message: format!("cannot resolve Hook repository/worktree scope: {error}"),
         })?;
     let now = now_utc();
@@ -151,7 +153,7 @@ pub fn publish_daemon_bindings(
         );
         tracedecay_hooks::HookConfigurationPublisherV1::new(writer)
             .publish(snapshot)
-            .map_err(|error| crate::errors::TraceDecayError::Config {
+            .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!(
                     "failed to publish {} Hook binding: {error}",
                     host.hook_key()
@@ -420,8 +422,8 @@ pub(crate) async fn dispatch(
     event_json: &str,
     project_root: &Path,
     telemetry: Option<&HookTimingSpan>,
+    started: Instant,
 ) -> HookDispatch {
-    let started = Instant::now();
     let decoded = match tracedecay_hooks::decode_native_hook_event(host, event_json.as_bytes()) {
         Ok(decoded) => decoded,
         Err(
@@ -432,7 +434,8 @@ pub(crate) async fn dispatch(
         }
         Err(_) => return unavailable(),
     };
-    let Some(prepared) = prepare_bound_hook(host, event_json, project_root, decoded) else {
+    let Some(prepared) = prepare_bound_hook(host, event_json, project_root, decoded, started)
+    else {
         return unavailable();
     };
     let native_session_id = prepared.native_session_id.clone();
@@ -465,10 +468,13 @@ pub(crate) async fn dispatch_for_scope(
     event_json: &str,
     project_root: Option<&Path>,
     telemetry: Option<&HookTimingSpan>,
+    started: Instant,
 ) -> HookDispatch {
     match project_root {
-        Some(project_root) => dispatch(runtime, host, event_json, project_root, telemetry).await,
-        None => dispatch_profile_scoped(runtime, host, event_json, telemetry).await,
+        Some(project_root) => {
+            dispatch(runtime, host, event_json, project_root, telemetry, started).await
+        }
+        None => dispatch_profile_scoped(runtime, host, event_json, telemetry, started).await,
     }
 }
 
@@ -477,8 +483,8 @@ async fn dispatch_profile_scoped(
     host: HookHostV1,
     event_json: &str,
     telemetry: Option<&HookTimingSpan>,
+    started: Instant,
 ) -> HookDispatch {
-    let started = Instant::now();
     let decoded = match tracedecay_hooks::decode_native_hook_event(host, event_json.as_bytes()) {
         Ok(decoded) => decoded,
         Err(
@@ -543,8 +549,8 @@ pub(crate) async fn dispatch_opencode_tool_after(
     event_json: &str,
     project_root: &Path,
     telemetry: Option<&HookTimingSpan>,
+    started: Instant,
 ) -> HookDispatch {
-    let started = Instant::now();
     let decoded = match tracedecay_hooks::decode_opencode_plugin_event(
         tracedecay_hooks::OpenCodePluginSurfaceV1::ToolExecuteAfter,
         event_json.as_bytes(),
@@ -558,9 +564,13 @@ pub(crate) async fn dispatch_opencode_tool_after(
         }
         Err(_) => return unavailable(),
     };
-    let Some(prepared) =
-        prepare_bound_hook(HookHostV1::OpenCode, event_json, project_root, decoded)
-    else {
+    let Some(prepared) = prepare_bound_hook(
+        HookHostV1::OpenCode,
+        event_json,
+        project_root,
+        decoded,
+        started,
+    ) else {
         return unavailable();
     };
     let native_session_id = prepared.native_session_id.clone();
@@ -610,7 +620,7 @@ pub(crate) async fn dispatch_opencode_lsp_updated(
 
 struct PreparedBoundHook {
     host: HookHostV1,
-    layout: crate::storage::StoreLayout,
+    layout: tracedecay_runtime_core::storage::StoreLayout,
     snapshot: HookConfigurationSnapshotV1,
     envelope: HookEventEnvelopeV2,
     native_session_id: Option<String>,
@@ -623,6 +633,7 @@ fn prepare_bound_hook(
     event_json: &str,
     project_root: &Path,
     decoded: tracedecay_hooks::DecodedNativeHookEventV1,
+    started: Instant,
 ) -> Option<PreparedBoundHook> {
     let layout = super::store_layout::layout(project_root)?;
     let config_path = tracedecay_hooks::hook_configuration_path(&layout.data_root, host);
@@ -639,7 +650,8 @@ fn prepare_bound_hook(
     let native_lifecycle = native_context_scout_lifecycle(host, &native_fields, material.event_id);
     let envelope = decoded.into_envelope(binding, material).ok()?;
     let envelope =
-        match replay_envelope_if_pending(&layout.data_root, host, binding, &envelope, now) {
+        match replay_envelope_if_pending(&layout.data_root, host, binding, &envelope, now, started)
+        {
             PendingEnvelopeV1::Missing => envelope,
             PendingEnvelopeV1::Exact(queued) => queued,
             PendingEnvelopeV1::Unavailable => return None,
@@ -663,7 +675,7 @@ async fn dispatch_decoded(
     started: Instant,
     admission: &DaemonAdmissionPort<'_>,
     delivery: &impl AsyncHookFeedbackDeliveryPortV1<
-        tracedecay_usecases::advisory::AdvisoryHookLookupNoticeV1,
+        tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
     >,
 ) -> HookDispatch {
     let PreparedBoundHook {
@@ -700,6 +712,7 @@ async fn dispatch_decoded(
             &envelope,
             binding,
             prepared_at,
+            started,
         )),
     };
     let guidance_envelope_id = match &immediate {
@@ -824,7 +837,7 @@ pub(crate) async fn commit_context_scout_feedback(
 
 fn render_host_delivery(
     guidance: Option<String>,
-    feedback_notice: Option<&tracedecay_usecases::advisory::AdvisoryHookLookupNoticeV1>,
+    feedback_notice: Option<&tracedecay_application::advisory::AdvisoryHookLookupNoticeV1>,
     github_stack_signal_available: bool,
 ) -> Option<String> {
     let notice = feedback_notice
@@ -848,9 +861,17 @@ fn append_for_replay(
     envelope: &HookEventEnvelopeV2,
     binding: &HookScopeBindingV1,
     now: UtcMicros,
+    started: Instant,
 ) -> SpoolAppendOutcomeV1 {
     let root = data_root.join("hook-v2-spool").join(host.hook_key());
-    let Ok((mut spool, _)) = HookSpoolV1::open(root, HookSpoolConfigV1::stock(host), now) else {
+    let Some(deadline) = started.checked_add(Duration::from_micros(
+        HookSynchronousDeadlineV1::start().remaining_micros(),
+    )) else {
+        return SpoolAppendOutcomeV1::Unavailable;
+    };
+    let Ok((mut spool, _)) =
+        HookSpoolV1::open_until(root, HookSpoolConfigV1::stock(host), now, deadline)
+    else {
         return SpoolAppendOutcomeV1::Unavailable;
     };
     match spool.append(envelope.clone(), binding, now) {
@@ -876,9 +897,17 @@ fn replay_envelope_if_pending(
     binding: &HookScopeBindingV1,
     retry: &HookEventEnvelopeV2,
     now: UtcMicros,
+    started: Instant,
 ) -> PendingEnvelopeV1 {
     let root = data_root.join("hook-v2-spool").join(host.hook_key());
-    let Ok((mut spool, _)) = HookSpoolV1::open(root, HookSpoolConfigV1::stock(host), now) else {
+    let Some(deadline) = started.checked_add(Duration::from_micros(
+        HookSynchronousDeadlineV1::start().remaining_micros(),
+    )) else {
+        return PendingEnvelopeV1::Unavailable;
+    };
+    let Ok((mut spool, _)) =
+        HookSpoolV1::open_until(root, HookSpoolConfigV1::stock(host), now, deadline)
+    else {
         return PendingEnvelopeV1::Unavailable;
     };
     let queued = match spool.pending_envelope(retry.event_id) {

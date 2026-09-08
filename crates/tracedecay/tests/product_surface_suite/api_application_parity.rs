@@ -5,9 +5,8 @@ use axum::extract::Extension;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 use tracedecay::application_surface::{
-    AffectedTestsSurfaceRequest, ApplicationSurfaceRequest, FeedbackImpactSurfaceRequest,
-    FeedbackSurfaceRequest, GitApplySurfaceRequest, GitPreviewSurfaceRequest,
-    GitReadSurfaceRequest, TestResultsSurfaceRequest, parse_application_surface_request,
+    ApplicationSurfaceRequest, FeedbackSurfaceRequest, GitApplySurfaceRequest,
+    GitPreviewSurfaceRequest, GitReadSurfaceRequest, parse_application_surface_request,
     resolve_application_surface_dispatch, resolve_http_application_surface_dispatch,
 };
 use tracedecay::mcp::tools::dispatch::resolve_mcp_application_surface_dispatch;
@@ -15,7 +14,8 @@ use tracedecay_api::{
     CanonicalInvocationResult, HttpApplicationControls, HttpApplicationRequest, HttpSseEvent,
     application_router,
 };
-use tracedecay_application::{
+use tracedecay_contracts::feedback::TestResultsSurfaceRequestV1;
+use tracedecay_contracts::{
     APPLICATION_DEFAULT_PROFILE_ID, ApplicationContractError, CancellationSignal, Deadline,
     IdempotencyKey, RequestId, ResultContractRef, RetryDirective, SafeDiagnostic, StreamEvent,
 };
@@ -87,14 +87,14 @@ async fn catalog_advertised_specialized_http_routes_invoke_the_application_owner
                 request.operation.as_str()
             ))
             .expect("binding id"),
-            Err(tracedecay_application::ApplicationProblemEnvelope::new(
+            Err(tracedecay_contracts::ApplicationProblemEnvelope::new(
                 ResultContractRef::new(
                     SchemaId::new("schema.test.feedback.result").expect("schema id"),
                     1,
                 )
                 .expect("result contract"),
                 request.request_id,
-                tracedecay_application::ApplicationProblem::unavailable(
+                tracedecay_contracts::ApplicationProblem::unavailable(
                     SafeDiagnostic::new("feedback.test_unavailable", "Feedback is unavailable")
                         .expect("diagnostic"),
                 ),
@@ -602,7 +602,7 @@ fn sse_projects_the_same_canonical_feedback_payload() {
 fn http_concealment_omits_binding_identity() {
     let fixture = parity_fixture();
     let concealed = &fixture["authorization_concealment"];
-    let result = Err(tracedecay_application::ApplicationProblemEnvelope::new(
+    let result = Err(tracedecay_contracts::ApplicationProblemEnvelope::new(
         ResultContractRef::new(
             SchemaId::new(
                 fixture["operations"]["feedback_get"]["result_schema"]
@@ -614,7 +614,7 @@ fn http_concealment_omits_binding_identity() {
         )
         .expect("result contract"),
         RequestId::new("request.feedback-concealment").expect("request id"),
-        tracedecay_application::ApplicationProblem::not_found_or_not_authorized(
+        tracedecay_contracts::ApplicationProblem::not_found_or_not_authorized(
             RetryDirective::Never,
         ),
     )
@@ -643,15 +643,15 @@ fn application_request(
 ) -> ApplicationSurfaceRequest {
     match operation {
         ApplicationSurfaceOperation::GitStatus => {
-            git_read_request(tracedecay_application::git::GitReadRequestV1::Status)
+            git_read_request(tracedecay_contracts::git::GitReadRequestV1::Status)
         }
         ApplicationSurfaceOperation::GitDiff => {
-            git_read_request(tracedecay_application::git::GitReadRequestV1::Diff {
+            git_read_request(tracedecay_contracts::git::GitReadRequestV1::Diff {
                 scope: GitDiffScopeV1::WorkingTree,
             })
         }
         ApplicationSurfaceOperation::GitHistory => {
-            git_read_request(tracedecay_application::git::GitReadRequestV1::History {
+            git_read_request(tracedecay_contracts::git::GitReadRequestV1::History {
                 max_count: 10,
                 path: None,
                 follow: false,
@@ -659,31 +659,25 @@ fn application_request(
             })
         }
         ApplicationSurfaceOperation::GitBlame => {
-            git_read_request(tracedecay_application::git::GitReadRequestV1::Blame {
+            git_read_request(tracedecay_contracts::git::GitReadRequestV1::Blame {
                 path: "src/lib.rs".to_owned(),
                 follow_renames: false,
             })
         }
         ApplicationSurfaceOperation::GitHunks => {
-            git_read_request(tracedecay_application::git::GitReadRequestV1::Hunks {
+            git_read_request(tracedecay_contracts::git::GitReadRequestV1::Hunks {
                 scope: GitDiffScopeV1::WorkingTree,
                 daemon_binding: None,
             })
         }
         ApplicationSurfaceOperation::GitPreview => git_requests().0,
         ApplicationSurfaceOperation::GitApply => git_requests().1,
-        ApplicationSurfaceOperation::FeedbackImpact => {
-            ApplicationSurfaceRequest::FeedbackImpact(FeedbackImpactSurfaceRequest {
-                request_handle: "rh_missing-application-parity".to_owned(),
-            })
-        }
-        ApplicationSurfaceOperation::AffectedTests => {
-            ApplicationSurfaceRequest::AffectedTests(AffectedTestsSurfaceRequest {
-                request_handle: "rh_missing-application-parity".to_owned(),
-            })
+        ApplicationSurfaceOperation::FeedbackImpact
+        | ApplicationSurfaceOperation::AffectedTests => {
+            feedback_request("rh_missing-application-parity")
         }
         ApplicationSurfaceOperation::TestResults => {
-            ApplicationSurfaceRequest::TestResults(TestResultsSurfaceRequest::default())
+            ApplicationSurfaceRequest::TestResults(TestResultsSurfaceRequestV1::default())
         }
         // Cursor-carrying code operations decode straight from the golden's
         // pinned request body, so the fixture proves the reviewed request
@@ -702,7 +696,7 @@ fn application_request(
 }
 
 fn git_read_request(
-    request: tracedecay_application::git::GitReadRequestV1,
+    request: tracedecay_contracts::git::GitReadRequestV1,
 ) -> ApplicationSurfaceRequest {
     ApplicationSurfaceRequest::GitRead(GitReadSurfaceRequest {
         request,

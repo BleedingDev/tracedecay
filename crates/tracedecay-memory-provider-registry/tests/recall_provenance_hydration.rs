@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tracedecay_application::{CancellationSignal, ResolvedScope};
+use tracedecay_contracts::{CancellationSignal, ResolvedScope};
 use tracedecay_domain::{ProjectId, RefId, RepositoryId, WorktreeId};
 use tracedecay_memory_provider_registry::{
     HostCanonicalRecordStore, HostEvidenceControlV1, HostEvidenceLookupErrorV1, HostEvidenceRefV1,

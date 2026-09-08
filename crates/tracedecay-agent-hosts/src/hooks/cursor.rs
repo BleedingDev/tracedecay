@@ -5,6 +5,7 @@
 //! Cursor expects Cursor-shaped stdout, separate from Claude, Codex, and Kiro.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde_json::Value;
 
@@ -65,12 +66,10 @@ pub async fn hook_cursor_post_tool_use(runtime: &HookRuntimeV1) -> i32 {
     );
     if let Some(decision) = cursor_post_tool_use_decision(runtime, &event)
         && !super::write_hook_output(
-            runtime,
             root.as_deref(),
             tracedecay_hooks::HookHostV1::CursorDesktop,
             &event,
             &decision,
-            Some(&_hook_telemetry),
         )
         .await
     {
@@ -81,15 +80,14 @@ pub async fn hook_cursor_post_tool_use(runtime: &HookRuntimeV1) -> i32 {
 
 #[hotpath::measure(future = true, label = "hosts.hooks.cursor.session_start")]
 pub async fn hook_cursor_session_start(runtime: &HookRuntimeV1) -> i32 {
+    let started = Instant::now();
     let event = read_hook_event!();
-    let (root, output) = cursor_session_start_response(runtime, &event).await;
+    let (root, output) = cursor_session_start_response(runtime, &event, started).await;
     if !super::write_hook_output(
-        runtime,
         root.as_deref(),
         tracedecay_hooks::HookHostV1::CursorDesktop,
         &event,
         &output,
-        None,
     )
     .await
     {
@@ -103,6 +101,7 @@ pub async fn hook_cursor_session_start(runtime: &HookRuntimeV1) -> i32 {
 async fn cursor_session_start_response(
     runtime: &HookRuntimeV1,
     event: &str,
+    started: Instant,
 ) -> (Option<PathBuf>, String) {
     let parsed = serde_json::from_str::<Value>(event).unwrap_or(Value::Null);
     let root = cursor_project_root_from_parsed_event_with_identity(runtime, &parsed).await;
@@ -120,6 +119,7 @@ async fn cursor_session_start_response(
         event,
         root.as_deref(),
         Some(&hook_telemetry),
+        started,
     )
     .await
     .into_recorded_guidance(&hook_telemetry)
@@ -250,10 +250,10 @@ fn cursor_project_root_candidate_from_parsed_event(parsed: &Value) -> Option<Pat
 pub(super) fn cursor_project_root_from_parsed_event(parsed: &Value) -> Option<PathBuf> {
     let resolved = cursor_hook_root_candidates(parsed)
         .into_iter()
-        .find_map(|candidate| crate::config::discover_project_root(&candidate));
+        .find_map(|candidate| tracedecay_runtime_core::config::discover_project_root(&candidate));
     let cwd_root = cursor_hook_cwd(parsed)
         .as_deref()
-        .and_then(crate::config::discover_project_root);
+        .and_then(tracedecay_runtime_core::config::discover_project_root);
     match (cwd_root, resolved) {
         // Prefer the root derived from cwd when available; this avoids routing
         // a root-B event into root A just because workspace_roots listed A first.

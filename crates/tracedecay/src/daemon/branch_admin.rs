@@ -565,9 +565,10 @@ impl StoreAdministration {
     pub(super) fn configure_codex_preparation_resources(
         &self,
         memory: Arc<tracedecay_runtime_core::resident_memory::ProcessResidentMemoryV1>,
+        background_cpu: Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>,
     ) -> tracedecay_sessions::runtime::source::TranscriptIngestResult<()> {
         self.session_temporal_refresh_schedulers
-            .configure_codex_preparation_resources(memory)
+            .configure_codex_preparation_resources(memory, background_cpu)
     }
 
     pub(super) fn store_telemetry_sampling(
@@ -1065,7 +1066,7 @@ impl StoreAdministration {
 
     #[hotpath::measure(label = "daemon.branch_admin.session_sync.shutdown", future = true)]
     pub(super) async fn shutdown_session_sync(&self) {
-        tracedecay_application::session_sync::SessionSyncServicePort::shutdown(
+        tracedecay_contracts::session_sync::SessionSyncServicePort::shutdown(
             self.session_sync_service.as_ref(),
         )
         .await;
@@ -1751,7 +1752,7 @@ fn ensure_no_cached_store_owners<Server>(
 }
 
 fn destructive_reservation_error(
-    error: crate::daemon::store_runtime::registry::StoreRuntimeRegistryFailure,
+    error: tracedecay_runtime_core::shard_runtime::registry::StoreRuntimeRegistryFailure,
 ) -> TraceDecayError {
     TraceDecayError::Config {
         message: format!("destructive store runtime reservation failed: {error:?}"),

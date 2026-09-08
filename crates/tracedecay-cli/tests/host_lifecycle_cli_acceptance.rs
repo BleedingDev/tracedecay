@@ -6,8 +6,8 @@ use std::process::{Command, Output, Stdio};
 
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tracedecay::agents::host_bundle_registry::unsupported_host_component_set_reason;
-use tracedecay::agents::host_bundle_v2::{
+use tracedecay_agent_hosts::agents::host_bundle_registry::unsupported_host_component_set_reason;
+use tracedecay_agent_hosts::agents::host_bundle_v2::{
     HostBundleComponentV1, HostComponentSetReceiptV1, HostKindV1, latest_host_component_receipt_at,
     latest_host_component_set_receipt_at,
 };
@@ -207,7 +207,7 @@ fn host_case(host: HostKindV1) -> HostCase {
         unsupported => panic!("no production lifecycle case for unsupported host {unsupported:?}"),
     };
     HostCase {
-        id: tracedecay::agents::integration_id_for_host(host),
+        id: tracedecay_agent_hosts::agents::integration_id_for_host(host),
         host,
         configs,
     }
@@ -357,7 +357,7 @@ fn assert_documented_mcp_registration(case: HostCase, cli: &IsolatedCli) {
     };
     let path = cli.home.path().join(relative);
     let config: serde_json::Value = if matches!(case.host, HostKindV1::Zed | HostKindV1::Kilo) {
-        tracedecay::agents::load_jsonc_file_strict(&path).unwrap()
+        tracedecay_agent_hosts::agents::load_jsonc_file_strict(&path).unwrap()
     } else {
         serde_json::from_slice(&fs::read(&path).unwrap()).unwrap()
     };
@@ -1535,7 +1535,7 @@ fn unadmitted_catalog_hosts_never_fall_back_to_direct_installers() {
             continue;
         }
         let cli = IsolatedCli::new();
-        let agent = tracedecay::agents::integration_id_for_host(host);
+        let agent = tracedecay_agent_hosts::agents::integration_id_for_host(host);
 
         let output = cli.run(&["install", "--agent", agent]);
 

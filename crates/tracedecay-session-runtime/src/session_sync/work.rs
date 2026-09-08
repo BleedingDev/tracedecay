@@ -507,7 +507,7 @@ impl SessionSyncProjectContext {
     async fn ingest_project_transcripts(
         &self,
         authority: &GlobalDbSessionIngestAuthority<RegisteredGlobalDbLeaseV1>,
-        cancellation: &tracedecay_usecases::observation::ObservationCancellation,
+        cancellation: &tracedecay_application::observation::ObservationCancellation,
     ) -> tracedecay_sessions::runtime::TranscriptIngestOutcome {
         let pass =
             tracedecay_sessions::runtime::ingest_project_sources_for_provider_with_cancellation(
@@ -528,7 +528,7 @@ impl SessionSyncProjectContext {
         &self,
         user_authority: &GlobalDbSessionIngestAuthority<RegisteredGlobalDbLeaseV1>,
         registry_authority: &GlobalDbSessionIngestAuthority<RegisteredGlobalDbLeaseV1>,
-        cancellation: &tracedecay_usecases::observation::ObservationCancellation,
+        cancellation: &tracedecay_application::observation::ObservationCancellation,
     ) -> tracedecay_sessions::runtime::TranscriptIngestOutcome {
         let pass = tracedecay_sessions::runtime::ingest_user_global_sources_for_provider_with_authorities_and_cancellation(
             &self.brain_id,
@@ -551,10 +551,11 @@ impl SessionSyncProjectContext {
         request: &SessionSyncRequestV1,
         project_sessions: RegisteredGlobalDbLeaseV1,
     ) -> SessionSyncWorkResult {
-        let cancellation = tracedecay_usecases::observation::ObservationCancellation::default();
+        let cancellation = tracedecay_application::observation::ObservationCancellation::default();
         let pass_cancellation = cancellation.clone();
         let pass = async {
-            let project_authority = GlobalDbSessionIngestAuthority::new(project_sessions.clone());
+            let project_authority = GlobalDbSessionIngestAuthority::new(project_sessions.clone())
+                .with_background_cpu(Arc::clone(&self.background_cpu));
             let project = self
                 .ingest_project_transcripts(&project_authority, &pass_cancellation)
                 .await;
@@ -640,8 +641,10 @@ impl SessionSyncProjectContext {
             } else {
                 let profile_sweep_started_at = now_micros();
                 let user_authority =
-                    GlobalDbSessionIngestAuthority::new(self.user_sessions.clone());
-                let registry_authority = GlobalDbSessionIngestAuthority::new(self.registry.clone());
+                    GlobalDbSessionIngestAuthority::new(self.user_sessions.clone())
+                        .with_background_cpu(Arc::clone(&self.background_cpu));
+                let registry_authority = GlobalDbSessionIngestAuthority::new(self.registry.clone())
+                    .with_background_cpu(Arc::clone(&self.background_cpu));
                 let user = self
                     .ingest_profile_transcripts(
                         &user_authority,
@@ -802,7 +805,7 @@ impl SessionSyncProjectContext {
         {
             return SessionSyncWorkResult::Interrupted(interruption);
         }
-        let cancellation = tracedecay_usecases::observation::ObservationCancellation::default();
+        let cancellation = tracedecay_application::observation::ObservationCancellation::default();
         let control = tracedecay_sessions::runtime::git_correlation::BoundedGitControl::new(
             cancellation.clone(),
             GIT_SYNC_COMMAND_DEADLINE,

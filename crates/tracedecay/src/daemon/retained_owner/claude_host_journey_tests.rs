@@ -267,7 +267,7 @@ async fn configuration_set(
     idempotency: &str,
 ) {
     let expected_revision = current_revision(harness, project).await;
-    let request = tracedecay_application::ConfigurationSetRequestV1 {
+    let request = tracedecay_contracts::ConfigurationSetRequestV1 {
         layer,
         key: SettingKey::new(key).expect("canonical setting key"),
         value,

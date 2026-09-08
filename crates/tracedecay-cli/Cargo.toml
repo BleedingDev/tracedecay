@@ -68,7 +68,7 @@ hotpath = [
     "tracedecay-agent-hosts/hotpath",
     "tracedecay-automation-runtime/hotpath",
     "tracedecay-api/hotpath",
-    "tracedecay-application/hotpath",
+    "tracedecay-contracts/hotpath",
     "tracedecay-daemon-control/hotpath",
     "tracedecay-daemon-identity/hotpath",
     "tracedecay-daemon-protocol/hotpath",
@@ -94,7 +94,7 @@ hotpath-alloc = [
     "tracedecay-agent-hosts/hotpath-alloc",
     "tracedecay-automation-runtime/hotpath-alloc",
     "tracedecay-api/hotpath-alloc",
-    "tracedecay-application/hotpath-alloc",
+    "tracedecay-contracts/hotpath-alloc",
     "tracedecay-daemon-control/hotpath-alloc",
     "tracedecay-daemon-identity/hotpath-alloc",
     "tracedecay-daemon-protocol/hotpath-alloc",
@@ -120,7 +120,7 @@ hotpath-cpu = [
     "tracedecay-agent-hosts/hotpath-cpu",
     "tracedecay-automation-runtime/hotpath-cpu",
     "tracedecay-api/hotpath-cpu",
-    "tracedecay-application/hotpath-cpu",
+    "tracedecay-contracts/hotpath-cpu",
     "tracedecay-daemon-control/hotpath-cpu",
     "tracedecay-daemon-identity/hotpath-cpu",
     "tracedecay-daemon-protocol/hotpath-cpu",
@@ -223,17 +223,19 @@ rayon = "1"
 regex = { version = "1.12.3", optional = true }
 rusqlite = { version = "0.40.1", default-features = false, features = ["backup"] }
 self-replace = "1"
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 tar = "0.4"
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7.19", features = ["codec"] }
 tracedecay = { path = "../tracedecay", version = "0.1.0-beta.37", default-features = false }
 tracedecay-agent-hosts = { path = "../tracedecay-agent-hosts", version = "0.1.0" }
 tracedecay-automation-runtime = { path = "../tracedecay-automation-runtime", version = "0.1.0" }
 tracedecay-api = { path = "../tracedecay-api", version = "0.1.0" }
-tracedecay-application = { path = "../tracedecay-application", version = "0.1.0" }
+tracedecay-contracts = { path = "../tracedecay-contracts", version = "0.1.0" }
 tracedecay-daemon-control = { path = "../tracedecay-daemon-control", version = "0.1.0" }
 tracedecay-daemon-identity = { path = "../tracedecay-daemon-identity", version = "0.1.0" }
 tracedecay-daemon-protocol = { path = "../tracedecay-daemon-protocol", version = "0.1.0" }
@@ -267,7 +269,6 @@ axum = "0.8"
 dirs = "6"
 fs2 = "0.4"
 regex = "1.12.3"
-tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 toml = "1"
 tower = "0.5"
@@ -284,10 +285,11 @@ tracedecay-memory-observation = { path = "../tracedecay-memory-observation", ver
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0", features = ["test-helpers"] }
 tracedecay-semantic = { path = "../tracedecay-semantic", version = "0.1.0", features = ["test-helpers"] }
 tracedecay-semantic-contracts.workspace = true
+tracedecay-store-runtime = { path = "../tracedecay-store-runtime", version = "0.1.0" }
 tracedecay-session-temporal-store = { path = "../tracedecay-session-temporal-store", version = "0.1.0" }
 # Dev-only: `tests/work_route_exposure_conformance.rs` still asserts against
 # the usecases `operation_stream` authority; production code is off usecases.
-tracedecay-usecases = { path = "../tracedecay-usecases", version = "0.1.0" }
+tracedecay-application = { path = "../tracedecay-application", version = "0.1.0" }
 ureq = { version = "3", features = ["json"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
@@ -304,6 +306,5 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tracedecay_observation_fau
 ignored = ["fs2"]
 
 [build-dependencies]
-logo-art = "0.2"
 serde_json = "1"
 sha2 = "0.11"

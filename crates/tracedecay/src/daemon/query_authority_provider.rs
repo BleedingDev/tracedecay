@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 
 use thiserror::Error;
 use tokio::task;
-use tracedecay_application::ResolvedScope;
+use tracedecay_contracts::ResolvedScope;
 use tracedecay_domain::{
     ComponentRevision, ManifestDigest, PrivacyDomainId, RetrievalAnchorId, RetrieverKind,
     configuration::UserProfileId,
@@ -19,17 +19,17 @@ use tracedecay_domain::{
 use crate::config::retrieval::{
     AcceptedRetrievalProfileV1, RetrievalProfileAuditOperationV1, RetrievalProfileStateV1,
 };
-use tracedecay_code_index_runtime::code_index_scheduler::query_runtime::{
-    AcceptedQueryEvaluationV1, QueryAuthorityMaterialV1, QueryAuthorityProviderErrorV1,
-    QueryAuthorityProviderV1,
-};
-use tracedecay_query::retrieval::QueryAuthorityV1;
-use tracedecay_usecases::semantic_runtime::{
+use tracedecay_application::semantic_runtime::{
     CommittedRetrievalProfileStateV1, RetrievalProfileActivationObserverErrorV1,
     RetrievalProfileActivationObserverV1, SemanticRuntimeFuture, SemanticSourceCoherenceOutcomeV1,
     prepare_project_semantic_redundancy_authority, project_semantic_production_runtime,
     semantic_source_coherence,
 };
+use tracedecay_code_index_runtime::code_index_scheduler::query_runtime::{
+    AcceptedQueryEvaluationV1, QueryAuthorityMaterialV1, QueryAuthorityProviderErrorV1,
+    QueryAuthorityProviderV1,
+};
+use tracedecay_query::retrieval::QueryAuthorityV1;
 
 /// Observation step that refuses a committed activation the serving
 /// generation has moved past.
@@ -280,6 +280,7 @@ impl RetrievalProfileActivationObserverV1 for DaemonQueryActivationRegistrarV1 {
                         )
                     })?;
                 let semantic_authority = if semantic_enabled {
+                    let lifecycle_owner = registry.semantic_lifecycle_owner_for_scope(&scope).await;
                     let committed = committed.clone();
                     let query_profile_id =
                         prepared.query_authority().profile().profile_id.clone();
@@ -287,6 +288,7 @@ impl RetrievalProfileActivationObserverV1 for DaemonQueryActivationRegistrarV1 {
                         tracedecay_code_index_runtime::code_index_scheduler::semantic_query_runtime::SemanticQueryAuthorityV1::from_committed(
                             committed,
                             query_profile_id,
+                            lifecycle_owner,
                         )
                     })
                     .await

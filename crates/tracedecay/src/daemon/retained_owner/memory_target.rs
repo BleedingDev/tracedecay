@@ -4,13 +4,13 @@ use std::path::Path;
 #[cfg(feature = "hotpath")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tracedecay_application::retained_surfaces::{MemoryScopeV1, RetainedProjectSelectorV1};
+use tracedecay_contracts::retained_surfaces::{MemoryScopeV1, RetainedProjectSelectorV1};
 use tracedecay_domain::{FactOwnerV1, ProjectId};
 use tracedecay_store::StoreShardScopeV1;
 
 use super::map_execution_error;
 use crate::tracedecay::TraceDecay;
-use tracedecay_application::RetainedSurfaceExecutionErrorV1;
+use tracedecay_contracts::RetainedSurfaceExecutionErrorV1;
 use tracedecay_runtime_core::db::Database;
 use tracedecay_runtime_core::store::memory::ProjectMemoryDbHandle;
 use tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1;
@@ -227,19 +227,16 @@ mod tests {
         Arc<crate::host_admission::HostAdmissionTestRuntimeV1>,
     ) {
         let tmp = tempfile::tempdir().unwrap();
-        // `initialize_project_graph_for_test` canonicalizes the root it mounts,
-        // so a selected id derived from the symlinked spelling registers a
-        // second authority for the same typed project and the resolver refuses
-        // it as `DuplicateProjectAuthority` (macOS `/var` -> `/private/var`).
-        let base = tracedecay_runtime_core::lifecycle_lease::canonical_or_original(tmp.path());
-        let profile_root = base.join("profile");
-        let active_root = base.join("active");
+        // Register the same canonical paths that retained-target lookup uses.
+        let fixture_root = tmp.path().canonicalize().unwrap();
+        let profile_root = fixture_root.join("profile");
+        let active_root = fixture_root.join("active");
         std::fs::create_dir_all(&active_root).unwrap();
         let active = TraceDecay::init_with_options(&active_root, open_options(&profile_root))
             .await
             .unwrap();
         let runtime = active.test_runtime_for_test().unwrap();
-        let selected_root = base.join("selected");
+        let selected_root = fixture_root.join("selected");
         std::fs::create_dir_all(&selected_root).unwrap();
         let selected_id = ProjectId::new(
             tracedecay_runtime_core::storage::default_profile_project_id(&selected_root),

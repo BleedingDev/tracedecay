@@ -3,7 +3,7 @@ members = [
     "crates/tracedecay",
     "crates/tracedecay-agent-hosts",
     "crates/tracedecay-api",
-    "crates/tracedecay-application",
+    "crates/tracedecay-contracts",
     "crates/tracedecay-automation",
     "crates/tracedecay-automation-runtime",
     "crates/tracedecay-capture",
@@ -59,7 +59,7 @@ members = [
     "crates/tracedecay-store",
     "crates/tracedecay-store-runtime",
     "crates/tracedecay-tool-catalog",
-    "crates/tracedecay-usecases",
+    "crates/tracedecay-application",
 ]
 exclude = [
     ".worktrees",
@@ -209,6 +209,12 @@ opt-level = 3
 # pinned to the PR head commit, until the fix lands upstream.
 [patch.crates-io]
 tree-sitter-rust = { git = "https://github.com/vanessa-rodrigues/tree-sitter-rust", rev = "877df9f82f320243ab23929589a940208faa9d15" }
+# The vendored COBOL external scanner in 0.5.0 spins forever at end of input
+# whenever a token starts in the sequence-number area with no six-column line
+# before EOF, and no parse deadline can interrupt a scanner call. This fork is
+# v0.5.0 plus the upstream fix (yutaro-sakamoto/tree-sitter-cobol#42), which
+# is still unmerged upstream (#1104).
+tokensave-large-treesitters = { git = "https://github.com/ScriptedAlchemy/tokensave-large-treesitters", rev = "102d0103b6fd093c1e5989cceede1ed9f08fe6a9" }
 # FastEmbed's user-defined constructor owns the ORT SessionBuilder but did not
 # expose rc.12's load canceler. This reviewed fork publishes that existing
 # handle immediately before CreateSessionFromArray so TraceDecay can enforce
@@ -235,11 +241,16 @@ fastembed = { git = "https://github.com/ScriptedAlchemy/fastembed-rs.git", rev =
 # only address a single 1 MiB chunk, which caps an epoch near 32 Ki node
 # records and then panics; the fork spans epochs across chunks and types the
 # exhaustion errors. The fork also carries graph correctness and bounded WAL
-# group-write fixes. Its workspace resolves sibling crates by path, so every
+# group-write fixes, and (ScriptedAlchemy/grafeo#4) the direct compact build:
+# `IncrementalCompactStoreBuilder` + `GrafeoDB::write_compact_container`
+# turn a verified row stream into a compacted container with one columnar
+# copy in memory and one container write — no staging LPG, WAL, or
+# in-memory `compact()` copy — which is how sealed generation stores are
+# built. Its workspace resolves sibling crates by path, so every
 # grafeo crate must come from the same revision — a mixed registry/git graph
 # would build type-incompatible instances of the patched crates.
-grafeo-adapters = { git = "https://github.com/ScriptedAlchemy/grafeo.git", rev = "38654a67ec9e8c4fdab43c00b41f04aa696b52ed" }
-grafeo-common = { git = "https://github.com/ScriptedAlchemy/grafeo.git", rev = "38654a67ec9e8c4fdab43c00b41f04aa696b52ed" }
-grafeo-core = { git = "https://github.com/ScriptedAlchemy/grafeo.git", rev = "38654a67ec9e8c4fdab43c00b41f04aa696b52ed" }
-grafeo-engine = { git = "https://github.com/ScriptedAlchemy/grafeo.git", rev = "38654a67ec9e8c4fdab43c00b41f04aa696b52ed" }
-grafeo-storage = { git = "https://github.com/ScriptedAlchemy/grafeo.git", rev = "38654a67ec9e8c4fdab43c00b41f04aa696b52ed" }
+grafeo-adapters = { git = "https://github.com/ScriptedAlchemy/grafeo.git", rev = "4dc04db299bb63269a2c216c66aa94fab40d9819" }
+grafeo-common = { git = "https://github.com/ScriptedAlchemy/grafeo.git", rev = "4dc04db299bb63269a2c216c66aa94fab40d9819" }
+grafeo-core = { git = "https://github.com/ScriptedAlchemy/grafeo.git", rev = "4dc04db299bb63269a2c216c66aa94fab40d9819" }
+grafeo-engine = { git = "https://github.com/ScriptedAlchemy/grafeo.git", rev = "4dc04db299bb63269a2c216c66aa94fab40d9819" }
+grafeo-storage = { git = "https://github.com/ScriptedAlchemy/grafeo.git", rev = "4dc04db299bb63269a2c216c66aa94fab40d9819" }

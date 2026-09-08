@@ -14,6 +14,7 @@ use crate::config::{
 use crate::project_store_runtime::{ProjectStoreRuntimeHandle, join_standalone_session_registry};
 #[cfg(any(test, feature = "test-transport"))]
 use tokio::sync::Mutex as AsyncMutex;
+use tracedecay_application::tracedecay::ProjectStoreRuntimeV1;
 use tracedecay_configuration::ProjectConfigurationRuntime;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
@@ -24,7 +25,6 @@ use tracedecay_runtime_core::storage::{self, StoreLayout};
 use tracedecay_runtime_core::weak_registry::WeakRegistry;
 #[cfg(any(test, feature = "test-transport"))]
 use tracedecay_store::ProjectId;
-use tracedecay_usecases::tracedecay::ProjectStoreRuntimeV1;
 
 use super::{TraceDecay, TraceDecayOpenOptions};
 
@@ -378,7 +378,7 @@ impl TraceDecay {
             tracedecay_agent_hosts::hooks::hook_project_id_for_layout(&ts.store_layout)
         {
             ts.context_scout_owner =
-                crate::agents::context_scout_owner::ProjectContextScoutOwnerV1::startup(
+                tracedecay_agent_hosts::agents::context_scout_owner::ProjectContextScoutOwnerV1::startup(
                     ts.db.clone(),
                     project_id,
                     tracedecay_domain::UtcMicros(
@@ -616,7 +616,7 @@ impl TraceDecay {
             tracedecay_agent_hosts::hooks::hook_project_id_for_layout(&ts.store_layout)
         {
             ts.context_scout_owner =
-                crate::agents::context_scout_owner::ProjectContextScoutOwnerV1::startup(
+                tracedecay_agent_hosts::agents::context_scout_owner::ProjectContextScoutOwnerV1::startup(
                     ts.db.clone(),
                     project_id,
                     tracedecay_domain::UtcMicros(

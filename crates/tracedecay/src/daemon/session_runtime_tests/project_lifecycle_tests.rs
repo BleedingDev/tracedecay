@@ -2,13 +2,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
-use tracedecay_application::session_sync::{
+use tracedecay_contracts::session_sync::{
     SessionSyncCommandV1, SessionSyncCompletionReceiptV1, SessionSyncCoverageV1,
     SessionSyncJournalStatusV1, SessionSyncJournalV1, SessionSyncOutcomeV1, SessionSyncRequestV1,
     SessionSyncScopeV1, SessionSyncServicePort, SessionSyncSourceCoverageV1, SessionSyncStatsV1,
     SessionTranscriptImportV1,
 };
-use tracedecay_application::{
+use tracedecay_contracts::{
     CancellationSignal, Deadline, IdempotencyKey, OperationTermination, RequestId,
 };
 use tracedecay_domain::{ProjectId, UserProfileId, UtcMicros};
@@ -74,6 +74,8 @@ async fn register(
             project_sessions: project_sessions.clone(),
             user_sessions: profile_sessions.clone(),
             registry: profile_sessions,
+            background_cpu: crate::host_admission::ensure_process_background_cpu_authority()
+                .expect("install fixture worker plan authority"),
             startup_import: false,
             project_refresh: SessionTemporalRefreshWake::unavailable(),
             user_refresh: SessionTemporalRefreshWake::unavailable(),
@@ -388,7 +390,7 @@ async fn exact_project_retirement_drains_a_keeps_b_live_and_rebinds_a() {
     );
     let replay = SessionSyncServicePort::cancel(
         &service,
-        tracedecay_application::session_sync::SessionSyncControlV1::new(
+        tracedecay_contracts::session_sync::SessionSyncControlV1::new(
             scope_a.clone(),
             recovery_request.idempotency_key().clone(),
         ),
@@ -464,6 +466,8 @@ async fn registration_recovery_fences_concurrent_execute() {
                 project_sessions,
                 user_sessions: profile_sessions.clone(),
                 registry: profile_sessions,
+                background_cpu: crate::host_admission::ensure_process_background_cpu_authority()
+                    .expect("install fixture worker plan authority"),
                 startup_import: false,
                 project_refresh: SessionTemporalRefreshWake::unavailable(),
                 user_refresh: SessionTemporalRefreshWake::unavailable(),
@@ -575,6 +579,8 @@ async fn terminal_recovered_alias_does_not_suppress_startup_import() {
             project_sessions,
             user_sessions: profile_sessions.clone(),
             registry: profile_sessions.clone(),
+            background_cpu: crate::host_admission::ensure_process_background_cpu_authority()
+                .expect("install fixture worker plan authority"),
             startup_import: true,
             project_refresh: SessionTemporalRefreshWake::unavailable(),
             user_refresh: SessionTemporalRefreshWake::unavailable(),
@@ -672,6 +678,8 @@ async fn recovery_upgrades_a_journal_whose_frontiers_exceed_one_query() {
             project_sessions,
             user_sessions: profile_sessions.clone(),
             registry: profile_sessions.clone(),
+            background_cpu: crate::host_admission::ensure_process_background_cpu_authority()
+                .expect("install fixture worker plan authority"),
             startup_import: false,
             project_refresh: SessionTemporalRefreshWake::unavailable(),
             user_refresh: SessionTemporalRefreshWake::unavailable(),

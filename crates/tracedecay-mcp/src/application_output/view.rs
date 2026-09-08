@@ -1,6 +1,6 @@
 use serde::Serialize;
 use serde_json::Value;
-use tracedecay_application::{
+use tracedecay_contracts::{
     ApplicationOutcome, ApplicationProblemRecord, ApplicationResult, EvidenceCoverage, Omission,
     OperationReceipt, ResolvedScope,
 };
@@ -154,7 +154,7 @@ impl CanonicalHumanView {
                 ))
             })
             .collect::<serde_json::Result<Vec<_>>>()?;
-        self.code("Coverage domains", list_or_none(domains));
+        self.code("Coverage domains", list_or_none(&domains));
         Ok(())
     }
 
@@ -170,7 +170,7 @@ impl CanonicalHumanView {
                 ))
             })
             .collect::<serde_json::Result<Vec<_>>>()?;
-        self.code("Omissions", list_or_none(omissions));
+        self.code("Omissions", list_or_none(&omissions));
         Ok(())
     }
 
@@ -240,13 +240,13 @@ impl CanonicalHumanView {
             .iter()
             .map(|detail| format!("{}: {}", detail.code, detail.message))
             .collect::<Vec<_>>();
-        self.text("Details", list_or_none(details));
+        self.text("Details", list_or_none(&details));
         let legal_actions = problem
             .legal_actions
             .iter()
             .map(scalar)
             .collect::<serde_json::Result<Vec<_>>>()?;
-        self.code("Legal actions", list_or_none(legal_actions));
+        self.code("Legal actions", list_or_none(&legal_actions));
         if let Some(coverage) = &problem.coverage {
             self.push_coverage(coverage)?;
         } else {
@@ -281,7 +281,7 @@ fn optional_count(value: Option<u64>) -> String {
     value.map_or_else(|| "unknown".to_owned(), |count| count.to_string())
 }
 
-fn list_or_none(values: Vec<String>) -> String {
+fn list_or_none(values: &[String]) -> String {
     if values.is_empty() {
         "none".to_owned()
     } else {
@@ -330,7 +330,7 @@ fn payload_summary(payload: Option<&Value>) -> serde_json::Result<String> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use tracedecay_application::{
+    use tracedecay_contracts::{
         CancellationObservation, CancellationStage, CoverageCompleteness, CoverageDomainState,
         Deadline, EvidenceCoverage, EvidenceDomain, Omission, OmissionReason, OperationBudgetUsage,
         OperationReceipt, OperationTermination,
@@ -339,7 +339,7 @@ mod tests {
 
     use super::{CanonicalHumanView, HumanField, HumanFieldValue, payload_summary};
     use serde_json::Value;
-    use tracedecay_application::{
+    use tracedecay_contracts::{
         ApplicationProblem, ApplicationProblemEnvelope, ApplicationResult, RequestId,
         ResultContractRef, SafeDiagnostic,
     };

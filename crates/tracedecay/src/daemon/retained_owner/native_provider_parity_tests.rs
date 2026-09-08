@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use tracedecay_application::retained_surfaces::{
+use tracedecay_contracts::retained_surfaces::{
     FactIdentitySourceResultV1, FactRetrievalTelemetryV1, FactSearchHitV1, FactStoreSearchResultV1,
 };
 use tracedecay_domain::{Confidence, FactCategoryV1, FactOwnerV1, ProjectId};

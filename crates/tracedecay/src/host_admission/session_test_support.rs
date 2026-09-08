@@ -392,7 +392,8 @@ impl HostAdmissionTestRuntimeV1 {
             }
         })?;
         let database = self.project_database_for_test()?;
-        let authority = tracedecay_host_admission::session_ingest_authority::GlobalDbSessionIngestAuthority::new(database);
+        let authority = tracedecay_host_admission::session_ingest_authority::GlobalDbSessionIngestAuthority::new(database)
+            .with_background_cpu(self.background_cpu());
         // Bound the instrumented pipeline's layout without requiring Send: the
         // borrowed authority's GATs cannot satisfy that higher-ranked obligation.
         // Keep polling here so the future remains within the fixture's lifetime.

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracedecay_application::{
+use tracedecay_contracts::{
     RequestAdmission, RetainedSurfaceExecutionContextV1, RetainedSurfaceExecutionErrorV1,
     RetainedSurfacePortsV1, now_micros,
 };
@@ -35,7 +35,7 @@ mod session;
 pub(crate) mod session_refresh;
 
 pub(crate) use memory_target::{MemoryTargetAccessV1, open_project_retained_memory_target};
-pub(crate) use tracedecay_application::retained_receipts as receipts;
+pub(crate) use tracedecay_contracts::retained_receipts as receipts;
 pub(crate) use tracedecay_session_memory::memory_mapping;
 pub(crate) use tracedecay_session_memory::memory_mapping::search_page;
 pub(crate) use tracedecay_session_memory::memory_mutation;
@@ -140,12 +140,12 @@ where
         RequestAdmission::Admitted => {}
         RequestAdmission::Cancelled => {
             return Err(RetainedSurfaceExecutionErrorV1::Cancelled(
-                tracedecay_application::CancellationStage::BeforeRead,
+                tracedecay_contracts::CancellationStage::BeforeRead,
             ));
         }
         RequestAdmission::TimedOut => {
             return Err(RetainedSurfaceExecutionErrorV1::TimedOut(
-                tracedecay_application::CancellationStage::BeforeRead,
+                tracedecay_contracts::CancellationStage::BeforeRead,
             ));
         }
     }
@@ -159,13 +159,13 @@ where
         .ok()
         .map(Duration::from_micros)
         .ok_or(RetainedSurfaceExecutionErrorV1::TimedOut(
-            tracedecay_application::CancellationStage::BeforeRead,
+            tracedecay_contracts::CancellationStage::BeforeRead,
         ))?;
     match tokio::time::timeout(remaining, future).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(map_execution_error(error)),
         Err(_) => Err(RetainedSurfaceExecutionErrorV1::TimedOut(
-            tracedecay_application::CancellationStage::DuringRead,
+            tracedecay_contracts::CancellationStage::DuringRead,
         )),
     }
 }
@@ -175,10 +175,23 @@ where
 pub(in crate::daemon) fn session_retrieval_unavailable_detail(
     unavailable: &tracedecay_session_runtime::session_retrieval::SessionRetrievalUnavailable,
 ) -> String {
-    format!(
-        "the session retrieval service is unavailable: {:?}",
-        unavailable.reason
-    )
+    // A refusal that names the refresh worker also names where the worker
+    // stands, so a converging store reads as converging, not as missing data.
+    match &unavailable.worker {
+        Some(worker) => format!(
+            "the session retrieval service is unavailable: {:?} (refresh worker backlog={}, \
+             blocker={:?}, retry_class={:?}, last_progress_at_unix_micros={:?})",
+            unavailable.reason,
+            worker.backlog,
+            worker.blocker,
+            worker.retry_class,
+            worker.last_progress_at_unix_micros
+        ),
+        None => format!(
+            "the session retrieval service is unavailable: {:?}",
+            unavailable.reason
+        ),
+    }
 }
 
 pub(super) fn map_execution_error(error: TraceDecayError) -> RetainedSurfaceExecutionErrorV1 {
@@ -239,7 +252,7 @@ mod tests {
             operation: "lcm_store_open".to_owned(),
         });
 
-        let problem = tracedecay_application::retained_surface_execution_problem(error);
+        let problem = tracedecay_contracts::retained_surface_execution_problem(error);
         let diagnostic = problem
             .diagnostic()
             .expect("an unavailable problem carries a diagnostic")

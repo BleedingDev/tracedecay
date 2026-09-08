@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use tracedecay_application::{ResolvedScope, try_now_micros};
+use tracedecay_contracts::{ResolvedScope, try_now_micros};
 use tracedecay_domain::{ProjectId, UserProfileId};
 use tracedecay_mcp::tools::ToolResult;
 use tracedecay_memory_provider_registry::{
@@ -153,7 +153,7 @@ impl CognitiveRecallMountError {
 pub enum RecallAdmissionLedgerError {
     /// The host clock could not stamp the ledger row.
     #[error("host clock unavailable for the recall admission ledger: {0}")]
-    Clock(#[source] tracedecay_application::ClockError),
+    Clock(#[source] tracedecay_contracts::ClockError),
     /// The report could not be serialised for its content digest.
     #[error("recall admission report could not be encoded: {0}")]
     Encode(#[source] serde_json::Error),
@@ -1119,8 +1119,8 @@ impl ProjectCognitiveRecallMountV1 {
     async fn confirm_canonical_records(
         &self,
         claimed: &std::collections::BTreeSet<String>,
-        deadline: &tracedecay_application::Deadline,
-        cancellation: &tracedecay_application::CancellationSignal,
+        deadline: &tracedecay_contracts::Deadline,
+        cancellation: &tracedecay_contracts::CancellationSignal,
     ) -> MountedCanonicalRecordStoreV1 {
         use std::collections::BTreeMap;
 
@@ -1178,7 +1178,7 @@ impl ProjectCognitiveRecallMountV1 {
             let deadline = deadline.clone();
             tracedecay_store::FactReadControl::new(Arc::new(move || {
                 cancellation.is_cancelled()
-                    || deadline.is_elapsed_at(tracedecay_application::now_micros())
+                    || deadline.is_elapsed_at(tracedecay_contracts::now_micros())
             }))
         };
         for record_id in claimed {
@@ -1443,7 +1443,7 @@ const ADVISORY_RECALL_CONTEXT_TOOL: &str = "tracedecay_context";
 
 /// Prefix every host-minted MCP request identity carries, ahead of the
 /// connection scope. Mirrors
-/// [`tracedecay_application::request_identity::mcp_connection_request_id`],
+/// [`tracedecay_contracts::request_identity::mcp_connection_request_id`],
 /// which mints `request.mcp.{connection_scope}.{digest}`.
 const MCP_REQUEST_IDENTITY_PREFIX: &str = "request.mcp.";
 
@@ -1489,7 +1489,7 @@ impl AdvisorySessionBindingV1 {
 /// it is what a session-bound advisory recall can be pinned to. A static
 /// identity that carries no digest suffix (the in-process transport harness
 /// mints one) is its own scope.
-fn mcp_connection_scope(request_id: &tracedecay_application::RequestId) -> Option<&str> {
+fn mcp_connection_scope(request_id: &tracedecay_contracts::RequestId) -> Option<&str> {
     let scoped = request_id
         .as_str()
         .strip_prefix(MCP_REQUEST_IDENTITY_PREFIX)?;
@@ -1514,7 +1514,7 @@ fn mcp_connection_scope(request_id: &tracedecay_application::RequestId) -> Optio
 /// no agent passes its own session id in tool arguments.
 fn advisory_session_binding(
     arguments: &serde_json::Value,
-    request_id: Option<&tracedecay_application::RequestId>,
+    request_id: Option<&tracedecay_contracts::RequestId>,
 ) -> Option<AdvisorySessionBindingV1> {
     if let Some(session_id) = crate::mcp::project_route::mcp_analytics_session_id(arguments) {
         return Some(AdvisorySessionBindingV1::CallerSession(session_id));
@@ -1535,8 +1535,8 @@ fn advisory_session_binding(
 pub(crate) struct AdvisoryRecallCallV1 {
     session: Option<AdvisorySessionBindingV1>,
     query: String,
-    deadline: Option<tracedecay_application::Deadline>,
-    cancellation: Option<tracedecay_application::CancellationSignal>,
+    deadline: Option<tracedecay_contracts::Deadline>,
+    cancellation: Option<tracedecay_contracts::CancellationSignal>,
 }
 
 impl AdvisoryRecallCallV1 {
@@ -1556,9 +1556,9 @@ impl AdvisoryRecallCallV1 {
 pub(crate) fn advisory_context_call(
     tool_name: &str,
     arguments: &serde_json::Value,
-    request_id: Option<&tracedecay_application::RequestId>,
-    deadline: Option<&tracedecay_application::Deadline>,
-    cancellation: Option<&tracedecay_application::CancellationSignal>,
+    request_id: Option<&tracedecay_contracts::RequestId>,
+    deadline: Option<&tracedecay_contracts::Deadline>,
+    cancellation: Option<&tracedecay_contracts::CancellationSignal>,
 ) -> Option<AdvisoryRecallCallV1> {
     if tool_name != ADVISORY_RECALL_CONTEXT_TOOL {
         return None;
@@ -1717,15 +1717,15 @@ const ADVISORY_RECALL_DEADLINE_BUDGET_MICROS: i64 = 2_000_000;
 
 /// The caller's deadline, clamped to the advisory lane's own budget.
 fn advisory_sub_deadline(
-    deadline: &tracedecay_application::Deadline,
+    deadline: &tracedecay_contracts::Deadline,
     now: tracedecay_domain::UtcMicros,
-) -> tracedecay_application::Deadline {
+) -> tracedecay_contracts::Deadline {
     let capped =
         tracedecay_domain::UtcMicros(now.0.saturating_add(ADVISORY_RECALL_DEADLINE_BUDGET_MICROS));
     if capped >= deadline.expires_at {
         return deadline.clone();
     }
-    tracedecay_application::Deadline::new(capped).unwrap_or_else(|_| deadline.clone())
+    tracedecay_contracts::Deadline::new(capped).unwrap_or_else(|_| deadline.clone())
 }
 
 /// Everything one production advisory recall needs from its caller.
@@ -1744,10 +1744,10 @@ pub(crate) struct AdvisoryRecallInputsV1<'inputs> {
     /// Application candidate budget; the mount clamps it to its own budget.
     pub(crate) maximum_candidates: usize,
     /// The caller's deadline, carried unchanged.
-    pub(crate) deadline: tracedecay_application::Deadline,
+    pub(crate) deadline: tracedecay_contracts::Deadline,
     /// The caller's live cancellation identity, carried unchanged. Cancelling
     /// it while the recall is in flight cancels the provider call.
-    pub(crate) cancellation: tracedecay_application::CancellationSignal,
+    pub(crate) cancellation: tracedecay_contracts::CancellationSignal,
 }
 
 /// Runs one bounded advisory recall over a mounted route and projects the
@@ -1764,7 +1764,7 @@ pub(crate) async fn advisory_context_recall(
     mount: &ProjectCognitiveRecallMountV1,
     inputs: AdvisoryRecallInputsV1<'_>,
 ) -> AdvisoryMemoryContextV1 {
-    use tracedecay_application::memory::CognitiveRecallProvenance;
+    use tracedecay_contracts::memory::CognitiveRecallProvenance;
 
     let authoritative_scope = mount.authoritative_scope().clone();
     // Every terminal outcome of this recall -- answered or not -- names the
@@ -1787,7 +1787,7 @@ pub(crate) async fn advisory_context_recall(
     };
     // One request identity per recall, derived from the session and the host
     // clock so a retry is a new request rather than a replay of another.
-    let request_id = match tracedecay_application::RequestId::new(format!(
+    let request_id = match tracedecay_contracts::RequestId::new(format!(
         "recall.context.{}.{}",
         inputs.canonical_session_id, now.0
     )) {
@@ -1801,7 +1801,7 @@ pub(crate) async fn advisory_context_recall(
             );
         }
     };
-    let request = match tracedecay_application::memory::CognitiveRecallRequest::new(
+    let request = match tracedecay_contracts::memory::CognitiveRecallRequest::new(
         authoritative_scope,
         request_id,
         // Cloned, not moved: the same caller deadline also bounds the
@@ -2698,9 +2698,9 @@ impl AdvisoryRecallUnavailableV1 {
 
 /// The stable label of one lane degradation.
 const fn degradation_label(
-    degradation: tracedecay_application::memory::CognitiveRecallDegradation,
+    degradation: tracedecay_contracts::memory::CognitiveRecallDegradation,
 ) -> &'static str {
-    use tracedecay_application::memory::CognitiveRecallDegradation as Degradation;
+    use tracedecay_contracts::memory::CognitiveRecallDegradation as Degradation;
     match degradation {
         Degradation::Unsupported => "unsupported",
         Degradation::Unavailable => "unavailable",
@@ -2977,7 +2977,7 @@ pub enum AdvisoryMemoryContextV1 {
         registration_revision: u64,
         /// Lane degradation the provider terminal or host admission reported,
         /// kept as the typed application value.
-        degradation: Option<tracedecay_application::memory::CognitiveRecallDegradation>,
+        degradation: Option<tracedecay_contracts::memory::CognitiveRecallDegradation>,
         /// Admitted, provenance-labelled advisory candidates.
         candidates: Vec<AdvisoryMemoryCandidateV1>,
         /// The receipts this recall's explain trace is reconciled from, plus
@@ -3399,7 +3399,7 @@ mod advisory_rendering_tests {
         AdvisoryMemoryContextV1::Answered {
             provider_id: "provider.native".to_owned(),
             registration_revision: 4,
-            degradation: Some(tracedecay_application::memory::CognitiveRecallDegradation::Partial),
+            degradation: Some(tracedecay_contracts::memory::CognitiveRecallDegradation::Partial),
             explain: None,
             candidates: (0..count)
                 .map(|index| AdvisoryMemoryCandidateV1 {
@@ -4172,8 +4172,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use tracedecay_application::memory::CognitiveRecallRequest;
-    use tracedecay_application::{
+    use tracedecay_contracts::memory::CognitiveRecallRequest;
+    use tracedecay_contracts::{
         CancellationContext, Deadline, RequestId, ResolvedScope, now_micros,
     };
     use tracedecay_domain::{
@@ -4334,8 +4334,8 @@ mod tests {
 
     /// The caller's live cancellation identity, matching the token id every
     /// fixture request carries.
-    fn live_signal() -> tracedecay_application::CancellationSignal {
-        tracedecay_application::CancellationSignal::active("token.cognitive-recall")
+    fn live_signal() -> tracedecay_contracts::CancellationSignal {
+        tracedecay_contracts::CancellationSignal::active("token.cognitive-recall")
             .expect("live cancellation signal")
     }
 
@@ -5804,7 +5804,7 @@ mod tests {
         };
         assert_eq!(
             degradation,
-            Some(tracedecay_application::memory::CognitiveRecallDegradation::Cancelled)
+            Some(tracedecay_contracts::memory::CognitiveRecallDegradation::Cancelled)
         );
         assert!(candidates.is_empty());
         assert_eq!(mount.ledger.report_count(), 0);
@@ -6073,14 +6073,14 @@ mod tests {
     /// ordinary agent call from its session again.
     #[test]
     fn a_host_minted_request_identity_yields_the_connection_it_was_minted_on() {
-        let minted = tracedecay_application::request_identity::mcp_connection_request_id(
+        let minted = tracedecay_contracts::request_identity::mcp_connection_request_id(
             &serde_json::json!(7),
             "instance7f-c3",
         )
         .expect("the host mints a connection-scoped request identity");
         assert_eq!(mcp_connection_scope(&minted), Some("instance7f-c3"));
 
-        let other = tracedecay_application::request_identity::mcp_connection_request_id(
+        let other = tracedecay_contracts::request_identity::mcp_connection_request_id(
             &serde_json::json!(9),
             "instance7f-c3",
         )
@@ -6097,7 +6097,7 @@ mod tests {
         );
         assert_eq!(
             mcp_connection_scope(
-                &tracedecay_application::request_identity::mcp_connection_request_id(
+                &tracedecay_contracts::request_identity::mcp_connection_request_id(
                     &serde_json::json!(7),
                     "instance7f-c4",
                 )
@@ -6122,7 +6122,7 @@ mod tests {
     /// lane dead code on every successful normal call.
     #[test]
     fn an_ordinary_context_call_binds_to_the_connection_it_arrived_on() {
-        let request_id = tracedecay_application::request_identity::mcp_connection_request_id(
+        let request_id = tracedecay_contracts::request_identity::mcp_connection_request_id(
             &serde_json::json!("call-1"),
             "instanceaa-c1",
         )
@@ -6151,7 +6151,7 @@ mod tests {
     /// wins over the connection it happened to arrive on.
     #[test]
     fn an_explicit_session_identity_outranks_the_connection_binding() {
-        let request_id = tracedecay_application::request_identity::mcp_connection_request_id(
+        let request_id = tracedecay_contracts::request_identity::mcp_connection_request_id(
             &serde_json::json!("call-2"),
             "instanceaa-c1",
         )
@@ -6179,7 +6179,7 @@ mod tests {
     /// no query, have no advisory lane at all.
     #[test]
     fn only_a_context_assembly_call_with_a_query_opens_the_lane() {
-        let request_id = tracedecay_application::request_identity::mcp_connection_request_id(
+        let request_id = tracedecay_contracts::request_identity::mcp_connection_request_id(
             &serde_json::json!("call-3"),
             "instanceaa-c1",
         )
@@ -6336,7 +6336,7 @@ mod tests {
                 &advisory,
                 AdvisoryMemoryContextV1::Answered {
                     degradation: Some(
-                        tracedecay_application::memory::CognitiveRecallDegradation::TimedOut
+                        tracedecay_contracts::memory::CognitiveRecallDegradation::TimedOut
                     ),
                     candidates,
                     ..
@@ -6474,7 +6474,7 @@ mod tests {
                 &first,
                 AdvisoryMemoryContextV1::Answered {
                     degradation: Some(
-                        tracedecay_application::memory::CognitiveRecallDegradation::TimedOut
+                        tracedecay_contracts::memory::CognitiveRecallDegradation::TimedOut
                     ),
                     candidates,
                     ..
@@ -6514,7 +6514,7 @@ mod tests {
                 &second,
                 AdvisoryMemoryContextV1::Answered {
                     degradation: Some(
-                        tracedecay_application::memory::CognitiveRecallDegradation::Unavailable
+                        tracedecay_contracts::memory::CognitiveRecallDegradation::Unavailable
                     ),
                     candidates,
                     ..

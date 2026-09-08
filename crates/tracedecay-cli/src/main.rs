@@ -819,7 +819,7 @@ async fn run_startup_preamble(command: &Commands) {
     let startup_policy = CommandStartupPolicy::for_command(command);
 
     // Check first-run before any config save creates the file.
-    let is_first_run = tracedecay_session_memory::user_config::UserConfig::is_fresh();
+    let is_first_run = !tracedecay_session_memory::user_config::UserConfig::exists();
 
     let is_force_flush = matches!(
         command,
@@ -874,7 +874,7 @@ async fn run_startup_preamble(command: &Commands) {
     }
 
     if startup_policy.runs_agent_install_check() {
-        tracedecay::agents::claude::check_install_stale();
+        tracedecay_agent_hosts::agents::claude::check_install_stale();
     }
 }
 
@@ -1253,7 +1253,7 @@ async fn dispatch_memory_command(action: MemoryAction) -> tracedecay_domain::err
                 serde_json::json!({ "format": "json" }),
             )
             .await?;
-            let status: tracedecay_application::retained_surfaces::MemoryStatusResultV1 =
+            let status: tracedecay_contracts::retained_surfaces::MemoryStatusResultV1 =
                 commands::retained_tool_payload("tracedecay_memory_status", result)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
@@ -1419,11 +1419,10 @@ async fn dispatch_daemon_command(action: DaemonAction) -> tracedecay_domain::err
             remote_tls_cert,
             remote_tls_key,
         } => {
-            let tracedecay_bin = tracedecay::agents::which_tracedecay_path().ok_or_else(|| {
-                tracedecay_domain::errors::TraceDecayError::Config {
+            let tracedecay_bin = tracedecay_agent_hosts::agents::which_tracedecay_path()
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
                     message: "tracedecay not found on PATH".to_string(),
-                }
-            })?;
+                })?;
             let remote_tls = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
                 remote_listen,
                 remote_tls_cert.map(PathBuf::from),

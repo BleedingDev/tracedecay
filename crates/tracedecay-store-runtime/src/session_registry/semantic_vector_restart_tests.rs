@@ -5,6 +5,13 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use tracedecay_application::semantic_runtime::{
+    RetainedSemanticVectorGraphV1, SemanticGraphExecutionAuthorityV1, SemanticVectorGraphScopeV1,
+    SemanticVectorRetentionAuthorizationV1, VerifiedSemanticVectorGraphRuntimeV1,
+};
+use tracedecay_application::store::vector_generations::{
+    GraphVectorGenerationStoreV1, SemanticVectorStageDescriptorV1, VectorGenerationPlanV1,
+};
 use tracedecay_code_index_retention::code_index_generations::DurablePublicationPointerV1;
 use tracedecay_code_index_runtime::CodeGraphReplayBindingV1;
 use tracedecay_code_index_runtime::code_graph_seat::CodeGraphSeatLeaseV1;
@@ -33,13 +40,6 @@ use tracedecay_store::{
     SemanticVectorStagePlan, SemanticVectorStagePublicationPrepareOutcome,
     SemanticVectorStagePublishOutcome, SemanticVectorStagePublishSettlement,
     SemanticVectorStageResumeOutcome, StoreRuntimeBindingV1, StoreShardIdV1,
-};
-use tracedecay_usecases::semantic_runtime::{
-    RetainedSemanticVectorGraphV1, SemanticGraphExecutionAuthorityV1, SemanticVectorGraphScopeV1,
-    SemanticVectorRetentionAuthorizationV1, VerifiedSemanticVectorGraphRuntimeV1,
-};
-use tracedecay_usecases::store::vector_generations::{
-    GraphVectorGenerationStoreV1, SemanticVectorStageDescriptorV1, VectorGenerationPlanV1,
 };
 
 use super::DaemonSessionRuntimeRegistryV1;
@@ -158,6 +158,13 @@ impl VerifiedSemanticVectorGraphRuntimeV1 for CancelRequestAfterAdoptionRuntime 
         authority: &SemanticGraphExecutionAuthorityV1,
     ) -> Result<SemanticVectorStagePublishOutcome, GraphDbError> {
         self.inner.settle_published(settlement, authority)
+    }
+
+    fn project_stage_census(
+        &self,
+        authority: &SemanticGraphExecutionAuthorityV1,
+    ) -> Result<tracedecay_store::SemanticVectorStageCensusPage, GraphDbError> {
+        self.inner.project_stage_census(authority)
     }
 
     fn reserve_one_generation(

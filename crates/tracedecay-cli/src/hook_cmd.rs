@@ -53,6 +53,9 @@ fn handle_hook_command_inner(
             Commands::HookCodexPostToolUse => {
                 Some(tracedecay_agent_hosts::hooks::hook_codex_post_tool_use(&runtime).await)
             }
+            Commands::HookCodexStop => {
+                Some(tracedecay_agent_hosts::hooks::hook_codex_stop(&runtime).await)
+            }
             Commands::HookHermesTerminalReceipt => {
                 Some(tracedecay_agent_hosts::hooks::hook_hermes_terminal_receipt(&runtime).await)
             }

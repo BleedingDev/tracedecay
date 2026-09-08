@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use thiserror::Error;
-use tracedecay_application::ResolvedScope;
+use tracedecay_contracts::ResolvedScope;
 use tracedecay_domain::{
     AuthorizationRevision, CodeGenerationId, ComponentRevision, ConfigurationRevisionId,
     DiversityPolicy, ExactAdmissionRuleRevision, FreshnessVectorDigest, FusionProfile,
@@ -686,7 +686,11 @@ where
     // Every lexical route (the query plus each caller anchor and the optional
     // preferred-symbol route) runs through the same lane against the same
     // pinned generation; the merge below is what composition admits as the
-    // single lexical lane input.
+    // single lexical lane input. The routes share the request's live
+    // execution control with the graph lane: a cancelled or expired request
+    // unwinds here with `RetrievalPortError::Cancelled` instead of hydrating
+    // every remaining candidate row while the caller's execution permit and
+    // the already-settled caller wait on it.
     let route_plan = LexicalRoutePlanV1::plan(query_view.as_str(), &input.lexical_routing)?;
     let (lexical, lexical_routes) =
         hotpath::measure_block!("daemon.code_index.query.lane.lexical", {
@@ -704,6 +708,7 @@ where
                     lexical_profile_revision: input.lexical_profile_revision.clone(),
                     score_domain: input.lexical_score_domain.clone(),
                     budget: request.budget,
+                    control: graph_control.as_ref(),
                 })?;
                 route_outcomes.push(LexicalRouteOutcomeV1 {
                     kind: route.kind.clone(),
@@ -726,9 +731,21 @@ where
         // seating failure (`retriever_unavailable`) after exact and lexical
         // had already completed. Text-only or still-pending generations keep
         // the typed unavailable receipt.
+        //
+        // Graph activation state is owned per sealed generation and shared by
+        // every handle bound to it, so the text owner answers for its own
+        // generation when no decoded complete generation accompanies it. A
+        // clean restart whose retained revision-7 head recovered serves graph
+        // reads from exactly that owner and deliberately leaves the sealed
+        // seat empty; resolving the lane only through the seat reported the
+        // recovered graph as `retriever_unavailable` until the next publish.
         let graph_serving = graph_latest
             .as_ref()
-            .and_then(|latest| latest.production_graph_serving().ok());
+            .map_or_else(
+                || text.production_graph_serving(),
+                |latest| latest.production_graph_serving(),
+            )
+            .ok();
         if graph_seeds.is_empty() {
             if graph_serving.is_some() {
                 RetrieverOutcome::Complete(RetrieverBatch {
@@ -907,7 +924,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
-    use tracedecay_application::ResolvedScope;
+    use tracedecay_contracts::ResolvedScope;
     use tracedecay_domain::{
         CalibrationProfileId, ComponentRevision, DiversityPolicy, FusionProfile, ManifestDigest,
         PrivacyDomainId, RefId, RepositoryId, RetrievalAnchorId, RetrievalBudget,

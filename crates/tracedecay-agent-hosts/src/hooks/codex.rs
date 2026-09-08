@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde_json::Value;
 use tracedecay_hooks::{DaemonHookEvent, HookAgent};
@@ -45,9 +46,138 @@ pub fn codex_additional_context_json(event_name: &str, additional_context: &str)
     super::additional_context_json(event_name, additional_context)
 }
 
+/// Codex `Stop` response: admit daemon-owned ingest before optional V2 guidance.
+pub async fn hook_codex_stop(runtime: &HookRuntimeV1) -> i32 {
+    let started = Instant::now();
+    let event = read_hook_event!();
+    let parsed = serde_json::from_str::<Value>(&event).unwrap_or(Value::Null);
+    if codex_stop_session_id(&parsed).is_none() {
+        return 1;
+    }
+    let root = event_project_root_with_identity(runtime, &parsed).await;
+    let telemetry = record_hook_invoked_parsed(
+        runtime,
+        root.as_deref(),
+        HintAgent::Codex,
+        "Stop",
+        &event,
+        &parsed,
+    );
+    // Required producer admission must not be starved by optional guidance work.
+    let queued = enqueue_codex_stop(runtime, &parsed, Some(&telemetry), started).await;
+    let guidance = super::dispatch::dispatch_for_scope(
+        runtime,
+        tracedecay_hooks::HookHostV1::Codex,
+        &event,
+        root.as_deref(),
+        Some(&telemetry),
+        started,
+    )
+    .await
+    .into_recorded_guidance(&telemetry)
+    .flatten();
+    let output = guidance.map_or_else(
+        || "{}".to_owned(),
+        |guidance| additional_context_json("Stop", &guidance),
+    );
+    let written = super::write_hook_output(
+        root.as_deref(),
+        tracedecay_hooks::HookHostV1::Codex,
+        &event,
+        &output,
+    )
+    .await;
+    i32::from(!written || !queued)
+}
+
+fn codex_stop_session_id(parsed: &Value) -> Option<&str> {
+    // Validate before dispatch; native decoders intentionally ignore identity fields.
+    let session_id = parsed.get("session_id").and_then(Value::as_str)?;
+    if parsed.get("hook_event_name").and_then(Value::as_str) != Some("Stop")
+        || session_id.trim().is_empty()
+        || session_id.chars().any(char::is_control)
+        || tracedecay_domain::SessionId::new(session_id.to_owned()).is_err()
+        || tracedecay_hooks::decode_native_hook_event(
+            tracedecay_hooks::HookHostV1::Codex,
+            parsed.to_string().as_bytes(),
+        )
+        .is_err()
+    {
+        return None;
+    }
+    Some(session_id)
+}
+
+async fn enqueue_codex_stop(
+    runtime: &HookRuntimeV1,
+    parsed: &Value,
+    telemetry: Option<&super::analytics::HookTimingSpan>,
+    started: Instant,
+) -> bool {
+    let Some(session_id) = codex_stop_session_id(parsed) else {
+        return false;
+    };
+    let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let Some(deadline) = tracedecay_hooks::HookSynchronousDeadlineV1::after_elapsed(elapsed) else {
+        return false;
+    };
+    // The action acknowledges retained cancellable work; it never waits for ingest.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_micros(deadline.remaining_micros()),
+        super::daemon_hook_action(
+            runtime,
+            None,
+            serde_json::json!({ "action": "codex_stop", "session_id": session_id }),
+            telemetry,
+        ),
+    )
+    .await;
+    let queued = matches!(result, Ok(Ok(ref value)) if value.get("status").and_then(Value::as_str) == Some("accepted"));
+    if !queued {
+        tracing::warn!("Codex Stop daemon enqueue failed or exceeded the hook deadline");
+    }
+    queued
+}
+
+#[cfg(test)]
+#[test]
+fn native_codex_stop_enqueues_exact_identity_and_refuses_invalid_identity() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let guard = super::TestDaemonHookActionGuard::install([serde_json::json!({"status":"accepted"})]);
+        let runtime = crate::ports::hook_runtime::crate_test_runtime();
+        let event = serde_json::json!({
+            "hook_event_name": "Stop", "session_id": "native-codex-session-123",
+            "turn_id": "turn-1", "cwd": "/workspace", "model": "codex",
+            "permission_mode": "default", "stop_hook_active": false,
+            "last_assistant_message": "finished"
+        });
+        assert!(enqueue_codex_stop(&runtime, &event, None, Instant::now()).await);
+        assert_eq!(guard.calls(), vec![(None, serde_json::json!({
+            "action": "codex_stop", "session_id": "native-codex-session-123", "format": "json"
+        }))]);
+        for invalid in [Value::Null, serde_json::json!(17), serde_json::json!(""), serde_json::json!(" ")] {
+            let mut rejected = event.clone();
+            rejected["session_id"] = invalid;
+            enqueue_codex_stop(&runtime, &rejected, None, Instant::now()).await;
+        }
+        let mut rejected = event.clone();
+        rejected.as_object_mut().unwrap().remove("session_id");
+        enqueue_codex_stop(&runtime, &rejected, None, Instant::now()).await;
+        let mut rejected = event;
+        rejected["hook_event_name"] = serde_json::json!("SessionStart");
+        enqueue_codex_stop(&runtime, &rejected, None, Instant::now()).await;
+        assert_eq!(guard.calls().len(), 1);
+    });
+}
+
 /// Codex `SessionStart` hook handler.
 #[hotpath::measure(future = true, label = "hosts.hooks.codex.session_start")]
 pub async fn hook_codex_session_start(runtime: &HookRuntimeV1) -> i32 {
+    let started = Instant::now();
     let event = read_hook_event!();
     let parsed = serde_json::from_str::<Value>(&event).unwrap_or(Value::Null);
     let root = event_project_root_with_identity(runtime, &parsed).await;
@@ -74,6 +204,7 @@ pub async fn hook_codex_session_start(runtime: &HookRuntimeV1) -> i32 {
         &event,
         root.as_deref(),
         Some(&hook_telemetry),
+        started,
     )
     .await
     .into_recorded_guidance(&hook_telemetry)
@@ -83,12 +214,10 @@ pub async fn hook_codex_session_start(runtime: &HookRuntimeV1) -> i32 {
         |guidance| additional_context_json("SessionStart", &guidance),
     );
     if !super::write_hook_output(
-        runtime,
         root.as_deref(),
         tracedecay_hooks::HookHostV1::Codex,
         &event,
         &output,
-        Some(&hook_telemetry),
     )
     .await
     {
@@ -116,6 +245,26 @@ pub async fn hook_codex_user_prompt_submit(runtime: &HookRuntimeV1) -> i32 {
     let event = read_hook_event!();
     let parsed = serde_json::from_str::<Value>(&event).unwrap_or(Value::Null);
     let root = event_project_root_with_identity(runtime, &parsed).await;
+    // A compatibility prompt callback can run before TraceDecay is installed
+    // for this profile. Only an existing profile can own projectless ingest.
+    let profile = tracedecay_runtime_core::storage::default_profile_root().and_then(|root| {
+        tracedecay_runtime_core::storage::read_existing_profile_identity_record(
+            &root.join(tracedecay_runtime_core::storage::PROFILE_IDENTITY_FILENAME),
+        )
+    });
+    match profile {
+        Ok(None) => {
+            return i32::from(
+                !super::write_hook_output(None, tracedecay_hooks::HookHostV1::Codex, &event, "{}")
+                    .await,
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Codex prompt profile identity is unavailable");
+            return 1;
+        }
+        Ok(Some(_)) => {}
+    }
     let hook_telemetry = record_hook_invoked_parsed(
         runtime,
         root.as_deref(),
@@ -149,12 +298,10 @@ pub async fn hook_codex_user_prompt_submit(runtime: &HookRuntimeV1) -> i32 {
         additional_context_json("UserPromptSubmit", &context)
     };
     if !super::write_hook_output(
-        runtime,
         root.as_deref(),
         tracedecay_hooks::HookHostV1::Codex,
         &event,
         &output,
-        Some(&hook_telemetry),
     )
     .await
     {
@@ -200,6 +347,7 @@ async fn codex_user_prompt_submit_context_with_root(parsed: &Value, root: Option
 /// `additionalContext` shape; unavailable or guidance-free admission is silent.
 #[hotpath::measure(future = true, label = "hosts.hooks.codex.post_tool_use")]
 pub async fn hook_codex_post_tool_use(runtime: &HookRuntimeV1) -> i32 {
+    let started = Instant::now();
     let event = read_hook_event!();
     // One parse supplies exact scope and analytics attribution.
     let parsed = serde_json::from_str::<Value>(&event).unwrap_or(Value::Null);
@@ -218,18 +366,17 @@ pub async fn hook_codex_post_tool_use(runtime: &HookRuntimeV1) -> i32 {
         &event,
         root.as_deref(),
         Some(&hook_telemetry),
+        started,
     )
     .await
     .into_recorded_guidance(&hook_telemetry)
     .flatten();
     if let Some(guidance) = guidance
         && !super::write_hook_output(
-            runtime,
             root.as_deref(),
             tracedecay_hooks::HookHostV1::Codex,
             &event,
             &additional_context_json("PostToolUse", &guidance),
-            Some(&hook_telemetry),
         )
         .await
     {
@@ -263,12 +410,10 @@ pub async fn hook_codex_post_compact(runtime: &HookRuntimeV1) -> i32 {
         codex_post_compact(runtime, &event, Some(&hook_telemetry)).await;
     }
     if !super::write_hook_output(
-        runtime,
         root.as_deref(),
         tracedecay_hooks::HookHostV1::Codex,
         &event,
         &serde_json::json!({}).to_string(),
-        Some(&hook_telemetry),
     )
     .await
     {
@@ -593,7 +738,7 @@ fn codex_prompt_hint(parsed: &Value) -> Option<ToolHint> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::config::USER_DATA_DIR_ENV;
+    use tracedecay_runtime_core::config::USER_DATA_DIR_ENV;
 
     #[test]
     fn codex_session_start_event_signals_daemon_with_real_cwd() {
@@ -631,9 +776,14 @@ mod tests {
         let project_root = project.path().canonicalize().unwrap();
         let profile_root = profile.path().canonicalize().unwrap();
         let _profile_env = crate::hooks::EnvGuard::set_path(USER_DATA_DIR_ENV, &profile_root);
-        crate::storage::pin_fixture_repository_identity(&project_root, "proj_hook_codex_prompt")
-            .unwrap();
-        let layout = crate::storage::resolve_layout_for_current_profile(&project_root).unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project_root,
+            "proj_hook_codex_prompt",
+        )
+        .unwrap();
+        let layout =
+            tracedecay_runtime_core::storage::resolve_layout_for_current_profile(&project_root)
+                .unwrap();
         std::fs::create_dir_all(&layout.data_root).unwrap();
         let event = serde_json::json!({
             "session_id": "codex-session-1",

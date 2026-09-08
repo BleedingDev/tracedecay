@@ -125,14 +125,15 @@ pub(crate) type RmcpInitializeResponseDecorator =
 /// boundary the only place allowed to offer a delivery settlement.
 #[derive(Clone)]
 pub(crate) struct RmcpWorkDeliverySettlement {
-    recorder: Option<Arc<tracedecay_usecases::observability::BoundedDeliverySettlementRecorderV1>>,
+    recorder:
+        Option<Arc<tracedecay_application::observability::BoundedDeliverySettlementRecorderV1>>,
     connection_scope: String,
 }
 
 impl RmcpWorkDeliverySettlement {
     pub(crate) fn new(
         recorder: Option<
-            Arc<tracedecay_usecases::observability::BoundedDeliverySettlementRecorderV1>,
+            Arc<tracedecay_application::observability::BoundedDeliverySettlementRecorderV1>,
         >,
         connection_scope: String,
     ) -> Self {
@@ -168,7 +169,7 @@ impl RmcpWorkDeliverySettlement {
         .ok()?;
         let identity = identity.as_str().trim_start_matches("sha256:");
         let channel = channel.as_str().trim_start_matches("sha256:");
-        let observed_at = tracedecay_application::clock::now_micros();
+        let observed_at = tracedecay_contracts::clock::now_micros();
         Some(tracedecay_domain::DeliverySettlementAttemptV1 {
             owner_event_id: format!("work:mcp-response:{identity}"),
             event_class: tracedecay_domain::DeliveryEventClassV1::OperationTerminal,
@@ -195,15 +196,15 @@ impl RmcpWorkDeliverySettlement {
         let settlement = tracedecay_domain::DeliverySettlementV1 {
             settled_at: std::cmp::max(
                 attempt.attempted_at,
-                tracedecay_application::clock::now_micros(),
+                tracedecay_contracts::clock::now_micros(),
             ),
             attempt,
             outcome,
             drop_reason,
         };
         match recorder.try_record(settlement) {
-            Ok(tracedecay_usecases::observability::DeliverySettlementRecordOutcomeV1::Enqueued) => {}
-            Ok(tracedecay_usecases::observability::DeliverySettlementRecordOutcomeV1::DroppedAtCapacity) => {
+            Ok(tracedecay_application::observability::DeliverySettlementRecordOutcomeV1::Enqueued) => {}
+            Ok(tracedecay_application::observability::DeliverySettlementRecordOutcomeV1::DroppedAtCapacity) => {
                 tracing::warn!("RMCP Work delivery settlement was dropped at recorder capacity");
             }
             Err(error) => tracing::warn!(%error, "RMCP Work delivery settlement was refused"),
@@ -1076,7 +1077,7 @@ mod tests {
         );
 
         for index in 0..8 {
-            fixture
+            let seeded = fixture
                 .client
                 .call_tool(
                     CallToolRequestParams::new("tracedecay_fact_store_add").with_arguments(
@@ -1096,8 +1097,13 @@ mod tests {
                 )
                 .await
                 .expect("seed large RMCP tools/call");
+            assert_ne!(
+                seeded.is_error,
+                Some(true),
+                "large-response seed {index} was refused: {seeded:?}"
+            );
         }
-        fixture
+        let listed = fixture
             .client
             .call_tool(
                 CallToolRequestParams::new("tracedecay_fact_store_list").with_arguments(
@@ -1114,13 +1120,22 @@ mod tests {
             )
             .await
             .expect("large RMCP tools/call");
+        assert_ne!(
+            listed.is_error,
+            Some(true),
+            "large-response list was refused: {listed:?}"
+        );
         let large_response = fixture.last_response();
         let large_text = large_response["result"]["content"][0]["text"]
             .as_str()
             .expect("large response text");
         let large_envelope: Value =
             serde_json::from_str(large_text).expect("large response truncation envelope");
-        assert_eq!(large_envelope["truncated"], json!(true));
+        assert_eq!(
+            large_envelope["truncated"],
+            json!(true),
+            "large-response list did not return a truncation envelope: {listed:?}"
+        );
         assert!(
             large_envelope["original_chars"]
                 .as_u64()
@@ -1242,7 +1257,7 @@ mod tests {
             super::super::application_surface_request_id(&wire_id, &adapter.memory_request_scope)
                 .expect("connection-scoped application request id");
         let cancellation =
-            tracedecay_application::CancellationSignal::active("cancellation.rmcp-wire-oracle")
+            tracedecay_contracts::CancellationSignal::active("cancellation.rmcp-wire-oracle")
                 .expect("cancellation signal");
         server
             .dispatch_authority

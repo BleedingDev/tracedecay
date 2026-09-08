@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use gix::bstr::ByteSlice;
 use serde_json::Value;
-use tracedecay_application::ResolvedScope;
 use tracedecay_code_extraction::{ImportModuleKindV1, ImportNamespaceV1};
 use tracedecay_code_index::chunks::CodeIndexImportEvidenceV1;
 use tracedecay_code_index::production::{
@@ -15,13 +14,14 @@ use tracedecay_code_index::production::{
     CodeIndexInterruptionV1, CodeIndexProductionErrorV1,
     MAX_IGNORED_DEPENDENCY_ENTRYPOINT_BYTES_V1,
 };
+use tracedecay_contracts::ResolvedScope;
 use tracedecay_domain::{CodeGenerationId, SanitizerDispositionV1, canonical_sha256};
 use tracedecay_runtime_core::privacy::{CodeSourceShapeV1, sanitize_code_source_bytes};
 
 use super::{
     CapturedSnapshotV1, CodeIndexPublishEvidenceV1, CodeIndexSchedulerErrorV1,
-    CodeIndexWorktreeSchedulerV1, LatestCompleteCodeIndexV1, StaticLanguageRegistry, now_micros,
-    projection_key,
+    CodeIndexWorktreeSchedulerV1, LatestCompleteCodeIndexV1, SourceContentManifestV1,
+    StaticLanguageRegistry, now_micros, projection_key,
 };
 use crate::code_index::languages::LanguageRegistry;
 
@@ -282,7 +282,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         self.retained_snapshot_bytes = retained_bytes;
         self._retained_snapshot_memory = retained_reservations;
         self.latest_content_identity = Some(generation.snapshot().content_identity.clone());
-        self.mark_reconciled();
+        self.mark_reconciled(SourceContentManifestV1::for_snapshot(generation.snapshot()));
         let latest = self.bind_latest_complete(Arc::clone(&generation), None);
         let publication = publication_evidence(reextracted_files, &generation)?;
         Ok(CodeIndexIgnoredDependencyBuildV1 {

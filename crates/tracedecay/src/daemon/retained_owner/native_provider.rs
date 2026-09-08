@@ -23,8 +23,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tracedecay_application::RetainedSurfaceExecutionErrorV1;
-use tracedecay_application::retained_surfaces::{
+use tracedecay_contracts::RetainedSurfaceExecutionErrorV1;
+use tracedecay_contracts::retained_surfaces::{
     FactCommitOwnerV1, FactCommitReceiptV1, FactIdentitySourceResultV1, FactProjectionV1,
     FactSearchGraphCoverageV1, FactV1, MemoryScopeV1,
 };
@@ -2111,7 +2111,7 @@ fn native_recall_candidate(
     call: &ProviderCall,
     profile_id: &UserProfileId,
     fact: &FactV1,
-    hit: &tracedecay_application::retained_surfaces::FactSearchHitV1,
+    hit: &tracedecay_contracts::retained_surfaces::FactSearchHitV1,
 ) -> Result<Value, NativeReadFailure> {
     // The canonical record this candidate *is*, named in the host's own
     // canonical-record reference form so host provenance hydration can read
@@ -2457,7 +2457,7 @@ fn native_recall_response_value(
     excluded_items: u64,
     truncated_items: u64,
     reasons: &[String],
-    next_after: Option<&tracedecay_application::retained_surfaces::FactSearchCursorV1>,
+    next_after: Option<&tracedecay_contracts::retained_surfaces::FactSearchCursorV1>,
 ) -> Value {
     let state = if !reasons.is_empty() || truncated_items > 0 {
         "partial"
@@ -2529,16 +2529,16 @@ fn graph_coverage_reasons(coverage: FactSearchGraphCoverageV1) -> Vec<String> {
         }
         FactSearchGraphCoverageV1::Complete { .. } => Vec::new(),
         FactSearchGraphCoverageV1::Degraded { reason } => vec![match reason {
-            tracedecay_application::retained_surfaces::FactSearchGraphDegradationV1::Conflict => {
+            tracedecay_contracts::retained_surfaces::FactSearchGraphDegradationV1::Conflict => {
                 "graph_conflict"
             }
-            tracedecay_application::retained_surfaces::FactSearchGraphDegradationV1::Unavailable => {
+            tracedecay_contracts::retained_surfaces::FactSearchGraphDegradationV1::Unavailable => {
                 "graph_unavailable"
             }
-            tracedecay_application::retained_surfaces::FactSearchGraphDegradationV1::BudgetExhausted => {
+            tracedecay_contracts::retained_surfaces::FactSearchGraphDegradationV1::BudgetExhausted => {
                 "graph_budget_exhausted"
             }
-            tracedecay_application::retained_surfaces::FactSearchGraphDegradationV1::DeadlineExceeded => {
+            tracedecay_contracts::retained_surfaces::FactSearchGraphDegradationV1::DeadlineExceeded => {
                 "graph_deadline_exceeded"
             }
         }

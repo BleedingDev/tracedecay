@@ -47,7 +47,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracedecay_application::{CancellationSignal, ResolvedScope};
+use tracedecay_contracts::{CancellationSignal, ResolvedScope};
 
 use crate::recall_context_pack::ProviderItemProvenanceV1;
 

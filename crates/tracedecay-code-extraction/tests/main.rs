@@ -12,6 +12,7 @@ mod batch;
 mod c;
 #[cfg(feature = "lang-cobol")]
 mod cobol;
+mod complexity_budget;
 mod cpp;
 mod csharp;
 #[cfg(feature = "lang-dart")]
@@ -37,6 +38,8 @@ mod lua;
 mod markdown;
 #[cfg(feature = "lang-markdown")]
 mod markdown_modern_grammar;
+#[cfg(feature = "lang-metal")]
+mod metal;
 #[cfg(feature = "lang-msbasic2")]
 mod msbasic2;
 #[cfg(feature = "lang-nix")]
@@ -63,6 +66,7 @@ mod quint;
 #[cfg(feature = "lang-ruby")]
 mod ruby;
 mod rust;
+mod same_line_identity;
 mod scala;
 mod svelte;
 mod swift;

@@ -26,19 +26,19 @@ fn assert_ready_verified_generation(body: &Value) {
 use tracedecay::config::USER_DATA_DIR_ENV;
 use tracedecay::dashboard;
 use tracedecay::tracedecay::TraceDecay;
-use tracedecay_application::{
-    CapabilityGrantId, CapabilityGrantSnapshot, DisclosureClass, RequestAdmission, RequestContext,
-    ResolvedScope,
-};
 use tracedecay_code_index::graph_projection::{
     CodeGraphProjectionStore, HermeticCodeGraphProjectionStore,
 };
 use tracedecay_code_index::lineage::{GenerationSymbolIndexV1, LineageSymbolRecordV1};
+use tracedecay_contracts::{
+    CapabilityGrantId, CapabilityGrantSnapshot, DisclosureClass, RequestAdmission, RequestContext,
+    ResolvedScope,
+};
 use tracedecay_domain::code_intelligence::{Edge, EdgeKind, Node, NodeKind, Visibility};
 use tracedecay_domain::{
     ActorId, BoundedSanitizedText, CanonicalRelationEdgeV1, ChunkerRevision, CodeGenerationId,
     CodeSearchChunkAnchorV1, CodeSearchChunkGrainV1, CodeSearchChunkId, CodeSearchChunkV1,
-    ContentDigest, EdgeAuthorityV1, FileIdentityDigest, FileOccurrenceId,
+    ComplexityAnalysisV1, ContentDigest, EdgeAuthorityV1, FileIdentityDigest, FileOccurrenceId,
     LanguageDescriptorRevision, LanguageId, ManifestDigest, PolicyRevisionId, ProjectId,
     RelationEdgeKindV1, SanitizedCodeFileV1, SanitizerRevision, SensitivityDecision,
     SensitivityLevelV1, SnapshotFileDispositionV1, SourceSpan, SymbolIdentityDigest,
@@ -175,6 +175,7 @@ fn make_node(id: &str, kind: NodeKind, name: &str, file_path: &str, start_line: 
         loops: 0,
         returns: 1,
         max_nesting: 1,
+        complexity_analysis: ComplexityAnalysisV1::Complete,
         unsafe_blocks: 0,
         unchecked_calls: 0,
         assertions: 0,
@@ -453,6 +454,7 @@ fn compose_graph_authority(
                     branches: node.branches,
                     loops: node.loops,
                     max_nesting: node.max_nesting,
+                    complexity_analysis: node.complexity_analysis,
                     line_span: node
                         .end_line
                         .saturating_sub(node.start_line)
@@ -539,7 +541,7 @@ fn compose_graph_authority(
         })
         .collect();
     let cancellation =
-        tracedecay_application::CancellationSignal::active("cancel.dashboard-graph-fixture")
+        tracedecay_contracts::CancellationSignal::active("cancel.dashboard-graph-fixture")
             .unwrap_or_else(|error| panic!("fixture graph cancellation: {error}"));
     let projection = HermeticCodeGraphProjectionStore::memory(&cancellation)
         .unwrap_or_else(|error| panic!("fixture graph projection: {error}"));

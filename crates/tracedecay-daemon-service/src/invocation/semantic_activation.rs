@@ -11,9 +11,9 @@
 
 use super::*;
 
+use tracedecay_application::semantic_runtime::SemanticConfigurationPinV1;
 use tracedecay_domain::configuration::{ConfigurationValueV1, SettingKey};
 use tracedecay_runtime_core::cancellation::CancellationToken;
-use tracedecay_usecases::semantic_runtime::SemanticConfigurationPinV1;
 
 use tracedecay_domain::configuration::SEMANTIC_RUNTIME_SETTING_KEY;
 #[cfg(test)]
@@ -89,10 +89,8 @@ impl DaemonInvocationService {
         // evaluation so a missing model is a fast typed refusal, not a
         // late one.
         let material = match semantic_activation_material(
-            tracedecay_usecases::semantic_runtime::project_or_shared_lifecycle_status(
-                &project_root_path,
-            )
-            .as_ref(),
+            tracedecay_application::semantic_runtime::project_lifecycle_status(&project_root_path)
+                .as_ref(),
         ) {
             Ok(material) => material,
             Err(problem) => return application_problem(request_id, problem),
@@ -218,7 +216,7 @@ impl DaemonInvocationService {
                 SemanticConfigurationPinV1::from_current(&post.into_current_state()).ok()
             });
         let runtime_state =
-            tracedecay_usecases::semantic_runtime::resolve_project_semantic_runtime_status(
+            tracedecay_application::semantic_runtime::resolve_project_semantic_runtime_status(
                 Some(&project_root_path),
                 pin,
             )

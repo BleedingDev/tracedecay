@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use sha2::{Digest, Sha256};
-use tracedecay_application::{CancellationSignal, RequestContext, ResolvedScope};
+use tracedecay_contracts::{CancellationSignal, RequestContext, ResolvedScope};
 use tracedecay_domain::{
     ComponentRevision, EphemeralSanitizedQueryViewV1, RetrievalRequest, ScoreDomainId,
 };
@@ -18,6 +18,7 @@ use tracedecay_session_memory::session::{
     TaskSessionRetrievalOutcomeV1,
 };
 use tracedecay_session_temporal_store::execution::TaskSessionRankSelectorV1;
+use tracedecay_sessions::serving::SessionProjectionServingStatus;
 use tracedecay_store::StoreShardScopeV1;
 
 use super::contract::{
@@ -154,6 +155,14 @@ pub trait SessionApplicationRetrievalPortV1: Send + Sync {
             )
         })
     }
+
+    /// The refresh worker's serving state for this root — current, still
+    /// converging history, or without a worker — so diagnostics can name the
+    /// state a pending projection is in. `None` when no worker serves the
+    /// root at all.
+    fn projection_serving_status(&self) -> Option<SessionProjectionServingStatus> {
+        None
+    }
 }
 
 /// Scope-bound terminal used when a project has no mounted session-retrieval
@@ -209,6 +218,12 @@ impl Drop for SessionRetrievalInFlightObservation {
 }
 
 impl SessionApplicationRetrievalPortV1 for DaemonSessionRetrievalService {
+    fn projection_serving_status(&self) -> Option<SessionProjectionServingStatus> {
+        self.refresh_status
+            .as_deref()
+            .map(|status| status.serving_status())
+    }
+
     fn retrieve_admitted<'a>(
         &'a self,
         context: &'a RequestContext,
@@ -590,7 +605,7 @@ const fn temporal_store_unavailable_value() -> SessionRetrievalUnavailable {
 mod tests {
     use std::collections::BTreeSet;
 
-    use tracedecay_application::{
+    use tracedecay_contracts::{
         CancellationContext, CapabilityGrantId, CapabilityGrantSnapshot, Deadline, DisclosureClass,
         RequestContext, RequestId,
     };
@@ -727,7 +742,7 @@ mod tests {
         )
     }
 
-    fn request_context_for(scope: tracedecay_application::ResolvedScope) -> RequestContext {
+    fn request_context_for(scope: tracedecay_contracts::ResolvedScope) -> RequestContext {
         let actor = ActorId::new("actor.message-search").expect("actor");
         let grant_digest =
             ManifestDigest::new(format!("sha256:{}", "5".repeat(64))).expect("grant digest");
@@ -772,7 +787,7 @@ mod tests {
             .identity
             .session_request_scope()
             .expect("application scope");
-        let head_scope = tracedecay_application::ResolvedScope::new(
+        let head_scope = tracedecay_contracts::ResolvedScope::new(
             serving_scope.project_id.clone(),
             serving_scope.repository_id.clone(),
             serving_scope.worktree_id.clone(),
@@ -802,7 +817,7 @@ mod tests {
             .identity
             .session_request_scope()
             .expect("application scope");
-        let foreign_scope = tracedecay_application::ResolvedScope::new(
+        let foreign_scope = tracedecay_contracts::ResolvedScope::new(
             serving_scope.project_id.clone(),
             serving_scope.repository_id.clone(),
             WorktreeId::new("worktree.project.other").expect("worktree identity"),

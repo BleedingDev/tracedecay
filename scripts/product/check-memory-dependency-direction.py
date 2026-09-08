@@ -17,19 +17,18 @@ reachability*, not crate-name spelling:
 Layer 1 (Cargo metadata) is default-deny on the dependency graph: exact names,
 split by dependency kind, with an exact allowed feature set per edge.
 
-Layer 2 (crate source) exists because layer 1 provably cannot finish the job.
-Cargo unifies features per compiled crate instance. `tracedecay-application`
-mounts an optional `gix` historical-blob reader behind its `native-git`
-feature, and the production root (`crates/tracedecay/Cargo.toml`) enables
-`tracedecay-application/native-git`. In that build there is exactly ONE
-compiled `tracedecay-application`, with `native-git` on, and every consumer in
-the graph links against it. Writing `default-features = false` on the
-registry's own dependency entry therefore does NOT produce a capability-free
-instance for the registry: `NativeHistoricalBlobReaderV1` is in scope for it
-regardless of what the registry's manifest requests. A manifest-only gate
-cannot see that, and a manifest-only gate cannot see it in principle. The only
-honest enforcement is an exact source-import allowlist over the crate's `src/`,
-which is what `source_contracts` provides.
+Layer 2 (crate source) exists because layer 1 cannot finish the job. The
+registry now depends on `tracedecay-contracts`, whose exact dependency closure
+has no optional `gix` reader. This removes the former application capability
+carrier from that edge, but does not make source enforcement redundant.
+Cargo unifies features per compiled crate instance: if a contract dependency
+later acquires an optional capability enabled by another consumer, writing
+`default-features = false` on the registry edge does not isolate its exports.
+The checker therefore derives an import-contract obligation from optional
+dependencies, without assuming today's contracts crate has one. Regression
+tests explicitly construct that hypothetical condition. Exact source-import
+allowlists also reject unlisted items, and executor call-site pins and the
+forbidden-symbol floor remain necessary regardless of feature unification.
 
 The direct-edge feature pins are retained, but their documented job is now the
 narrow one they can actually do: stop the *registry itself* from asking for a
@@ -56,7 +55,7 @@ ENFORCEMENT INDEX
       dependency of its own requires an exact source-import allowlist for that
       edge, because feature unification means the direct edge does not bound
       what that crate exports in the production build. This is the structural
-      statement of the `tracedecay-application`/`gix` problem, derived from
+      statement of the former `tracedecay-application`/`gix` problem, derived from
       metadata rather than from a crate name a policy edit could remove.
     - Any production edge to a known executor crate (EXECUTOR_DEPENDENCIES,
       held in the checker, not the policy) requires the same, plus every

@@ -1,8 +1,8 @@
 use std::sync::Mutex as StdMutex;
 
-use crate::agents::context_scout_v2::ContextScoutDurableStoreOutcomeV1;
 use crate::daemon::context_scout_lifecycle::AuthorityRegistrationV1;
 use serde_json::json;
+use tracedecay_agent_hosts::agents::context_scout_v2::ContextScoutDurableStoreOutcomeV1;
 use tracedecay_domain::{ObservationSourceRangeV1, ProjectId, ProviderId, SessionId, UtcMicros};
 use tracedecay_sessions::admission::HostAdmissionScope;
 
@@ -179,6 +179,7 @@ async fn kimi_and_opencode_queued_lifecycle_delivery_prepares_scout_lookup() {
             assert!(
                 admit_native_context_scout_lifecycle(
                     &sessions,
+                    Some(&runtime.background_cpu()),
                     ProviderId::new(provider).unwrap(),
                     &identity,
                     range,
@@ -188,6 +189,7 @@ async fn kimi_and_opencode_queued_lifecycle_delivery_prepares_scout_lookup() {
             assert!(
                 admit_native_context_scout_lifecycle(
                     &sessions,
+                    Some(&runtime.background_cpu()),
                     ProviderId::new(provider).unwrap(),
                     &identity,
                     range,

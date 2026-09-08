@@ -11,11 +11,12 @@ mod metadata;
 pub mod migrations;
 mod purpose;
 mod retrieval_anchor_authority;
+pub use retrieval_anchor_authority::append_retrieval_anchor_disposition_on;
 pub mod retrieval_anchor_schema;
 mod semantic_vector_staging;
 mod sql;
 
-pub use crate::store_runtime::registry::RepositoryRuntimePhysicalSnapshot;
+pub use crate::shard_runtime::registry::RepositoryRuntimePhysicalSnapshot;
 pub use access::OwnedMaintenanceDatabaseScope;
 #[doc(hidden)]
 pub use access::enter_maintenance_database_scope;

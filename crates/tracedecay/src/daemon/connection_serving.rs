@@ -472,7 +472,7 @@ impl DaemonWorkDeliveryDescriptorV1 {
             ) => application_outcome_payload(outcome).is_some_and(|hydration| {
                 matches!(
                     hydration,
-                    tracedecay_application::WorkArtifactHydrationV1::Hydrated { attempts, .. }
+                    tracedecay_contracts::WorkArtifactHydrationV1::Hydrated { attempts, .. }
                         if !attempts.is_empty()
                 )
             }),
@@ -518,8 +518,7 @@ impl DaemonWorkDeliveryDescriptorV1 {
         owner_event_id: String,
         work_attempt: Option<tracedecay_domain::WorkAttemptIdentityV1>,
     ) -> tracedecay_domain::DeliverySettlementAttemptV1 {
-        let attempted_at =
-            std::cmp::max(self.valid_at, tracedecay_application::clock::now_micros());
+        let attempted_at = std::cmp::max(self.valid_at, tracedecay_contracts::clock::now_micros());
         tracedecay_domain::DeliverySettlementAttemptV1 {
             owner_event_id,
             event_class: self.event_class,
@@ -550,7 +549,7 @@ impl DaemonWorkDeliveryDescriptorV1 {
         else {
             return Vec::new();
         };
-        let Some(tracedecay_application::WorkArtifactHydrationV1::Hydrated { attempts, .. }) =
+        let Some(tracedecay_contracts::WorkArtifactHydrationV1::Hydrated { attempts, .. }) =
             application_outcome_payload(outcome)
         else {
             return Vec::new();
@@ -563,17 +562,19 @@ impl DaemonWorkDeliveryDescriptorV1 {
 }
 
 fn application_outcome_payload<T>(
-    outcome: &tracedecay_application::ApplicationOutcome<T>,
+    outcome: &tracedecay_contracts::ApplicationOutcome<T>,
 ) -> Option<&T> {
     match outcome {
-        tracedecay_application::ApplicationOutcome::Evidence(result) => result.payload.as_ref(),
-        tracedecay_application::ApplicationOutcome::Preview(result) => result.payload.as_ref(),
-        tracedecay_application::ApplicationOutcome::Effect(result) => result.payload.as_ref(),
+        tracedecay_contracts::ApplicationOutcome::Evidence(result) => result.payload.as_ref(),
+        tracedecay_contracts::ApplicationOutcome::Preview(result) => result.payload.as_ref(),
+        tracedecay_contracts::ApplicationOutcome::Effect(result) => result.payload.as_ref(),
     }
 }
 
 fn offer_daemon_work_delivery(
-    recorder: Option<&Arc<tracedecay_usecases::observability::BoundedDeliverySettlementRecorderV1>>,
+    recorder: Option<
+        &Arc<tracedecay_application::observability::BoundedDeliverySettlementRecorderV1>,
+    >,
     attempt: Option<tracedecay_domain::DeliverySettlementAttemptV1>,
     outcome: tracedecay_domain::DeliverySettlementOutcomeV1,
     drop_reason: Option<tracedecay_domain::DeliveryDropReasonV1>,
@@ -586,17 +587,17 @@ fn offer_daemon_work_delivery(
     let settlement = tracedecay_domain::DeliverySettlementV1 {
         settled_at: std::cmp::max(
             attempt.attempted_at,
-            tracedecay_application::clock::now_micros(),
+            tracedecay_contracts::clock::now_micros(),
         ),
         attempt,
         outcome,
         drop_reason,
     };
     match recorder.try_record(settlement) {
-        Ok(tracedecay_usecases::observability::DeliverySettlementRecordOutcomeV1::Enqueued) => {
+        Ok(tracedecay_application::observability::DeliverySettlementRecordOutcomeV1::Enqueued) => {
             Ok(())
         }
-        Ok(tracedecay_usecases::observability::DeliverySettlementRecordOutcomeV1::DroppedAtCapacity) => {
+        Ok(tracedecay_application::observability::DeliverySettlementRecordOutcomeV1::DroppedAtCapacity) => {
             tracing::warn!("daemon Work delivery receipt was dropped at recorder capacity");
             Err(
                 tracedecay_daemon_protocol::DaemonInvocationDeliveryAckRejectReason::RecorderAtCapacity,
@@ -619,7 +620,9 @@ fn offer_daemon_work_delivery(
 /// this terminal ACK is observed by the daemon.
 fn settle_daemon_work_delivery(
     attempts: Option<&[tracedecay_domain::DeliverySettlementAttemptV1]>,
-    recorder: Option<&Arc<tracedecay_usecases::observability::BoundedDeliverySettlementRecorderV1>>,
+    recorder: Option<
+        &Arc<tracedecay_application::observability::BoundedDeliverySettlementRecorderV1>,
+    >,
     outcome: tracedecay_domain::DeliverySettlementOutcomeV1,
     drop_reason: Option<tracedecay_domain::DeliveryDropReasonV1>,
 ) -> std::result::Result<(), tracedecay_daemon_protocol::DaemonInvocationDeliveryAckRejectReason> {

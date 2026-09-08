@@ -154,7 +154,7 @@ pub async fn get_parse_offset(
             Ok(Some(ParseOffset {
                 byte_offset: encoding.decode(&row, 0, "decode transcript byte offset")?,
                 mtime: encoding.decode(&row, 1, "decode transcript mtime")?,
-                file_id: decode_file_id(&row, 2, "decode transcript file id")?,
+                file_id: decode_u64_bits(&row, 2, "decode transcript file id")?,
             }))
         }
         Err(error) if sqlite_missing_column(&error, "file_id") => {
@@ -195,13 +195,14 @@ fn sqlite_missing_column(error: &tracedecay_runtime_core::db::engine::Error, col
     }
 }
 
-/// The two reserved corpus authorities carry hash words, not ordered byte
-/// positions. Reuse the file-id bit codec for their full-width unsigned words;
+/// Reserved Codex corpus epochs and OpenCode generation/rewrite frontiers
+/// carry full-width digests or sentinels. Preserve their unsigned bit patterns;
 /// ordinary cursors keep checked signed storage and reject negative corruption.
 #[derive(Clone, Copy)]
 enum ParseOffsetEncoding {
     TranscriptCursor,
     CodexCorpusEpoch,
+    OpenCodeFrontier,
 }
 
 impl ParseOffsetEncoding {
@@ -209,6 +210,8 @@ impl ParseOffsetEncoding {
         match path {
             crate::runtime::source::CODEX_HISTORY_EPOCH_KEY
             | crate::runtime::ingest::USER_INGEST_CODEX_HISTORY_EPOCH_KEY => Self::CodexCorpusEpoch,
+            "host-frontier://opencode/content-generation/v1"
+            | "host-frontier://opencode/rewrite-rowid/v1" => Self::OpenCodeFrontier,
             _ => Self::TranscriptCursor,
         }
     }
@@ -221,7 +224,9 @@ impl ParseOffsetEncoding {
     ) -> Result<u64, TranscriptPersistenceError> {
         match self {
             Self::TranscriptCursor => decode_u64(row, index, operation),
-            Self::CodexCorpusEpoch => decode_file_id(row, index, operation),
+            Self::CodexCorpusEpoch | Self::OpenCodeFrontier => {
+                decode_u64_bits(row, index, operation)
+            }
         }
     }
 
@@ -232,7 +237,7 @@ impl ParseOffsetEncoding {
     ) -> Result<i64, TranscriptPersistenceError> {
         match self {
             Self::TranscriptCursor => encode_i64(value, operation),
-            Self::CodexCorpusEpoch => Ok(encode_file_id(value)),
+            Self::CodexCorpusEpoch | Self::OpenCodeFrontier => Ok(encode_u64_bits(value)),
         }
     }
 }
@@ -252,7 +257,7 @@ fn encode_i64(value: u64, operation: &'static str) -> Result<i64, TranscriptPers
     i64::try_from(value).map_err(|error| TranscriptPersistenceError::storage(operation, error))
 }
 
-fn decode_file_id(
+fn decode_u64_bits(
     row: &Row,
     index: i32,
     operation: &'static str,
@@ -260,14 +265,14 @@ fn decode_file_id(
     let value = row
         .get::<i64>(index)
         .map_err(|error| TranscriptPersistenceError::storage(operation, error))?;
-    Ok(decode_file_id_value(value))
+    Ok(decode_u64_bits_value(value))
 }
 
-fn encode_file_id(value: u64) -> i64 {
+fn encode_u64_bits(value: u64) -> i64 {
     i64::from_le_bytes(value.to_le_bytes())
 }
 
-fn decode_file_id_value(value: i64) -> u64 {
+fn decode_u64_bits_value(value: i64) -> u64 {
     u64::from_le_bytes(value.to_le_bytes())
 }
 
@@ -306,7 +311,7 @@ pub async fn set_parse_offset(
             path,
             encoding.encode(offset.byte_offset, "encode transcript byte offset")?,
             encoding.encode(offset.mtime, "encode transcript mtime")?,
-            encode_file_id(offset.file_id)
+            encode_u64_bits(offset.file_id)
         ],
     )
     .await
@@ -897,6 +902,11 @@ impl<D: SessionRegisteredDb + Sync> SessionStoreAccess<'_, D> {
         })
     }
 
+    /// The SQL ordering compares the stored signed encoding, so it is exact
+    /// for transcript positions and mtimes (never above `i64::MAX`); host
+    /// frontiers that carry sentinels or digests in these columns advance
+    /// through a changed `file_id` or a strictly greater revision `mtime`
+    /// (see `opencode_frontier`), never through the byte-offset comparison.
     #[hotpath::skip]
     async fn set_parse_offset_monotonic_in_existing_tx(
         conn: &impl Executor,
@@ -904,10 +914,8 @@ impl<D: SessionRegisteredDb + Sync> SessionStoreAccess<'_, D> {
         offset: ParseOffset,
     ) -> Result<(), String> {
         let path = path_identity_key(path);
-        if matches!(
-            ParseOffsetEncoding::for_path(&path),
-            ParseOffsetEncoding::CodexCorpusEpoch
-        ) {
+        let encoding = ParseOffsetEncoding::for_path(&path);
+        if matches!(encoding, ParseOffsetEncoding::CodexCorpusEpoch) {
             return Err("Codex corpus epochs require exact compare-and-set".to_owned());
         }
         conn.execute(
@@ -923,11 +931,13 @@ impl<D: SessionRegisteredDb + Sync> SessionStoreAccess<'_, D> {
                         AND excluded.byte_offset >= parse_offsets.byte_offset)",
             params![
                 path,
-                i64::try_from(offset.byte_offset)
-                    .map_err(|error| format!("encode transcript byte offset: {error}"))?,
-                i64::try_from(offset.mtime)
-                    .map_err(|error| format!("encode transcript mtime: {error}"))?,
-                encode_file_id(offset.file_id)
+                encoding
+                    .encode(offset.byte_offset, "encode transcript byte offset")
+                    .map_err(|error| error.to_string())?,
+                encoding
+                    .encode(offset.mtime, "encode transcript mtime")
+                    .map_err(|error| error.to_string())?,
+                encode_u64_bits(offset.file_id)
             ],
         )
         .await
@@ -963,8 +973,8 @@ mod tests {
     use tracedecay_store::{SessionMessageRecord, SessionRecord};
 
     use super::{
-        PayloadFileRollback, TranscriptBatch, TranscriptPersistenceError, decode_file_id_value,
-        encode_file_id, flush_transcript_statement_window, stage_full_transcript_messages,
+        PayloadFileRollback, TranscriptBatch, TranscriptPersistenceError, decode_u64_bits_value,
+        encode_u64_bits, flush_transcript_statement_window, stage_full_transcript_messages,
     };
 
     #[derive(Default)]
@@ -1013,11 +1023,52 @@ mod tests {
         }
     }
 
+    /// Every `parse_offsets` column round-trips the whole `u64` domain: the
+    /// Codex corpus epoch stores a 128-bit digest across `byte_offset` and
+    /// `mtime`, so any half with its top bit set must persist losslessly and
+    /// non-negative transcript positions must keep their identity encoding.
     #[test]
-    fn transcript_file_id_encoding_round_trips_the_full_u64_domain() {
-        for file_id in [0, i64::MAX as u64, (i64::MAX as u64) + 1, u64::MAX] {
-            assert_eq!(decode_file_id_value(encode_file_id(file_id)), file_id);
+    fn parse_offset_field_encoding_round_trips_the_full_u64_domain() {
+        for value in [0, 1, i64::MAX as u64, (i64::MAX as u64) + 1, u64::MAX] {
+            assert_eq!(decode_u64_bits_value(encode_u64_bits(value)), value);
         }
+        assert_eq!(
+            encode_u64_bits(7),
+            7,
+            "non-negative values keep their stored form"
+        );
+        assert!(
+            encode_u64_bits((i64::MAX as u64) + 1) < 0,
+            "the upper half maps onto the negative INTEGER range instead of failing"
+        );
+    }
+
+    #[test]
+    fn reserved_frontiers_preserve_bits_without_relaxing_ordinary_cursors() {
+        for path in [
+            crate::runtime::source::CODEX_HISTORY_EPOCH_KEY,
+            crate::runtime::ingest::USER_INGEST_CODEX_HISTORY_EPOCH_KEY,
+            "host-frontier://opencode/content-generation/v1",
+            "host-frontier://opencode/rewrite-rowid/v1",
+        ] {
+            let encoding = super::ParseOffsetEncoding::for_path(path);
+            for value in [0, i64::MAX as u64, (i64::MAX as u64) + 1, u64::MAX] {
+                assert_eq!(
+                    decode_u64_bits_value(
+                        encoding.encode(value, "test reserved frontier").unwrap()
+                    ),
+                    value,
+                    "reserved frontier {path}"
+                );
+            }
+        }
+        let cursor = super::ParseOffsetEncoding::for_path("/project/transcript.jsonl");
+        assert_eq!(
+            cursor.encode(i64::MAX as u64, "test cursor").unwrap(),
+            i64::MAX
+        );
+        assert!(cursor.encode((i64::MAX as u64) + 1, "test cursor").is_err());
+        assert!(cursor.encode(u64::MAX, "test cursor").is_err());
     }
 
     #[test]

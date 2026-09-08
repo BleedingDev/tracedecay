@@ -1,6 +1,6 @@
 //! Runtime pin surfaces and control-plane config helpers.
 //!
-//! Retrieval-profile evaluation stays in `tracedecay-usecases::config::retrieval`.
+//! Retrieval-profile evaluation stays in `tracedecay-application::config::retrieval`.
 //! The re-export rows below are surfaces `tracedecay-global-db` and
 //! `tracedecay-domain` already own, kept under the `crate::config::…`
 //! spelling so call sites share one import path.
@@ -281,6 +281,11 @@ fn semantic_config_from_snapshot(snapshot: &ConfigurationSnapshotV1) -> Result<S
             ))
         })?,
     };
+    // Structural only: this crate is catalog-free. Membership of
+    // `selected_model` is admitted at the configuration write boundary and
+    // again by the lifecycle owner on selection, so a persisted id the
+    // catalog no longer serves degrades semantics without blocking exact,
+    // lexical, or graph retrieval behind an unpublishable configuration.
     semantic.validate()?;
     Ok(semantic)
 }

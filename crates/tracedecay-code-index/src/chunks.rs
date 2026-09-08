@@ -20,13 +20,14 @@ use tracedecay_code_extraction::ExtractionArtifactV1;
 use tracedecay_domain::{
     BoundedSanitizedText, CanonicalRelationEdgeV1, ChunkLogicalIdentityV1, ChunkerRevision,
     CodeGenerationId, CodeSearchChunkAnchorV1, CodeSearchChunkGrainV1, CodeSearchChunkId,
-    CodeSearchChunkV1, ContentDigest, Edge, EdgeAuthorityV1, EdgeKind, ExactTechnicalTermKindV1,
-    ExactTechnicalTermV1, ExtractionAdmittedChunkV1, FileIdentityDigest, FileOccurrenceId,
-    LanguageDescriptorV1, MAX_CHUNK_TEXT_BYTES, Node, NodeKind, PolicyRevisionId,
+    CodeSearchChunkV1, ComplexityAnalysisV1, ContentDigest, Edge, EdgeAuthorityV1, EdgeKind,
+    ExactTechnicalTermKindV1, ExactTechnicalTermV1, ExtractionAdmittedChunkV1, FileIdentityDigest,
+    FileOccurrenceId, LanguageDescriptorV1, MAX_CHUNK_TEXT_BYTES, Node, NodeKind, PolicyRevisionId,
     RelationEdgeKindV1, RepositoryId, SanitizerRevision, SensitivityDecision, SensitivityLevelV1,
     SourceSpan, SymbolIdentityDigest, SymbolOccurrenceId, UnresolvedRef, ValidatedCodeFileV1,
     canonical_sha256, classify_technical_token, split_subtokens, technical_tokens,
 };
+use tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1;
 
 use super::{
     extract::{ExtractedCodeFileV1, ExtractionCancellation},
@@ -169,11 +170,14 @@ unsafe impl ExtractionAdmittedChunkV1 for ExtractionAdmittedCodeSearchChunkV1 {
 const PARALLEL_CHUNK_THRESHOLD: usize = 16;
 
 /// Map `operation` over every chunk, fanning out across the pool once the batch
-/// is large enough. Results are returned in chunk order and the reported
+/// is large enough. Each admitted unit meters against `background_cpu`; a
+/// standalone caller without an installed worker runtime passes `None` and
+/// runs unmetered. Results are returned in chunk order and the reported
 /// failure is always the lowest-index one, so the outcome is identical to the
 /// sequential sweep this replaces.
 #[hotpath::measure(label = "code_index.chunk.map_ordered")]
 fn map_chunks_ordered<T, F>(
+    background_cpu: Option<&Arc<ProcessBackgroundCpuV1>>,
     chunks: &[Arc<CodeSearchChunkV1>],
     operation: F,
 ) -> Result<Vec<T>, ChunkingFailureV1>
@@ -186,7 +190,7 @@ where
     }
     let results: Vec<Result<T, ChunkingFailureV1>> = chunks
         .par_iter()
-        .map(|chunk| crate::parallelism::with_background_cpu_permit(|| operation(chunk)))
+        .map(|chunk| crate::parallelism::with_permits_on(background_cpu, 1, || operation(chunk)))
         .collect::<Vec<_>>();
     results.into_iter().collect()
 }
@@ -195,6 +199,7 @@ where
 /// the pool once the batch is large enough. The lowest-index failure is
 /// returned, matching the sequential sweep's short-circuit outcome.
 fn try_for_each_chunk_ordered<F>(
+    background_cpu: Option<&Arc<ProcessBackgroundCpuV1>>,
     chunks: &[Arc<CodeSearchChunkV1>],
     operation: F,
 ) -> Result<(), ChunkingFailureV1>
@@ -208,7 +213,7 @@ where
         .par_iter()
         .enumerate()
         .filter_map(|(index, chunk)| {
-            crate::parallelism::with_background_cpu_permit(|| operation(chunk))
+            crate::parallelism::with_permits_on(background_cpu, 1, || operation(chunk))
                 .err()
                 .map(|error| (index, error))
         })
@@ -221,9 +226,11 @@ where
 
 impl ExactExtractionAuthorityV1 {
     fn mint(chunks: &[Arc<CodeSearchChunkV1>]) -> Result<Self, ChunkingFailureV1> {
-        let digests = map_chunks_ordered(chunks, |chunk| {
-            canonical_digest(EXACT_EXTRACTION_AUTHORITY_SEPARATOR, chunk)
-        })?;
+        let digests = map_chunks_ordered(
+            crate::parallelism::installed_background_cpu(),
+            chunks,
+            |chunk| canonical_digest(EXACT_EXTRACTION_AUTHORITY_SEPARATOR, chunk),
+        )?;
         let mut chunk_digests = BTreeMap::new();
         for (chunk, digest) in chunks.iter().zip(digests) {
             chunk_digests.insert(chunk.id.clone(), digest);
@@ -278,7 +285,11 @@ impl ExactExtractionAuthorityV1 {
             .unwrap_or(chunks.len());
         // The sequential sweep stopped at the first repeated identity, so only
         // the chunks ahead of it were ever digest-checked.
-        try_for_each_chunk_ordered(&chunks[..repeated_at], |chunk| self.validate_chunk(chunk))?;
+        try_for_each_chunk_ordered(
+            crate::parallelism::installed_background_cpu(),
+            &chunks[..repeated_at],
+            |chunk| self.validate_chunk(chunk),
+        )?;
         if repeated_at < chunks.len() {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
                 "chunk set repeats parser-backed exact extraction identity".to_owned(),
@@ -302,9 +313,12 @@ impl ExactExtractionAuthorityV1 {
         if chunks.len() < PARALLEL_CHUNK_THRESHOLD {
             return chunks.into_iter().map(|chunk| self.admit(chunk)).collect();
         }
+        let background_cpu = crate::parallelism::installed_background_cpu();
         let admitted = chunks
             .into_par_iter()
-            .map(|chunk| crate::parallelism::with_background_cpu_permit(|| self.admit(chunk)))
+            .map(|chunk| {
+                crate::parallelism::with_permits_on(background_cpu, 1, || self.admit(chunk))
+            })
             .collect::<Vec<_>>();
         admitted.into_iter().collect()
     }
@@ -367,16 +381,20 @@ impl CodeFileChunksV1 {
                 "document chunk membership does not match canonical chunk order".to_owned(),
             ));
         }
-        try_for_each_chunk_ordered(&self.chunks, |chunk| {
-            if chunk.anchor.generation_id != self.document.generation_id
-                || chunk.anchor.file_occurrence_id != self.document.file_occurrence_id
-            {
-                return Err(ChunkingFailureV1::GenerationMismatch);
-            }
-            chunk
-                .validate()
-                .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))
-        })
+        try_for_each_chunk_ordered(
+            crate::parallelism::installed_background_cpu(),
+            &self.chunks,
+            |chunk| {
+                if chunk.anchor.generation_id != self.document.generation_id
+                    || chunk.anchor.file_occurrence_id != self.document.file_occurrence_id
+                {
+                    return Err(ChunkingFailureV1::GenerationMismatch);
+                }
+                chunk
+                    .validate()
+                    .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))
+            },
+        )
     }
 
     /// Rebind carried-forward chunks to their next generation without
@@ -723,6 +741,7 @@ struct SymbolRow {
     branches: u32,
     loops: u32,
     max_nesting: u32,
+    complexity_analysis: ComplexityAnalysisV1,
     line_span: u32,
     start_line: u32,
     signature: Option<String>,
@@ -1257,6 +1276,7 @@ impl DeterministicCodeChunker {
             branches: u32,
             loops: u32,
             max_nesting: u32,
+            complexity_analysis: ComplexityAnalysisV1,
             line_span: u32,
             start_line: u32,
             signature: Option<String>,
@@ -1282,6 +1302,7 @@ impl DeterministicCodeChunker {
                     branches: node.branches,
                     loops: node.loops,
                     max_nesting: node.max_nesting,
+                    complexity_analysis: node.complexity_analysis,
                     line_span: node
                         .end_line
                         .saturating_sub(node.start_line)
@@ -1360,6 +1381,7 @@ impl DeterministicCodeChunker {
                 branches: node.branches,
                 loops: node.loops,
                 max_nesting: node.max_nesting,
+                complexity_analysis: node.complexity_analysis,
                 line_span: node.line_span,
                 start_line: node.start_line,
                 signature: node.signature.clone(),
@@ -1405,6 +1427,7 @@ impl DeterministicCodeChunker {
                 branches: row.branches,
                 loops: row.loops,
                 max_nesting: row.max_nesting,
+                complexity_analysis: row.complexity_analysis,
                 line_span: row.line_span,
                 start_line: row.start_line,
                 signature: row.signature.clone(),
@@ -2159,37 +2182,26 @@ mod tests {
     };
     use crate::intake::{CodeIndexIntake, SanitizedCodeIntake};
     use crate::languages::{LanguageRegistry, StaticLanguageRegistry};
-    use tracedecay_private_fs::background_cpu::{
-        install_process_background_cpu, process_background_cpu,
-    };
 
     struct AlwaysCancelled;
 
-    /// Installs the process-global background CPU authority at width 2. That
-    /// authority is set once per process and never uninstalled, so inside the
-    /// shared `--lib` binary every later test that nests
-    /// `with_background_cpu_permit` starves behind a width-2 gate; under
-    /// libtest fan-out that deadlocked the whole binary (159 threads parked in
-    /// futex waits for 16+ minutes). It therefore runs only in isolation:
-    /// `cargo test -p tracedecay-code-index --lib nested_chunk_fanout -- --ignored --test-threads=1`.
+    /// Stolen Rayon workers inside a nested chunk fan-out each take their own
+    /// admission and never exceed the injected width. The authority is local
+    /// to this test — nothing process-wide is installed, so it cannot gate
+    /// sibling tests in the shared `--lib` binary.
     #[test]
-    #[ignore = "installs the process-global background CPU width; run alone with --ignored --test-threads=1"]
     fn nested_chunk_fanout_admits_stolen_workers_without_exceeding_width() {
-        assert!(
-            process_background_cpu().is_none(),
-            "no test may install a shadow background CPU authority"
-        );
         let _preview = crate::parallelism::preview_worker_plan(
             tracedecay_domain::configuration::CodeIndexWorkerSelectionV1::Automatic {},
             20 * crate::parallelism::INDEX_WORKER_RESIDENT_BUDGET_BYTES_V1,
         );
         assert!(
-            process_background_cpu().is_none(),
-            "worker-plan preview must not install background CPU authority"
+            crate::parallelism::installed_background_cpu().is_none(),
+            "worker-plan preview must not install the worker runtime"
         );
-        let authority =
-            install_process_background_cpu(NonZeroUsize::new(2).expect("nonzero background width"))
-                .expect("background CPU authority");
+        let authority = Arc::new(ProcessBackgroundCpuV1::new(
+            NonZeroUsize::new(2).expect("nonzero background width"),
+        ));
         let fixture = chunk_source("pub fn shared_cpu_fixture() {}\n")
             .chunks
             .into_iter()
@@ -2207,9 +2219,9 @@ mod tests {
 
         let mapped = pool
             .install(|| {
-                crate::parallelism::with_background_cpu_permit(|| {
+                authority.with_permit(|| {
                     let parent = rayon::current_thread_index().expect("parent Rayon worker");
-                    map_chunks_ordered(&chunks, |_| {
+                    map_chunks_ordered(Some(&authority), &chunks, |_| {
                         let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                         maximum.fetch_max(current, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(5));
@@ -2282,6 +2294,7 @@ mod tests {
             branches: 0,
             loops: 0,
             max_nesting: 0,
+            complexity_analysis: ComplexityAnalysisV1::Complete,
             line_span: source[start..end].lines().count() as u32,
             start_line: source[..start].matches('\n').count() as u32,
             signature: None,
@@ -3341,6 +3354,168 @@ pub fn real_symbol() {}
             &unsupported_kind.reason,
             CodeIndexEdgeAbstentionReasonV1::UnsupportedRelationKind
         ));
+    }
+
+    /// Two same-line methods share kind, name, and start line; the parser must
+    /// still hand this path distinct endpoints so each `Contains`/`Calls`
+    /// relation binds to its own symbol instead of abstaining or cross-binding.
+    #[test]
+    fn same_line_symbols_bind_relations_to_their_own_occurrence() {
+        let compact = "struct A; struct B; fn alpha() {} fn beta() {} impl A { fn run() { alpha(); } } impl B { fn run() { beta(); } }\n";
+        let formatted = "struct A;\nstruct B;\nfn alpha() {}\nfn beta() {}\nimpl A {\n    fn run() {\n        alpha();\n    }\n}\nimpl B {\n    fn run() {\n        beta();\n    }\n}\n";
+
+        let index = |source: &str| {
+            let file = validated_file("src/lib.rs", source.as_bytes());
+            let batch = batch_for(&file, ParseOutcomeV1::Complete);
+            chunker()
+                .index_file(&file, &batch, &rust_descriptor(), &NeverCancelled)
+                .expect("indexing succeeds")
+        };
+        let relations = |artifacts: &CodeFileIndexArtifactsV1| {
+            let name_of = |occurrence: &SymbolOccurrenceId| {
+                artifacts
+                    .symbols
+                    .iter()
+                    .find(|symbol| &symbol.occurrence == occurrence)
+                    .map(|symbol| symbol.qualified_name.clone())
+                    .expect("edge endpoint names an indexed symbol")
+            };
+            artifacts
+                .edges
+                .iter()
+                .map(|edge| {
+                    (
+                        edge.kind,
+                        name_of(&edge.from_occurrence),
+                        name_of(&edge.to_occurrence),
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+        };
+
+        let artifacts = index(compact);
+        let runs = artifacts
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.kind == "method")
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            runs,
+            BTreeSet::from(["src/lib.rs::A::run", "src/lib.rs::B::run"])
+        );
+        let expected = BTreeSet::from([
+            (
+                RelationEdgeKindV1::Contains,
+                "src/lib.rs::A".to_owned(),
+                "src/lib.rs::A::run".to_owned(),
+            ),
+            (
+                RelationEdgeKindV1::Contains,
+                "src/lib.rs::B".to_owned(),
+                "src/lib.rs::B::run".to_owned(),
+            ),
+            (
+                RelationEdgeKindV1::Calls,
+                "src/lib.rs::A::run".to_owned(),
+                "src/lib.rs::alpha".to_owned(),
+            ),
+            (
+                RelationEdgeKindV1::Calls,
+                "src/lib.rs::B::run".to_owned(),
+                "src/lib.rs::beta".to_owned(),
+            ),
+        ]);
+        let actual = relations(&artifacts);
+        assert!(
+            actual.is_superset(&expected),
+            "missing relations: {:?}",
+            expected.difference(&actual).collect::<Vec<_>>()
+        );
+        assert!(
+            !actual.contains(&(
+                RelationEdgeKindV1::Calls,
+                "src/lib.rs::A::run".to_owned(),
+                "src/lib.rs::beta".to_owned(),
+            )),
+            "A::run must not be cross-bound to beta"
+        );
+        // The file node is not a symbol row, so its `Contains` edges always
+        // abstain; every symbol-to-symbol edge must bind.
+        let symbol_abstentions = artifacts
+            .edge_abstentions
+            .iter()
+            .filter(|abstention| !abstention.source_node_id.starts_with("file:"))
+            .collect::<Vec<_>>();
+        assert!(
+            symbol_abstentions.is_empty(),
+            "same-line naming must not produce missing-endpoint abstentions: {symbol_abstentions:?}"
+        );
+
+        // Reformatting onto separate lines changes extraction-local ids but
+        // neither the relations nor the declared logical symbol identities.
+        let reformatted = index(formatted);
+        assert_eq!(relations(&reformatted), actual);
+        let identities = |artifacts: &CodeFileIndexArtifactsV1| {
+            artifacts
+                .symbols
+                .iter()
+                .map(|symbol| (symbol.qualified_name.clone(), symbol.identity.clone()))
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(identities(&reformatted), identities(&artifacts));
+    }
+
+    /// A body larger than the extractor's traversal budget reaches this path
+    /// as an incomplete analysis: the lineage record carries the state and
+    /// offers no exact counters, while ordinary bodies stay exact.
+    #[test]
+    fn incomplete_complexity_walk_reaches_lineage_records_as_unavailable_counters() {
+        let mut source = String::from("pub fn huge(mut x: u64) -> u64 {\n");
+        for _ in 0..tracedecay_code_extraction::complexity::TRAVERSAL_BUDGET / 4 {
+            source.push_str("    x += 1;\n");
+        }
+        source.push_str("    if x > 3 { return x; }\n    x\n}\n\npub fn small(x: u64) -> u64 {\n    if x > 3 { return x; }\n    x\n}\n");
+        let file = validated_file("src/lib.rs", source.as_bytes());
+        let batch = batch_for(&file, ParseOutcomeV1::Complete);
+        let artifacts = chunker()
+            .index_file(&file, &batch, &rust_descriptor(), &NeverCancelled)
+            .expect("indexing succeeds");
+        let record = |name: &str| {
+            artifacts
+                .symbols
+                .iter()
+                .find(|symbol| symbol.qualified_name == format!("src/lib.rs::{name}"))
+                .unwrap_or_else(|| panic!("{name} lineage record"))
+        };
+
+        let huge = record("huge");
+        assert_eq!(
+            huge.complexity_analysis,
+            ComplexityAnalysisV1::TraversalBudgetExhausted
+        );
+        assert_eq!(
+            huge.exact_complexity(),
+            None,
+            "an incomplete walk must not surface counters as exact"
+        );
+        let wire = serde_json::to_value(huge).expect("lineage record");
+        assert_eq!(
+            wire["complexity_analysis"],
+            serde_json::json!("traversal_budget_exhausted")
+        );
+
+        let small = record("small");
+        assert_eq!(small.complexity_analysis, ComplexityAnalysisV1::Complete);
+        let exact = small.exact_complexity().expect("complete walk is exact");
+        assert_eq!((exact.branches, exact.max_nesting), (1, 2));
+        assert!(
+            serde_json::to_value(small)
+                .expect("lineage record")
+                .get("complexity_analysis")
+                .is_none(),
+            "complete records keep their pinned wire shape"
+        );
     }
 
     #[test]

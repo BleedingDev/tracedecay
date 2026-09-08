@@ -4,7 +4,7 @@ use std::process::Command;
 use super::*;
 use crate::daemon::ProjectServerRequirement;
 #[cfg(unix)]
-use tracedecay_application::doctor::{
+use tracedecay_contracts::doctor::{
     DoctorReportV1, SemanticOwnerPrerequisiteV1, SemanticOwnerStateV1,
 };
 
@@ -146,7 +146,8 @@ async fn assert_fresh_project_open_owners(label: &str, git_state: ProjectGitStat
     assert_eq!(
         feedback_cycle.is_some(),
         matches!(git_state, ProjectGitState::Committed),
-        "feedback cycle presence must follow exact committed Git identity"
+        "feedback cycle presence must follow exact committed Git identity for {}",
+        canonical_project.display(),
     );
     assert!(
         crate::daemon::hook_v2_replay::hook_v2_replay_consumer_registered(&replay_root),
@@ -2104,11 +2105,11 @@ async fn released_automation_tombstone_allows_one_eventual_replacement() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn first_memory_call_precedes_full_owner_registration() {
-    use tracedecay_application::retained_surfaces::{
+    use tracedecay_contracts::retained_surfaces::{
         FactProjectionV1, FactStoreAddCommitV1, FactStoreAddResultV1, FactStoreGetResultV1,
         MemoryStatusResultV1, RetainedSurfaceRequestV1,
     };
-    use tracedecay_application::{CancellationContext, Deadline, now_micros};
+    use tracedecay_contracts::{CancellationContext, Deadline, now_micros};
     use tracedecay_daemon_protocol::{DaemonInvocationOutcome, DaemonInvocationRequest};
     use tracedecay_domain::UtcMicros;
 

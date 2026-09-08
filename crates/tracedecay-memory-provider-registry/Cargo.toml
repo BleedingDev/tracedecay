@@ -28,18 +28,9 @@ tiktoken-rs = "0.12"
 # `macros` for the one biased race that boundary settles worker completion,
 # caller cancellation, and the deadline in.
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync", "time"] }
-# Contract surface only: port traits and value types.
-#
-# `default-features = false` states this crate's own intent and stops a future
-# `default` feature set from widening the edge. It does NOT make the linked
-# crate capability-free: Cargo unifies features per compiled crate instance,
-# `tracedecay-application` mounts a gix historical-blob reader behind its
-# optional `native-git` feature, and crates/tracedecay/Cargo.toml enables that
-# feature in the production root graph. What actually bounds this crate is the
-# source-import contract in product/architecture/memory-dependency-policy.json,
-# which admits an exact list of `tracedecay_application::` item paths and
-# refuses `NativeHistoricalBlobReaderV1` and everything else.
-tracedecay-application = { path = "../tracedecay-application", version = "0.1.0", default-features = false }
+# Transport-neutral recall ports, request context, and clock contracts only.
+# Runtime execution and historical-blob readers remain outside this crate.
+tracedecay-contracts = { path = "../tracedecay-contracts", version = "0.1.0", default-features = false }
 tracedecay-memory-fabric = { path = "../tracedecay-memory-fabric" }
 tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
 tracedecay-memory-provider-native = { path = "../tracedecay-memory-provider-native" }

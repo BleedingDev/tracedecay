@@ -12,18 +12,20 @@ use super::project_open_admission::ProjectOpenWaitOutcome;
 use super::*;
 use std::future::Future;
 use tracedecay_code_index_runtime::git_transactions;
+use tracedecay_contracts::SharedProfileStoreLocatorV1;
 use tracedecay_daemon_service::{
     DaemonInvocationOperation, DaemonInvocationPayload, DaemonInvocationProblem,
     DaemonInvocationService, Lease, SemanticInvocationControlV1,
 };
 use tracedecay_runtime_core::cancellation::CancellationToken;
+use tracedecay_store::StoreShardScopeV1;
 
 fn semantic_invocation_interruption_response(
     request_id: &str,
     control: Option<&SemanticInvocationControlV1>,
 ) -> Option<DaemonInvocationResponse> {
     control
-        .and_then(|control| control.interruption(tracedecay_application::clock::now_micros()))
+        .and_then(|control| control.interruption(tracedecay_contracts::clock::now_micros()))
         .map(|problem| {
             DaemonInvocationResponse::application_problem(request_id.to_owned(), problem)
         })
@@ -74,27 +76,27 @@ async fn await_project_open_with_semantic_control<Output>(
     control: Option<&SemanticInvocationControlV1>,
     request_cancellation: Option<&CancellationToken>,
     project_open: impl Future<Output = Output>,
-) -> std::result::Result<Output, tracedecay_application::ApplicationProblem> {
+) -> std::result::Result<Output, tracedecay_contracts::ApplicationProblem> {
     let Some(control) = control else {
         return Ok(project_open.await);
     };
-    if let Some(problem) = control.interruption(tracedecay_application::clock::now_micros()) {
+    if let Some(problem) = control.interruption(tracedecay_contracts::clock::now_micros()) {
         return Err(problem);
     }
     if request_cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return Err(tracedecay_application::ApplicationProblem::cancelled_before_admission());
+        return Err(tracedecay_contracts::ApplicationProblem::cancelled_before_admission());
     }
-    let remaining = control.remaining(tracedecay_application::clock::now_micros())?;
+    let remaining = control.remaining(tracedecay_contracts::clock::now_micros())?;
     let deadline = tokio::time::Instant::now()
         .checked_add(remaining)
         .ok_or_else(
-            || tracedecay_application::ApplicationProblem::InvalidRequest {
-                diagnostic: tracedecay_application::SafeDiagnostic {
+            || tracedecay_contracts::ApplicationProblem::InvalidRequest {
+                diagnostic: tracedecay_contracts::SafeDiagnostic {
                     code: "semantic_evaluation_deadline_out_of_range".to_owned(),
                     message: "The semantic evaluation deadline is outside the supported range"
                         .to_owned(),
                 },
-                retry: tracedecay_application::RetryDirective::Never,
+                retry: tracedecay_contracts::RetryDirective::Never,
                 legal_actions: Vec::new(),
             },
         )?;
@@ -107,20 +109,20 @@ async fn await_project_open_with_semantic_control<Output>(
                 None => std::future::pending::<()>().await,
             }
         } => {
-            Err(tracedecay_application::ApplicationProblem::cancelled_before_admission())
+            Err(tracedecay_contracts::ApplicationProblem::cancelled_before_admission())
         }
         () = tokio::time::sleep_until(deadline) => {
-            Err(tracedecay_application::ApplicationProblem::TimedOut {
-                stage: tracedecay_application::CancellationStage::BeforeAdmission,
-                retry: tracedecay_application::RetryDirective::Never,
+            Err(tracedecay_contracts::ApplicationProblem::TimedOut {
+                stage: tracedecay_contracts::CancellationStage::BeforeAdmission,
+                retry: tracedecay_contracts::RetryDirective::Never,
                 legal_actions: Vec::new(),
             })
         }
         output = &mut project_open => {
             if request_cancellation.is_some_and(CancellationToken::is_cancelled) {
-                Err(tracedecay_application::ApplicationProblem::cancelled_before_admission())
+                Err(tracedecay_contracts::ApplicationProblem::cancelled_before_admission())
             } else if let Some(problem) =
-                control.interruption(tracedecay_application::clock::now_micros())
+                control.interruption(tracedecay_contracts::clock::now_micros())
             {
                 Err(problem)
             } else {
@@ -133,7 +135,7 @@ async fn await_project_open_with_semantic_control<Output>(
 async fn await_lsp_project_open_upgrade(
     project_open_gates: &Arc<tokio::sync::Mutex<ProjectOpenGates>>,
     route: &ProjectRouteKey,
-    deadline: &tracedecay_application::Deadline,
+    deadline: &tracedecay_contracts::Deadline,
     request_cancellation: &CancellationToken,
 ) -> ProjectOpenWaitOutcome {
     project_open_tasks(project_open_gates.as_ref())
@@ -143,38 +145,38 @@ async fn await_lsp_project_open_upgrade(
 }
 
 async fn await_lsp_route_rejoin<Output>(
-    deadline: &tracedecay_application::Deadline,
+    deadline: &tracedecay_contracts::Deadline,
     request_cancellation: &CancellationToken,
     route_read: impl Future<Output = Output>,
-) -> std::result::Result<Output, tracedecay_application::ApplicationProblem> {
+) -> std::result::Result<Output, tracedecay_contracts::ApplicationProblem> {
     if request_cancellation.is_cancelled() {
-        return Err(tracedecay_application::ApplicationProblem::cancelled_before_admission());
+        return Err(tracedecay_contracts::ApplicationProblem::cancelled_before_admission());
     }
-    let now = tracedecay_application::clock::now_micros();
+    let now = tracedecay_contracts::clock::now_micros();
     let remaining_micros = deadline
         .expires_at
         .0
         .checked_sub(now.0)
         .filter(|remaining| *remaining > 0)
-        .ok_or_else(tracedecay_application::ApplicationProblem::timed_out_before_admission)?;
+        .ok_or_else(tracedecay_contracts::ApplicationProblem::timed_out_before_admission)?;
     let remaining_micros = u64::try_from(remaining_micros)
-        .map_err(|_| tracedecay_application::ApplicationProblem::timed_out_before_admission())?;
+        .map_err(|_| tracedecay_contracts::ApplicationProblem::timed_out_before_admission())?;
     let sleep = tokio::time::sleep(Duration::from_micros(remaining_micros));
     tokio::pin!(sleep);
     tokio::pin!(route_read);
     tokio::select! {
         biased;
         () = request_cancellation.cancelled() => {
-            Err(tracedecay_application::ApplicationProblem::cancelled_before_admission())
+            Err(tracedecay_contracts::ApplicationProblem::cancelled_before_admission())
         }
         () = &mut sleep => {
-            Err(tracedecay_application::ApplicationProblem::timed_out_before_admission())
+            Err(tracedecay_contracts::ApplicationProblem::timed_out_before_admission())
         }
         output = &mut route_read => {
             if request_cancellation.is_cancelled() {
-                Err(tracedecay_application::ApplicationProblem::cancelled_before_admission())
-            } else if deadline.is_elapsed_at(tracedecay_application::clock::now_micros()) {
-                Err(tracedecay_application::ApplicationProblem::timed_out_before_admission())
+                Err(tracedecay_contracts::ApplicationProblem::cancelled_before_admission())
+            } else if deadline.is_elapsed_at(tracedecay_contracts::clock::now_micros()) {
+                Err(tracedecay_contracts::ApplicationProblem::timed_out_before_admission())
             } else {
                 Ok(output)
             }
@@ -196,11 +198,11 @@ fn lsp_project_open_wait_response(
         )),
         ProjectOpenWaitOutcome::Cancelled => Some(DaemonInvocationResponse::application_problem(
             request_id.to_owned(),
-            tracedecay_application::ApplicationProblem::cancelled_before_admission(),
+            tracedecay_contracts::ApplicationProblem::cancelled_before_admission(),
         )),
         ProjectOpenWaitOutcome::TimedOut => Some(DaemonInvocationResponse::application_problem(
             request_id.to_owned(),
-            tracedecay_application::ApplicationProblem::timed_out_before_admission(),
+            tracedecay_contracts::ApplicationProblem::timed_out_before_admission(),
         )),
     }
 }
@@ -468,7 +470,7 @@ pub(super) async fn write_tool_list_changed_notification(
 /// registered" from "this root is registered but its LSP owner answers for a
 /// different checkout".
 fn multi_root_root_refused(
-    selector: &tracedecay_application::RegisteredRootSelectorV1,
+    selector: &tracedecay_contracts::RegisteredRootSelectorV1,
     reason_code: &str,
 ) {
     log_daemon_event(
@@ -484,12 +486,12 @@ fn multi_root_root_refused(
 pub(super) async fn resolve_multi_root_projects(
     store_administration: &StoreAdministration,
     service: &DaemonInvocationService,
-    selectors: &[tracedecay_application::RegisteredRootSelectorV1],
+    selectors: &[tracedecay_contracts::RegisteredRootSelectorV1],
 ) -> std::result::Result<
     Vec<(
         PathBuf,
-        tracedecay_application::ResolvedScope,
-        tracedecay_application::RegisteredRootLocatorV1,
+        tracedecay_contracts::ResolvedScope,
+        tracedecay_contracts::RegisteredRootLocatorV1,
     )>,
     DaemonInvocationProblem,
 > {
@@ -497,23 +499,22 @@ pub(super) async fn resolve_multi_root_projects(
         .registered_profile_database()
         .await
         .map_err(|_| DaemonInvocationProblem::Unavailable)?;
-    let profile_id = store_administration
+    let profile_identity = store_administration
         .profile_identity()
-        .map_err(|_| DaemonInvocationProblem::Unavailable)?
-        .profile_id()
-        .clone();
-    // `SharedProfileStoreLocatorV1` names the one physical profile store every
-    // registered root of this profile resolves through, and an authorized
-    // scope set refuses roots that do not share it. The registry's
-    // `store_instances.store_id` is per project (`store:<project>:<mode>`), so
-    // stamping it here made every federated workspace that spans two projects
-    // — the only kind this resolver builds — fail closed on its own locator.
-    // The profile lease's verified locator is that shared store authority.
-    let profile_store_id = database
-        .verified_locator()
-        .locator_digest
-        .as_str()
-        .to_owned();
+        .map_err(|_| DaemonInvocationProblem::Unavailable)?;
+    let profile_shard = &database.binding().shard_id;
+    if profile_shard.scope != StoreShardScopeV1::Profile
+        || &profile_shard.brain_id != profile_identity.brain_id()
+        || &profile_shard.profile_id != profile_identity.profile_id()
+    {
+        return Err(DaemonInvocationProblem::Unavailable);
+    }
+    let profile_locator = SharedProfileStoreLocatorV1::new(
+        profile_shard.brain_id.clone(),
+        profile_shard.profile_id.clone(),
+        database.verified_locator().locator_digest.as_str(),
+    )
+    .map_err(|_| DaemonInvocationProblem::Unavailable)?;
     let mut roots = Vec::with_capacity(selectors.len());
     for selector in selectors {
         let context = database
@@ -564,10 +565,9 @@ pub(super) async fn resolve_multi_root_projects(
             multi_root_root_refused(selector, reason_code);
             return Err(DaemonInvocationProblem::NotFoundOrNotAuthorized);
         }
-        let locator = tracedecay_application::RegisteredRootLocatorV1::new(
+        let locator = tracedecay_contracts::RegisteredRootLocatorV1::new(
             selector.project_id.clone(),
-            profile_id.clone(),
-            profile_store_id.clone(),
+            profile_locator.clone(),
             root.clone(),
         )
         .map_err(|_| DaemonInvocationProblem::Unavailable)?;
@@ -777,33 +777,33 @@ fn project_open_problem(
 #[cfg(test)]
 mod semantic_control_tests {
     use super::*;
-    use tracedecay_application::ApplicationProblemKind;
+    use tracedecay_contracts::ApplicationProblemKind;
 
     fn active_control(deadline_offset_micros: i64) -> SemanticInvocationControlV1 {
-        let observed_at = tracedecay_application::clock::now_micros();
+        let observed_at = tracedecay_contracts::clock::now_micros();
         SemanticInvocationControlV1::new(
             observed_at,
-            tracedecay_application::Deadline::new(tracedecay_domain::UtcMicros(
+            tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(
                 observed_at
                     .0
                     .checked_add(deadline_offset_micros)
                     .expect("test deadline"),
             ))
             .expect("valid deadline"),
-            tracedecay_application::CancellationContext::active("semantic-project-open-active")
+            tracedecay_contracts::CancellationContext::active("semantic-project-open-active")
                 .expect("active cancellation"),
         )
     }
 
     fn cancelled_control() -> SemanticInvocationControlV1 {
-        let observed_at = tracedecay_application::clock::now_micros();
+        let observed_at = tracedecay_contracts::clock::now_micros();
         SemanticInvocationControlV1::new(
             observed_at,
-            tracedecay_application::Deadline::new(tracedecay_domain::UtcMicros(
+            tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(
                 observed_at.0.checked_add(1_000_000).expect("test deadline"),
             ))
             .expect("valid deadline"),
-            tracedecay_application::CancellationContext::cancelled(
+            tracedecay_contracts::CancellationContext::cancelled(
                 "semantic-project-open-cancelled",
                 observed_at,
             )

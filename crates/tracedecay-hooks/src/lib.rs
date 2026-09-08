@@ -11,9 +11,9 @@
 pub mod admission_ledger;
 pub mod capture;
 pub mod config;
-mod contention;
 pub mod core_events;
 pub mod delivery_spool;
+mod lock_admission;
 pub mod native;
 pub mod runtime;
 pub mod spool;
@@ -23,7 +23,8 @@ pub use admission_ledger::{
     HookAdmissionLedgerV1,
 };
 pub use capture::{
-    NativeHookCaptureOutcomeV1, NativeHookCaptureSourceV1, capture_native_event_for_replay,
+    NativeHookCaptureOutcomeV1, NativeHookCaptureSourceV1,
+    capture_native_event_with_delivery_writer, native_hook_delivery_settlement,
 };
 pub use config::{
     HOOK_CONFIGURATION_SCHEMA_VERSION, HookConfigurationFileReaderV1,

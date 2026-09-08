@@ -13,10 +13,10 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use recall_fixture::*;
-use tracedecay_application::memory::{
+use tracedecay_contracts::memory::{
     CognitiveRecallDegradation, CognitiveRecallPort, CognitiveRecallRequest,
 };
-use tracedecay_application::{
+use tracedecay_contracts::{
     CancellationContext, CancellationSignal, Deadline, RequestId, ResolvedScope, now_micros,
 };
 use tracedecay_domain::{ProjectId, RefId, RepositoryId, UtcMicros, WorktreeId};
@@ -1648,7 +1648,7 @@ fn compose_with_observer(
 /// upstream provider envelope one layer below and would not detect an
 /// observer-dependent transformation applied during admission, normalization,
 /// selection, or bridging.
-fn product_output_sha256(result: &tracedecay_application::memory::CognitiveRecallResult) -> String {
+fn product_output_sha256(result: &tracedecay_contracts::memory::CognitiveRecallResult) -> String {
     let canonical = serde_json::to_vec(result).expect("canonical product output");
     sha256_hex(&canonical)
 }
@@ -1658,10 +1658,7 @@ fn product_output_sha256(result: &tracedecay_application::memory::CognitiveRecal
 async fn product_output(
     composition: Arc<ProjectMemoryProviderComposition>,
     scope: ResolvedScope,
-) -> (
-    tracedecay_application::memory::CognitiveRecallResult,
-    String,
-) {
+) -> (tracedecay_contracts::memory::CognitiveRecallResult, String) {
     let port = mount(composition, Arc::new(LedgerObserver::default())).expect("mounted port");
     let outcome = port
         .recall_admitted(request(scope, 60_000_000, false), &live_signal())

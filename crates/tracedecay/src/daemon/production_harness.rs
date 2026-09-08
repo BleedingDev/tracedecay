@@ -387,24 +387,6 @@ async fn install_production_composition_stores(
     #[cfg(not(test))]
     let _ = long_lived_session_maintenance_for_test;
     let invocation = DaemonInvocationState::default();
-    // The daemon bootstrap installs the Codex shared-JSONL preparation
-    // authority right after creating the invocation state; without it every
-    // transcript ingest refuses as background-resource unavailable. The
-    // authority is a process singleton (a daemon restart is a new process),
-    // so an in-process harness reopen must rejoin the memory authority the
-    // first open installed rather than install a fresh one.
-    static HARNESS_CODEX_PREPARATION_MEMORY: std::sync::OnceLock<
-        Arc<tracedecay_runtime_core::resident_memory::ProcessResidentMemoryV1>,
-    > = std::sync::OnceLock::new();
-    let preparation_memory = Arc::clone(
-        HARNESS_CODEX_PREPARATION_MEMORY
-            .get_or_init(|| invocation.code_index_schedulers.process_resident_memory()),
-    );
-    store_administration
-        .configure_codex_preparation_resources(preparation_memory)
-        .map_err(|error| TraceDecayError::Config {
-            message: format!("failed to configure Codex preparation resources: {error}"),
-        })?;
     invocation.configure_github_read_only_credentials(&profile_identity);
     let http_application_registry = http_application::DaemonHttpApplicationRegistry::default();
     let project_open_gates = Arc::new(tokio::sync::Mutex::new(ProjectOpenGates::default()));
@@ -437,8 +419,19 @@ async fn install_production_composition_profile_workers(
             let profile_sessions = store_administration
                 .registered_profile_session_database()
                 .await?;
+            // Installing the worker plan also mounts the Codex shared-JSONL
+            // preparation resources; without them every transcript ingest
+            // refuses as background-resource unavailable. The process-wide
+            // preparation authority keeps the first resources mounted (a
+            // daemon restart is a new process), so an in-process harness
+            // reopen rejoins them while its own store administration retains
+            // the same one process CPU authority.
             invocation
-                .install_profile_worker_plan(profile_sessions, profile_identity.profile_id())
+                .install_profile_worker_plan(
+                    store_administration,
+                    profile_sessions,
+                    profile_identity.profile_id(),
+                )
                 .await?;
             store_administration.install_remote_recovery_project_lifecycle(
                 invocation.clone(),
@@ -963,6 +956,28 @@ impl ProductionProjectCompositionHarnessV1 {
             })
     }
 
+    /// The mounted project's current configuration revision: the CAS token
+    /// every configuration mutation tool requires, so a journey can write a
+    /// project setting through the production `tracedecay_configuration_*`
+    /// surface instead of a private store path.
+    #[hotpath::skip]
+    pub async fn configuration_revision(&self, project_root: impl AsRef<Path>) -> Result<String> {
+        let project_root = project_root.as_ref().to_path_buf();
+        let graph = self.server(&project_root)?.cg().await;
+        let current = graph
+            .configuration_runtime()
+            .client()
+            .current()
+            .await
+            .map_err(|error| TraceDecayError::Config {
+                message: format!(
+                    "production-composition project '{}' has no current configuration: {error}",
+                    project_root.display()
+                ),
+            })?;
+        Ok(current.revision_id().as_str().to_owned())
+    }
+
     #[hotpath::measure(label = "daemon.harness.track_worktree_branch", future = true)]
     pub async fn track_worktree_branch(
         &self,
@@ -1042,8 +1057,16 @@ impl ProductionProjectCompositionHarnessV1 {
 async fn wait_for_production_composition_code_index(
     invocation: &DaemonInvocationState,
     project_root: &Path,
-    scope: &tracedecay_application::ResolvedScope,
+    scope: &tracedecay_contracts::ResolvedScope,
 ) -> Result<()> {
+    // A linked worktree without the `sync.watch_linked_worktrees` opt-in
+    // serves but never indexes: no publication can satisfy this wait, and the
+    // daemon's own deferred owners answer that admission at spawn time rather
+    // than parking on it. Mount the composition the same way; reads then report
+    // the typed `linked_worktree_disabled` state.
+    if super::project_open_owners::code_index_disabled_for_scope(invocation, scope) {
+        return Ok(());
+    }
     let wait_started = Instant::now();
     let publication = timeout(Duration::from_secs(20), async {
         loop {
@@ -1410,6 +1433,94 @@ mod code_index_activation_test {
                     .any(|result| result["display"]["name"] == json!("indexed_symbol"))
             }),
             "fresh-profile production search did not serve the indexed symbol: {query}"
+        );
+        harness.shutdown().await;
+    }
+
+    /// A linked worktree mounted without the `sync.watch_linked_worktrees`
+    /// opt-in is the typed `linked_worktree_disabled` route: the composition
+    /// must open on it (the daemon does), not exhaust the publication wait
+    /// for a generation that admission forbids.
+    #[tokio::test(flavor = "multi_thread")]
+    #[hotpath::skip]
+    async fn linked_worktree_without_opt_in_mounts_as_the_typed_disabled_route() {
+        let isolation = TempDir::new().expect("production harness isolation");
+        let primary = isolation.path().join("primary");
+        std::fs::create_dir_all(&primary).expect("primary root");
+        std::fs::write(primary.join("lib.rs"), "pub fn indexed_symbol() {}\n")
+            .expect("primary source");
+        let linked = isolation.path().join("linked");
+        let linked_arg = linked.to_string_lossy().into_owned();
+        for arguments in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=TraceDecay Test",
+                "-c",
+                "user.email=tracedecay@example.invalid",
+                "commit",
+                "-qm",
+                "seed project",
+            ],
+            vec!["worktree", "add", "-q", "-b", "linked", &linked_arg],
+        ] {
+            let status = Command::new(
+                tracedecay_runtime_core::git::try_git_program()
+                    .expect("absolute git executable should resolve"),
+            )
+            .args(&arguments)
+            .current_dir(&primary)
+            .status()
+            .expect("git fixture command");
+            assert!(status.success(), "git {arguments:?}");
+        }
+
+        let harness = ProductionProjectCompositionHarnessV1::open(
+            isolation.path(),
+            [primary.clone(), linked.clone()],
+        )
+        .await
+        .expect("a disabled linked route mounts without a publication");
+        let schedulers = &harness
+            .resources
+            .as_ref()
+            .expect("live harness")
+            .invocation
+            .code_index_schedulers;
+        let project_id = tracedecay_domain::ProjectId::new(
+            harness
+                .project_id(&linked)
+                .await
+                .expect("linked project identity"),
+        )
+        .expect("typed project identity");
+        let linked_scope =
+            tracedecay_code_index_runtime::resolved_scope_for_project(&linked, &project_id)
+                .expect("linked route scope");
+        assert_eq!(
+            schedulers.automatic_admission_for_scope(&linked_scope),
+            Some(
+                tracedecay_code_index_runtime::code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled
+            )
+        );
+        assert!(schedulers.latest_generation_id(&primary).await.is_some());
+        assert!(schedulers.latest_generation_id(&linked).await.is_none());
+        let payload = super::journey_test_support::tool_payload(
+            &harness
+                .call_tool(
+                    &linked,
+                    "tracedecay_search",
+                    json!({ "query": "indexed_symbol", "limit": 1, "format": "json" }),
+                )
+                .await
+                .expect("linked-route search response"),
+        );
+        assert_eq!(payload["status"], json!("unavailable"), "{payload}");
+        assert_eq!(
+            payload["reason"],
+            json!("linked_worktree_disabled"),
+            "{payload}"
         );
         harness.shutdown().await;
     }

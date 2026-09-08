@@ -796,6 +796,16 @@ export type CommitId = z.infer<typeof CommitIdSchema>;
 export const ComparisonDispositionV1Schema = z.enum(["insufficient_evidence", "promote", "reject"]);
 export type ComparisonDispositionV1 = z.infer<typeof ComparisonDispositionV1Schema>;
 
+/** Whether the bounded complexity walk over a symbol's body ran to the end.
+
+The extractor stops walking a body once its traversal budget is spent. The
+counters accumulated by then are lower bounds over the visited prefix, not
+facts about the whole body, so every surface that prints, ranks, or
+aggregates complexity must render this state instead of treating those
+counters as exact. */
+export const ComplexityAnalysisV1Schema = z.union([z.literal("complete"), z.literal("traversal_budget_exhausted")]);
+export type ComplexityAnalysisV1 = z.infer<typeof ComplexityAnalysisV1Schema>;
+
 /** Strongly typed canonical identity: `ComponentVersion`. */
 export const ComponentVersionSchema = z.string();
 export type ComponentVersion = z.infer<typeof ComponentVersionSchema>;
@@ -2435,6 +2445,7 @@ export const GraphNodeV1Schema = z.object({
   assertions: z.number().int().safe().nullable(),
   attrs_start_line: z.number().int().safe().nullable(),
   branches: z.number().int().safe().nullable(),
+  complexity_analysis: z.union([z.lazy(() => ComplexityAnalysisV1Schema), z.null()]),
   degree: z.number().int().safe().nullable(),
   doc: z.string().nullable(),
   edge_kind: z.string().nullable(),
@@ -4412,11 +4423,12 @@ export const SettingsPayloadV1Schema = z.object({
 });
 export type SettingsPayloadV1 = z.infer<typeof SettingsPayloadV1Schema>;
 
-/** Shared physical profile-store locator supplied by the profile authority.
+/** Logical and verified physical identity of the shared Profile shard.
 
-The typed profile and store IDs select this locator. It never derives an
-identity from a path, CWD, active graph, or mutable project alias. */
+Brain and profile IDs select the shard; the verified store locator binds its
+physical store. Lease incarnations and authority epochs remain runtime fences. */
 export const SharedProfileStoreLocatorV1Schema = z.object({
+  brain_id: z.lazy(() => BrainIdSchema),
   profile_id: z.lazy(() => UserProfileIdSchema),
   store_id: z.string(),
 }).strict();

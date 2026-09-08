@@ -49,7 +49,7 @@ pub(super) enum CombinedEffectAdmission {
         skill: Box<AutomationSettledTerminal>,
     },
     Conflict,
-    PreAdmissionProblem(Vec<tracedecay_application::ApplicationProblemEnvelope>),
+    PreAdmissionProblem(Vec<tracedecay_contracts::ApplicationProblemEnvelope>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1107,9 +1107,7 @@ mod tests {
 
     use fs2::FileExt;
     use tempfile::TempDir;
-    use tracedecay_application::{
-        CancellationSignal, ObservabilityHorizonV1, ObservabilityQueryPort, ObservabilityQueryV1,
-    };
+    use tracedecay_application::observability::RegisteredObservabilityPortV1;
     use tracedecay_automation_runtime::automation::AutomationRunControl;
     use tracedecay_automation_runtime::automation::backend::{
         AgentTaskBackend, AgentTaskKind, AgentTaskRequest, AgentTaskResponse,
@@ -1124,11 +1122,13 @@ mod tests {
         CombinedReviewAutomationOptions, RetainedAutomationSettlementDisposition,
         run_skill_writer_with_backend_and_retrieval,
     };
+    use tracedecay_contracts::{
+        CancellationSignal, ObservabilityHorizonV1, ObservabilityQueryPort, ObservabilityQueryV1,
+    };
     use tracedecay_domain::{
         AutomationTerminalV1, ManifestDigest, ObservabilityPayloadV1, ProjectId, RunId, SessionId,
         canonical_sha256,
     };
-    use tracedecay_usecases::observability::RegisteredObservabilityPortV1;
 
     use super::{
         AdmissionState, AutomationEffectAdmission, CombinedEffectAdmission, CombinedEffectOutcome,
@@ -1152,13 +1152,9 @@ mod tests {
     impl CombinedAdmissionFixture {
         async fn new() -> Self {
             let temp = TempDir::new().expect("combined admission fixture");
-            // The fixture initializes the project under this root and then
-            // re-reads it canonicalized; on macOS (`/var` -> `/private/var`)
-            // the two spellings register two authorities for one typed project
-            // and `project_sessions` is refused as `DuplicateProjectAuthority`.
-            let base = tracedecay_runtime_core::lifecycle_lease::canonical_or_original(temp.path());
-            let project_root = base.join("project");
-            let profile_root = base.join("profile");
+            let fixture_root = temp.path().canonicalize().expect("canonical fixture root");
+            let project_root = fixture_root.join("project");
+            let profile_root = fixture_root.join("profile");
             std::fs::create_dir_all(project_root.join("src"))
                 .expect("combined admission source directory");
             std::fs::write(project_root.join("src/lib.rs"), "pub fn fixture() {}\n")
@@ -1189,7 +1185,7 @@ mod tests {
                 &project_id,
             )
             .expect("combined admission scope");
-            let observed_at = tracedecay_application::now_micros();
+            let observed_at = tracedecay_contracts::now_micros();
             let configuration = memory
                 .configuration_runtime()
                 .client()

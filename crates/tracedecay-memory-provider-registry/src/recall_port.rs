@@ -57,12 +57,12 @@
 use std::fmt;
 use std::sync::Arc;
 
-use tracedecay_application::memory::{
+use tracedecay_contracts::memory::{
     CognitiveRecallCandidate, CognitiveRecallDegradation, CognitiveRecallPort,
     CognitiveRecallPortResult, CognitiveRecallProvenance, CognitiveRecallProviderIdentity,
     CognitiveRecallRequest, CognitiveRecallResult,
 };
-use tracedecay_application::{
+use tracedecay_contracts::{
     ApplicationContractError, CancellationSignal, ClockError, ResolvedScope, try_now_micros,
 };
 use tracedecay_memory_fabric::{

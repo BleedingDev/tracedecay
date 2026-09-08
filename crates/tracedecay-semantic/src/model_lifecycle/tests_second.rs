@@ -17,7 +17,7 @@
             Arc::clone(&source) as Arc<dyn ModelMemberSourceV1>,
         )
         .unwrap();
-        let selected = apply_config_selection_to_owner(&owner, Some(&model_id), true).unwrap();
+        let selected = owner.select_model(Some(&model_id), true).unwrap();
 
         assert!(matches!(
             selected.state,
@@ -1350,4 +1350,280 @@
         assert_eq!(reopened_status.state, Some(installed));
         assert!(!reopened.enqueue_demand_acquisition_if_needed());
         assert_eq!(offline_source.calls.load(Ordering::SeqCst), 0);
+    }
+
+
+    #[test]
+    fn scoped_owners_share_verified_bytes_without_selection_or_lease_aliasing() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("fixture");
+        let (catalog, model_id) = tiny_catalog(&fixture);
+        let source = Arc::new(FixtureSource {
+            root: fixture,
+            calls: AtomicUsize::new(0),
+        });
+        let shared = temp.path().join("artifacts");
+        let first_root = temp.path().join("first");
+        let first = SemanticModelLifecycleOwnerV1::open_scoped(
+            &first_root,
+            &shared,
+            "profile/project-a",
+            catalog.clone(),
+            source.clone(),
+        )
+        .unwrap();
+        let second = SemanticModelLifecycleOwnerV1::open_scoped(
+            temp.path().join("second"),
+            &shared,
+            "profile/project-b",
+            catalog.clone(),
+            source.clone(),
+        )
+        .unwrap();
+        first.select_model(Some(&model_id), false).unwrap();
+        second.select_model(None, true).unwrap();
+        first.acquire_blocking_for_tests().unwrap();
+        let state = first.status().state.unwrap();
+        // The lifecycle names the catalog package — the identity every
+        // projection and compatibility pin carries — while the inventory
+        // addresses the shared bytes by its own content digest.
+        assert_eq!(
+            state.artifact_digest(),
+            catalog_package_digest(catalog.get(&model_id).unwrap())
+        );
+        let installed = install_path_of(&state).unwrap().to_path_buf();
+        assert!(installed.starts_with(&shared));
+        let digest = first
+            .artifact_store
+            .installed_digest(&installed)
+            .expect("a scoped install is addressed by the shared inventory");
+        assert_eq!(first.artifact_store.installed_directory(&digest), installed);
+        assert_ne!(digest.as_str(), state.artifact_digest());
+        assert_eq!(second.status().selected_model, None);
+        assert!(second.status().auto_download);
+        let fetched = source.calls.load(Ordering::SeqCst);
+        second.select_model(Some(&model_id), false).unwrap();
+        assert_eq!(source.calls.load(Ordering::SeqCst), fetched);
+        let discovered = second.status().state.unwrap();
+        assert_eq!(discovered.artifact_digest(), state.artifact_digest());
+        assert_eq!(install_path_of(&discovered), Some(installed.as_path()));
+        assert_eq!(first.artifact_store.inventory().unwrap().records.len(), 1);
+        let second_lease = second.lease_id(EMBEDDING_ACTIVE_LEASE_ID_V1);
+        first.select_model(None, false).unwrap();
+        drop(first);
+        let reopened = SemanticModelLifecycleOwnerV1::open_scoped(
+            &first_root,
+            &shared,
+            "profile/project-a",
+            catalog,
+            source,
+        )
+        .unwrap();
+        assert_eq!(reopened.status().selected_model, None);
+        assert_eq!(
+            reopened
+                .artifact_store
+                .artifact_digest_for_lease(
+                    &second_lease,
+                    ArtifactLeaseKindV1::Active,
+                    current_unix_seconds().unwrap(),
+                )
+                .unwrap(),
+            Some(digest.clone())
+        );
+        let now = current_unix_seconds().unwrap() + 8 * 24 * 60 * 60;
+        reopened.run_daemon_artifact_gc(now).unwrap();
+        assert!(installed.is_dir());
+        assert_eq!(
+            second.status().selected_model.as_deref(),
+            Some(model_id.as_str())
+        );
+    }
+
+    /// A scoped acquisition survives restart under its catalog identity: the
+    /// reopened owner re-admits the inventory install by its directory, keeps
+    /// the catalog package digest the pins compare against, and re-acquires
+    /// its own active lease without fetching again. Re-admission verifies the
+    /// manifest against the bundled runtime, so the gate matches
+    /// `restart_re_admits_explicit_import_without_legacy_acquisition`.
+    #[cfg(feature = "semantic-fastembed")]
+    #[test]
+    fn scoped_acquisition_re_admits_after_restart_under_catalog_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("fixture");
+        let (catalog, model_id) = tiny_catalog(&fixture);
+        let source = Arc::new(FixtureSource {
+            root: fixture,
+            calls: AtomicUsize::new(0),
+        });
+        let shared = temp.path().join("artifacts");
+        let root = temp.path().join("owner");
+        let owner = SemanticModelLifecycleOwnerV1::open_scoped(
+            &root,
+            &shared,
+            "profile/project-a",
+            catalog.clone(),
+            source.clone(),
+        )
+        .unwrap();
+        owner.select_model(Some(&model_id), false).unwrap();
+        owner.acquire_blocking_for_tests().unwrap();
+        owner.mark_ready().unwrap();
+        let ready = owner.status().state.unwrap();
+        let catalog_digest = catalog_package_digest(catalog.get(&model_id).unwrap());
+        assert_eq!(ready.artifact_digest(), catalog_digest);
+        let installed = install_path_of(&ready).unwrap().to_path_buf();
+        let inventory_digest = owner.artifact_store.installed_digest(&installed).unwrap();
+        let active_lease = owner.lease_id(EMBEDDING_ACTIVE_LEASE_ID_V1);
+        let fetched = source.calls.load(Ordering::SeqCst);
+        drop(owner);
+
+        let reopened = SemanticModelLifecycleOwnerV1::open_scoped(
+            &root,
+            &shared,
+            "profile/project-a",
+            catalog,
+            source.clone(),
+        )
+        .unwrap();
+        let readmitted = reopened.select_model(Some(&model_id), false).unwrap();
+        let state = readmitted.state.expect("re-admitted install");
+        assert!(matches!(state, SemanticModelLifecycleStateV1::Ready { .. }));
+        assert_eq!(state.artifact_digest(), catalog_digest);
+        assert_eq!(install_path_of(&state), Some(installed.as_path()));
+        assert_eq!(source.calls.load(Ordering::SeqCst), fetched);
+        assert!(!reopened.enqueue_demand_acquisition_if_needed());
+        assert_eq!(
+            reopened
+                .artifact_store
+                .artifact_digest_for_lease(
+                    &active_lease,
+                    ArtifactLeaseKindV1::Active,
+                    current_unix_seconds().unwrap(),
+                )
+                .unwrap(),
+            Some(inventory_digest)
+        );
+    }
+
+    #[test]
+    fn scoped_reranker_active_and_rollback_slots_do_not_replace_foreign_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("fixture");
+        let (catalog, model_id) = tiny_catalog(&fixture);
+        let source = Arc::new(FixtureSource {
+            root: fixture.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let shared = temp.path().join("artifacts");
+        let first = SemanticModelLifecycleOwnerV1::open_scoped(
+            temp.path().join("first"),
+            &shared,
+            "profile/project-a",
+            catalog.clone(),
+            source.clone(),
+        )
+        .unwrap();
+        let second = SemanticModelLifecycleOwnerV1::open_scoped(
+            temp.path().join("second"),
+            &shared,
+            "profile/project-b",
+            catalog.clone(),
+            source,
+        )
+        .unwrap();
+        let mut manifest = tiny_manifest(catalog.get(&model_id).unwrap());
+        let now = current_unix_seconds().unwrap();
+        let old = first
+            .artifact_store
+            .import_local_directory(&manifest, &fixture, now)
+            .unwrap();
+        manifest.payload.resource_ceiling.max_resident_bytes += 1;
+        let new = first
+            .artifact_store
+            .import_local_directory(&manifest, &fixture, now)
+            .unwrap();
+        for owner in [&first, &second] {
+            owner
+                .artifact_store
+                .activate_artifact_with_rollback(
+                    &old.artifact_digest,
+                    &owner.lease_id(RERANKER_ACTIVE_LEASE_ID_V1),
+                    &owner.lease_id(RERANKER_ROLLBACK_LEASE_ID_V1),
+                    now,
+                )
+                .unwrap();
+        }
+        first
+            .artifact_store
+            .activate_artifact_with_rollback(
+                &new.artifact_digest,
+                &first.lease_id(RERANKER_ACTIVE_LEASE_ID_V1),
+                &first.lease_id(RERANKER_ROLLBACK_LEASE_ID_V1),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            first.reranker_artifact_status().unwrap(),
+            RerankerArtifactLifecycleStatusV1 {
+                active_artifact_digest: Some(new.artifact_digest),
+                rollback_artifact_digest: Some(old.artifact_digest.clone()),
+            }
+        );
+        assert_eq!(
+            second.reranker_artifact_status().unwrap(),
+            RerankerArtifactLifecycleStatusV1 {
+                active_artifact_digest: Some(old.artifact_digest.clone()),
+                rollback_artifact_digest: None,
+            }
+        );
+        first.rollback_reranker_artifact(now).unwrap();
+        assert_eq!(
+            second
+                .reranker_artifact_status()
+                .unwrap()
+                .active_artifact_digest,
+            Some(old.artifact_digest)
+        );
+    }
+
+
+    #[test]
+    fn scoped_model2vec_acquisition_preserves_catalog_member_paths_for_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("fixture");
+        let (mut catalog, model_id) = tiny_catalog(&fixture);
+        let model = catalog.models.iter_mut().find(|model| model.model_id == model_id).unwrap();
+        model.backend = CatalogedEmbeddingBackendV1::Model2VecStatic {
+            table_precision: EmbeddingPrecisionV1::Fp32,
+        };
+        let member = model.members.get_mut("model").unwrap();
+        fs::rename(fixture.join(&member.path), fixture.join("model.safetensors")).unwrap();
+        member.path = "model.safetensors".to_owned();
+        member.upstream_path = member.path.clone();
+        let source = Arc::new(FixtureSource { root: fixture, calls: AtomicUsize::new(0) });
+        let shared = temp.path().join("artifacts");
+        let first = SemanticModelLifecycleOwnerV1::open_scoped(
+            temp.path().join("first"), &shared, "profile/project-a", catalog.clone(), source.clone(),
+        ).unwrap();
+        first.select_model(Some(&model_id), false).unwrap();
+        first.acquire_blocking_for_tests().unwrap();
+        let state = first.status().state.unwrap();
+        let install = install_path_of(&state).unwrap();
+        assert!(install.join("model.safetensors").is_file());
+        assert!(!install.join("model.onnx").exists());
+        let second = SemanticModelLifecycleOwnerV1::open_scoped(
+            temp.path().join("second"), &shared, "profile/project-b", catalog, source.clone(),
+        ).unwrap();
+        let fetched = source.calls.load(Ordering::SeqCst);
+        let reused = second.select_model(Some(&model_id), false).unwrap();
+        assert_eq!(reused.state.as_ref().and_then(install_path_of), Some(install));
+        assert_eq!(source.calls.load(Ordering::SeqCst), fetched);
+        #[cfg(feature = "semantic-model2vec")]
+        {
+            let environment = RuntimeEnvironmentV1::detect_embedding_process(
+                crate::embedding_backend::EmbeddingRuntimeFamilyV1::Model2VecStatic,
+            ).unwrap();
+            assert_eq!(environment.runtime, crate::model2vec_adapter::MODEL2VEC_RUNTIME_FAMILY_V1);
+        }
     }

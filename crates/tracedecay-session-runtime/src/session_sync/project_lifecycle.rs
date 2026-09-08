@@ -1,17 +1,18 @@
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use tracedecay_application::session_sync::{
+use tracedecay_contracts::session_sync::{
     SessionSyncCommandV1, SessionSyncJournalStatusV1, SessionSyncJournalV1, SessionSyncOutcomeV1,
     SessionSyncRequestV1, SessionSyncScopeV1, SessionTranscriptImportV1,
 };
-use tracedecay_application::{
+use tracedecay_contracts::{
     CancellationSignal, Deadline, IdempotencyKey, OperationTermination, RequestId, now_micros,
 };
 use tracedecay_domain::{BrainId, ProjectId, UserProfileId, UtcMicros};
 use tracedecay_store::{StoreShardScopeV1, VerifiedStoreLocatorV1};
 
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1;
 use tracedecay_sessions::admission::SESSION_INGEST_DISABLED_REASON_V1;
 
 use super::{
@@ -30,12 +31,13 @@ pub struct SessionSyncProjectContext {
     pub(super) project_root: PathBuf,
     /// The authoritative project-open scope, propagated verbatim from
     /// `DaemonSessionSyncConfig`. Never re-derived from `project_root`.
-    pub(super) scope: tracedecay_application::ResolvedScope,
+    pub(super) scope: tracedecay_contracts::ResolvedScope,
     pub(super) transcript_source_home: Option<PathBuf>,
     pub(super) project_sessions: RwLock<Option<RegisteredGlobalDbLeaseV1>>,
     project_sessions_locator: VerifiedStoreLocatorV1,
     pub(super) user_sessions: RegisteredGlobalDbLeaseV1,
     pub registry: RegisteredGlobalDbLeaseV1,
+    pub(super) background_cpu: Arc<ProcessBackgroundCpuV1>,
     pub(super) project_refresh:
         crate::session_temporal_refresh_scheduler::SessionTemporalRefreshWake,
     pub(super) user_refresh: crate::session_temporal_refresh_scheduler::SessionTemporalRefreshWake,
@@ -311,6 +313,7 @@ impl DaemonSessionSyncService {
             project_sessions_locator,
             user_sessions: config.user_sessions,
             registry: config.registry,
+            background_cpu: config.background_cpu,
             project_refresh: config.project_refresh,
             user_refresh: config.user_refresh,
         });

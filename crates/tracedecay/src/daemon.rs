@@ -37,7 +37,7 @@ pub(crate) use tracedecay_daemon_protocol::{
     DaemonAuthPreface, DaemonEndpoint, DaemonInvocationOutcome, DaemonInvocationRequest,
     DaemonInvocationResponse, default_loopback_endpoint, parse_daemon_invocation_request,
 };
-pub use tracedecay_daemon_protocol::{DaemonClientIdentity, DaemonHandshake};
+pub(crate) use tracedecay_daemon_protocol::{DaemonClientIdentity, DaemonHandshake};
 #[cfg(unix)]
 #[allow(unused_imports)]
 pub(crate) use tracedecay_daemon_protocol::{
@@ -49,7 +49,6 @@ use tracedecay_mcp::{ErrorCode, JsonRpcRequest, JsonRpcResponse, McpTransport};
 use tracedecay_mcp::{ToolRegistryMode, explore_call_budget, project_catalog_discovery_scope};
 use tracedecay_runtime_core::cancellation::CancellationToken;
 
-pub use tracedecay_daemon_protocol::SOCKET_ENV;
 pub(crate) const PROJECT_WARMING_RETRY_HINT: &str =
     "is warming in the background; retry the same tool shortly";
 #[cfg(unix)]
@@ -84,7 +83,7 @@ impl AuthenticatedFirstRequest {
         hotpath::gauge!("daemon.engine.first_request.decode").inc(1_u64);
         #[cfg(test)]
         FIRST_REQUEST_DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
-        let parsed = serde_json::from_str(raw.trim()).ok();
+        let parsed = JsonRpcRequest::decode(raw.trim()).ok();
         Self { raw, parsed }
     }
 
@@ -404,7 +403,6 @@ pub(crate) mod session_runtime_tests;
 #[cfg(test)]
 pub(crate) mod store_runtime_tests;
 
-pub(crate) mod store_runtime;
 mod store_writer_gate;
 mod wire_io;
 pub(crate) mod work_evidence_retrieval;

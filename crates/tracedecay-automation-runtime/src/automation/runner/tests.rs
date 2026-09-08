@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::json;
-use tracedecay_application::retained_surfaces::MemoryAutomationFactEvidenceItemV1;
-use tracedecay_application::{
+use tracedecay_contracts::retained_surfaces::MemoryAutomationFactEvidenceItemV1;
+use tracedecay_contracts::{
     CancellationContext, CapabilityGrantId, CapabilityGrantSnapshot, Deadline, DisclosureClass,
     RequestContext, RequestId,
 };
@@ -52,18 +52,18 @@ use super::{
     combined_skill_writer_evidence_or_not_combined, split_skill_runtime_failure,
     validate_session_fact_candidates,
 };
-use crate::db::{Database, DatabaseAuthority, TestDatabaseRuntimeMode};
 use crate::ports::session_evidence::{LcmGrepSort, LcmScope};
-use crate::store::memory::DatabaseFactStore;
+use tracedecay_runtime_core::db::{Database, DatabaseAuthority, TestDatabaseRuntimeMode};
+use tracedecay_runtime_core::store::memory::DatabaseFactStore;
 
 mod early_gate;
 
 #[test]
 fn combined_skill_runtime_failure_preserves_both_error_causes() {
-    let runtime_error = crate::errors::TraceDecayError::Config {
+    let runtime_error = tracedecay_domain::errors::TraceDecayError::Config {
         message: "skill runtime failed".to_owned(),
     };
-    let record_error = crate::errors::TraceDecayError::Config {
+    let record_error = tracedecay_domain::errors::TraceDecayError::Config {
         message: "skill failed-record publication failed".to_owned(),
     };
 
@@ -97,10 +97,10 @@ fn asymmetric_combined_failure_preserves_the_successful_sibling_record() {
         "completed_at": "2"
     }))
     .expect("failed record");
-    let append_error = crate::errors::TraceDecayError::Config {
+    let append_error = tracedecay_domain::errors::TraceDecayError::Config {
         message: "skill terminal construction failed".to_owned(),
     };
-    let original_error = crate::errors::TraceDecayError::Config {
+    let original_error = tracedecay_domain::errors::TraceDecayError::Config {
         message: "combined output failed".to_owned(),
     };
 
@@ -419,8 +419,8 @@ async fn oversized_automation_request_preserves_candidate_stage_without_executio
     assert!(matches!(
         outcome,
         AutomationTemporalRetrieval::StructuralRefusal(
-            tracedecay_application::retrieval::SessionRetrievalStructuralRefusalV1::BudgetExhausted {
-                stage: tracedecay_application::retrieval::SessionRetrievalBudgetStageV1::RequestCandidateBytes,
+            tracedecay_contracts::retrieval::SessionRetrievalStructuralRefusalV1::BudgetExhausted {
+                stage: tracedecay_contracts::retrieval::SessionRetrievalBudgetStageV1::RequestCandidateBytes,
             }
         )
     ));
@@ -497,8 +497,8 @@ fn temporal_automation_evidence_fails_closed_for_non_complete_outcomes() {
     assert!(matches!(
         refusal,
         AutomationTemporalRetrieval::StructuralRefusal(
-            tracedecay_application::retrieval::SessionRetrievalStructuralRefusalV1::BudgetExhausted {
-                stage: tracedecay_application::retrieval::SessionRetrievalBudgetStageV1::ExecutionWorkExhausted,
+            tracedecay_contracts::retrieval::SessionRetrievalStructuralRefusalV1::BudgetExhausted {
+                stage: tracedecay_contracts::retrieval::SessionRetrievalBudgetStageV1::ExecutionWorkExhausted,
             }
         )
     ));
@@ -540,7 +540,7 @@ fn temporal_automation_evidence_preserves_cursor_manifest_refusal() {
         };
         assert_eq!(
             refusal,
-            tracedecay_application::retrieval::SessionRetrievalStructuralRefusalV1::CursorManifestLimitExceeded {
+            tracedecay_contracts::retrieval::SessionRetrievalStructuralRefusalV1::CursorManifestLimitExceeded {
                 kind,
                 observed,
                 maximum,
@@ -587,7 +587,7 @@ impl AutomationSessionRetrieval for RecordingRejectedAutomationRetrieval {
 
 struct StructuralRefusalAutomationRetrieval {
     anchor_session_id: SessionId,
-    refusal: tracedecay_application::retrieval::SessionRetrievalStructuralRefusalV1,
+    refusal: tracedecay_contracts::retrieval::SessionRetrievalStructuralRefusalV1,
     calls: AtomicUsize,
 }
 
@@ -608,8 +608,8 @@ async fn reflector_evidence_keeps_budget_stage_in_terminal_reason() {
     let retrieval = StructuralRefusalAutomationRetrieval {
         anchor_session_id: SessionId::new("session.automation.reflector-budget").unwrap(),
         refusal:
-            tracedecay_application::retrieval::SessionRetrievalStructuralRefusalV1::BudgetExhausted {
-                stage: tracedecay_application::retrieval::SessionRetrievalBudgetStageV1::RequestCandidateBytes,
+            tracedecay_contracts::retrieval::SessionRetrievalStructuralRefusalV1::BudgetExhausted {
+                stage: tracedecay_contracts::retrieval::SessionRetrievalBudgetStageV1::RequestCandidateBytes,
             },
         calls: AtomicUsize::new(0),
     };
@@ -637,8 +637,8 @@ async fn skill_writer_evidence_keeps_budget_stage_in_terminal_reason() {
     let retrieval = StructuralRefusalAutomationRetrieval {
         anchor_session_id: SessionId::new("session.automation.skill-budget").unwrap(),
         refusal:
-            tracedecay_application::retrieval::SessionRetrievalStructuralRefusalV1::BudgetExhausted {
-                stage: tracedecay_application::retrieval::SessionRetrievalBudgetStageV1::ExecutionWorkExhausted,
+            tracedecay_contracts::retrieval::SessionRetrievalStructuralRefusalV1::BudgetExhausted {
+                stage: tracedecay_contracts::retrieval::SessionRetrievalBudgetStageV1::ExecutionWorkExhausted,
             },
         calls: AtomicUsize::new(0),
     };
@@ -670,8 +670,8 @@ async fn combined_reflector_first_preserves_budget_stage_for_sequential_fallback
     let retrieval = StructuralRefusalAutomationRetrieval {
         anchor_session_id: SessionId::new("session.automation.combined-reflector-budget").unwrap(),
         refusal:
-            tracedecay_application::retrieval::SessionRetrievalStructuralRefusalV1::BudgetExhausted {
-                stage: tracedecay_application::retrieval::SessionRetrievalBudgetStageV1::RequestCandidateBytes,
+            tracedecay_contracts::retrieval::SessionRetrievalStructuralRefusalV1::BudgetExhausted {
+                stage: tracedecay_contracts::retrieval::SessionRetrievalBudgetStageV1::RequestCandidateBytes,
             },
         calls: AtomicUsize::new(0),
     };
@@ -702,8 +702,8 @@ async fn combined_skill_second_preserves_distinct_budget_stage_for_sequential_fa
     let retrieval = StructuralRefusalAutomationRetrieval {
         anchor_session_id: SessionId::new("session.automation.combined-skill-budget").unwrap(),
         refusal:
-            tracedecay_application::retrieval::SessionRetrievalStructuralRefusalV1::BudgetExhausted {
-                stage: tracedecay_application::retrieval::SessionRetrievalBudgetStageV1::ExecutionWorkExhausted,
+            tracedecay_contracts::retrieval::SessionRetrievalStructuralRefusalV1::BudgetExhausted {
+                stage: tracedecay_contracts::retrieval::SessionRetrievalBudgetStageV1::ExecutionWorkExhausted,
             },
         calls: AtomicUsize::new(0),
     };
@@ -1035,10 +1035,12 @@ async fn proposal_validation_does_not_wait_for_the_writer_lane() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("memory.db");
     crate::register_test_schema_installer();
-    let authority =
-        crate::db::DatabaseAuthority::acquire_test(&path, "automation validation writer lane")
-            .unwrap();
-    let (db, _) = crate::db::Database::publish_test_runtime(
+    let authority = tracedecay_runtime_core::db::DatabaseAuthority::acquire_test(
+        &path,
+        "automation validation writer lane",
+    )
+    .unwrap();
+    let (db, _) = tracedecay_runtime_core::db::Database::publish_test_runtime(
         &path,
         &authority,
         TestDatabaseRuntimeMode::Initialize,
@@ -1132,10 +1134,12 @@ async fn proposal_validation_quarantines_fields_outside_the_public_receipt_contr
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("memory.db");
     crate::register_test_schema_installer();
-    let authority =
-        crate::db::DatabaseAuthority::acquire_test(&path, "automation evidence closed fields")
-            .unwrap();
-    let (db, _) = crate::db::Database::publish_test_runtime(
+    let authority = tracedecay_runtime_core::db::DatabaseAuthority::acquire_test(
+        &path,
+        "automation evidence closed fields",
+    )
+    .unwrap();
+    let (db, _) = tracedecay_runtime_core::db::Database::publish_test_runtime(
         &path,
         &authority,
         TestDatabaseRuntimeMode::Initialize,
@@ -1247,9 +1251,12 @@ async fn proposal_validation_canonicalizes_public_evidence_before_commit() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("memory.db");
     crate::register_test_schema_installer();
-    let authority =
-        crate::db::DatabaseAuthority::acquire_test(&path, "canonical automation evidence").unwrap();
-    let (db, _) = crate::db::Database::publish_test_runtime(
+    let authority = tracedecay_runtime_core::db::DatabaseAuthority::acquire_test(
+        &path,
+        "canonical automation evidence",
+    )
+    .unwrap();
+    let (db, _) = tracedecay_runtime_core::db::Database::publish_test_runtime(
         &path,
         &authority,
         TestDatabaseRuntimeMode::Initialize,

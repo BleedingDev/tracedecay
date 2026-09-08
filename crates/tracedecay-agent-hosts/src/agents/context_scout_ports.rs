@@ -7,16 +7,17 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracedecay_application::context_scout::{
+use tracedecay_application::configuration::ConfigurationCurrentStateV1;
+use tracedecay_contracts::context_scout::{
     ContextScoutAddressV1, ContextScoutCandidateV1, ContextScoutCategoryV1,
     ContextScoutEvidenceEnvelopeV1, ContextScoutEvidenceSourceKindV1,
     ContextScoutEvidenceSourceReceiptV1, ContextScoutModelBackendV1,
     ContextScoutRedactionReceiptV1,
 };
-use tracedecay_application::feedback::{
+use tracedecay_contracts::feedback::{
     FeedbackCompletedPublicationReadPort, FeedbackCompletedPublicationV1,
 };
-use tracedecay_application::{
+use tracedecay_contracts::{
     CoverageCompleteness, CoverageDomainState, EvidenceCoverage, EvidenceDomain, FreshnessState,
     RequestAdmission, RequestContext, ResolvedScope, RetrieverContributionState, TemporalState,
 };
@@ -34,15 +35,14 @@ use tracedecay_domain::{
     ThreadId, TurnId, UserProfileId, UtcMicros, WorktreeId, canonical_sha256,
 };
 use tracedecay_hooks::{HookEventEnvelopeV2, HookScopeBindingV1};
-use tracedecay_usecases::configuration::ConfigurationCurrentStateV1;
 
 use super::context_scout_v2::{
     ContextScoutControlV1, ContextScoutDeliverySelectionInputV1, ContextScoutEvidenceEnvelopeExt,
     ContextScoutLimitsV1, ContextScoutRuntimeModeV1, ContextScoutSelectionInputV1,
     ContextScoutServiceStateV1, select_context_scout_delivery_window,
 };
-use crate::db::Database;
-use crate::db::engine::params;
+use tracedecay_runtime_core::db::Database;
+use tracedecay_runtime_core::db::engine::params;
 
 const ADDRESS_LEDGER_KEY_V1: &str = "agents.context-scout.addresses.v1";
 const ADDRESS_LEDGER_SCHEMA_VERSION_V1: u16 = 1;
@@ -1065,7 +1065,7 @@ pub fn context_scout_candidates_from_publication(
 }
 
 async fn load_address_ledger(
-    transaction: &crate::db::DatabaseWriteTransaction<'_>,
+    transaction: &tracedecay_runtime_core::db::DatabaseWriteTransaction<'_>,
     project_id: &ProjectId,
 ) -> Option<StoredContextScoutAddressLedgerV1> {
     let mut rows = transaction
@@ -1147,7 +1147,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::db::{DatabaseAuthority, TestDatabaseRuntimeMode};
+    use tracedecay_runtime_core::db::{DatabaseAuthority, TestDatabaseRuntimeMode};
 
     async fn database() -> (TempDir, Database) {
         crate::register_test_schema_installer();

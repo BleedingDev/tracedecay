@@ -12,15 +12,16 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde_json::{Value, json};
-use tracedecay::daemon::{
-    DaemonHandshake, DaemonHookEvent, HookAgent, HookEventNotifyOutcomeV1, HookRouteMetadata,
-    HookTerminalReceipt, call_tool, notify_hook_event,
-};
+use tracedecay::daemon::{call_tool, notify_hook_event};
 use tracedecay_code_index::production::{
     CodeIndexPublishedGenerationV1, SealedGenerationSegmentReadV1,
 };
 use tracedecay_code_index_retention::code_index_generations::{
     DurablePublicationPointerV1, scoped_code_index_store_root,
+};
+use tracedecay_daemon_protocol::DaemonHandshake;
+use tracedecay_hooks::{
+    DaemonHookEvent, HookAgent, HookEventNotifyOutcomeV1, HookRouteMetadata, HookTerminalReceipt,
 };
 
 use crate::code_index_journey::{
