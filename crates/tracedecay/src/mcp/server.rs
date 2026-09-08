@@ -953,7 +953,11 @@ impl McpServer {
             active_project_id.as_deref(),
         ) {
             (Some(registry), Some(profile), Some(registered), Some(project_id)) => {
-                let serving_db = cg.db_path();
+                // Registry scope paths are rooted at the mounted database's
+                // canonical profile path. Use the mounted graph locator too,
+                // not the diagnostic path reconstructed from StoreLayout (which
+                // can retain a symlink spelling of the profile root).
+                let serving_db = cg.db().canonical_database_path().to_path_buf();
                 match SessionRetrievalServingIdentityV1::resolve_project(
                     project_id,
                     &serving_db,

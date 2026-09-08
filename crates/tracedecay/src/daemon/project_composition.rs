@@ -1285,6 +1285,30 @@ async fn production_project_server_inner(
                 .await?,
             )
         };
+        // Retained memory uses the admitted graph and configuration, not the
+        // session upgrade. Publish it before any core request can be admitted.
+        let retained_registration = Box::pin(async {
+            if project_database_is_read_only {
+                return Ok(());
+            }
+            let retained_access = project_open_owners::daemon_owned_project_source_access_at(
+                &code_search_scope,
+                canonical_project_path,
+                &runtime_configuration,
+                tracedecay_application::now_micros(),
+            )
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("project-open retained source access denied: {error}"),
+            })?;
+            project_open_owners::register_project_open_retained_owner(
+                invocation,
+                canonical_project_path,
+                resolved.as_ref(),
+                &retained_access,
+            )
+            .await
+        })
+        .await;
         // Publish the graph/search/diagnostic core before session admission.
         // Source-edit previews are available, while mutations fail closed as
         // warming until the full server has its transaction authority.
@@ -1338,6 +1362,9 @@ async fn production_project_server_inner(
         let session_capabilities_published = AtomicBool::new(false);
         let mut published_full_candidate = None;
         let full_upgrade: Result<Arc<crate::mcp::McpServer>> = Box::pin(async {
+            // A retained admission failure still follows the full-upgrade
+            // failure path, preserving the independently usable code core.
+            retained_registration?;
             // The core is reachable from here on, so every step below leaves
             // this block with an error instead of returning behind a published
             // route: the funnel around it owns retiring the owner. Retired

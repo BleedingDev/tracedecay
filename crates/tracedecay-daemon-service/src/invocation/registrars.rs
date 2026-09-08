@@ -1328,8 +1328,9 @@ impl DaemonRetainedRuntimeRegistrar {
     /// configuration into) refused the second same-identity worktree route and
     /// every reopen of a route whose ports had been rebuilt: project open then
     /// degraded, for the life of the daemon. A matching route aliases the
-    /// incumbent and stamps its own grant on it; a foreign scope or actor is
-    /// still refused rather than given a second retained runtime.
+    /// incumbent and stamps its own grant on it. Later publication may add
+    /// missing families (session/LCM after the memory core), but never replaces
+    /// an incumbent family. A foreign scope or actor is still refused.
     #[hotpath::skip]
     pub async fn register(
         &self,
@@ -1350,6 +1351,10 @@ impl DaemonRetainedRuntimeRegistrar {
                 project_root,
                 |registered: &mut RegisteredRetainedRuntime| {
                     if registered.scope == scope && registered.actor == actor {
+                        let mut completed = registered.ports.as_ref().clone();
+                        if completed.mount_missing_from(ports.as_ref()) {
+                            registered.ports = Arc::new(completed);
+                        }
                         registered.grant = grant.clone();
                         Ok(())
                     } else {

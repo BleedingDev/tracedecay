@@ -2100,3 +2100,198 @@ async fn released_automation_tombstone_allows_one_eventual_replacement() {
         "exactly one live replacement must own the scheduler"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_memory_call_precedes_full_owner_registration() {
+    use tracedecay_application::retained_surfaces::{
+        FactProjectionV1, FactStoreAddCommitV1, FactStoreAddResultV1, FactStoreGetResultV1,
+        MemoryStatusResultV1, RetainedSurfaceRequestV1,
+    };
+    use tracedecay_application::{CancellationContext, Deadline, now_micros};
+    use tracedecay_daemon_protocol::{DaemonInvocationOutcome, DaemonInvocationRequest};
+    use tracedecay_domain::UtcMicros;
+
+    async fn invoke(
+        engine: &DaemonEngine,
+        handshake: &DaemonHandshake,
+        id: &str,
+        operation: &str,
+        request: serde_json::Value,
+    ) -> serde_json::Value {
+        let request: RetainedSurfaceRequestV1 = serde_json::from_value(serde_json::json!({
+            "operation": operation,
+            "request": request,
+        }))
+        .expect("retained request schema");
+        let observed_at = now_micros();
+        let response = super::super::execute_daemon_invocation(
+            engine,
+            handshake,
+            DaemonInvocationRequest::retained_application(
+                id,
+                request,
+                observed_at,
+                Deadline::new(UtcMicros(observed_at.0 + 20_000_000)).expect("request deadline"),
+                CancellationContext::active(format!("cancel.{id}")).expect("request cancellation"),
+            ),
+        )
+        .await;
+        let DaemonInvocationOutcome::RetainedApplication { outcome, .. } = response.outcome else {
+            panic!("{operation} must have a retained authority on its first call: {response:?}");
+        };
+        let outcome = serde_json::to_value(outcome).expect("retained outcome JSON");
+        assert!(
+            matches!(outcome["outcome"].as_str(), Some("evidence" | "effect")),
+            "{operation} must succeed, not return an unavailable or empty fallback: {outcome}"
+        );
+        outcome
+            .pointer("/value/payload")
+            .cloned()
+            .expect("retained result payload")
+    }
+
+    let temp = TempDir::new().expect("memory publication fixture");
+    let project = temp.path().join("project");
+    let profile_root = temp.path().join("profile");
+    std::fs::create_dir_all(project.join("src")).expect("fixture project");
+    std::fs::write(project.join("src/lib.rs"), "pub fn memory_fixture() {}\n")
+        .expect("fixture source");
+    // The later session-family check needs a real Git-scoped serving identity.
+    let initialized = Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(&project)
+        .status()
+        .expect("initialize session fixture repository");
+    assert!(initialized.success(), "fixture git init must succeed");
+    let client_identity = test_client_identity_for(profile_root.clone());
+    initialize_test_project(&project, &client_identity).await;
+    let project = project.canonicalize().expect("canonical project");
+    let handshake = DaemonHandshake {
+        project_path: Some(project.clone()),
+        client_identity,
+        ..test_handshake_defaults()
+    };
+    let _database_scope =
+        enter_test_daemon_database_scope(&profile_root, "memory core publication");
+    let engine = test_daemon_engine_for_profile(&profile_root);
+    // This existing gate stops full owner registration before the old retained
+    // mount. No timing window, retry, or polling is needed to expose the race.
+    let registration = engine
+        .invocation
+        .service
+        .pause_configuration_runtime_registration(project)
+        .await;
+    let opening_engine = engine.clone();
+    let opening_handshake = handshake.clone();
+    let opening =
+        tokio::spawn(async move { opening_engine.project_server(&opening_handshake).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        registration.before_registration,
+    )
+    .await
+    .expect("reach full owner registration")
+    .expect("registration gate");
+
+    let status: MemoryStatusResultV1 = serde_json::from_value(
+        invoke(
+            &engine,
+            &handshake,
+            "memory.first",
+            "memory_status",
+            serde_json::json!({}),
+        )
+        .await,
+    )
+    .expect("memory status schema");
+    assert_eq!(status.memory.fact_count, 0);
+    let added: FactStoreAddResultV1 = serde_json::from_value(
+        invoke(
+            &engine,
+            &handshake,
+            "memory.add",
+            "fact_store_add",
+            serde_json::json!({"content": "Retained memory is available before session owner setup."}),
+        )
+        .await,
+    )
+    .expect("fact add schema");
+    let FactStoreAddResultV1::Committed {
+        result: FactStoreAddCommitV1::Added { fact, .. },
+    } = added
+    else {
+        panic!("first fact must be committed exactly once: {added:?}");
+    };
+    let FactProjectionV1::Available { fact } = fact else {
+        panic!("committed fact must be readable");
+    };
+    let isolated: MemoryStatusResultV1 = serde_json::from_value(
+        invoke(
+            &engine,
+            &handshake,
+            "memory.profile",
+            "memory_status",
+            serde_json::json!({"memory_scope": "user"}),
+        )
+        .await,
+    )
+    .expect("profile memory status schema");
+    assert_eq!(
+        isolated.memory.fact_count, 0,
+        "project writes must stay scoped"
+    );
+    assert!(
+        !opening.is_finished(),
+        "memory must not wait for the full owner set"
+    );
+
+    registration
+        .allow_registration
+        .send(())
+        .expect("release registration");
+    registration
+        .after_registration
+        .await
+        .expect("configuration published");
+    registration
+        .allow_return
+        .send(())
+        .expect("release full owner setup");
+    let server = opening
+        .await
+        .expect("open task")
+        .expect("full project open");
+    let read: FactStoreGetResultV1 = serde_json::from_value(
+        invoke(
+            &engine,
+            &handshake,
+            "memory.get",
+            "fact_store_get",
+            serde_json::json!({"fact_id": fact.fact_id}),
+        )
+        .await,
+    )
+    .expect("fact get schema");
+    let FactProjectionV1::Available { fact: persisted } = read.fact else {
+        panic!("core write must survive full publication");
+    };
+    assert_eq!(persisted.fact_id, fact.fact_id);
+    assert_eq!(persisted.content, fact.content);
+    // Registering the core must not strand session operations on its missing
+    // session port. Full publication adds that family to the same authority.
+    // A session query reads the retained store directly; a branch query also
+    // requires Git evidence publication, which is independent of this mount.
+    invoke(
+        &engine,
+        &handshake,
+        "memory.workflows",
+        "workflows",
+        serde_json::json!({"session_id": "memory-publication-fixture"}),
+    )
+    .await;
+    drop(server);
+    let shutdown = engine.shutdown_all().await;
+    assert!(shutdown.project_servers.is_clean(), "{shutdown:?}");
+    assert!(shutdown.background.unfinished().is_empty(), "{shutdown:?}");
+}

@@ -622,6 +622,42 @@ pub(crate) async fn install_project_open_source_edit_owners_for_test(
     Ok(true)
 }
 
+/// Memory belongs to core publication; session and LCM join once mounted.
+pub(super) async fn register_project_open_retained_owner(
+    invocation: &DaemonInvocationState,
+    project_root: &Path,
+    server: &McpServer,
+    access: &ProjectSourceAccessSnapshot,
+) -> Result<()> {
+    let retained_observed_at = now_micros();
+    let retained_grant =
+        project_open_retained_grant(access, retained_observed_at).map_err(|error| {
+            TraceDecayError::Config {
+                message: format!("project-open retained grant is invalid: {error}"),
+            }
+        })?;
+    let retained_ports = server.retained_surface_ports(
+        project_root,
+        access.scope.project_id.clone(),
+        access.configuration_digest.clone(),
+    );
+    hotpath::future!(
+        invocation.retained_runtime_registrar().register(
+            project_root.to_path_buf(),
+            access.scope.clone(),
+            access.requester.clone(),
+            retained_grant,
+            retained_ports,
+        ),
+        label = "daemon.project.open.owners.retained"
+    )
+    .await
+    .map_err(|error| TraceDecayError::Config {
+        message: format!("project-open retained runtime registration failed: {error}"),
+    })?;
+    Ok(())
+}
+
 /// Registers code-index-independent owners for one newly inserted project.
 #[hotpath::measure(label = "daemon.project.owners.register", future = true)]
 pub(super) async fn register_project_open_production_owners(
@@ -799,32 +835,7 @@ pub(super) async fn register_project_open_production_owners(
     .map_err(|error| TraceDecayError::Config {
         message: format!("project-open configuration runtime registration failed: {error}"),
     })?;
-    let retained_observed_at = now_micros();
-    let retained_grant =
-        project_open_retained_grant(&access, retained_observed_at).map_err(|error| {
-            TraceDecayError::Config {
-                message: format!("project-open retained grant is invalid: {error}"),
-            }
-        })?;
-    let retained_ports = server.retained_surface_ports(
-        project_root,
-        scope.project_id.clone(),
-        access.configuration_digest.clone(),
-    );
-    hotpath::future!(
-        invocation.retained_runtime_registrar().register(
-            project_root.to_path_buf(),
-            scope.clone(),
-            requester.clone(),
-            retained_grant,
-            retained_ports,
-        ),
-        label = "daemon.project.open.owners.retained"
-    )
-    .await
-    .map_err(|error| TraceDecayError::Config {
-        message: format!("project-open retained runtime registration failed: {error}"),
-    })?;
+    register_project_open_retained_owner(invocation, project_root, server, &access).await?;
     // Mount the native-integration authority under the same pinned policy
     // digest the configuration runtime just registered, so the coordinator's
     // stale/denied predicates and the handler's minted grants agree on one

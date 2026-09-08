@@ -166,6 +166,25 @@ pub struct RetainedSurfacePortsV1<'a> {
 }
 
 impl<'a> RetainedSurfacePortsV1<'a> {
+    /// Complete a same-authority mount without replacing any incumbent family.
+    /// The registrar must prove scope and actor identity before calling this.
+    pub fn mount_missing_from(&mut self, other: &Self) -> bool {
+        fn mount<T: ?Sized>(target: &mut Option<Arc<T>>, source: &Option<Arc<T>>) -> bool {
+            if target.is_none() && source.is_some() {
+                *target = source.clone();
+                true
+            } else {
+                false
+            }
+        }
+        // Do not short-circuit: each independent family must be considered.
+        let automation = mount(&mut self.automation, &other.automation);
+        let memory = mount(&mut self.memory, &other.memory);
+        let session = mount(&mut self.session, &other.session);
+        let lcm = mount(&mut self.lcm, &other.lcm);
+        automation || memory || session || lcm
+    }
+
     pub fn with_automation(
         mut self,
         port: Arc<dyn RetainedAutomationExecutionPortV1 + 'a>,
