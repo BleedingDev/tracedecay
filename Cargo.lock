@@ -6807,6 +6807,7 @@ dependencies = [
 name = "tracedecay-memory-ncm-runtime"
 version = "0.1.0-beta.37"
 dependencies = [
+ "cap-std",
  "fastembed",
  "rusqlite",
  "serde",
@@ -6814,6 +6815,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "tracedecay-memory-ncm-core",
+ "tracedecay-private-fs",
 ]
 
 [[package]]

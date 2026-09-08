@@ -6,6 +6,8 @@
 //! Mutations use one `BEGIN IMMEDIATE` transaction and one `COMMIT`; dropping
 //! a mutation lets rusqlite roll the transaction back.
 
+mod bootstrap;
+
 use crate::ports::StateRoot;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
@@ -444,37 +446,18 @@ impl fmt::Debug for NamespaceStore {
 }
 
 impl NamespaceStore {
-    /// Creates a new namespace store and fails if its namespace directory exists.
+    /// Atomically publishes a fully initialized namespace store.
+    /// Existing namespace paths are never replaced, including malformed stores.
     pub fn create(
         root: &StateRoot,
         namespace: &str,
         identity: StoreIdentity,
     ) -> Result<Self, StoreError> {
-        let (namespace_dir, db_path) = namespace_paths(root, namespace)?;
-        if namespace_dir.exists() {
-            return Err(StoreError::AlreadyExists);
-        }
-        let namespaces_dir = root.path().join("namespaces");
-        fs::create_dir_all(&namespaces_dir).map_err(io_error)?;
-        if let Err(error) = fs::create_dir(&namespace_dir) {
-            return if error.kind() == std::io::ErrorKind::AlreadyExists {
-                Err(StoreError::AlreadyExists)
-            } else {
-                Err(io_error(error))
-            };
-        }
-
-        let result =
-            Self::create_in_directory(namespace, namespace_dir.clone(), db_path.clone(), identity);
-        if result.is_err() {
-            remove_created_namespace(&namespace_dir, &db_path);
-        }
-        result
+        bootstrap::create(root, namespace, identity)
     }
 
     fn create_in_directory(
         namespace: &str,
-        _namespace_dir: PathBuf,
         db_path: PathBuf,
         identity: StoreIdentity,
     ) -> Result<Self, StoreError> {
@@ -1099,13 +1082,6 @@ fn namespace_paths(root: &StateRoot, namespace: &str) -> Result<(PathBuf, PathBu
         .map_err(StoreError::InvalidNamespace)?;
     let db_path = namespace_dir.join("ncm.sqlite");
     Ok((namespace_dir, db_path))
-}
-
-fn remove_created_namespace(namespace_dir: &Path, db_path: &Path) {
-    let _ = fs::remove_file(db_path);
-    let _ = fs::remove_file(namespace_dir.join("ncm.sqlite-wal"));
-    let _ = fs::remove_file(namespace_dir.join("ncm.sqlite-shm"));
-    let _ = fs::remove_dir(namespace_dir);
 }
 
 fn validate_identity(identity: &StoreIdentity) -> Result<(), StoreError> {
