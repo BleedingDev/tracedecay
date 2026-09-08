@@ -36,12 +36,13 @@ BEAD_ID_RE = re.compile(r"^tdmem-[0-9]{4}$")
 # ingest journey. Revision patch-footprint.v4 (ADR-0017) re-measures every cap at
 # the tree carrying the hook-route bridge, the online-only retention authority,
 # the feature-gated build repair, and the executable Codex fixture against
-# upstream head 3b59bb7eb: 49 upstream production files, 16 test/fixture
-# files, 5594 total upstream changed lines, and 723 lines in the largest file. Per-entry line budgets in the convergence map remain
-# the binding per-file limit.
+# upstream head 3b59bb7eb: 54 upstream production files, 23 test/fixture
+# files, 5715 total upstream changed lines, and 723 lines in the largest file.
+# The 2026-09-08 ADR-0017 reconciliation consolidates isolated fixture repairs
+# in the existing integration-test seam. Per-entry budgets remain binding.
 EXPECTED_BUDGET = {
     "max_upstream_existing_production_files": 56,
-    "max_upstream_existing_test_or_fixture_files": 18,
+    "max_upstream_existing_test_or_fixture_files": 26,
     "max_total_upstream_changed_lines": 6430,
     "max_changed_lines_per_upstream_file": 830,
     "max_composition_root_files": 15,
@@ -51,9 +52,11 @@ EXPECTED_BUDGET = {
     "max_allowed_touch_point_files_per_category": 15,
     # Revision v2 raised this from zero to exactly the two additive
     # configuration-registry files approved by ADR-0012; revision v3 raises it
-    # to four for the two host-adapter hook files approved by ADR-0014. The
-    # per-ADR cap of 2 keeps either ADR from being stretched to a third file.
-    "default_max_exception_zone_files": 5,
+    # to four for the two host-adapter hook files approved by ADR-0014.
+    # ADR-0017 admits one host-readiness file and one exact global-db crate-root
+    # recursion attribute, for six zone files in total. The per-ADR cap of 2
+    # prevents any of these decisions from authorizing a third file.
+    "default_max_exception_zone_files": 6,
     "max_exception_files_per_adr": 2,
     "max_workspace_manifest_files": 2,
     "manual_generated_file_edits": 0,
@@ -122,21 +125,29 @@ EXPECTED_TOUCH_POINT_CAPS = {
     "daemon_composition_mount": (15, 1094),
     "daemon_shutdown_deadline": (8, 420),
     "production_harness_shutdown": (1, 106),
-    "integration_test_runtime_isolation": (3, 240),
+    "integration_test_runtime_isolation": (9, 373),
     "normalized_observation_mount": (2, 160),
     "recall_context_mount": (5, 340),
     "post_settlement_feedback_mount": (2, 160),
     "configuration_registry_mount": (5, 718),
-    "host_hook_ingest": (4, 486),
+    "host_hook_ingest": (5, 486),
     "hook_route_bridge": (12, 1046),
     "vector_retention_authority": (5, 517),
-    "feature_gated_build_repair": (1, 11),
+    "feature_gated_build_repair": (4, 27),
 }
 # Categories whose local caps were revised above the value this policy revision
 # shipped with, and the ADR that approved the exact numbers pinned above. A
 # revised category must carry a matching `cap_revision` block; a category with
 # no approved revision must not carry one.
 REVISED_TOUCH_POINT_CAPS = {
+    "integration_test_runtime_isolation": {
+        "adr": (
+            "product/architecture/adr/"
+            "ADR-0017-patch-footprint-revision-v4.md"
+        ),
+        "previous_max_files": 3,
+        "previous_max_changed_lines": 240,
+    },
     # ADR-0016 supersedes only ADR-0015 as the approving decision for this
     # category. The file cap remains 8; only the 360-line cap is replaced.
     "daemon_shutdown_deadline": {

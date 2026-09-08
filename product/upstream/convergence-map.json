@@ -735,7 +735,6 @@
         "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
         "crates/tracedecay/src/daemon/invocation_tests/types_tests.rs",
         "crates/tracedecay/src/daemon/invocation_tests/lsp_lease_tests.rs",
-        "crates/tracedecay/src/daemon/invocation_tests/lsp_tests.rs",
         "crates/tracedecay/src/daemon/invocation_tests/project_lifecycle_tests.rs"
       ],
       "touch_points": [
@@ -751,7 +750,7 @@
         "Upstream behavior: daemon shutdown preserves lifecycle ordering and always completes terminal teardown after reporting the observed outcome.",
         "Product behavior: one caller-supplied absolute deadline bounds every nested shutdown and blocking-drain step without refresh.",
         "The call chain's own unit tests assert the shutdown fence through an observable effect of begin_shutdown - LSP admission closing - under a bounded wait, never through a fixed number of scheduler yields or a lock-contention probe, so the fence assertion is literal rather than probabilistic.",
-        "A superseded hook receipt terminal is never emitted while work it reports remains in flight; if the shared abort deadline expires, the runtime retains truthful ownership or suppresses that terminal until settlement."
+        "Started superseded hook work retains its permit through the upstream unbounded join unless owner retirement preempts it; settlement emits according to the superseded flag, not an invented successful completion. Ordinary owner cancellation and waiting supersession are not interchangeable terminal cases."
       ],
       "tests": [
         "cargo test --locked -p tracedecay-daemon-service --lib deadline_tests",
@@ -773,7 +772,14 @@
       "path_patterns": [
         "crates/tracedecay/tests/common/mod.rs",
         "crates/tracedecay/tests/memory_suite/memory_eval_test.rs",
-        "crates/tracedecay-daemon-control/src/service/tests.rs"
+        "crates/tracedecay-daemon-control/src/service/tests.rs",
+        "crates/tracedecay/src/runtime_ports.rs",
+        "crates/tracedecay/tests/transcript_ingest_suite/hermes.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/lsp_tests.rs",
+        "crates/tracedecay/src/daemon/tests/rmcp_route.rs",
+        "crates/tracedecay/tests/hooks_lsp_suite/hook_lifecycle_lease_test.rs",
+        "crates/tracedecay/src/mcp/tools/plugin_conformance_tests.rs",
+        "crates/tracedecay/tests/hermes_suite/lcm_bridge.rs"
       ],
       "touch_points": [
         "integration_test_runtime_isolation"
@@ -782,15 +788,16 @@
         "tdmem-0404",
         "tdmem-1204"
       ],
-      "rationale": "Constrain the two existing integration-test harness paths that select the checkout CLI and isolate daemon routing for memory-suite execution, plus the one upstream lib-test module whose platform gate has to be removed for the workspace to compile its tests on macOS.",
+      "rationale": "Constrain same-checkout CLI selection, isolated daemon/profile ownership, canonical fixture identity, real-worker versus virtual-time coordination, retained-result envelope decoding, and the two obsolete prose inventories to exact test paths. The retired daemon-control import repair grants no current execution authority.",
       "semantic_invariants": [
-        "Upstream behavior: integration tests use one bounded production-equivalent daemon socket and never inherit an installed daemon or global profile.",
-        "Product behavior: the memory suite executes a CLI built from the same checkout or fails closed before mixing revisions.",
-        "Upstream test modules are touched only to make them compile on every supported host; no test body, assertion, or production path changes."
+        "Integration tests use a same-checkout CLI and one isolated production-equivalent socket/profile, never an installed daemon or inherited global profile.",
+        "Fixture corrections preserve production behavior and assertions on routing, canonical project identity, delivery settlement, retained result schemas, stdout, spool capture, and absence of direct database writes.",
+        "The only assertion removals are the reverse registered-tool prose inventory and obsolete Hermes command-prose markers; mentioned-tool validity, readOnly allowlist equality, installed-template equality, and executable behavioral assertions remain."
       ],
       "tests": [
         "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1",
-        "cargo test --locked -p tracedecay-daemon-control --lib"
+        "cargo test --locked -p tracedecay-daemon-control --lib",
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
       ],
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
@@ -956,7 +963,8 @@
         "crates/tracedecay-cli/Cargo.toml",
         "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance.rs",
         "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance/native_plugin_fixture.rs",
-        "crates/tracedecay-agent-hosts/src/agents/claude.rs"
+        "crates/tracedecay-agent-hosts/src/agents/claude.rs",
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest/tests.rs"
       ],
       "touch_points": [
         "host_hook_ingest",
@@ -1109,16 +1117,21 @@
       "ownership_class": "upstream_owned",
       "feature": "feature-gated-build-repair",
       "path_patterns": [
-        "crates/tracedecay/src/dashboard.rs"
+        "crates/tracedecay/src/dashboard.rs",
+        "crates/tracedecay-host-admission/src/lib.rs",
+        "crates/tracedecay-host-admission/tests/host_capture_background_cpu_admission.rs",
+        "crates/tracedecay-global-db/src/lib.rs",
+        "crates/tracedecay-session-temporal-store/src/lib.rs"
       ],
       "touch_points": [
-        "feature_gated_build_repair"
+        "feature_gated_build_repair",
+        "exception"
       ],
       "bead_ids": [
         "tdmem-1200",
         "tdmem-1208"
       ],
-      "rationale": "Hold build repairs for upstream files that only compile under a feature upstream CI does not build, so the product tree checks cleanly with every feature it ships.",
+      "rationale": "Hold the dashboard accessor repair and crate-level recursion_limit attributes required by hotpath-instrumented async bodies under the shipped feature set; default builds alone do not exercise that query depth.",
       "semantic_invariants": [
         "A repair changes how a value is read, never what is read or what the feature does.",
         "Each repair is deleted the moment the upstream file compiles on its own."
@@ -1164,7 +1177,7 @@
         "tdmem-0902",
         "tdmem-0904"
       ],
-      "line_budget": 180,
+      "line_budget": 150,
       "rebase_or_removal_plan": "Regenerate Cargo.lock after removing product workspace members and retain every unrelated upstream resolution.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -1207,7 +1220,7 @@
         "tdmem-0308",
         "tdmem-0904"
       ],
-      "line_budget": 80,
+      "line_budget": 12,
       "rebase_or_removal_plan": "Remove only the additive product workspace member lines while preserving every upstream workspace setting.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -1237,7 +1250,7 @@
       "bead_ids": [
         "tdmem-0601"
       ],
-      "line_budget": 4,
+      "line_budget": 2,
       "rebase_or_removal_plan": "Remove the recall module declaration and re-export together if the upstream application boundary adopts a different equivalent port.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -1366,7 +1379,7 @@
         "tdmem-0902",
         "tdmem-0702"
       ],
-      "line_budget": 40,
+      "line_budget": 31,
       "rebase_or_removal_plan": "Remove the three optional dependencies, the memory-provider-host feature, its feature-list membership, and the conformance dev-dependency together.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -1447,7 +1460,7 @@
         "tdmem-0307",
         "tdmem-0308"
       ],
-      "line_budget": 60,
+      "line_budget": 26,
       "rebase_or_removal_plan": "Remove only the feature-gated mount identity, inertness, and release assertions with the host mount.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -1480,7 +1493,7 @@
         "tdmem-0603",
         "tdmem-0607"
       ],
-      "line_budget": 68,
+      "line_budget": 66,
       "rebase_or_removal_plan": "Remove the feature-gated retained field, constructor transfer, and test accessor without changing MCP routes.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -1511,7 +1524,7 @@
         "tdmem-0308",
         "tdmem-0603"
       ],
-      "line_budget": 74,
+      "line_budget": 70,
       "rebase_or_removal_plan": "Remove the feature-gated type alias, optional construction field, defaults, and builder method together.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -1530,7 +1543,8 @@
       "semantic_invariants": [
         "Upstream behavior: shutdown_background_tasks_until keeps its caller-supplied absolute deadline and its existing teardown order when the provider host feature is absent.",
         "Enabled product behavior: shutdown_background_tasks_until awaits journey.shutdown(deadline) before the dashboard, dispatch, replay, and catch-up teardown, bounding the worker join and lease reap by the same deadline rather than a fresh budget.",
-        "Enabled product behavior: every journey shutdown failure (worker or replay task past the deadline, outstanding leases, failed reap) is appended to the typed failure list that becomes ShutdownStatus::Failed; none is hidden behind a clean terminal."
+        "Enabled product behavior: every journey shutdown failure (worker or replay task past the deadline, outstanding leases, failed reap) is appended to the typed failure list that becomes ShutdownStatus::Failed; none is hidden behind a clean terminal.",
+        "Incidental formatting in this exact file is included in its pinned-head changed-line budget; it grants no additional semantic or path authority."
       ],
       "verification": [
         "git diff --check",
@@ -1623,7 +1637,7 @@
         "tdmem-0405",
         "tdmem-1204"
       ],
-      "line_budget": 12,
+      "line_budget": 2,
       "rebase_or_removal_plan": "Revert only the constructor visibility change after the Native bridge no longer needs the retained owner's existing MemoryApplication authority; preserve every retained operation and its canonical write path.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -1685,7 +1699,7 @@
         "tdmem-0404",
         "tdmem-1204"
       ],
-      "line_budget": 8,
+      "line_budget": 4,
       "rebase_or_removal_plan": "Remove the engine forwarding delta when upstream engine shutdown accepts the same caller-owned absolute deadline.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -1716,7 +1730,7 @@
         "tdmem-0404",
         "tdmem-1204"
       ],
-      "line_budget": 16,
+      "line_budget": 12,
       "rebase_or_removal_plan": "Remove the invocation-state forwarding patch after upstream accepts an equivalent shared-deadline shutdown signature.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -1799,7 +1813,7 @@
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "daemon_shutdown_deadline",
-      "rationale": "LspLeaseTaskRegistry::shutdown takes every lease task out of the registry before it joins them one at a time, so the caller cannot bound that join from outside: a timeout there drops the future holding the taken tasks, and a dropped JoinHandle detaches its task instead of aborting it. The deadline therefore has to reach the registry, which owns the handles. shutdown now accepts the caller's absolute deadline and is the last file in the shutdown call chain that still minted an unbounded wait. The same file's BoundedHookOrchestratorV1::admit dropped the superseded work future before emitting its receipt terminal, which detaches nested blocking work for the same reason a dropped JoinHandle does, so the supersession path now joins that future under the shared abort deadline.",
+      "rationale": "Pass the caller's absolute deadline into the lease registry that owns captured JoinHandles, cancelling every lease before joining and aborting unfinished tasks rather than detaching them. The hook orchestrator already joins superseded work while retaining its permit at the pinned upstream head; delete the redundant second timed reaper, which could poll the completed async future again and panic.",
       "semantic_invariants": [
         "Upstream behavior: shutdown still closes admission first, retires every registered lease task, and returns the observed outcome; generation matching, the weak-registry finish path, and Drop-time abort are unchanged.",
         "Product behavior: shutdown consumes the caller's absolute deadline and mints no budget of its own.",
@@ -1807,8 +1821,8 @@
         "Product behavior: a task still unfinished at the deadline is aborted before the registry releases its handle, rather than merely dropped: dropping a JoinHandle detaches the task instead of stopping it.",
         "Product behavior: the guarantee abort buys is bounded and stated as such. Tokio abort is cooperative, so a task already executing inside its own poll \u2014 a lease body blocking a worker thread, for instance \u2014 keeps running until it reaches a suspension point, and it may still run that far after shutdown has returned. What is guaranteed is that an aborted task never resumes past that suspension point, so no lease effect sequenced after an await can execute once shutdown has abandoned the join.",
         "Product behavior: an unfinished, aborted, or panicked join is reported as DaemonInvocationProblem::Unavailable, so an incomplete lease teardown is never hidden behind a successful terminal.",
-        "Product behavior: a superseded hook cycle retains its permit and drives its cancelled work future under TASK_ABORT_DEADLINE; if the work remains unfinished at that deadline, the same bounded owner continues reaping it while holding the permit, so no detached-worker tail can grow and the receipt terminal is emitted only after settlement.",
-        "Upstream behavior: owner-level retirement is unchanged - owner cancellation remains biased, drops the work future immediately, emits no terminal, and does not wait on work whose owner retired; only superseded work is reaped to settlement."
+        "Upstream behavior: started superseded hook work is joined once while its permit remains held; that join is unbounded by TASK_ABORT_DEADLINE and biased owner cancellation can preempt it. The redundant second timer/re-poll is removed, not replaced.",
+        "Upstream behavior: ordinary owner retirement does not invent a completion terminal. A waiting supersession is distinct: settlement retains the superseded flag, including when retirement preempts its join, so a superseded receipt may still be emitted without claiming the retired work completed."
       ],
       "verification": [
         "git diff --check",
@@ -1823,8 +1837,8 @@
         "tdmem-0404",
         "tdmem-1204"
       ],
-      "line_budget": 50,
-      "rebase_or_removal_plan": "Delete the deadline parameter and restore the unbounded join when upstream's lease registry retires its tasks under a caller-supplied deadline itself. If upstream moves LspLeaseTaskRegistry out of invocation/types.rs, re-locate this entry with it rather than widening the area.",
+      "line_budget": 37,
+      "rebase_or_removal_plan": "Remove the deadline delta when upstream lease shutdown accepts the caller deadline and aborts unfinished owned tasks. Remove the local duplicate-reaper repair when no downstream reaper overlays the upstream supersession join; never restore a second poll of a completed future.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
       "upstreamability": {
@@ -1903,17 +1917,20 @@
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "integration_test_runtime_isolation",
-      "rationale": "Make the memory evaluation journey reuse the shared isolated command environment and one production-equivalent bounded socket path.",
+      "rationale": "Reuse the isolated same-checkout command/socket environment, initialize through the fixture daemon, and decode the CLI application envelope once before validating the retained result schema.",
       "semantic_invariants": [
         "Upstream behavior: the memory evaluation test exercises the production daemon protocol through one isolated socket and profile.",
-        "Product behavior: memory-suite setup shares the common same-checkout CLI environment and cannot attach to an inherited daemon."
+        "Product behavior: memory-suite setup shares the common same-checkout CLI environment and cannot attach to an inherited daemon.",
+        "Fixture setup starts its daemon before CLI initialization, avoiding a second direct database writer.",
+        "run_exact_value unwraps the application envelope once; run_exact validates the retained T result rather than mistaking its own outcome tag for another envelope. Scenario result and ranking assertions remain unchanged."
       ],
       "verification": [
         "git diff --check",
         "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1"
       ],
       "tests": [
-        "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1"
+        "cargo test --locked -p tracedecay --features test-helpers --test memory_suite harness_ -- --test-threads=1",
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
       ],
       "bead_ids": [
         "tdmem-0404",
@@ -1952,7 +1969,8 @@
         "Additive only: no existing setting's default, scope, sensitivity, or restart requirement changes.",
         "The Native provider default stays false, so mounting the provider composition remains an explicit per-project decision.",
         "The routing default is validated before registration and a validation failure is a typed InvalidDefinition rather than a silently skipped setting.",
-        "No schema, migration, transaction, lineage, or recovery path in the zone is touched."
+        "No schema, migration, transaction, lineage, or recovery path in the zone is touched.",
+        "Incidental formatting in this exact file is included in its pinned-head changed-line budget; it grants no additional semantic or path authority."
       ],
       "verification": [
         "git diff --check"
@@ -1996,7 +2014,8 @@
       "semantic_invariants": [
         "Additive only: the reconciliation rule itself is unchanged and the pre-existing key keeps its behavior.",
         "Reconciliation stays idempotent for a profile that already carries the keys.",
-        "No protected-change, rollback, or snapshot semantics are altered."
+        "No protected-change, rollback, or snapshot semantics are altered.",
+        "Incidental formatting in this exact file is included in its pinned-head changed-line budget; it grants no additional semantic or path authority."
       ],
       "verification": [
         "git diff --check"
@@ -2008,7 +2027,7 @@
         "tdmem-0402",
         "tdmem-0607"
       ],
-      "line_budget": 20,
+      "line_budget": 10,
       "rebase_or_removal_plan": "Re-apply two entries to the additive-key list, or delete them with the registrations.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -2122,7 +2141,7 @@
       "bead_ids": [
         "tdmem-0607"
       ],
-      "line_budget": 60,
+      "line_budget": 21,
       "rebase_or_removal_plan": "Delete the two fields and the routing reader as one additive patch.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -2384,7 +2403,7 @@
       "bead_ids": [
         "tdmem-1009"
       ],
-      "line_budget": 84,
+      "line_budget": 3,
       "rebase_or_removal_plan": "Remove current_diagnostic_generation() and restore the inline current.generation/coverage match at its call site.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -2435,7 +2454,9 @@
         "A dormant provider host, an observer-only routing gate, or a non-context tool leaves the dispatched result exactly as the handler produced it; every other advisory failure is a typed unavailable lane attributed to the routed provider, and the host answer is still delivered unchanged.",
         "The advisory lane cannot hold the dispatch task -- and therefore the already-produced canonical answer -- open. The provider's own half of the sub-deadline is enforced inside the cognitive-recall mount by the host provider-invocation boundary, which answers at the deadline with a typed Answered result carrying CognitiveRecallDegradation::TimedOut (or Cancelled when the caller withdraws), keeps the still-running worker accounted as stranded, and refuses the provider before contact until it returns. Cancellation is monotonic at every provider-boundary edge: pre-contact refusals yield to newly ready withdrawal without contact or census effect, delivered answers are accepted only after a final consent poll, and once withdrawal is observed no worker settlement can later turn it into Ok. The wall-clock timeout on this path is a strictly later net past a fixed grace margin for the host-side stages that run after the provider answered; when it fires the lane terminates as advisory_lane_deadline_exceeded and claims nothing about the provider invocation.",
         "The lane is applied after the handler answered, so a coalesced read shared with other callers never carries this caller's advisory candidates.",
-        "The dispatch path names no provider, registry, or fabric type; the provider boundary stays behind the cognitive-recall mount."
+        "The dispatch path names no provider, registry, or fabric type; the provider boundary stays behind the cognitive-recall mount.",
+        "Incidental formatting in this exact file is included in its pinned-head changed-line budget; it grants no additional semantic or path authority.",
+        "Before strict handler decoding, route-only metadata is separated from business arguments while the original route identity survives for admission; declared tool fields are never stripped."
       ],
       "verification": [
         "git diff --check"
@@ -2450,7 +2471,7 @@
         "tdmem-0607",
         "tdmem-0605"
       ],
-      "line_budget": 90,
+      "line_budget": 71,
       "rebase_or_removal_plan": "Remove the advisory admission before dispatch and the advisory compile after dispatch.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -2607,7 +2628,7 @@
       "bead_ids": [
         "tdmem-1001"
       ],
-      "line_budget": 65,
+      "line_budget": 59,
       "rebase_or_removal_plan": "Re-apply one macro line, one registration tuple, and one async capture function onto the upstream kernel table; delete all three if upstream's profile kernel starts covering registered projects.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -2640,7 +2661,7 @@
       "bead_ids": [
         "tdmem-1001"
       ],
-      "line_budget": 20,
+      "line_budget": 19,
       "rebase_or_removal_plan": "Re-apply one [[test]] block and one feature line onto the upstream manifest; both are deleted with the memory-provider-host feature.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -2688,11 +2709,11 @@
       "owner": "BleedingDev",
       "upstream_owner": "ScriptedAlchemy",
       "touch_point": "daemon_shutdown_deadline",
-      "rationale": "Exercise the superseded hook-work ownership fix at the daemon invocation composition seam. The regression keeps nested blocking work alive beyond TASK_ABORT_DEADLINE and proves the superseded receipt terminal is withheld until the same future settles, preventing detached work from being reported complete.",
+      "rationale": "Keep nested blocking work alive beyond TASK_ABORT_DEADLINE and prove that, while the owner remains live, the superseded receipt is withheld until settlement. The fixture delays and notifications exercise elapsed time; they do not witness a production reaper timer, because upstream now joins superseded work without that timer.",
       "semantic_invariants": [
-        "The test advances virtual time beyond TASK_ABORT_DEADLINE only after observing that the reaper timer is armed, then proves nested work remains unfinished, no superseded receipt terminal was emitted, and the successor has not consumed the retained permit.",
+        "After a fixture notification that cancellation was observed, the test advances virtual time beyond TASK_ABORT_DEADLINE and waits for the fixture continuation, then proves nested work remains unfinished and the superseded receipt is still withheld. This does not assert that a production reaper timer was armed.",
         "After explicit release, the test observes the superseded receipt terminal under a bounded deadline and proves nested blocking work had settled before that terminal.",
-        "The test uses channels, virtual time, and explicit release signals rather than sleeps, yield loops, or assertions that accept multiple terminal outcomes."
+        "The test combines fixture-local virtual-time delay, channels, and explicit blocking-work release; real time is resumed for the bounded terminal wait. No claim is made that the deleted redundant production timer still exists."
       ],
       "verification": [
         "git diff --check",
@@ -2886,7 +2907,8 @@
       "semantic_invariants": [
         "Routing and private-route authorization run before stripping, so no caller loses its route by this change.",
         "A field the called tool declares in its input schema is never stripped; the catalog lockstep test fails when a new top-level session or thread field is left unclassified.",
-        "The preserved identity view yields the same analytics session id and query text as the original arguments."
+        "The preserved identity view yields the same analytics session id and query text as the original arguments.",
+        "Incidental formatting in this exact file is included in its pinned-head changed-line budget; it grants no additional semantic or path authority."
       ],
       "verification": [
         "git diff --check",
@@ -2959,7 +2981,7 @@
         "tdmem-1001",
         "tdmem-0308"
       ],
-      "line_budget": 2,
+      "line_budget": 1,
       "rebase_or_removal_plan": "Re-apply one mod line, or delete it with the projectless bridge tests.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -3040,7 +3062,8 @@
       "rationale": "Assert that route metadata is preserved byte for byte through the CLI gate and that a semantic session_id still fails schema validation when it is not a string.",
       "semantic_invariants": [
         "The pass-through test covers every allowlisted spelling in one payload.",
-        "The strict test proves the allowlist does not weaken a declared field."
+        "The strict test proves the allowlist does not weaken a declared field.",
+        "Incidental formatting in this exact file is included in its pinned-head changed-line budget; it grants no additional semantic or path authority."
       ],
       "verification": [
         "git diff --check",
@@ -3053,7 +3076,7 @@
         "tdmem-1001",
         "tdmem-0308"
       ],
-      "line_budget": 43,
+      "line_budget": 41,
       "rebase_or_removal_plan": "Re-apply the two test bodies, or delete them with the allowlist entries.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -3115,7 +3138,7 @@
         "tdmem-1001",
         "tdmem-0308"
       ],
-      "line_budget": 7,
+      "line_budget": 6,
       "rebase_or_removal_plan": "Re-apply one or_else on the helper, or delete it if grep rows gain a display path upstream.",
       "status": "active",
       "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
@@ -3384,6 +3407,382 @@
       "upstreamability": {
         "kind": "upstream_candidate",
         "rationale": "A build repair upstream needs for its own feature-gated file."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest/tests.rs",
+      "area_id": "host_hook_ingest_mount",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "host_hook_ingest",
+      "rationale": "Name the project-scoped Claude capture route (ClaudeProjectKernelV1) as a registered kernel in the capture-registry lockstep test, which upstream asserts is unregistered because upstream has no project-scoped Claude catch-up.",
+      "semantic_invariants": [
+        "The test still proves every other supported route is registered and every unknown route is reported through the typed unknown_provider status.",
+        "Only the Claude project SourceScan tuple moves from the unregistered list to the registered list."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features memory-provider-host hook_runtime"
+      ],
+      "tests": [
+        "cargo test --locked -p tracedecay --features memory-provider-host hook_runtime"
+      ],
+      "bead_ids": [
+        "tdmem-1001"
+      ],
+      "line_budget": 5,
+      "rebase_or_removal_plan": "Re-apply the moved tuple, or delete it with ClaudeProjectKernelV1 when upstream ships a project-scoped Claude capture route.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "Test-only file that travels with the Claude project kernel."
+      }
+    },
+    {
+      "path": "crates/tracedecay-host-admission/src/lib.rs",
+      "area_id": "feature_gated_build_repair",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "feature_gated_build_repair",
+      "rationale": "Raise the crate recursion limit to 256 so the hotpath-instrumented async test bodies of this crate compile under --features hotpath,hotpath-mcp, which upstream 3b59bb7eb does not build for it; the attribute changes no behavior.",
+      "semantic_invariants": [
+        "Only a crate-level recursion_limit attribute and its comment are added; no item in the crate changes.",
+        "The crate compiles identically without the hotpath features."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked"
+      ],
+      "tests": [
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ],
+      "bead_ids": [
+        "tdmem-1200",
+        "tdmem-1208"
+      ],
+      "line_budget": 5,
+      "rebase_or_removal_plan": "Delete the attribute when upstream builds this crate under the hotpath feature set on its own.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A build repair upstream needs for its own feature set."
+      }
+    },
+    {
+      "path": "crates/tracedecay-host-admission/tests/host_capture_background_cpu_admission.rs",
+      "area_id": "feature_gated_build_repair",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "feature_gated_build_repair",
+      "rationale": "Raise the crate recursion limit to 256 so the hotpath-instrumented async test bodies of this crate compile under --features hotpath,hotpath-mcp, which upstream 3b59bb7eb does not build for it; the attribute changes no behavior.",
+      "semantic_invariants": [
+        "Only a crate-level recursion_limit attribute and its comment are added; no item in the crate changes.",
+        "The crate compiles identically without the hotpath features."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked"
+      ],
+      "tests": [
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ],
+      "bead_ids": [
+        "tdmem-1200",
+        "tdmem-1208"
+      ],
+      "line_budget": 5,
+      "rebase_or_removal_plan": "Delete the attribute when upstream builds this crate under the hotpath feature set on its own.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A build repair upstream needs for its own feature set."
+      }
+    },
+    {
+      "path": "crates/tracedecay-global-db/src/lib.rs",
+      "area_id": "feature_gated_build_repair",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "exception",
+      "rationale": "Raise the crate recursion limit to 256 so the hotpath-instrumented async test bodies of this crate compile under --features hotpath,hotpath-mcp, which upstream 3b59bb7eb does not build for it; the attribute changes no behavior.",
+      "semantic_invariants": [
+        "Only a crate-level recursion_limit attribute and its comment are added; no item in the crate changes.",
+        "The crate compiles identically without the hotpath features."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked"
+      ],
+      "tests": [
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ],
+      "bead_ids": [
+        "tdmem-1200",
+        "tdmem-1208"
+      ],
+      "line_budget": 5,
+      "rebase_or_removal_plan": "Delete the attribute when upstream builds this crate under the hotpath feature set on its own.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A build repair upstream needs for its own feature set."
+      },
+      "exception": {
+        "zone": "native_database_internals",
+        "adr": "product/architecture/adr/ADR-0017-patch-footprint-revision-v4.md",
+        "why_unavoidable": "rustc's recursion_limit applies at the upstream global-db crate root, which is inside the forbidden Native database zone; a product crate or item-local attribute cannot raise that crate's query depth for hotpath instrumentation.",
+        "alternatives_rejected": [
+          "Disable the shipped hotpath feature set to avoid compiling the instrumented async bodies",
+          "Move or duplicate upstream database code into a product-owned crate",
+          "Exempt all crate-root build attributes from Native database ownership checks"
+        ],
+        "policy_revision": "patch-footprint.v4",
+        "rollback_plan": "Delete only the recursion_limit attribute and its comment when upstream builds this exact crate under the hotpath feature set without the local repair; no database implementation is changed."
+      }
+    },
+    {
+      "path": "crates/tracedecay-session-temporal-store/src/lib.rs",
+      "area_id": "feature_gated_build_repair",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "feature_gated_build_repair",
+      "rationale": "Raise the crate recursion limit to 256 so the hotpath-instrumented async test bodies of this crate compile under --features hotpath,hotpath-mcp, which upstream 3b59bb7eb does not build for it; the attribute changes no behavior.",
+      "semantic_invariants": [
+        "Only a crate-level recursion_limit attribute and its comment are added; no item in the crate changes.",
+        "The crate compiles identically without the hotpath features."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked"
+      ],
+      "tests": [
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ],
+      "bead_ids": [
+        "tdmem-1200",
+        "tdmem-1208"
+      ],
+      "line_budget": 4,
+      "rebase_or_removal_plan": "Delete the attribute when upstream builds this crate under the hotpath feature set on its own.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A build repair upstream needs for its own feature set."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/runtime_ports.rs",
+      "area_id": "integration_test_harness",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "integration_test_runtime_isolation",
+      "rationale": "Compare the resolved project root by canonical path identity rather than its /var versus /private/var spelling in the unregistered-checkout fixture.",
+      "semantic_invariants": [
+        "Only the test assertion changes; production runtime-port routing is unchanged.",
+        "same_canonical_path proves the resolved root denotes the fixture checkout, and the nonempty project-ID assertion remains."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --lib runtime_ports::tests"
+      ],
+      "tests": [
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ],
+      "bead_ids": [
+        "tdmem-1208"
+      ],
+      "line_budget": 12,
+      "rebase_or_removal_plan": "Remove this exact fixture delta when upstream provides the same isolation or contract assertion; do not carry a parallel fixture or broaden production behavior.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A provider-neutral fixture correction that preserves executable behavior and can converge independently upstream."
+      }
+    },
+    {
+      "path": "crates/tracedecay/tests/transcript_ingest_suite/hermes.rs",
+      "area_id": "integration_test_harness",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "integration_test_runtime_isolation",
+      "rationale": "Bind Hermes message search to the authoritative project ID and separately assert that the stored session path denotes the fixture project.",
+      "semantic_invariants": [
+        "The search filter uses db.project_id(), not a filesystem path masquerading as an ID.",
+        "Path-identity and retained user-message assertions remain; the fixture cannot satisfy the test with another project."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features test-helpers --test transcript_ingest_suite hermes_state_db_populates_projection_for_pinned_project"
+      ],
+      "tests": [
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ],
+      "bead_ids": [
+        "tdmem-1208"
+      ],
+      "line_budget": 14,
+      "rebase_or_removal_plan": "Remove this exact fixture delta when upstream provides the same isolation or contract assertion; do not carry a parallel fixture or broaden production behavior.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A provider-neutral fixture correction that preserves executable behavior and can converge independently upstream."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/invocation_tests/lsp_tests.rs",
+      "area_id": "integration_test_harness",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "integration_test_runtime_isolation",
+      "rationale": "Pause virtual time only for disconnect TTL expiry, then resume real time before the SQLite recorder drain joins real worker threads.",
+      "semantic_invariants": [
+        "Only fixture scheduling changes; production lease duration, admission, and recorder behavior are unchanged.",
+        "The test still proves both registries are empty and exactly one unacknowledged delivery is recorded as dropped."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --lib lsp_disconnect_expiry_settles_unacknowledged_outbound_as_dropped"
+      ],
+      "tests": [
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ],
+      "bead_ids": [
+        "tdmem-1208"
+      ],
+      "line_budget": 6,
+      "rebase_or_removal_plan": "Remove this exact fixture delta when upstream provides the same isolation or contract assertion; do not carry a parallel fixture or broaden production behavior.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A provider-neutral fixture correction that preserves executable behavior and can converge independently upstream."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/tests/rmcp_route.rs",
+      "area_id": "integration_test_harness",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "integration_test_runtime_isolation",
+      "rationale": "Initialize the sibling route target through the fixture daemon with allow_init rather than opening a competing maintenance writer on its profile database.",
+      "semantic_invariants": [
+        "The authenticated handshake retains the fixture client identity and selects the exact sibling project.",
+        "Only target setup changes; routing, isolation, and selected-target behavioral assertions remain."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --lib daemon::tests::rmcp_route"
+      ],
+      "tests": [
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ],
+      "bead_ids": [
+        "tdmem-1208"
+      ],
+      "line_budget": 4,
+      "rebase_or_removal_plan": "Remove this exact fixture delta when upstream provides the same isolation or contract assertion; do not carry a parallel fixture or broaden production behavior.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A provider-neutral fixture correction that preserves executable behavior and can converge independently upstream."
+      }
+    },
+    {
+      "path": "crates/tracedecay/tests/hooks_lsp_suite/hook_lifecycle_lease_test.rs",
+      "area_id": "integration_test_harness",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "integration_test_runtime_isolation",
+      "rationale": "Expect the exact Claude Stop unavailable-daemon diagnostic while proving host callback output and transport-only capture remain unchanged.",
+      "semantic_invariants": [
+        "Only hook-stop may emit the exact project_ingest daemon_call_failed diagnostic; every other callback still requires empty stderr.",
+        "The stdout, spool identity/redelivery, successful host callback, and no-direct-database assertions remain."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features test-helpers --test hooks_lsp_suite native_hook_captures_only_bound_transport_spool_records"
+      ],
+      "tests": [
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ],
+      "bead_ids": [
+        "tdmem-1208"
+      ],
+      "line_budget": 10,
+      "rebase_or_removal_plan": "Remove this exact fixture delta when upstream provides the same isolation or contract assertion; do not carry a parallel fixture or broaden production behavior.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A provider-neutral fixture correction that preserves executable behavior and can converge independently upstream."
+      }
+    },
+    {
+      "path": "crates/tracedecay/src/mcp/tools/plugin_conformance_tests.rs",
+      "area_id": "integration_test_harness",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "integration_test_runtime_isolation",
+      "rationale": "Remove the reverse prose inventory requiring every registered tool to appear in plugin text; retain validity checks on tools actually mentioned and the readOnly allowlist.",
+      "semantic_invariants": [
+        "Mentioned tools must still resolve to registered tools; removing the reverse inventory cannot license invented tool names.",
+        "The documented Auto-review allowlist must still match readOnlyHint annotations exactly; no runtime or safety assertion is removed."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --lib mcp::tools::plugin_conformance_tests"
+      ],
+      "tests": [
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ],
+      "bead_ids": [
+        "tdmem-1208"
+      ],
+      "line_budget": 27,
+      "rebase_or_removal_plan": "Remove this exact fixture delta when upstream provides the same isolation or contract assertion; do not carry a parallel fixture or broaden production behavior.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A provider-neutral fixture correction that preserves executable behavior and can converge independently upstream."
+      }
+    },
+    {
+      "path": "crates/tracedecay/tests/hermes_suite/lcm_bridge.rs",
+      "area_id": "integration_test_harness",
+      "owner": "BleedingDev",
+      "upstream_owner": "ScriptedAlchemy",
+      "touch_point": "integration_test_runtime_isolation",
+      "rationale": "Keep exact installed Hermes skill/template equality and remove the obsolete command-prose marker inventory from the installation fixture.",
+      "semantic_invariants": [
+        "The installed skill must remain byte-for-byte equal to its shipped template.",
+        "Only prose-marker and deprecated-prose inventory assertions are removed; bridge execution and retrieval behavior tests remain."
+      ],
+      "verification": [
+        "git diff --check",
+        "cargo test --locked -p tracedecay --features test-helpers --test hermes_suite generated_skill_install_preserves_its_template"
+      ],
+      "tests": [
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ],
+      "bead_ids": [
+        "tdmem-1208"
+      ],
+      "line_budget": 56,
+      "rebase_or_removal_plan": "Remove this exact fixture delta when upstream provides the same isolation or contract assertion; do not carry a parallel fixture or broaden production behavior.",
+      "status": "active",
+      "last_verified_upstream_sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289",
+      "upstreamability": {
+        "kind": "upstream_candidate",
+        "rationale": "A provider-neutral fixture correction that preserves executable behavior and can converge independently upstream."
       }
     }
   ],

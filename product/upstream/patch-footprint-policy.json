@@ -1,4 +1,7 @@
 {
+  "administrative_paths_excluded_from_footprint": [
+    ".codex/**"
+  ],
   "allowed_touch_points": [
     {
       "allowed_changes": [
@@ -99,7 +102,6 @@
         "crates/tracedecay/src/daemon/retained_owner.rs",
         "crates/tracedecay/src/daemon/retained_owner/memory.rs",
         "crates/tracedecay-daemon-service/src/project_runtime.rs",
-        "crates/tracedecay/src/runtime_ports.rs",
         "crates/tracedecay/src/daemon/tests/ownership.rs",
         "crates/tracedecay/src/mcp/server.rs",
         "crates/tracedecay/src/mcp/server/construction.rs",
@@ -122,7 +124,7 @@
         "bound blocking drain work by the caller deadline's remaining budget",
         "report Failed for incomplete shutdown while completing terminal teardown",
         "make the shutdown call chain's own unit tests assert the fence through an observable effect of begin_shutdown instead of a fixed number of scheduler yields",
-        "settle superseded hook work truthfully before emitting its receipt terminal, with deterministic coverage of work that outlives the abort deadline"
+        "preserve the upstream single supersession join and remove a redundant second reaper, proving live-owner receipt ordering while distinguishing ordinary retirement from an already-superseded receipt"
       ],
       "cap_revision": {
         "adr": "product/architecture/adr/ADR-0016-daemon-shutdown-receipt-ordering-headroom.md",
@@ -152,7 +154,6 @@
         "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
         "crates/tracedecay/src/daemon/invocation_tests/types_tests.rs",
         "crates/tracedecay/src/daemon/invocation_tests/lsp_lease_tests.rs",
-        "crates/tracedecay/src/daemon/invocation_tests/lsp_tests.rs",
         "crates/tracedecay/src/daemon/invocation_tests/project_lifecycle_tests.rs"
       ],
       "required_verification": [
@@ -187,30 +188,50 @@
     {
       "allowed_changes": [
         "select an explicit or Cargo-provided same-checkout CLI and otherwise fail closed",
-        "clear inherited daemon routing and use one bounded production-equivalent socket path",
-        "share the common isolated command environment across the memory integration suite",
-        "remove a platform gate from a test-only import so an upstream lib-test module compiles on every supported host"
+        "clear inherited daemon routing and share one isolated bounded production-equivalent socket and command environment",
+        "initialize fixture projects through their already-owned daemon instead of competing database writers",
+        "assert canonical path identity and use the authoritative project ID for fixture message search",
+        "pause virtual time only for lease TTL expiry and resume it before draining real SQLite workers",
+        "decode the CLI application envelope once and validate the retained result schema without changing behavioral result assertions",
+        "expect the exact unavailable-daemon Claude Stop diagnostic while retaining stdout, spool, and no-direct-database assertions",
+        "remove only the reverse registered-tool prose inventory and obsolete Hermes command-prose markers, preserving mentioned-tool validity, the readOnly allowlist, installed-template equality, and executable behavior"
       ],
+      "cap_revision": {
+        "adr": "product/architecture/adr/ADR-0017-patch-footprint-revision-v4.md",
+        "measured_changed_lines": 325,
+        "measured_files": 9,
+        "policy_revision": "patch-footprint.v4",
+        "previous_max_changed_lines": 240,
+        "previous_max_files": 3
+      },
       "category": "integration_test",
       "forbidden_changes": [
-        "guessing a sibling profile binary",
+        "guessing a sibling profile binary or silently mixing checkout revisions",
         "reusing an installed daemon or global profile",
-        "silently mixing checkout revisions",
-        "changing production behavior",
-        "changing any upstream test body, assertion, or fixture while fixing its compilation"
+        "changing production behavior or its ownership and admission rules",
+        "weakening behavioral assertions, accepting multiple terminal outcomes, or skipping executable tests to hide a failure",
+        "loosening mentioned-tool validity, the readOnly allowlist, or exact installed-template equality"
       ],
       "id": "integration_test_runtime_isolation",
-      "max_changed_lines": 240,
-      "max_files": 3,
+      "max_changed_lines": 373,
+      "max_files": 9,
       "paths": [
         "crates/tracedecay/tests/common/mod.rs",
         "crates/tracedecay/tests/memory_suite/memory_eval_test.rs",
-        "crates/tracedecay-daemon-control/src/service/tests.rs"
+        "crates/tracedecay-daemon-control/src/service/tests.rs",
+        "crates/tracedecay/src/runtime_ports.rs",
+        "crates/tracedecay/tests/transcript_ingest_suite/hermes.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/lsp_tests.rs",
+        "crates/tracedecay/src/daemon/tests/rmcp_route.rs",
+        "crates/tracedecay/tests/hooks_lsp_suite/hook_lifecycle_lease_test.rs",
+        "crates/tracedecay/src/mcp/tools/plugin_conformance_tests.rs",
+        "crates/tracedecay/tests/hermes_suite/lcm_bridge.rs"
       ],
       "required_verification": [
         "memory-suite harness isolation tests",
         "same-checkout CLI resolution tests",
-        "daemon socket isolation tests"
+        "daemon socket isolation tests",
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
       ]
     },
     {
@@ -343,12 +364,13 @@
       ],
       "id": "host_hook_ingest",
       "max_changed_lines": 486,
-      "max_files": 4,
+      "max_files": 5,
       "paths": [
         "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest/kernels.rs",
         "crates/tracedecay-cli/Cargo.toml",
         "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance.rs",
-        "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance/native_plugin_fixture.rs"
+        "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance/native_plugin_fixture.rs",
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest/tests.rs"
       ],
       "required_verification": [
         "cargo test --locked -p tracedecay --features memory-provider-host hook_runtime",
@@ -429,27 +451,29 @@
     },
     {
       "allowed_changes": [
-        "replace a private field access with the public accessor upstream introduced for it, inside a file upstream only compiles under a feature"
+        "replace a private field access with the public accessor upstream introduced for it, inside a file upstream only compiles under a feature",
+        "add a crate-level recursion_limit attribute so hotpath-instrumented async bodies compile under a feature set upstream does not build for that crate"
       ],
       "category": "feature_gated_build_repair",
       "forbidden_changes": [
         "changing what a repaired expression reads or the behavior of the feature",
-        "touching a file that compiles without the repair"
+        "touching a file whose relevant shipped feature build already compiles without the repair"
       ],
       "id": "feature_gated_build_repair",
-      "max_changed_lines": 11,
-      "max_files": 1,
+      "max_changed_lines": 27,
+      "max_files": 4,
       "paths": [
-        "crates/tracedecay/src/dashboard.rs"
+        "crates/tracedecay/src/dashboard.rs",
+        "crates/tracedecay-host-admission/src/lib.rs",
+        "crates/tracedecay-host-admission/tests/host_capture_background_cpu_admission.rs",
+        "crates/tracedecay-session-temporal-store/src/lib.rs"
       ],
       "required_verification": [
         "cargo check --workspace --all-targets --features test-transport --locked",
+        "cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked",
         "python3 scripts/product/check-patch-footprint-policy.py"
       ]
     }
-  ],
-  "administrative_paths_excluded_from_footprint": [
-    ".codex/**"
   ],
   "bead_id": "tdmem-0105",
   "convergence_map": {
@@ -765,7 +789,7 @@
     }
   ],
   "initial_budget": {
-    "default_max_exception_zone_files": 5,
+    "default_max_exception_zone_files": 6,
     "manual_generated_file_edits": 0,
     "max_allowed_touch_point_files_per_category": 15,
     "max_changed_lines_per_upstream_file": 830,
@@ -773,13 +797,14 @@
     "max_exception_files_per_adr": 2,
     "max_total_upstream_changed_lines": 6430,
     "max_upstream_existing_production_files": 56,
-    "max_upstream_existing_test_or_fixture_files": 18,
+    "max_upstream_existing_test_or_fixture_files": 26,
     "max_workspace_manifest_files": 2,
     "notes": [
       "Revision patch-footprint.v2 is approved by product/architecture/adr/ADR-0011-patch-footprint-revision-v2.md: every cap equals the M4 observation-journey mount, M5 cognitive-recall port, Native configuration registration, and session-sync exact-scope footprint measured at that revision's tree plus at most roughly fifteen percent headroom. Per-entry line_budget values in the convergence map remain the binding limit for an individual file.",
       "Revision patch-footprint.v3 is approved by product/architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md: it carries every v2 cap forward unchanged except the three the Claude Code host hook ingest journey moves - upstream existing production files 34 -> 37, total upstream changed lines 3300 -> 3500, and exception-zone files 2 -> 4 - each set from the footprint measured at this revision's tree (37 production files, 3393 total changed lines, 4 exception-zone files) plus at most roughly fifteen percent headroom.",
       "Revision patch-footprint.v4 is approved by product/architecture/adr/ADR-0017-patch-footprint-revision-v4.md: it re-measures every aggregate cap against the tree that carries the hook-route bridge, the online-only retention authority, the feature-gated build repair, and the executable Codex fixture at upstream head 3b59bb7eb - upstream existing production files 37 -> 56, test/fixture files 9 -> 18, total upstream changed lines 3500 -> 6430, changed lines per upstream file 560 -> 830, and exception-zone files 4 -> 5 - each the measurement plus at most roughly fifteen percent headroom. It adds the hook_route_bridge, vector_retention_authority, and feature_gated_build_repair touch points, widens host_hook_ingest to the Codex fixture, and admits one more host_specific_adapters file (agents/claude.rs) under this ADR.",
       "ADR-0016 supersedes only ADR-0015 as the approving decision for the daemon_shutdown_deadline touch point, retaining 8 files and raising only its line cap from 360 to 420 against a measured 8 files and 416 lines for the deterministic types_tests.rs supersession receipt-ordering regression. Root commits this policy slice before the implementation slice. It changes no aggregate cap and keeps patch-footprint.v3.",
+      "The 2026-09-08 ADR-0017 reconciliation supersedes the original v4 snapshot with 54 production files, 23 test/fixture files, 5715 changed lines, and 6 explicit exception-zone files at the same pinned head. It retains production and line caps, revises the test/fixture cap to 26 and exception cap to 6, and binds the expanded fixture seam to measured behavior repairs.",
       "Added files under product_owned_paths are excluded from the upstream footprint totals.",
       "Renaming or copying an upstream file counts as touching the destination and source.",
       "Changed lines are additions plus deletions from git numstat against the immutable upstream floor.",

@@ -12,6 +12,7 @@ import textwrap
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 POLICY = REPO / "product/upstream/patch-footprint-policy.json"
@@ -203,6 +204,79 @@ class PatchFootprintPolicyTest(unittest.TestCase):
                 "upstream_existing_test_or_fixture_files",
             },
         )
+
+    def test_fixture_repair_cap_revision_is_bound_to_adr_0017(self) -> None:
+        touch = copy.deepcopy(self.touch_point(
+            self.policy, "integration_test_runtime_isolation"
+        ))
+        errors: list[str] = []
+        CHECKER_MODULE.validate_touch_point_cap_revision(
+            REPO, touch["id"], touch, errors
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual((touch["max_files"], touch["max_changed_lines"]), (9, 373))
+        self.assertEqual(touch["cap_revision"]["measured_changed_lines"], 325)
+        touch["cap_revision"]["previous_max_changed_lines"] = 239
+        CHECKER_MODULE.validate_touch_point_cap_revision(
+            REPO, touch["id"], touch, errors
+        )
+        self.assertTrue(any("previous_max_changed_lines must be 240" in e for e in errors))
+
+    def test_fixture_repairs_have_one_exact_existing_seam(self) -> None:
+        paths = (
+            "crates/tracedecay/src/runtime_ports.rs",
+            "crates/tracedecay/src/daemon/invocation_tests/lsp_tests.rs",
+            "crates/tracedecay/src/daemon/tests/rmcp_route.rs",
+            "crates/tracedecay/src/mcp/tools/plugin_conformance_tests.rs",
+            "crates/tracedecay/tests/hermes_suite/lcm_bridge.rs",
+            "crates/tracedecay/tests/hooks_lsp_suite/hook_lifecycle_lease_test.rs",
+            "crates/tracedecay/tests/transcript_ingest_suite/hermes.rs",
+        )
+        touches = {row["id"]: row for row in self.policy["allowed_touch_points"]}
+        areas = {row["id"]: row for row in self.convergence_map["areas"]}
+        for path in paths:
+            with self.subTest(path=path):
+                entries = [row for row in self.convergence_map["entries"]
+                           if row["path"] == path and row["status"] == "active"]
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0]["touch_point"], "integration_test_runtime_isolation")
+                self.assertEqual(
+                    CHECKER_MODULE.matching_touch_points(path, touches),
+                    ["integration_test_runtime_isolation"],
+                )
+                self.assertEqual(
+                    CHECKER_MODULE.matching_active_area_ids(path, areas, "upstream_owned"),
+                    ["integration_test_harness"],
+                )
+        # Test-only semantics do not override the checker's path classification.
+        self.assertFalse(CHECKER_MODULE.is_test_or_fixture(paths[0]))
+        self.assertTrue(CHECKER_MODULE.is_test_or_fixture(paths[3]))
+
+    def test_hotpath_global_db_root_keeps_explicit_native_zone_authority(self) -> None:
+        path = "crates/tracedecay-global-db/src/lib.rs"
+        entries = {row["path"]: row for row in self.convergence_map["entries"]}
+        entry = copy.deepcopy(entries[path])
+        self.assertEqual(entry["touch_point"], "exception")
+        self.assertEqual(entry["exception"]["zone"], "native_database_internals")
+        self.assertEqual(entry["line_budget"], 5)
+        adr = entry["exception"]["adr"]
+        self.assertTrue(adr.endswith("ADR-0017-patch-footprint-revision-v4.md"))
+        self.assertEqual(sum(row.get("exception", {}).get("adr") == adr
+                             for row in entries.values() if row["status"] == "active"), 2)
+        zones = {row["id"]: row for row in self.policy["exception_zones"]}
+        self.assertEqual(zones["native_database_internals"]["default_policy"], "forbidden")
+        touches = copy.deepcopy({row["id"]: row for row in self.policy["allowed_touch_points"]})
+        # Merely moving this path into the build seam cannot bypass the zone.
+        entry["touch_point"] = "feature_gated_build_repair"
+        entry.pop("exception")
+        touches["feature_gated_build_repair"]["paths"].append(path)
+        errors: list[str] = []
+        with mock.patch.object(CHECKER_MODULE, "diff_numstat", return_value={path: (5, 0)}):
+            CHECKER_MODULE.validate_actual_footprint(
+                REPO, CHECKER_MODULE.EXPECTED_FLOOR, self.policy, touches, zones,
+                {path: entry}, {}, errors,
+            )
+        self.assertTrue(any("without exception evidence" in e for e in errors), errors)
 
     def test_budget_cannot_be_silently_loosened(self) -> None:
         policy = copy.deepcopy(self.policy)
