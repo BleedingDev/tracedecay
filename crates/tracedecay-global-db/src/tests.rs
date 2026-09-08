@@ -919,6 +919,177 @@ async fn parse_offset_pair_conflict_rolls_back_both_authorities() {
 }
 
 #[tokio::test]
+async fn codex_epoch_unsigned_sqlite_roundtrip_and_atomic_cas() {
+    let harness = RegisteredGlobalDbHarness::open("codex-epoch-unsigned").await;
+    let db = &harness.registered;
+    for (frontier_key, epoch_key) in [
+        (
+            "tracedecay-internal:codex-history-frontier:v2",
+            "tracedecay-internal:codex-history-epoch:v2",
+        ),
+        (
+            "tracedecay-internal:user-ingest-codex-history-frontier:v2",
+            "tracedecay-internal:user-ingest-codex-history-epoch:v2",
+        ),
+    ] {
+        let mut expected = ParseOffset::default();
+        let mut frontier = ParseOffset::default();
+        for (high, low) in [(1 << 63, u64::MAX), (u64::MAX, 1 << 63), (0, 0)] {
+            let next = ParseOffset {
+                byte_offset: high,
+                mtime: low,
+                file_id: u64::MAX,
+            };
+            let next_frontier = ParseOffset {
+                file_id: frontier.file_id + 1,
+                ..frontier
+            };
+            db.replace_parse_offset_pair_result(
+                (frontier_key, frontier, next_frontier),
+                (epoch_key, expected, next),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                db.get_parse_offset_result(epoch_key).await.unwrap(),
+                Some(next)
+            );
+            assert_eq!(
+                db.get_parse_offset_result(frontier_key).await.unwrap(),
+                Some(next_frontier)
+            );
+            // A stale second authority must not publish the first authority.
+            assert!(matches!(
+                db.replace_parse_offset_pair_result(
+                    (frontier_key, next_frontier, frontier),
+                    (epoch_key, expected, ParseOffset::default()),
+                )
+                .await,
+                Err(TranscriptPersistenceError::PairConflict { .. })
+            ));
+            assert_eq!(
+                db.get_parse_offset_result(epoch_key).await.unwrap(),
+                Some(next)
+            );
+            assert_eq!(
+                db.get_parse_offset_result(frontier_key).await.unwrap(),
+                Some(next_frontier)
+            );
+            expected = next;
+            frontier = next_frontier;
+        }
+        assert!(
+            db.advance_parse_offset_result(epoch_key, expected)
+                .await
+                .is_err()
+        );
+        // Failure during the second write rolls the already-written frontier back.
+        db.writer_connection()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_epoch BEFORE INSERT ON parse_offsets
+             WHEN NEW.file_path = '{epoch_key}'
+             BEGIN SELECT RAISE(ABORT, 'forced epoch failure'); END;"
+            ))
+            .await
+            .unwrap();
+        assert!(
+            db.replace_parse_offset_pair_result(
+                (frontier_key, frontier, ParseOffset::default()),
+                (epoch_key, expected, ParseOffset::default()),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            db.get_parse_offset_result(epoch_key).await.unwrap(),
+            Some(expected)
+        );
+        assert_eq!(
+            db.get_parse_offset_result(frontier_key).await.unwrap(),
+            Some(frontier)
+        );
+        db.writer_connection()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_epoch;")
+            .await
+            .unwrap();
+        db.writer_connection()
+            .unwrap()
+            .execute(
+                "UPDATE parse_offsets SET byte_offset = 'invalid' WHERE file_path = ?1",
+                tracedecay_runtime_core::db::engine::params![epoch_key],
+            )
+            .await
+            .unwrap();
+        assert!(db.get_parse_offset_result(epoch_key).await.is_err());
+        assert!(
+            db.replace_parse_offset_pair_result(
+                (frontier_key, frontier, ParseOffset::default()),
+                (epoch_key, expected, ParseOffset::default()),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            db.get_parse_offset_result(frontier_key).await.unwrap(),
+            Some(frontier)
+        );
+    }
+}
+
+#[tokio::test]
+async fn transcript_cursor_keeps_checked_storage_and_monotonic_order() {
+    let harness = RegisteredGlobalDbHarness::open("cursor-checked-order").await;
+    let db = &harness.registered;
+    let cursor = ParseOffset {
+        byte_offset: 100,
+        mtime: 7,
+        file_id: u64::MAX,
+    };
+    db.advance_parse_offset_result("ordinary.jsonl", cursor)
+        .await
+        .unwrap();
+    db.advance_parse_offset_result(
+        "ordinary.jsonl",
+        ParseOffset {
+            byte_offset: 5,
+            ..cursor
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.get_parse_offset_result("ordinary.jsonl").await.unwrap(),
+        Some(cursor)
+    );
+    for offset in [
+        ParseOffset {
+            byte_offset: 1 << 63,
+            ..cursor
+        },
+        ParseOffset {
+            mtime: u64::MAX,
+            ..cursor
+        },
+    ] {
+        assert!(db.set_parse_offset("ordinary.jsonl", offset).await.is_err());
+        assert_eq!(
+            db.get_parse_offset_result("ordinary.jsonl").await.unwrap(),
+            Some(cursor)
+        );
+    }
+    db.writer_connection()
+        .unwrap()
+        .execute_batch(
+            "UPDATE parse_offsets SET byte_offset = -1 WHERE file_path = 'ordinary.jsonl';",
+        )
+        .await
+        .unwrap();
+    assert!(db.get_parse_offset_result("ordinary.jsonl").await.is_err());
+}
+
+#[tokio::test]
 async fn parse_offset_pair_rejects_one_key_without_writing() {
     let harness = RegisteredGlobalDbHarness::open("parse-offset-pair-same-key").await;
     let db = &harness.registered;

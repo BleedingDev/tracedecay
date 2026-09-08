@@ -7,6 +7,8 @@ mod startup;
 mod user;
 mod user_provider;
 
+pub(crate) use scheduler::USER_INGEST_CODEX_HISTORY_EPOCH_KEY;
+
 pub use authority::{IngestAdmissionBinding, SessionIngestAuthority};
 pub use failure::{
     IngestPassCoverage, TranscriptCatchUpFailure, TranscriptIngestDisposition,

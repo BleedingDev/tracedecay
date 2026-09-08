@@ -136,6 +136,7 @@ pub async fn get_parse_offset(
 ) -> Result<Option<ParseOffset>, TranscriptPersistenceError> {
     let path = path_identity_key(path);
     let path = path.as_str();
+    let encoding = ParseOffsetEncoding::for_path(path);
     match conn
         .query(
             "SELECT byte_offset, mtime, file_id FROM parse_offsets WHERE file_path = ?1",
@@ -151,8 +152,8 @@ pub async fn get_parse_offset(
                 return Ok(None);
             };
             Ok(Some(ParseOffset {
-                byte_offset: decode_u64(&row, 0, "decode transcript byte offset")?,
-                mtime: decode_u64(&row, 1, "decode transcript mtime")?,
+                byte_offset: encoding.decode(&row, 0, "decode transcript byte offset")?,
+                mtime: encoding.decode(&row, 1, "decode transcript mtime")?,
                 file_id: decode_file_id(&row, 2, "decode transcript file id")?,
             }))
         }
@@ -173,8 +174,8 @@ pub async fn get_parse_offset(
                 return Ok(None);
             };
             Ok(Some(ParseOffset {
-                byte_offset: decode_u64(&row, 0, "decode transcript byte offset")?,
-                mtime: decode_u64(&row, 1, "decode transcript mtime")?,
+                byte_offset: encoding.decode(&row, 0, "decode transcript byte offset")?,
+                mtime: encoding.decode(&row, 1, "decode transcript mtime")?,
                 file_id: 0,
             }))
         }
@@ -191,6 +192,48 @@ fn sqlite_missing_column(error: &tracedecay_runtime_core::db::engine::Error, col
             message.contains(&format!("no such column: {column}"))
         }
         _ => false,
+    }
+}
+
+/// The two reserved corpus authorities carry hash words, not ordered byte
+/// positions. Reuse the file-id bit codec for their full-width unsigned words;
+/// ordinary cursors keep checked signed storage and reject negative corruption.
+#[derive(Clone, Copy)]
+enum ParseOffsetEncoding {
+    TranscriptCursor,
+    CodexCorpusEpoch,
+}
+
+impl ParseOffsetEncoding {
+    fn for_path(path: &str) -> Self {
+        match path {
+            crate::runtime::source::CODEX_HISTORY_EPOCH_KEY
+            | crate::runtime::ingest::USER_INGEST_CODEX_HISTORY_EPOCH_KEY => Self::CodexCorpusEpoch,
+            _ => Self::TranscriptCursor,
+        }
+    }
+
+    fn decode(
+        self,
+        row: &Row,
+        index: i32,
+        operation: &'static str,
+    ) -> Result<u64, TranscriptPersistenceError> {
+        match self {
+            Self::TranscriptCursor => decode_u64(row, index, operation),
+            Self::CodexCorpusEpoch => decode_file_id(row, index, operation),
+        }
+    }
+
+    fn encode(
+        self,
+        value: u64,
+        operation: &'static str,
+    ) -> Result<i64, TranscriptPersistenceError> {
+        match self {
+            Self::TranscriptCursor => encode_i64(value, operation),
+            Self::CodexCorpusEpoch => Ok(encode_file_id(value)),
+        }
     }
 }
 
@@ -251,6 +294,7 @@ pub async fn set_parse_offset(
     offset: ParseOffset,
 ) -> Result<(), TranscriptPersistenceError> {
     let path = path_identity_key(path);
+    let encoding = ParseOffsetEncoding::for_path(&path);
     conn.execute(
         "INSERT INTO parse_offsets (file_path, byte_offset, mtime, file_id)
          VALUES (?1, ?2, ?3, ?4)
@@ -260,8 +304,8 @@ pub async fn set_parse_offset(
             file_id = excluded.file_id",
         params![
             path,
-            encode_i64(offset.byte_offset, "encode transcript byte offset")?,
-            encode_i64(offset.mtime, "encode transcript mtime")?,
+            encoding.encode(offset.byte_offset, "encode transcript byte offset")?,
+            encoding.encode(offset.mtime, "encode transcript mtime")?,
             encode_file_id(offset.file_id)
         ],
     )
@@ -860,6 +904,12 @@ impl<D: SessionRegisteredDb + Sync> SessionStoreAccess<'_, D> {
         offset: ParseOffset,
     ) -> Result<(), String> {
         let path = path_identity_key(path);
+        if matches!(
+            ParseOffsetEncoding::for_path(&path),
+            ParseOffsetEncoding::CodexCorpusEpoch
+        ) {
+            return Err("Codex corpus epochs require exact compare-and-set".to_owned());
+        }
         conn.execute(
             "INSERT INTO parse_offsets (file_path, byte_offset, mtime, file_id)
                  VALUES (?1, ?2, ?3, ?4)
