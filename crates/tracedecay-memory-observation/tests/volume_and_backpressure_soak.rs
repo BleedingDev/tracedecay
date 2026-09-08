@@ -42,8 +42,8 @@
 //! and it spends ninety per cent of the per-attempt share of the round's
 //! budget doing it. The producer is deliberately faster than the drain — it
 //! offers half again as many records per iteration as one drain can deliver —
-//! so the lane really does fill, really does cross both thresholds, and really
-//! does have to recover.
+//! so proposed admissions really do cross both thresholds while the admitted
+//! queue stays below them, and the lane really does have to recover.
 //!
 //! Time is virtual. The runtimes own no clock, so the soak supplies one, and
 //! the provider's latency and the queue's backlog age are measured on it.
@@ -70,15 +70,15 @@ use support::{
 };
 
 use tracedecay_memory_observation::{
-    AdmissionDecisionV1, BackpressurePolicyV1, BackpressureReasonV1, BackpressureRefusalV1,
-    DeliveryAttemptV1, DeliveryControlV1, DeliveryRuntimeV1, DeliveryStateV1, DeliveryWakeV1,
-    DispatchPolicyV1, DispatchRequestV1, IngressControlV1, IngressRuntimeV1,
-    JournalInspectionFilterV1, LeaseRequestV1, LeasedObservationV1, OPEN_WITHHELD_AUDIT_ROWS,
-    ObservationAdmissionAdapterV1, ObservationDispatchPortV1, ObservationJournalError,
-    ObservationJournalReaderV1, ObservationLaneKeyV1, ObservationLoadClassV1,
-    ObservationRetentionPortV1, ProviderDeliveryAdapterV1, QueuePressureV1, RetentionClassV1,
-    RetentionPolicyV1, RetryBackoffV1, SourceRecordV1, SourceSequenceV1, SqliteObservationJournal,
-    UTILIZATION_SCALE_PPM,
+    AdmissionDecisionV1, BackpressureDecisionV1, BackpressurePolicyV1, BackpressureReasonV1,
+    BackpressureRefusalV1, DeliveryAttemptV1, DeliveryControlV1, DeliveryRuntimeV1,
+    DeliveryStateV1, DeliveryWakeV1, DispatchPolicyV1, DispatchRequestV1, IngressControlV1,
+    IngressRuntimeV1, JournalInspectionFilterV1, LeaseRequestV1, LeasedObservationV1,
+    OPEN_WITHHELD_AUDIT_ROWS, ObservationAdmissionAdapterV1, ObservationDispatchPortV1,
+    ObservationJournalError, ObservationJournalReaderV1, ObservationLaneKeyV1,
+    ObservationLoadClassV1, ObservationRetentionPortV1, ProviderDeliveryAdapterV1, QueuePressureV1,
+    RetentionClassV1, RetentionPolicyV1, RetryBackoffV1, SourceRecordV1, SourceSequenceV1,
+    SqliteObservationJournal, UTILIZATION_SCALE_PPM,
 };
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
@@ -434,6 +434,8 @@ struct SoakMetrics {
     peak_queue_items: u64,
     peak_queue_bytes: u64,
     peak_utilization_ppm: u32,
+    peak_optional_refusal_projection_ppm: u32,
+    peak_required_refusal_projection_ppm: u32,
     peak_backlog_age_micros: i64,
     sheds_optional: u64,
     sheds_required: u64,
@@ -481,7 +483,19 @@ fn store_bytes(path: &std::path::Path) -> u64 {
 /// point" is enforced: a refusal has to name a reading that justifies it, and
 /// a required record may only be refused by the ceiling, the refusal
 /// threshold, or a measured state that is already saturated.
-fn verify_shed(refusal: &BackpressureRefusalV1, metrics: &mut SoakMetrics) -> TestResult {
+fn verify_shed(
+    refusal: &BackpressureRefusalV1,
+    pressure: &QueuePressureV1,
+    metrics: &mut SoakMetrics,
+) -> TestResult {
+    assert_eq!(refusal.backlog.queue_items, pressure.queue_items);
+    assert_eq!(refusal.backlog.queue_bytes, pressure.queue_bytes);
+    assert_eq!(refusal.backlog.max_queue_items, pressure.max_queue_items);
+    assert_eq!(refusal.backlog.max_queue_bytes, pressure.max_queue_bytes);
+    let projected = projected_ppm(pressure, refusal.additional_bytes);
+    if refusal.projected_utilization_ppm != projected {
+        return Err("refusal projection disagrees with independently measured pressure".into());
+    }
     match refusal.load_class {
         ObservationLoadClassV1::Optional => metrics.sheds_optional += 1,
         ObservationLoadClassV1::Required => metrics.sheds_required += 1,
@@ -524,6 +538,18 @@ fn verify_shed(refusal: &BackpressureRefusalV1, metrics: &mut SoakMetrics) -> Te
                     threshold,
                 ))));
             }
+            // Refused bytes never enter the journal. Keep their verified
+            // projection separate from actual occupancy, and count only
+            // utilization refusals as evidence that a threshold was exercised.
+            let peak = match refusal.load_class {
+                ObservationLoadClassV1::Optional => {
+                    &mut metrics.peak_optional_refusal_projection_ppm
+                }
+                ObservationLoadClassV1::Required => {
+                    &mut metrics.peak_required_refusal_projection_ppm
+                }
+            };
+            *peak = (*peak).max(projected);
         }
         BackpressureReasonV1::BacklogAge => {
             metrics.sheds_by_age += 1;
@@ -553,6 +579,56 @@ fn soak_records() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_SOAK_RECORDS)
+}
+
+/// Crossing a threshold in a refused projection does not require admitted
+/// occupancy to reach it. Exercise the soak's verifier with the real gate,
+/// including an invalid-projection control that must not count as coverage.
+#[test]
+fn refusal_projection_exercises_thresholds_without_inflating_queue_occupancy() -> TestResult {
+    let gate = gate_with(soak_backpressure_policy())?;
+    let mut metrics = SoakMetrics::default();
+    for (class, queue_bytes, threshold) in [
+        (ObservationLoadClassV1::Optional, 59, SHED_OPTIONAL_AT_PPM),
+        (ObservationLoadClassV1::Required, 89, REFUSE_AT_PPM),
+    ] {
+        let pressure = QueuePressureV1 {
+            queue_items: 1,
+            queue_bytes,
+            oldest_admitted_at_unix_micros: Some(T0),
+            max_queue_items: 128,
+            max_queue_bytes: 100,
+        };
+        let backlog = gate.observe(&pressure, T0);
+        assert!(backlog.utilization_ppm < threshold);
+        assert_eq!(
+            gate.decide(&backlog, class, 1),
+            BackpressureDecisionV1::Admit
+        );
+        let BackpressureDecisionV1::Shed(refusal) = gate.decide(&backlog, class, 2) else {
+            return Err("crossing the class threshold must refuse the candidate".into());
+        };
+        assert_eq!(refusal.reason, BackpressureReasonV1::QueueUtilization);
+        assert_eq!(refusal.backlog.utilization_ppm, backlog.utilization_ppm);
+        verify_shed(&refusal, &pressure, &mut metrics)?;
+
+        let mut invalid = refusal;
+        invalid.projected_utilization_ppm += 1;
+        let mut rejected_metrics = SoakMetrics::default();
+        assert!(verify_shed(&invalid, &pressure, &mut rejected_metrics).is_err());
+        assert_eq!(
+            rejected_metrics.sheds_optional + rejected_metrics.sheds_required,
+            0
+        );
+    }
+    assert_eq!(metrics.peak_optional_refusal_projection_ppm, 610_000);
+    assert_eq!(metrics.peak_required_refusal_projection_ppm, 910_000);
+    assert_eq!(metrics.sheds_optional, 1);
+    assert_eq!(metrics.sheds_required, 1);
+    // Refusal verification must never turn projected bytes into occupancy.
+    assert_eq!(metrics.peak_utilization_ppm, 0);
+    assert_eq!(metrics.peak_queue_bytes, 0);
+    Ok(())
 }
 
 // ---------------------------------------------------------------- the soak --
@@ -614,7 +690,9 @@ fn volume_soak_keeps_the_queue_bounded_drops_nothing_and_never_starves() -> Test
             // The lane as the journal holds it, read by the soak, before the
             // gate reads it for itself.
             let pressure = store.lane_pressure(&lane)?;
-            let projected = projected_ppm(&pressure, 0);
+            // This fixture has no extensions; its canonical body is its
+            // complete queue weight, including bytes the cheap pre-gate omits.
+            let projected = projected_ppm(&pressure, u64::try_from(body_at(sequence).len())?);
 
             control.set_now(clock.now());
             let resume = ingress.recover(&stream)?;
@@ -702,7 +780,7 @@ fn volume_soak_keeps_the_queue_bounded_drops_nothing_and_never_starves() -> Test
                     class.as_wire(),
                 ))));
             }
-            verify_shed(&shed.refusal, &mut metrics)?;
+            verify_shed(&shed.refusal, &pressure, &mut metrics)?;
             // A shed is a refusal, not a drop: the watermark holds here and
             // this exact sequence is offered again after the lane drains.
             break;
@@ -815,19 +893,22 @@ fn volume_soak_keeps_the_queue_bounded_drops_nothing_and_never_starves() -> Test
         metrics.peak_queue_bytes,
     );
     // The producer really did outrun the drain, and it did so hard enough to
-    // exercise both thresholds. A soak that only ever reached the shed point
+    // exercise both thresholds with projected admissions, not require the
+    // journal to contain bytes the gate correctly refused. A soak that only
+    // ever reached the shed point
     // would have proven nothing about the refusal point, and one that never
     // refused a required record would have left the reserved band untested.
     assert!(
-        metrics.sheds_optional > 0 && metrics.peak_utilization_ppm >= SHED_OPTIONAL_AT_PPM,
-        "the lane never reached the shed threshold: peak {} ppm, {} optional sheds",
-        metrics.peak_utilization_ppm,
+        metrics.sheds_optional > 0
+            && metrics.peak_optional_refusal_projection_ppm >= SHED_OPTIONAL_AT_PPM,
+        "the lane never exercised the shed threshold: peak refusal projection {} ppm, {} optional sheds",
+        metrics.peak_optional_refusal_projection_ppm,
         metrics.sheds_optional,
     );
     assert!(
-        metrics.sheds_required > 0 && metrics.peak_utilization_ppm >= REFUSE_AT_PPM,
-        "the lane never reached the refusal threshold: peak {} ppm, {} required sheds",
-        metrics.peak_utilization_ppm,
+        metrics.sheds_required > 0 && metrics.peak_required_refusal_projection_ppm >= REFUSE_AT_PPM,
+        "the lane never exercised the refusal threshold: peak refusal projection {} ppm, {} required sheds",
+        metrics.peak_required_refusal_projection_ppm,
         metrics.sheds_required,
     );
 
@@ -897,6 +978,7 @@ fn volume_soak_keeps_the_queue_bounded_drops_nothing_and_never_starves() -> Test
     println!(
         "soak seed={SOAK_SEED:#x} records={records} iterations={} appended={} shed={} \
          delivered={} peak_queue_items={} peak_queue_bytes={} peak_utilization_ppm={} \
+         peak_optional_refusal_projection_ppm={} peak_required_refusal_projection_ppm={} \
          peak_backlog_age_micros={} sheds_optional={} sheds_required={} sheds_by_ceiling={} \
          max_shed_repeats={} dropped=0 foreground_p50={} foreground_p99={} foreground_max={} \
          provider_peak_deadline_use_ppm={} store_bytes_before={bytes_before} \
@@ -909,6 +991,8 @@ fn volume_soak_keeps_the_queue_bounded_drops_nothing_and_never_starves() -> Test
         metrics.peak_queue_items,
         metrics.peak_queue_bytes,
         metrics.peak_utilization_ppm,
+        metrics.peak_optional_refusal_projection_ppm,
+        metrics.peak_required_refusal_projection_ppm,
         metrics.peak_backlog_age_micros,
         metrics.sheds_optional,
         metrics.sheds_required,

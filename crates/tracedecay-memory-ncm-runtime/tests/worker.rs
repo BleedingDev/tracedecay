@@ -314,24 +314,91 @@ fn deadline_kills_mutating_worker_and_next_call_respawns() {
     assert!(client.pid().is_some());
 }
 
+#[cfg(unix)]
 #[test]
 fn observe_killed_after_commit_reconciles_without_second_record() {
+    use std::os::unix::fs::PermissionsExt;
+
     let root = TempDir::new().expect("temp root");
-    let client = client(&root);
+    let withheld_reply = root.path().join("withheld-reply");
+    let launcher = root.path().join("withhold-first-reply.sh");
+    let quote = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+    let binary = quote(Path::new(BINARY));
+    let reply_path = quote(&withheld_reply);
+    // Keep the client's stdout pipe open on fd 3, but escrow the first worker's
+    // reply. A complete Success frame proves SQLite committed; elapsed time does
+    // not. `exec` preserves the supervised PID and leaves no proxy child behind.
+    fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\nif [ ! -e {reply_path} ]; then\n  exec 3>&1\n  exec {binary} \"$@\" > {reply_path}\nfi\nexec {binary} \"$@\"\n"
+        ),
+    )
+    .expect("write reply-withholding launcher");
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))
+        .expect("make launcher executable");
+    let client = WorkerClient::spawn(&launcher, root.path(), options()).expect("client starts");
     let ns = namespace(3);
-    let mut payload = observe_payload("reconcile-observe", "stable key", "stable value");
-    payload["test_sleep_after_commit_ms"] = json!(1000);
-    let result = client.call(
-        Request::new(30, 0, Operation::Observe, &ns, payload),
-        Duration::from_millis(150),
-    );
-    assert_eq!(result, Err(ClientError::EffectUnknown { op_id: 30 }));
+    let payload = observe_payload("reconcile-observe", "stable key", "stable value");
+    let committed = thread::scope(|scope| {
+        let pending = scope.spawn(|| {
+            client.call(
+                Request::new(30, 0, Operation::Observe, &ns, payload.clone()),
+                CALL_DEADLINE,
+            )
+        });
+        let expires = Instant::now() + CALL_DEADLINE;
+        let committed = loop {
+            assert!(
+                Instant::now() < expires,
+                "worker must commit before the deadline"
+            );
+            match fs::read(&withheld_reply) {
+                Ok(bytes) => match wire::read_reply(&mut bytes.as_slice()) {
+                    Ok(Some(reply)) => break reply,
+                    Ok(None) | Err(wire::FrameError::Truncated) => {}
+                    Err(error) => panic!("invalid withheld reply: {error}"),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read withheld reply: {error}"),
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(committed.outcome, Outcome::Success, "{committed:?}");
+        assert_eq!(committed.state_generation, 1);
+        assert_eq!(committed.payload.as_ref().unwrap()["replayed"], false);
+        assert!(
+            !pending.is_finished(),
+            "caller must not receive the acknowledgement"
+        );
+        let pid = client.pid().expect("committed worker is still supervised");
+        assert!(
+            Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .status()
+                .expect("kill committed worker")
+                .success()
+        );
+        assert_eq!(
+            pending.join().expect("pending caller joins"),
+            Err(ClientError::EffectUnknown { op_id: 30 })
+        );
+        assert_eq!(client.pid(), None);
+        assert!(!process_exists(pid), "committed worker must be reaped");
+        committed
+    });
 
     let replay = client
         .reconcile_unknown("reconcile-observe")
         .expect("receipt replay succeeds after restart");
-    assert_eq!(replay.outcome, Outcome::Success);
+    assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
+    assert_eq!(replay.state_generation, committed.state_generation);
     assert_eq!(replay.payload.as_ref().unwrap()["replayed"], true);
+    assert_eq!(
+        replay.payload.as_ref().unwrap()["record_id"],
+        committed.payload.as_ref().unwrap()["record_id"]
+    );
 
     let inspection = client
         .call(
@@ -339,7 +406,10 @@ fn observe_killed_after_commit_reconciles_without_second_record() {
             CALL_DEADLINE,
         )
         .expect("inspection succeeds");
+    assert_eq!(inspection.outcome, Outcome::Success, "{inspection:?}");
     assert_eq!(inspection.payload.as_ref().unwrap()["records"], 1);
+    assert_eq!(inspection.payload.as_ref().unwrap()["commit_seq"], 1);
+    assert_eq!(inspection.payload.as_ref().unwrap()["tick"], 1);
 }
 
 #[test]
