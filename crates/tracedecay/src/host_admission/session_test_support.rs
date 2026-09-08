@@ -393,7 +393,10 @@ impl HostAdmissionTestRuntimeV1 {
         })?;
         let database = self.project_database_for_test()?;
         let authority = tracedecay_host_admission::session_ingest_authority::GlobalDbSessionIngestAuthority::new(database);
-        Ok(
+        // Bound the instrumented pipeline's layout without requiring Send: the
+        // borrowed authority's GATs cannot satisfy that higher-ranked obligation.
+        // Keep polling here so the future remains within the fixture's lifetime.
+        let ingest: std::pin::Pin<Box<dyn std::future::Future<Output = _> + '_>> = Box::pin(
             tracedecay_sessions::runtime::ingest_project_sources_for_provider(
                 &self.brain_id,
                 &self.profile_id,
@@ -402,10 +405,9 @@ impl HostAdmissionTestRuntimeV1 {
                 Some(project_id.clone()),
                 provider,
                 true,
-            )
-            .await
-            .stats,
-        )
+            ),
+        );
+        Ok(ingest.await.stats)
     }
 
     #[doc(hidden)]

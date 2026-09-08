@@ -1386,7 +1386,16 @@ async fn open_registered_test_database_with(
     scope: tracedecay_runtime_core::db::TestDatabaseRuntimeScope,
     write_authority: RegisteredTestWriteAuthority,
 ) -> tracedecay_domain::errors::Result<(RegisteredGlobalDbLeaseV1, RegisteredGlobalDbOwnerV1)> {
-    open_registered_test_database_with_identity(path, scope, write_authority, None).await
+    // Erase the instrumented publication future before it enters the shared
+    // fixture layout; otherwise every host-admission caller inherits its depth.
+    let open: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + '_>> =
+        Box::pin(open_registered_test_database_with_identity(
+            path,
+            scope,
+            write_authority,
+            None,
+        ));
+    open.await
 }
 
 #[cfg(any(test, feature = "test-helpers"))]

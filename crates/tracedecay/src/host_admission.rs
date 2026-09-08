@@ -250,7 +250,20 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[hotpath::skip]
-    async fn open(profile_root: PathBuf, project: Option<(PathBuf, ProjectId)>) -> Result<Self> {
+    fn open(
+        profile_root: PathBuf,
+        project: Option<(PathBuf, ProjectId)>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self>> + Send>> {
+        // Keep the complete fixture's instrumented startup layout out of callers.
+        // It remains caller-polled, so cancellation still drops its owned state.
+        Box::pin(Self::open_registered(profile_root, project))
+    }
+
+    #[hotpath::skip]
+    async fn open_registered(
+        profile_root: PathBuf,
+        project: Option<(PathBuf, ProjectId)>,
+    ) -> Result<Self> {
         // Fixture compositions run in-process daemon code that reads the
         // registered product runtime (handshakes, initialize payloads);
         // test processes only ever register the canonical fixture.

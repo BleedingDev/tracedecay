@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, future::Future, pin::Pin};
 
 use tracedecay::session_temporal_benchmark::{
     refresh_contract, run_measurement, validate_contract,
@@ -17,10 +17,12 @@ fn main() {
                 .enable_all()
                 .build()
                 .expect("build tokio runtime");
-            runtime.block_on(async {
-                run_measurement().await.map(|value| {
-                    println!("{}", serde_json::to_string_pretty(&value).unwrap());
-                })
+            // Erase the instrumented future's layout at the runtime boundary;
+            // block_on still polls and owns the complete benchmark operation.
+            let measurement: Pin<Box<dyn Future<Output = Result<_, String>>>> =
+                Box::pin(run_measurement());
+            runtime.block_on(measurement).map(|value| {
+                println!("{}", serde_json::to_string_pretty(&value).unwrap());
             })
         }
         [argument] if argument == "--refresh-contract" => {
@@ -28,10 +30,10 @@ fn main() {
                 .enable_all()
                 .build()
                 .expect("build tokio runtime");
-            runtime.block_on(async {
-                refresh_contract().await.map(|value| {
-                    println!("{}", serde_json::to_string_pretty(&value).unwrap());
-                })
+            let refresh: Pin<Box<dyn Future<Output = Result<_, String>>>> =
+                Box::pin(refresh_contract());
+            runtime.block_on(refresh).map(|value| {
+                println!("{}", serde_json::to_string_pretty(&value).unwrap());
             })
         }
         _ => Err(
