@@ -222,7 +222,11 @@ fn acknowledged_sequence_closes_gaps_and_is_monotonic_across_deletion() -> TestR
         store.append_admitted(&Builder::at_sequence(sequence).build()?)?;
     }
     let leased = store.lease_pending(&lease_request(T0, 28))?;
-    assert_eq!(leased.len(), 28, "fixture must span multiple gap-scan pages");
+    assert_eq!(
+        leased.len(),
+        28,
+        "fixture must span multiple gap-scan pages"
+    );
 
     // A suffix larger than the internal page budget cannot authorize skipping
     // the still-unacknowledged prefix. Record it first so closing sequence one
@@ -249,7 +253,11 @@ fn acknowledged_sequence_closes_gaps_and_is_monotonic_across_deletion() -> TestR
     // This is the final receipt write. Its transaction may inspect one page,
     // even though all 28 rows now have acknowledging evidence.
     store.record_attempt(&applied_receipt(&leased[0], T0 + SECOND))?;
-    assert_eq!(stored_sequence()?, 8, "receipt exceeded its eight-row budget");
+    assert_eq!(
+        stored_sequence()?,
+        8,
+        "receipt exceeded its eight-row budget"
+    );
     drop(store);
 
     // Real recovery assessments must finish the projection without any new or

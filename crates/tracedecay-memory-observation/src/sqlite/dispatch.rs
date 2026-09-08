@@ -1105,10 +1105,14 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
                 "registration_revision",
             ),
             (
-                Some(refusal.provider_instance_id.as_str()) == receipt.provider_instance_id.as_deref(),
+                Some(refusal.provider_instance_id.as_str())
+                    == receipt.provider_instance_id.as_deref(),
                 "provider_instance_id",
             ),
-            (refusal.attempt_number == receipt.attempt_number, "attempt_number"),
+            (
+                refusal.attempt_number == receipt.attempt_number,
+                "attempt_number",
+            ),
         ] {
             if !matches {
                 return Err(ObservationJournalError::AttemptRefusalBindingMismatch { field });

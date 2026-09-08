@@ -60,10 +60,8 @@ impl McpServer {
         // strictly and reject any field they do not declare. Keep the identity
         // view those lanes bind on, and hand the handler only its declared
         // business arguments.
-        let route_identity_arguments = crate::mcp::project_route::take_route_only_metadata(
-            tool_name,
-            &mut handler_arguments,
-        );
+        let route_identity_arguments =
+            crate::mcp::project_route::take_route_only_metadata(tool_name, &mut handler_arguments);
         if tracedecay_automation::analytics::is_skill_view_tool(tool_name)
             && let Some(request_id) = json_rpc_request_id_string(id)
             && let Some(map) = handler_arguments.as_object_mut()

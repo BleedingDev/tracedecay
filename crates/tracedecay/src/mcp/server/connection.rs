@@ -1416,10 +1416,7 @@ impl McpServer {
     }
 
     #[hotpath::skip]
-    async fn shutdown_background_tasks_until(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Vec<String> {
+    async fn shutdown_background_tasks_until(&self, deadline: tokio::time::Instant) -> Vec<String> {
         let mut failures = Vec::new();
         #[cfg(feature = "memory-provider-host")]
         if let Some(journey) = self._observation_journey_mount.as_ref() {

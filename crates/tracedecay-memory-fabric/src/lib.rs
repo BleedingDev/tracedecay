@@ -1437,7 +1437,9 @@ mod rejection_tests {
         } else {
             assert_eq!(
                 fabric.invalidate_matching_readiness(&call),
-                Err(FabricError::ProviderUnknown(call.provider_id.as_str().to_owned()))
+                Err(FabricError::ProviderUnknown(
+                    call.provider_id.as_str().to_owned()
+                ))
             );
         }
 

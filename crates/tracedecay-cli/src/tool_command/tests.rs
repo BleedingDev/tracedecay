@@ -565,11 +565,7 @@ fn dispatch_routing_keys_bypass_unknown_key_gate() {
         "response_handle_project_root": "/tmp/r",
         "cwd": "/tmp"
     });
-    let parsed = parse_invocation(
-        &d,
-        &["--args".to_string(), expected.to_string()],
-    )
-    .unwrap();
+    let parsed = parse_invocation(&d, &["--args".to_string(), expected.to_string()]).unwrap();
     assert_eq!(parsed.tool_args, expected);
 }
 
