@@ -50,6 +50,7 @@ use tracedecay_memory_observation::{
 
 /// The Claude Code session id the whole journey is bound to.
 const CLAUDE_SESSION: &str = "claude-cli-journey-session";
+const CODEX_SESSION: &str = "codex-cli-journey-session";
 
 /// A term that appears in the transcript and in the later question, so a recall
 /// that answers at all has something to answer with.
@@ -120,6 +121,7 @@ const GLOBAL_DB_ENV: &str = "TRACEDECAY_GLOBAL_DB";
 // ---------------------------------------------------------------------------
 
 struct ClaudeHostJourney {
+    codex: bool,
     daemon: Option<Child>,
     home: TempDir,
     profile: PathBuf,
@@ -139,7 +141,7 @@ impl ClaudeHostJourney {
     /// running and both memory-provider gates committed. Both settings are
     /// `DaemonRestart`, so the daemon is restarted before the journey begins:
     /// a composition that is already open keeps the mounts it opened with.
-    fn start() -> Self {
+    fn start(codex: bool) -> Self {
         let home = TempDir::new().expect("isolated home");
         let root = home.path().to_path_buf();
         let profile = root.join(".tracedecay");
@@ -151,6 +153,7 @@ impl ClaudeHostJourney {
         initialize_project(&project);
 
         let mut journey = Self {
+            codex,
             daemon: None,
             home,
             profile,
@@ -194,9 +197,12 @@ impl ClaudeHostJourney {
 
     fn start_daemon(&mut self) {
         assert!(self.daemon.is_none(), "a daemon is already running");
+        let log = fs::File::create(self.home.path().join("daemon.stderr.log"))
+            .expect("isolated daemon log");
         let mut daemon = self
             .cli(&["daemon", "run"])
             .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
             .spawn()
             .expect("daemon should start");
         wait_for_authority(&mut daemon, &daemon_authority_path(&self.profile));
@@ -378,8 +384,27 @@ impl ClaudeHostJourney {
         child.wait_with_output().expect("hook completes")
     }
 
-    /// The shipped `SessionStart` hook, with Claude Code's own payload.
+    /// Initial native lifecycle: Claude ingests at SessionStart; Codex registers
+    /// its route there and captures the first completed turn at Stop.
     fn run_session_start_hook(&self) -> Output {
+        if self.codex {
+            let started = self.run_hook(
+                "hook-codex-session-start",
+                &json!({
+                    "session_id": CODEX_SESSION,
+                    "cwd": self.project.to_string_lossy(),
+                    "transcript_path": self.transcript_path().to_string_lossy(),
+                    "hook_event_name": "SessionStart",
+                    "source": "startup",
+                }),
+            );
+            assert!(
+                started.status.success(),
+                "Codex SessionStart must publish its route: {}",
+                String::from_utf8_lossy(&started.stderr)
+            );
+            return self.run_codex_stop_hook(1);
+        }
         self.run_hook(
             "hook-claude-session-start",
             &json!({
@@ -400,6 +425,9 @@ impl ClaudeHostJourney {
     /// `claude_stop_response_for_event`), while the `PostToolUse` handler only
     /// dispatches guidance and commits nothing.
     fn run_stop_hook(&self) -> Output {
+        if self.codex {
+            return self.run_codex_stop_hook(2);
+        }
         self.run_hook(
             "hook-stop",
             &json!({
@@ -412,7 +440,40 @@ impl ClaudeHostJourney {
         )
     }
 
+    fn session_id(&self) -> &'static str {
+        if self.codex {
+            CODEX_SESSION
+        } else {
+            CLAUDE_SESSION
+        }
+    }
+
+    /// Native Stop grammar from fixtures/host_events/codex/stop.json.
+    fn run_codex_stop_hook(&self, turn: u32) -> Output {
+        self.run_hook(
+            "hook-codex-stop",
+            &json!({
+                "session_id": CODEX_SESSION,
+                "turn_id": format!("codex-journey-turn-{turn}"),
+                "transcript_path": self.transcript_path().to_string_lossy(),
+                "cwd": self.project.to_string_lossy(),
+                "hook_event_name": "Stop",
+                "model": "gpt-5",
+                "permission_mode": "default",
+                "stop_hook_active": false,
+                "last_assistant_message": null,
+            }),
+        )
+    }
+
     fn transcript_path(&self) -> PathBuf {
+        if self.codex {
+            return self
+                .home
+                .path()
+                .join(".codex/sessions/2026/02/01")
+                .join(format!("rollout-2026-02-01T00-00-00-{CODEX_SESSION}.jsonl"));
+        }
         self.home
             .path()
             .join(".claude/projects/-claude-cli-journey")
@@ -436,7 +497,21 @@ impl ClaudeHostJourney {
                  deadline"
             ),
         );
-        fs::write(&path, turn).expect("write Claude transcript");
+        let turn = if self.codex {
+            // The native thread identity and cwd bind this rollout to the
+            // registered project; write only after the baseline mount/import.
+            format!(
+                "{}\n{turn}",
+                json!({
+                    "timestamp": "2026-02-01T00:00:00.000Z",
+                    "type": "session_meta",
+                    "payload": { "id": CODEX_SESSION, "cwd": self.project },
+                })
+            )
+        } else {
+            turn
+        };
+        fs::write(&path, turn).expect("write host transcript");
     }
 
     /// Appends the second turn: the exchange the session has *while it is
@@ -476,6 +551,28 @@ impl ClaudeHostJourney {
         assistant_text: &str,
     ) -> String {
         let cwd = self.project.to_string_lossy().to_string();
+        if self.codex {
+            // Native event_msg records, as in transcript_ingest_suite/codex.rs.
+            // Metadata is written once; later turns append to the same rollout.
+            let rows = [
+                json!({
+                    "timestamp": user_timestamp,
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": user_text },
+                }),
+                json!({
+                    "timestamp": assistant_timestamp,
+                    "type": "event_msg",
+                    "payload": { "type": "agent_message", "message": assistant_text },
+                }),
+            ];
+            return rows
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+        }
         let user_uuid = format!("cli-journey-uuid-{first_uuid}");
         let assistant_uuid = format!("cli-journey-uuid-{}", first_uuid + 1);
         let rows = [
@@ -582,8 +679,27 @@ impl ClaudeHostJourney {
             assert!(
                 Instant::now() < deadline,
                 "the hook's observations never settled {minimum_rows} deliveries within \
-                 {SETTLEMENT_BUDGET:?}; last saw {:?}",
-                journal_digest(&rows)
+                 {SETTLEMENT_BUDGET:?}; last saw {:?}; daemon stderr: {}",
+                journal_digest(&rows),
+                {
+                    let mut log = fs::File::open(self.home.path().join("daemon.stderr.log"))
+                        .expect("read isolated daemon log");
+                    let offset = log
+                        .metadata()
+                        .expect("log metadata")
+                        .len()
+                        .saturating_sub(16 * 1024);
+                    std::io::Seek::seek(&mut log, std::io::SeekFrom::Start(offset))
+                        .expect("seek diagnostic tail");
+                    let mut tail = Vec::new();
+                    log.take(16 * 1024)
+                        .read_to_end(&mut tail)
+                        .expect("read diagnostic tail");
+                    tracedecay_runtime_core::privacy::sanitize_provider_metadata_text(
+                        &String::from_utf8_lossy(&tail),
+                    )
+                    .unwrap_or_else(|| "[daemon diagnostics withheld by privacy policy]".to_owned())
+                }
             );
             std::thread::sleep(JOURNAL_POLL_INTERVAL);
         }
@@ -956,7 +1072,20 @@ fn journey_task() -> String {
 #[test]
 fn the_shipped_claude_session_start_and_stop_hooks_commit_observations_and_a_later_context_call_carries_the_advisory_lane()
  {
-    let journey = ClaudeHostJourney::start();
+    assert_host_memory_journey(false);
+}
+
+/// Two native Codex Stop events, including a replay of each, must commit the
+/// rollout through the real daemon/provider and supply later context. The
+/// shared assertions retain the no-importer control, exact delivery identities,
+/// provenance deduplication, and whole-message tail check for both hosts.
+#[test]
+fn the_shipped_codex_stop_hook_commits_observations_and_later_context_recalls_them() {
+    assert_host_memory_journey(true);
+}
+
+fn assert_host_memory_journey(codex: bool) {
+    let journey = ClaudeHostJourney::start(codex);
 
     // 1. The project is mounted and the provider host is live *before* the
     //    transcript exists. This baseline call is what forces project open, so
@@ -1023,16 +1152,32 @@ fn the_shipped_claude_session_start_and_stop_hooks_commit_observations_and_a_lat
         journal_digest(&replayed)
     );
 
-    // 6. The session keeps running: it writes another turn, whose assistant
-    //    reply is long and ends in a distinct sentinel. Again nothing else
-    //    happens — the journal must hold exactly the first turn's rows for a
-    //    full quiescence window before the Stop hook runs.
+    // 6. The session keeps running and writes a second turn. Claude must wait
+    //    for its next hook. Codex Stop acknowledges retained daemon work, so
+    //    the first Stop's follow-up may already ingest the appended bytes.
     journey.append_mid_session_claude_turn();
-    journey.assert_journal_unchanged_without_a_hook(&replayed);
+    if codex {
+        let deadline = Instant::now() + QUIESCENCE_WINDOW;
+        while Instant::now() < deadline {
+            let progressed = journey.journal_rows();
+            assert!(
+                (ROWS_PER_TURN..=2 * ROWS_PER_TURN).contains(&progressed.len()),
+                "Codex follow-up may only add the second turn: {:?}",
+                journal_digest(&progressed)
+            );
+            let identities = journal_row_identities(&progressed);
+            assert!(
+                settled.iter().all(|identity| identities.contains(identity)),
+                "Codex follow-up must retain every settled first-turn identity"
+            );
+            std::thread::sleep(JOURNAL_POLL_INTERVAL);
+        }
+    } else {
+        journey.assert_journal_unchanged_without_a_hook(&replayed);
+    }
 
-    // 7. The shipped Stop hook — the one Claude Code fires at the end of a
-    //    live turn — is the only thing that runs, and it commits exactly that
-    //    turn's two messages.
+    // 7. The next Stop must converge to exactly both turns, whether Codex's
+    //    retained follow-up already captured the second one or not.
     let stop = journey.run_stop_hook();
     assert!(
         stop.status.success(),
@@ -1068,7 +1213,7 @@ fn the_shipped_claude_session_start_and_stop_hooks_commit_observations_and_a_lat
                  {TAIL_SENTINEL} note?"
             ),
             "format": "json",
-            "_meta": { "session_id": CLAUDE_SESSION },
+            "_meta": { "session_id": journey.session_id() },
         }),
     );
     let lane = advisory_lane(&answer)

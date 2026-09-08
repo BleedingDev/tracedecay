@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-#[cfg(test)]
 use tracedecay_hooks::{DaemonHookEvent, HookAgent};
 
 use crate::ports::hook_runtime::HookRuntimeV1;
@@ -60,6 +59,15 @@ pub async fn hook_codex_session_start(runtime: &HookRuntimeV1) -> i32 {
         &event,
         &parsed,
     );
+    if let Some(project_root) = root.as_deref() {
+        super::notify_hook_event_with_telemetry(
+            runtime,
+            project_root,
+            codex_session_start_route_event(&parsed, project_root),
+            &hook_telemetry,
+        )
+        .await;
+    }
     let guidance = super::dispatch::dispatch_for_scope(
         runtime,
         tracedecay_hooks::HookHostV1::Codex,
@@ -89,9 +97,15 @@ pub async fn hook_codex_session_start(runtime: &HookRuntimeV1) -> i32 {
     0
 }
 
+fn codex_session_start_route_event(parsed: &Value, project_root: &Path) -> DaemonHookEvent {
+    DaemonHookEvent::session_start(HookAgent::Codex, project_root.to_path_buf()).with_route(Some(
+        super::hook_route_metadata_from_parsed(parsed, project_root),
+    ))
+}
+
 #[cfg(test)]
 fn codex_session_start_hook_event(parsed: &Value) -> Option<DaemonHookEvent> {
-    event_cwd_from_parsed(parsed).map(|cwd| DaemonHookEvent::session_start(HookAgent::Codex, cwd))
+    event_cwd_from_parsed(parsed).map(|cwd| codex_session_start_route_event(parsed, &cwd))
 }
 
 /// Codex `UserPromptSubmit` hook handler.

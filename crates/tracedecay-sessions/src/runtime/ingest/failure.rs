@@ -445,9 +445,29 @@ pub(super) fn warn_transcript_catch_up_failure(
     message: &'static str,
 ) -> TranscriptCatchUpFailure {
     let failure = classify_transcript_ingest_failure(provider, source, error);
+    // Operation names are static labels; sanitize storage detail before logging.
+    let storage_operation = match error {
+        source::TranscriptIngestError::Store(tracedecay_store::TranscriptStoreError::Storage {
+            operation,
+            ..
+        }) => Some(*operation),
+        _ => None,
+    };
+    let storage_detail = match error {
+        source::TranscriptIngestError::Store(tracedecay_store::TranscriptStoreError::Storage {
+            source,
+            ..
+        }) => {
+            tracedecay_runtime_core::privacy::sanitize_provider_metadata_text(&source.to_string())
+                .filter(|detail| detail.len() <= 1024)
+        }
+        _ => None,
+    };
     tracing::warn!(
         reason_code = failure.reason_code,
         retryable = failure.retryable,
+        storage_operation,
+        storage_detail,
         "{message}"
     );
     failure
