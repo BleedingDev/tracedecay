@@ -454,7 +454,14 @@ fn native_hook_captures_only_bound_transport_spool_records() {
             _ => b"{}\n",
         };
         assert_eq!(output.stdout, expected_stdout, "{hook}: {output:?}");
-        assert!(output.stderr.is_empty(), "{hook}: {output:?}");
+        let expected_stderr: &[u8] = if hook == "hook-stop" {
+            // Claude's project catch-up reports its unavailable daemon without
+            // failing the host callback or claiming that ingest completed.
+            b"[tracedecay] Claude Stop transcript ingest failed open: stage=project_ingest outcome=daemon_call_failed\n"
+        } else {
+            b""
+        };
+        assert_eq!(output.stderr, expected_stderr, "{hook}: {output:?}");
         // A host redelivers a callback whose exit it could not observe, and
         // sibling hooks fire concurrently for one edit. The redelivery names
         // the same event and must settle as the capture already recorded, on

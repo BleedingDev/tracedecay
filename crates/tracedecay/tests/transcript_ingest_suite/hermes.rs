@@ -30,8 +30,8 @@ use crate::restart_atomicity::{
     open_sibling_project_session_db, set_projection_failure,
 };
 use crate::support::{
-    assert_metadata_path_eq, create_git_repo_with_linked_worktree, init_git_repo,
-    normalize_path_text,
+    assert_metadata_path_eq, assert_path_text_eq, create_git_repo_with_linked_worktree,
+    init_git_repo,
 };
 
 const SESSION_ID: &str = "20260101_000000_abc123";
@@ -314,9 +314,14 @@ async fn hermes_state_db_populates_projection_for_pinned_project() {
         .get_session("hermes", SESSION_ID)
         .await
         .expect("hermes session should be stored");
-    let project_path = normalize_path_text(&project.to_string_lossy());
+    assert_path_text_eq(&session.project_path, &project);
     let results = db
-        .search_session_messages("hermes", Some(&project_path), "billing pipeline", 10)
+        .search_session_messages(
+            "hermes",
+            Some(db.project_id().as_str()),
+            "billing pipeline",
+            10,
+        )
         .await;
     assert!(
         results.iter().any(|hit| hit.message.role == "user"),

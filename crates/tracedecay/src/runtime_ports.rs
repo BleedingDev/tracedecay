@@ -352,13 +352,10 @@ mod tests {
             .resolve_store_layout(unregistered.path())
             .await
             .expect("the root resolves a canonical layout for any checkout");
-        assert_eq!(
-            layout.project_root,
-            unregistered
-                .path()
-                .canonicalize()
-                .expect("canonical checkout")
-        );
+        assert!(tracedecay_runtime_core::path_safety::same_canonical_path(
+            &layout.project_root,
+            unregistered.path(),
+        ));
         assert!(layout.identity.project_id.is_some());
     }
 

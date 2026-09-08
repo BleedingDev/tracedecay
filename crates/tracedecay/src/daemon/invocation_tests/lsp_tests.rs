@@ -635,13 +635,16 @@ async fn lsp_detach_after_unacknowledged_outbound_records_disconnected_drop() {
     assert_one_lsp_delivery_drop(fixture).await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn lsp_disconnect_expiry_settles_unacknowledged_outbound_as_dropped() {
     let fixture = lsp_delivery_fixture().await;
     let service = DaemonInvocationService::default();
     let registry = Arc::new(Mutex::new(LspSessionRegistry::default()));
     let session = open_polled_lsp_delivery(&fixture, &service, &registry, "expiry").await;
 
+    // Only the disconnect lease uses virtual time. SQLite and its recorder
+    // drain use real worker threads and must not race an auto-advanced timer.
+    tokio::time::pause();
     service.disconnect_lsp_session(&registry, session).await;
     tokio::task::yield_now().await;
     tokio::time::advance(std::time::Duration::from_millis(LSP_SESSION_TTL_MS)).await;
@@ -649,6 +652,7 @@ async fn lsp_disconnect_expiry_settles_unacknowledged_outbound_as_dropped() {
 
     assert!(service.lsp_sessions.lock().await.is_empty());
     assert_eq!(registry.lock().await.active_sessions(), 0);
+    tokio::time::resume();
     drop(service);
     assert_one_lsp_delivery_drop(fixture).await;
 }

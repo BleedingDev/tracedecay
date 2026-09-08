@@ -13,7 +13,6 @@ use tracedecay_application::retained_surfaces::{
     FactStoreGetResultV1, FactStoreListResultV1, FactStoreSearchResultV1, FactV1,
     MemoryStatusResultV1,
 };
-use tracedecay_application::{ApplicationEnvelope, ApplicationOutcome};
 use tracedecay_domain::FactId;
 
 use crate::common;
@@ -220,18 +219,12 @@ fn run_exact_value(fixture: &Fixture, tool: &str, args: Value) -> Value {
 
 fn run_exact<T: serde::de::DeserializeOwned>(fixture: &Fixture, tool: &str, args: Value) -> T {
     let response = run_exact_value(fixture, tool, args);
-    let envelope: ApplicationEnvelope<T> =
-        serde_json::from_value(response).unwrap_or_else(|error| {
-            panic!("{tool} output violated its retained result schema: {error}")
-        });
-    let payload = match envelope.outcome {
-        ApplicationOutcome::Evidence(evidence) => evidence.payload,
-        ApplicationOutcome::Effect(effect) => effect.payload,
-        ApplicationOutcome::Preview(_) => {
-            panic!("{tool} unexpectedly returned a preview for an exact retained operation")
-        }
-    };
-    payload.unwrap_or_else(|| panic!("{tool} returned no exact retained result payload"))
+    // run_exact_value already unwraps the CLI application envelope. The
+    // generated retained-surface schema describes T itself, not another
+    // ApplicationEnvelope<T> (an add result has its own `outcome` tag).
+    serde_json::from_value(response).unwrap_or_else(|error| {
+        panic!("{tool} output violated its retained result schema: {error}")
+    })
 }
 
 fn canonical_test_dir(path: &Path) -> PathBuf {

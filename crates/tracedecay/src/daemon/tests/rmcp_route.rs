@@ -718,9 +718,11 @@ async fn mount_rmcp_target(
         "pub const RMCP_SELECTED_TARGET_MARKER: &str = \"target-beta\";\n",
     )
     .expect("target source marker");
-    initialize_test_project(&project, &fixture.handshake.client_identity).await;
+    // The fixture already owns this profile's writer. Initialize through that
+    // daemon rather than opening a competing maintenance writer for its DB.
     let handshake = DaemonHandshake {
         project_path: Some(project.clone()),
+        allow_init: true,
         client_identity: fixture.handshake.client_identity.clone(),
         client_instance_id: "rmcp-selected-target".to_owned(),
         ..test_handshake_defaults()

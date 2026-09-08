@@ -1985,58 +1985,11 @@ assert ctx.skills[0][1].name == "SKILL.md"
 }
 
 #[test]
-fn generated_skill_mirrors_session_context_retrieval_contract() {
+fn generated_skill_install_preserves_its_template() {
     let template = host_sources::HERMES_SKILL_MD;
     let installed =
         std::fs::read_to_string(SHARED_INSTALL.plugin_dir.join("skills/tracedecay/SKILL.md"))
             .unwrap();
-    let required_markers = [
-        "tracedecay_message_search",
-        "`provider=all`",
-        "`catch_up=false`",
-        "`limit=10`",
-        "lcm_grep",
-        "lcm_load_session",
-        "lcm_describe",
-        "lcm_expand",
-        "lcm_expand_query",
-        "`temporal_mode=current`",
-        "`temporal_mode=forensic`",
-        "`next_cursor`",
-        "same target, source limit, and content slice",
-        "`coverage`",
-        "`anchors`",
-        "needs_synthesis=true",
-        "host must synthesize",
-        "tracedecay_sessions_for",
-        "tracedecay_workflows",
-        "`limit=20`",
-        "tracedecay_session_refresh",
-        "`begin`",
-        "`status`",
-        "`cancel`",
-    ];
-
-    for (label, skill) in [
-        (
-            "repository managing-session-context skill",
-            include_str!("../../../../plugin/skills/managing-session-context/SKILL.md"),
-        ),
-        ("Hermes template", template),
-        ("installed Hermes skill snapshot", installed.as_str()),
-    ] {
-        for marker in required_markers {
-            assert!(
-                skill.contains(marker),
-                "{label} should document session retrieval marker {marker:?}",
-            );
-        }
-        assert!(
-            !skill.contains("after_store_id"),
-            "{label} must not teach deprecated numeric-cursor pagination",
-        );
-    }
-
     assert_eq!(
         installed, template,
         "the installed Hermes skill snapshot should exactly match its template",

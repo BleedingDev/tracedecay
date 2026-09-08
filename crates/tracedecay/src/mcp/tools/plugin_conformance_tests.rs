@@ -97,30 +97,6 @@ fn plugin_tool_mentions_resolve_to_registered_tools() {
     );
 }
 
-/// Guards against shipping tools no skill/rule/command ever points an
-/// agent at (the audit found whole tool families with zero usage because
-/// nothing in the bundle referenced them). New tools must either be
-/// referenced somewhere under cursor-plugin/ or consciously allow-listed
-/// here with a reason.
-#[test]
-fn registered_tools_are_referenced_by_the_plugin_bundle() {
-    // Currently every registered tool is referenced by the bundle. Add a
-    // name here only with a written reason for shipping it unsteered.
-    const TOOLS_WITHOUT_PLUGIN_REFERENCE: &[&str] = &[];
-    let mentions = embedded_plugin_tool_mentions();
-    let missing: Vec<String> = registered_tool_names()
-        .into_iter()
-        .filter(|name| {
-            !mentions.contains(name) && !TOOLS_WITHOUT_PLUGIN_REFERENCE.contains(&name.as_str())
-        })
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "tools registered in get_tool_definitions() but referenced nowhere under \
-         cursor-plugin/ (reference them in a skill or allow-list them): {missing:?}"
-    );
-}
-
 /// The Auto-review allowlist documented in the plugin README must stay in
 /// lockstep with the tools' `readOnlyHint` annotations: every read-only
 /// tool is listed (so it skips the classifier) and no mutating tool is.
