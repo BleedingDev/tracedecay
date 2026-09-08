@@ -18,7 +18,7 @@ use crate::retention::{
     ForgetReceiptV1, ForgetSourceRequestV1, ForgetVerificationV1, RetentionPolicyV1,
     RetentionSweepReceiptV1,
 };
-use crate::settlement::SourceStreamKeyV1;
+use crate::settlement::{CanonicalSettlementReceiptV1, SourceStreamKeyV1};
 use crate::state::DeliveryStateV1;
 
 /// What an admission attempt did. Every refusal is typed and visible; none of
@@ -112,6 +112,23 @@ pub trait ObservationDispatchPortV1: Send + Sync {
     fn record_withheld(
         &self,
         withheld: &WithheldAdmissionV1,
+    ) -> Result<(), ObservationJournalError>;
+
+    /// Checkpoints a validated canonical event outside the message delivery contract.
+    /// No payload or hygiene verdict is stored.
+    fn record_non_message(
+        &self,
+        stream: &SourceStreamKeyV1,
+        source: &CanonicalSettlementReceiptV1,
+    ) -> Result<(), ObservationJournalError>;
+
+    /// Validates a replay against durable identity without repeating admission work.
+    fn validate_replay_identity(
+        &self,
+        stream: &SourceStreamKeyV1,
+        sequence: SourceSequenceV1,
+        event_id: &str,
+        revision: u64,
     ) -> Result<(), ObservationJournalError>;
 
     /// Reads the ingress replay position for one source stream.

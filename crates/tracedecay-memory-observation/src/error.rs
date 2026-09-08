@@ -16,6 +16,12 @@ pub enum ObservationJournalError {
     /// The underlying SQLite store failed.
     #[error("observation journal storage failure: {0}")]
     Storage(#[from] rusqlite::Error),
+    /// A checkpoint attempted to rewrite an already decided source position.
+    #[error("source eligibility checkpoint conflicts at sequence {sequence}")]
+    SourceCheckpointConflict {
+        /// Conflicting canonical sequence.
+        sequence: u64,
+    },
     /// A JSON column could not be encoded or decoded.
     #[error("could not serialize observation journal field {field}: {detail}")]
     Serialization {

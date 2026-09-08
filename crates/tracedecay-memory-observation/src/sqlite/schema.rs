@@ -36,7 +36,7 @@ use crate::error::ObservationJournalError;
 use super::row::{WithheldAuditCursorV1, validate_withheld_page};
 
 /// Schema version this build writes and understands.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 const LEGACY_SCHEMA_VERSION: i64 = 1;
 
@@ -296,6 +296,19 @@ CREATE TABLE IF NOT EXISTS tdmem_observation_attempt_orphan_v1 (
 CREATE INDEX IF NOT EXISTS tdmem_observation_attempt_orphan_key_v1
     ON tdmem_observation_attempt_orphan_v1 (idempotency_key, attempt_number);
 
+-- Payload-free replay evidence, retained like the stream cursor across forgetting
+-- and sweeps. No content, hygiene verdict, or subject binding is duplicated here.
+CREATE TABLE IF NOT EXISTS tdmem_observation_non_message_v1 (
+    source_authority TEXT NOT NULL,
+    exact_scope_sha256 TEXT NOT NULL,
+    source_stream TEXT NOT NULL,
+    source_sequence INTEGER NOT NULL CHECK (source_sequence >= 0),
+    source_event_id TEXT NOT NULL,
+    source_event_revision TEXT NOT NULL,
+    settlement_proof_sha256 TEXT NOT NULL,
+    PRIMARY KEY (source_authority, exact_scope_sha256, source_stream, source_sequence)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS tdmem_observation_replay_cursor_v1 (
     source_authority             TEXT    NOT NULL,
     exact_scope_sha256           TEXT    NOT NULL,
@@ -305,7 +318,7 @@ CREATE TABLE IF NOT EXISTS tdmem_observation_replay_cursor_v1 (
     last_source_event_revision   TEXT    NOT NULL,
     last_settlement_proof_sha256 TEXT,
     last_disposition             TEXT    NOT NULL CHECK (last_disposition IN (
-        'admitted', 'withheld')),
+        'admitted', 'withheld', 'non_message')),
     updated_at_micros            INTEGER NOT NULL,
     PRIMARY KEY (source_authority, exact_scope_sha256, source_stream)
 ) WITHOUT ROWID;
@@ -438,6 +451,7 @@ pub(crate) fn initialize(
         // EXISTS` cannot widen it: the two columns are added explicitly.
         PRE_ASSESSMENT_IDENTITY_SCHEMA_VERSION
         | PRE_ATTEMPT_ORPHAN_SCHEMA_VERSION
+        | 6
         | SCHEMA_VERSION => {
             transaction.execute_batch(SCHEMA_DDL)?;
             add_recovery_v5_columns(&transaction)?;
@@ -448,6 +462,12 @@ pub(crate) fn initialize(
                 field: "user_version",
             });
         }
+    }
+    if version > 0 && version < 7 {
+        // Widen the persisted cursor disposition without changing its identity or rows.
+        transaction.execute_batch("ALTER TABLE tdmem_observation_replay_cursor_v1 RENAME TO tdmem_observation_replay_cursor_old;")?;
+        transaction.execute_batch(SCHEMA_DDL)?;
+        transaction.execute_batch("INSERT INTO tdmem_observation_replay_cursor_v1 SELECT * FROM tdmem_observation_replay_cursor_old; DROP TABLE tdmem_observation_replay_cursor_old;")?;
     }
     let audit = validate_withheld_page(&transaction, None, OPEN_WITHHELD_AUDIT_ROWS)?;
     transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;

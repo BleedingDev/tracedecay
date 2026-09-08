@@ -1319,3 +1319,176 @@ fn a_dispatch_policy_is_bounded_by_the_retention_policy_it_runs_under() -> TestR
     }
     Ok(())
 }
+
+#[test]
+fn non_message_checkpoint_reopens_and_refuses_conflicts_and_corruption() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("journal.sqlite3");
+    let stream = stream_key("session-1")?;
+    let source = Builder::at_sequence(1).build()?.source;
+    {
+        let store = journal(&path)?;
+        store.record_non_message(&stream, &source)?;
+        store.record_non_message(&stream, &source)?;
+        let mut conflicting = source.clone();
+        conflicting.source_event_id = "another-event".to_owned();
+        assert!(store.record_non_message(&stream, &conflicting).is_err());
+        assert!(
+            store
+                .append_admitted(&Builder::at_sequence(1).build()?)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .inspect(&JournalInspectionFilterV1::default())?
+                .total_rows,
+            0
+        );
+    }
+    let store = journal(&path)?;
+    let cursor = store.replay_cursor(&stream)?.expect("durable checkpoint");
+    assert_eq!(cursor.last_admitted_sequence, SourceSequenceV1(1));
+    assert_eq!(cursor.last_disposition, ReplayDispositionV1::NonMessage);
+    assert_eq!(cursor.last_source_event_id, source.source_event_id);
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute(
+        "UPDATE tdmem_observation_replay_cursor_v1 SET last_settlement_proof_sha256='corrupt'",
+        [],
+    )?;
+    assert!(store.replay_cursor(&stream).is_err());
+    Ok(())
+}
+
+#[test]
+fn non_message_position_survives_a_later_append_and_reopen() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("journal.sqlite3");
+    let stream = stream_key("session-1")?;
+    let first = Builder::at_sequence(1).build()?;
+    {
+        let store = journal(&path)?;
+        store.record_non_message(&stream, &first.source)?;
+        assert!(matches!(
+            store.append_admitted(&Builder::at_sequence(2).build()?)?,
+            AppendOutcomeV1::Appended { .. }
+        ));
+    }
+    let store = journal(&path)?;
+    assert!(matches!(
+        store.append_admitted(&first),
+        Err(ObservationJournalError::SourceCheckpointConflict { sequence: 1 })
+    ));
+    // Identical evidence remains idempotent even behind the latest cursor.
+    store.record_non_message(&stream, &first.source)?;
+    assert_eq!(
+        store
+            .replay_cursor(&stream)?
+            .unwrap()
+            .last_admitted_sequence,
+        SourceSequenceV1(2)
+    );
+    assert!(matches!(
+        store.record_withheld(&support::withheld_at(1, "subject-1")?),
+        Err(ObservationJournalError::SourceCheckpointConflict { sequence: 1 })
+    ));
+    for change_revision in [false, true] {
+        let mut changed = first.source.clone();
+        if change_revision {
+            changed.source_event_revision += 1;
+        } else {
+            changed.source_event_id = "changed-event".to_owned();
+        }
+        assert!(matches!(
+            store.record_non_message(&stream, &changed),
+            Err(ObservationJournalError::SourceCheckpointConflict { sequence: 1 })
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn processed_positions_validate_identity_without_repeating_admission() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("journal.sqlite3");
+    let stream = stream_key("session-1")?;
+    {
+        let store = journal(&path)?;
+        store.record_non_message(&stream, &Builder::at_sequence(1).build()?.source)?;
+        store.append_admitted(&Builder::at_sequence(2).build()?)?;
+        store.record_withheld(&support::withheld_at(3, "subject-3")?)?;
+    }
+    let store = journal(&path)?;
+    let wake = DeliveryWakeV1::new();
+    let admission = FixtureAdmission::admitting(lane()?);
+    let gate = support::gate()?;
+    let control = ingest_control();
+    let ingress = IngressRuntimeV1::new(&store, &admission, &wake, &gate, &control);
+    let resume = ingress.recover(&stream)?;
+    assert_eq!(
+        ingress
+            .ingest(&resume, &records(&[1, 2, 3])?)?
+            .already_processed,
+        3
+    );
+    for sequence in [1, 2, 3] {
+        for change_revision in [false, true] {
+            let mut changed = record_at(sequence)?;
+            if change_revision {
+                changed.source_event_revision += 1;
+            } else {
+                changed.source_event_id = "changed-event".to_owned();
+            }
+            assert!(ingress.ingest(&resume, &[changed]).is_err());
+        }
+    }
+    assert_eq!(admission.calls.get(), 0);
+    Ok(())
+}
+
+#[test]
+fn version_six_cursor_migrates_without_losing_admitted_positions() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("journal.sqlite3");
+    let stream = stream_key("session-1")?;
+    let first = Builder::at_sequence(1).build()?;
+    let second = Builder::at_sequence(2).build()?;
+    journal(&path)?.append_admitted(&first)?;
+    {
+        let connection = rusqlite::Connection::open(&path)?;
+        connection.execute_batch(
+            "ALTER TABLE tdmem_observation_replay_cursor_v1 RENAME TO old_cursor;
+             CREATE TABLE tdmem_observation_replay_cursor_v1 (
+                 source_authority TEXT NOT NULL,
+                 exact_scope_sha256 TEXT NOT NULL,
+                 source_stream TEXT NOT NULL,
+                 last_admitted_sequence INTEGER NOT NULL,
+                 last_source_event_id TEXT NOT NULL,
+                 last_source_event_revision TEXT NOT NULL,
+                 last_settlement_proof_sha256 TEXT,
+                 last_disposition TEXT NOT NULL CHECK (last_disposition IN ('admitted', 'withheld')),
+                 updated_at_micros INTEGER NOT NULL,
+                 PRIMARY KEY (source_authority, exact_scope_sha256, source_stream)
+             ) WITHOUT ROWID;
+             INSERT INTO tdmem_observation_replay_cursor_v1 SELECT * FROM old_cursor;
+             DROP TABLE old_cursor;
+             DROP TABLE tdmem_observation_non_message_v1;
+             PRAGMA user_version=6;",
+        )?;
+    }
+    {
+        let store = journal(&path)?;
+        assert!(matches!(
+            store.append_admitted(&first)?,
+            AppendOutcomeV1::DuplicateIdempotencyKey { .. }
+        ));
+        store.record_non_message(&stream, &second.source)?;
+        store.append_admitted(&Builder::at_sequence(3).build()?)?;
+    }
+    let store = journal(&path)?;
+    store.record_non_message(&stream, &second.source)?;
+    assert!(matches!(
+        store.append_admitted(&second),
+        Err(ObservationJournalError::SourceCheckpointConflict { sequence: 2 })
+    ));
+    Ok(())
+}

@@ -30,7 +30,7 @@ use crate::inspection::{
     ObservationLaneKeyV1, QueuePressureV1, ReplayCursorV1, ReplayDispositionV1,
 };
 use crate::port::{AppendOutcomeV1, ObservationDispatchPortV1};
-use crate::settlement::SourceStreamKeyV1;
+use crate::settlement::{CanonicalSettlementReceiptV1, SourceStreamKeyV1};
 use crate::state::DeliveryStateV1;
 
 use super::SqliteObservationJournal;
@@ -238,6 +238,14 @@ impl SqliteObservationJournal {
         let registration = sql_i64(
             admitted.target.registration_revision,
             "registration_revision",
+        )?;
+
+        reject_non_message(
+            transaction,
+            authority,
+            &exact_scope_sha256,
+            stream,
+            sequence,
         )?;
 
         // (1) Same key already journalled? Then it is the same content: the key
@@ -520,6 +528,13 @@ impl SqliteObservationJournal {
         withheld.validate()?;
         let sequence = sql_i64(withheld.source_sequence, "source_sequence")?;
         self.with_transaction(|transaction| {
+            reject_non_message(
+                transaction,
+                &withheld.source_authority,
+                &withheld.exact_scope_sha256,
+                &withheld.source_stream,
+                sequence,
+            )?;
             transaction.execute(
                 INSERT_WITHHELD,
                 params![
@@ -555,6 +570,25 @@ impl SqliteObservationJournal {
             Ok(())
         })
     }
+}
+
+fn reject_non_message(
+    transaction: &Transaction<'_>,
+    authority: &str,
+    scope: &str,
+    stream: &str,
+    sequence: i64,
+) -> Result<(), ObservationJournalError> {
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tdmem_observation_non_message_v1 WHERE source_authority=?1 AND exact_scope_sha256=?2 AND source_stream=?3 AND source_sequence=?4)",
+        params![authority, scope, stream, sequence], |row| row.get(0),
+    )?;
+    if exists {
+        return Err(ObservationJournalError::SourceCheckpointConflict {
+            sequence: read_u64(sequence, "source_sequence")?,
+        });
+    }
+    Ok(())
 }
 
 fn read_pressure(
@@ -594,6 +628,98 @@ impl ObservationDispatchPortV1 for SqliteObservationJournal {
         self.record_withheld_at(withheld, unix_now_micros())
     }
 
+    fn record_non_message(
+        &self,
+        stream: &SourceStreamKeyV1,
+        source: &CanonicalSettlementReceiptV1,
+    ) -> Result<(), ObservationJournalError> {
+        stream.validate()?;
+        source.validate()?;
+        if stream.source_authority != source.source_authority
+            || stream.source_stream != source.source_stream
+        {
+            return Err(ObservationJournalError::UnsettledSource {
+                field: "source_stream",
+            });
+        }
+        let sequence = sql_i64(source.source_sequence.0, "source_sequence")?;
+        self.with_transaction(|transaction| {
+            let decided: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tdmem_observation_journal_v1 WHERE source_authority=?1 AND exact_scope_sha256=?2 AND source_stream=?3 AND source_sequence=?4 UNION ALL SELECT 1 FROM tdmem_observation_withheld_v2 WHERE source_authority=?1 AND exact_scope_sha256=?2 AND source_stream=?3 AND source_sequence=?4)",
+                params![stream.source_authority.as_wire(), &stream.exact_scope_sha256, stream.source_stream.as_str(), sequence],
+                |row| row.get(0),
+            )?;
+            if decided {
+                return Err(ObservationJournalError::SourceCheckpointConflict { sequence: source.source_sequence.0 });
+            }
+            let previous: Option<(String, String, String)> = transaction.query_row(
+                "SELECT source_event_id, source_event_revision, settlement_proof_sha256 FROM tdmem_observation_non_message_v1 WHERE source_authority=?1 AND exact_scope_sha256=?2 AND source_stream=?3 AND source_sequence=?4",
+                params![stream.source_authority.as_wire(), &stream.exact_scope_sha256, stream.source_stream.as_str(), sequence],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional()?;
+            if let Some((event, revision, proof)) = previous {
+                if event == source.source_event_id
+                    && revision == source.source_event_revision.to_string()
+                    && proof == source.settlement_proof_sha256 {
+                    return Ok(());
+                }
+                return Err(ObservationJournalError::SourceCheckpointConflict { sequence: source.source_sequence.0 });
+            }
+            let previous: Option<i64> = transaction.query_row(SELECT_CURSOR,
+                params![stream.source_authority.as_wire(), &stream.exact_scope_sha256, stream.source_stream.as_str()],
+                |row| row.get(0),
+            ).optional()?;
+            if previous.is_some_and(|position| position >= sequence) {
+                return Err(ObservationJournalError::SourceCheckpointConflict { sequence: source.source_sequence.0 });
+            }
+            transaction.execute("INSERT INTO tdmem_observation_non_message_v1 VALUES (?1,?2,?3,?4,?5,?6,?7)", params![
+                stream.source_authority.as_wire(), &stream.exact_scope_sha256, stream.source_stream.as_str(),
+                sequence, &source.source_event_id, source.source_event_revision.to_string(), &source.settlement_proof_sha256,
+            ])?;
+            transaction.execute(UPSERT_CURSOR, params![
+                stream.source_authority.as_wire(), &stream.exact_scope_sha256, stream.source_stream.as_str(),
+                sequence, &source.source_event_id, source.source_event_revision.to_string(),
+                &source.settlement_proof_sha256, ReplayDispositionV1::NonMessage.as_wire(), unix_now_micros(),
+            ])?;
+            Ok(())
+        })
+    }
+
+    fn validate_replay_identity(
+        &self,
+        stream: &SourceStreamKeyV1,
+        sequence: SourceSequenceV1,
+        event_id: &str,
+        revision: u64,
+    ) -> Result<(), ObservationJournalError> {
+        stream.validate()?;
+        self.with_connection(|connection| {
+            // Read existing durable decisions, never ask the admission/provider adapter.
+            // Missing evidence (including expired history) fails closed.
+            let mut statement = connection.prepare(
+                "SELECT source_event_id, CAST(source_event_revision AS TEXT), NULL FROM tdmem_observation_journal_v1 WHERE source_authority=?1 AND exact_scope_sha256=?2 AND source_stream=?3 AND source_sequence=?4
+                 UNION ALL SELECT source_event_id, source_event_revision, NULL FROM tdmem_observation_withheld_v2 WHERE source_authority=?1 AND exact_scope_sha256=?2 AND source_stream=?3 AND source_sequence=?4
+                 UNION ALL SELECT source_event_id, source_event_revision, settlement_proof_sha256 FROM tdmem_observation_non_message_v1 WHERE source_authority=?1 AND exact_scope_sha256=?2 AND source_stream=?3 AND source_sequence=?4
+                 UNION ALL SELECT last_source_event_id, last_source_event_revision, last_settlement_proof_sha256 FROM tdmem_observation_replay_cursor_v1 WHERE source_authority=?1 AND exact_scope_sha256=?2 AND source_stream=?3 AND last_admitted_sequence=?4"
+            )?;
+            let mut rows = statement.query(params![stream.source_authority.as_wire(), &stream.exact_scope_sha256, stream.source_stream.as_str(), sql_i64(sequence.0, "source_sequence")?])?;
+            let mut found = false;
+            while let Some(row) = rows.next()? {
+                found = true;
+                if let Some(proof) = row.get::<_, Option<String>>(2)? {
+                    crate::identity::require_sha256(&proof, "settlement_proof_sha256")?;
+                }
+                if row.get::<_, String>(0)? != event_id || row.get::<_, String>(1)? != revision.to_string() {
+                    return Err(ObservationJournalError::SourceCheckpointConflict { sequence: sequence.0 });
+                }
+            }
+            if !found {
+                return Err(ObservationJournalError::SourceCheckpointConflict { sequence: sequence.0 });
+            }
+            Ok(())
+        })
+    }
+
     fn replay_cursor(
         &self,
         stream: &SourceStreamKeyV1,
@@ -622,6 +748,17 @@ impl ObservationDispatchPortV1 for SqliteObservationJournal {
                 .optional()?;
             row.map(
                 |(sequence, event_id, revision, proof, disposition, updated)| {
+                    let disposition = ReplayDispositionV1::from_wire(&disposition)?;
+                    if disposition == ReplayDispositionV1::NonMessage
+                        && (event_id.is_empty()
+                            || revision.parse::<u64>().is_err()
+                            || !proof.as_deref().is_some_and(crate::identity::is_sha256))
+                    {
+                        return Err(ObservationJournalError::Corrupt {
+                            table: "tdmem_observation_replay_cursor_v1",
+                            field: "non_message_checkpoint",
+                        });
+                    }
                     Ok(ReplayCursorV1 {
                         last_admitted_sequence: SourceSequenceV1(read_u64(
                             sequence,
@@ -630,7 +767,7 @@ impl ObservationDispatchPortV1 for SqliteObservationJournal {
                         last_source_event_id: event_id,
                         last_source_event_revision: revision,
                         last_settlement_proof_sha256: proof,
-                        last_disposition: ReplayDispositionV1::from_wire(&disposition)?,
+                        last_disposition: disposition,
                         updated_at_unix_micros: updated,
                     })
                 },

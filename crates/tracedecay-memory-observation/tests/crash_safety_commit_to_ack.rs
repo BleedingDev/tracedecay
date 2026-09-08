@@ -602,6 +602,25 @@ impl ObservationDispatchPortV1 for CrashingDispatchPortV1<'_> {
         self.inner.record_withheld(withheld)
     }
 
+    fn record_non_message(
+        &self,
+        stream: &SourceStreamKeyV1,
+        source: &tracedecay_memory_observation::CanonicalSettlementReceiptV1,
+    ) -> Result<(), ObservationJournalError> {
+        self.inner.record_non_message(stream, source)
+    }
+
+    fn validate_replay_identity(
+        &self,
+        stream: &SourceStreamKeyV1,
+        sequence: SourceSequenceV1,
+        event_id: &str,
+        revision: u64,
+    ) -> Result<(), ObservationJournalError> {
+        self.inner
+            .validate_replay_identity(stream, sequence, event_id, revision)
+    }
+
     fn replay_cursor(
         &self,
         stream: &SourceStreamKeyV1,

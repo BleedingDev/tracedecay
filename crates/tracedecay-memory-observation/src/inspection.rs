@@ -18,7 +18,7 @@ use crate::state::DeliveryStateV1;
 /// How far the journal has admitted from one source stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplayCursorV1 {
-    /// Highest source sequence admitted or withheld on this stream.
+    /// Highest source sequence decided on this stream.
     pub last_admitted_sequence: SourceSequenceV1,
     /// Identity of the event at that sequence.
     pub last_source_event_id: String,
@@ -29,13 +29,13 @@ pub struct ReplayCursorV1 {
     /// Settlement proof of the last admitted event, absent when the last
     /// position was withheld rather than admitted.
     pub last_settlement_proof_sha256: Option<String>,
-    /// Whether the last position was admitted or withheld.
+    /// The delivery, hygiene, or eligibility decision at the last position.
     pub last_disposition: ReplayDispositionV1,
     /// Instant the cursor last moved.
     pub updated_at_unix_micros: i64,
 }
 
-/// Whether a replay position was admitted into the journal or withheld.
+/// The durable decision for a canonical replay position.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ReplayDispositionV1 {
     /// The event was admitted and a delivery row exists.
@@ -43,6 +43,8 @@ pub enum ReplayDispositionV1 {
     /// Hygiene refused the event. No payload and no delivery row exist, and the
     /// event must not be re-emitted.
     Withheld,
+    /// Valid canonical evidence with no eligible user/assistant message.
+    NonMessage,
 }
 
 impl ReplayDispositionV1 {
@@ -52,6 +54,7 @@ impl ReplayDispositionV1 {
         match self {
             Self::Admitted => "admitted",
             Self::Withheld => "withheld",
+            Self::NonMessage => "non_message",
         }
     }
 
@@ -60,6 +63,7 @@ impl ReplayDispositionV1 {
         match value {
             "admitted" => Ok(Self::Admitted),
             "withheld" => Ok(Self::Withheld),
+            "non_message" => Ok(Self::NonMessage),
             other => Err(ObservationJournalError::UnknownWireValue {
                 field: "last_disposition",
                 value: other.to_owned(),

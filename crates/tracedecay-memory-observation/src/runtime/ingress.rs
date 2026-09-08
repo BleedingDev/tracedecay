@@ -32,19 +32,14 @@
 //! that stopped a batch produces a typed [`IngressStopV1`], never a silent
 //! return.
 //!
-//! # Why there are exactly two decisions
-//!
-//! The journal has two watermark-advancing primitives, so the adapter has two
-//! answers. There is no "ignore this record" decision, because advancing a
-//! watermark past a record nobody decided about is a silent drop with extra
-//! steps. A caller whose source carries records that are not observable filters
-//! them before they reach ingress, and the watermark simply never covers them.
+//! Valid canonical non-message evidence receives an explicit eligibility
+//! checkpoint, not a fabricated hygiene refusal or a delivery row.
 
 use crate::envelope::{AdmittedObservationV1, WithheldAdmissionV1};
 use crate::identity::SourceSequenceV1;
 use crate::inspection::{ObservationLaneKeyV1, ReplayDispositionV1};
 use crate::port::{AppendOutcomeV1, ObservationDispatchPortV1};
-use crate::settlement::SourceStreamKeyV1;
+use crate::settlement::{CanonicalSettlementReceiptV1, SourceStreamKeyV1};
 
 use super::backpressure::{
     BackpressureDecisionV1, BackpressureGateV1, BackpressureHaltV1, ObservationLoadClassV1,
@@ -150,6 +145,8 @@ pub enum AdmissionDecisionV1 {
     Admit(Box<AdmittedObservationV1>),
     /// Withhold the record, recording digests and a typed reason only.
     Withhold(Box<WithheldAdmissionV1>),
+    /// Validated canonical evidence contains no eligible message.
+    NonMessage(Box<CanonicalSettlementReceiptV1>),
 }
 
 /// The caller-supplied admission and hygiene seam.
@@ -263,6 +260,8 @@ pub struct IngressBatchReportV1 {
     pub appended: u32,
     /// Records recorded as withheld by hygiene.
     pub withheld: u32,
+    /// Valid non-message records checkpointed without provider delivery.
+    pub non_messages: u32,
     /// Records the journal already held under the same key or the same settled
     /// event. Idempotent replay, not new work.
     pub duplicates: u32,
@@ -421,6 +420,12 @@ where
             report.records_considered = report.records_considered.saturating_add(1);
 
             if !resume.accepts(record.source_sequence) {
+                self.port.validate_replay_identity(
+                    &record.stream,
+                    record.source_sequence,
+                    &record.source_event_id,
+                    record.source_event_revision,
+                )?;
                 report.already_processed = report.already_processed.saturating_add(1);
                 continue;
             }
@@ -550,6 +555,16 @@ where
                         }
                     }
                 }
+                AdmissionDecisionV1::NonMessage(source) => {
+                    verify_source(record, &source)?;
+                    if let Some(stop) = self.caller_stop(record) {
+                        report.stopped_on = Some(stop);
+                        break;
+                    }
+                    self.port.record_non_message(&record.stream, &source)?;
+                    report.non_messages = report.non_messages.saturating_add(1);
+                    report.high_watermark = Some(record.source_sequence);
+                }
                 AdmissionDecisionV1::Withhold(withheld) => {
                     verify_withheld(record, &withheld)?;
                     self.port.record_withheld(&withheld)?;
@@ -635,40 +650,11 @@ fn verify_admitted<T>(
 ) -> Result<(), ObservationRuntimeError> {
     mismatch(
         record,
-        "source_authority",
-        record.stream.source_authority.as_wire(),
-        admitted.source.source_authority.as_wire(),
-    )?;
-    mismatch(
-        record,
         "exact_scope_sha256",
         &record.stream.exact_scope_sha256,
         &admitted.exact_scope_sha256(),
     )?;
-    mismatch(
-        record,
-        "source_stream",
-        record.stream.source_stream.as_str(),
-        admitted.source.source_stream.as_str(),
-    )?;
-    mismatch(
-        record,
-        "source_sequence",
-        &record.source_sequence.0.to_string(),
-        &admitted.source.source_sequence.0.to_string(),
-    )?;
-    mismatch(
-        record,
-        "source_event_id",
-        &record.source_event_id,
-        &admitted.source.source_event_id,
-    )?;
-    mismatch(
-        record,
-        "source_event_revision",
-        &record.source_event_revision.to_string(),
-        &admitted.source.source_event_revision.to_string(),
-    )
+    verify_source(record, &admitted.source)
 }
 
 /// Proves a withholding decision describes the record it answers.
@@ -711,5 +697,41 @@ fn verify_withheld<T>(
         "source_event_revision",
         &record.source_event_revision.to_string(),
         &withheld.source_event_revision,
+    )
+}
+
+fn verify_source<T>(
+    record: &SourceRecordV1<T>,
+    source: &CanonicalSettlementReceiptV1,
+) -> Result<(), ObservationRuntimeError> {
+    mismatch(
+        record,
+        "source_authority",
+        record.stream.source_authority.as_wire(),
+        source.source_authority.as_wire(),
+    )?;
+    mismatch(
+        record,
+        "source_stream",
+        record.stream.source_stream.as_str(),
+        source.source_stream.as_str(),
+    )?;
+    mismatch(
+        record,
+        "source_sequence",
+        &record.source_sequence.0.to_string(),
+        &source.source_sequence.0.to_string(),
+    )?;
+    mismatch(
+        record,
+        "source_event_id",
+        &record.source_event_id,
+        &source.source_event_id,
+    )?;
+    mismatch(
+        record,
+        "source_event_revision",
+        &record.source_event_revision.to_string(),
+        &source.source_event_revision.to_string(),
     )
 }

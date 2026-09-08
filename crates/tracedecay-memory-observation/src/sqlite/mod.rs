@@ -234,6 +234,27 @@ impl SqliteObservationJournal {
         source_stream: &SourceStreamIdV1,
     ) -> Result<Option<SourceSequenceV1>, ObservationJournalError> {
         self.with_connection(|connection| {
+            // A corrupt eligibility checkpoint must not hide itself behind the
+            // global MAX and skip canonical evidence before per-stream recovery.
+            let mut checkpoints = connection.prepare(
+                "SELECT last_disposition, last_source_event_id, last_source_event_revision, last_settlement_proof_sha256 FROM tdmem_observation_replay_cursor_v1 WHERE source_authority=?1 AND source_stream=?2",
+            )?;
+            let mut rows = checkpoints.query(rusqlite::params![source_authority.as_wire(), source_stream.as_str()])?;
+            while let Some(row) = rows.next()? {
+                let disposition: String = row.get(0)?;
+                let disposition = crate::inspection::ReplayDispositionV1::from_wire(&disposition)?;
+                if disposition == crate::inspection::ReplayDispositionV1::NonMessage {
+                    let event: String = row.get(1)?;
+                    let revision: String = row.get(2)?;
+                    let proof: Option<String> = row.get(3)?;
+                    if event.is_empty() || revision.parse::<u64>().is_err()
+                        || !proof.as_deref().is_some_and(crate::identity::is_sha256) {
+                        return Err(ObservationJournalError::Corrupt {
+                            table: "tdmem_observation_replay_cursor_v1", field: "non_message_checkpoint",
+                        });
+                    }
+                }
+            }
             let sequence = connection.query_row(
                 "SELECT MAX(last_admitted_sequence) \
                  FROM tdmem_observation_replay_cursor_v1 \
