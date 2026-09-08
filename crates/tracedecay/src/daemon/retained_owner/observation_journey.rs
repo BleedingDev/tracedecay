@@ -67,7 +67,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tracedecay_application::ResolvedScope;
-use tracedecay_domain::{DurableObservationV1, ObservationScopeV1, ProjectId, UserProfileId};
+use tracedecay_domain::{
+    CanonicalMessageRoleV1, CanonicalObservationEnvelopeV1, CanonicalObservationFactV1,
+    DurableObservationV1, ObservationContractError, ObservationScopeV1, ProjectId, UserProfileId,
+};
 use tracedecay_memory_hygiene::{
     AdvisoryMetadataAdmissionV1, AdvisoryMetadataFieldV1, AdvisoryTextAdmissionV1,
     AdvisoryTextHardener, AdvisoryTextWithheldReasonV1, AdvisoryTrustTierV1, HygieneError,
@@ -904,6 +907,66 @@ struct AdmissionContextV1 {
     provider_payload_contract: OwnedVersionedId,
 }
 
+/// Validate the canonical contract before deciding eligibility. Only the provider
+/// copy is narrowed; source evidence and its identity remain untouched.
+/// Shape-limit failures follow hygiene's terminal-withholding path, but must
+/// still refuse delivery if narrowing leaves a payload that hygiene admits.
+fn eligible_message_payload(
+    observation: &DurableObservationV1,
+) -> Result<Option<(Value, Option<ObservationContractError>)>, String> {
+    let envelope: CanonicalObservationEnvelopeV1 =
+        serde_json::from_value(observation.payload().clone()).map_err(|error| error.to_string())?;
+    let shape_error = match envelope.validate() {
+        Ok(()) => None,
+        Err(
+            error @ (ObservationContractError::CanonicalEnvelopeTooLarge
+            | ObservationContractError::CanonicalEnvelopeTooDeep
+            | ObservationContractError::CanonicalEnvelopeTooManyValues),
+        ) => Some(error),
+        Err(error) => return Err(error.to_string()),
+    };
+    if envelope.provider() != observation.source().provider()
+        || envelope.relations().session_id() != observation.source().session_id()
+        || envelope.evidence().ordering_domain() != observation.identity().ordering_domain()
+        || envelope.evidence().range() != observation.identity().position()
+        || observation
+            .identity()
+            .native_record_id()
+            .is_some_and(|id| id != envelope.stable_record_id())
+    {
+        return Err("canonical envelope source identity mismatch".to_owned());
+    }
+    if envelope
+        .facts()
+        .iter()
+        .any(|fact| matches!(fact, CanonicalObservationFactV1::Unknown { .. }))
+    {
+        return Err("unknown canonical fact is not an eligibility decision".to_owned());
+    }
+    let facts: Vec<_> = envelope
+        .facts()
+        .iter()
+        .filter(|fact| {
+            matches!(
+                fact,
+                CanonicalObservationFactV1::Message {
+                    role: CanonicalMessageRoleV1::User | CanonicalMessageRoleV1::Assistant,
+                    ..
+                }
+            )
+        })
+        .collect();
+    if facts.is_empty() {
+        if let Some(error) = shape_error {
+            return Err(error.to_string());
+        }
+        return Ok(None);
+    }
+    let mut payload = observation.payload().clone();
+    payload["facts"] = serde_json::to_value(facts).map_err(|error| error.to_string())?;
+    Ok(Some((payload, shape_error)))
+}
+
 /// Turns one canonical `StoredObservation` into an admission decision.
 ///
 /// The order is fixed by the observation contract and enforced here, not
@@ -936,6 +999,11 @@ enum AdmissionAdapterError {
         /// Underlying refusal.
         #[source]
         source: ObservationJourneyError,
+    },
+    #[error("canonical observation {source_event_id} has an invalid envelope: {detail}")]
+    InvalidCanonicalEnvelope {
+        source_event_id: String,
+        detail: String,
     },
     #[error("hygiene could not decide canonical observation {source_event_id}: {source}")]
     Hygiene {
@@ -1031,6 +1099,18 @@ impl ObservationAdmissionAdapterV1 for CanonicalObservationAdmissionAdapterV1 {
             source,
         })?;
 
+        let message_payload = eligible_message_payload(observation).map_err(|detail| {
+            AdmissionAdapterError::InvalidCanonicalEnvelope {
+                source_event_id: source_event_id.clone(),
+                detail,
+            }
+        })?;
+        let Some((message_payload, shape_error)) = message_payload else {
+            return Ok(AdmissionDecisionV1::NonMessage(Box::new(
+                canonical_settlement_receipt(record, stored),
+            )));
+        };
+
         // The provider sees the observation envelope, not the bare canonical
         // payload, so hygiene has to run over the envelope: the sanitization
         // receipt binds the exact bytes that will be delivered, and a receipt
@@ -1040,7 +1120,7 @@ impl ObservationAdmissionAdapterV1 for CanonicalObservationAdmissionAdapterV1 {
         let envelope = provider_observation_envelope(
             context.observation_kind.as_str(),
             SESSION_MESSAGE_PAYLOAD_CONTRACT,
-            observation.payload(),
+            &message_payload,
         );
         // A settled record whose *shape* hygiene will not walk — nested or
         // sized beyond the ceilings the store itself never lets a record reach
@@ -1117,6 +1197,12 @@ impl ObservationAdmissionAdapterV1 for CanonicalObservationAdmissionAdapterV1 {
                 Ok(AdmissionDecisionV1::Withhold(Box::new(withheld)))
             }
             ObservationAdmission::Admitted { sanitized, receipt } => {
+                if let Some(error) = shape_error {
+                    return Err(AdmissionAdapterError::InvalidCanonicalEnvelope {
+                        source_event_id,
+                        detail: error.to_string(),
+                    });
+                }
                 // Hygiene may redact spans inside the payload; it must not have
                 // turned the envelope into something the provider cannot parse.
                 // Checking is one map lookup, and the alternative is a dispatch
@@ -8206,6 +8292,148 @@ mod tests {
             })
             .expect("a later open mounts over the same durable journal")
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_message_checkpoint_survives_reopen_and_mixed_batch_delivers_only_messages() {
+        let temp = TempDir::new().unwrap();
+        let fixture = mount_hygiene_fixture(&temp, "project.non-message").await;
+        let session = SessionId::new("session.non-message").unwrap();
+        let mut metadata = canonical_observation(&fixture.project_id, &session, "unused")
+            .payload()
+            .clone();
+        metadata["native_record_kind"] = json!("session_meta");
+        metadata["facts"] = json!([{"kind":"boundary", "boundary_kind":"session_start"}]);
+        let observation =
+            canonical_observation_with_payload(&fixture.project_id, &session, metadata.clone());
+        let records = SettledRecordsPort::single(settled_record(1, observation));
+        let pass = run_startup_replay(
+            fixture.journey.as_ref(),
+            &records,
+            &HostCancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pass.admitted, 0);
+        assert_eq!(fixture.port.observe_calls.load(Ordering::Relaxed), 0);
+        let connection = rusqlite::Connection::open(fixture.journey.journal_path()).unwrap();
+        let disposition: String = connection
+            .query_row(
+                "SELECT last_disposition FROM tdmem_observation_replay_cursor_v1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(disposition, "non_message");
+        assert_eq!(records.records[0].observation().payload(), &metadata);
+        assert!(
+            journal_snapshot(fixture.journey.journal_path())
+                .starts_with("journal=0 delivery=0 withheld=0 receipts=0 cursors=1 ")
+        );
+        fixture
+            .journey
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        let reopened = fixture.reopen();
+        assert_eq!(
+            run_startup_replay(reopened.as_ref(), &records, &HostCancellationToken::new())
+                .await
+                .unwrap()
+                .admitted,
+            0
+        );
+        let mut mixed = records.records.clone();
+        for position in 1..=2 {
+            let mut payload = canonical_observation_at(
+                &fixture.project_id,
+                &session,
+                "eligible message",
+                position,
+            )
+            .payload()
+            .clone();
+            payload["facts"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"kind":"boundary", "boundary_kind":"session_start"}));
+            mixed.push(settled_record(
+                position + 1,
+                canonical_observation_with_payload_at(
+                    &fixture.project_id,
+                    &session,
+                    payload,
+                    position,
+                ),
+            ));
+        }
+        let records = SettledRecordsPort { records: mixed };
+        assert_eq!(
+            run_startup_replay(reopened.as_ref(), &records, &HostCancellationToken::new())
+                .await
+                .unwrap()
+                .admitted,
+            2
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fixture.port.delivered.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fixture.port.observe_calls.load(Ordering::Relaxed), 2);
+        for delivered in fixture.port.delivered.lock().unwrap().iter() {
+            let payload: Value = serde_json::from_slice(&delivered.bytes).unwrap();
+            // Only message facts enter the provider copy, including mixed-fact records.
+            let text = serde_json::to_string(&payload).unwrap();
+            assert!(!text.contains("session_start"));
+        }
+        assert_eq!(
+            records.records[1].observation().payload()["facts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        reopened
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn corrupt_canonical_metadata_refuses_without_checkpoint() {
+        let temp = TempDir::new().unwrap();
+        let fixture = mount_hygiene_fixture(&temp, "project.corrupt-metadata").await;
+        let session = SessionId::new("session.corrupt-metadata").unwrap();
+        let mut payload = canonical_observation(&fixture.project_id, &session, "unused")
+            .payload()
+            .clone();
+        payload["version"] = json!(999);
+        let records = SettledRecordsPort::single(settled_record(
+            1,
+            canonical_observation_with_payload(&fixture.project_id, &session, payload),
+        ));
+        assert!(
+            run_startup_replay(
+                fixture.journey.as_ref(),
+                &records,
+                &HostCancellationToken::new()
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            journal_snapshot(fixture.journey.journal_path())
+                .starts_with("journal=0 delivery=0 withheld=0 receipts=0 cursors=0 ")
+        );
+        assert_eq!(fixture.port.observe_calls.load(Ordering::Relaxed), 0);
+        fixture
+            .journey
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
     }
 
     /// Mounts the production journey against a real registered project store
