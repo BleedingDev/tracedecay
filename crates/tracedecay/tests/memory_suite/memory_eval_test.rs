@@ -22,6 +22,84 @@ mod assertions;
 
 use assertions::{Assertion, AssertionOutcome, CompareOp, Phase, should_skip_assertion};
 
+#[cfg(test)]
+mod daemon_stderr_tests {
+    use super::*;
+
+    #[test]
+    fn noisy_child() {
+        use std::io::Write;
+        let Ok(mode) = std::env::var("TRACEDECAY_STDERR_FIXTURE_MODE") else {
+            return;
+        };
+        let mut stderr = std::io::stderr().lock();
+        // No newlines: also catches line-buffered implementations with unbounded lines.
+        for _ in 0..512 {
+            stderr.write_all(&[b'x'; 4096]).unwrap();
+        }
+        stderr.write_all(b"\nstartup-evidence-marker\n").unwrap();
+        stderr.flush().unwrap();
+        drop(stderr);
+        if mode == "exit" {
+            std::process::exit(42);
+        }
+        std::fs::write(
+            std::env::var_os("TRACEDECAY_STDERR_FIXTURE_READY").unwrap(),
+            b"ready",
+        )
+        .unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn daemon_stderr_is_drained_before_readiness() {
+        let dir = TempDir::new().unwrap();
+        let module = module_path!().split_once("::").unwrap().1;
+        for mode in ["ready", "exit", "timeout"] {
+            let ready = dir.path().join(mode);
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", &format!("{module}::noisy_child"), "--nocapture"])
+                .env("TRACEDECAY_STDERR_FIXTURE_MODE", mode)
+                .env("TRACEDECAY_STDERR_FIXTURE_READY", &ready)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            let mut child = common::TestChildProcess::new(command.spawn().unwrap());
+            let result = child.wait_for_daemon_ready(|| mode == "ready" && ready.exists(), &ready);
+            if mode == "ready" {
+                result.unwrap();
+                assert!(child.try_wait().unwrap().is_none());
+                child.kill_and_wait().unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("startup-evidence-marker"), "{error}");
+                assert!(error.len() < 17 * 1024, "diagnostics must remain bounded");
+                assert!(child.try_wait().unwrap().is_some());
+                if mode == "exit" {
+                    assert!(
+                        error.contains("exited before accepting connections"),
+                        "{error}"
+                    );
+                    assert!(error.contains("42"), "{error}");
+                } else {
+                    assert!(
+                        error.contains("timed out waiting for daemon authority"),
+                        "{error}"
+                    );
+                    assert!(
+                        ready.exists(),
+                        "child must finish writing before the timeout"
+                    );
+                    assert!(error.contains(&ready.display().to_string()), "{error}");
+                }
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct Scenario {
     schema_version: u32,

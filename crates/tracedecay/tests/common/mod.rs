@@ -562,14 +562,22 @@ pub fn http_agent_with_timeout(timeout: Duration) -> ureq::Agent {
 /// panic while the child is still running, `Drop` force-stops and reaps it.
 pub struct TestChildProcess {
     child: Child,
+    stderr_reader: Option<std::thread::JoinHandle<std::collections::VecDeque<u8>>>,
+    stderr_tail: std::collections::VecDeque<u8>,
 }
+
+const DAEMON_STDERR_TAIL_BYTES: usize = 16 * 1024;
 
 /// Daemon-specific name retained for test fixtures that keep a daemon alive.
 pub type DaemonProcess = TestChildProcess;
 
 impl TestChildProcess {
     pub fn new(child: Child) -> Self {
-        Self { child }
+        Self {
+            child,
+            stderr_reader: None,
+            stderr_tail: std::collections::VecDeque::new(),
+        }
     }
 
     pub fn id(&self) -> u32 {
@@ -659,31 +667,94 @@ impl TestChildProcess {
     /// `Child::kill` maps to `SIGKILL` on Unix and the platform termination
     /// primitive elsewhere, keeping fault-injection tests portable.
     pub fn kill_and_wait(&mut self) -> std::io::Result<ExitStatus> {
-        terminate_and_reap(&mut self.child)
+        let status = terminate_and_reap(&mut self.child)?;
+        if let Some(reader) = self.stderr_reader.take() {
+            self.stderr_tail = reader
+                .join()
+                .map_err(|_| std::io::Error::other("daemon stderr reader panicked"))?;
+        }
+        Ok(status)
     }
 
     fn drain_stderr(&mut self) {
         let Some(mut stderr) = self.child.stderr.take() else {
             return;
         };
-        std::thread::spawn(move || {
-            if let Some(path) = std::env::var_os("TRACEDECAY_TEST_DAEMON_LOG")
-                && let Ok(mut file) = std::fs::OpenOptions::new()
+        self.stderr_reader = Some(std::thread::spawn(move || {
+            use std::io::Write;
+            let mut log = std::env::var_os("TRACEDECAY_TEST_DAEMON_LOG").and_then(|path| {
+                std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(path)
-            {
-                let _ = std::io::copy(&mut stderr, &mut file);
-                return;
+                    .ok()
+            });
+            let mut tail = std::collections::VecDeque::with_capacity(DAEMON_STDERR_TAIL_BYTES);
+            let mut buffer = [0; 4096];
+            loop {
+                let count = match stderr.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => count,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                let excess = (tail.len() + count).saturating_sub(DAEMON_STDERR_TAIL_BYTES);
+                tail.drain(..excess);
+                tail.extend(&buffer[..count]);
+                // A failed optional log must never stop draining the child pipe.
+                if let Some(file) = &mut log
+                    && file.write_all(&buffer[..count]).is_err()
+                {
+                    log = None;
+                }
             }
-            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-        });
+            tail
+        }));
+    }
+
+    pub fn wait_for_daemon_ready(
+        &mut self,
+        mut ready: impl FnMut() -> bool,
+        authority_path: &Path,
+    ) -> Result<(), String> {
+        // Drain before the first readiness probe: startup output can fill a pipe.
+        self.drain_stderr();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reason = loop {
+            if ready() {
+                return Ok(());
+            }
+            match self.try_wait() {
+                Ok(Some(status)) => {
+                    break format!(
+                        "tracedecay daemon exited before accepting connections: {status}"
+                    );
+                }
+                Err(error) => break format!("daemon status should be readable: {error}"),
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                break format!(
+                    "timed out waiting for daemon authority at {}",
+                    authority_path.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        // Stop/reap first, then join to include the final stderr bytes on both
+        // early exit and timeout. The owner also joins on normal fixture drop.
+        let cleanup = self.kill_and_wait();
+        let stderr = self.stderr_tail.make_contiguous();
+        Err(format!(
+            "{reason}; stderr tail: {}; cleanup: {cleanup:?}",
+            String::from_utf8_lossy(stderr).trim()
+        ))
     }
 }
 
 impl Drop for TestChildProcess {
     fn drop(&mut self) {
-        let _ = terminate_and_reap(&mut self.child);
+        let _ = self.kill_and_wait();
     }
 }
 
@@ -1074,42 +1145,18 @@ fn spawn_tracedecay_daemon_process(
     let child = command.spawn().expect("tracedecay daemon should start");
     let mut daemon = DaemonProcess::new(child);
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    poll_until(
-        deadline,
-        Duration::from_millis(25),
-        || {
-            #[cfg(unix)]
-            let ready = std::os::unix::net::UnixStream::connect(&socket_path).is_ok();
-            #[cfg(not(unix))]
-            let ready = portable_daemon_connectable();
-            if ready {
-                return Some(());
-            }
-            if let Some(status) = daemon
-                .child
-                .try_wait()
-                .expect("daemon status should be readable")
-            {
-                let mut stderr = String::new();
-                if let Some(mut child_stderr) = daemon.child.stderr.take() {
-                    let _ = child_stderr.read_to_string(&mut stderr);
-                }
-                panic!(
-                    "tracedecay daemon exited before accepting connections: {status}; stderr: {}",
-                    stderr.trim()
-                );
-            }
-            None
-        },
-        || {
-            format!(
-                "timed out waiting for daemon authority at {}",
-                authority_path.display()
-            )
-        },
-    );
-    daemon.drain_stderr();
+    daemon
+        .wait_for_daemon_ready(
+            || {
+                #[cfg(unix)]
+                let ready = std::os::unix::net::UnixStream::connect(&socket_path).is_ok();
+                #[cfg(not(unix))]
+                let ready = portable_daemon_connectable();
+                ready
+            },
+            &authority_path,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
     daemon
 }
 
