@@ -11,8 +11,9 @@ pub mod topology;
 pub mod work_executable_binding;
 
 pub use tracedecay_domain::configuration::{
-    MemoryProviderRecallDegradationCauseV1, MemoryProviderRecallDegradationV1,
-    MemoryProviderRecallFallbackV1, MemoryProviderRecallRoutingV1, SEMANTIC_RUNTIME_SETTING_KEY,
+    MemoryProviderNcmObserverV1, MemoryProviderRecallDegradationCauseV1,
+    MemoryProviderRecallDegradationV1, MemoryProviderRecallFallbackV1,
+    MemoryProviderRecallRoutingV1, SEMANTIC_RUNTIME_SETTING_KEY,
 };
 pub use tracedecay_global_db::configuration::{registry, resolver};
 #[cfg(test)]
@@ -28,8 +29,9 @@ use tracedecay_domain::configuration::{
     INDEX_EXTRACT_DOCSTRINGS_SETTING_KEY, INDEX_GIT_IGNORE_SETTING_KEY, INDEX_INCLUDE_SETTING_KEY,
     INDEX_MAX_FILE_SIZE_SETTING_KEY, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
     INDEX_TRACK_CALL_SITES_SETTING_KEY, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
-    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
-    SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY, SettingKey, TELEMETRY_TIMINGS_SETTING_KEY,
+    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY, SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY, SettingKey,
+    TELEMETRY_TIMINGS_SETTING_KEY,
 };
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
@@ -47,6 +49,7 @@ pub struct TraceDecayConfig {
     pub diagnostics_prewarm: bool,
     pub native_graph_activation: bool,
     pub memory_provider_native_enabled: bool,
+    pub memory_provider_ncm_observer: MemoryProviderNcmObserverV1,
     pub memory_provider_recall_routing: MemoryProviderRecallRoutingV1,
     pub semantic: SemanticConfig,
     pub sync: SyncConfig,
@@ -65,6 +68,7 @@ impl Default for TraceDecayConfig {
             diagnostics_prewarm: false,
             native_graph_activation: true,
             memory_provider_native_enabled: false,
+            memory_provider_ncm_observer: MemoryProviderNcmObserverV1::default(),
             memory_provider_recall_routing: MemoryProviderRecallRoutingV1::default(),
             semantic: SemanticConfig::default(),
             sync: SyncConfig::default(),
@@ -254,6 +258,7 @@ fn runtime_config_from_snapshot(snapshot: &ConfigurationSnapshotV1) -> Result<Tr
             snapshot,
             MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
         )?,
+        memory_provider_ncm_observer: memory_provider_ncm_observer_from_snapshot(snapshot)?,
         memory_provider_recall_routing: memory_provider_recall_routing_from_snapshot(snapshot)?,
         semantic: semantic_config_from_snapshot(snapshot)?,
         sync: SyncConfig {
@@ -329,6 +334,30 @@ pub fn required_unsigned(snapshot: &ConfigurationSnapshotV1, key_name: &str) -> 
             value.kind()
         ))),
     }
+}
+
+fn memory_provider_ncm_observer_from_snapshot(
+    snapshot: &ConfigurationSnapshotV1,
+) -> Result<MemoryProviderNcmObserverV1> {
+    let routing: MemoryProviderNcmObserverV1 =
+        match required_setting(snapshot, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY)? {
+            ConfigurationValueV1::Text(value) => serde_json::from_str(value).map_err(|error| {
+                config_error(format!(
+                    "resolved configuration setting '{MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY}' is not a NCM observer document: {error}"
+                ))
+            })?,
+            _ => {
+                return Err(config_error(format!(
+                    "resolved configuration setting '{MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY}' is not text"
+                )));
+            }
+        };
+    routing.validate().map_err(|error| {
+        config_error(format!(
+            "resolved configuration setting '{MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY}' is invalid: {error}"
+        ))
+    })?;
+    Ok(routing)
 }
 
 fn memory_provider_recall_routing_from_snapshot(
@@ -445,6 +474,64 @@ mod memory_provider_snapshot_tests {
 
     fn routing_text(routing: &MemoryProviderRecallRoutingV1) -> ConfigurationValueV1 {
         ConfigurationValueV1::Text(serde_json::to_string(routing).expect("routing encodes"))
+    }
+
+    #[test]
+    fn ncm_observer_snapshot_defaults_off_and_validates_admitted_paths() {
+        let stock = runtime_config_from_snapshot(&default_snapshot()).unwrap();
+        assert_eq!(
+            stock.memory_provider_ncm_observer,
+            MemoryProviderNcmObserverV1::Disabled {}
+        );
+        assert_eq!(
+            serde_json::to_string(&stock.memory_provider_ncm_observer).unwrap(),
+            r#"{"mode":"disabled"}"#
+        );
+        let disabled = runtime_config_from_snapshot(&snapshot_with(
+            MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+            Some(ConfigurationValueV1::Text(
+                r#"{"mode":"disabled"}"#.to_owned(),
+            )),
+        ))
+        .unwrap();
+        assert_eq!(
+            disabled.memory_provider_ncm_observer,
+            MemoryProviderNcmObserverV1::default()
+        );
+        let observer = MemoryProviderNcmObserverV1::Enabled {
+            worker_binary: PathBuf::from("/opt/tracedecay/tracedecay-ncm-worker"),
+            state_root: PathBuf::from("/var/lib/tracedecay/ncm"),
+        };
+        let value = ConfigurationValueV1::Text(serde_json::to_string(&observer).unwrap());
+        let selected = runtime_config_from_snapshot(&snapshot_with(
+            MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+            Some(value),
+        ))
+        .unwrap();
+        assert_eq!(selected.memory_provider_ncm_observer, observer);
+        for document in [
+            r#"{"mode":"enabled","worker_binary":"relative-worker","state_root":"/state"}"#,
+            r#"{"mode":"enabled","worker_binary":"/worker","state_root":"/state/../other"}"#,
+            r#"{"mode":"enabled","worker_binary":"/worker"}"#,
+            r#"{"mode":"disabled","active":true}"#,
+            r#"{"mode":"enabled","worker_binary":"/worker","state_root":"/state","active":true}"#,
+        ] {
+            assert!(
+                runtime_config_from_snapshot(&snapshot_with(
+                    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+                    Some(ConfigurationValueV1::Text(document.to_owned()))
+                ))
+                .is_err(),
+                "{document}"
+            );
+        }
+        assert!(
+            runtime_config_from_snapshot(&snapshot_with(
+                MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+                None
+            ))
+            .is_err()
+        );
     }
 
     #[test]

@@ -202,10 +202,11 @@
     ],
     "bindings": [
       "exact_coding_scope",
+      "checkout_observations",
       "project_facts",
       "profile_facts"
     ],
-    "binding_source": "product/architecture/coding-memory-authority-matrix.json namespace variants",
+    "binding_source": "product/architecture/coding-memory-authority-matrix.json namespace variants and coding-memory-authority-matrix.md Native staged checkout recall boundary",
     "authorization_source": "tracedecay.memory.provider.registry.v1 registration_contract.recall_scope_bindings",
     "authorization_carried_by": "host_admitted_call_never_provider_reply",
     "missing_binding_policy": "reject_contract_violation",
@@ -229,6 +230,21 @@
         "optional_empty_or_equal": [],
         "forbidden": [],
         "resolved_scope_digest_mismatch_policy": "reject_stale_identity"
+      },
+      {
+        "binding": "checkout_observations",
+        "required_equal": [
+          "profile_id",
+          "project_id",
+          "repository_identity",
+          "worktree_identity",
+          "branch_identity"
+        ],
+        "optional_empty_or_equal": [],
+        "forbidden": [
+          "agent_session_id",
+          "resolved_scope_digest"
+        ]
       },
       {
         "binding": "project_facts",

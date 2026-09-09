@@ -1145,9 +1145,12 @@ async fn mount_life(
             profile_id: UserProfileId::new(PROFILE).expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id,
+            provider: crate::daemon::project_composition::native_observation_mount(
+                &(paths.root.clone()),
+                REGISTRATION_REVISION,
+            )
+            .expect("native mount metadata"),
             store_data_root: paths.root.clone(),
-            registration_revision: REGISTRATION_REVISION,
-            host_limits: crate::daemon::retained_owner::native_provider::native_provider_limits(),
             policy: fuzz_policy(),
         },
         store,

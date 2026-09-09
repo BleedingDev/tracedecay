@@ -12,7 +12,8 @@ use tracedecay_domain::configuration::{
     INDEX_EXCLUDE_SETTING_KEY, INDEX_EXTRACT_DOCSTRINGS_SETTING_KEY, INDEX_GIT_IGNORE_SETTING_KEY,
     INDEX_INCLUDE_SETTING_KEY, INDEX_MAX_FILE_SIZE_SETTING_KEY,
     INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY, INDEX_TRACK_CALL_SITES_SETTING_KEY,
-    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, MemoryProviderNcmObserverV1,
     MemoryProviderRecallRoutingV1, PROJECT_WORK_EXPERTISE_CONSENT_SETTING_KEY,
     RestartRequirementV1, SEMANTIC_RUNTIME_SETTING_KEY, SOURCE_BINDINGS_SETTING_KEY,
     SYNC_AUTO_INIT_SETTING_KEY, SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
@@ -541,6 +542,12 @@ fn register_project_settings(
             field: "memory provider recall routing default encoding",
         })
     })?;
+    let ncm_observer_default = serde_json::to_string(&MemoryProviderNcmObserverV1::default())
+        .map_err(|_| {
+            ConfigurationRegistryError::InvalidDefinition(DomainError::NonCanonical {
+                field: "NCM observer default encoding",
+            })
+        })?;
     let settings = vec![
         (
             INDEX_EXCLUDE_SETTING_KEY,
@@ -593,6 +600,12 @@ fn register_project_settings(
         (
             MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
             ConfigurationValueV1::Boolean(defaults.memory_provider_native_enabled),
+            SettingSensitivityV1::Public,
+            RestartRequirementV1::DaemonRestart,
+        ),
+        (
+            MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+            ConfigurationValueV1::Text(ncm_observer_default),
             SettingSensitivityV1::Public,
             RestartRequirementV1::DaemonRestart,
         ),

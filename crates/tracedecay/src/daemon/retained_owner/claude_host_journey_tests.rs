@@ -961,8 +961,9 @@ const OPERATOR_CLAUDE_SETTINGS: &str =
 /// must give back.
 const OPERATOR_PROJECT_RULES: &str = "# Team rules\n\nAlways run the linter before pushing.\n";
 
-/// The heading of the TraceDecay-managed block inside a project `CLAUDE.md`.
-const MANAGED_RULES_MARKER: &str = "## MANDATORY: No Explore Agents When Tracedecay Is Available";
+/// Stable delimiters of the TraceDecay-managed block inside a project `CLAUDE.md`.
+const MANAGED_RULES_START: &str = "<!-- tracedecay:claude:start -->";
+const MANAGED_RULES_END: &str = "<!-- tracedecay:claude:end -->";
 
 /// Every file the deployed bundle holds, as `(relative path, bytes)`, sorted.
 fn deployed_bundle(deploy_dir: &Path) -> Vec<(String, Vec<u8>)> {
@@ -1157,10 +1158,16 @@ fn the_shipped_claude_bundle_stages_hooks_and_registers_project_rules_without_di
         registered.starts_with(OPERATOR_PROJECT_RULES),
         "registration must append to the operator's own rules: {registered}"
     );
-    assert_eq!(
-        registered.matches(MANAGED_RULES_MARKER).count(),
-        1,
-        "registration must write exactly one managed block: {registered}"
+    for marker in [MANAGED_RULES_START, MANAGED_RULES_END] {
+        assert_eq!(
+            registered.matches(marker).count(),
+            1,
+            "registration must write exactly one managed block delimiter: {registered}"
+        );
+    }
+    assert!(
+        registered.find(MANAGED_RULES_START).unwrap() < registered.find(MANAGED_RULES_END).unwrap(),
+        "registration must order the managed block delimiters: {registered}"
     );
     integration
         .activate_project_host_component_registration(components, &install, &project)
@@ -1177,7 +1184,7 @@ fn the_shipped_claude_bundle_stages_hooks_and_registers_project_rules_without_di
         .expect("deregistering the project host component");
     let undone = std::fs::read_to_string(&project_rules).expect("rules after undo");
     assert!(
-        !undone.contains(MANAGED_RULES_MARKER),
+        !undone.contains(MANAGED_RULES_START) && !undone.contains(MANAGED_RULES_END),
         "undo must remove the managed block: {undone}"
     );
     assert!(

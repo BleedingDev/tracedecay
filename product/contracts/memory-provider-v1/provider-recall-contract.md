@@ -20,23 +20,26 @@ Empty queries, wildcard scope, path or CWD inference, repository-only matching, 
 
 ## Exact scope
 
-All identity fields match exactly. Cross-worktree, cross-branch, cross-session, or repository-only recall is forbidden in V1. A candidate from another scope is `scope_mismatch`, not a weak match.
+Request and response envelopes remain bound to all seven admitted identity fields. A candidate is checked under its separately authorized binding below; the checkout observation binding does not widen the requesting session or grant transcript citation authority.
 
-The provider may internally maintain broader abstractions, but every returned candidate is labelled with the exact admitted scope from which it was derived. TraceDecay revalidates scope before any candidate is considered for context.
+Every candidate carries its own scope claim. TraceDecay validates that claim against the admitted request before considering the candidate for context, without substituting the request identity for the original evidence identity.
 
 ## Scope binding
 
-Every candidate's `exact_scope_identity` carries an explicit `scope_binding` that names which identity namespace the provider attests: `exact_coding_scope`, `project_facts`, or `profile_facts`. The values mirror the namespace variants of the accepted coding-memory authority matrix. A missing or unknown binding is a contract violation.
+Every candidate's `exact_scope_identity` carries an explicit `scope_binding` that names which identity namespace the provider attests: `exact_coding_scope`, `checkout_observations`, `project_facts`, or `profile_facts`. The bindings follow the accepted coding-memory authority boundaries; checkout observations are a recall projection of exact origin storage. A missing or unknown binding is a contract violation.
 
 The host, not the provider, decides which bindings a provider may attest: the registry records `recall_scope_bindings` at registration and passes them to admission with the admitted call. A candidate whose binding the registry did not authorize for its provider is denied `scope_binding_unauthorized`. Bindings are never read from a provider reply and cannot widen the admitted scope.
 
 Per binding, every identity field is required, optional, or forbidden:
 
 - `exact_coding_scope`: all seven fields required and byte-equal to the admitted scope; a differing `resolved_scope_digest` alone is `stale_identity`.
+- `checkout_observations`: Native only; profile, project, repository, worktree, and branch required and byte-equal; session and resolved-scope digest present but empty. Original session and both scope digests remain in `provenance.native_linkage.staged_observation.origin_scope`.
 - `project_facts`: `profile_id` and `project_id` required and equal; `repository_identity`, `worktree_identity`, and `branch_identity` optional (empty or equal); `agent_session_id` and `resolved_scope_digest` forbidden.
 - `profile_facts`: `profile_id` required and equal; every other field forbidden.
 
 An empty required field is `unknown_identity`, a differing required or optional field is `scope_mismatch`, a non-empty forbidden field is `forbidden_identity`, and a malformed field (surrounding whitespace or control characters) is `unknown_identity`. Missing identity fails closed.
+
+Session observations admit only exact or checkout bindings, never project/profile fact bindings. Native scans at most the newest retention ceiling (512) of non-tombstoned rows matching all five checkout columns before scoring; each row must re-derive its own stored seven-field digest. Storage keys, original receipts, source references, tombstones, and request-bound candidate IDs retain their existing authority. A staged candidate remains provider-attested `Available`, never hydrated host evidence. NCM remains exact-only.
 
 ## Temporal semantics
 

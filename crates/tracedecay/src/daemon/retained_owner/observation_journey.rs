@@ -50,8 +50,8 @@
 //! host-granted provider-state root *before* answering, so the row settles
 //! `Acknowledged` with committed effect evidence after a single attempt. A
 //! staged row is advisory provider state that becomes a recall candidate for
-//! its own exact coding scope; it is never a canonical fact, and promotion to
-//! a fact remains the separate explicit path. Every other contract-known kind
+//! the same checkout while retaining its exact origin scope; it is never a
+//! canonical fact, and promotion to a fact remains the separate explicit path. Every other contract-known kind
 //! still answers `capability_unsupported` with the diagnostic
 //! `native.observation_unsupported`, which this journey records as one typed,
 //! non-retried rejection.
@@ -60,7 +60,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -94,15 +94,18 @@ use tracedecay_memory_observation::{
     SourceStreamIdV1, SourceStreamKeyV1, SqliteObservationJournal, TerminalIdentityMismatchV1,
     WakeOutcomeV1, WithheldAdmissionV1, extensions_digest,
 };
+#[cfg(test)]
+use tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID;
 use tracedecay_memory_provider_registry::{
     ApiError, BoundedCallRefusalV1, BoundedProviderCallV1, CancellationToken, CanonicalPayload,
     CompositionLifecycleError, FabricError, HandshakeRequest, HandshakeRequestParts,
-    HandshakeResponse, NATIVE_PROVIDER_ID, ObserverDeliveryResult, OperationControl,
-    OwnedExactScope, OwnedProviderId, OwnedVersionedId, PayloadSanitizationReceipt,
+    HandshakeResponse, ObservationInstanceProofV1, ObservationProviderMountV1,
+    ObservationStateNamespacePolicyV1, ObserverDeliveryResult, OperationControl, OwnedExactScope,
+    OwnedProviderId, OwnedVersionedId, PayloadSanitizationReceipt,
     ProjectMemoryProviderComposition, ProjectMemoryProviderRegistry, ProviderCall,
     ProviderCallParts, ProviderHandshakeWorkV1, ProviderLimits, ProviderOperation,
     ReadinessEvidenceV1, RestartBudgetV1, ShutdownBudgetV1, SupervisedProviderReadinessV1,
-    SupervisedReadinessConfigV1, SupervisedReadinessError,
+    SupervisedReadinessConfigV1, SupervisedReadinessError, TerminalCode,
 };
 use tracedecay_runtime_core::cancellation::CancellationToken as HostCancellationToken;
 use tracedecay_store::{
@@ -111,6 +114,7 @@ use tracedecay_store::{
 
 /// File name of the project-owned observation journal inside the canonical
 /// store layout. Placement only; never an identity input.
+#[cfg(test)]
 const JOURNAL_FILE_NAME: &str = "memory-observation-journal-v1.sqlite3";
 
 /// Directory name of the host-owned root every supervised provider's state is
@@ -1243,6 +1247,7 @@ impl ObservationAdmissionAdapterV1 for CanonicalObservationAdmissionAdapterV1 {
 
                 let target = readiness_target_for_scope(
                     &context.readiness,
+                    &context.provider_lane.provider_id,
                     &exact_scope,
                     context.registration_revision,
                     context.limits,
@@ -1381,11 +1386,9 @@ fn forget_source_key_for(
     exact_scope: &OwnedExactScope,
     observation: &DurableObservationV1,
 ) -> Result<ForgetSourceKeyV1, ObservationJournalError> {
-    ForgetSourceKeyV1::new(format!(
-        "session:{}:{}",
-        exact_scope.exact_scope_sha256(),
-        observation.source().session_id().as_str()
-    ))
+    ForgetSourceKeyV1::new(
+        exact_scope.session_forget_source_key(observation.source().session_id().as_str()),
+    )
 }
 
 /// Copies the canonical commit receipt into the journal's settlement proof.
@@ -1505,6 +1508,7 @@ fn absorb(digest: &mut Sha256, value: &[u8]) {
 /// the journal stores.
 #[derive(Clone)]
 struct RegistryObservationDeliveryAdapterV1 {
+    provider_id: OwnedProviderId,
     composition: Arc<ProjectMemoryProviderComposition>,
     readiness: Arc<SupervisedProviderReadinessV1>,
     /// The bounded-execution boundary every provider call runs on. Delivery
@@ -1983,6 +1987,7 @@ impl RegistryObservationDeliveryAdapterV1 {
             )
         };
         let readiness_request = readiness_handshake_request(
+            &self.provider_id,
             &leased.exact_scope,
             self.registration_revision,
             self.limits,
@@ -2647,18 +2652,14 @@ impl BoundedProviderCallV1 for ThreadBoundedProviderCallV1 {
 fn mount_supervised_provider_readiness(
     composition: Arc<ProjectMemoryProviderComposition>,
     isolation: Arc<ThreadBoundedProviderCallV1>,
-    registration_revision: u64,
-    host_limits: ProviderLimits,
-    provider_state_root: PathBuf,
+    provider: &ObservationProviderMountV1,
 ) -> Result<SupervisedProviderReadinessV1, ObservationJourneyError> {
-    let provider_id =
-        OwnedProviderId::new(NATIVE_PROVIDER_ID).map_err(ObservationJourneyError::Contract)?;
-    SupervisedProviderReadinessV1::new(
+    let supervised = SupervisedProviderReadinessV1::new(
         composition,
         isolation,
-        provider_id,
-        registration_revision,
-        host_limits,
+        provider.provider_id.clone(),
+        provider.registration_revision,
+        provider.host_limits,
         SupervisedReadinessConfigV1 {
             restart_budget: RestartBudgetV1 {
                 max_attempts_per_window: SUPERVISOR_RESTART_ATTEMPTS_PER_WINDOW,
@@ -2675,21 +2676,16 @@ fn mount_supervised_provider_readiness(
             max_supervised_scopes: SUPERVISED_SCOPE_CEILING,
         },
     )
-    .map_err(ObservationJourneyError::SupervisedReadiness)?
-    // The Native provider is admitted to own exactly the state namespaces
-    // under its own provider identity. A handshake that reports any other
-    // namespace — a traversal out of the host-owned root, or another
-    // authority's name — is a fail-closed readiness refusal here rather than
-    // a namespace the host would then treat as this provider's state
-    // (`tdmem-1107`).
-    .with_admitted_state_namespace_prefix(NATIVE_PROVIDER_ID)
-    .map_err(ObservationJourneyError::SupervisedReadiness)?
-    // Containment, not merely validation: the host owns the state root, and a
-    // validated readiness is granted a capability rooted at its admitted
-    // namespace underneath it. That capability is the only provider state path
-    // the host produces (`tdmem-1107`).
-    .with_state_root(provider_state_root)
-    .map_err(ObservationJourneyError::SupervisedReadiness)
+    .map_err(ObservationJourneyError::SupervisedReadiness)?;
+    let supervised = match &provider.state_namespace_policy {
+        ObservationStateNamespacePolicyV1::Prefix(prefix) => supervised
+            .with_admitted_state_namespace_prefix(prefix)
+            .map_err(ObservationJourneyError::SupervisedReadiness)?,
+        ObservationStateNamespacePolicyV1::AdapterAttestedExactScope => supervised,
+    };
+    supervised
+        .with_state_root(provider.state_root.clone())
+        .map_err(ObservationJourneyError::SupervisedReadiness)
 }
 
 /// Obtains a readiness target for one exact scope **through the mounted
@@ -2704,6 +2700,7 @@ fn mount_supervised_provider_readiness(
 /// delivered, and the host keeps running.
 fn readiness_target_for_scope(
     supervised: &SupervisedProviderReadinessV1,
+    provider_id: &OwnedProviderId,
     exact_scope: &OwnedExactScope,
     registration_revision: u64,
     host_limits: ProviderLimits,
@@ -2712,6 +2709,7 @@ fn readiness_target_for_scope(
 ) -> Result<ProviderTargetV1, ObservationJourneyError> {
     readiness_target_and_evidence_for_scope(
         supervised,
+        provider_id,
         exact_scope,
         registration_revision,
         host_limits,
@@ -2729,6 +2727,7 @@ fn readiness_target_for_scope(
 /// deliver to one incarnation while it verified another.
 fn readiness_target_and_evidence_for_scope(
     supervised: &SupervisedProviderReadinessV1,
+    provider_id: &OwnedProviderId,
     exact_scope: &OwnedExactScope,
     registration_revision: u64,
     host_limits: ProviderLimits,
@@ -2736,6 +2735,7 @@ fn readiness_target_and_evidence_for_scope(
     control: OperationControl,
 ) -> Result<(ProviderTargetV1, ReadinessEvidenceV1), ObservationJourneyError> {
     let request = readiness_handshake_request(
+        provider_id,
         exact_scope,
         registration_revision,
         host_limits,
@@ -2759,6 +2759,7 @@ fn readiness_target_and_evidence_for_scope(
 
 /// Builds the readiness handshake request for one exact scope.
 fn readiness_handshake_request(
+    provider_id: &OwnedProviderId,
     exact_scope: &OwnedExactScope,
     registration_revision: u64,
     host_limits: ProviderLimits,
@@ -2770,8 +2771,7 @@ fn readiness_handshake_request(
         return Err(ObservationJourneyError::EntropyUnavailable);
     }
     HandshakeRequest::new(HandshakeRequestParts {
-        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID)
-            .map_err(ObservationJourneyError::Contract)?,
+        provider_id: provider_id.clone(),
         registration_revision,
         exact_scope: exact_scope.clone(),
         request_id: format!("observation-readiness.{}", exact_scope.exact_scope_sha256()),
@@ -2894,7 +2894,8 @@ pub(crate) struct ProjectObservationJourneyV1 {
     /// acceptance tests can read the resulting durable row without polling.
     delivery_changed: Arc<CensusTransitionV1>,
     provider_id: String,
-    provider_instance_id: String,
+    provider_instance_id: Arc<OnceLock<Option<String>>>,
+    instance_proof: Option<Arc<dyn ObservationInstanceProofV1>>,
     registration_revision: u64,
     lease_owner: String,
     retention_sweep_schedule: RetentionSweepScheduleV1,
@@ -3447,6 +3448,9 @@ impl ProjectObservationJourneyV1 {
         let mut slot = self.live_replay_task.lock().map_err(|_| {
             ObservationJourneyError::Worker(std::io::Error::other("live replay task lock poisoned"))
         })?;
+        if self.stopping.is_cancelled() {
+            return Err(ObservationJourneyError::Cancelled { admitted: 0 });
+        }
         if slot.is_some() {
             return Err(ObservationJourneyError::Worker(std::io::Error::other(
                 "live replay task already started",
@@ -3461,6 +3465,17 @@ impl ProjectObservationJourneyV1 {
                 };
                 if journey.stopping.is_cancelled() {
                     break;
+                }
+                if !journey
+                    .provider_instance_id
+                    .get()
+                    .is_some_and(Option::is_some)
+                {
+                    // A pending one-shot bootstrap has not proved an instance.
+                    // An unavailable bootstrap remains unavailable until the
+                    // daemon is recreated; do not advance its canonical cursor.
+                    journey.report_backlog().await;
+                    continue;
                 }
                 let bounds = ReplayBoundsV1 {
                     cancellation: &journey.stopping,
@@ -3712,6 +3727,43 @@ impl ProjectObservationJourneyV1 {
         failures
     }
 
+    /// Starts an already-owned delivery worker once, ordered against shutdown.
+    fn start_delivery_worker(&self) -> Result<(), ObservationJourneyError> {
+        let mut slot = self.worker.lock().map_err(|_| {
+            ObservationJourneyError::Worker(std::io::Error::other("delivery worker lock poisoned"))
+        })?;
+        if self.stopping.is_cancelled() {
+            return Err(ObservationJourneyError::Cancelled { admitted: 0 });
+        }
+        if slot.is_some() {
+            return Err(ObservationJourneyError::Worker(std::io::Error::other(
+                "delivery worker already started",
+            )));
+        }
+        *slot = Some(
+            self.spawn_worker()
+                .map_err(ObservationJourneyError::Worker)?,
+        );
+        Ok(())
+    }
+
+    /// Activates an optional observer only after its full server is published.
+    pub(crate) fn start_observer_with_live_replay<S>(
+        self: &Arc<Self>,
+        observation_store: S,
+    ) -> Result<(), ObservationJourneyError>
+    where
+        S: ObservationAdmissionPort + 'static,
+    {
+        self.start_delivery_worker()?;
+        if let Err(error) = self.start_live_replay(observation_store) {
+            self.stopping.cancel();
+            self.wake.request_shutdown();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn spawn_worker(&self) -> Result<JoinHandle<()>, std::io::Error> {
         let journal = Arc::clone(&self.journal);
         let delivery = Arc::clone(&self.delivery);
@@ -3721,7 +3773,8 @@ impl ProjectObservationJourneyV1 {
         let wake = Arc::clone(&self.wake);
         let stopping = self.stopping.clone();
         let provider_id = self.provider_id.clone();
-        let provider_instance_id = self.provider_instance_id.clone();
+        let provider_instance_id = Arc::clone(&self.provider_instance_id);
+        let instance_proof = self.instance_proof.clone();
         let registration_revision = self.registration_revision;
         let lease_owner = self.lease_owner.clone();
         let retention_sweep_schedule = self.retention_sweep_schedule;
@@ -3733,6 +3786,23 @@ impl ProjectObservationJourneyV1 {
         thread::Builder::new()
             .name("td-memory-observation".to_owned())
             .spawn(move || {
+                if let Some(proof) = instance_proof {
+                    let cancelled = stopping.clone();
+                    let result = proof.prove(
+                        Instant::now() + Duration::from_micros(READINESS_DEADLINE_MICROS as u64),
+                        Arc::new(move || cancelled.is_cancelled()),
+                    );
+                    let instance = match result {
+                        Ok(instance) if !stopping.is_cancelled() => instance,
+                        Ok(_) => None,
+                        Err(terminal) => {
+                            tracing::warn!(?terminal, provider = %provider_id,
+                                "observer instance proof unavailable until daemon recreation");
+                            None
+                        }
+                    };
+                    let _ = provider_instance_id.set(instance);
+                }
                 let runtime =
                     DeliveryRuntimeV1::new(journal.as_ref(), delivery.as_ref(), wake.as_ref());
                 // Due at once: a journal a restart found full of aged rows is
@@ -3748,132 +3818,136 @@ impl ProjectObservationJourneyV1 {
                     if runtime.wait_for_work(delivery_park) == WakeOutcomeV1::ShutdownRequested {
                         break;
                     }
-                    let now = tracedecay_contracts::now_micros().0;
-                    let request = DispatchRequestV1 {
-                        lease: LeaseRequestV1 {
-                            provider_id: provider_id.clone(),
-                            registration_revision,
-                            provider_instance_id: provider_instance_id.clone(),
-                            exact_scope_sha256: None,
-                            lease_owner: lease_owner.clone(),
-                            now_unix_micros: now,
-                            lease_duration_micros: dispatch_policy.lease_duration_micros,
-                            max_items: dispatch_policy.batch_max_items,
-                            max_bytes: dispatch_policy.batch_max_bytes,
-                        },
-                        // An adapter failure produced no provider answer, so
-                        // the row comes back on the journal's own capped
-                        // exponential for the attempt the claim consumed — the
-                        // same curve a recorded `provider_unavailable` rides,
-                        // rather than a flat interval that would hammer an
-                        // unreachable provider until its ceiling is gone. The
-                        // journal's attempt ceiling still bounds it; nothing
-                        // here retries a typed terminal.
-                        retry_backoff: RetryBackoffV1::of(journal.policy()),
-                        attempt_budget_micros: dispatch_policy.attempt_budget_micros,
-                    };
-                    // A drain, not a single batch: the wake edge is one
-                    // collapsed signal, so a backlog that is already journalled
-                    // would otherwise move `batch_max_items` per park interval
-                    // with nothing to signal about it again. The bounds are
-                    // derived from the dispatch policy revalidated against the
-                    // journal's own retention policy, which is the only way to
-                    // obtain them — this loop cannot widen them.
-                    match dispatch_policy
-                        .drain_bounds(journal.policy(), now)
-                        .map_err(ObservationRuntimeError::from)
-                        .and_then(|bounds| {
-                            runtime.drain(&request, &bounds, || {
-                                tracedecay_contracts::now_micros().0
-                            })
-                        }) {
-                        Ok(report) => {
-                            if report.totals.cancelled_before_dispatch > 0
-                                || report.totals.cancelled_in_flight > 0
-                            {
-                                tracing::info!(
-                                    event = "memory_observation_dispatch_cancelled",
-                                    rounds = report.rounds,
-                                    leased = report.totals.leased,
-                                    cancelled_in_flight = report.totals.cancelled_in_flight,
-                                    cancelled_before_dispatch =
-                                        report.totals.cancelled_before_dispatch,
-                                    "shutdown stopped an observation dispatch round; released rows stay pending"
-                                );
+                    // Only a real one-shot instance proof or the existing
+                    // Native instance can authorize per-attempt lease identity.
+                    if let Some(provider_instance_id) = provider_instance_id.get().and_then(Option::as_ref) {
+                        let now = tracedecay_contracts::now_micros().0;
+                        let request = DispatchRequestV1 {
+                            lease: LeaseRequestV1 {
+                                provider_id: provider_id.clone(),
+                                registration_revision,
+                                provider_instance_id: provider_instance_id.clone(),
+                                exact_scope_sha256: None,
+                                lease_owner: lease_owner.clone(),
+                                now_unix_micros: now,
+                                lease_duration_micros: dispatch_policy.lease_duration_micros,
+                                max_items: dispatch_policy.batch_max_items,
+                                max_bytes: dispatch_policy.batch_max_bytes,
+                            },
+                            // An adapter failure produced no provider answer, so
+                            // the row comes back on the journal's own capped
+                            // exponential for the attempt the claim consumed — the
+                            // same curve a recorded `provider_unavailable` rides,
+                            // rather than a flat interval that would hammer an
+                            // unreachable provider until its ceiling is gone. The
+                            // journal's attempt ceiling still bounds it; nothing
+                            // here retries a typed terminal.
+                            retry_backoff: RetryBackoffV1::of(journal.policy()),
+                            attempt_budget_micros: dispatch_policy.attempt_budget_micros,
+                        };
+                        // A drain, not a single batch: the wake edge is one
+                        // collapsed signal, so a backlog that is already journalled
+                        // would otherwise move `batch_max_items` per park interval
+                        // with nothing to signal about it again. The bounds are
+                        // derived from the dispatch policy revalidated against the
+                        // journal's own retention policy, which is the only way to
+                        // obtain them — this loop cannot widen them.
+                        match dispatch_policy
+                            .drain_bounds(journal.policy(), now)
+                            .map_err(ObservationRuntimeError::from)
+                            .and_then(|bounds| {
+                                runtime.drain(&request, &bounds, || {
+                                    tracedecay_contracts::now_micros().0
+                                })
+                            }) {
+                            Ok(report) => {
+                                if report.totals.cancelled_before_dispatch > 0
+                                    || report.totals.cancelled_in_flight > 0
+                                {
+                                    tracing::info!(
+                                        event = "memory_observation_dispatch_cancelled",
+                                        rounds = report.rounds,
+                                        leased = report.totals.leased,
+                                        cancelled_in_flight = report.totals.cancelled_in_flight,
+                                        cancelled_before_dispatch =
+                                            report.totals.cancelled_before_dispatch,
+                                        "shutdown stopped an observation dispatch round; released rows stay pending"
+                                    );
+                                }
+                                for failure in &report.totals.failures {
+                                    // The worker census travels with the failure:
+                                    // a delivery that produced no receipt because
+                                    // the provider never answered is only half
+                                    // reported without saying how many borrowed
+                                    // workers that provider is still holding.
+                                    let census = isolation.census();
+                                    // And so does the *classification*: whether
+                                    // the provider could not be reached, crashed,
+                                    // was abandoned at the host's bound, or
+                                    // answered something the host refused are four
+                                    // different faults with four different
+                                    // repairs, and the log line is where an
+                                    // operator meets them.
+                                    let class =
+                                        DeliveryRefusalClassV1::classify(failure.cause.cause());
+                                    tracing::warn!(
+                                        event = "memory_observation_delivery_failed",
+                                        observation_id = %failure.observation_id.as_str(),
+                                        attempt = failure.attempt_number,
+                                        lease_released = failure.lease_released,
+                                        refusal_class = class.as_wire(),
+                                        error = %failure.cause,
+                                        borrowed_workers_live = census.live,
+                                        borrowed_workers_abandoned = census.abandoned,
+                                        "one observation delivery produced no receipt"
+                                    );
+                                    refusals.record(DeliveryRefusalV1 {
+                                        observation_id: failure
+                                            .observation_id
+                                            .as_str()
+                                            .to_owned(),
+                                        attempt_number: failure.attempt_number,
+                                        at_unix_micros: tracedecay_contracts::now_micros().0,
+                                        class,
+                                        detail: failure.cause.to_string(),
+                                    });
+                                }
+                                // Work the bounds cut short is real, durable, and
+                                // eligible now. Re-arming the wake makes the next
+                                // turn start at once instead of parking on a
+                                // backlog nothing will signal about again; a
+                                // shutdown stop is not re-armed, because the next
+                                // wait must return `ShutdownRequested`.
+                                if report.more_work_pending()
+                                    && report.stop != DrainStopV1::ShutdownRequested
+                                {
+                                    tracing::debug!(
+                                        event = "memory_observation_dispatch_yielded",
+                                        rounds = report.rounds,
+                                        leased = report.totals.leased,
+                                        stop = ?report.stop,
+                                        "observation dispatch reached its drain bound with work still queued"
+                                    );
+                                    wake.signal();
+                                }
                             }
-                            for failure in &report.totals.failures {
-                                // The worker census travels with the failure:
-                                // a delivery that produced no receipt because
-                                // the provider never answered is only half
-                                // reported without saying how many borrowed
-                                // workers that provider is still holding.
-                                let census = isolation.census();
-                                // And so does the *classification*: whether
-                                // the provider could not be reached, crashed,
-                                // was abandoned at the host's bound, or
-                                // answered something the host refused are four
-                                // different faults with four different
-                                // repairs, and the log line is where an
-                                // operator meets them.
-                                let class =
-                                    DeliveryRefusalClassV1::classify(failure.cause.cause());
+                            Err(error) => {
+                                // A journal-level failure is neither swallowed nor
+                                // retried in a tight loop: the worker parks and the
+                                // next wake tries again.
                                 tracing::warn!(
-                                    event = "memory_observation_delivery_failed",
-                                    observation_id = %failure.observation_id.as_str(),
-                                    attempt = failure.attempt_number,
-                                    lease_released = failure.lease_released,
-                                    refusal_class = class.as_wire(),
-                                    error = %failure.cause,
-                                    borrowed_workers_live = census.live,
-                                    borrowed_workers_abandoned = census.abandoned,
-                                    "one observation delivery produced no receipt"
+                                    event = "memory_observation_dispatch_failed",
+                                    error = %error,
+                                    "one observation dispatch round failed"
                                 );
-                                refusals.record(DeliveryRefusalV1 {
-                                    observation_id: failure
-                                        .observation_id
-                                        .as_str()
-                                        .to_owned(),
-                                    attempt_number: failure.attempt_number,
-                                    at_unix_micros: tracedecay_contracts::now_micros().0,
-                                    class,
-                                    detail: failure.cause.to_string(),
-                                });
-                            }
-                            // Work the bounds cut short is real, durable, and
-                            // eligible now. Re-arming the wake makes the next
-                            // turn start at once instead of parking on a
-                            // backlog nothing will signal about again; a
-                            // shutdown stop is not re-armed, because the next
-                            // wait must return `ShutdownRequested`.
-                            if report.more_work_pending()
-                                && report.stop != DrainStopV1::ShutdownRequested
-                            {
-                                tracing::debug!(
-                                    event = "memory_observation_dispatch_yielded",
-                                    rounds = report.rounds,
-                                    leased = report.totals.leased,
-                                    stop = ?report.stop,
-                                    "observation dispatch reached its drain bound with work still queued"
-                                );
-                                wake.signal();
                             }
                         }
-                        Err(error) => {
-                            // A journal-level failure is neither swallowed nor
-                            // retried in a tight loop: the worker parks and the
-                            // next wake tries again.
-                            tracing::warn!(
-                                event = "memory_observation_dispatch_failed",
-                                error = %error,
-                                "one observation dispatch round failed"
-                            );
-                        }
+                        // `drain` owns the attempt/state/refusal transitions the
+                        // mounted acceptance suite observes. Publish only after the
+                        // whole report, including its refusal classifications, is
+                        // visible so a waiter reads one coherent result.
+                        delivery_changed.publish();
                     }
-                    // `drain` owns the attempt/state/refusal transitions the
-                    // mounted acceptance suite observes. Publish only after the
-                    // whole report, including its refusal classifications, is
-                    // visible so a waiter reads one coherent result.
-                    delivery_changed.publish();
                     if let Err(error) = runtime.reap(
                         tracedecay_contracts::now_micros().0,
                         dispatch_policy.reap_budget,
@@ -4001,10 +4075,8 @@ pub(crate) struct ObservationJourneyMountInputsV1 {
     pub(crate) authoritative_project_id: ProjectId,
     /// Canonical store-owned data root. Storage placement only.
     pub(crate) store_data_root: PathBuf,
-    /// Product-owned registration revision the fabric registered under.
-    pub(crate) registration_revision: u64,
-    /// Host limits the handshake negotiates against.
-    pub(crate) host_limits: ProviderLimits,
+    /// Registered provider identity, state authority, and handshake limits.
+    pub(crate) provider: ObservationProviderMountV1,
     /// Every bound the journey runs under. Validated at mount; a policy that
     /// cannot bound the worker refuses the mount.
     pub(crate) policy: ObservationJourneyPolicyV1,
@@ -4017,6 +4089,15 @@ pub(crate) struct ObservationJourneyMountInputsV1 {
 /// Readiness is proved separately for each canonical record's own source-session
 /// scope before admission and again immediately before delivery.
 pub(crate) fn mount_project_observation_journey(
+    inputs: ObservationJourneyMountInputsV1,
+) -> Result<Arc<ProjectObservationJourneyV1>, ObservationJourneyError> {
+    let journey = construct_project_observation_journey(inputs)?;
+    journey.start_delivery_worker()?;
+    Ok(journey)
+}
+
+/// Constructs retained state without starting provider proof or replay workers.
+fn construct_project_observation_journey(
     inputs: ObservationJourneyMountInputsV1,
 ) -> Result<Arc<ProjectObservationJourneyV1>, ObservationJourneyError> {
     inputs
@@ -4046,7 +4127,9 @@ pub(crate) fn mount_project_observation_journey(
     )
     .map_err(ObservationJourneyError::Journal)?;
 
-    let journal_path = inputs.store_data_root.join(JOURNAL_FILE_NAME);
+    let journal_path = inputs
+        .store_data_root
+        .join(inputs.provider.journal_file_name);
     // Shared before the adapters are built: the delivery adapter's recovery
     // gate reads the same durable journal the worker delivers from, so the
     // acknowledged watermark it compares against is the one this dispatcher
@@ -4073,17 +4156,14 @@ pub(crate) fn mount_project_observation_journey(
     let supervised_readiness = Arc::new(mount_supervised_provider_readiness(
         Arc::clone(&inputs.composition),
         Arc::clone(&provider_isolation),
-        inputs.registration_revision,
-        inputs.host_limits,
-        inputs.store_data_root.join(PROVIDER_STATE_DIR_NAME),
+        &inputs.provider,
     )?);
 
     // The lane this journey queues in, named from the registration alone so
     // pressure can be measured without a readiness handshake.
     let provider_lane = ObservationLaneKeyV1 {
-        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID)
-            .map_err(ObservationJourneyError::Contract)?,
-        registration_revision: inputs.registration_revision,
+        provider_id: inputs.provider.provider_id.clone(),
+        registration_revision: inputs.provider.registration_revision,
     };
     provider_lane
         .validate()
@@ -4095,8 +4175,8 @@ pub(crate) fn mount_project_observation_journey(
             scope: inputs.scope,
             readiness: Arc::clone(&supervised_readiness),
             provider_lane: provider_lane.clone(),
-            registration_revision: inputs.registration_revision,
-            limits: inputs.host_limits,
+            registration_revision: inputs.provider.registration_revision,
+            limits: inputs.provider.host_limits,
             observe_capability: observe_capability.clone(),
             sanitizer,
             observation_kind: OwnedVersionedId::new(SESSION_MESSAGE_OBSERVATION_KIND)
@@ -4106,16 +4186,17 @@ pub(crate) fn mount_project_observation_journey(
         },
     });
     let delivery = Arc::new(RegistryObservationDeliveryAdapterV1 {
+        provider_id: inputs.provider.provider_id.clone(),
         composition: Arc::clone(&inputs.composition),
         readiness: supervised_readiness,
         isolation: Arc::clone(&provider_isolation),
-        registration_revision: inputs.registration_revision,
-        limits: inputs.host_limits,
+        registration_revision: inputs.provider.registration_revision,
+        limits: inputs.provider.host_limits,
         observe_capability,
         recovery: ObservationRecoveryGateV1 {
             journal: Arc::clone(&journal),
-            provider_id: NATIVE_PROVIDER_ID.to_owned(),
-            registration_revision: inputs.registration_revision,
+            provider_id: inputs.provider.provider_id.as_str().to_owned(),
+            registration_revision: inputs.provider.registration_revision,
             source_authority: SourceAuthorityV1::HostSession,
             source_stream: source_stream.clone(),
             budget: RecoveryBudgetV1 {
@@ -4131,6 +4212,10 @@ pub(crate) fn mount_project_observation_journey(
         BackpressureGateV1::new(inputs.policy.backpressure)
             .map_err(ObservationJourneyError::Journal)?,
     );
+    let provider_instance_id = Arc::new(OnceLock::new());
+    if inputs.provider.instance_proof.is_none() {
+        let _ = provider_instance_id.set(inputs.provider.provider_instance_id.clone());
+    }
     let journey = Arc::new(ProjectObservationJourneyV1 {
         journal,
         wake: Arc::new(DeliveryWakeV1::new()),
@@ -4141,9 +4226,10 @@ pub(crate) fn mount_project_observation_journey(
         provider_isolation,
         delivery_refusals: Arc::new(DeliveryRefusalWindowV1::default()),
         delivery_changed: Arc::new(CensusTransitionV1::default()),
-        provider_id: NATIVE_PROVIDER_ID.to_owned(),
-        provider_instance_id: super::native_provider::PROVIDER_INSTANCE_ID.to_owned(),
-        registration_revision: inputs.registration_revision,
+        provider_id: inputs.provider.provider_id.as_str().to_owned(),
+        provider_instance_id,
+        instance_proof: inputs.provider.instance_proof,
+        registration_revision: inputs.provider.registration_revision,
         lease_owner,
         retention_sweep_schedule,
         dispatch_policy: inputs.policy.dispatch,
@@ -4155,13 +4241,6 @@ pub(crate) fn mount_project_observation_journey(
         live_stall: Mutex::new(None),
         journal_path,
     });
-    let worker = journey
-        .spawn_worker()
-        .map_err(ObservationJourneyError::Worker)?;
-    match journey.worker.lock() {
-        Ok(mut slot) => *slot = Some(worker),
-        Err(poisoned) => *poisoned.into_inner() = Some(worker),
-    }
     Ok(journey)
 }
 
@@ -4443,12 +4522,13 @@ mod claude_host_journey_tests;
 /// Whether a startup replay refusal is one a later pass can clear.
 ///
 /// The rule is fail-closed: a refusal counts as retryable only when the store
-/// itself named a transport-level failure, or when the blocking ingest task was
-/// cancelled rather than lost. Everything else — a canonical record the
-/// contract refuses, an identity or cursor disagreement, a journal or ingress
-/// refusal, a panicked ingest task, a scope or hygiene failure — describes the
-/// evidence, not the attempt, and replaying the same bytes produces the same
-/// answer forever.
+/// itself named a transport-level failure, the blocking ingest task was
+/// cancelled rather than lost, or canonical admission retained a refused
+/// handshake with `StaleIdentity`. That handshake can refresh a persisted
+/// namespace's descriptor before a later pass admits the same record.
+/// Canonical contract defects, identity or cursor disagreements, other journal
+/// or ingress refusals, panicked ingest tasks, and scope or hygiene failures
+/// remain permanent: replaying the same evidence cannot repair those defects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplayRecoverabilityV1 {
     /// A later pass over the same watermark can succeed.
@@ -4479,6 +4559,25 @@ pub(crate) fn replay_recoverability(error: &ObservationJourneyError) -> ReplayRe
         ObservationJourneyError::Replay(ObservationStoreError::Storage { .. }) => {
             ReplayRecoverabilityV1::Retryable
         }
+        // A persisted provider namespace can refresh its descriptor during
+        // the first handshake. The unchanged canonical record is admissible
+        // on a later supervised pass; retain every other admission refusal.
+        ObservationJourneyError::Ingress(ObservationRuntimeError::Admission { cause, .. })
+            if matches!(
+                cause.cause().downcast_ref::<AdmissionAdapterError>(),
+                Some(AdmissionAdapterError::Readiness {
+                    source: ObservationJourneyError::SupervisedReadiness(
+                        SupervisedReadinessError::Unavailable {
+                            terminal_code: Some(TerminalCode::StaleIdentity),
+                            ..
+                        }
+                    ),
+                    ..
+                })
+            ) =>
+        {
+            ReplayRecoverabilityV1::Retryable
+        }
         // The blocking-pool task was cancelled, not lost: its transaction
         // either committed or did not, and the watermark re-presents the
         // record either way. A panicked task is a different thing entirely and
@@ -4502,12 +4601,13 @@ pub(crate) fn replay_recoverability(error: &ObservationJourneyError) -> ReplayRe
 /// Every other startup replay refusal is **classified** rather than swallowed,
 /// because "live replay will retry it" is only true of a failure a retry can
 /// clear. A retryable refusal — a canonical store that was busy, a blocking
-/// ingest task the runtime cancelled — leaves the watermark where it was and
-/// the bounded live replay task genuinely converges on it, so the mount
-/// succeeds and the refusal is logged with its retry path. A permanent one —
-/// an unreadable or contract-violating canonical record, a journal or ingress
-/// refusal, a panicked ingest task — cannot be cleared by replaying the same
-/// bytes again, and a mount that reported success over it would leave a
+/// ingest task the runtime cancelled, or canonical admission whose handshake
+/// returned `StaleIdentity` while refreshing a namespace descriptor — leaves
+/// the watermark where it was and the bounded live replay task converges on
+/// it. The mount succeeds and logs the refusal with its retry path. A permanent one —
+/// an unreadable or contract-violating canonical record, another journal or
+/// admission evidence refusal, a panicked ingest task — cannot be cleared by
+/// replaying the same bytes again, and a mount that reported success would leave a
 /// committed observation undelivered for as long as the project stayed open
 /// while every readiness surface said the journey was healthy. That is
 /// returned typed as [`ObservationJourneyError::StartupReplayPermanent`], so
@@ -4579,6 +4679,25 @@ where
     Ok(journey)
 }
 
+/// Retains an optional observer without starting its provider bootstrap or replay.
+/// The published full server activates the existing owned workers after cutover.
+pub(crate) async fn mount_observer_dormant(
+    inputs: ObservationJourneyMountInputsV1,
+    cancellation: &HostCancellationToken,
+) -> Result<Arc<ProjectObservationJourneyV1>, ObservationJourneyError> {
+    if cancellation.is_cancelled() {
+        return Err(ObservationJourneyError::Cancelled { admitted: 0 });
+    }
+    let journey =
+        tokio::task::spawn_blocking(move || construct_project_observation_journey(inputs))
+            .await
+            .map_err(ObservationJourneyError::MountTask)??;
+    if cancellation.is_cancelled() {
+        return Err(ObservationJourneyError::Cancelled { admitted: 0 });
+    }
+    Ok(journey)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -4606,7 +4725,7 @@ mod tests {
     use tracedecay_memory_provider_registry::{
         CommittedEffectEvidence, EnabledProviderMode, FabricConfig, FallbackDirective,
         HandshakeResponse, NativeMemoryApplicationPort, NativeObservation,
-        NativeProviderActivation, ProviderDescriptor, ProviderReply, TerminalCode, TerminalRecord,
+        NativeProviderActivation, ProviderDescriptor, ProviderReply, TerminalRecord,
     };
     use tracedecay_sessions::admission::HostAdmissionScope;
     use tracedecay_store::{
@@ -4629,6 +4748,8 @@ mod tests {
     /// boundary between the host's canonical commit and the provider's durable
     /// acknowledgement.
     mod crash_restart_fuzz;
+    #[cfg(unix)]
+    mod real_ncm_observer;
 
     /// The host's bounded-execution boundary, judged on its own accounting
     /// rather than through a journey (`tdmem-sz9`).
@@ -5406,10 +5527,12 @@ mod tests {
                 profile_id,
                 scope: scope(project_id.clone()),
                 authoritative_project_id: project_id.clone(),
+                provider: crate::daemon::project_composition::native_observation_mount(
+                    &(journal_root),
+                    1,
+                )
+                .expect("native mount metadata"),
                 store_data_root: journal_root,
-                registration_revision: 1,
-                host_limits: crate::daemon::retained_owner::native_provider::native_provider_limits(
-                ),
                 policy,
             })
             .expect("mounted journey");
@@ -7329,9 +7452,12 @@ mod tests {
             profile_id: profile_id.clone(),
             scope: resolved_scope.clone(),
             authoritative_project_id: project_id.clone(),
+            provider: crate::daemon::project_composition::native_observation_mount(
+                &(journal_root),
+                1,
+            )
+            .expect("native mount metadata"),
             store_data_root: journal_root,
-            registration_revision: 1,
-            host_limits: super::super::native_provider::native_provider_limits(),
             policy: ObservationJourneyPolicyV1::project_default(),
         })
         .expect("mounted journey");
@@ -7683,9 +7809,12 @@ mod tests {
             profile_id: UserProfileId::new("profile.observation-journey").expect("profile id"),
             scope: resolved_scope.clone(),
             authoritative_project_id: project_id.clone(),
+            provider: crate::daemon::project_composition::native_observation_mount(
+                &(journal_root),
+                1,
+            )
+            .expect("native mount metadata"),
             store_data_root: journal_root,
-            registration_revision: 1,
-            host_limits: super::super::native_provider::native_provider_limits(),
             policy: ObservationJourneyPolicyV1::project_default(),
         })
         .expect("mounted journey");
@@ -7875,9 +8004,12 @@ mod tests {
                 .expect("profile id"),
             scope: resolved_scope,
             authoritative_project_id: project_id.clone(),
+            provider: crate::daemon::project_composition::native_observation_mount(
+                &(journal_root),
+                1,
+            )
+            .expect("native mount metadata"),
             store_data_root: journal_root,
-            registration_revision: 1,
-            host_limits: super::super::native_provider::native_provider_limits(),
             policy: ObservationJourneyPolicyV1::project_default(),
         })
         .expect("mounted journey");
@@ -8074,9 +8206,12 @@ mod tests {
                 profile_id: profile_id.clone(),
                 scope: resolved_scope.clone(),
                 authoritative_project_id: project_id.clone(),
+                provider: crate::daemon::project_composition::native_observation_mount(
+                    &(journal_root.clone()),
+                    1,
+                )
+                .expect("native mount metadata"),
                 store_data_root: journal_root.clone(),
-                registration_revision: 1,
-                host_limits: super::super::native_provider::native_provider_limits(),
                 policy: ObservationJourneyPolicyV1::project_default(),
             })
             .expect("mounted journey")
@@ -8285,9 +8420,12 @@ mod tests {
                 profile_id: UserProfileId::new("profile.observation-hygiene").expect("profile id"),
                 scope: scope(self.project_id.clone()),
                 authoritative_project_id: self.project_id.clone(),
+                provider: crate::daemon::project_composition::native_observation_mount(
+                    &(self.journal_root.clone()),
+                    1,
+                )
+                .expect("native mount metadata"),
                 store_data_root: self.journal_root.clone(),
-                registration_revision: 1,
-                host_limits: super::super::native_provider::native_provider_limits(),
                 policy: ObservationJourneyPolicyV1::project_default(),
             })
             .expect("a later open mounts over the same durable journal")
@@ -8462,9 +8600,12 @@ mod tests {
             profile_id: UserProfileId::new("profile.observation-hygiene").expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
+            provider: crate::daemon::project_composition::native_observation_mount(
+                &(journal_root.clone()),
+                1,
+            )
+            .expect("native mount metadata"),
             store_data_root: journal_root.clone(),
-            registration_revision: 1,
-            host_limits: super::super::native_provider::native_provider_limits(),
             policy: ObservationJourneyPolicyV1::project_default(),
         })
         .expect("mounted journey");
@@ -9414,9 +9555,12 @@ mod tests {
             profile_id: UserProfileId::new("profile.observation-retention").expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
+            provider: crate::daemon::project_composition::native_observation_mount(
+                &(journal_root.clone()),
+                1,
+            )
+            .expect("native mount metadata"),
             store_data_root: journal_root.clone(),
-            registration_revision: 1,
-            host_limits: super::super::native_provider::native_provider_limits(),
             policy: ObservationJourneyPolicyV1::project_default(),
         };
 
@@ -9564,16 +9708,224 @@ mod tests {
                 .expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id,
+            provider: crate::daemon::project_composition::native_observation_mount(
+                &(journal_root),
+                1,
+            )
+            .expect("native mount metadata"),
             store_data_root: journal_root,
-            registration_revision: 1,
-            host_limits: super::super::native_provider::native_provider_limits(),
             policy: ObservationJourneyPolicyV1::project_default(),
         }
     }
 
+    #[derive(Debug)]
+    struct HeldInstanceProof {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        instance: String,
+    }
+
+    impl ObservationInstanceProofV1 for HeldInstanceProof {
+        fn prove(
+            &self,
+            deadline: Instant,
+            cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+        ) -> Result<Option<String>, TerminalCode> {
+            self.entered.store(true, Ordering::Release);
+            loop {
+                if cancelled() {
+                    return Err(TerminalCode::Cancelled);
+                }
+                if Instant::now() >= deadline {
+                    return Err(TerminalCode::DeadlineExceeded);
+                }
+                if self.release.load(Ordering::Acquire) {
+                    return Ok(Some(self.instance.clone()));
+                }
+                thread::park_timeout(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optional_instance_bootstrap_does_not_block_native_and_drains_restart_pending_rows() {
+        let temp = TempDir::new().unwrap();
+        let project = "project.observation-startup-classification";
+        let project_id = ProjectId::new(project).unwrap();
+        let session = SessionId::new("session.optional-bootstrap-pending").unwrap();
+        let record = settled_record(
+            1,
+            canonical_observation(&project_id, &session, "pending observer message"),
+        );
+        let store = || RefusingReplayPort {
+            refusals: Mutex::new(vec![]),
+            then: vec![record.clone()],
+        };
+        // Persist admission and its watermark without a proved delivery instance.
+        let mut seed_inputs = classification_mount_inputs(&temp, project);
+        let expected_instance = seed_inputs.provider.provider_instance_id.take().unwrap();
+        let seed = mount_project_observation_journey(seed_inputs).unwrap();
+        assert_eq!(
+            run_startup_replay(seed.as_ref(), &store(), &HostCancellationToken::new())
+                .await
+                .unwrap()
+                .admitted,
+            1
+        );
+        let pending_path = seed.journal_path().to_owned();
+        assert!(!journal_snapshot(&pending_path).contains("acknowledged"));
+        seed.shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await;
+        drop(seed);
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let mut inputs = classification_mount_inputs(&temp, project);
+        inputs.provider.provider_instance_id = None;
+        inputs.provider.instance_proof = Some(Arc::new(HeldInstanceProof {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            instance: expected_instance,
+        }));
+        let observer = tokio::time::timeout(
+            Duration::from_secs(1),
+            mount_observer_dormant(inputs, &HostCancellationToken::new()),
+        )
+        .await
+        .expect("mount must not await optional bootstrap")
+        .unwrap();
+        assert!(!entered.load(Ordering::Acquire));
+        assert!(observer.worker.lock().unwrap().is_none());
+        assert!(observer.live_replay_task.lock().unwrap().is_none());
+        observer.start_observer_with_live_replay(store()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(observer.provider_instance_id.get().is_none());
+
+        let native_root = TempDir::new().unwrap();
+        let native = mount_and_replay(
+            classification_mount_inputs(&native_root, project),
+            store(),
+            &HostCancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            wait_for_settlement(native.journal_path()).await,
+            ("acknowledged".to_owned(), 1)
+        );
+        assert!(
+            observer.provider_instance_id.get().is_none(),
+            "Native settled while observer proof was held"
+        );
+        release.store(true, Ordering::Release);
+        assert_eq!(
+            wait_for_settlement(&pending_path).await,
+            ("acknowledged".to_owned(), 1)
+        );
+        native
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await;
+        observer
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optional_instance_bootstrap_observes_journey_shutdown() {
+        let temp = TempDir::new().unwrap();
+        let entered = Arc::new(AtomicBool::new(false));
+        let mut inputs =
+            classification_mount_inputs(&temp, "project.observation-startup-classification");
+        let instance = inputs.provider.provider_instance_id.take().unwrap();
+        inputs.provider.instance_proof = Some(Arc::new(HeldInstanceProof {
+            entered: Arc::clone(&entered),
+            release: Arc::new(AtomicBool::new(false)),
+            instance,
+        }));
+        let observer = mount_observer_dormant(inputs, &HostCancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!entered.load(Ordering::Acquire));
+        observer
+            .start_observer_with_live_replay(RefusingReplayPort {
+                refusals: Mutex::new(vec![]),
+                then: vec![],
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let started = Instant::now();
+        let failures = observer
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(
+            failures.is_empty(),
+            "shutdown must join the cancelled proof: {failures:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(observer.provider_instance_id.get(), Some(&None));
+    }
+
+    #[tokio::test]
+    async fn dormant_observer_shutdown_prevents_late_worker_activation() {
+        let temp = TempDir::new().unwrap();
+        let entered = Arc::new(AtomicBool::new(false));
+        let mut inputs =
+            classification_mount_inputs(&temp, "project.observation-startup-classification");
+        let instance = inputs.provider.provider_instance_id.take().unwrap();
+        inputs.provider.instance_proof = Some(Arc::new(HeldInstanceProof {
+            entered: Arc::clone(&entered),
+            release: Arc::new(AtomicBool::new(false)),
+            instance,
+        }));
+        let observer = mount_observer_dormant(inputs, &HostCancellationToken::new())
+            .await
+            .unwrap();
+        assert!(observer.worker.lock().unwrap().is_none());
+        assert!(observer.live_replay_task.lock().unwrap().is_none());
+        assert!(
+            observer
+                .shutdown(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .is_empty()
+        );
+        assert!(matches!(
+            observer.start_observer_with_live_replay(RefusingReplayPort {
+                refusals: Mutex::new(vec![]),
+                then: vec![],
+            }),
+            Err(ObservationJourneyError::Cancelled { admitted: 0 })
+        ));
+        assert!(matches!(
+            observer.start_live_replay(RefusingReplayPort {
+                refusals: Mutex::new(vec![]),
+                then: vec![],
+            }),
+            Err(ObservationJourneyError::Cancelled { admitted: 0 })
+        ));
+        assert!(observer.worker.lock().unwrap().is_none());
+        assert!(observer.live_replay_task.lock().unwrap().is_none());
+        drop(observer);
+        assert!(
+            !entered.load(Ordering::Acquire),
+            "discarded candidate must never prove a provider instance"
+        );
+    }
+
     /// Acceptance: the classification is fail-closed. Only a storage-layer
-    /// refusal and a cancelled ingest task are retryable; everything that
-    /// describes the *evidence* is permanent, because replaying the same bytes
+    /// refusal, a cancelled ingest task, and an admitted stale handshake are
+    /// retryable; evidence defects remain permanent because replaying the same bytes
     /// produces the same answer forever.
     #[test]
     fn replay_recoverability_is_fail_closed() {
@@ -9605,6 +9957,46 @@ mod tests {
             replay_recoverability(&ObservationJourneyError::EntropyUnavailable),
             ReplayRecoverabilityV1::Permanent
         );
+    }
+
+    #[test]
+    fn only_nested_stale_handshake_admission_is_retryable() {
+        for terminal_code in [
+            Some(TerminalCode::StaleIdentity),
+            Some(TerminalCode::InvalidRequest),
+            Some(TerminalCode::ScopeMismatch),
+            Some(TerminalCode::ProviderUnavailable),
+            None,
+        ] {
+            let readiness = SupervisedReadinessError::Unavailable {
+                exact_scope_sha256: "0".repeat(64),
+                kind: tracedecay_memory_provider_registry::DegradationKindV1::HandshakeRefused,
+                terminal_code,
+                detail: "text is not used to classify readiness".to_owned(),
+                retry_in_micros: 1_000,
+            };
+            assert_eq!(
+                replay_recoverability(&ObservationJourneyError::SupervisedReadiness(
+                    readiness.clone()
+                )),
+                ReplayRecoverabilityV1::Permanent,
+                "only the canonical admission boundary gains replay recovery"
+            );
+            let error = ObservationJourneyError::Ingress(ObservationRuntimeError::Admission {
+                source_event_id: "record.stale-handshake".to_owned(),
+                source_sequence: 1,
+                cause: AdapterFailureV1::new(AdmissionAdapterError::Readiness {
+                    source_event_id: "record.stale-handshake".to_owned(),
+                    source: ObservationJourneyError::SupervisedReadiness(readiness),
+                }),
+            });
+            let expected = if terminal_code == Some(TerminalCode::StaleIdentity) {
+                ReplayRecoverabilityV1::Retryable
+            } else {
+                ReplayRecoverabilityV1::Permanent
+            };
+            assert_eq!(replay_recoverability(&error), expected, "{terminal_code:?}");
+        }
     }
 
     /// Acceptance: a permanent startup replay refusal refuses the mount.
@@ -9917,9 +10309,12 @@ mod tests {
             profile_id: UserProfileId::new("profile.mount-off-worker").unwrap(),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
+            provider: crate::daemon::project_composition::native_observation_mount(
+                &(journal_root.clone()),
+                1,
+            )
+            .expect("native mount metadata"),
             store_data_root: journal_root.clone(),
-            registration_revision: 1,
-            host_limits: super::super::native_provider::native_provider_limits(),
             policy: ObservationJourneyPolicyV1::project_default(),
         };
 
@@ -10011,9 +10406,12 @@ mod tests {
                 profile_id: UserProfileId::new("profile.shutdown-off-worker").unwrap(),
                 scope: scope(project_id.clone()),
                 authoritative_project_id: project_id.clone(),
+                provider: crate::daemon::project_composition::native_observation_mount(
+                    &(journal_root.clone()),
+                    1,
+                )
+                .expect("native mount metadata"),
                 store_data_root: journal_root.clone(),
-                registration_revision: 1,
-                host_limits: super::super::native_provider::native_provider_limits(),
                 policy: ObservationJourneyPolicyV1::project_default(),
             },
             store.clone(),

@@ -55,6 +55,7 @@ pub const INDEX_TRACK_CALL_SITES_SETTING_KEY: &str = "index.track_call_sites.v1"
 pub const INDEX_GIT_IGNORE_SETTING_KEY: &str = "index.git_ignore.v1";
 pub const INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY: &str = "index.native_graph_activation.v1";
 pub const MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY: &str = "memory.provider_native_enabled.v1";
+pub const MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY: &str = "memory.provider_ncm_observer.v1";
 pub const MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY: &str = "memory.provider_recall_routing.v1";
 pub const DIAGNOSTICS_PREWARM_SETTING_KEY: &str = "diagnostics.prewarm.v1";
 pub const SEMANTIC_RUNTIME_SETTING_KEY: &str = "semantic.runtime.v1";
@@ -103,6 +104,7 @@ pub const CONFIGURATION_SETTING_KEYS_V1: &[&str] = &[
     INDEX_GIT_IGNORE_SETTING_KEY,
     INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
     MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
     MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
     DIAGNOSTICS_PREWARM_SETTING_KEY,
     SEMANTIC_RUNTIME_SETTING_KEY,
@@ -1011,6 +1013,55 @@ impl MemoryProviderRecallDegradationV1 {
                 return Err(DomainError::NonCanonical {
                     field: "memory provider recall degradation duplicate cause",
                 });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Optional real NCM observer. Changing this setting requires a daemon restart.
+/// The existing offline installer must install into `state_root/models` before
+/// readiness can be proved; mounting never downloads or copies models.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MemoryProviderNcmObserverV1 {
+    /// Construct no NCM adapter, process, or observation journey.
+    Disabled {},
+    /// Observe canonical commits without any authority to answer recall.
+    Enabled {
+        /// Absolute path of the production NCM worker executable.
+        worker_binary: std::path::PathBuf,
+        /// Absolute admitted root containing models and provider namespaces.
+        state_root: std::path::PathBuf,
+    },
+}
+
+impl Default for MemoryProviderNcmObserverV1 {
+    fn default() -> Self {
+        Self::Disabled {}
+    }
+}
+
+impl MemoryProviderNcmObserverV1 {
+    /// Reject relative paths and traversal instead of resolving against a host CWD.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if let Self::Enabled {
+            worker_binary,
+            state_root,
+        } = self
+        {
+            for (path, field) in [
+                (worker_binary, "NCM observer worker binary"),
+                (state_root, "NCM observer state root"),
+            ] {
+                if !path.is_absolute()
+                    || path
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+                    || path.to_str().is_none_or(|text| text.contains('\0'))
+                {
+                    return Err(DomainError::NonCanonical { field });
+                }
             }
         }
         Ok(())

@@ -22,7 +22,9 @@
 #[cfg(feature = "rust-backend")]
 pub mod rust_backend;
 #[cfg(feature = "rust-backend")]
-pub use rust_backend::{RustNcmConfig, RustNcmError, RustNcmSurface, StateRoot, WorkerOptions};
+pub use rust_backend::{
+    RustNcmConfig, RustNcmError, RustNcmSurface, RustNcmWorkerOwner, StateRoot, WorkerOptions,
+};
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -452,6 +454,7 @@ impl NcmProviderAdapter {
         }
         let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
         let opaque_ids = OpaqueCallerIds::from_call(&namespace, call);
+        project_observation_sources(&mut value, call, &namespace)?;
         remove_exact_scope_identity(&mut value);
         if !rewrite_caller_identity_fields(&mut value, call, &opaque_ids)
             || json_contains_scope_component(&value, &call.exact_scope)
@@ -1626,6 +1629,169 @@ fn opaque_surface_id(namespace: &NcmNamespace, kind: &[u8], public_value: &str) 
     digest_field(&mut digest, kind);
     digest_field(&mut digest, public_value.as_bytes());
     hex_digest(&digest.finalize())
+}
+
+/// Projects host session metadata before the privacy gate. The admitted host
+/// relation is the canonical source session; `agent_session_id` is a separately
+/// derived checkout binding, so those two strings must not be compared directly.
+fn project_observation_sources(
+    value: &mut Value,
+    call: &ProviderCall,
+    namespace: &NcmNamespace,
+) -> Option<()> {
+    let object = value.as_object_mut()?;
+    if call.operation == ProviderOperation::DeleteBySource {
+        let Some(source) =
+            unique_source_alias(object, &["source", "source_id", "forget_source_key"]).ok()?
+        else {
+            return Some(());
+        };
+        for alias in ["source", "source_id", "forget_source_key"] {
+            object.remove(alias);
+        }
+        object.insert(
+            "source".to_owned(),
+            Value::String(opaque_surface_id(namespace, b"forget-source-key", &source)),
+        );
+        return Some(());
+    }
+    if call.operation != ProviderOperation::Observe {
+        return Some(());
+    }
+    let source = observe_source_alias(object).ok()?;
+    let is_session = object.get("observation_kind").and_then(Value::as_str)
+        == Some("session.message_committed.v1");
+    let canonical = object.get("canonical_payload").and_then(Value::as_object);
+    let has_canonical_shape = canonical.is_some_and(|payload| {
+        [
+            "version",
+            "provider",
+            "native_record_kind",
+            "stable_record_id",
+            "relations",
+            "facts",
+        ]
+        .iter()
+        .any(|field| payload.contains_key(*field))
+    });
+    if is_session && has_canonical_shape {
+        if object.get("payload_contract").and_then(Value::as_str)
+            != Some("tracedecay.memory.observation.session-message.v1")
+        {
+            return None;
+        }
+        let canonical = canonical?;
+        if canonical.get("version").and_then(Value::as_u64) != Some(1) {
+            return None;
+        }
+        nonempty_json_string(canonical.get("native_record_kind")?)?;
+        nonempty_json_string(canonical.get("provider")?)?;
+        nonempty_json_string(canonical.get("stable_record_id")?)?;
+        let session = nonempty_json_string(canonical.get("relations")?.get("session_id")?)?;
+        let source_key = call.exact_scope.session_forget_source_key(session);
+        if source.as_ref().is_some_and(|source| source != &source_key) {
+            return None;
+        }
+        let mut roles = Vec::new();
+        let mut contents = Vec::new();
+        for fact in canonical.get("facts")?.as_array()? {
+            let fact = fact.as_object()?;
+            if fact.get("kind").and_then(Value::as_str) != Some("message") {
+                continue;
+            }
+            roles.push(nonempty_json_string(fact.get("role")?)?.to_owned());
+            contents.push(message_fact_text(fact.get("content")?)?);
+        }
+        if contents.is_empty() {
+            return None;
+        }
+        *value = serde_json::json!({
+            "observation_kind": "session.message_committed.v1",
+            "payload_contract": "tracedecay.memory.observation.session-message.v1",
+            "canonical_payload": {
+                "role": roles.join("\n"),
+                "content": contents.join("\n"),
+                "forget_source_key": opaque_surface_id(namespace, b"forget-source-key", &source_key)
+            }
+        });
+        return Some(());
+    }
+    if let Some(source) = source {
+        object.remove("source_identity");
+        let opaque = opaque_surface_id(namespace, b"forget-source-key", &source);
+        if let Some(canonical) = object
+            .get_mut("canonical_payload")
+            .and_then(Value::as_object_mut)
+        {
+            canonical.insert("forget_source_key".to_owned(), Value::String(opaque));
+        } else {
+            object.insert("source_identity".to_owned(), Value::String(opaque));
+        }
+    }
+    Some(())
+}
+
+fn nonempty_json_string(value: &Value) -> Option<&str> {
+    value.as_str().filter(|text| !text.trim().is_empty())
+}
+
+/// Accepts only message text shapes, never a serialized metadata fallback.
+fn message_fact_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(_) => Some(nonempty_json_string(content)?.trim().to_owned()),
+        Value::Object(object) => Some(nonempty_json_string(object.get("text")?)?.trim().to_owned()),
+        Value::Array(items) if !items.is_empty() => {
+            let parts = items
+                .iter()
+                .map(message_fact_text)
+                .collect::<Option<Vec<_>>>()?;
+            Some(parts.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+fn unique_source_alias(
+    object: &serde_json::Map<String, Value>,
+    aliases: &[&str],
+) -> Result<Option<String>, ()> {
+    let mut source: Option<String> = None;
+    for alias in aliases {
+        if let Some(value) = object.get(*alias) {
+            let candidate = nonempty_json_string(value).ok_or(())?;
+            if source.as_ref().is_some_and(|source| source != candidate) {
+                return Err(());
+            }
+            source = Some(candidate.to_owned());
+        }
+    }
+    Ok(source)
+}
+
+fn observe_source_alias(object: &serde_json::Map<String, Value>) -> Result<Option<String>, ()> {
+    let canonical_source = object
+        .get("canonical_payload")
+        .and_then(Value::as_object)
+        .map(|payload| unique_source_alias(payload, &["forget_source_key"]))
+        .transpose()?
+        .flatten();
+    let envelope_source = match object.get("source_identity") {
+        None => None,
+        Some(Value::Object(source)) => unique_source_alias(
+            source,
+            &[
+                "forget_source_key",
+                "source_event_sha256",
+                "source_event_id",
+            ],
+        )?,
+        Some(value) => Some(nonempty_json_string(value).ok_or(())?.to_owned()),
+    };
+    match (canonical_source, envelope_source) {
+        (Some(first), Some(second)) if first != second => Err(()),
+        (Some(source), _) | (_, Some(source)) => Ok(Some(source)),
+        (None, None) => Ok(None),
+    }
 }
 
 fn remove_exact_scope_identity(value: &mut Value) {

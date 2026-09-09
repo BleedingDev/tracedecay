@@ -1,10 +1,11 @@
 # Biomem-based Rust NCM backend
 
-**Status label after a passing backend receipt:** `backend-accepted, host-not-yet-integrated`.
+**Backend-only status label after a passing backend receipt:** `backend-accepted, host-not-yet-integrated`.
 
 This is never a `demo-ready` claim. The standalone worker and adapter are accepted only when
 `scripts/product/ncm/check-backend.py` exits 0 and writes a passing receipt for the exact source
-commit. Host mounting, active recall, usefulness, packaging, and release remain tasks 023–026.
+commit. Full host acceptance, active recall, usefulness, packaging, and release remain tasks
+023–026; the experimental observer mount below does not close those gates.
 
 ## What this package is
 
@@ -20,7 +21,8 @@ It consists of:
 
 The provider ID remains `ncm`. The implementation version is
 `ncm-biomem-rs.v1+<canonical-config-sha256-prefix>`. The feature is default-off and nothing in this
-backend acceptance mounts or registers it in the host.
+backend acceptance mounts or registers it in the host. The optional daemon observer mount is
+a separate integration.
 
 ## Build the production worker
 
@@ -64,6 +66,68 @@ The installer publishes `models/ncm-encoder-manifest.json`, resolves the Xenova 
 The frozen model profile is `paraphrase-multilingual-MiniLM-L12-v2`, 384 dimensions, 128-token
 maximum, masked mean pooling, and L2 normalization. See
 `product/ncm/reference/embedding-manifest.json` for the machine-readable pin.
+
+## Experimental daemon observer
+
+A build with `memory-provider-host` can mount the real NCM worker beside Native as an observer.
+When enabled, the daemon invocation retains one `RustNcmWorkerOwner` bound to its profile, worker
+binary, and state root. Enabled project surfaces reuse its serialized worker/model process, while
+each mount keeps its own descriptor and accepted readiness. Conflicting profile or configured
+path values are refused. Closing a project retains the daemon owner; releasing the final owner
+uses the existing bounded worker-client shutdown. Declaring the observer starts no worker or
+model. Its existing delivery thread performs one bounded attempt to prove the real worker's
+identity; Native startup does not wait for that proof or NCM replay. Declaration alone establishes
+no readiness.
+
+The canonical project setting `memory.provider_ncm_observer.v1` is JSON text and defaults to
+`{"mode":"disabled"}`. To enable it, commit an enabled document through the configuration API:
+
+```json
+{
+  "mode": "enabled",
+  "worker_binary": "/absolute/path/to/tracedecay-ncm-worker",
+  "state_root": "/absolute/path/to/ncm-state"
+}
+```
+
+Both paths must be absolute; parent traversal is refused. Install the pinned model using the
+existing installer into that same `state_root` first, so its artifacts are under
+`state_root/models`. The daemon does not download or copy models. Restart the daemon after
+changing this setting or installing a previously unavailable worker/model.
+
+`memory.provider_native_enabled.v1` must also be true; an NCM observer without the Native host is
+refused. This setting never selects NCM for active recall. Enabling it leaves existing recall
+routing unchanged: when `memory.provider_recall_routing.v1` selects `tracedecay.native`, Native continues
+to answer product context requests.
+
+Each provider receives canonical commits through its own bounded journey. Under the canonical
+store data root, Native keeps `memory-observation-journal-v1.sqlite3`; NCM uses
+`memory-observation-ncm-journal-v1.sqlite3`. Their independent replay cursors and receipts allow
+NCM to catch up when enabled after Native has already acknowledged a commit. NCM runtime state
+lives under `state_root/namespaces/<bare-64-hex-namespace>`, with the existing exact-scope binding.
+A missing worker or model reports typed unavailable readiness, produces no successful observer
+receipt, and leaves undelivered observations unacknowledged. A failed bootstrap remains
+unavailable until the daemon is recreated; it does not retry in the background. Native remains
+available.
+
+The real Claude and Codex host fixtures require the production worker built above and the
+installed model root. On Unix, including macOS, run both from the repository root:
+
+```bash
+export TRACEDECAY_NCM_WORKER="$PWD/target/debug/tracedecay-ncm-worker"
+export TRACEDECAY_NCM_REAL_MODEL_ROOT="$PWD/target/ncm-backend-model-root"
+cargo test -p tracedecay-cli \
+  --features memory-provider-host,test-transport \
+  --test product_memory_provider_claude_host_journey \
+  real_ncm_observer_receives_shipped_ -- --ignored --test-threads=1
+```
+
+Adjust the worker path if the build used `CARGO_TARGET_DIR`. The two tests drive shipped Claude
+and Codex hooks, check separate Native/NCM receipts, and keep Native selected for context.
+They isolate mutable provider state and share only installed model artifacts. A real host pass
+requires both tests to finish successfully with those artifacts; typechecking alone does not
+establish it. These experimental integration tests do not replace the backend gate or establish
+completion of task 024 or release readiness.
 
 ## Run the backend-only gate
 
@@ -110,9 +174,13 @@ violation produces exit code 2 and a blocked receipt.
 
 The host integration owner must preserve these boundaries:
 
-- Construct `RustNcmSurface::new(RustNcmConfig { worker_binary, state_root, worker_options })`.
-  `worker_binary` and `state_root` must be absolute; production `WorkerOptions::default()` must not
-  set `test_double`.
+- Construct one `RustNcmWorkerOwner::new(RustNcmConfig { worker_binary, state_root, worker_options })`
+  per daemon invocation/profile, and retain it in an `Arc`. Create each project surface with
+  `RustNcmSurface::from_production_worker(Arc::clone(&worker))` to declare pinned identity without
+  a startup preflight. Run `prove_provider_instance` once on the retained delivery thread before
+  observation delivery; descriptors and accepted readiness remain local to each mount.
+  `worker_binary` and `state_root` must be absolute; production
+  `WorkerOptions::default()` must not set `test_double`.
 - Wrap the surface with `NcmProviderAdapter::new(Arc::new(surface))`; do not bypass exact-scope,
   sanitization, readiness, terminal, or payload-containment checks.
 - Keep `NcmNamespace::from_exact_scope` unchanged, including `agent_session_id` and
@@ -125,8 +193,9 @@ The host integration owner must preserve these boundaries:
 - Set host snapshot limits high enough for the file-backed snapshot transport. A one-record raw
   snapshot is about 1.1 MiB and its provider JSON byte array about 3.3 MiB; use the frozen
   `snapshot_bytes` ceiling of 256 MiB rather than the 1 MiB normal reply-frame ceiling.
-- Launch one supervised worker per profile. The worker performs no model download; installation is
-  an explicit preflight and normal open is verified-local/offline.
+- Reuse the retained supervised worker across projects with the same profile and configured paths;
+  conflicting bindings are refused until daemon restart. The worker performs no model download;
+  installation is an explicit preflight and normal open is verified-local/offline.
 - Preserve provider ID `ncm`, algorithm profile `ncm-biomem-rs.v1`, projection digest, encoder model
   and artifact digest, epoch, and commit sequence in readiness/receipt identity checks.
 
@@ -144,7 +213,8 @@ shared files wholesale:
    `rust-backend = ["dep:tracedecay-memory-ncm-runtime"]`, and add the optional runtime dependency
    with `default-features = false`. Keep conformance as a dev dependency only.
 4. Carry `crates/tracedecay-memory-provider-ncm/src/rust_backend/mod.rs` and its small feature-gated
-   exports in `src/lib.rs`. Do not enable the feature by default or register/mount NCM yet.
+   exports in `src/lib.rs`. Keep the backend feature default-off; the daemon observer mount above
+   is enabled separately through its host feature and canonical configuration.
 5. Reconcile, rather than overwrite, the stabilized host ownership/dependency manifests and the
    accepted upstream floor. Rerun this backend checker on the exact joined tree.
 
@@ -163,5 +233,5 @@ a specifically reviewed source commit/tree and record the joined tree separately
   platform, test upgrades and disablement, and issue separate fidelity, backend, host-safety,
   platform, and usefulness verdicts.
 
-Until all four are complete on the joined tree, the only valid successful label is
-`backend-accepted, host-not-yet-integrated`; it is not demo-ready or release-ready.
+The experimental observer mount does not complete all four gates. Backend-only receipts retain
+`backend-accepted, host-not-yet-integrated`; they do not establish demo or release readiness.

@@ -172,6 +172,20 @@ class ProviderRecallContractTest(unittest.TestCase):
             contract, "binding rules must cover every binding in contract order"
         )
 
+    def test_checkout_binding_cannot_make_checkout_fields_optional_or_claim_session(self) -> None:
+        for field in ["profile_id", "project_id", "repository_identity", "worktree_identity", "branch_identity"]:
+            contract = copy.deepcopy(self.contract)
+            rule = next(row for row in contract["candidate_scope_binding"]["binding_rules"] if row["binding"] == "checkout_observations")
+            rule["required_equal"].remove(field)
+            rule["optional_empty_or_equal"].append(field)
+            self.assert_rejected(contract, "binding rule checkout_observations.required_equal drifted")
+        for field in ["agent_session_id", "resolved_scope_digest"]:
+            contract = copy.deepcopy(self.contract)
+            rule = next(row for row in contract["candidate_scope_binding"]["binding_rules"] if row["binding"] == "checkout_observations")
+            rule["forbidden"].remove(field)
+            rule["optional_empty_or_equal"].append(field)
+            self.assert_rejected(contract, "binding rule checkout_observations.forbidden drifted")
+
     def test_request_must_carry_exact_scope(self) -> None:
         contract = copy.deepcopy(self.contract)
         contract["recall_request"]["required_fields"].remove("exact_scope_identity")

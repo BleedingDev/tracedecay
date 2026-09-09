@@ -11,15 +11,16 @@ use tracedecay_contracts::clock::now_micros;
 use tracedecay_domain::ProjectId;
 use tracedecay_domain::configuration::{
     CodeIndexWorkerSelectionV1, ConfigurationLayerIdV1, ConfigurationRevisionId,
-    ConfigurationSnapshotV1, ConfigurationValueV1, MemoryProviderRecallRoutingV1,
-    SOURCE_BINDINGS_SETTING_KEY, SYNC_AUTO_INIT_SETTING_KEY, SYNC_AUTO_WATCH_SETTING_KEY,
-    SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY, SYNC_BRANCH_GC_DAYS_SETTING_KEY,
-    SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY, SYNC_MAX_CONCURRENT_SYNCS_SETTING_KEY,
-    SYNC_ORPHAN_DB_GC_DAYS_SETTING_KEY, SYNC_READ_COOLDOWN_SECS_SETTING_KEY,
-    SYNC_READ_REFRESH_SETTING_KEY, SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY,
-    SYNC_SESSION_START_SYNC_SETTING_KEY, SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY,
-    SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY, SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY,
-    SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, SettingKey, UserProfileId,
+    ConfigurationSnapshotV1, ConfigurationValueV1, MemoryProviderNcmObserverV1,
+    MemoryProviderRecallRoutingV1, SOURCE_BINDINGS_SETTING_KEY, SYNC_AUTO_INIT_SETTING_KEY,
+    SYNC_AUTO_WATCH_SETTING_KEY, SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY,
+    SYNC_BRANCH_GC_DAYS_SETTING_KEY, SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY,
+    SYNC_MAX_CONCURRENT_SYNCS_SETTING_KEY, SYNC_ORPHAN_DB_GC_DAYS_SETTING_KEY,
+    SYNC_READ_COOLDOWN_SECS_SETTING_KEY, SYNC_READ_REFRESH_SETTING_KEY,
+    SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY, SYNC_SESSION_START_SYNC_SETTING_KEY,
+    SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY, SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
+    SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY, SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, SettingKey,
+    UserProfileId,
 };
 
 use tracedecay_configuration::ConfigurationControlStore;
@@ -170,6 +171,9 @@ pub struct TraceDecayConfig {
     /// adapter, journal, or background work.
     #[serde(default)]
     pub memory_provider_native_enabled: bool,
+    /// Restart-required real NCM observer; defaults to no worker or journey.
+    #[serde(default)]
+    pub memory_provider_ncm_observer: MemoryProviderNcmObserverV1,
     /// Explicit recall routing gate: which enabled provider, if any, may
     /// answer product recall, and the only fallback rule that may extend it.
     /// Defaults to no active provider, so enabling the host alone never
@@ -601,6 +605,7 @@ impl Default for TraceDecayConfig {
             diagnostics_prewarm: false,
             native_graph_activation: default_native_graph_activation(),
             memory_provider_native_enabled: false,
+            memory_provider_ncm_observer: MemoryProviderNcmObserverV1::default(),
             memory_provider_recall_routing: MemoryProviderRecallRoutingV1::default(),
             semantic: SemanticConfig::default(),
             sync: SyncConfig::default(),
@@ -1325,6 +1330,7 @@ impl TraceDecayConfig {
             diagnostics_prewarm: shared.diagnostics_prewarm,
             native_graph_activation: shared.native_graph_activation,
             memory_provider_native_enabled: shared.memory_provider_native_enabled,
+            memory_provider_ncm_observer: shared.memory_provider_ncm_observer.clone(),
             memory_provider_recall_routing: shared.memory_provider_recall_routing.clone(),
             semantic: shared.semantic.clone(),
             sync: SyncConfig {

@@ -13,7 +13,7 @@ mod enabled {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
@@ -30,7 +30,7 @@ mod enabled {
     use tracedecay_memory_provider_ncm::{
         NCM_PROVIDER_ID, NcmCognitiveSurface, NcmProviderAdapter, NcmSurfaceCall,
         NcmSurfaceHandshakeRequest, NcmSurfaceHandshakeResponse, RustNcmConfig, RustNcmSurface,
-        StateRoot, WorkerOptions,
+        RustNcmWorkerOwner, StateRoot, WorkerOptions,
     };
 
     const RESOLVED_SCOPE_DIGEST: &str =
@@ -189,6 +189,122 @@ mod enabled {
             })
             .expect("valid handshake request"),
         )
+    }
+
+    #[test]
+    fn production_declaration_starts_no_child_and_refuses_test_double_identity() {
+        let root = TestRoot::new("lazy-production-identity");
+        let owner = Arc::new(
+            RustNcmWorkerOwner::new(RustNcmConfig {
+                worker_binary: worker_binary(),
+                state_root: root.state_root(),
+                worker_options: WorkerOptions {
+                    test_double: true,
+                    ..WorkerOptions::default()
+                },
+            })
+            .unwrap(),
+        );
+        let surface = Arc::new(RustNcmSurface::from_production_worker(Arc::clone(&owner)).unwrap());
+        assert!(owner.worker_pid().is_none());
+        assert!(surface.provider_instance_id().unwrap().is_none());
+        let declared = surface.descriptor();
+        assert_eq!(declared.state_generation, 0);
+        assert_eq!(
+            surface.prove_provider_instance(
+                std::time::Instant::now() + Duration::from_secs(5),
+                Arc::new(|| true),
+            ),
+            Err(TerminalCode::Cancelled)
+        );
+        assert_eq!(
+            surface.prove_provider_instance(std::time::Instant::now(), Arc::new(|| false),),
+            Err(TerminalCode::DeadlineExceeded)
+        );
+        assert!(owner.worker_pid().is_none());
+        assert_eq!(
+            surface.prove_provider_instance(
+                std::time::Instant::now() + Duration::from_secs(5),
+                Arc::new(|| false),
+            ),
+            Err(TerminalCode::StateIncompatible)
+        );
+        assert_eq!(surface.descriptor(), declared);
+        assert!(surface.provider_instance_id().unwrap().is_none());
+        let adapter = NcmProviderAdapter::new(surface.clone()).unwrap();
+        for _ in 0..2 {
+            let reply = handshake(&adapter, &scope("lazy-production-identity"));
+            assert_eq!(
+                reply.terminal.terminal_code(),
+                TerminalCode::StateIncompatible
+            );
+            assert_eq!(surface.descriptor(), declared);
+            assert!(surface.provider_instance_id().unwrap().is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with pinned offline model"]
+    fn lazy_production_declaration_is_proved_by_real_worker_handshake() {
+        let root = TestRoot::new("lazy-production-real-model");
+        let installed = PathBuf::from(std::env::var_os("TRACEDECAY_NCM_REAL_MODEL_ROOT").unwrap());
+        assert!(installed.is_absolute());
+        std::os::unix::fs::symlink(installed.join("models"), root.0.join("models")).unwrap();
+        let owner = Arc::new(
+            RustNcmWorkerOwner::new(RustNcmConfig {
+                worker_binary: worker_binary(),
+                state_root: root.state_root(),
+                worker_options: WorkerOptions::default(),
+            })
+            .unwrap(),
+        );
+        let surface = Arc::new(RustNcmSurface::from_production_worker(Arc::clone(&owner)).unwrap());
+        let declared = surface.descriptor();
+        assert!(owner.worker_pid().is_none());
+        assert!(surface.provider_instance_id().unwrap().is_none());
+        let adapter = NcmProviderAdapter::new(surface.clone()).unwrap();
+        let proved = surface
+            .prove_provider_instance(
+                std::time::Instant::now() + Duration::from_secs(5),
+                Arc::new(|| false),
+            )
+            .unwrap();
+        assert!(proved.is_some());
+        assert_eq!(surface.descriptor(), declared);
+        assert!(
+            surface.provider_instance_id().unwrap().is_none(),
+            "global proof must not install session identity"
+        );
+        let ready = handshake(&adapter, &scope("lazy-production-real-model"));
+        assert_eq!(ready.terminal.terminal_code(), TerminalCode::Success);
+        assert_eq!(surface.descriptor(), declared);
+        assert!(surface.provider_instance_id().unwrap().is_some());
+        assert!(ready.ready_receipt_sha256.is_some());
+    }
+
+    #[test]
+    fn missing_worker_retains_real_adapter_and_reports_unavailable_handshake() {
+        let root = TestRoot::new("missing-worker-observer");
+        let surface = RustNcmSurface::new(RustNcmConfig {
+            worker_binary: root.0.join("absent-ncm-worker"),
+            state_root: root.state_root(),
+            worker_options: WorkerOptions::default(),
+        })
+        .expect("missing executable retains lazy real surface");
+        assert!(surface.provider_instance_id().unwrap().is_none());
+        let provider = NcmProviderAdapter::new(Arc::new(surface)).expect("real adapter");
+        let response = handshake(&provider, &scope("missing-worker-observer"));
+        assert_eq!(
+            response.terminal.terminal_code(),
+            TerminalCode::ProviderUnavailable
+        );
+        assert_eq!(
+            response.terminal.diagnostic_id(),
+            Some("ncm.rust.worker_spawn_failed")
+        );
+        assert!(response.provider_instance_id.is_none());
+        assert!(response.ready_receipt_sha256.is_none());
     }
 
     fn operation_contract(operation: ProviderOperation) -> &'static str {
@@ -364,6 +480,186 @@ mod enabled {
         output
     }
 
+    fn exercise_shared_worker_project_surfaces(root: &TestRoot, options: WorkerOptions) {
+        let owner = Arc::new(
+            RustNcmWorkerOwner::new(RustNcmConfig {
+                worker_binary: worker_binary(),
+                state_root: root.state_root(),
+                worker_options: options,
+            })
+            .expect("shared worker owner"),
+        );
+        assert!(owner.worker_pid().is_none(), "owner construction is lazy");
+        let barrier = std::sync::Barrier::new(2);
+        let (surface_a, surface_b) = std::thread::scope(|threads| {
+            let mount = || {
+                barrier.wait();
+                Arc::new(
+                    RustNcmSurface::from_worker(Arc::clone(&owner)).expect("project-local surface"),
+                )
+            };
+            let a = threads.spawn(mount);
+            let b = threads.spawn(mount);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        let pid = owner.worker_pid().expect("one live worker process");
+        assert_eq!(surface_a.worker_pid(), Some(pid));
+        assert_eq!(surface_b.worker_pid(), Some(pid));
+        let adapter_a = NcmProviderAdapter::new(surface_a.clone()).unwrap();
+        let adapter_b = NcmProviderAdapter::new(surface_b.clone()).unwrap();
+        let scope_a = scope("project-shared-worker-a");
+        let scope_b = scope("project-shared-worker-b");
+        for (id, key) in [
+            ("a-first", "alpha first command"),
+            ("a-second", "alpha second command"),
+        ] {
+            let reply = invoke_after_handshake(
+                &adapter_a,
+                &scope_a,
+                ProviderOperation::Observe,
+                Some(id),
+                observe_value(id, key, "project A only"),
+            );
+            assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+        }
+
+        // B's handshake must not replace A's accepted readiness or descriptor
+        // generation. A and B intentionally start this pair at different generations.
+        let (receipt_a, generation_a) = ready_parts(&handshake(&adapter_a, &scope_a));
+        let (receipt_b, generation_b) = ready_parts(&handshake(&adapter_b, &scope_b));
+        assert!(generation_a > generation_b);
+        let a = adapter_a.invoke(&call(
+            ProviderOperation::Observe,
+            &scope_a,
+            &receipt_a,
+            generation_a,
+            Some("a-third"),
+            observe_value("a-third", "cargo test", "project A only"),
+            10_000,
+        ));
+        assert_eq!(a.terminal.terminal_code(), TerminalCode::Success);
+        let b = adapter_b.invoke(&call(
+            ProviderOperation::Observe,
+            &scope_b,
+            &receipt_b,
+            generation_b,
+            Some("b-first"),
+            observe_value("b-first", "cargo test", "project B only"),
+            10_000,
+        ));
+        assert_eq!(b.terminal.terminal_code(), TerminalCode::Success);
+        assert_ne!(a.state_generation, b.state_generation);
+
+        let (receipt_b, generation_b) = ready_parts(&handshake(&adapter_b, &scope_b));
+        let (receipt_a, generation_a) = ready_parts(&handshake(&adapter_a, &scope_a));
+        let descriptor_before_proof = surface_a.descriptor();
+        let instance_before_proof = surface_a.provider_instance_id().unwrap();
+        assert_eq!(
+            surface_a
+                .prove_provider_instance(
+                    std::time::Instant::now() + Duration::from_secs(5),
+                    Arc::new(|| false),
+                )
+                .unwrap(),
+            instance_before_proof
+        );
+        assert_eq!(surface_a.descriptor(), descriptor_before_proof);
+        // The existing accepted session receipts below must remain usable.
+        let recall_b = adapter_b.invoke(&call(
+            ProviderOperation::Recall,
+            &scope_b,
+            &receipt_b,
+            generation_b,
+            None,
+            json!({"query_text": "cargo test", "top_k": 5}),
+            10_000,
+        ));
+        let recall_a = adapter_a.invoke(&call(
+            ProviderOperation::Recall,
+            &scope_a,
+            &receipt_a,
+            generation_a,
+            None,
+            json!({"query_text": "cargo test", "top_k": 5}),
+            10_000,
+        ));
+        assert_eq!(recall_a.terminal.terminal_code(), TerminalCode::Success);
+        assert_eq!(recall_b.terminal.terminal_code(), TerminalCode::Success);
+        let recalled_a = response_json(&recall_a);
+        let recalled_b = response_json(&recall_b);
+        assert!(find_string(&recalled_a, "value_text", "project A only"));
+        assert!(!find_string(&recalled_a, "value_text", "project B only"));
+        assert!(find_string(&recalled_b, "value_text", "project B only"));
+        assert!(!find_string(&recalled_b, "value_text", "project A only"));
+        assert_ne!(
+            handshake(&adapter_a, &scope_a).state_namespace,
+            handshake(&adapter_b, &scope_b).state_namespace
+        );
+
+        drop(adapter_a);
+        drop(surface_a);
+        assert_eq!(
+            owner.worker_pid(),
+            Some(pid),
+            "closing A must leave B's worker alive"
+        );
+        let retained = invoke_after_handshake(
+            &adapter_b,
+            &scope_b,
+            ProviderOperation::Recall,
+            None,
+            json!({"query_text": "cargo test", "top_k": 5}),
+        );
+        assert_eq!(retained.terminal.terminal_code(), TerminalCode::Success);
+        assert!(find_string(
+            &response_json(&retained),
+            "value_text",
+            "project B only"
+        ));
+        assert_eq!(
+            owner.worker_pid(),
+            Some(pid),
+            "B must not need a replacement worker"
+        );
+        drop(adapter_b);
+        drop(surface_b);
+        let witness = Arc::downgrade(&owner);
+        let started = std::time::Instant::now();
+        drop(owner);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "last owner uses bounded client teardown"
+        );
+        assert!(witness.upgrade().is_none());
+    }
+
+    #[test]
+    fn shared_worker_keeps_project_readiness_generations_and_namespaces_independent() {
+        let root = TestRoot::new("shared-project-surfaces");
+        exercise_shared_worker_project_surfaces(
+            &root,
+            WorkerOptions {
+                test_double: true,
+                ..WorkerOptions::default()
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with pinned offline model"]
+    fn real_shared_worker_keeps_project_readiness_generations_and_namespaces_independent() {
+        let root = TestRoot::new("shared-project-real-model");
+        let installed = PathBuf::from(
+            std::env::var_os("TRACEDECAY_NCM_REAL_MODEL_ROOT")
+                .expect("installed pinned model fixture"),
+        );
+        assert!(installed.is_absolute());
+        std::os::unix::fs::symlink(installed.join("models"), root.0.join("models"))
+            .expect("share immutable models only");
+        exercise_shared_worker_project_surfaces(&root, WorkerOptions::default());
+    }
+
     #[test]
     fn descriptor_and_handshake_expose_reserved_identity_and_exact_capabilities() {
         let root = TestRoot::new("handshake");
@@ -400,6 +696,92 @@ mod enabled {
             NCM_PROVIDER_ID
         );
         assert!(response.ready_receipt_sha256.is_some());
+    }
+
+    #[test]
+    fn canonical_message_embeds_content_and_deletes_by_same_source_after_restart() {
+        let root = TestRoot::new("canonical-message-restart");
+        let exact_scope = scope("project-canonical-message");
+        let canonical_session = "host-session-canonical-message";
+        let text = "Remember the violet telescope calibration procedure";
+        {
+            let adapter = NcmProviderAdapter::new(surface(&root)).expect("adapter");
+            let observed = invoke_after_handshake(
+                &adapter,
+                &exact_scope,
+                ProviderOperation::Observe,
+                Some("canonical-message"),
+                json!({
+                    "observation_kind": "session.message_committed.v1",
+                    "payload_contract": "tracedecay.memory.observation.session-message.v1",
+                    "canonical_payload": {
+                        "version": 1, "provider": "claude", "native_record_kind": "message",
+                        "stable_record_id": "private-canonical-message-record",
+                        "relations": {"session_id": canonical_session, "project_id": exact_scope.project_id},
+                        "facts": [{"kind": "message", "role": "assistant", "content": [{"type": "text", "text": text}]}]
+                    }
+                }),
+            );
+            assert_eq!(observed.terminal.terminal_code(), TerminalCode::Success);
+            let recalled = invoke_after_handshake(
+                &adapter,
+                &exact_scope,
+                ProviderOperation::Recall,
+                None,
+                json!({"query_text": text, "top_k": 5}),
+            );
+            assert_eq!(recalled.terminal.terminal_code(), TerminalCode::Success);
+            let recalled = response_json(&recalled);
+            assert!(find_string(&recalled, "key_text", text));
+            assert!(find_string(
+                &recalled,
+                "value_text",
+                &format!("assistant: {text}")
+            ));
+        }
+        let adapter = NcmProviderAdapter::new(surface(&root)).expect("restarted adapter");
+        // Construction preflights an empty namespace. Loading this persisted
+        // namespace refreshes the new surface's generation once before admission.
+        let mut reopened_ready = handshake(&adapter, &exact_scope);
+        if reopened_ready.terminal.terminal_code() == TerminalCode::StaleIdentity {
+            reopened_ready = handshake(&adapter, &exact_scope);
+        }
+        assert_eq!(
+            reopened_ready.terminal.terminal_code(),
+            TerminalCode::Success,
+            "persisted namespace must be ready after at most one identity refresh"
+        );
+        let (receipt, generation) = ready_parts(&reopened_ready);
+        let recalled = adapter.invoke(&call(
+            ProviderOperation::Recall,
+            &exact_scope,
+            &receipt,
+            generation,
+            None,
+            json!({"query_text": text, "top_k": 5}),
+            10_000,
+        ));
+        assert_eq!(recalled.terminal.terminal_code(), TerminalCode::Success);
+        assert!(find_string(&response_json(&recalled), "key_text", text));
+        let deleted = invoke_after_handshake(
+            &adapter,
+            &exact_scope,
+            ProviderOperation::DeleteBySource,
+            Some("canonical-message-delete"),
+            json!({"forget_source_key": exact_scope.session_forget_source_key(canonical_session)}),
+        );
+        assert_eq!(deleted.terminal.terminal_code(), TerminalCode::Success);
+        let recalled = invoke_after_handshake(
+            &adapter,
+            &exact_scope,
+            ProviderOperation::Recall,
+            None,
+            json!({"query_text": text, "top_k": 5}),
+        );
+        assert_eq!(
+            recalled.terminal.terminal_code(),
+            TerminalCode::SuccessZeroResults
+        );
     }
 
     #[test]
@@ -569,8 +951,8 @@ mod enabled {
         if recall.terminal.terminal_code() == TerminalCode::Success {
             assert!(!find_string(
                 &response_json(&recall),
-                "source",
-                "source-delete"
+                "value_text",
+                "first outcome"
             ));
         } else {
             assert_eq!(
@@ -657,8 +1039,8 @@ mod enabled {
         if beta.terminal.terminal_code() == TerminalCode::Success {
             assert!(!find_string(
                 &response_json(&beta),
-                "source",
-                "source-snapshot-two"
+                "value_text",
+                "beta outcome"
             ));
         } else {
             assert_eq!(
@@ -668,22 +1050,56 @@ mod enabled {
         }
     }
 
+    /// Withholds a successful observation from the caller by cancelling only
+    /// after the real worker has returned evidence that its effect committed.
+    struct CancelAfterCommitSurface {
+        inner: Arc<RustNcmSurface>,
+        cancel_next_observe: AtomicBool,
+    }
+
+    impl NcmCognitiveSurface for CancelAfterCommitSurface {
+        fn descriptor(&self) -> tracedecay_memory_provider_api::ProviderDescriptor {
+            self.inner.descriptor()
+        }
+
+        fn handshake(&self, request: &NcmSurfaceHandshakeRequest) -> NcmSurfaceHandshakeResponse {
+            self.inner.handshake(request)
+        }
+
+        fn invoke(&self, call: &NcmSurfaceCall) -> ProviderReply {
+            let reply = self.inner.invoke(call);
+            if call.operation == ProviderOperation::Observe
+                && self.cancel_next_observe.swap(false, Ordering::SeqCst)
+            {
+                assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+                assert_eq!(
+                    reply.terminal.committed_effect().state(),
+                    CommittedEffectState::Committed
+                );
+                call.control.cancellation().cancel();
+            }
+            reply
+        }
+    }
+
     #[test]
-    fn deadline_after_commit_returns_effect_unknown_then_retry_replays() {
+    fn cancellation_after_commit_returns_effect_unknown_then_retry_is_duplicate() {
         let root = TestRoot::new("effect-unknown");
-        let adapter = NcmProviderAdapter::new(surface(&root)).expect("construct adapter");
+        let controlled = Arc::new(CancelAfterCommitSurface {
+            inner: surface(&root),
+            cancel_next_observe: AtomicBool::new(true),
+        });
+        let adapter = NcmProviderAdapter::new(controlled).expect("construct adapter");
         let exact_scope = scope("project-effect-unknown");
         let ready = handshake(&adapter, &exact_scope);
         let (receipt, generation) = ready_parts(&ready);
-        let mut observation = observe_value(
+        let observation = observe_value(
             "source-effect-unknown",
-            "deadline command",
-            "deadline outcome",
+            "cancellation command",
+            "cancellation outcome",
         );
-        observation
-            .as_object_mut()
-            .expect("observation object")
-            .insert("test_sleep_after_commit_ms".to_owned(), json!(250));
+        // The real worker commits before the decorator cancels this call.
+        // No scheduler-dependent deadline decides whether dispatch happened.
         let unknown = adapter.invoke(&call(
             ProviderOperation::Observe,
             &exact_scope,
@@ -691,7 +1107,7 @@ mod enabled {
             generation,
             Some("observe-effect-unknown"),
             observation.clone(),
-            50,
+            10_000,
         ));
         assert_eq!(
             unknown.terminal.terminal_code(),
@@ -720,7 +1136,7 @@ mod enabled {
             &retry_receipt,
             retry_generation,
             Some("observe-effect-unknown"),
-            observation,
+            observation.clone(),
             10_000,
         ));
         assert_eq!(retried.terminal.terminal_code(), TerminalCode::Success);
@@ -728,19 +1144,32 @@ mod enabled {
             retried.terminal.committed_effect().state(),
             CommittedEffectState::Duplicate
         );
+        let replayed = invoke_after_handshake(
+            &adapter,
+            &exact_scope,
+            ProviderOperation::Observe,
+            Some("observe-effect-unknown"),
+            observation,
+        );
+        assert_eq!(replayed.terminal.terminal_code(), TerminalCode::Success);
+        assert_eq!(
+            replayed.terminal.committed_effect().state(),
+            CommittedEffectState::Duplicate
+        );
         let recall = invoke_after_handshake(
             &adapter,
             &exact_scope,
             ProviderOperation::Recall,
             None,
-            json!({"query_text": "deadline command", "top_k": 5}),
+            json!({"query_text": "cancellation command", "top_k": 5}),
         );
         assert_eq!(recall.terminal.terminal_code(), TerminalCode::Success);
-        assert!(find_string(
-            &response_json(&recall),
-            "value_text",
-            "deadline outcome"
-        ));
+        let recalled = response_json(&recall);
+        let candidates = recalled["Candidates"]["candidates"]
+            .as_array()
+            .expect("recall candidate array");
+        assert_eq!(candidates.len(), 1, "observation must commit exactly once");
+        assert_eq!(candidates[0]["value_text"], "cancellation outcome");
     }
 
     struct LeakingSurface {

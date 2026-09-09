@@ -564,6 +564,13 @@ impl OwnedExactScope {
         }
     }
 
+    /// Returns the host's stable deletion key for a canonical source session
+    /// within this complete exact scope.
+    #[must_use]
+    pub fn session_forget_source_key(&self, session_id: &str) -> String {
+        format!("session:{}:{session_id}", self.exact_scope_sha256())
+    }
+
     /// Returns the canonical TraceDecay-owned digest of the complete exact
     /// scope. Provider-local namespaces must use a distinct derivation.
     #[must_use]

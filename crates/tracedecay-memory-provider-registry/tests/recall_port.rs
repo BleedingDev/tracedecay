@@ -529,6 +529,7 @@ async fn port_admits_only_exact_scope_current_candidates_and_reports_denials() {
         report.authorized_scope_bindings,
         RecallScopeBindingsV1::new([
             ScopeBinding::ExactCodingScope,
+            ScopeBinding::CheckoutObservations,
             ScopeBinding::ProjectFacts,
             ScopeBinding::ProfileFacts
         ])

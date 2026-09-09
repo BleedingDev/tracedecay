@@ -22,12 +22,12 @@ use tracedecay_domain::configuration::{
     ConfigurationLayerIdV1, ConfigurationReceiptId, ConfigurationRevisionId,
     ConfigurationSnapshotV1, ConfigurationValueV1, CredentialKindV1, CredentialReferenceId,
     CredentialReferenceMetadataV1, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
-    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
-    ProtectedChange, ProtectedChangePlan, ProtectedChangeSnapshotError,
-    RedactedConfigurationChangeV1, RollbackModeV1, RuleEffect, SOURCE_BINDINGS_SETTING_KEY,
-    SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY, ScopeControlOperationV1, ScopeSourceBinding,
-    SettingKey, SourceKindV1, USER_CODE_INDEX_WORKERS_SETTING_KEY, UserProfileId,
-    WORK_TOPOLOGY_POLICY_SETTING_KEY,
+    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, ProtectedChange, ProtectedChangePlan,
+    ProtectedChangeSnapshotError, RedactedConfigurationChangeV1, RollbackModeV1, RuleEffect,
+    SOURCE_BINDINGS_SETTING_KEY, SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY, ScopeControlOperationV1,
+    ScopeSourceBinding, SettingKey, SourceKindV1, USER_CODE_INDEX_WORKERS_SETTING_KEY,
+    UserProfileId, WORK_TOPOLOGY_POLICY_SETTING_KEY,
 };
 use tracedecay_domain::{AccessPolicyDigest, ActorId, ManifestDigest, UtcMicros, canonical_sha256};
 #[cfg(test)]
@@ -595,6 +595,7 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
             let registry = ConfigurationRegistry::core().map_err(ConfigurationError::validation)?;
             let additive_keys = [
                 INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
+                MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
                 MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
                 MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
                 SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,

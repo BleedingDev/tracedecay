@@ -3371,6 +3371,15 @@ fn candidate_scope_matches(scope: &Map<String, Value>, request_scope: &OwnedExac
                 && required("branch_identity", branch)
                 && required("agent_session_id", session)
         }
+        RecallScopeBinding::CheckoutObservations => {
+            required("profile_id", profile)
+                && required("project_id", project)
+                && required("repository_identity", repository)
+                && required("worktree_identity", worktree)
+                && required("branch_identity", branch)
+                && forbidden("agent_session_id")
+                && forbidden("resolved_scope_digest")
+        }
         RecallScopeBinding::ProjectFacts => {
             required("profile_id", profile)
                 && required("project_id", project)
@@ -3426,4 +3435,53 @@ fn candidate_entry(
         contains_forgotten_source: false,
     };
     (entry, content.to_vec())
+}
+
+#[cfg(test)]
+mod checkout_scope_tests {
+    use super::*;
+
+    #[test]
+    fn baseline_checkout_matching_requires_five_fields_and_empty_session_metadata() {
+        let request = OwnedExactScope::new(
+            "profile",
+            "project",
+            "repository",
+            "worktree",
+            "branch",
+            "session-b",
+            format!("sha256:{}", "b".repeat(64)),
+        )
+        .expect("scope");
+        let identity = json!({
+            "scope_binding": "checkout_observations", "profile_id": "profile", "project_id": "project",
+            "repository_identity": "repository", "worktree_identity": "worktree", "branch_identity": "branch",
+            "agent_session_id": "", "resolved_scope_digest": "",
+        });
+        let identity = identity.as_object().expect("identity");
+        assert!(candidate_scope_matches(identity, &request));
+        for field in [
+            "profile_id",
+            "project_id",
+            "repository_identity",
+            "worktree_identity",
+            "branch_identity",
+        ] {
+            for value in ["", "other"] {
+                let mut bad = identity.clone();
+                bad.insert(field.to_owned(), json!(value));
+                assert!(!candidate_scope_matches(&bad, &request), "{field}={value}");
+            }
+        }
+        for field in ["agent_session_id", "resolved_scope_digest"] {
+            let mut bad = identity.clone();
+            bad.insert(field.to_owned(), json!("origin-a"));
+            assert!(!candidate_scope_matches(&bad, &request));
+            bad.remove(field);
+            assert!(!candidate_scope_matches(&bad, &request));
+        }
+        let mut unknown = identity.clone();
+        unknown.insert("scope_binding".to_owned(), json!("unknown_checkout"));
+        assert!(!candidate_scope_matches(&unknown, &request));
+    }
 }

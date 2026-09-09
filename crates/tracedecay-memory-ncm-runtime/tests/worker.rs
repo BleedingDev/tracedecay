@@ -286,6 +286,73 @@ fn malformed_json_gets_typed_error_and_next_request_works() {
 }
 
 #[test]
+fn cancelled_queued_request_starts_no_child_and_owner_remains_usable() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = TempDir::new().unwrap();
+    let client = client(&root);
+    let checkpoints = Arc::new(AtomicUsize::new(0));
+    let probe = Arc::clone(&checkpoints);
+    // The caller's pre-enqueue check passes; every later queue/owner check
+    // observes cancellation, so this proves the queued path, not just entry.
+    let result = client.call_cancellable(
+        Request::new(18, 0, Operation::Health, "", json!({})),
+        CALL_DEADLINE,
+        Arc::new(move || probe.fetch_add(1, Ordering::AcqRel) != 0),
+    );
+    assert_eq!(result, Err(ClientError::Cancelled));
+    assert!(client.pid().is_none());
+    assert!(checkpoints.load(Ordering::Acquire) >= 2);
+    let next = client
+        .call(
+            Request::new(19, 0, Operation::Health, "", json!({})),
+            CALL_DEADLINE,
+        )
+        .unwrap();
+    assert_eq!(next.outcome, Outcome::Success);
+}
+
+#[test]
+fn inflight_cancellation_reaps_child_and_next_request_recovers() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let root = TempDir::new().unwrap();
+    let client = Arc::new(client(&root));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let call_client = Arc::clone(&client);
+    let call_cancelled = Arc::clone(&cancelled);
+    let call = thread::spawn(move || {
+        call_client.call_cancellable(
+            Request::new(
+                16,
+                0,
+                Operation::Handshake,
+                namespace(1),
+                json!({"test_sleep_before_ms": 1000}),
+            ),
+            CALL_DEADLINE,
+            Arc::new(move || call_cancelled.load(Ordering::Acquire)),
+        )
+    });
+    let deadline = Instant::now() + CALL_DEADLINE;
+    while client.pid().is_none() {
+        assert!(Instant::now() < deadline, "worker must enter request");
+        thread::yield_now();
+    }
+    let started = Instant::now();
+    cancelled.store(true, Ordering::Release);
+    assert_eq!(call.join().unwrap(), Err(ClientError::Cancelled));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(client.pid().is_none(), "cancelled child must be reaped");
+    let next = client
+        .call(
+            Request::new(17, 0, Operation::Health, "", json!({})),
+            CALL_DEADLINE,
+        )
+        .unwrap();
+    assert_eq!(next.outcome, Outcome::Success);
+    assert!(client.pid().is_some());
+}
+
+#[test]
 fn deadline_kills_mutating_worker_and_next_call_respawns() {
     let root = TempDir::new().expect("temp root");
     let client = client(&root);
@@ -317,96 +384,58 @@ fn deadline_kills_mutating_worker_and_next_call_respawns() {
 #[cfg(unix)]
 #[test]
 fn observe_killed_after_commit_reconciles_without_second_record() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = TempDir::new().expect("temp root");
-    let withheld_reply = root.path().join("withheld-reply");
-    let launcher = root.path().join("withhold-first-reply.sh");
-    let quote = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
-    let binary = quote(Path::new(BINARY));
-    let reply_path = quote(&withheld_reply);
-    // Keep the client's stdout pipe open on fd 3, but escrow the first worker's
-    // reply. A complete Success frame proves SQLite committed; elapsed time does
-    // not. `exec` preserves the supervised PID and leaves no proxy child behind.
-    fs::write(
-        &launcher,
-        format!(
-            "#!/bin/sh\nif [ ! -e {reply_path} ]; then\n  exec 3>&1\n  exec {binary} \"$@\" > {reply_path}\nfi\nexec {binary} \"$@\"\n"
-        ),
-    )
-    .expect("write reply-withholding launcher");
-    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))
-        .expect("make launcher executable");
-    let client = WorkerClient::spawn(&launcher, root.path(), options()).expect("client starts");
+    let client = client(&root);
     let ns = namespace(3);
-    let payload = observe_payload("reconcile-observe", "stable key", "stable value");
-    let committed = thread::scope(|scope| {
-        let pending = scope.spawn(|| {
-            client.call(
-                Request::new(30, 0, Operation::Observe, &ns, payload.clone()),
-                CALL_DEADLINE,
-            )
-        });
-        let expires = Instant::now() + CALL_DEADLINE;
-        let committed = loop {
-            assert!(
-                Instant::now() < expires,
-                "worker must commit before the deadline"
-            );
-            match fs::read(&withheld_reply) {
-                Ok(bytes) => match wire::read_reply(&mut bytes.as_slice()) {
-                    Ok(Some(reply)) => break reply,
-                    Ok(None) | Err(wire::FrameError::Truncated) => {}
-                    Err(error) => panic!("invalid withheld reply: {error}"),
-                },
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("read withheld reply: {error}"),
-            }
-            thread::sleep(Duration::from_millis(5));
+    let mut payload = observe_payload("reconcile-observe", "stable key", "stable value");
+    // This existing fault holds a successful, non-replayed mutation's reply
+    // after commit. The ordinary request deadline kills the worker. Only the
+    // durable replay assertion below proves that commit preceded the kill.
+    payload["test_sleep_after_commit_ms"] = json!(CALL_DEADLINE.as_millis() as u64);
+    let result = client.call(
+        Request::new(30, 0, Operation::Observe, &ns, payload),
+        CALL_DEADLINE,
+    );
+    if let Ok(reply) = &result {
+        let outcome = match &reply.outcome {
+            Outcome::Success => "success",
+            Outcome::Empty => "empty",
+            Outcome::Rejected(_) => "rejected",
+            Outcome::Busy => "busy",
+            Outcome::Cancelled => "cancelled",
+            Outcome::EffectUnknown => "effect_unknown",
+            Outcome::Incompatible => "incompatible",
+            Outcome::Corrupt => "corrupt",
+            Outcome::Unavailable(_) => "unavailable",
+            Outcome::Unsupported => "unsupported",
+            Outcome::BudgetExceeded => "budget_exceeded",
         };
-        assert_eq!(committed.outcome, Outcome::Success, "{committed:?}");
-        assert_eq!(committed.state_generation, 1);
-        assert_eq!(committed.payload.as_ref().unwrap()["replayed"], false);
-        assert!(
-            !pending.is_finished(),
-            "caller must not receive the acknowledgement"
-        );
-        let pid = client.pid().expect("committed worker is still supervised");
-        assert!(
-            Command::new("kill")
-                .arg("-9")
-                .arg(pid.to_string())
-                .status()
-                .expect("kill committed worker")
-                .success()
-        );
-        assert_eq!(
-            pending.join().expect("pending caller joins"),
-            Err(ClientError::EffectUnknown { op_id: 30 })
-        );
-        assert_eq!(client.pid(), None);
-        assert!(!process_exists(pid), "committed worker must be reaped");
-        committed
-    });
+        panic!("postcommit reply hold returned before the kill: outcome={outcome}");
+    }
+    assert_eq!(result, Err(ClientError::EffectUnknown { op_id: 30 }));
+    assert_eq!(
+        client.pid(),
+        None,
+        "deadline must reap the supervised child"
+    );
 
     let replay = client
         .reconcile_unknown("reconcile-observe")
         .expect("receipt replay succeeds after restart");
-    assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
-    assert_eq!(replay.state_generation, committed.state_generation);
-    assert_eq!(replay.payload.as_ref().unwrap()["replayed"], true);
+    assert_eq!(replay.outcome, Outcome::Success);
+    assert_eq!(replay.state_generation, 1);
     assert_eq!(
-        replay.payload.as_ref().unwrap()["record_id"],
-        committed.payload.as_ref().unwrap()["record_id"]
+        replay.payload.as_ref().unwrap()["replayed"],
+        true,
+        "the first attempt must have committed before it was killed",
     );
-
     let inspection = client
         .call(
             Request::new(31, 0, Operation::Inspection, &ns, json!({})),
             CALL_DEADLINE,
         )
         .expect("inspection succeeds");
-    assert_eq!(inspection.outcome, Outcome::Success, "{inspection:?}");
+    assert_eq!(inspection.outcome, Outcome::Success);
     assert_eq!(inspection.payload.as_ref().unwrap()["records"], 1);
     assert_eq!(inspection.payload.as_ref().unwrap()["commit_seq"], 1);
     assert_eq!(inspection.payload.as_ref().unwrap()["tick"], 1);

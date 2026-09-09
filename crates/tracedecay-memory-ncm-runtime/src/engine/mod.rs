@@ -17,6 +17,42 @@ use std::sync::{Arc, Mutex, RwLock};
 use tracedecay_memory_ncm_core::kernel::NcmKernel;
 use tracedecay_memory_ncm_core::types::{NcmConfig, RecordId, SourceId};
 
+/// Declares the production algorithm and pinned encoder without opening state,
+/// reading installed artifacts, or starting a worker. This is expected identity,
+/// never evidence that an installed worker is ready.
+pub fn production_identity_declaration() -> Result<
+    (
+        tracedecay_memory_ncm_core::types::AlgorithmIdentity,
+        crate::ports::EncoderIdentity,
+    ),
+    String,
+> {
+    use sha2::{Digest, Sha256};
+    let config_json = serde_json::to_string(&NcmConfig::default())
+        .map_err(|error| format!("serialize production config: {error}"))?;
+    let config_sha256 = Sha256::digest(config_json.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let encoder =
+        crate::embedding::PinnedEncoder::reference().map_err(|error| error.to_string())?;
+    let artifact_sha256 = encoder
+        .artifact_sha256()
+        .ok_or_else(|| "reference encoder manifest omitted ONNX digest".to_owned())?
+        .to_owned();
+    Ok((
+        tracedecay_memory_ncm_core::types::AlgorithmIdentity {
+            profile: tracedecay_memory_ncm_core::types::ALGORITHM_PROFILE.to_owned(),
+            config_sha256,
+        },
+        crate::ports::EncoderIdentity {
+            model: encoder.model,
+            artifact_sha256,
+            max_length: encoder.max_length,
+        },
+    ))
+}
+
 pub(crate) const MAX_RESIDENT_NAMESPACES: usize = 4;
 pub(crate) const MAX_CATALOG_NAMESPACES: usize = 32;
 pub(crate) const MAX_TOP_K: usize = 16;

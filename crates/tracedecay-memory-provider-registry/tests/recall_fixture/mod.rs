@@ -76,10 +76,11 @@ pub fn authorized_exact() -> RecallScopeBindingsV1 {
 /// mirroring `NATIVE_RECALL_SCOPE_BINDINGS`.
 ///
 /// Native attests owner-bound facts as `project_facts`/`profile_facts` and
-/// its provider-local staged session observations as `exact_coding_scope`.
+/// its provider-local staged session observations as `checkout_observations`.
 pub fn authorized_native() -> RecallScopeBindingsV1 {
     RecallScopeBindingsV1::new([
         ScopeBinding::ExactCodingScope,
+        ScopeBinding::CheckoutObservations,
         ScopeBinding::ProjectFacts,
         ScopeBinding::ProfileFacts,
     ])

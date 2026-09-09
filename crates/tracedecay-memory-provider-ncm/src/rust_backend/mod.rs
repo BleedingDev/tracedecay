@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
@@ -87,20 +87,19 @@ struct SurfaceState {
     identity: Option<RuntimeIdentity>,
 }
 
-/// Real NCM surface backed by one supervised `tracedecay-ncm-worker` process.
-pub struct RustNcmSurface {
+/// One serialized worker client and request identity authority shared by surfaces.
+///
+/// Sharing the owner serializes namespace creation and loads one model per worker.
+/// Adapter readiness and descriptor generations remain local to each surface.
+/// The last strong owner drops the existing bounded worker client and its process.
+pub struct RustNcmWorkerOwner {
     client: WorkerClient,
-    state: Mutex<SurfaceState>,
-    fallback_descriptor: ProviderDescriptor,
     next_request_id: AtomicU64,
 }
 
-impl RustNcmSurface {
-    /// Constructs a worker client and performs a read-only identity preflight.
-    ///
-    /// An unavailable production encoder is not a construction error: the
-    /// surface remains constructible and handshakes return a typed not-ready
-    /// terminal until a new surface is created after the model is installed.
+impl RustNcmWorkerOwner {
+    /// Admits a lazy worker owner. No child or model is started until a surface
+    /// performs its first preflight through the existing bounded client.
     pub fn new(config: RustNcmConfig) -> Result<Self, RustNcmError> {
         let checked_root = StateRoot::new(config.state_root.path().to_path_buf())
             .map_err(RustNcmError::StateRoot)?;
@@ -115,53 +114,13 @@ impl RustNcmSurface {
             config.worker_options,
         )
         .map_err(|error| RustNcmError::WorkerSpawn(error.to_string()))?;
-        let fallback_descriptor =
-            descriptor_for(PROVISIONAL_CONFIG_SHA256, "not-ready", "not-ready", 0)?;
-        let preflight = Request::new(
-            1,
-            DEFAULT_PREFLIGHT_MILLIS,
-            Operation::Handshake,
-            PREFLIGHT_NAMESPACE,
-            json!({"algorithm_profile": ALGORITHM_PROFILE}),
-        );
-        let (descriptor, identity) =
-            match client.call(preflight, Duration::from_millis(DEFAULT_PREFLIGHT_MILLIS)) {
-                Ok(reply) if reply.outcome == Outcome::Success => {
-                    let identity = parse_runtime_identity(&reply)?;
-                    let descriptor = descriptor_from_identity(&identity, reply.state_generation)?;
-                    (descriptor, Some(identity))
-                }
-                Ok(reply) if matches!(reply.outcome, Outcome::Unavailable(_)) => {
-                    (fallback_descriptor.clone(), None)
-                }
-                Ok(reply) => {
-                    return Err(RustNcmError::HandshakeIdentity(format!(
-                        "preflight outcome {:?}",
-                        reply.outcome
-                    )));
-                }
-                Err(ClientError::Spawn(detail)) => return Err(RustNcmError::WorkerSpawn(detail)),
-                Err(ClientError::RestartExhausted | ClientError::WorkerExited) => {
-                    return Err(RustNcmError::WorkerSpawn(
-                        "worker exited during identity preflight".to_owned(),
-                    ));
-                }
-                Err(error) => {
-                    return Err(RustNcmError::HandshakeIdentity(error.to_string()));
-                }
-            };
         Ok(Self {
             client,
-            state: Mutex::new(SurfaceState {
-                descriptor,
-                identity,
-            }),
-            fallback_descriptor,
-            next_request_id: AtomicU64::new(2),
+            next_request_id: AtomicU64::new(1),
         })
     }
 
-    /// Returns the current worker process identifier, when the lazy worker is alive.
+    /// Current child process identity, absent before launch or after exit.
     #[must_use]
     pub fn worker_pid(&self) -> Option<u32> {
         self.client.pid()
@@ -169,6 +128,179 @@ impl RustNcmSurface {
 
     fn request_id(&self) -> u64 {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+/// Project-local NCM identity over an owned or shared supervised worker process.
+pub struct RustNcmSurface {
+    worker: Arc<RustNcmWorkerOwner>,
+    state: Mutex<SurfaceState>,
+    fallback_descriptor: ProviderDescriptor,
+}
+
+impl RustNcmSurface {
+    /// Constructs a standalone worker owner and a read-only identity preflight.
+    ///
+    /// An unavailable encoder or executable remains typed not-ready. Recreate
+    /// the standalone owner, or restart its owning daemon, after installation.
+    pub fn new(config: RustNcmConfig) -> Result<Self, RustNcmError> {
+        Self::from_worker(Arc::new(RustNcmWorkerOwner::new(config)?))
+    }
+
+    /// Constructs fresh surface identity over an existing serialized worker.
+    ///
+    /// Every project wraps its own surface in its own adapter. Sharing this
+    /// owner never shares descriptor generation or accepted adapter readiness.
+    /// A worker started without its model must be recreated after installation.
+    pub fn from_worker(worker: Arc<RustNcmWorkerOwner>) -> Result<Self, RustNcmError> {
+        let fallback_descriptor =
+            descriptor_for(PROVISIONAL_CONFIG_SHA256, "not-ready", "not-ready", 0)?;
+        let preflight = Request::new(
+            worker.request_id(),
+            DEFAULT_PREFLIGHT_MILLIS,
+            Operation::Handshake,
+            PREFLIGHT_NAMESPACE,
+            json!({"algorithm_profile": ALGORITHM_PROFILE}),
+        );
+        let (descriptor, identity) = match worker
+            .client
+            .call(preflight, Duration::from_millis(DEFAULT_PREFLIGHT_MILLIS))
+        {
+            Ok(reply) if reply.outcome == Outcome::Success => {
+                let identity = parse_runtime_identity(&reply)?;
+                let descriptor = descriptor_from_identity(&identity, reply.state_generation)?;
+                (descriptor, Some(identity))
+            }
+            Ok(reply) if matches!(reply.outcome, Outcome::Unavailable(_)) => {
+                (fallback_descriptor.clone(), None)
+            }
+            Ok(reply) => {
+                return Err(RustNcmError::HandshakeIdentity(format!(
+                    "preflight outcome {:?}",
+                    reply.outcome
+                )));
+            }
+            // The owner exists and retries are already bounded by the
+            // worker client. Retain its real surface when the executable
+            // is absent or exits: handshakes report the existing typed
+            // unavailable terminal, exactly as missing-model preflight does.
+            Err(
+                ClientError::Spawn(_) | ClientError::RestartExhausted | ClientError::WorkerExited,
+            ) => (fallback_descriptor.clone(), None),
+            Err(error) => {
+                return Err(RustNcmError::HandshakeIdentity(error.to_string()));
+            }
+        };
+        Ok(Self {
+            worker,
+            state: Mutex::new(SurfaceState {
+                descriptor,
+                identity,
+            }),
+            fallback_descriptor,
+        })
+    }
+
+    /// Declares the pinned production surface over a shared lazy owner.
+    /// No preflight runs here. The first supervised handshake must prove this
+    /// immutable declaration before any instance identity or readiness exists.
+    pub fn from_production_worker(worker: Arc<RustNcmWorkerOwner>) -> Result<Self, RustNcmError> {
+        let (algorithm, encoder) =
+            tracedecay_memory_ncm_runtime::engine::production_identity_declaration()
+                .map_err(RustNcmError::HandshakeIdentity)?;
+        if algorithm.profile != ALGORITHM_PROFILE {
+            return Err(RustNcmError::HandshakeIdentity(
+                "production algorithm profile does not match adapter".to_owned(),
+            ));
+        }
+        let descriptor = descriptor_for(
+            &algorithm.config_sha256,
+            &encoder.model,
+            &encoder.artifact_sha256,
+            0,
+        )?;
+        Ok(Self {
+            worker,
+            state: Mutex::new(SurfaceState {
+                descriptor: descriptor.clone(),
+                identity: None,
+            }),
+            fallback_descriptor: descriptor,
+        })
+    }
+
+    /// Proves the worker's global implementation identity without changing
+    /// any session's descriptor generation, projection, or accepted readiness.
+    /// This read-only bootstrap is bounded by the caller and the existing
+    /// preflight ceiling; cancellation applies only to this worker request.
+    pub fn prove_provider_instance(
+        &self,
+        deadline: std::time::Instant,
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Option<String>, TerminalCode> {
+        if cancelled() {
+            return Err(TerminalCode::Cancelled);
+        }
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(TerminalCode::DeadlineExceeded)?
+            .min(Duration::from_millis(DEFAULT_PREFLIGHT_MILLIS));
+        let millis = u64::try_from(remaining.as_millis()).unwrap_or(DEFAULT_PREFLIGHT_MILLIS);
+        if millis == 0 {
+            return Err(TerminalCode::DeadlineExceeded);
+        }
+        let request = Request::new(
+            self.worker.request_id(),
+            millis,
+            Operation::Handshake,
+            PREFLIGHT_NAMESPACE,
+            json!({"algorithm_profile": ALGORITHM_PROFILE}),
+        );
+        let reply = self
+            .worker
+            .client
+            .call_cancellable(request, remaining, Arc::clone(&cancelled))
+            .map_err(|error| client_terminal_code(&error))?;
+        if cancelled() {
+            return Err(TerminalCode::Cancelled);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(TerminalCode::DeadlineExceeded);
+        }
+        if matches!(reply.outcome, Outcome::Unavailable(_)) {
+            return Ok(None);
+        }
+        if reply.outcome != Outcome::Success {
+            return Err(outcome_terminal_code(&reply.outcome));
+        }
+        let identity =
+            parse_runtime_identity(&reply).map_err(|_| TerminalCode::StateIncompatible)?;
+        let candidate = descriptor_from_identity(&identity, reply.state_generation)
+            .map_err(|_| TerminalCode::StateIncompatible)?;
+        if !same_immutable_descriptor(&self.descriptor_snapshot(), &candidate) {
+            return Err(TerminalCode::StateIncompatible);
+        }
+        Ok(Some(implementation_version(&identity.config_sha256)))
+    }
+
+    /// Instance identity proved by the real preflight, if the worker was ready.
+    /// This is the same identity authority used by the successful handshake;
+    /// state schema metadata never substitutes for an unproved instance.
+    pub fn provider_instance_id(&self) -> Result<Option<String>, RustNcmError> {
+        let state = self.state.lock().map_err(|_| {
+            RustNcmError::HandshakeIdentity("surface identity lock poisoned".to_owned())
+        })?;
+        Ok(state
+            .identity
+            .as_ref()
+            .map(|identity| implementation_version(&identity.config_sha256)))
+    }
+
+    /// Returns the shared worker process identifier, when the lazy worker is alive.
+    #[must_use]
+    pub fn worker_pid(&self) -> Option<u32> {
+        self.worker.worker_pid()
     }
 
     fn descriptor_snapshot(&self) -> ProviderDescriptor {
@@ -206,13 +338,15 @@ impl RustNcmSurface {
         millis: u64,
     ) -> Result<Reply, ClientError> {
         let request = Request::new(
-            self.request_id(),
+            self.worker.request_id(),
             millis,
             operation,
             namespace.as_str(),
             payload,
         );
-        self.client.call(request, Duration::from_millis(millis))
+        self.worker
+            .client
+            .call(request, Duration::from_millis(millis))
     }
 }
 
@@ -295,9 +429,15 @@ impl NcmCognitiveSurface for RustNcmSurface {
             }
         };
         let current = self.descriptor_snapshot();
-        if !same_immutable_descriptor(&current, &candidate)
-            || current.state_generation != candidate.state_generation
-        {
+        if !same_immutable_descriptor(&current, &candidate) {
+            return handshake_failure(
+                &self.fallback_descriptor.provider_id,
+                request,
+                TerminalCode::StateIncompatible,
+                "ncm.rust.handshake_immutable_identity_mismatch",
+            );
+        }
+        if current.state_generation != candidate.state_generation {
             let _ = self.install_identity(identity, reply.state_generation);
             return handshake_failure(
                 &self.fallback_descriptor.provider_id,
@@ -936,10 +1076,11 @@ fn observation_text(kind: &str, payload: &Map<String, Value>) -> Option<(String,
         .and_then(Value::as_object)
         .unwrap_or(payload);
     let pair = match kind {
-        "session.message_committed.v1" => (
-            string_at(nested, &["role", "message_kind", "summary"]),
-            string_at(nested, &["content", "message", "text", "summary"]),
-        ),
+        "session.message_committed.v1" => {
+            let content = string_at(nested, &["content", "message", "text", "summary"])?;
+            let role = string_at(nested, &["role", "message_kind", "summary"])?;
+            (Some(content.clone()), Some(format!("{role}: {content}")))
+        }
         "tool.execution_settled.v1" => (
             string_at(nested, &["command", "tool_name", "tool", "summary"]),
             string_at(

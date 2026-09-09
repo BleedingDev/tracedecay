@@ -15,8 +15,8 @@
 //! unable to re-enter a prompt while remaining fully audit-visible.
 //!
 //! Provider assertions cannot widen scope or validity. Every candidate names
-//! the [`ScopeBinding`] it attests (`exact_coding_scope`, `project_facts`, or
-//! `profile_facts`, mirroring the authority-matrix namespaces); the host
+//! the [`ScopeBinding`] it attests (`exact_coding_scope`, `checkout_observations`,
+//! `project_facts`, or `profile_facts`, following the authority-matrix boundaries); the host
 //! admits a binding only when the registry recorded it as authorized for the
 //! provider at registration ([`RecallScopeBindingsV1`], carried with the
 //! admitted call and never read from a reply), and then applies that
@@ -150,6 +150,9 @@ pub enum ScopeField {
 pub enum ScopeBinding {
     /// All seven identity fields bind byte-for-byte to the admitted scope.
     ExactCodingScope,
+    /// A staged observation of this checkout: profile, project, repository,
+    /// worktree and branch bind; session and resolved-scope digest are forbidden.
+    CheckoutObservations,
     /// A project-owned fact: profile and project bind; repository, worktree,
     /// and branch are optional; session and resolved-scope digest are
     /// forbidden.
@@ -165,6 +168,7 @@ impl ScopeBinding {
     pub const fn as_wire(self) -> &'static str {
         match self {
             Self::ExactCodingScope => "exact_coding_scope",
+            Self::CheckoutObservations => "checkout_observations",
             Self::ProjectFacts => "project_facts",
             Self::ProfileFacts => "profile_facts",
         }
@@ -175,6 +179,7 @@ impl ScopeBinding {
     pub fn from_wire(value: &str) -> Option<Self> {
         match value {
             "exact_coding_scope" => Some(Self::ExactCodingScope),
+            "checkout_observations" => Some(Self::CheckoutObservations),
             "project_facts" => Some(Self::ProjectFacts),
             "profile_facts" => Some(Self::ProfileFacts),
             _ => None,
@@ -186,6 +191,12 @@ impl ScopeBinding {
     const fn field_rule(self, field: ScopeField) -> ScopeFieldRule {
         match self {
             Self::ExactCodingScope => ScopeFieldRule::RequiredEqual,
+            Self::CheckoutObservations => match field {
+                ScopeField::AgentSessionId | ScopeField::ResolvedScopeDigest => {
+                    ScopeFieldRule::Forbidden
+                }
+                _ => ScopeFieldRule::RequiredEqual,
+            },
             Self::ProjectFacts => match field {
                 ScopeField::ProfileId | ScopeField::ProjectId => ScopeFieldRule::RequiredEqual,
                 ScopeField::RepositoryIdentity
@@ -1481,30 +1492,24 @@ const SESSION_OBSERVATION_MEMORY_CLASS: &str = "session_observation";
 /// Host-owned policy relating a candidate's declared memory class to the
 /// scope binding it may be admitted under.
 ///
-/// Provider authorization is *provider-wide*: a provider authorized for
-/// `exact_coding_scope`, `project_facts`, and `profile_facts` may use any of
-/// the three on any candidate, and [`check_scope`] then applies only that
-/// binding's own field rules. For a staged session observation that is not
-/// enough. `project_facts` and `profile_facts` make repository, worktree and
-/// branch optional and *forbid* session identity and the resolved scope
-/// digest, so a session observation wearing one of them would be admitted in
-/// a different checkout, a different branch, or a different agent session
-/// than the one it was observed in — precisely the cross-scope leak the exact
-/// binding exists to prevent. A session observation is therefore admissible
-/// only under `exact_coding_scope`, which requires all seven identity fields
-/// byte-equal.
+/// Provider authorization is provider-wide, while session observations must
+/// retain all five checkout identities. They may use the fully exact binding
+/// or the Native-authorized checkout binding; project/profile fact bindings
+/// would make checkout fields optional or forbidden and are never admissible
+/// for this class. Session and resolved-scope identity remain origin metadata
+/// when the candidate uses the checkout binding.
 ///
-/// The rule is deliberately one-directional. It constrains the class the host
-/// knows is checkout- and session-bound; it does not dictate which binding a
-/// canonical fact class must use, because a fact's ownership binding is the
-/// provider's own attestation about a record the host can independently
-/// confirm.
+/// This rule constrains session observations without changing canonical facts'
+/// existing owner-bound admission.
 fn check_class_binding(
     memory_class: &Value,
     binding: ScopeBinding,
 ) -> Result<(), RecallDenialReason> {
     if memory_class.as_str() == Some(SESSION_OBSERVATION_MEMORY_CLASS)
-        && binding != ScopeBinding::ExactCodingScope
+        && !matches!(
+            binding,
+            ScopeBinding::ExactCodingScope | ScopeBinding::CheckoutObservations
+        )
     {
         return Err(RecallDenialReason::MemoryClassBindingUnauthorized {
             memory_class: SESSION_OBSERVATION_MEMORY_CLASS.to_owned(),

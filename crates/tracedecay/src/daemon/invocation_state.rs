@@ -40,6 +40,8 @@ mod project_invocation;
 #[derive(Clone)]
 pub(crate) struct DaemonInvocationState {
     pub(super) lsp_session_registry: Arc<tokio::sync::Mutex<LspSessionRegistry>>,
+    #[cfg(feature = "memory-provider-host")]
+    pub(super) ncm_worker_owner: Arc<project_composition::NcmWorkerOwnerSlot>,
     pub(super) service: DaemonInvocationService,
     pub(super) github_credential_lifecycle:
         github_credential_lifecycle::DaemonGitHubReadOnlyCredentialLifecycleV1,
@@ -82,6 +84,8 @@ impl DaemonInvocationState {
                 LspSessionRegistry::default(),
             )),
             service,
+            #[cfg(feature = "memory-provider-host")]
+            ncm_worker_owner: Arc::new(project_composition::NcmWorkerOwnerSlot::default()),
             github_credential_lifecycle:
                 github_credential_lifecycle::DaemonGitHubReadOnlyCredentialLifecycleV1::default(),
             code_index_schedulers,

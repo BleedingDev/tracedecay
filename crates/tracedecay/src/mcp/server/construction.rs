@@ -212,7 +212,7 @@ pub(crate) struct McpServerConstructionContext {
     #[cfg(feature = "memory-provider-host")]
     pub(crate) memory_provider_host_mount: Option<MemoryProviderHostMount>,
     #[cfg(feature = "memory-provider-host")]
-    pub(crate) observation_journey_mount: Option<ObservationJourneyMount>,
+    pub(crate) observation_journey_mount: Vec<ObservationJourneyMount>,
     #[cfg(feature = "memory-provider-host")]
     pub(crate) cognitive_recall_mount: Option<CognitiveRecallMount>,
     pub(crate) project_server_live: Option<Arc<AtomicBool>>,
@@ -327,7 +327,7 @@ impl McpServerConstructionContext {
             #[cfg(feature = "memory-provider-host")]
             memory_provider_host_mount: None,
             #[cfg(feature = "memory-provider-host")]
-            observation_journey_mount: None,
+            observation_journey_mount: Vec::new(),
             #[cfg(feature = "memory-provider-host")]
             cognitive_recall_mount: None,
             project_server_live: None,
@@ -437,7 +437,7 @@ impl McpServerConstructionContext {
             #[cfg(feature = "memory-provider-host")]
             memory_provider_host_mount: None,
             #[cfg(feature = "memory-provider-host")]
-            observation_journey_mount: None,
+            observation_journey_mount: Vec::new(),
             #[cfg(feature = "memory-provider-host")]
             cognitive_recall_mount: None,
             project_server_live: None,
@@ -509,7 +509,7 @@ impl McpServerConstructionContext {
             #[cfg(feature = "memory-provider-host")]
             memory_provider_host_mount: None,
             #[cfg(feature = "memory-provider-host")]
-            observation_journey_mount: None,
+            observation_journey_mount: Vec::new(),
             #[cfg(feature = "memory-provider-host")]
             cognitive_recall_mount: None,
             project_server_live: None,
@@ -716,7 +716,7 @@ impl McpServerConstructionContext {
 
     #[cfg(feature = "memory-provider-host")]
     pub(crate) fn with_observation_journey_mount(mut self, mount: ObservationJourneyMount) -> Self {
-        self.observation_journey_mount = Some(mount);
+        self.observation_journey_mount.push(mount);
         self
     }
 

@@ -2520,3 +2520,214 @@ fn snapshot_restore_request_is_measured_against_snapshot_bytes() {
     );
     assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 1);
 }
+
+fn canonical_message_payload(content: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "observation_kind": "session.message_committed.v1",
+        "payload_contract": "tracedecay.memory.observation.session-message.v1",
+        "canonical_payload": {
+            "version": 1,
+            "provider": "claude",
+            "native_record_kind": "message",
+            "stable_record_id": "project-a:private-record",
+            "relations": {"session_id": "canonical-host-session", "project_id": "project-a"},
+            "facts": [{"kind": "message", "role": "assistant", "content": content,
+                "model": "private-model", "request_id": "private-request"}]
+        }
+    })
+}
+
+fn invoke_projected_payload(
+    operation: ProviderOperation,
+    payload: &serde_json::Value,
+) -> (ProviderReply, Option<NcmSurfaceCall>) {
+    let surface = Arc::new(
+        MockSurface::new(NCM_PROVIDER_ID, &["deletion.by_source.v1"], false)
+            .with_safe_response_payload(),
+    );
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+    let mut request = ready_call(&provider, operation);
+    request.payload = canonical_payload(operation, &serde_json::to_vec(payload).expect("JSON"));
+    let reply = provider.invoke(&admitted(request));
+    let captured = surface.last_call.lock().expect("call lock").clone();
+    (reply, captured)
+}
+
+#[test]
+fn canonical_message_projects_text_and_strips_host_metadata() {
+    for (content, expected) in [
+        (serde_json::json!("safe message"), "safe message"),
+        (
+            serde_json::json!({"text": " safe message ", "ignored": "project-a"}),
+            "safe message",
+        ),
+        (
+            serde_json::json!(["first", {"type": "text", "text": "second"}]),
+            "first\nsecond",
+        ),
+    ] {
+        let (reply, captured) = invoke_projected_payload(
+            ProviderOperation::Observe,
+            &canonical_message_payload(content),
+        );
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+        let captured = captured.expect("projected surface call");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&captured.payload.bytes).expect("JSON");
+        let projected = payload["canonical_payload"]
+            .as_object()
+            .expect("projection");
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected["role"], "assistant");
+        assert_eq!(projected["content"], expected);
+        assert_eq!(
+            projected["forget_source_key"]
+                .as_str()
+                .expect("opaque source")
+                .len(),
+            64
+        );
+        let text = String::from_utf8(captured.payload.bytes).expect("UTF-8");
+        for forbidden in [
+            "canonical-host-session",
+            "project-a",
+            "private-record",
+            "private-model",
+            "private-request",
+            "relations",
+            "stable_record_id",
+            "facts",
+        ] {
+            assert!(!text.contains(forbidden), "metadata leaked: {forbidden}");
+        }
+    }
+}
+
+#[test]
+fn canonical_message_accepts_provider_native_record_labels() {
+    for native_kind in ["message", "user", "assistant", "response_item", "event_msg"] {
+        let mut payload =
+            canonical_message_payload(serde_json::json!({"text": "visible normalized message"}));
+        payload["canonical_payload"]["native_record_kind"] = serde_json::json!(native_kind);
+        let (reply, captured) = invoke_projected_payload(ProviderOperation::Observe, &payload);
+        assert_eq!(
+            reply.terminal.terminal_code(),
+            TerminalCode::Success,
+            "native kind: {native_kind}"
+        );
+        let captured: serde_json::Value =
+            serde_json::from_slice(&captured.expect("projected message").payload.bytes)
+                .expect("JSON");
+        assert_eq!(
+            captured["canonical_payload"]["content"],
+            "visible normalized message"
+        );
+    }
+}
+
+#[test]
+fn canonical_message_refuses_malformed_shape_and_content_identity_leaks() {
+    let original = canonical_message_payload(serde_json::json!("safe message"));
+    let mut cases = Vec::new();
+    for (field, replacement) in [
+        ("version", serde_json::json!(2)),
+        ("provider", serde_json::json!(null)),
+        ("native_record_kind", serde_json::json!("")),
+        ("native_record_kind", serde_json::json!(null)),
+        ("stable_record_id", serde_json::json!("")),
+        ("relations", serde_json::json!({"session_id": " "})),
+        ("relations", serde_json::json!({})),
+        ("relations", serde_json::json!({"session_id": 42})),
+        ("facts", serde_json::json!([])),
+        (
+            "facts",
+            serde_json::json!([{"kind": "message", "role": "assistant", "content": {"image": "opaque"}}]),
+        ),
+    ] {
+        let mut payload = original.clone();
+        payload["canonical_payload"][field] = replacement;
+        cases.push(payload);
+    }
+    for content in [
+        "actual project-a content",
+        "actual request-a content",
+        "actual session-a content",
+        "actual operation-observation.accept.v1 content",
+    ] {
+        cases.push(canonical_message_payload(serde_json::json!(content)));
+    }
+    for payload in cases {
+        let (reply, captured) = invoke_projected_payload(ProviderOperation::Observe, &payload);
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::InvalidRequest);
+        assert!(captured.is_none(), "refused payload never reaches surface");
+    }
+}
+
+#[test]
+fn observe_and_delete_source_aliases_share_one_restart_stable_opaque_key() {
+    let session = "canonical-host-session";
+    let raw_source = scope().session_forget_source_key(session);
+    assert_eq!(
+        raw_source,
+        format!("session:{}:{session}", scope().exact_scope_sha256())
+    );
+    let (_, observed) = invoke_projected_payload(
+        ProviderOperation::Observe,
+        &canonical_message_payload(serde_json::json!("safe message")),
+    );
+    let observed: serde_json::Value =
+        serde_json::from_slice(&observed.expect("observe").payload.bytes).expect("JSON");
+    let expected = &observed["canonical_payload"]["forget_source_key"];
+    // Each invocation constructs a fresh adapter: no process-local mapping is needed.
+    for alias in ["source", "source_id", "forget_source_key"] {
+        let payload = serde_json::json!({alias: raw_source});
+        let (reply, deleted) =
+            invoke_projected_payload(ProviderOperation::DeleteBySource, &payload);
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+        let deleted: serde_json::Value =
+            serde_json::from_slice(&deleted.expect("delete").payload.bytes).expect("JSON");
+        assert_eq!(&deleted["source"], expected);
+    }
+    for source_identity in [
+        serde_json::json!(raw_source),
+        serde_json::json!({"forget_source_key": raw_source}),
+        serde_json::json!({"source_event_sha256": raw_source}),
+        serde_json::json!({"source_event_id": raw_source}),
+    ] {
+        let payload = serde_json::json!({
+            "observation_kind": "tool.execution_settled.v1",
+            "payload_contract": "tracedecay.memory.observation.tool-execution.v1",
+            "source_identity": source_identity,
+            "canonical_payload": {"command": "build", "outcome_summary": "passed"}
+        });
+        let (reply, captured) = invoke_projected_payload(ProviderOperation::Observe, &payload);
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+        let captured: serde_json::Value =
+            serde_json::from_slice(&captured.expect("legacy observe").payload.bytes).expect("JSON");
+        assert_eq!(
+            &captured["canonical_payload"]["forget_source_key"],
+            expected
+        );
+        assert!(captured.get("source_identity").is_none());
+    }
+}
+
+#[test]
+fn conflicting_or_malformed_source_aliases_fail_closed() {
+    for payload in [
+        serde_json::json!({"source": "first", "source_id": "second"}),
+        serde_json::json!({"source": "first", "forget_source_key": 42}),
+    ] {
+        let (_, captured) = invoke_projected_payload(ProviderOperation::DeleteBySource, &payload);
+        assert!(captured.is_none());
+    }
+    for source_identity in [
+        serde_json::json!("different"),
+        serde_json::json!({"source_event_id": "first", "source_event_sha256": "second"}),
+    ] {
+        let payload = serde_json::json!({"canonical_payload": {"forget_source_key": "first"},
+            "source_identity": source_identity});
+        let (_, captured) = invoke_projected_payload(ProviderOperation::Observe, &payload);
+        assert!(captured.is_none());
+    }
+}

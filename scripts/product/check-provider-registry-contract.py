@@ -418,7 +418,7 @@ def validate_registration(contract: dict[str, Any], errors: list[str]) -> None:
         'registration_contract.recall_scope_bindings',
         errors,
     )
-    scope_binding_values = ['exact_coding_scope', 'project_facts', 'profile_facts']
+    scope_binding_values = ['exact_coding_scope', 'checkout_observations', 'project_facts', 'profile_facts']
     if bindings.get('provider_may_self_declare') is not False:
         errors.append('providers cannot self-declare recall scope bindings')
     if bindings.get('values') != scope_binding_values:
@@ -436,9 +436,9 @@ def validate_registration(contract: dict[str, Any], errors: list[str]) -> None:
             errors.append(f'recall scope bindings for {provider_id} must be a unique non-empty list')
         elif any(value not in scope_binding_values for value in declared):
             errors.append(f'recall scope bindings for {provider_id} name an unknown binding')
-    if declarations.get('tracedecay.native') != ['exact_coding_scope', 'project_facts', 'profile_facts']:
+    if declarations.get('tracedecay.native') != ['exact_coding_scope', 'checkout_observations', 'project_facts', 'profile_facts']:
         errors.append(
-            'tracedecay.native must be authorized for exact_coding_scope, project_facts, '
+            'tracedecay.native must be authorized for exact_coding_scope, checkout_observations, project_facts, '
             'and profile_facts only'
         )
     if declarations.get('ncm') != ['exact_coding_scope']:

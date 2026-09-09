@@ -170,7 +170,22 @@ impl WorkerClient {
     }
 
     /// Sends one bounded call and waits through the hard-kill escalation budget.
-    pub fn call(&self, mut request: Request, deadline: Duration) -> Result<Reply, ClientError> {
+    pub fn call(&self, request: Request, deadline: Duration) -> Result<Reply, ClientError> {
+        self.call_cancellable(request, deadline, Arc::new(|| false))
+    }
+
+    /// Sends one bounded request with a caller-owned cancellation probe.
+    /// Cancellation retires only this request, using the existing kill/reap
+    /// path if it reached the child. The shared owner remains available.
+    pub fn call_cancellable(
+        &self,
+        mut request: Request,
+        deadline: Duration,
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Reply, ClientError> {
+        if cancelled() || deadline.is_zero() {
+            return Err(ClientError::Cancelled);
+        }
         let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
         request.deadline_ms = deadline_ms;
         let logical_request = request.clone();
@@ -208,6 +223,7 @@ impl WorkerClient {
             expires,
             queued_bytes: frame_bytes,
             response: response_tx,
+            cancelled: Arc::clone(&cancelled),
         };
         match self.calls.try_send(command) {
             Ok(()) => {}
@@ -225,10 +241,34 @@ impl WorkerClient {
         let wait = deadline
             .saturating_add(KILL_ESCALATION)
             .saturating_add(Duration::from_millis(100));
-        let mut result = match response_rx.recv_timeout(wait) {
-            Ok(result) => result,
-            Err(RecvTimeoutError::Timeout) => Err(ClientError::Cancelled),
-            Err(RecvTimeoutError::Disconnected) => Err(ClientError::OwnerStopped),
+        let mut wait_until = Instant::now()
+            .checked_add(wait)
+            .unwrap_or_else(Instant::now);
+        let mut cancellation_seen = false;
+        let mut result = loop {
+            if !cancellation_seen && cancelled() {
+                cancellation_seen = true;
+                wait_until =
+                    wait_until.min(Instant::now() + KILL_ESCALATION + Duration::from_millis(100));
+            }
+            let Some(remaining) = wait_until.checked_duration_since(Instant::now()) else {
+                break Err(if cancellation_seen {
+                    indeterminate_or(&request, ClientError::Cancelled)
+                } else {
+                    ClientError::Cancelled
+                });
+            };
+            match response_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok(result) => {
+                    break if (cancellation_seen || cancelled()) && result.is_ok() {
+                        Err(indeterminate_or(&request, ClientError::Cancelled))
+                    } else {
+                        result
+                    };
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break Err(ClientError::OwnerStopped),
+            }
         };
         if let Ok(reply) = result {
             result = self.hydrate_snapshot_export(&request, reply);
@@ -541,6 +581,7 @@ struct OwnerCommand {
     expires: Instant,
     queued_bytes: usize,
     response: SyncSender<Result<Reply, ClientError>>,
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 #[derive(Clone)]
@@ -568,7 +609,7 @@ fn owner_loop(
             Err(RecvTimeoutError::Disconnected) => break,
         };
         queued_bytes.fetch_sub(command.queued_bytes, Ordering::AcqRel);
-        if Instant::now() >= command.expires {
+        if (command.cancelled)() || Instant::now() >= command.expires {
             let _ = command.response.send(Err(ClientError::Cancelled));
             continue;
         }
@@ -592,7 +633,12 @@ fn owner_loop(
             }
         }
         let result = match process.as_mut() {
-            Some(worker) => worker.execute(&command.request, command.expires, &shutdown),
+            Some(worker) => worker.execute(
+                &command.request,
+                command.expires,
+                &shutdown,
+                command.cancelled.as_ref(),
+            ),
             None => Err(ClientError::OwnerStopped),
         };
         let abnormal = matches!(
@@ -606,7 +652,7 @@ fn owner_loop(
         if abnormal && let Some(worker) = process.take() {
             worker.terminate(false);
         }
-        if abnormal {
+        if abnormal && !(command.cancelled)() {
             restart_failures = restart_failures.saturating_add(1);
         } else if result.is_ok() {
             restart_failures = 0;
@@ -711,7 +757,11 @@ impl WorkerProcess {
         request: &Request,
         expires: Instant,
         shutdown: &AtomicBool,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<Reply, ClientError> {
+        if cancelled() {
+            return Err(ClientError::Cancelled);
+        }
         let remaining = remaining(expires).ok_or_else(|| timeout_error(request))?;
         let mut outbound = request.clone();
         outbound.deadline_ms = u64::try_from(remaining.as_millis())
@@ -725,14 +775,18 @@ impl WorkerProcess {
         self.writer
             .send(WriterCommand::Frame(frame, ack_tx))
             .map_err(|_| ClientError::WorkerExited)?;
-        match wait_channel(&ack_rx, expires, shutdown) {
+        match wait_channel(&ack_rx, expires, shutdown, cancelled) {
             Ok(Ok(())) => {}
             Ok(Err(detail)) => return Err(ClientError::Transport(detail)),
             Err(WaitError::Deadline) => return Err(timeout_error(request)),
-            Err(WaitError::Shutdown) => return Err(ClientError::Cancelled),
+            // The writer may have sent the frame before cancellation was
+            // observed. A mutating operation is indeterminate until reconciled.
+            Err(WaitError::Shutdown) => {
+                return Err(indeterminate_or(request, ClientError::Cancelled));
+            }
             Err(WaitError::Disconnected) => return Err(ClientError::WorkerExited),
         }
-        let reply = match wait_channel(&self.replies, expires, shutdown) {
+        let reply = match wait_channel(&self.replies, expires, shutdown, cancelled) {
             Ok(Ok(reply)) => reply,
             Ok(Err(detail)) => {
                 return Err(indeterminate_or(
@@ -851,9 +905,10 @@ fn wait_channel<T>(
     receiver: &Receiver<T>,
     expires: Instant,
     shutdown: &AtomicBool,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<T, WaitError> {
     loop {
-        if shutdown.load(Ordering::Acquire) {
+        if shutdown.load(Ordering::Acquire) || cancelled() {
             return Err(WaitError::Shutdown);
         }
         let remaining = remaining(expires).ok_or(WaitError::Deadline)?;

@@ -243,17 +243,15 @@ class ProviderRegistryContractTest(unittest.TestCase):
 
     def test_rejects_drifted_native_recall_scope_bindings(self) -> None:
         # Native's authorized set is pinned exactly. It now spans the whole
-        # closed vocabulary — owner facts plus the exact coding scope its
-        # staged session observations are attested under — so drift is proved
-        # by narrowing it rather than by appending a fourth value that the
-        # vocabulary does not contain.
+        # closed vocabulary — owner facts plus exact and checkout observations —
+        # so drift is proved by narrowing it.
         self.mutate_contract(
             lambda contract: contract["registration_contract"]["recall_scope_bindings"][
                 "provider_declarations"
             ].__setitem__("tracedecay.native", ["project_facts", "profile_facts"])
         )
         self.assert_rejected(
-            "tracedecay.native must be authorized for exact_coding_scope, project_facts, "
+            "tracedecay.native must be authorized for exact_coding_scope, checkout_observations, project_facts, "
             "and profile_facts only"
         )
 
@@ -273,6 +271,10 @@ class ProviderRegistryContractTest(unittest.TestCase):
                 "provider_declarations"
             ].__setitem__("ncm", ["project_facts"])
         )
+        self.assert_rejected("ncm must be authorized for exact_coding_scope only")
+
+    def test_rejects_ncm_checkout_observation_authorization(self) -> None:
+        self.mutate_contract(lambda contract: contract["registration_contract"]["recall_scope_bindings"]["provider_declarations"]["ncm"].append("checkout_observations"))
         self.assert_rejected("ncm must be authorized for exact_coding_scope only")
 
     def test_rejects_registration_without_recall_scope_bindings_field(self) -> None:

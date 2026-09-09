@@ -8,16 +8,23 @@
 //! with native payloads on stdin). The later agent question is
 //! `tracedecay tool tracedecay_context`. Nothing in this file constructs a
 //! hook envelope, seals a binding, or runs an administrative import; the only
-//! thing that touches the daemon between "no journal rows" and "a settled
-//! journal row" is the hook process.
+//! fixture action that can ingest between the negative control and the first
+//! settled rows is the shipped hook process.
 //!
 //! That ordering is the point. The daemon runs a transcript import when a
 //! project mounts, so a journey that writes the transcript *before* the daemon
 //! comes up cannot tell a working hook from a broken one — startup would have
 //! ingested the same rows. Here the daemon is already up and has already
 //! mounted the project (the baseline `tracedecay_context` call below forces
-//! that) when the transcript is written, and the journal is proved empty and
-//! *stays* empty across a bounded settling window before the hook runs.
+//! that). The fixture waits for startup import and projection completion before
+//! writing the transcript, then proves the journal stays empty across a bounded
+//! settling window before the hook runs. Background history reconciliation
+//! remains enabled; this is a bounded causal control, not global hook exclusivity.
+//!
+//! The ignored real-NCM variants also enable the canonical NCM observer setting
+//! before restart, then require independent applied receipts in both journals.
+//! They share only the installed model artifacts; mutable NCM state belongs to
+//! the same isolated HOME as the daemon. Native remains the active recall route.
 //!
 //! # What this proves about the product
 //!
@@ -40,11 +47,14 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tracedecay_daemon_identity::authority::DaemonAuthorityRecord;
+use tracedecay_daemon_protocol::BrokerStream;
 use tracedecay_domain::configuration::{
     MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
 };
 use tracedecay_memory_observation::{
-    DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1, ObservationJournalReaderV1,
+    DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
+    ObservationCommittedEffectV1, ObservationJournalReaderV1, ObservationOutcomeV1,
     RetentionPolicyV1, SqliteObservationJournal,
 };
 
@@ -71,6 +81,11 @@ const CONFIGURED_PROVIDER_ID: &str = "tracedecay.native";
 
 /// File name of the durable observation journal the mounted journey owns.
 const JOURNAL_FILE_NAME: &str = "memory-observation-journal-v1.sqlite3";
+
+/// Matches the adapter's declared `tracedecay_memory_provider_ncm::NCM_PROVIDER_ID`.
+/// This CLI target deliberately has no direct dependency on the adapter.
+const NCM_OBSERVER_PROVIDER_ID: &str = "ncm";
+const NCM_JOURNAL_FILE_NAME: &str = "memory-observation-ncm-journal-v1.sqlite3";
 
 /// Observation kind the journey admits for host session messages.
 const SESSION_MESSAGE_OBSERVATION_KIND: &str = "session.message_committed.v1";
@@ -122,6 +137,7 @@ const GLOBAL_DB_ENV: &str = "TRACEDECAY_GLOBAL_DB";
 
 struct ClaudeHostJourney {
     codex: bool,
+    ncm_observer: bool,
     daemon: Option<Child>,
     home: TempDir,
     profile: PathBuf,
@@ -134,6 +150,7 @@ struct ClaudeHostJourney {
     /// for the duration of the journey. The observation is a read; it takes one
     /// handle and keeps it.
     journal: OnceLock<SqliteObservationJournal>,
+    ncm_journal: OnceLock<SqliteObservationJournal>,
 }
 
 impl ClaudeHostJourney {
@@ -142,6 +159,10 @@ impl ClaudeHostJourney {
     /// `DaemonRestart`, so the daemon is restarted before the journey begins:
     /// a composition that is already open keeps the mounts it opened with.
     fn start(codex: bool) -> Self {
+        Self::start_with_observer(codex, false)
+    }
+
+    fn start_with_observer(codex: bool, ncm_observer: bool) -> Self {
         let home = TempDir::new().expect("isolated home");
         let root = home.path().to_path_buf();
         let profile = root.join(".tracedecay");
@@ -154,18 +175,23 @@ impl ClaudeHostJourney {
 
         let mut journey = Self {
             codex,
+            ncm_observer,
             daemon: None,
             home,
             profile,
             project,
             bin_dir,
             journal: OnceLock::new(),
+            ncm_journal: OnceLock::new(),
         };
         journey.start_daemon();
         journey.initialize_registered_project();
         let project_id = journey.project_id();
         journey.commit_provider_gates(&project_id);
-        // Both gates are DaemonRestart settings: restart is what makes the
+        if ncm_observer {
+            journey.commit_real_ncm_observer(&project_id);
+        }
+        // All provider gates are DaemonRestart settings: restart is what makes the
         // provider host mount.
         journey.stop_daemon();
         journey.start_daemon();
@@ -263,6 +289,213 @@ impl ClaudeHostJourney {
             .to_owned()
     }
 
+    /// Reads the daemon's existing internal scheduler status transport. The CLI
+    /// public tool catalog intentionally omits this administration binding.
+    fn startup_sync_status(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        key: &str,
+        deadline: Instant,
+    ) -> Value {
+        use tokio::io::AsyncWriteExt;
+        use tracedecay_daemon_protocol::{
+            DaemonClientIdentity, DaemonConnection, DaemonHandshake, MovedStoreAdoption,
+            next_daemon_response_line, write_daemon_preamble,
+        };
+        let authority: DaemonAuthorityRecord = serde_json::from_slice(
+            &fs::read(daemon_authority_path(&self.profile)).expect("current daemon authority"),
+        )
+        .expect("canonical daemon authority");
+        assert_eq!(
+            Some(authority.pid),
+            self.daemon.as_ref().map(Child::id),
+            "status authority must name the fixture daemon"
+        );
+        assert_eq!(
+            fs::canonicalize(&authority.profile_root).expect("canonical authority profile"),
+            fs::canonicalize(&self.profile).expect("canonical isolated profile"),
+            "status authority must name the isolated profile"
+        );
+        let connection = DaemonConnection::new(
+            authority.endpoint.clone(),
+            Some(authority.auth_token.clone()),
+        )
+        .with_daemon_version(authority.version.clone());
+        let handshake = DaemonHandshake {
+            project_path: Some(self.project.clone()),
+            scope_prefix: None,
+            timings: false,
+            allow_init: false,
+            allow_initialize_root_routing: false,
+            client_identity: DaemonClientIdentity::new(
+                authority.profile_root,
+                self.profile.join("global.db"),
+            ),
+            client_version: authority.version,
+            client_instance_id: format!("startup-status-fixture-{}", std::process::id()),
+            tool_list_changed_capable: false,
+            catalog_version: String::new(),
+            moved_store_adoption: MovedStoreAdoption::Never,
+        };
+        let request_id = json!("startup-history-status");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let now = tracedecay_contracts::clock::now_micros();
+        let expires_at = tracedecay_domain::UtcMicros(
+            now.0
+                .saturating_add(i64::try_from(remaining.as_micros()).unwrap_or(i64::MAX)),
+        );
+        let request = json!({
+            "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+            "params": {"name": "tracedecay_admin_cli", "arguments": {
+                "action": "sessions_sync_status", "idempotency_key": key,
+            }, "_meta": tracedecay_mcp::tool_call_deadline_meta(expires_at)},
+        });
+        let phase = std::cell::Cell::new("connect");
+        runtime.block_on(async {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                let stream = BrokerStream::connect(&connection.endpoint)
+                    .await
+                    .expect("connect status transport");
+                let (reader, mut writer) = tokio::io::split(stream);
+                phase.set("preamble");
+                write_daemon_preamble(&mut writer, &connection, &handshake)
+                    .await
+                    .expect("status preamble");
+                phase.set("request_write");
+                let mut bytes = serde_json::to_vec(&request).expect("encode status request");
+                bytes.push(b'\n');
+                writer
+                    .write_all(&bytes)
+                    .await
+                    .expect("write status request");
+                writer.flush().await.expect("flush status request");
+                phase.set("response_read");
+                let mut reader = tokio::io::BufReader::new(reader);
+                let line = next_daemon_response_line(
+                    &mut reader,
+                    &connection,
+                    "startup history status",
+                    Duration::from_millis(250),
+                )
+                .await
+                .expect("bounded status response")
+                .expect("status response must exist");
+                let response: Value =
+                    serde_json::from_str(&line).expect("status JSON-RPC response");
+                assert_eq!(response["jsonrpc"], "2.0", "status JSON-RPC version");
+                assert_eq!(response["id"], request_id, "status response correlation");
+                assert!(
+                    response.get("error").is_none_or(Value::is_null),
+                    "status RPC must succeed"
+                );
+                let result = response
+                    .get("result")
+                    .filter(|result| result.is_object())
+                    .expect("status tool result");
+                assert_ne!(result["isError"], true, "status tool must succeed");
+                let payload = tracedecay::daemon::tool_json_payload(result, "tracedecay_admin_cli")
+                    .expect("status tool JSON payload");
+                phase.set("close");
+                writer.shutdown().await.expect("close status transport");
+                payload
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "startup status exceeded settlement deadline: phase={}",
+                    phase.get()
+                )
+            })
+        })
+    }
+
+    /// Drain the actual startup import and retained projection before the
+    /// fixture writes evidence. These read-only status calls schedule no import.
+    fn await_startup_history(&self) {
+        let authority: DaemonAuthorityRecord = serde_json::from_slice(
+            &fs::read(daemon_authority_path(&self.profile)).expect("current daemon authority"),
+        )
+        .expect("canonical daemon authority");
+        let key = format!(
+            "session-sync.startup.{}.{}",
+            authority.process_run_id,
+            self.project_id()
+        );
+        let deadline = Instant::now() + SETTLEMENT_BUDGET;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("startup status runtime");
+        loop {
+            let outcome = self.startup_sync_status(&runtime, &key, deadline);
+            let status = outcome["status"].as_str().expect("startup sync status");
+            match status {
+                "accepted" | "joined" => {}
+                "unavailable"
+                    if matches!(
+                        outcome["reason_code"].as_str(),
+                        Some(
+                            "session_sync_authority_unavailable"
+                                | "session_sync_operation_not_found"
+                        )
+                    ) => {}
+                "complete" => {
+                    assert_eq!(
+                        outcome["termination"], "completed",
+                        "startup import must complete successfully"
+                    );
+                    let coverage = outcome["coverage"]
+                        .as_array()
+                        .expect("startup source coverage");
+                    assert!(
+                        !coverage.is_empty(),
+                        "startup import must report source coverage"
+                    );
+                    // Match the shipped CLI await's remaining-work accounting.
+                    let remaining = coverage
+                        .iter()
+                        .try_fold(0_u64, |remaining, entry| {
+                            let coverage = entry.get("coverage")?;
+                            let deferred = match coverage.get("outcome")?.as_str()? {
+                                "complete" => 0,
+                                "partial" => coverage.get("deferred_units")?.as_u64()?,
+                                "backpressured" => coverage.get("rejected_units")?.as_u64()?,
+                                _ => return None,
+                            };
+                            Some(remaining.saturating_add(deferred))
+                        })
+                        .expect("truthful startup source coverage");
+                    assert_eq!(remaining, 0, "startup import must leave no remaining work");
+                    break;
+                }
+                other => panic!("startup import refused with status {other}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "startup import did not finish; last status {status}, reason {:?}",
+                outcome["reason_code"].as_str()
+            );
+            std::thread::sleep(JOURNAL_POLL_INTERVAL);
+        }
+        loop {
+            let doctor = self.tool("tracedecay_lcm_doctor", &json!({ "format": "json" }));
+            let projection = doctor
+                .pointer("/outcome/value/payload/projection")
+                .expect("project doctor must report its retained projection");
+            let state = projection["state"].as_str().expect("projection state");
+            match state {
+                "current" => return,
+                "stale" => {}
+                other => panic!("startup projection cannot converge from state {other}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "startup projection did not converge; last state {state}"
+            );
+            std::thread::sleep(JOURNAL_POLL_INTERVAL);
+        }
+    }
+
     /// One MCP tool call through the shipped `tracedecay tool` surface, which
     /// dispatches over the daemon transport exactly like any other client.
     ///
@@ -272,6 +505,14 @@ impl ClaudeHostJourney {
     fn tool_result(&self, name: &str, arguments: &Value) -> Value {
         let project = self.project.to_string_lossy().to_string();
         let payload = arguments.to_string();
+        let stage = match arguments
+            .pointer("/_meta/session_id")
+            .and_then(Value::as_str)
+        {
+            Some(session) if session == self.session_id() => "origin-session",
+            Some(_) => "next-session",
+            None => "unbound-session",
+        };
         let stdout = run_ok(
             &mut self.cli(&[
                 "tool",
@@ -282,7 +523,7 @@ impl ClaudeHostJourney {
                 &payload,
                 "--json",
             ]),
-            &format!("tracedecay tool {name}"),
+            &format!("tracedecay tool {name} ({stage})"),
         );
         let text = String::from_utf8(stdout).expect("tool output is UTF-8");
         serde_json::from_str(&text)
@@ -366,6 +607,51 @@ impl ClaudeHostJourney {
         );
     }
 
+    /// Only the opt-in real-worker tests call this. The existing TempDir owns
+    /// every mutable NCM namespace; only installed model artifacts are shared.
+    #[cfg(unix)]
+    fn commit_real_ncm_observer(&self, project_id: &str) {
+        let worker = PathBuf::from(
+            std::env::var_os("TRACEDECAY_NCM_WORKER").expect("real NCM worker binary is required"),
+        );
+        let installed = PathBuf::from(
+            std::env::var_os("TRACEDECAY_NCM_REAL_MODEL_ROOT")
+                .expect("installed pinned NCM model root is required"),
+        );
+        assert!(
+            worker.is_absolute() && worker.is_file(),
+            "worker must be an absolute binary path"
+        );
+        assert!(installed.is_absolute(), "model root must be absolute");
+        let models = installed
+            .join("models")
+            .canonicalize()
+            .expect("installed models directory");
+        assert!(models.is_dir(), "installed root must contain models");
+        let state_root = self.home.path().join("ncm-observer");
+        fs::create_dir(&state_root).expect("isolated NCM state root");
+        std::os::unix::fs::symlink(models, state_root.join("models"))
+            .expect("share only installed model artifacts");
+        self.configuration_set(
+            project_id,
+            "memory.provider_ncm_observer.v1",
+            json!({
+                "kind": "text",
+                "value": json!({
+                    "mode": "enabled",
+                    "worker_binary": worker.canonicalize().expect("canonical worker binary"),
+                    "state_root": state_root.canonicalize().expect("canonical isolated state root"),
+                }).to_string(),
+            }),
+            "configuration.idempotency.cli-journey-ncm-observer",
+        );
+    }
+
+    #[cfg(not(unix))]
+    fn commit_real_ncm_observer(&self, _project_id: &str) {
+        panic!("the opt-in real NCM model fixture requires Unix");
+    }
+
     /// Runs one shipped Claude lifecycle hook process, handing it the bytes
     /// Claude Code itself writes on stdin.
     fn run_hook(&self, subcommand: &str, payload: &Value) -> Output {
@@ -387,17 +673,8 @@ impl ClaudeHostJourney {
     /// Initial native lifecycle: Claude ingests at SessionStart; Codex registers
     /// its route there and captures the first completed turn at Stop.
     fn run_session_start_hook(&self) -> Output {
+        let started = self.run_session_start_event(self.session_id(), &self.transcript_path());
         if self.codex {
-            let started = self.run_hook(
-                "hook-codex-session-start",
-                &json!({
-                    "session_id": CODEX_SESSION,
-                    "cwd": self.project.to_string_lossy(),
-                    "transcript_path": self.transcript_path().to_string_lossy(),
-                    "hook_event_name": "SessionStart",
-                    "source": "startup",
-                }),
-            );
             assert!(
                 started.status.success(),
                 "Codex SessionStart must publish its route: {}",
@@ -405,11 +682,20 @@ impl ClaudeHostJourney {
             );
             return self.run_codex_stop_hook(1);
         }
+        started
+    }
+
+    /// The shipped SessionStart route binding, independent of turn capture.
+    fn run_session_start_event(&self, session_id: &str, transcript: &Path) -> Output {
         self.run_hook(
-            "hook-claude-session-start",
+            if self.codex {
+                "hook-codex-session-start"
+            } else {
+                "hook-claude-session-start"
+            },
             &json!({
-                "session_id": CLAUDE_SESSION,
-                "transcript_path": self.transcript_path().to_string_lossy(),
+                "session_id": session_id,
+                "transcript_path": transcript.to_string_lossy(),
                 "cwd": self.project.to_string_lossy(),
                 "hook_event_name": "SessionStart",
                 "source": "startup",
@@ -467,17 +753,21 @@ impl ClaudeHostJourney {
     }
 
     fn transcript_path(&self) -> PathBuf {
+        self.transcript_path_for_session(self.session_id())
+    }
+
+    fn transcript_path_for_session(&self, session_id: &str) -> PathBuf {
         if self.codex {
             return self
                 .home
                 .path()
                 .join(".codex/sessions/2026/02/01")
-                .join(format!("rollout-2026-02-01T00-00-00-{CODEX_SESSION}.jsonl"));
+                .join(format!("rollout-2026-02-01T00-00-00-{session_id}.jsonl"));
         }
         self.home
             .path()
             .join(".claude/projects/-claude-cli-journey")
-            .join(format!("{CLAUDE_SESSION}.jsonl"))
+            .join(format!("{session_id}.jsonl"))
     }
 
     /// Writes the first turn of the transcript Claude Code itself writes. Every
@@ -626,15 +916,34 @@ impl ClaudeHostJourney {
     /// `None` only while the mounted journey has not created its store yet,
     /// which is genuinely "no deliveries"; a store that exists but refuses to
     /// open fails the test loudly rather than reading as an empty journal.
-    fn journal(&self) -> Option<&SqliteObservationJournal> {
-        if let Some(journal) = self.journal.get() {
+    fn journal_for(&self, ncm: bool) -> Option<&SqliteObservationJournal> {
+        let slot = if ncm {
+            &self.ncm_journal
+        } else {
+            &self.journal
+        };
+        if let Some(journal) = slot.get() {
             return Some(journal);
         }
-        let path = self.journal_path()?;
+        let native_path = self.journal_path()?;
+        // The observer must be mounted beside Native in the canonical store,
+        // never discovered under its own provider state or another project.
+        let path = if ncm {
+            let path = native_path
+                .parent()
+                .expect("canonical store root")
+                .join(NCM_JOURNAL_FILE_NAME);
+            if !path.is_file() {
+                return None;
+            }
+            path
+        } else {
+            native_path
+        };
         let journal = SqliteObservationJournal::open(&path, inspection_retention_policy())
             .expect("the durable observation journal must open through its own store API");
-        let _ = self.journal.set(journal);
-        self.journal.get()
+        let _ = slot.set(journal);
+        slot.get()
     }
 
     /// Every delivery the durable observation journal holds, read through the
@@ -647,7 +956,11 @@ impl ClaudeHostJourney {
     /// rows"; every other failure — the store will not open, the inspection is
     /// refused, the page did not fit — fails the test loudly.
     fn journal_rows(&self) -> Vec<JournalInspectionRowV1> {
-        let Some(journal) = self.journal() else {
+        self.journal_rows_for(false)
+    }
+
+    fn journal_rows_for(&self, ncm: bool) -> Vec<JournalInspectionRowV1> {
+        let Some(journal) = self.journal_for(ncm) else {
             return Vec::new();
         };
         let page = journal
@@ -670,15 +983,23 @@ impl ClaudeHostJourney {
     /// moment it does. A deadline is a failure that reports what it last saw,
     /// never a half-settled journal handed back to be asserted against.
     fn await_settled_journal(&self, minimum_rows: usize) -> Vec<JournalInspectionRowV1> {
+        self.await_settled_journal_for(false, minimum_rows)
+    }
+
+    fn await_settled_journal_for(
+        &self,
+        ncm: bool,
+        minimum_rows: usize,
+    ) -> Vec<JournalInspectionRowV1> {
         let deadline = Instant::now() + SETTLEMENT_BUDGET;
         loop {
-            let rows = self.journal_rows();
+            let rows = self.journal_rows_for(ncm);
             if rows.len() >= minimum_rows && rows.iter().all(|row| row.state.is_terminal()) {
                 return rows;
             }
             assert!(
                 Instant::now() < deadline,
-                "the hook's observations never settled {minimum_rows} deliveries within \
+                "the hook's observations (NCM={ncm}) never settled {minimum_rows} deliveries within \
                  {SETTLEMENT_BUDGET:?}; last saw {:?}; daemon stderr: {}",
                 journal_digest(&rows),
                 {
@@ -705,6 +1026,75 @@ impl ClaudeHostJourney {
         }
     }
 
+    /// Both recipients must independently acknowledge the same canonical
+    /// messages. Their provider-addressed observation/idempotency IDs differ.
+    fn assert_observer_settled(
+        &self,
+        native: &[JournalInspectionRowV1],
+        previous: &[JournalInspectionRowV1],
+    ) -> Vec<JournalInspectionRowV1> {
+        if !self.ncm_observer {
+            return Vec::new();
+        }
+        let observer = self.await_settled_journal_for(true, native.len());
+        assert_settled_session_messages(&observer, native.len());
+        assert_eq!(
+            canonical_row_identities(&observer),
+            canonical_row_identities(native),
+            "both providers must receive exactly the same canonical session messages"
+        );
+        let identities = journal_row_identities(&observer);
+        assert!(
+            journal_row_identities(previous)
+                .iter()
+                .all(|row| identities.contains(row)),
+            "observer replay and append must preserve every settled delivery identity"
+        );
+        for (ncm, provider, rows) in [
+            (false, CONFIGURED_PROVIDER_ID, native),
+            (true, NCM_OBSERVER_PROVIDER_ID, observer.as_slice()),
+        ] {
+            let journal = self.journal_for(ncm).expect("mounted recipient journal");
+            for row in rows {
+                assert_eq!(row.provider_id, provider);
+                let receipts = journal
+                    .receipts_for(&row.observation_id)
+                    .expect("provider receipts");
+                assert_eq!(
+                    receipts.len(),
+                    1,
+                    "one provider receipt per committed message"
+                );
+                let receipt = &receipts[0];
+                assert_eq!(receipt.provider_id.as_str(), provider);
+                assert_eq!(receipt.observation_id, row.observation_id);
+                assert_eq!(receipt.idempotency_key, row.idempotency_key);
+                assert_eq!(receipt.payload_sha256, row.payload_sha256);
+                assert_eq!(receipt.extensions_digest, row.extensions_digest);
+                assert_eq!(receipt.registration_revision, row.registration_revision);
+                assert_eq!(
+                    receipt.provider_instance_id.as_ref(),
+                    Some(&row.provider_instance_id)
+                );
+                assert_eq!(receipt.attempt_number, 1);
+                assert_eq!(receipt.outcome, ObservationOutcomeV1::Applied);
+                assert_eq!(
+                    receipt.committed_effect,
+                    ObservationCommittedEffectV1::Applied
+                );
+                assert!(
+                    receipt
+                        .provider_receipt_digest
+                        .as_ref()
+                        .is_some_and(|digest| digest.len() == 64
+                            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())),
+                    "an applied delivery must carry its provider acknowledgement digest"
+                );
+            }
+        }
+        observer
+    }
+
     /// The negative control. For one window derived from the journey's own
     /// live-replay park, the journal must hold exactly the deliveries it held
     /// before the transcript was written — which is what makes the next hook
@@ -721,6 +1111,13 @@ impl ClaudeHostJourney {
                  commits it. Observed {:?}",
                 journal_digest(&rows)
             );
+            if self.ncm_observer {
+                assert_eq!(
+                    canonical_row_identities(&self.journal_rows_for(true)),
+                    canonical_row_identities(expected),
+                    "observer journal must also stay unchanged without a hook"
+                );
+            }
             std::thread::sleep(JOURNAL_POLL_INTERVAL);
         }
     }
@@ -765,6 +1162,26 @@ fn journal_row_identities(rows: &[JournalInspectionRowV1]) -> Vec<(String, Strin
                 row.observation_id.as_str().to_owned(),
                 row.payload_sha256.clone(),
                 row.attempt_number,
+            )
+        })
+        .collect::<Vec<_>>();
+    identities.sort();
+    identities
+}
+
+/// Canonical identity shared across provider-addressed journals.
+fn canonical_row_identities(
+    rows: &[JournalInspectionRowV1],
+) -> Vec<(String, String, u64, String, String)> {
+    let mut identities = rows
+        .iter()
+        .map(|row| {
+            (
+                row.exact_scope_sha256.clone(),
+                row.source_stream.clone(),
+                row.source_sequence.0,
+                row.payload_sha256.clone(),
+                row.extensions_digest.clone(),
             )
         })
         .collect::<Vec<_>>();
@@ -926,6 +1343,10 @@ fn daemon_authority_path(profile_root: &Path) -> PathBuf {
 }
 
 fn wait_for_authority(daemon: &mut Child, path: &Path) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("daemon listener probe runtime");
     let deadline = Instant::now() + Duration::from_secs(180);
     while Instant::now() < deadline {
         if let Some(status) = daemon.try_wait().expect("daemon status") {
@@ -936,12 +1357,25 @@ fn wait_for_authority(daemon: &mut Child, path: &Path) {
             panic!("daemon exited before publishing authority: {status}; stderr: {stderr}");
         }
         if let Ok(bytes) = fs::read(path)
-            && let Ok(record) = serde_json::from_slice::<Value>(&bytes)
-            && record["auth_token"]
-                .as_str()
-                .is_some_and(|token| token.len() == 64)
+            && let Ok(record) = serde_json::from_slice::<DaemonAuthorityRecord>(&bytes)
+            && record.pid == daemon.id()
+            && record.auth_token.len() == 64
         {
-            return;
+            // Authority JSON survives shutdown and is published before bind.
+            // Require this child and its listener; the shipped hook and tool
+            // calls that follow prove authenticated route publication.
+            if runtime.block_on(async {
+                matches!(
+                    tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        BrokerStream::connect(&record.endpoint),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                )
+            }) {
+                return;
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1084,12 +1518,37 @@ fn the_shipped_codex_stop_hook_commits_observations_and_later_context_recalls_th
     assert_host_memory_journey(true);
 }
 
+/// Opt-in production mount coverage: actual worker plus pinned offline model,
+/// configured through the shipped CLI. NCM receives evidence as an observer;
+/// the full existing journey still requires Native to supply later context.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with pinned offline model"]
+fn real_ncm_observer_receives_shipped_claude_hooks_while_native_answers_context() {
+    assert_host_memory_journey_with_observer(false, true);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with pinned offline model"]
+fn real_ncm_observer_receives_shipped_codex_hooks_while_native_answers_context() {
+    assert_host_memory_journey_with_observer(true, true);
+}
+
 fn assert_host_memory_journey(codex: bool) {
-    let journey = ClaudeHostJourney::start(codex);
+    assert_host_memory_journey_with_observer(codex, false);
+}
+
+fn assert_host_memory_journey_with_observer(codex: bool, ncm_observer: bool) {
+    let mut journey = if ncm_observer {
+        ClaudeHostJourney::start_with_observer(codex, true)
+    } else {
+        ClaudeHostJourney::start(codex)
+    };
 
     // 1. The project is mounted and the provider host is live *before* the
-    //    transcript exists. This baseline call is what forces project open, so
-    //    the daemon's own startup import has already run and found nothing.
+    //    transcript exists. Baseline context forces project open; the explicit
+    //    status barrier below then waits for startup import and projection.
     let task = journey_task();
     let baseline = journey.tool(
         "tracedecay_context",
@@ -1111,10 +1570,22 @@ fn assert_host_memory_journey(codex: bool) {
         journal_digest(&journey.journal_rows())
     );
 
+    if ncm_observer {
+        assert!(
+            journey.journal_for(true).is_some(),
+            "configured observer must mount beside Native"
+        );
+        assert!(
+            journey.journal_rows_for(true).is_empty(),
+            "observer starts with no messages"
+        );
+    }
+
+    journey.await_startup_history();
+
     // 2. Claude Code writes its transcript. Nothing else happens: the journal
     //    must stay unchanged for a window several live-replay passes long,
-    //    which is what makes step 3's transition attributable to the hook
-    //    alone.
+    //    providing a bounded negative control for step 3's hook transition.
     journey.write_claude_transcript();
     journey.assert_journal_unchanged_without_a_hook(&[]);
 
@@ -1133,6 +1604,7 @@ fn assert_host_memory_journey(codex: bool) {
     //    acknowledged on their first and only attempt, content still present.
     let rows = journey.await_settled_journal(ROWS_PER_TURN);
     assert_settled_session_messages(&rows, ROWS_PER_TURN);
+    let observer_rows = journey.assert_observer_settled(&rows, &[]);
 
     // 5. Claude re-runs its own hooks; the same invocation must not duplicate
     //    the observation, because the idempotency key is content-derived. The
@@ -1151,6 +1623,8 @@ fn assert_host_memory_journey(codex: bool) {
          observation identity, payload digest and attempt count: {:?}",
         journal_digest(&replayed)
     );
+
+    let observer_replayed = journey.assert_observer_settled(&replayed, &observer_rows);
 
     // 6. The session keeps running and writes a second turn. Claude must wait
     //    for its next hook. Codex Stop acknowledges retained daemon work, so
@@ -1187,6 +1661,7 @@ fn assert_host_memory_journey(codex: bool) {
     );
     let mid_session = journey.await_settled_journal(2 * ROWS_PER_TURN);
     assert_settled_session_messages(&mid_session, 2 * ROWS_PER_TURN);
+    let observer_mid_session = journey.assert_observer_settled(&mid_session, &observer_replayed);
 
     // 8. The Stop hook is idempotent in exactly the same way.
     let mid_session_settled = journal_row_identities(&mid_session);
@@ -1203,8 +1678,247 @@ fn assert_host_memory_journey(codex: bool) {
         journal_digest(&mid_session_replayed)
     );
 
-    // 9. A later ordinary agent question carries the advisory lane, and the
-    //    lane can now answer with what the hooks observed.
+    let observer_final =
+        journey.assert_observer_settled(&mid_session_replayed, &observer_mid_session);
+    if ncm_observer {
+        // Let retained hook work finish across the existing bounded settling
+        // window, then prove neither journal or receipt count grew on replay.
+        journey.assert_journal_unchanged_without_a_hook(&mid_session_replayed);
+        journey.assert_observer_settled(&journey.journal_rows(), &observer_final);
+    }
+
+    // 9. The originating session can recall exactly what its hooks observed.
+    let original = assert_recalled_session_messages(&journey, journey.session_id());
+
+    // 10. A fresh daemon and a different agent session must recall those same
+    //     durable messages. B starts through the shipped lifecycle with an
+    //     empty transcript: route binding must add no canonical messages.
+    journey.stop_daemon();
+    journey.start_daemon();
+    let next_session = if journey.codex {
+        "5ab47634-f1b2-4ccd-a1c3-2b0c2a9a3e10"
+    } else {
+        "b93546e4-5ca5-4e9a-a94c-d4867f679ee2"
+    };
+    let next_transcript = journey.transcript_path_for_session(next_session);
+    fs::write(&next_transcript, "").expect("new session has an empty transcript");
+    let started = journey.run_session_start_event(next_session, &next_transcript);
+    assert!(
+        started.status.success(),
+        "next SessionStart must publish its route: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let after_start = journey.await_settled_journal(2 * ROWS_PER_TURN);
+    assert_eq!(
+        journal_row_identities(&after_start),
+        mid_session_settled,
+        "starting an empty session must preserve the original deliveries"
+    );
+    assert_settled_session_messages(&after_start, 2 * ROWS_PER_TURN);
+    let native_journal = journey
+        .journal_for(false)
+        .expect("Native journal after bootstrap");
+    for row in &after_start {
+        assert_eq!(
+            native_journal
+                .receipts_for(&row.observation_id)
+                .expect("Native receipts")
+                .len(),
+            1,
+            "empty SessionStart must not add another delivery receipt"
+        );
+    }
+    journey.assert_observer_settled(&after_start, &observer_final);
+    let recalled = assert_recalled_session_messages(&journey, next_session);
+    assert_eq!(
+        recalled, original,
+        "restart and session change must preserve the same four messages and their provenance"
+    );
+    if !ncm_observer {
+        assert_canonical_fact_feedback_journey(&mut journey, next_session);
+    }
+}
+
+/// Canonical fact feedback has its own public host authority. This separate
+/// journey does not attribute an outcome to any staged session observation.
+fn assert_canonical_fact_feedback_journey(journey: &mut ClaudeHostJourney, session_id: &str) {
+    let canonical_payload = |journey: &ClaudeHostJourney, name: &str, arguments: Value| {
+        let response = journey.tool(name, &arguments);
+        response
+            .pointer("/outcome/value/payload")
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("{name} omitted its canonical application payload: {response}")
+            })
+    };
+    let term = if journey.codex {
+        "amber garden codex feedback"
+    } else {
+        "amber garden claude feedback"
+    };
+    let content = format!("The {term} retry budget is three seconds.");
+    let created = canonical_payload(
+        journey,
+        "tracedecay_fact_store_add",
+        json!({ "content": content, "category": "decision", "trust": 0.5, "format": "json" }),
+    );
+    assert_eq!(created["outcome"], "committed");
+    assert_eq!(created["result"]["disposition"], "added");
+    assert_eq!(created["result"]["fact"]["kind"], "available");
+    let fact_id = created["result"]["fact"]["fact"]["fact_id"]
+        .as_str()
+        .expect("created canonical fact identity")
+        .to_owned();
+    assert_eq!(created["result"]["commit"]["fact_id"], fact_id);
+
+    let recalled_provenance = |journey: &ClaudeHostJourney| {
+        let answer = journey.tool(
+            "tracedecay_context",
+            &json!({
+                "task": term,
+                "format": "json",
+                "_meta": { "session_id": session_id },
+            }),
+        );
+        let lane = advisory_lane(&answer).expect("Native canonical fact recall lane");
+        assert_eq!(lane["state"], "answered", "{lane}");
+        assert_eq!(lane["provider_id"], CONFIGURED_PROVIDER_ID);
+        assert_eq!(lane["degradation"], Value::Null, "{lane}");
+        let expected = format!("cited source record:{fact_id}");
+        let selected = lane["candidates"]
+            .as_array()
+            .expect("canonical recall candidates")
+            .iter()
+            .filter(|candidate| candidate["provenance"] == expected)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected.len(),
+            1,
+            "the host must confirm this exact fact once: {lane}"
+        );
+        assert!(
+            selected[0]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains(&content)),
+            "the selected canonical record must carry its created content: {lane}"
+        );
+        selected[0]["provenance"].clone()
+    };
+    let selected_provenance = recalled_provenance(journey);
+    let selected_fact_id = selected_provenance
+        .as_str()
+        .and_then(|source| source.strip_prefix("cited source record:"))
+        .expect("host-confirmed canonical fact identity");
+    let before = canonical_payload(
+        journey,
+        "tracedecay_fact_store_get",
+        json!({ "fact_id": selected_fact_id, "format": "json" }),
+    );
+    assert_eq!(before["fact"]["kind"], "available");
+    assert_eq!(before["fact"]["fact"]["fact_id"], fact_id);
+    let previous_event = before["fact"]["fact"]["last_event_id"]
+        .as_str()
+        .expect("current canonical event");
+    let old_trust = before["fact"]["fact"]["trust_score_millionths"]
+        .as_u64()
+        .expect("current canonical trust");
+    let source_label = format!("native-canonical-feedback-{session_id}");
+    let reason = "The recalled canonical fact supplied the retry budget.";
+    let feedback = canonical_payload(
+        journey,
+        "tracedecay_fact_feedback",
+        json!({
+            "fact_id": selected_fact_id,
+            "expected_last_event_id": previous_event,
+            "action": "helpful",
+            "source_label": source_label,
+            "reason": reason,
+            "format": "json",
+        }),
+    );
+    assert_eq!(feedback["feedback"]["fact_id"], fact_id);
+    assert_eq!(feedback["feedback"]["action"], "helpful");
+    assert_eq!(feedback["feedback"]["old_trust_millionths"], old_trust);
+    let new_trust = feedback["feedback"]["new_trust_millionths"]
+        .as_u64()
+        .expect("feedback trust");
+    assert!(
+        new_trust > old_trust,
+        "helpful feedback must increase trust: {feedback}"
+    );
+    assert_eq!(feedback["feedback"]["helpful_count"], 1);
+    assert_eq!(feedback["feedback"]["unhelpful_count"], 0);
+    let feedback_event = feedback["feedback"]["event_id"]
+        .as_str()
+        .expect("canonical feedback event");
+    assert_ne!(feedback_event, previous_event);
+    assert_eq!(feedback["fact"]["kind"], "available");
+    assert_eq!(feedback["fact"]["fact"]["fact_id"], fact_id);
+    assert_eq!(feedback["fact"]["fact"]["last_event_id"], feedback_event);
+    assert_eq!(
+        feedback["fact"]["fact"]["trust_score_millionths"],
+        new_trust
+    );
+    assert_eq!(feedback["commit"]["disposition"], "committed");
+    assert_eq!(
+        feedback["commit"]["owner"],
+        created["result"]["commit"]["owner"]
+    );
+    assert_eq!(feedback["commit"]["fact_id"], fact_id);
+    assert_eq!(feedback["commit"]["last_event_id"], feedback_event);
+    assert!(
+        feedback["commit"]["committed_event_ids"]
+            .as_array()
+            .expect("committed feedback events")
+            .contains(&json!(feedback_event))
+    );
+
+    // Restart only to prove the feedback event and its attribution are durable.
+    journey.stop_daemon();
+    journey.start_daemon();
+    // The route is process-local; the shipped hook republishes the same session.
+    let transcript = journey.transcript_path_for_session(session_id);
+    let started = journey.run_session_start_event(session_id, &transcript);
+    assert!(
+        started.status.success(),
+        "SessionStart must republish the canonical feedback session after restart: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let persisted = canonical_payload(
+        journey,
+        "tracedecay_fact_store_get",
+        json!({ "fact_id": selected_fact_id, "format": "json" }),
+    );
+    assert_eq!(persisted["fact"]["kind"], "available");
+    assert_eq!(persisted["fact"]["fact"]["fact_id"], fact_id);
+    assert_eq!(persisted["fact"]["fact"]["last_event_id"], feedback_event);
+    assert_eq!(
+        persisted["fact"]["fact"]["trust_score_millionths"],
+        new_trust
+    );
+    let history = persisted["trust_history"]
+        .as_array()
+        .expect("persisted trust history");
+    assert_eq!(
+        history.len(),
+        1,
+        "one attributed feedback event must survive restart"
+    );
+    assert_eq!(history[0]["event_id"], feedback_event);
+    assert_eq!(history[0]["action"], "helpful");
+    assert_eq!(history[0]["source_label"], source_label);
+    assert_eq!(history[0]["reason"], reason);
+    assert_eq!(history[0]["old_trust_millionths"], old_trust);
+    assert_eq!(history[0]["new_trust_millionths"], new_trust);
+    assert_eq!(recalled_provenance(journey), selected_provenance);
+}
+
+/// The existing complete recall assertions, shared by origin and next session.
+/// Returns content/provenance identities; request-bound candidate IDs may differ.
+fn assert_recalled_session_messages(
+    journey: &ClaudeHostJourney,
+    recalled_session_id: &str,
+) -> Vec<(String, String)> {
     let answer = journey.tool(
         "tracedecay_context",
         &json!({
@@ -1213,7 +1927,7 @@ fn assert_host_memory_journey(codex: bool) {
                  {TAIL_SENTINEL} note?"
             ),
             "format": "json",
-            "_meta": { "session_id": journey.session_id() },
+            "_meta": { "session_id": recalled_session_id },
         }),
     );
     let lane = advisory_lane(&answer)
@@ -1269,4 +1983,19 @@ fn assert_host_memory_journey(codex: bool) {
         }),
         "the advisory lane must recall the mid-session message whole, tail included: {lane}"
     );
+
+    let mut identities = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate["content"]
+                    .as_str()
+                    .expect("verified message content")
+                    .to_owned(),
+                candidate["provenance"].to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    identities.sort();
+    identities
 }

@@ -25,15 +25,12 @@
 //!   `(exact_scope_sha256, source_authority, source_event_id, source_revision,
 //!   payload_sha256)` is what makes one settled source event produce at most one
 //!   row for the lifetime of the store.
-//! * **Same-session recall only, in this slice.** Rows are addressed by the full
-//!   seven-field exact coding scope, and `exact_coding_scope` admission requires
-//!   byte-equality on `agent_session_id` and `resolved_scope_digest`. A row
-//!   staged in session A therefore cannot be recalled in session B even in the
-//!   identical repository, worktree, and branch. That is a deliberate, honest
-//!   limitation of this slice (see ADR-0002); the durable checkout-level binding
-//!   is a separate bead. Because all seven scope fields are stored as explicit
-//!   columns rather than only their digest, that later binding needs a new
-//!   index, not a data migration.
+//! * **Exact origin storage, checkout recall.** All seven identity fields and
+//!   their digest remain immutable storage and idempotency authority. Recall
+//!   reads only the newest bounded window matching the five checkout fields,
+//!   then validates every row against its own stored origin digest. The Native
+//!   candidate's checkout binding permits another session on that checkout;
+//!   origin session identity remains provenance, never host citation authority.
 //!
 //! Blocking discipline: like `SqliteObservationJournal`, every method here is
 //! synchronous and holds a `std::sync::Mutex` across a `SQLite` transaction. An
@@ -164,6 +161,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS tdmem_native_staged_observation_sequence_v1
 
 CREATE INDEX IF NOT EXISTS tdmem_native_staged_observation_recall_v1
     ON tdmem_native_staged_observation_v1 (exact_scope_sha256, tombstone, admitted_sequence);
+CREATE INDEX IF NOT EXISTS tdmem_native_staged_observation_checkout_recall_v1
+    ON tdmem_native_staged_observation_v1 (
+        profile_id, project_id, repository_identity, worktree_identity, branch_identity,
+        tombstone, admitted_sequence
+    );
 ";
 
 /// The seven canonical exact-scope identity fields a staged row is addressed
@@ -766,13 +768,14 @@ impl StagedObservationStore {
         Ok(StagedOutcome::Committed(evidence))
     }
 
-    /// Returns the staged rows of exactly this exact scope, best first.
+    /// Returns advisory rows from this checkout, best first, across sessions.
     ///
-    /// Only rows whose stored `exact_scope_sha256` equals this scope's digest
-    /// and whose content survives (`tombstone = 0`) are returned; a row whose
-    /// message text cannot be extracted contract-aware is skipped rather than
-    /// answered with envelope JSON. Ordering is `(score desc, admitted_sequence
-    /// desc, idempotency_key asc)` and is therefore total and reproducible.
+    /// The five checkout fields must match and content must survive. Before
+    /// scoring, the query bounds the newest rows by the per-scope retention
+    /// ceiling (512 by default), even when many origin sessions share a checkout.
+    /// Each row must re-derive its own stored seven-field origin digest. Rows
+    /// with no contract-aware message text are skipped. Final ordering is
+    /// `(score desc, admitted_sequence desc, idempotency_key asc)`.
     ///
     /// # Errors
     ///
@@ -797,7 +800,8 @@ impl StagedObservationStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let exact_scope_sha256 = scope.exact_scope_sha256();
+        let scan_limit =
+            i64::try_from(self.retention.maximum_content_rows_per_scope).unwrap_or(i64::MAX);
         let query_tokens = normalized_tokens(query);
 
         let guard = self.connection()?;
@@ -807,13 +811,21 @@ impl StagedObservationStore {
                     source_authority, source_event_id, source_revision, observation_kind, \
                     payload_contract, sanitized_payload, payload_sha256, operation_id, \
                     request_identity, provider_reference, receipt, effect_digest, \
-                    admitted_sequence, admitted_at_unix_ms \
+                    admitted_sequence, admitted_at_unix_ms, exact_scope_sha256 \
              FROM tdmem_native_staged_observation_v1 \
-             WHERE exact_scope_sha256 = ?1 AND tombstone = 0 \
-             ORDER BY admitted_sequence ASC",
+             WHERE profile_id = ?1 AND project_id = ?2 AND repository_identity = ?3 \
+               AND worktree_identity = ?4 AND branch_identity = ?5 AND tombstone = 0 \
+             ORDER BY admitted_sequence DESC LIMIT ?6",
         )?;
         let mut raw = Vec::new();
-        let mut rows = statement.query(params![exact_scope_sha256])?;
+        let mut rows = statement.query(params![
+            scope.profile_id,
+            scope.project_id,
+            scope.repository_identity,
+            scope.worktree_identity,
+            scope.branch_identity,
+            scan_limit,
+        ])?;
         while let Some(row) = rows.next()? {
             let stored_scope = ExactScopeFields {
                 profile_id: row.get(1)?,
@@ -825,6 +837,7 @@ impl StagedObservationStore {
                 resolved_scope_digest: row.get(7)?,
             };
             let idempotency_key: String = row.get(0)?;
+            let exact_scope_sha256: String = row.get(22)?;
             if stored_scope.exact_scope_sha256() != exact_scope_sha256 {
                 return Err(StagedStoreError::ScopeDigestMismatch {
                     idempotency_key,
@@ -870,8 +883,9 @@ impl StagedObservationStore {
         drop(statement);
         drop(guard);
 
-        // Recency is rank over the rows of this scope, oldest first, so it is a
-        // function of the stored order and never of a wall clock.
+        // SQL selects the newest bounded window. Restore oldest-first order
+        // before assigning the existing deterministic recency ranks.
+        raw.reverse();
         let total = raw.len();
         for (position, candidate) in raw.iter_mut().enumerate() {
             #[allow(clippy::cast_precision_loss)]
@@ -1363,6 +1377,13 @@ mod tests {
             other => panic!("expected the tombstone to answer duplicate, got {other:?}"),
         }
         assert_eq!(row_count(&store), 2);
+        let mut next_session = scope.clone();
+        next_session.agent_session_id = "session.beta".to_owned();
+        let recalled = store
+            .recall(&next_session, "oldest message", 8)
+            .expect("cross-session recall");
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].idempotency_key, "key.two");
     }
 
     #[test]
@@ -1403,7 +1424,8 @@ mod tests {
         let root = TempDir::new().expect("temp root");
         let store = store(&root, 2);
         let alpha = scope("session.alpha");
-        let beta = scope("session.beta");
+        let mut beta = scope("session.beta");
+        beta.worktree_identity = "worktree.other".to_owned();
 
         store
             .stage_or_duplicate(record(
@@ -1441,7 +1463,7 @@ mod tests {
             .iter()
             .map(|row| row.idempotency_key.as_str())
             .collect();
-        // a1 was evicted by the cap of two, and b1 belongs to another session.
+        // a1 was evicted by the cap of two, and b1 belongs to another worktree.
         assert_eq!(keys, vec!["key.a2", "key.a3"]);
         assert!(hits.iter().all(|row| row.scope == alpha));
         assert_eq!(hits[0].message_text, "alpha sqlite schema");
@@ -1541,8 +1563,8 @@ mod tests {
             let connection = store.connection().expect("connection");
             connection
                 .execute(
-                    "UPDATE tdmem_native_staged_observation_v1 SET branch_identity = ?1",
-                    params!["refs/heads/tampered"],
+                    "UPDATE tdmem_native_staged_observation_v1 SET agent_session_id = ?1",
+                    params!["session.tampered"],
                 )
                 .expect("tamper");
         }
@@ -1554,5 +1576,130 @@ mod tests {
             matches!(error, StagedStoreError::ScopeDigestMismatch { .. }),
             "unexpected error {error:?}"
         );
+    }
+
+    #[test]
+    fn checkout_recall_survives_reopen_and_keeps_the_exact_origin() {
+        let root = TempDir::new().expect("root");
+        let alpha = scope("session.alpha");
+        let mut beta = scope("session.beta");
+        beta.resolved_scope_digest = format!("sha256:{}", "b".repeat(64));
+        let evidence = {
+            let store = store(&root, 8);
+            store
+                .stage_or_duplicate(record(
+                    &alpha,
+                    "key.origin",
+                    "event.origin",
+                    1,
+                    "checkout message",
+                ))
+                .expect("stage")
+        };
+        let reopened = store(&root, 8);
+        let rows = reopened
+            .recall(&beta, "checkout", 8)
+            .expect("other-session recall");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scope, alpha);
+        assert_eq!(rows[0].exact_scope_sha256, alpha.exact_scope_sha256());
+        assert_ne!(rows[0].exact_scope_sha256, beta.exact_scope_sha256());
+        let StagedOutcome::Committed(evidence) = evidence else {
+            panic!("first commit");
+        };
+        assert_eq!(rows[0].provider_reference, evidence.provider_reference);
+        assert_eq!(rows[0].receipt, evidence.receipt);
+        for field in 0..5 {
+            let mut foreign = beta.clone();
+            match field {
+                0 => foreign.profile_id = "profile.other".to_owned(),
+                1 => foreign.project_id = "project.other".to_owned(),
+                2 => foreign.repository_identity = "repository.other".to_owned(),
+                3 => foreign.worktree_identity = "worktree.other".to_owned(),
+                _ => foreign.branch_identity = "refs/heads/other".to_owned(),
+            }
+            assert!(
+                reopened
+                    .recall(&foreign, "checkout", 8)
+                    .expect("foreign recall")
+                    .is_empty(),
+                "checkout field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn checkout_recall_bounds_the_newest_cross_session_rows_before_scoring() {
+        let root = TempDir::new().expect("root");
+        let store = store(&root, 3);
+        for index in 0..6 {
+            let origin = scope(&format!("session.{index}"));
+            let text = if index < 3 {
+                "needle needle matching ancient message"
+            } else {
+                "recent message"
+            };
+            store
+                .stage_or_duplicate(record(
+                    &origin,
+                    &format!("key.{index}"),
+                    &format!("event.{index}"),
+                    1,
+                    text,
+                ))
+                .expect("stage");
+        }
+        // Per-exact-scope retention does not evict one-row sessions. The recall
+        // query must impose its own checkout-wide bound before lexical scoring.
+        assert_eq!(row_count(&store), 6);
+        let request = scope("session.request");
+        let hits = store
+            .recall(&request, "needle", usize::MAX)
+            .expect("bounded recall");
+        assert_eq!(
+            hits.iter()
+                .map(|r| r.idempotency_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key.5", "key.4", "key.3"]
+        );
+        assert_eq!(
+            store
+                .recall(&request, "needle", usize::MAX)
+                .expect("repeat"),
+            hits
+        );
+        assert_eq!(
+            store.recall(&request, "needle", 1).expect("limit")[0],
+            hits[0]
+        );
+    }
+
+    #[test]
+    fn a_request_digest_cannot_replace_the_stored_origin_digest() {
+        let root = TempDir::new().expect("root");
+        let store = store(&root, 8);
+        let alpha = scope("session.alpha");
+        let beta = scope("session.beta");
+        store
+            .stage_or_duplicate(record(
+                &alpha,
+                "key.origin",
+                "event.origin",
+                1,
+                "origin content",
+            ))
+            .expect("stage");
+        store
+            .connection()
+            .expect("connection")
+            .execute(
+                "UPDATE tdmem_native_staged_observation_v1 SET exact_scope_sha256 = ?1",
+                params![beta.exact_scope_sha256()],
+            )
+            .expect("corrupt stored origin digest");
+        assert!(matches!(
+            store.recall(&beta, "origin", 8),
+            Err(StagedStoreError::ScopeDigestMismatch { .. })
+        ));
     }
 }

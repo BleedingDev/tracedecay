@@ -902,9 +902,8 @@ mod enabled {
         ));
         if recall.terminal.terminal_code() == TerminalCode::Success {
             let value = response_json(&recall);
-            assert!(!find_string(&value, "source", "source-delete"));
             assert!(!find_string(&value, "value_text", "deleted outcome"));
-            assert!(find_string(&value, "source", "source-keep"));
+            assert!(find_string(&value, "value_text", "kept outcome"));
         }
     }
 

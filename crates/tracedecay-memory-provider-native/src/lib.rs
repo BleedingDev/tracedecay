@@ -43,23 +43,21 @@ pub const NATIVE_PROVIDER_ID: &str = "tracedecay.native";
 /// the wire vocabulary of `tracedecay.memory.provider.recall.v1`
 /// `candidate_scope_binding.bindings`.
 ///
-/// Native facts carry only their owner — a project or the profile — and are
-/// attested as `project_facts` or `profile_facts`. Native additionally
-/// attests `exact_coding_scope`, because the Native application port also
-/// answers recall from the session observations it staged as provider-local
-/// advisory state: a staged row is recorded under the whole admitted exact
-/// scope, so it is attested under that scope and nothing weaker.
-///
-/// `exact_coding_scope` admission compares every exact-scope field
-/// byte-for-byte, `agent_session_id` and `resolved_scope_digest` included, so
-/// a staged row is recallable only inside the session that produced it. That
-/// is a deliberate limitation of this slice, not an oversight; a durable
-/// cross-session binding for staged observations is tracked as `tdmem-b8q`.
+/// Native facts attest their project/profile owner. Staged observations are
+/// stored under all seven exact origin fields, but may be recalled in another
+/// agent session on the same profile, project, repository, worktree and branch
+/// under `checkout_observations`. Candidate session and resolved-scope fields
+/// are empty; the immutable origin fields remain in provenance. The fully exact
+/// binding remains authorized and still compares all seven fields.
 ///
 /// The registry records this declaration at registration and passes it to
 /// admission with the admitted call; a provider reply can never widen it.
-pub const NATIVE_RECALL_SCOPE_BINDINGS: &[&str] =
-    &["exact_coding_scope", "project_facts", "profile_facts"];
+pub const NATIVE_RECALL_SCOPE_BINDINGS: &[&str] = &[
+    "exact_coding_scope",
+    "checkout_observations",
+    "project_facts",
+    "profile_facts",
+];
 
 /// Provider-neutral contract carried by an admitted observation call.
 pub const OBSERVATION_CONTRACT_ID: &str = "tracedecay.memory.provider.observation.v1";

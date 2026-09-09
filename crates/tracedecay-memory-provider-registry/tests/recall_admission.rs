@@ -1089,6 +1089,7 @@ fn scope_binding_wire_values_match_the_generated_contract() -> Result<(), Box<dy
     };
     let bindings = [
         ScopeBinding::ExactCodingScope,
+        ScopeBinding::CheckoutObservations,
         ScopeBinding::ProjectFacts,
         ScopeBinding::ProfileFacts,
     ];
@@ -1234,7 +1235,12 @@ fn project_facts_candidate_from_another_worktree_of_the_same_project_is_denied()
     );
     assert_eq!(
         ledger["authorized_scope_bindings"],
-        json!(["exact_coding_scope", "project_facts", "profile_facts"])
+        json!([
+            "exact_coding_scope",
+            "checkout_observations",
+            "project_facts",
+            "profile_facts"
+        ])
     );
     Ok(())
 }
@@ -1483,7 +1489,7 @@ fn project_facts_candidate_from_a_foreign_project_or_profile_is_denied()
 }
 
 /// A staged session observation may only be admitted under
-/// `exact_coding_scope`, whatever else its provider is authorized for.
+/// `exact_coding_scope` or `checkout_observations`, whatever else its provider is authorized for.
 ///
 /// The real defect this catches is provider-wide authorization being read as
 /// per-candidate authorization. Native is authorized for `exact_coding_scope`,
@@ -1491,8 +1497,7 @@ fn project_facts_candidate_from_a_foreign_project_or_profile_is_denied()
 /// alone stops a provider-local staged row from claiming `project_facts` —
 /// and that binding makes the checkout fields optional and *forbids* the
 /// session identity and the resolved scope digest, so the row would be
-/// admitted in another checkout, another branch, or another agent session
-/// than the one it was observed in. The class-to-binding policy denies it
+/// admitted in another checkout or branch than the one it was observed in. The class-to-binding policy denies it
 /// before any field is compared, which is why the mutated candidates below
 /// carry a scope that would otherwise pass.
 #[test]
@@ -1560,5 +1565,188 @@ fn a_staged_session_observation_cannot_be_admitted_as_project_or_profile_facts()
     )?;
     assert_eq!(admission.admitted.len(), 1);
     assert!(admission.report.denied.is_empty());
+    Ok(())
+}
+
+fn checkout_observation_candidate(
+    scope: &tracedecay_memory_provider_api::OwnedExactScope,
+) -> Value {
+    let mut identity = exact_scope_candidate_value(scope);
+    identity["scope_binding"] = json!("checkout_observations");
+    identity["agent_session_id"] = json!("");
+    identity["resolved_scope_digest"] = json!("");
+    let mut value = candidate_value(
+        "staged-checkout",
+        "origin session text",
+        identity,
+        current_validity(),
+    );
+    value["memory_class"] = json!("session_observation");
+    value
+}
+
+#[test]
+fn checkout_observations_cross_sessions_only_under_native_registration()
+-> Result<(), Box<dyn Error>> {
+    let origin = admitted_scope();
+    let mut request = origin.clone();
+    request.agent_session_id = "session-next".to_owned();
+    request.resolved_scope_digest = STALE_SCOPE_DIGEST.to_owned();
+    let candidate = checkout_observation_candidate(&origin);
+    let native = RecallScopeBindingsV1::from_wire(
+        tracedecay_memory_provider_native::NATIVE_RECALL_SCOPE_BINDINGS
+            .iter()
+            .copied(),
+    )?;
+    assert_eq!(native, authorized_native());
+    let admitted = admit_recall_candidates(
+        &request,
+        "request-next",
+        &current_query(),
+        &native,
+        vec![decode(candidate.clone())],
+    )?;
+    assert_eq!(admitted.admitted.len(), 1);
+    assert!(admitted.report.denied.is_empty());
+    assert_eq!(
+        admitted.admitted[0].scope_binding(),
+        ScopeBinding::CheckoutObservations
+    );
+
+    // Read the actual registry declaration: NCM remains exact-only.
+    let contract: Value = serde_json::from_str(include_str!(
+        "../../../product/contracts/memory-provider-v1/provider-registry-contract.json"
+    ))?;
+    let ncm =
+        contract["registration_contract"]["recall_scope_bindings"]["provider_declarations"]["ncm"]
+            .as_array()
+            .expect("NCM declaration");
+    let ncm = RecallScopeBindingsV1::from_wire(ncm.iter().map(|v| v.as_str().expect("binding")))?;
+    assert_eq!(ncm, authorized_exact());
+    let refused = admit_recall_candidates(
+        &request,
+        "request-next",
+        &current_query(),
+        &ncm,
+        vec![decode(candidate)],
+    )?;
+    assert!(refused.admitted.is_empty());
+    assert_eq!(
+        refused.report.denied[0].reason,
+        RecallDenialReason::ScopeBindingUnauthorized {
+            binding: ScopeBinding::CheckoutObservations
+        }
+    );
+
+    // Fully exact candidates still cannot move from session A to B.
+    let mut exact = candidate_value(
+        "exact-origin",
+        "text",
+        exact_scope_candidate_value(&origin),
+        current_validity(),
+    );
+    exact["memory_class"] = json!("session_observation");
+    let refused = admit_recall_candidates(
+        &request,
+        "request-next",
+        &current_query(),
+        &native,
+        vec![decode(exact)],
+    )?;
+    assert_eq!(
+        refused.report.denied[0].reason,
+        RecallDenialReason::ScopeMismatch {
+            field: ScopeField::AgentSessionId
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn checkout_observation_requires_each_checkout_identity_and_forbids_session_claims()
+-> Result<(), Box<dyn Error>> {
+    let origin = admitted_scope();
+    for (wire, field) in [
+        ("profile_id", ScopeField::ProfileId),
+        ("project_id", ScopeField::ProjectId),
+        ("repository_identity", ScopeField::RepositoryIdentity),
+        ("worktree_identity", ScopeField::WorktreeIdentity),
+        ("branch_identity", ScopeField::BranchIdentity),
+    ] {
+        for (value, reason) in [
+            ("different", RecallDenialReason::ScopeMismatch { field }),
+            ("", RecallDenialReason::UnknownIdentity { field }),
+        ] {
+            let mut candidate = checkout_observation_candidate(&origin);
+            candidate["exact_scope_identity"][wire] = json!(value);
+            let refused = admit_recall_candidates(
+                &origin,
+                "request",
+                &current_query(),
+                &authorized_native(),
+                vec![decode(candidate)],
+            )?;
+            assert!(refused.admitted.is_empty());
+            assert_eq!(refused.report.denied[0].reason, reason, "{wire}={value}");
+        }
+        let mut missing = checkout_observation_candidate(&origin);
+        missing["exact_scope_identity"]
+            .as_object_mut()
+            .expect("identity")
+            .remove(wire);
+        assert!(
+            serde_json::from_value::<RecallCandidateV1>(missing).is_err(),
+            "missing {wire}"
+        );
+    }
+    for (wire, field) in [
+        ("agent_session_id", ScopeField::AgentSessionId),
+        ("resolved_scope_digest", ScopeField::ResolvedScopeDigest),
+    ] {
+        let mut candidate = checkout_observation_candidate(&origin);
+        candidate["exact_scope_identity"][wire] = json!(if wire == "agent_session_id" {
+            origin.agent_session_id.as_str()
+        } else {
+            origin.resolved_scope_digest.as_str()
+        });
+        let refused = admit_recall_candidates(
+            &origin,
+            "request",
+            &current_query(),
+            &authorized_native(),
+            vec![decode(candidate)],
+        )?;
+        assert_eq!(
+            refused.report.denied[0].reason,
+            RecallDenialReason::ForbiddenIdentity { field }
+        );
+        assert_eq!(
+            refused.report.denied[0].provider_claimed_scope_binding,
+            ScopeBinding::CheckoutObservations
+        );
+        let mut malformed = checkout_observation_candidate(&origin);
+        malformed["exact_scope_identity"][wire] = json!(" malformed ");
+        let refused = admit_recall_candidates(
+            &origin,
+            "request",
+            &current_query(),
+            &authorized_native(),
+            vec![decode(malformed)],
+        )?;
+        assert_eq!(
+            refused.report.denied[0].reason,
+            RecallDenialReason::UnknownIdentity { field },
+            "malformed identity precedence is unchanged"
+        );
+        let mut missing = checkout_observation_candidate(&origin);
+        missing["exact_scope_identity"]
+            .as_object_mut()
+            .expect("identity")
+            .remove(wire);
+        assert!(
+            serde_json::from_value::<RecallCandidateV1>(missing).is_err(),
+            "forbidden {wire} must still be present and empty"
+        );
+    }
     Ok(())
 }

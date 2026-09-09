@@ -534,9 +534,8 @@ fn recall_request_value(project_id: &str) -> Value {
     })
 }
 
-/// The one exact coding scope the recall fixtures use. A staged observation
-/// is only recallable under the identical seven fields, so the observe and the
-/// recall call in the round-trip test share this single definition.
+/// The exact request scope used by the recall fixtures. Staged observation
+/// storage retains this origin; checkout recall may answer another session.
 fn recall_exact_scope(project_id: &str) -> OwnedExactScope {
     OwnedExactScope::new(
         "profile.native-bridge-recall",
@@ -1503,9 +1502,8 @@ fn staged_row_count(provider_state_root: &Path) -> i64 {
 }
 
 /// The end-to-end slice this bead exists for: an admitted session message is
-/// durably staged before the success is answered, and the same exact coding
-/// scope recalls it as an advisory candidate carrying all seven attested
-/// identity fields and the extracted human message text.
+/// durably staged before success, then another session on the same checkout
+/// recalls the message while the seven-field origin remains in provenance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn staged_session_observation_round_trips_into_an_advisory_recall_candidate() {
     const MESSAGE: &str = "native bridge staged observation about the recall merge order";
@@ -1525,12 +1523,15 @@ async fn staged_session_observation_round_trips_into_an_advisory_recall_candidat
         "session.native-bridge-staged",
         MESSAGE,
     );
-    let call = staged_session_call(
+    let mut call = staged_session_call(
         project_id.as_str(),
         &canonical_payload,
         "idempotency.native-bridge-staged",
         "operation.native-bridge-staged",
     );
+    call.exact_scope.agent_session_id = "agent.native-bridge-origin-a".to_owned();
+    call.exact_scope.resolved_scope_digest = OTHER_SCOPE_DIGEST.to_owned();
+    let origin_scope = call.exact_scope.clone();
     let reply = port.observe(staged_observation_for(&call, canonical_payload.clone()));
 
     assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
@@ -1585,19 +1586,19 @@ async fn staged_session_observation_round_trips_into_an_advisory_recall_candidat
     assert_eq!(staged["content_ref"], Value::Null);
     assert_eq!(staged["memory_class"], json!("session_observation"));
 
-    // All seven attested fields, under the binding that requires every one of
-    // them to be byte-equal to the admitted scope.
+    // The claim binds the five checkout fields; session and resolution are
+    // absent from admission authority and retained only as exact origin metadata.
     assert_eq!(
         staged["exact_scope_identity"],
         json!({
-            "scope_binding": "exact_coding_scope",
+            "scope_binding": "checkout_observations",
             "profile_id": "profile.native-bridge-recall",
             "project_id": project_id.as_str(),
             "repository_identity": "repo.native-bridge-recall",
             "worktree_identity": "worktree.native-bridge-recall",
             "branch_identity": "branch.native-bridge-recall",
-            "agent_session_id": "agent.native-bridge-recall",
-            "resolved_scope_digest": SCOPE_DIGEST,
+            "agent_session_id": "",
+            "resolved_scope_digest": "",
         })
     );
 
@@ -1618,6 +1619,28 @@ async fn staged_session_observation_round_trips_into_an_advisory_recall_candidat
         staged["provenance"]["native_linkage"]["staged_observation"]["receipt"],
         json!(receipt)
     );
+    assert_eq!(
+        staged["provenance"]["native_linkage"]["staged_observation"]["origin_scope"],
+        json!({
+            "agent_session_id": origin_scope.agent_session_id,
+            "resolved_scope_digest": origin_scope.resolved_scope_digest,
+            "exact_scope_sha256": origin_scope.exact_scope_sha256(),
+        })
+    );
+    assert_eq!(
+        staged["provenance"]["native_linkage"]["staged_observation"]["source_event_id"],
+        json!("record.native-bridge-staged")
+    );
+    assert!(
+        staged["candidate_id"]
+            .as_str()
+            .expect("candidate id")
+            .starts_with("request.native-bridge-recall:")
+    );
+    assert_eq!(
+        body["exact_scope_identity"],
+        recall_scope_value(project_id.as_str())
+    );
     assert_eq!(staged["source_refs"], json!([]));
     assert_eq!(staged["trace_refs"], json!([]));
 
@@ -1635,17 +1658,17 @@ async fn staged_session_observation_round_trips_into_an_advisory_recall_candidat
 /// Response budgeting applies to the complete provider reply, not only to the
 /// canonical JSON payload inside it.
 ///
-/// Four whole staged messages intentionally overfill a synthetic 8 KiB
-/// response boundary. The provider must remove lower-ranked staged rows until
-/// the terminal, payload framing, digest, and retained candidate all fit; it
-/// must not discover the framing overhead after selection and collapse the
-/// whole recall into `capacity_exceeded`. The synthetic limit keeps this
+/// Four whole staged messages intentionally overfill a synthetic response
+/// boundary derived from the actual two-candidate payload. The provider must
+/// remove lower-ranked staged rows until the terminal, payload framing, digest,
+/// and retained candidate all fit; it must not discover the framing overhead
+/// after selection and collapse the whole recall into `capacity_exceeded`.
+/// The synthetic limit keeps this
 /// aggregate-accounting regression independent of the production descriptor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn staged_recall_trims_to_a_valid_partial_reply_without_losing_the_top_whole_message() {
     const QUERY_TERM: &str = "quicksilver-budget-boundary";
     const TAIL: &str = "obsidian-tail-sentinel";
-    const TEST_RESPONSE_BYTES: u64 = 8_192;
 
     let (_temporary, project_root, graph, owner, project_id) = real_project_fixture().await;
     let provider_state_root = test_provider_state_root(&project_root);
@@ -1748,13 +1771,19 @@ async fn staged_recall_trims_to_a_valid_partial_reply_without_losing_the_top_who
         .expect("recall reply carries a payload")
         .bytes
         .len();
+    let payload_bytes = u64::try_from(payload_bytes).expect("fixture payload length fits u64");
+    // Place the seam after the actual payload but before the complete reply,
+    // so candidate provenance growth cannot invalidate the fixture setup.
+    let test_response_bytes = payload_bytes
+        .checked_add(1)
+        .expect("fixture response boundary fits u64");
     assert!(
-        u64::try_from(payload_bytes).unwrap_or(u64::MAX) < TEST_RESPONSE_BYTES,
+        payload_bytes < test_response_bytes,
         "the payload-only check must fit the synthetic boundary"
     );
     assert!(
         matches!(
-            two_candidate_reply.validate(TEST_RESPONSE_BYTES),
+            two_candidate_reply.validate(test_response_bytes),
             Err(ApiError::BoundaryBytesExceeded {
                 field: "response",
                 ..
@@ -1769,13 +1798,13 @@ async fn staged_recall_trims_to_a_valid_partial_reply_without_losing_the_top_who
         &test_profile_id(),
         &page,
         &staged_rows,
-        TEST_RESPONSE_BYTES,
+        test_response_bytes,
     )
     .expect("build bounded partial reply");
 
     assert_eq!(reply.terminal.terminal_code(), TerminalCode::Partial);
     assert!(
-        reply.validate(TEST_RESPONSE_BYTES).is_ok(),
+        reply.validate(test_response_bytes).is_ok(),
         "the reply must fit the synthetic aggregate byte boundary"
     );
     let body = recall_payload(&reply);

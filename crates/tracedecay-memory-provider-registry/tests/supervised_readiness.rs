@@ -114,6 +114,7 @@ fn handshake_request(scope: OwnedExactScope) -> HandshakeRequest {
 /// exercised rather than only the supervisor unit's.
 struct MountedNativePort {
     descriptor: ProviderDescriptor,
+    handshake_terminal: TerminalCode,
     omit_state_namespace: AtomicBool,
     handshake_calls: AtomicUsize,
 }
@@ -122,6 +123,7 @@ impl MountedNativePort {
     fn new() -> Self {
         Self {
             descriptor: descriptor(),
+            handshake_terminal: TerminalCode::Success,
             omit_state_namespace: AtomicBool::new(false),
             handshake_calls: AtomicUsize::new(0),
         }
@@ -132,6 +134,7 @@ impl MountedNativePort {
     fn retaining_a_replay_position() -> Self {
         Self {
             descriptor: descriptor_with_replay(),
+            handshake_terminal: TerminalCode::Success,
             omit_state_namespace: AtomicBool::new(false),
             handshake_calls: AtomicUsize::new(0),
         }
@@ -145,18 +148,32 @@ impl NativeMemoryApplicationPort for MountedNativePort {
 
     fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
         self.handshake_calls.fetch_add(1, Ordering::Relaxed);
+        let terminal = TerminalRecord::new(
+            ProviderOperation::Handshake,
+            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider"),
+            self.handshake_terminal,
+            CommittedEffectEvidence::none(Some(self.descriptor.state_generation)),
+            FallbackDirective::forbidden(),
+            request.request_id.clone(),
+            request.exact_scope.exact_scope_sha256(),
+            (self.handshake_terminal != TerminalCode::Success)
+                .then(|| "fixture.handshake_refused".to_owned()),
+        )
+        .expect("handshake terminal");
+        if self.handshake_terminal != TerminalCode::Success {
+            return HandshakeResponse {
+                terminal,
+                descriptor: None,
+                provider_instance_id: None,
+                state_namespace: None,
+                accepted_scope: None,
+                effective_limits: None,
+                ready_receipt_sha256: None,
+                warnings: Vec::new(),
+            };
+        }
         HandshakeResponse {
-            terminal: TerminalRecord::new(
-                ProviderOperation::Handshake,
-                OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider"),
-                TerminalCode::Success,
-                CommittedEffectEvidence::none(Some(self.descriptor.state_generation)),
-                FallbackDirective::forbidden(),
-                request.request_id.clone(),
-                request.exact_scope.exact_scope_sha256(),
-                None,
-            )
-            .expect("handshake terminal"),
+            terminal,
             descriptor: Some(self.descriptor.clone()),
             provider_instance_id: Some("native.mounted-instance".to_owned()),
             state_namespace: if self.omit_state_namespace.load(Ordering::Relaxed) {
@@ -362,13 +379,23 @@ fn a_disabled_composition_is_typed_unavailability_and_the_host_continues() {
             .ready_target(&request, pass.saturating_mul(10_000_000))
             .expect_err("disabled composition cannot be ready");
         match error {
-            SupervisedReadinessError::Unavailable { kind, .. } => assert!(
-                matches!(
-                    kind,
-                    DegradationKindV1::StartFailed | DegradationKindV1::RestartBudgetExhausted
-                ),
-                "unexpected degradation kind {kind}"
-            ),
+            SupervisedReadinessError::Unavailable {
+                kind,
+                terminal_code,
+                ..
+            } => {
+                assert!(
+                    matches!(
+                        kind,
+                        DegradationKindV1::StartFailed | DegradationKindV1::RestartBudgetExhausted
+                    ),
+                    "unexpected degradation kind {kind}"
+                );
+                assert_eq!(
+                    terminal_code, None,
+                    "no provider handshake terminal was returned"
+                );
+            }
             other => panic!("expected typed unavailability, got {other}"),
         }
     }
@@ -807,4 +834,32 @@ fn an_elapsed_caller_deadline_is_refused_without_contacting_the_provider() {
         other => panic!("expected an elapsed-deadline refusal, got {other:?}"),
     }
     assert_eq!(port.handshake_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn refused_handshake_preserves_its_typed_provider_terminal() {
+    for terminal_code in [
+        TerminalCode::StaleIdentity,
+        TerminalCode::InvalidRequest,
+        TerminalCode::ScopeMismatch,
+        TerminalCode::ProviderUnavailable,
+    ] {
+        let mut port = MountedNativePort::new();
+        port.handshake_terminal = terminal_code;
+        let readiness = mount(enabled_composition(Arc::new(port)), 4);
+        let error = readiness
+            .ready_target(&handshake_request(exact_scope("worktree-terminal")), 1_000)
+            .expect_err("handshake terminal must refuse readiness");
+        match error {
+            SupervisedReadinessError::Unavailable {
+                kind,
+                terminal_code: retained,
+                ..
+            } => {
+                assert_eq!(kind, DegradationKindV1::HandshakeRefused);
+                assert_eq!(retained, Some(terminal_code));
+            }
+            other => panic!("expected typed handshake refusal, got {other}"),
+        }
+    }
 }

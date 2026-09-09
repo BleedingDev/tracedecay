@@ -561,6 +561,7 @@
             "values": {
               "const": [
                 "exact_coding_scope",
+                "checkout_observations",
                 "project_facts",
                 "profile_facts"
               ]
@@ -578,6 +579,7 @@
                 "items": {
                   "enum": [
                     "exact_coding_scope",
+                    "checkout_observations",
                     "project_facts",
                     "profile_facts"
                   ]

@@ -186,8 +186,8 @@ pub const CONTRACTS: &[ContractSpec] = &[
     ContractSpec {
         contract_id: "tracedecay.memory.provider.registry.v1",
         bead_id: "tdmem-0201",
-        contract_sha256: "d2373a0819c4b2437df1f1d8bd135daef177daaa6e533022af432a25156774a9",
-        schema_sha256: "96a348ca37d80dad3eaac1b672b9c52b6c485c21ddcb191521a14f5b73dc77c7",
+        contract_sha256: "e29e0ad40d5932f70a4bbc96fb43a8885c9c39a62e661415c858112463d27ef3",
+        schema_sha256: "42da808e540fc8695b9940be0d3aa3bc7f5287980e5ea28923cbc01bba45a550",
     },
     ContractSpec {
         contract_id: "tracedecay.memory.provider.handshake.v1",
@@ -204,7 +204,7 @@ pub const CONTRACTS: &[ContractSpec] = &[
     ContractSpec {
         contract_id: "tracedecay.memory.provider.recall.v1",
         bead_id: "tdmem-0204",
-        contract_sha256: "1a8a55d0855a918fe4b02ec3835218b93062563c4280415a89f5f3f1b7ed2e00",
+        contract_sha256: "cd58acb4a781d6996bf8cc7160d33dc046c8eaba030118e61a974d4645507083",
         schema_sha256: "5be720cdd34cc0546f134ecb1bb4a0f2fef0761535629248c7f35bf9a7da8ba3",
     },
     ContractSpec {
@@ -811,6 +811,8 @@ impl ProvenanceState {
 pub enum RecallScopeBinding {
     /// Wire value `exact_coding_scope`.
     ExactCodingScope,
+    /// Wire value `checkout_observations`.
+    CheckoutObservations,
     /// Wire value `project_facts`.
     ProjectFacts,
     /// Wire value `profile_facts`.
@@ -823,6 +825,7 @@ impl RecallScopeBinding {
     pub const fn as_wire(self) -> &'static str {
         match self {
             Self::ExactCodingScope => "exact_coding_scope",
+            Self::CheckoutObservations => "checkout_observations",
             Self::ProjectFacts => "project_facts",
             Self::ProfileFacts => "profile_facts",
         }
@@ -833,6 +836,7 @@ impl RecallScopeBinding {
     pub fn from_wire(value: &str) -> Option<Self> {
         match value {
             "exact_coding_scope" => Some(Self::ExactCodingScope),
+            "checkout_observations" => Some(Self::CheckoutObservations),
             "project_facts" => Some(Self::ProjectFacts),
             "profile_facts" => Some(Self::ProfileFacts),
             _ => None,

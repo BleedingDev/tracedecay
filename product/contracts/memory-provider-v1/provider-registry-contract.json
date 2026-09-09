@@ -798,6 +798,7 @@
       "provider_may_self_declare": false,
       "values": [
         "exact_coding_scope",
+        "checkout_observations",
         "project_facts",
         "profile_facts"
       ],
@@ -805,6 +806,7 @@
       "provider_declarations": {
         "tracedecay.native": [
           "exact_coding_scope",
+          "checkout_observations",
           "project_facts",
           "profile_facts"
         ],

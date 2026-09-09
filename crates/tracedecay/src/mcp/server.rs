@@ -478,7 +478,7 @@ pub struct McpServer {
     #[cfg(feature = "memory-provider-host")]
     _memory_provider_host_mount: Option<MemoryProviderHostMount>,
     #[cfg(feature = "memory-provider-host")]
-    _observation_journey_mount: Option<ObservationJourneyMount>,
+    _observation_journey_mount: Vec<ObservationJourneyMount>,
     /// Retains the cognitive-recall route so session recall ports can be
     /// minted against this project server's exact scope and admission ledger.
     #[cfg(feature = "memory-provider-host")]

@@ -5908,6 +5908,7 @@ dependencies = [
  "tracedecay-memory-conformance",
  "tracedecay-memory-hygiene",
  "tracedecay-memory-observation",
+ "tracedecay-memory-provider-ncm",
  "tracedecay-memory-provider-registry",
  "tracedecay-policy",
  "tracedecay-private-fs",

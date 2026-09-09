@@ -45,6 +45,11 @@ use std::sync::Arc;
 use tracedecay_memory_fabric::MemoryFabric;
 use tracedecay_memory_provider_api::MemoryProvider;
 
+mod observation_mount;
+pub use observation_mount::{
+    ObservationInstanceProofV1, ObservationProviderMountV1, ObservationStateNamespacePolicyV1,
+};
+
 pub mod provider_invocation;
 pub mod recall_admission;
 pub mod recall_context_pack;

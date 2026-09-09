@@ -40,11 +40,13 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use tracedecay_memory_provider_api::contract::TerminalCode;
+
 use crate::state_capability::ProviderStateAuthorityV1;
 use crate::supervisor::{
-    DegradationKindV1, ProviderLifecycleAdapterV1, ProviderSupervisorV1, QuarantinePolicyV1,
-    QuarantineRecordV1, QuarantineReleaseError, ReadinessEvidenceV1, ReproveOutcomeV1,
-    RestartBudgetV1, ShutdownBudgetV1, SupervisedScopeV1, SupervisorConfigError,
+    DegradationCauseV1, DegradationKindV1, ProviderLifecycleAdapterV1, ProviderSupervisorV1,
+    QuarantinePolicyV1, QuarantineRecordV1, QuarantineReleaseError, ReadinessEvidenceV1,
+    ReproveOutcomeV1, RestartBudgetV1, ShutdownBudgetV1, SupervisedScopeV1, SupervisorConfigError,
     SupervisorOutcomeV1, validate_admitted_state_namespace_prefix,
 };
 use crate::{
@@ -327,6 +329,9 @@ pub enum SupervisedReadinessError {
         exact_scope_sha256: String,
         /// Typed degradation kind.
         kind: DegradationKindV1,
+        /// Provider terminal when degradation came from a refused handshake.
+        /// Other degradation causes carry no provider terminal.
+        terminal_code: Option<TerminalCode>,
         /// Degradation detail captured at the pass.
         detail: String,
         /// Micros until the enforced backoff admits another pass, or
@@ -575,6 +580,12 @@ impl SupervisedScopeReadinessV1 {
                 Err(SupervisedReadinessError::Unavailable {
                     exact_scope_sha256: self.exact_scope_sha256.clone(),
                     kind: cause.kind(),
+                    terminal_code: match &cause {
+                        DegradationCauseV1::HandshakeRefused { terminal_code } => {
+                            Some(*terminal_code)
+                        }
+                        _ => None,
+                    },
                     detail: cause.to_string(),
                     retry_in_micros,
                 })
@@ -631,6 +642,10 @@ impl SupervisedScopeReadinessV1 {
             Err(cause) => Err(SupervisedReadinessError::Unavailable {
                 exact_scope_sha256: self.exact_scope_sha256.clone(),
                 kind: cause.kind(),
+                terminal_code: match &cause {
+                    DegradationCauseV1::HandshakeRefused { terminal_code } => Some(*terminal_code),
+                    _ => None,
+                },
                 detail: cause.to_string(),
                 retry_in_micros: i64::MAX,
             }),
@@ -667,6 +682,10 @@ impl SupervisedScopeReadinessV1 {
             return Err(SupervisedReadinessError::Unavailable {
                 exact_scope_sha256: self.exact_scope_sha256.clone(),
                 kind: cause.kind(),
+                terminal_code: match &cause {
+                    DegradationCauseV1::HandshakeRefused { terminal_code } => Some(*terminal_code),
+                    _ => None,
+                },
                 detail: cause.to_string(),
                 retry_in_micros: i64::MAX,
             });

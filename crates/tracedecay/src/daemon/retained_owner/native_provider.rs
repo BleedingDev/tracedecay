@@ -293,7 +293,7 @@ impl ProjectNativeMemoryApplicationPort {
     /// journal item stays redeliverable.
     ///
     /// Nothing on this path writes a canonical fact. A staged row becomes an
-    /// advisory recall candidate only, and only for its own exact scope.
+    /// advisory recall candidate only, bound to its five origin checkout fields.
     fn observe_staged_session(&self, envelope: &NativeObservationEnvelope<'_>) -> ProviderReply {
         let call = envelope.call;
         let Some(idempotency_key) = call.idempotency_key.clone() else {
@@ -2254,9 +2254,9 @@ fn staged_score_millionths(score: f64) -> u64 {
 
 /// One staged session observation as an advisory recall candidate.
 ///
-/// The scope attested is the row's own seven stored fields under
-/// `exact_coding_scope`, which the store already proved re-derive the stored
-/// digest. Nothing about a staged row is shaped like a host evidence
+/// The candidate attests the row's five checkout fields; its own original
+/// session and scope digests remain in origin provenance. The store already
+/// proved the seven origin fields re-derive their stored digest. Nothing about a staged row is shaped like a host evidence
 /// reference: `origin_refs` names the provider-local row, the operation that
 /// committed it, and the host request identity of that delivery, so host
 /// provenance hydration classifies it as provider-attested rather than
@@ -2340,6 +2340,11 @@ fn native_staged_recall_candidate(
                     "source_event_id": row.source_event_id,
                     "receipt": row.receipt,
                     "effect_digest": row.effect_digest,
+                    "origin_scope": {
+                        "agent_session_id": row.scope.agent_session_id,
+                        "resolved_scope_digest": row.scope.resolved_scope_digest,
+                        "exact_scope_sha256": row.exact_scope_sha256,
+                    },
                 },
             },
             "transform_chain": [],
@@ -2347,7 +2352,7 @@ fn native_staged_recall_candidate(
             "redaction_reason": Value::Null,
         },
         "explanation": {
-            "summary": "staged session observation of this exact coding scope",
+            "summary": "staged session observation of this checkout",
             "matched_features": [],
             "activation_trace_refs": [],
             "native_linkage_ref": "provenance.native_linkage",
@@ -2363,26 +2368,19 @@ fn native_staged_recall_candidate(
     }))
 }
 
-/// The `exact_coding_scope` claim one staged row attests: all seven identity
-/// fields as they were stored at admission.
-///
-/// The binding requires every field to be non-empty and byte-equal to the
-/// admitted scope, and the store only returns rows whose stored fields
-/// re-derive the requested scope digest — which is also why staged recall is
-/// *same-session* in this slice: `agent_session_id` and
-/// `resolved_scope_digest` bind byte-for-byte, so a row admitted in one agent
-/// session is never admissible in another, even in the same checkout. A
-/// checkout-level binding is a provider-contract change tracked as `tdmem-b8q`.
+/// The checkout claim binds the stored origin's five checkout fields.
+/// Session and resolved-scope fields must be present and empty in the claim;
+/// their original values remain only in staged-observation origin provenance.
 fn staged_scope_attestation(row: &StagedRow) -> Value {
     serde_json::json!({
-        "scope_binding": "exact_coding_scope",
+        "scope_binding": "checkout_observations",
         "profile_id": row.scope.profile_id,
         "project_id": row.scope.project_id,
         "repository_identity": row.scope.repository_identity,
         "worktree_identity": row.scope.worktree_identity,
         "branch_identity": row.scope.branch_identity,
-        "agent_session_id": row.scope.agent_session_id,
-        "resolved_scope_digest": row.scope.resolved_scope_digest,
+        "agent_session_id": "",
+        "resolved_scope_digest": "",
     })
 }
 

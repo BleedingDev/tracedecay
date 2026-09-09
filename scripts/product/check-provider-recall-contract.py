@@ -121,6 +121,7 @@ CANDIDATE_FIELDS = [
 
 SCOPE_BINDINGS = [
     "exact_coding_scope",
+    "checkout_observations",
     "project_facts",
     "profile_facts",
 ]
@@ -132,6 +133,13 @@ BINDING_RULES = {
         "required_equal": SCOPE_FIELDS,
         "optional_empty_or_equal": [],
         "forbidden": [],
+    },
+    "checkout_observations": {
+        "required_equal": [
+            "profile_id", "project_id", "repository_identity", "worktree_identity", "branch_identity",
+        ],
+        "optional_empty_or_equal": [],
+        "forbidden": ["agent_session_id", "resolved_scope_digest"],
     },
     "project_facts": {
         "required_equal": ["profile_id", "project_id"],

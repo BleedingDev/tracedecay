@@ -1415,10 +1415,14 @@ impl McpServer {
     async fn shutdown_background_tasks_until(&self, deadline: tokio::time::Instant) -> Vec<String> {
         let mut failures = Vec::new();
         #[cfg(feature = "memory-provider-host")]
-        if let Some(journey) = self._observation_journey_mount.as_ref() {
-            for failure in journey.shutdown(deadline).await {
-                failures.push(failure.to_string());
-            }
+        for outcome in futures_util::future::join_all(
+            self._observation_journey_mount
+                .iter()
+                .map(|journey| journey.shutdown(deadline)),
+        )
+        .await
+        {
+            failures.extend(outcome.into_iter().map(|failure| failure.to_string()));
         }
         // The hosted dashboard is daemon-process state (`DASHBOARD_MANAGER`),
         // not project-server state. `tracedecay_dashboard` starts against the
