@@ -343,6 +343,58 @@ async fn projectless_admin_project_response(
     )
 }
 
+/// Resolve terminal work from the session route already published by the host.
+/// A root carried by Stop only checks that binding; it never selects another project.
+fn codex_stop_project_route(
+    arguments: &serde_json::Value,
+    store_administration: &StoreAdministration,
+) -> Result<Option<crate::mcp::project_route::ResolvedProjectRoute>> {
+    use crate::mcp::project_route::WorkspaceProjectRoute;
+
+    let expected_root = match arguments.get("project_root") {
+        Some(serde_json::Value::String(root)) if !root.is_empty() => Some(Path::new(root)),
+        Some(_) => {
+            return Err(TraceDecayError::project_route(
+                "project_route_invalid_root",
+                false,
+                "Codex Stop project_root must be a nonempty path",
+            ));
+        }
+        None => None,
+    };
+    let routes = store_administration.project_routes().snapshot()?;
+    match routes.workspace_route_for_arguments(arguments) {
+        Some(WorkspaceProjectRoute::Resolved(route)) => {
+            let profile = store_administration.profile_identity()?;
+            if &route.profile_id != profile.profile_id() {
+                return Err(TraceDecayError::project_route(
+                    "project_route_profile_mismatch",
+                    false,
+                    "Codex Stop session route belongs to another profile",
+                ));
+            }
+            if let Some(root) = expected_root
+                && authority::canonical_identity_path(root)?
+                    != authority::canonical_identity_path(&route.requested_root)?
+            {
+                return Err(TraceDecayError::project_route(
+                    "project_route_root_mismatch",
+                    false,
+                    "Codex Stop root does not match its registered session route",
+                ));
+            }
+            Ok(Some(route.as_ref().clone()))
+        }
+        Some(WorkspaceProjectRoute::Failed(failure)) => Err(failure.clone().into_error()),
+        None if expected_root.is_some() => Err(TraceDecayError::project_route(
+            "project_route_not_found",
+            true,
+            "Codex Stop project session has no registered route",
+        )),
+        None => Ok(None),
+    }
+}
+
 async fn projectless_hook_runtime_response(
     id: serde_json::Value,
     arguments: serde_json::Value,
@@ -388,6 +440,15 @@ async fn projectless_hook_runtime_response(
             }
         };
     let host_admission_broker = Ok(&host_admission_broker);
+    let codex_project_route =
+        if arguments.get("action").and_then(serde_json::Value::as_str) == Some("codex_stop") {
+            match codex_stop_project_route(&arguments, store_administration) {
+                Ok(route) => route,
+                Err(error) => return tool_error_response(id, "tracedecay_hook_runtime", &error),
+            }
+        } else {
+            None
+        };
     let refresh_wake = boxed_projectless_phase(
         store_administration
             .session_temporal_refresh_schedulers()
@@ -410,6 +471,7 @@ async fn projectless_hook_runtime_response(
                     .background_cpu(),
             ),
         host_admission_broker,
+        codex_project_route,
     ))
     .await
     {

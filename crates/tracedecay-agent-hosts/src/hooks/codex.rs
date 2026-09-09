@@ -64,7 +64,8 @@ pub async fn hook_codex_stop(runtime: &HookRuntimeV1) -> i32 {
         &parsed,
     );
     // Required producer admission must not be starved by optional guidance work.
-    let queued = enqueue_codex_stop(runtime, &parsed, Some(&telemetry), started).await;
+    let queued =
+        enqueue_codex_stop(runtime, &parsed, root.as_deref(), Some(&telemetry), started).await;
     let guidance = super::dispatch::dispatch_for_scope(
         runtime,
         tracedecay_hooks::HookHostV1::Codex,
@@ -111,6 +112,7 @@ fn codex_stop_session_id(parsed: &Value) -> Option<&str> {
 async fn enqueue_codex_stop(
     runtime: &HookRuntimeV1,
     parsed: &Value,
+    project_root: Option<&Path>,
     telemetry: Option<&super::analytics::HookTimingSpan>,
     started: Instant,
 ) -> bool {
@@ -121,15 +123,18 @@ async fn enqueue_codex_stop(
     let Some(deadline) = tracedecay_hooks::HookSynchronousDeadlineV1::after_elapsed(elapsed) else {
         return false;
     };
+    let mut arguments = serde_json::json!({ "action": "codex_stop", "session_id": session_id });
+    if let Some(project_root) = project_root {
+        // A binding check against the session's daemon-published route, never a new authority.
+        let Some(project_root) = project_root.to_str() else {
+            return false;
+        };
+        arguments["project_root"] = serde_json::json!(project_root);
+    }
     // The action acknowledges retained cancellable work; it never waits for ingest.
     let result = tokio::time::timeout(
         std::time::Duration::from_micros(deadline.remaining_micros()),
-        super::daemon_hook_action(
-            runtime,
-            None,
-            serde_json::json!({ "action": "codex_stop", "session_id": session_id }),
-            telemetry,
-        ),
+        super::daemon_hook_action(runtime, None, arguments, telemetry),
     )
     .await;
     let queued = matches!(result, Ok(Ok(ref value)) if value.get("status").and_then(Value::as_str) == Some("accepted"));
@@ -147,7 +152,7 @@ fn native_codex_stop_enqueues_exact_identity_and_refuses_invalid_identity() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let guard = super::TestDaemonHookActionGuard::install([serde_json::json!({"status":"accepted"})]);
+        let guard = super::TestDaemonHookActionGuard::install([serde_json::json!({"status":"accepted"}), serde_json::json!({"status":"accepted"})]);
         let runtime = crate::ports::hook_runtime::crate_test_runtime();
         let event = serde_json::json!({
             "hook_event_name": "Stop", "session_id": "native-codex-session-123",
@@ -155,22 +160,27 @@ fn native_codex_stop_enqueues_exact_identity_and_refuses_invalid_identity() {
             "permission_mode": "default", "stop_hook_active": false,
             "last_assistant_message": "finished"
         });
-        assert!(enqueue_codex_stop(&runtime, &event, None, Instant::now()).await);
+        assert!(enqueue_codex_stop(&runtime, &event, None, None, Instant::now()).await);
         assert_eq!(guard.calls(), vec![(None, serde_json::json!({
             "action": "codex_stop", "session_id": "native-codex-session-123", "format": "json"
         }))]);
+        assert!(enqueue_codex_stop(&runtime, &event, Some(Path::new("/registered/worktree")), None, Instant::now()).await);
+        assert_eq!(guard.calls()[1], (None, serde_json::json!({
+            "action": "codex_stop", "session_id": "native-codex-session-123", "format": "json",
+            "project_root": "/registered/worktree"
+        })));
         for invalid in [Value::Null, serde_json::json!(17), serde_json::json!(""), serde_json::json!(" ")] {
             let mut rejected = event.clone();
             rejected["session_id"] = invalid;
-            enqueue_codex_stop(&runtime, &rejected, None, Instant::now()).await;
+            enqueue_codex_stop(&runtime, &rejected, None, None, Instant::now()).await;
         }
         let mut rejected = event.clone();
         rejected.as_object_mut().unwrap().remove("session_id");
-        enqueue_codex_stop(&runtime, &rejected, None, Instant::now()).await;
+        enqueue_codex_stop(&runtime, &rejected, None, None, Instant::now()).await;
         let mut rejected = event;
         rejected["hook_event_name"] = serde_json::json!("SessionStart");
-        enqueue_codex_stop(&runtime, &rejected, None, Instant::now()).await;
-        assert_eq!(guard.calls().len(), 1);
+        enqueue_codex_stop(&runtime, &rejected, None, None, Instant::now()).await;
+        assert_eq!(guard.calls().len(), 2);
     });
 }
 

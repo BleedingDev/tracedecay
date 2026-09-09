@@ -64,6 +64,7 @@ async fn cancelled_codex_provider_stops_before_opening_the_next_jsonl_source() {
             &temp.path().join("must-not-open.jsonl"),
             temp.path(),
             project_id,
+            None,
             &PanicHostAdmission,
             None,
             &cancellation,

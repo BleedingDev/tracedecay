@@ -1,11 +1,11 @@
-//! The Claude Code host memory journey, driven as real subprocesses against a
-//! live daemon.
+//! The Claude Code and Codex host memory journeys, driven as real subprocesses
+//! against a live daemon.
 //!
 //! Everything here is the shipped `tracedecay` binary: the daemon is
 //! `tracedecay daemon run`, the operator gates are committed through
-//! `tracedecay tool tracedecay_configuration_set`, the hook is the process
-//! Claude Code itself spawns (`tracedecay hook-claude-session-start`, native
-//! payload on stdin), and the later agent question is
+//! `tracedecay tool tracedecay_configuration_set`, and the hooks are the processes
+//! Claude Code and Codex spawn (their native session-start and Stop commands,
+//! with native payloads on stdin). The later agent question is
 //! `tracedecay tool tracedecay_context`. Nothing in this file constructs a
 //! hook envelope, seals a binding, or runs an administrative import; the only
 //! thing that touches the daemon between "no journal rows" and "a settled
@@ -24,9 +24,9 @@
 //! * an operator can reach the provider host through the shipped CLI: the
 //!   `memory-provider-host` feature is a real CLI feature, so the binary under
 //!   test contains the mount (`required-features` on this target);
-//! * a Claude Code lifecycle hook invocation commits that session's messages as
-//!   canonical project observations, which the mounted observation journey then
-//!   settles against the routed provider exactly once;
+//! * Claude Code and Codex lifecycle hook invocations commit their session's
+//!   messages as canonical project observations, which the mounted observation
+//!   journey then settles against the routed provider exactly once;
 //! * a later ordinary `tracedecay_context` call carries the advisory
 //!   provider-memory lane, bounded and de-duplicated, naming the provider the
 //!   project's own routing policy pinned.
@@ -104,7 +104,7 @@ const QUIESCENCE_REPLAY_PASSES: u64 = 4;
 const QUIESCENCE_WINDOW: Duration =
     Duration::from_millis(QUIESCENCE_REPLAY_PASSES * LIVE_REPLAY_PARK_MILLIS);
 
-/// How many deliveries one Claude turn contributes: the observation journey
+/// How many deliveries one turn from either host contributes: the observation journey
 /// admits one `session.message_committed.v1` per committed session message, and
 /// each turn written below is one user record and one assistant record.
 const ROWS_PER_TURN: usize = 2;

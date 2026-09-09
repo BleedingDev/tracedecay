@@ -154,6 +154,7 @@ pub(crate) async fn handle_projectless_hook_runtime(
     global_db: &RegisteredGlobalDb,
     session_authorities: SessionAuthorities<'_>,
     host_admission_broker: std::result::Result<&SharedHostAdmissionBroker, HostAdmissionOutcome>,
+    codex_project_route: Option<crate::mcp::project_route::ResolvedProjectRoute>,
 ) -> Result<ToolResult> {
     let action = required_str(&args, "action")?;
     if !projectless_action_allowed(action, &args) {
@@ -182,6 +183,7 @@ pub(crate) async fn handle_projectless_hook_runtime(
             profile_root,
             &session_runtime_registry,
             session_authorities,
+            codex_project_route,
         )?,
         "hermes_receipt" => {
             let host_admission_broker =

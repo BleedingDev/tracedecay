@@ -20,6 +20,7 @@ pub(super) fn retain_codex_stop(
     profile_root: &Path,
     session_runtime_registry: &Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>,
     session_authorities: SessionAuthorities<'_>,
+    project_route: Option<crate::mcp::project_route::ResolvedProjectRoute>,
 ) -> Result<Value> {
     let session_id = required_str(args, "session_id")?.to_owned();
     let user_sessions = session_authorities
@@ -30,64 +31,105 @@ pub(super) fn retain_codex_stop(
         .profile_identity
         .clone()
         .ok_or_else(|| config_error("daemon profile identity is unavailable"))?;
+    let project = project_route
+        .map(|route| {
+            let server = route.retained_server()?;
+            if server.project_route_live() == Some(false) {
+                return Err(config_error("Codex Stop project route is no longer live"));
+            }
+            let sessions = server.project_session_db().ok_or_else(|| {
+                config_error("Codex Stop project session authority is unavailable")
+            })?;
+            Ok((server, sessions))
+        })
+        .transpose()?;
+    let transcript_home = tracedecay_sessions::runtime::home_dir()
+        .ok_or_else(|| config_error("Codex transcript source home is unavailable"))?;
     let background_cpu = session_authorities.background_cpu.clone();
     let profile_root = profile_root.to_path_buf();
     let weak_registry = Arc::downgrade(session_runtime_registry);
     let task_session_id = session_id.clone();
     let accepted =
         session_runtime_registry.retain_hook_task("codex", &session_id, move |cancellation| {
-            hotpath::future!(
-                async move {
-                    if cancellation.is_cancelled() {
-                        return;
+            let followup = async move {
+                if cancellation.is_cancelled() {
+                    return;
+                }
+                let Some(session_runtime_registry) = weak_registry.upgrade() else {
+                    return;
+                };
+                let Ok(global_db) = session_runtime_registry.profile_database().await else {
+                    return;
+                };
+                let graph = match project.as_ref() {
+                    Some((server, _)) => {
+                        if server.project_route_live() == Some(false) {
+                            return;
+                        }
+                        let Some(graph) =
+                            await_terminal_operation(&cancellation, server.cg_snapshot()).await
+                        else {
+                            return;
+                        };
+                        Some(graph)
                     }
-                    let Some(session_runtime_registry) = weak_registry.upgrade() else {
-                        return;
-                    };
-                    let Ok(global_db) = session_runtime_registry.profile_database().await else {
-                        return;
-                    };
-                    let ingest_args = json!({
-                        "action": "ingest_transcript",
-                        "provider": "codex",
-                        "user_scope": true,
-                        "session_id": task_session_id,
-                    });
-                    let authorities = SessionAuthorities::new(None, Some(&user_sessions))
-                        .with_profile_identity(Some(std::sync::Arc::clone(&profile_identity)))
-                        .with_background_cpu(background_cpu.clone());
-                    let ingested = ingest_transcript_with_cancellation(
-                        None,
-                        &ingest_args,
-                        Some(&profile_root),
-                        Some(global_db.as_ref()),
-                        None,
-                        authorities,
+                    None => None,
+                };
+                let ingest_args = json!({
+                    "action": "ingest_transcript",
+                    "provider": "codex",
+                    "user_scope": project.is_none(),
+                    "max_new_bytes": tracedecay_sessions::runtime::codex::CODEX_HOOK_MAX_NEW_BYTES,
+                    "session_id": task_session_id,
+                });
+                let authorities = SessionAuthorities::new(
+                    project.as_ref().map(|(_, sessions)| sessions),
+                    Some(&user_sessions),
+                )
+                .with_profile_identity(Some(std::sync::Arc::clone(&profile_identity)))
+                .with_background_cpu(background_cpu.clone());
+                let ingested = ingest_transcript_with_cancellation(
+                    graph.as_deref(),
+                    &ingest_args,
+                    Some(&profile_root),
+                    Some(global_db.as_ref()),
+                    None,
+                    authorities,
+                    &cancellation,
+                )
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, "retained Codex Stop transcript ingestion failed");
+                    error
+                })
+                .ok()
+                .and_then(|result| result.get("messages_upserted").and_then(Value::as_u64))
+                .is_some_and(|count| count > 0);
+                if project.is_none()
+                    && ingested
+                    && !cancellation.is_cancelled()
+                    && let Some(session_id) = ingest_args.get("session_id").cloned()
+                {
+                    let _ = await_terminal_operation(
                         &cancellation,
+                        user_review(
+                            &json!({
+                                "action": "user_review",
+                                "provider": "codex",
+                                "session_id": session_id,
+                            }),
+                            &profile_root,
+                            &session_runtime_registry,
+                        ),
                     )
-                    .await
-                    .ok()
-                    .and_then(|result| result.get("messages_upserted").and_then(Value::as_u64))
-                    .is_some_and(|count| count > 0);
-                    if ingested
-                        && !cancellation.is_cancelled()
-                        && let Some(session_id) = ingest_args.get("session_id").cloned()
-                    {
-                        let _ = await_terminal_operation(
-                            &cancellation,
-                            user_review(
-                                &json!({
-                                    "action": "user_review",
-                                    "provider": "codex",
-                                    "session_id": session_id,
-                                }),
-                                &profile_root,
-                                &session_runtime_registry,
-                            ),
-                        )
-                        .await;
-                    }
-                },
+                    .await;
+                }
+            };
+            hotpath::future!(
+                tracedecay_sessions::runtime::with_transcript_source_home(
+                    transcript_home,
+                    followup
+                ),
                 label = "mcp.hook_runtime.terminal_followup"
             )
         });

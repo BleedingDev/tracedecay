@@ -470,6 +470,7 @@ async fn capture_codex_project(
         &source,
         cg.project_root(),
         project_id,
+        ctx.args.get("session_id").and_then(Value::as_str),
         ctx.max_new_bytes,
         ctx.cancellation,
     )

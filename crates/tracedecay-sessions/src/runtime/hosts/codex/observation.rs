@@ -278,6 +278,7 @@ pub async fn try_admit_codex_jsonl_observations_for_project_with_admission(
         path,
         project_root,
         project_id,
+        None,
         admission,
         max_new_bytes,
         &ObservationCancellation::default(),
@@ -289,6 +290,7 @@ pub async fn try_admit_codex_jsonl_observations_for_project_with_admission_and_c
     path: &Path,
     project_root: &Path,
     project_id: ProjectId,
+    session_id: Option<&str>,
     admission: &dyn HostAdmission,
     max_new_bytes: Option<u64>,
     cancellation: &ObservationCancellation,
@@ -298,6 +300,7 @@ pub async fn try_admit_codex_jsonl_observations_for_project_with_admission_and_c
         CodexObservationAdmission::Project {
             root: project_root,
             project_id,
+            session_id,
         },
         admission,
         max_new_bytes,
@@ -373,6 +376,7 @@ pub(super) enum CodexObservationAdmission<'a> {
     Project {
         root: &'a Path,
         project_id: ProjectId,
+        session_id: Option<&'a str>,
     },
     Profile {
         session_id: Option<&'a str>,
@@ -402,7 +406,16 @@ impl CodexObservationAdmission<'_> {
     }
 
     pub(super) fn accepts_session(&self, session_id: &str) -> bool {
-        !matches!(self, Self::Profile { session_id: Some(expected), .. } if *expected != session_id)
+        match self {
+            Self::Project {
+                session_id: expected,
+                ..
+            }
+            | Self::Profile {
+                session_id: expected,
+                ..
+            } => expected.is_none_or(|expected| expected == session_id),
+        }
     }
 
     fn projection_project_path<'b>(&'b self, cwd: Option<&'b Path>) -> Option<&'b Path> {
@@ -969,6 +982,7 @@ mod replay_boundary_tests {
         let admission_scope = CodexObservationAdmission::Project {
             root: &project,
             project_id: project_id.clone(),
+            session_id: None,
         };
         let ordinary_source = ObservationSourceIdentityV1::for_provider(
             ProviderId::new(PROVIDER).unwrap(),

@@ -117,18 +117,33 @@ async fn admit_codex_project_rollouts(
     source: &tracedecay_sessions::runtime::codex::CodexSource,
     project_root: &Path,
     project_id: ProjectId,
+    session_id: Option<&str>,
     max_new_bytes: Option<u64>,
     cancellation: &ObservationCancellation,
 ) -> Result<bool> {
     let mut budget = max_new_bytes;
-    let mut deferred = false;
-    let mut paths = source.transcript_paths(project_root).into_iter().peekable();
+    let (paths, mut deferred) = match session_id {
+        Some(session_id) => {
+            let source = source.clone();
+            let session_id = session_id.to_owned();
+            let lookup = tokio::task::spawn_blocking(move || {
+                source.find_session_transcript_paths_bounded(&session_id)
+            })
+            .await
+            .map_err(|_| config_error("Codex exact-session discovery task failed"))?
+            .map_err(|error| map_transcript_ingest_error(&error))?;
+            (lookup.paths, lookup.source_deferred)
+        }
+        None => (source.transcript_paths(project_root), false),
+    };
+    let mut paths = paths.into_iter().peekable();
     while let Some(path) = paths.next() {
         let progress =
             tracedecay_sessions::runtime::codex::try_admit_codex_jsonl_observations_for_project_with_admission_and_cancellation(
                 &path,
                 project_root,
                 project_id.clone(),
+                session_id,
                 admission,
                 budget,
                 cancellation,
@@ -318,6 +333,7 @@ async fn admit_codex_rollouts_once(
         &source,
         cg.project_root(),
         project_id,
+        None,
         None,
         &cancellation,
     )

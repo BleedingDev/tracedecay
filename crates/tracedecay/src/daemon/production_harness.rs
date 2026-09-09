@@ -1552,3 +1552,6 @@ mod semantic_restart_journey_test;
 
 #[cfg(test)]
 mod semantic_index_fixture_check_test;
+
+#[cfg(all(test, feature = "test-helpers"))]
+mod codex_stop_journey_test;

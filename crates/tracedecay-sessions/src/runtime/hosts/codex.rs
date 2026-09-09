@@ -1027,7 +1027,7 @@ const EXACT_HOOK_DISCOVERY_UNITS_PER_CALL: usize = 64;
 const MAX_EXACT_HOOK_SOURCE_AUTHORITIES: usize = 8;
 const MAX_EXACT_HOOK_SESSION_REQUESTS: usize = 64;
 
-pub(crate) struct CodexExactSessionLookupOutcome {
+pub struct CodexExactSessionLookupOutcome {
     pub paths: Vec<PathBuf>,
     pub source_deferred: bool,
     #[cfg(test)]
@@ -1222,7 +1222,7 @@ impl CodexSource {
     /// rollout filename used by a Codex hook event. Repeated calls continue the
     /// same iterator instead of rereading the corpus prefix.
     #[hotpath::measure(label = "sessions.hosts.codex.find_session")]
-    pub(crate) fn find_session_transcript_paths_bounded(
+    pub fn find_session_transcript_paths_bounded(
         &self,
         session_id: &str,
     ) -> TranscriptIngestResult<CodexExactSessionLookupOutcome> {
