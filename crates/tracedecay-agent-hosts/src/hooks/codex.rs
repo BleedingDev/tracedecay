@@ -116,10 +116,10 @@ async fn enqueue_codex_stop(
     let Some(session_id) = codex_stop_session_id(parsed) else {
         return false;
     };
-    let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    let Some(deadline) = tracedecay_hooks::HookSynchronousDeadlineV1::after_elapsed(elapsed) else {
+    let deadline = super::dispatch::native_lifecycle_deadline(started);
+    if Instant::now() >= deadline {
         return false;
-    };
+    }
     let mut arguments = serde_json::json!({ "action": "codex_stop", "session_id": session_id });
     if let Some(project_root) = project_root {
         // A binding check against the session's daemon-published route, never a new authority.
@@ -129,8 +129,8 @@ async fn enqueue_codex_stop(
         arguments["project_root"] = serde_json::json!(project_root);
     }
     // The action acknowledges retained cancellable work; it never waits for ingest.
-    let result = tokio::time::timeout(
-        std::time::Duration::from_micros(deadline.remaining_micros()),
+    let result = tokio::time::timeout_at(
+        deadline.into(),
         super::daemon_hook_action(runtime, None, arguments, telemetry),
     )
     .await;
@@ -179,6 +179,45 @@ fn native_codex_stop_enqueues_exact_identity_and_refuses_invalid_identity() {
         enqueue_codex_stop(&runtime, &rejected, None, None, Instant::now()).await;
         assert_eq!(guard.calls().len(), 2);
     });
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn native_codex_stop_enqueue_uses_reserved_lifecycle_time_and_refuses_expiry() {
+    let guard = super::TestDaemonHookActionGuard::install([serde_json::json!({
+        "status": "accepted"
+    })]);
+    let runtime = crate::ports::hook_runtime::crate_test_runtime();
+    let event = serde_json::json!({
+        "hook_event_name": "Stop", "session_id": "session-stop-reserve",
+        "turn_id": "turn-one", "cwd": "/workspace", "model": "codex",
+        "permission_mode": "default", "stop_hook_active": false,
+        "last_assistant_message": "finished"
+    });
+    let started = Instant::now() - std::time::Duration::from_millis(900);
+    assert!(
+        tracedecay_hooks::HookSynchronousDeadlineV1::after_elapsed(super::analytics::elapsed_us(
+            started
+        ))
+        .is_none()
+    );
+    assert!(enqueue_codex_stop(&runtime, &event, None, None, started).await);
+    assert_eq!(guard.calls().len(), 1);
+    assert!(
+        !enqueue_codex_stop(
+            &runtime,
+            &event,
+            None,
+            None,
+            Instant::now() - std::time::Duration::from_secs(2),
+        )
+        .await
+    );
+    assert_eq!(
+        guard.calls().len(),
+        1,
+        "expired enqueue must not reach transport"
+    );
 }
 
 /// Codex `SessionStart` hook handler.

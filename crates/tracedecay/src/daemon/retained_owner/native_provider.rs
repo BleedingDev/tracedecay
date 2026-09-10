@@ -2345,6 +2345,7 @@ fn build_native_recall_reply_with_response_bytes(
     }
 
     let temporal = owned_temporal_query(&request.temporal_query)?;
+    let mut accepted_common_sources: Vec<&StagedRow> = Vec::new();
     for row in staged_rows {
         if staged_row_excluded(row, call, &request.exclusions) {
             excluded_items += 1;
@@ -2400,6 +2401,23 @@ fn build_native_recall_reply_with_response_bytes(
             push_reason(&mut reasons, "candidate_content_budget");
             continue;
         }
+        // Repeated deliveries with the same canonical attribution, full message,
+        // revision, and validity share one recall slot and content budget.
+        // Keep the first accepted row in the store's existing rank order.
+        if common_recall(request)
+            && row.original_source.as_ref().is_some_and(|original_source| {
+                accepted_common_sources.iter().any(|accepted| {
+                    accepted.original_source.as_ref() == Some(original_source)
+                        && accepted.message_text == row.message_text
+                        && accepted.source_revision == row.source_revision
+                        && accepted.validity == row.validity
+                })
+            })
+        {
+            excluded_items = excluded_items.saturating_add(1);
+            push_reason(&mut reasons, "duplicate_source_observation");
+            continue;
+        }
         let content_bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
         if total_content_bytes.saturating_add(content_bytes)
             > request.budgets.maximum_total_content_bytes
@@ -2421,6 +2439,9 @@ fn build_native_recall_reply_with_response_bytes(
                 request,
             )?,
         });
+        if common_recall(request) {
+            accepted_common_sources.push(row);
+        }
     }
 
     // Stable, so equal-score members of one class keep the order their own

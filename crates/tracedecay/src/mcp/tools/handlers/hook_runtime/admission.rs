@@ -603,7 +603,12 @@ pub(super) async fn hook_v2_admit(
                 "disposition": tracedecay_hooks::HookTransportDispositionV1::CatchupRequired,
                 "reason": "admission_identity_conflict",
             }),
-            HookV2AdmissionOutcomeV1::CatchupRequired => hook_v2_catchup_response(action),
+            HookV2AdmissionOutcomeV1::CatchupRequired => json!({
+                "action": action,
+                "status": "rejected",
+                "disposition": tracedecay_hooks::HookTransportDispositionV1::CatchupRequired,
+                "reason": "binding_changed",
+            }),
             HookV2AdmissionOutcomeV1::Backpressured => json!({
                 "action": action,
                 "status": "backpressured",

@@ -21,7 +21,7 @@ use tracedecay_hooks::admission_ledger::{
 use tracedecay_hooks::{HookAdmissionLedgerReceiptV1, HookEventEnvelopeV2, HookHostV1};
 use tracedecay_sessions::repository_provenance::RepositoryProvenanceAdmissionContext;
 use tracedecay_sessions::runtime::source::{
-    JsonlResumeState, StoredCursor, capture_live_jsonl_origin,
+    JsonlResumeState, LiveJsonlOriginPrevious, StoredCursor, capture_live_jsonl_origin,
 };
 use tracedecay_store::StoreShardScopeV1;
 
@@ -439,25 +439,29 @@ fn capture_origin(
     {
         return None;
     }
-    let checkpoint = previous
+    let previous_observation = previous
         .filter(|previous| {
             previous.observation.canonical_source_path == canonical_source_path
                 && previous.observation.source == source.source
         })
-        .map(|previous| previous.observation.checkpoint);
-    let resume = checkpoint.map(|checkpoint| {
-        (
-            StoredCursor {
+        .map(|previous| &previous.observation);
+    let checkpoint = previous_observation.map(|previous| previous.checkpoint);
+    let resume = previous_observation.map(|previous| {
+        let checkpoint = previous.checkpoint;
+        LiveJsonlOriginPrevious {
+            cursor: StoredCursor {
                 position: checkpoint.complete_frontier,
                 file_id: checkpoint.generation,
                 mtime: 0,
             },
-            JsonlResumeState {
+            resume: JsonlResumeState {
                 generation: checkpoint.generation,
                 file_identity: checkpoint.file_identity,
                 fingerprint: checkpoint.complete_prefix_fingerprint,
             },
-        )
+            physical_eof: previous.physical_eof,
+            native_birth_witness: previous.native_birth_witness,
+        }
     });
     let scan = capture_live_jsonl_origin(
         &source.source_path,
@@ -489,6 +493,7 @@ fn capture_origin(
             complete_prefix_fingerprint: scan.complete_prefix_fingerprint,
         },
         physical_eof: scan.physical_eof,
+        native_birth_witness: scan.native_birth_witness,
         validated_checkpoint: checkpoint.filter(|_| scan.validated_previous),
         frames: scan
             .frames

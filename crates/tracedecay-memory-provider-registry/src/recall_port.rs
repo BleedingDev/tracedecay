@@ -79,7 +79,7 @@ use tracedecay_memory_provider_api::{
     ProviderLimits, ProviderOperation, ProviderReply,
 };
 
-use crate::ProjectMemoryProviderComposition;
+use crate::{COMMON_ADVISORY_PROFILE_ID, ProjectMemoryProviderComposition};
 use crate::provider_invocation::{
     ProviderInvocationBoundaryV1, ProviderInvocationFaultV1, ProviderInvocationRequestV1,
 };
@@ -88,7 +88,7 @@ use crate::recall_admission::{
     AdmittedTemporalQuery, RECALL_QUERY_CAPABILITY_ID, RecallAdmissionError, RecallAdmissionReport,
     RecallBudgetsV1, RecallCandidateContent, RecallCandidateV1, RecallRequestParts,
     UnknownValidityPolicy, admit_recall_reply_with_profile,
-    build_recall_request_payload_with_context, rfc3339_utc_micros,
+    build_recall_request_payload_with_capabilities, rfc3339_utc_micros,
 };
 use crate::recall_normalization::{
     RecallNormalizationError, RecallNormalizationPolicyV1, RecallNormalizationV1,
@@ -1182,15 +1182,33 @@ struct RecallCallPlan {
 
 impl RecallCallPlan {
     fn common_profile_for(&self, call: &ProviderCall) -> Result<bool, CognitiveRecallPortError> {
-        self.registration_profiles
-            .get(&call.provider_id)
-            .filter(|(revision, _)| *revision == call.registration_revision)
-            .map(|(_, required)| *required)
-            .ok_or(CognitiveRecallPortError::Admission(
-                RecallAdmissionError::OutcomeBinding {
-                    field: "host registration profile",
-                },
-            ))
+        registered_common_profile(
+            &self.registration_profiles,
+            &call.provider_id,
+            call.registration_revision,
+        )
+        .map_err(CognitiveRecallPortError::Admission)
+    }
+
+    fn required_capabilities(
+        &self,
+        provider_id: &OwnedProviderId,
+        registration_revision: u64,
+    ) -> Result<Vec<OwnedVersionedId>, RecallRoutePlanError> {
+        let common_profile = registered_common_profile(
+            &self.registration_profiles,
+            provider_id,
+            registration_revision,
+        )
+        .map_err(RecallRoutePlanError::Admission)?;
+        let mut capabilities = vec![self.recall_capability.clone()];
+        if common_profile {
+            capabilities.push(
+                OwnedVersionedId::new(COMMON_ADVISORY_PROFILE_ID)
+                    .map_err(RecallRoutePlanError::Contract)?,
+            );
+        }
+        Ok(capabilities)
     }
 
     fn control(&self) -> OperationControl {
@@ -1204,16 +1222,33 @@ impl RecallCallPlan {
     }
 }
 
+/// Bind readiness, dispatch, and admission to the same host registration.
+fn registered_common_profile(
+    registration_profiles: &BTreeMap<OwnedProviderId, (u64, bool)>,
+    provider_id: &OwnedProviderId,
+    registration_revision: u64,
+) -> Result<bool, RecallAdmissionError> {
+    registration_profiles
+        .get(provider_id)
+        .filter(|(revision, _)| *revision == registration_revision)
+        .map(|(_, required)| *required)
+        .ok_or(RecallAdmissionError::OutcomeBinding {
+            field: "host registration profile",
+        })
+}
+
 impl ActiveCallPlan for RecallCallPlan {
     type Error = RecallRoutePlanError;
 
     fn handshake_request(&self, target: &RouteTarget) -> Result<HandshakeRequest, Self::Error> {
+        let required_capabilities =
+            self.required_capabilities(&target.provider_id, target.registration_revision)?;
         HandshakeRequest::new(HandshakeRequestParts {
             provider_id: target.provider_id.clone(),
             registration_revision: target.registration_revision,
             exact_scope: self.exact_scope.clone(),
             request_id: format!("recall-readiness.{}", self.request_id),
-            required_capabilities: vec![self.recall_capability.clone()],
+            required_capabilities,
             host_limits: self.host_limits,
             control: self.control(),
             challenge_nonce: challenge_nonce()?,
@@ -1222,11 +1257,13 @@ impl ActiveCallPlan for RecallCallPlan {
     }
 
     fn provider_call(&self, target: &ReadyRouteTarget) -> Result<ProviderCall, Self::Error> {
+        let required_capabilities =
+            self.required_capabilities(&target.provider_id, target.registration_revision)?;
         // The request payload must echo exactly the control the call carries:
         // the provider verifies the deadline and refuses a remaining budget
         // larger than the one the host actually dispatched.
         let call_control = self.control();
-        let payload = build_recall_request_payload_with_context(
+        let payload = build_recall_request_payload_with_capabilities(
             &RecallRequestParts {
                 provider_id: target.provider_id.clone(),
                 registration_revision: target.registration_revision,
@@ -1243,6 +1280,7 @@ impl ActiveCallPlan for RecallCallPlan {
             },
             self.exclusions.as_ref(),
             self.history_grant.as_ref(),
+            &required_capabilities,
         )
         .map_err(RecallRoutePlanError::Admission)?;
         ProviderCall::new(ProviderCallParts {
@@ -1257,7 +1295,7 @@ impl ActiveCallPlan for RecallCallPlan {
             idempotency_key: None,
             control: call_control,
             payload,
-            required_capabilities: vec![self.recall_capability.clone()],
+            required_capabilities,
             extensions: Vec::new(),
         })
         .map_err(RecallRoutePlanError::Contract)
@@ -1523,6 +1561,31 @@ mod application_context_tests {
             8,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn common_profile_binding_requires_the_exact_registered_target_revision() {
+        let provider_id = OwnedProviderId::new("provider.profile-binding").unwrap();
+        let unknown_provider = OwnedProviderId::new("provider.unregistered").unwrap();
+        for common_profile in [false, true] {
+            let profiles = BTreeMap::from([(provider_id.clone(), (31, common_profile))]);
+            assert_eq!(
+                registered_common_profile(&profiles, &provider_id, 31).unwrap(),
+                common_profile
+            );
+            for (target, revision) in [
+                (&provider_id, 30),
+                (&provider_id, 32),
+                (&unknown_provider, 31),
+            ] {
+                assert!(matches!(
+                    registered_common_profile(&profiles, target, revision),
+                    Err(RecallAdmissionError::OutcomeBinding {
+                        field: "host registration profile",
+                    })
+                ));
+            }
+        }
     }
 
     #[test]

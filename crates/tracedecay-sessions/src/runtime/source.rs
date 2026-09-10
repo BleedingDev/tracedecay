@@ -901,8 +901,8 @@ pub(in crate::runtime) use jsonl::{
 };
 pub use jsonl::{
     JsonlFrameDeferral, JsonlResumeState, LiveJsonlOriginCapture, LiveJsonlOriginFrame,
-    MAX_JSONL_RECORD_BYTES, RawJsonlFrame, RawJsonlFrameReader, RawJsonlRecord,
-    RawJsonlSkippedRange, RawJsonlSkippedReason, STRICT_JSONL_BATCH_BYTES,
+    LiveJsonlOriginPrevious, MAX_JSONL_RECORD_BYTES, RawJsonlFrame, RawJsonlFrameReader,
+    RawJsonlRecord, RawJsonlSkippedRange, RawJsonlSkippedReason, STRICT_JSONL_BATCH_BYTES,
     capture_live_jsonl_origin, try_stream_new_jsonl_raw_strict_with_resume,
 };
 pub use jsonl::{JsonlLine, NewJsonl, stream_new_jsonl};
@@ -1103,10 +1103,45 @@ fn should_resume_jsonl(prev: StoredCursor, file_size: u64, mtime: u64, file_id: 
     mtime >= prev.mtime
 }
 
-fn stable_jsonl_file_id(
+pub(in crate::runtime) fn stable_jsonl_file_id(
     file: &mut std::fs::File,
     meta: &std::fs::Metadata,
 ) -> std::io::Result<(u64, u64)> {
+    let (head, identity_window_bytes) = jsonl_head_fingerprint(file)?;
+    Ok((
+        jsonl_file_id_with_head(file, meta, head)?,
+        identity_window_bytes,
+    ))
+}
+
+/// The existing file identity with an empty head, using this open handle's
+/// native identity. Platforms without a native file identity cannot prove an
+/// empty-to-first-append transition.
+pub(in crate::runtime) fn empty_jsonl_file_id(
+    file: &std::fs::File,
+    meta: &std::fs::Metadata,
+) -> std::io::Result<Option<u64>> {
+    #[cfg(any(unix, windows))]
+    {
+        let digest = Sha256::digest(b"tracedecay-jsonl-head-v1");
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        jsonl_file_id_with_head(file, meta, u64::from_be_bytes(bytes)).map(Some)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, meta);
+        Ok(None)
+    }
+}
+
+fn jsonl_file_id_with_head(
+    file: &std::fs::File,
+    meta: &std::fs::Metadata,
+    head: u64,
+) -> std::io::Result<u64> {
+    #[cfg(not(windows))]
+    let _ = file;
     let mut hasher = Sha256::new();
     hasher.update(b"tracedecay-jsonl-file-id-v1");
     #[cfg(unix)]
@@ -1133,12 +1168,11 @@ fn stable_jsonl_file_id(
             }
         }
     }
-    let (head, identity_window_bytes) = jsonl_head_fingerprint(file)?;
     hasher.update(head.to_le_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];
     bytes.copy_from_slice(&digest[..8]);
-    Ok((u64::from_be_bytes(bytes), identity_window_bytes))
+    Ok(u64::from_be_bytes(bytes))
 }
 
 pub(super) fn jsonl_file_identity(path: &Path) -> std::io::Result<u64> {

@@ -75,6 +75,141 @@ struct FlushPolicy<'policy> {
     persisted_cursor_update: PersistedCursorUpdate,
 }
 
+/// A server-selected live checkpoint. It is an internal Rust value, never a
+/// caller-supplied JSON offset or an authorization to upgrade source provenance.
+/// The host validates its profile and project binding before constructing it.
+#[derive(Clone, Debug)]
+pub struct SealedJsonlSourceBound {
+    canonical_path: PathBuf,
+    source: ObservationSourceIdentityV1,
+    scope: ObservationScopeV1,
+    generation: u64,
+    file_identity: u64,
+    complete_frontier: u64,
+    complete_prefix_fingerprint: u64,
+}
+
+impl SealedJsonlSourceBound {
+    pub fn new(
+        canonical_path: PathBuf,
+        source: ObservationSourceIdentityV1,
+        scope: ObservationScopeV1,
+        generation: u64,
+        file_identity: u64,
+        complete_frontier: u64,
+        complete_prefix_fingerprint: u64,
+    ) -> Self {
+        Self {
+            canonical_path,
+            source,
+            scope,
+            generation,
+            file_identity,
+            complete_frontier,
+            complete_prefix_fingerprint,
+        }
+    }
+
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
+    fn matches_request(
+        &self,
+        path: &Path,
+        source: &ObservationSourceIdentityV1,
+        scope: &ObservationScopeV1,
+    ) -> bool {
+        path == self.canonical_path && source == &self.source && scope == &self.scope
+    }
+
+    /// Validate one opened no-follow file, including the scanned page's prefix.
+    /// A rename/rewrite between the scanner and this read cannot supply a page
+    /// from a different generation or prefix to the capture path.
+    fn matches_page(&self, page: &SharedJsonlPage, cancellation: &ObservationCancellation) -> bool {
+        use crate::runtime::source::{
+            jsonl_file_change_token, jsonl_native_file_identity, jsonl_prefix_digest,
+            stable_jsonl_file_id,
+        };
+        use std::io::{Read, Seek, SeekFrom};
+        if cancellation.is_cancelled()
+            || page.new_cursor.file_id != self.generation
+            || page.file_identity != self.file_identity
+        {
+            return false;
+        }
+        let check = || -> std::io::Result<bool> {
+            let mut file = tracedecay_private_fs::framed_log::open_regular_read_no_follow(
+                &self.canonical_path,
+            )?;
+            let before = file.metadata()?;
+            let native_identity = jsonl_native_file_identity(&file, &before);
+            if !before.is_file()
+                || before.len() < self.complete_frontier
+                || native_identity.is_none()
+                || stable_jsonl_file_id(&mut file, &before)?.0 != self.file_identity
+            {
+                return Ok(false);
+            }
+            struct CancellableFile<'a> {
+                file: &'a mut std::fs::File,
+                cancellation: &'a ObservationCancellation,
+            }
+            impl Read for CancellableFile<'_> {
+                fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                    if self.cancellation.is_cancelled() {
+                        return Err(std::io::Error::other(
+                            "JSONL checkpoint validation cancelled",
+                        ));
+                    }
+                    self.file.read(bytes)
+                }
+            }
+            impl Seek for CancellableFile<'_> {
+                fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                    self.file.seek(position)
+                }
+            }
+            let checkpoint = page
+                .frames
+                .iter()
+                .map(|frame| (frame.end_offset, frame.resume_fingerprint))
+                .chain(
+                    page.skipped
+                        .iter()
+                        .map(|range| (range.end_offset, range.resume_fingerprint)),
+                )
+                .max_by_key(|(end, _)| *end);
+            let mut reader = CancellableFile {
+                file: &mut file,
+                cancellation,
+            };
+            let (digest, _) = jsonl_prefix_digest(&mut reader, self.complete_frontier)?;
+            let fingerprint = |witness: [u8; 32]| {
+                u64::from_be_bytes(witness[..8].try_into().expect("eight-byte prefix witness"))
+            };
+            if fingerprint(digest.witness(self.complete_frontier))
+                != self.complete_prefix_fingerprint
+            {
+                return Ok(false);
+            }
+            if let Some((end, expected)) = checkpoint {
+                let (digest, _) = jsonl_prefix_digest(&mut reader, end)?;
+                if fingerprint(digest.witness(end)) != expected {
+                    return Ok(false);
+                }
+            }
+            let after = file.metadata()?;
+            Ok(!cancellation.is_cancelled()
+                && before.len() == after.len()
+                && jsonl_file_change_token(&before) == jsonl_file_change_token(&after)
+                && native_identity == jsonl_native_file_identity(&file, &after)
+                && stable_jsonl_file_id(&mut file, &after)?.0 == self.file_identity)
+        };
+        check().unwrap_or(false)
+    }
+}
+
 pub(in crate::runtime) struct JsonlObservationAdmissionRequest<'request> {
     provider: &'static str,
     path: &'request Path,
@@ -85,6 +220,7 @@ pub(in crate::runtime) struct JsonlObservationAdmissionRequest<'request> {
     max_new_bytes: Option<u64>,
     required_start_cursor: Option<Option<ObservationSourceCursorV1>>,
     max_end_offset: Option<u64>,
+    sealed_source: Option<&'request SealedJsonlSourceBound>,
     persisted_cursor_update: PersistedCursorUpdate,
     cancellation: ObservationCancellation,
     shared_frame_preparation: SharedJsonlFramePreparation,
@@ -109,6 +245,7 @@ impl<'request> JsonlObservationAdmissionRequest<'request> {
             max_new_bytes: None,
             required_start_cursor: None,
             max_end_offset: None,
+            sealed_source: None,
             persisted_cursor_update: PersistedCursorUpdate::Monotonic,
             cancellation: ObservationCancellation::default(),
             shared_frame_preparation: SharedJsonlFramePreparation::None,
@@ -133,7 +270,19 @@ impl<'request> JsonlObservationAdmissionRequest<'request> {
 
     /// Bound this admission to an absolute source offset.
     pub(in crate::runtime) fn with_max_end_offset(mut self, max_end_offset: u64) -> Self {
-        self.max_end_offset = Some(max_end_offset);
+        self.max_end_offset = Some(
+            self.max_end_offset
+                .map_or(max_end_offset, |old| old.min(max_end_offset)),
+        );
+        self
+    }
+
+    pub(in crate::runtime) fn with_sealed_source(
+        mut self,
+        sealed_source: &'request SealedJsonlSourceBound,
+    ) -> Self {
+        self = self.with_max_end_offset(sealed_source.complete_frontier);
+        self.sealed_source = Some(sealed_source);
         self
     }
 
@@ -2136,12 +2285,19 @@ pub(in crate::runtime) async fn admit_jsonl_observations<State: Clone>(
         mut max_new_bytes,
         required_start_cursor,
         max_end_offset,
+        sealed_source,
         persisted_cursor_update,
         cancellation,
         shared_frame_preparation,
     } = request;
     if cancellation.is_cancelled() {
         return Err(TranscriptIngestError::Cancelled { provider });
+    }
+    if sealed_source.is_some_and(|bound| !bound.matches_request(path, &source, &scope)) {
+        return Ok(JsonlObservationAdmissionProgress {
+            source_deferred: true,
+            ..JsonlObservationAdmissionProgress::default()
+        });
     }
     let mut expected_cursor =
         admission
@@ -2204,6 +2360,50 @@ pub(in crate::runtime) async fn admit_jsonl_observations<State: Clone>(
         false,
     )
     .await?;
+    // The scanner may admit its first complete record beyond a byte budget.
+    // An authority ceiling is stricter: refuse the entire page before capture,
+    // skipped coverage, initialization callbacks, or any durable cursor write.
+    if max_end_offset.is_some_and(|end| {
+        raw.start_offset > end
+            || raw.read_through > end
+            || raw.new_cursor.position > end
+            || raw
+                .frames
+                .iter()
+                .any(|frame| frame.offset > end || frame.end_offset > end)
+            || raw
+                .skipped
+                .iter()
+                .any(|range| range.offset > end || range.end_offset > end)
+    }) {
+        return Ok(JsonlObservationAdmissionProgress {
+            source_deferred: true,
+            ..JsonlObservationAdmissionProgress::default()
+        });
+    }
+    if let Some(bound) = sealed_source {
+        let bound = bound.clone();
+        let page = Arc::clone(&raw);
+        let validation_cancellation = cancellation.clone();
+        let background_cpu = shared_jsonl_background_cpu()?;
+        let valid = tokio::task::spawn_blocking(move || {
+            let Some(_permit) = background_cpu.try_acquire() else {
+                return false;
+            };
+            bound.matches_page(&page, &validation_cancellation)
+        })
+        .await
+        .map_err(|_| TranscriptIngestError::BlockingScanTaskFailed { provider })?;
+        if cancellation.is_cancelled() {
+            return Err(TranscriptIngestError::Cancelled { provider });
+        }
+        if !valid || raw.start_offset != previous.position {
+            return Ok(JsonlObservationAdmissionProgress {
+                source_deferred: true,
+                ..JsonlObservationAdmissionProgress::default()
+            });
+        }
+    }
     let mut progress = JsonlObservationAdmissionProgress {
         bytes_consumed: raw.read_through.saturating_sub(raw.start_offset),
         source_deferred: raw.deferred.is_some(),

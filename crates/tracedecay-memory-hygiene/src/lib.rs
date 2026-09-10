@@ -984,6 +984,92 @@ mod tests {
 
     use super::*;
 
+    fn history_envelope_with_structural_source_id() -> Value {
+        let source_id = concat!(
+            "tracedecay-claude-observation-source-v1-sha256-",
+            "1d49a58eb1d460720a46c5afe048e2cb89856ad8a602b7ebb82eac181a0c54a6"
+        );
+        let source = json!({
+            "provider": "claude",
+            "session_id": "fixture-session",
+            "source_key": source_id,
+            "observation_id": format!("sha256:{}", "1".repeat(64)),
+        });
+        json!({
+            "observation_kind": "session.message_committed.v1",
+            "payload_contract": "tracedecay.session.message.v1",
+            "canonical_payload": {"role": "user", "content": "The retry budget changed."},
+            "source_identity": {"original_source": {"source": source.clone()}},
+            "history_grant": {
+                "policy_revision": 1,
+                "sources": [{"attribution": {"source": source}}],
+            },
+        })
+    }
+
+    #[test]
+    fn structural_digest_source_metadata_is_admitted_with_full_envelope_receipt()
+    -> Result<(), HygieneError> {
+        let envelope = history_envelope_with_structural_source_id();
+        let canonical = canonical_payload_bytes(&envelope)?;
+        let expected = sha256_hex(&canonical);
+        let ObservationAdmission::Admitted { sanitized, receipt } =
+            ObservationSanitizer::new()?.admit_observation(&envelope, &[])?
+        else {
+            panic!("innocent message and structural source metadata must be admitted");
+        };
+        assert_eq!(sanitized, envelope);
+        assert_eq!(canonical_payload_bytes(&sanitized)?, canonical);
+        assert_eq!(receipt.disposition(), SanitizationDisposition::Accepted);
+        assert_eq!(receipt.source_payload_sha256(), expected);
+        assert_eq!(receipt.sanitized_payload_sha256(), expected);
+        assert_ne!(
+            expected,
+            sha256_hex(&canonical_payload_bytes(&envelope["canonical_payload"])?),
+            "the receipt binds the whole delivered envelope, including source metadata"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structural_digest_suffixes_do_not_hide_known_credentials_or_payload_secrets()
+    -> Result<(), HygieneError> {
+        // Reuse the inert credential-shaped fixture from the secret-class tests.
+        let secret = concat!("ghp_", "KsY7QwT2mZ4bV9nR6cX1jH8pL3dG5fA0eUwQ");
+        let digest = "a".repeat(64);
+        let sanitizer = ObservationSanitizer::new()?;
+        for (in_payload, value) in [
+            (false, secret.to_owned()),
+            (false, format!("fixture-{secret}")),
+            (false, format!("{secret}-sha256-{digest}")),
+            (false, format!("fixture-{secret}-sha256-{digest}")),
+            (true, secret.to_owned()),
+        ] {
+            let mut envelope = history_envelope_with_structural_source_id();
+            if in_payload {
+                envelope["canonical_payload"]["content"] = json!(value);
+            } else {
+                envelope["source_identity"]["original_source"]["source"]["source_key"] =
+                    json!(value);
+            }
+            assert!(
+                sanitizer
+                    .classify(&envelope)?
+                    .iter()
+                    .any(|finding| { finding.class() == HygieneClass::KnownCredentialPrefix }),
+                "known credential rules must still inspect the complete envelope"
+            );
+            assert!(matches!(
+                sanitizer.admit_observation(&envelope, &[])?,
+                ObservationAdmission::Withheld {
+                    reason: WithheldReason::SecretRejected,
+                    ..
+                }
+            ));
+        }
+        Ok(())
+    }
+
     /// Every ceiling hygiene enforces as an *error* must dominate the ceiling
     /// the canonical store enforces on the record it wraps, or a settled
     /// record could be refused as an admission fault instead of classified.

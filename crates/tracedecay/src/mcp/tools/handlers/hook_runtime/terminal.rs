@@ -8,7 +8,7 @@ use tracedecay_automation_runtime::automation::config_error;
 use tracedecay_domain::errors::Result;
 
 use super::hermes::user_review;
-use super::ingest::ingest_transcript_with_cancellation;
+use super::ingest::{CodexStopSourceBound, ingest_transcript_with_stop_bound};
 use super::required_str;
 
 /// Admit a Codex terminal receipt by retaining its follow-up work in
@@ -75,6 +75,21 @@ pub(super) fn retain_codex_stop(
                     }
                     None => None,
                 };
+                let stop_bound = match (graph.as_deref(), project.as_ref()) {
+                    (Some(cg), Some((_, sessions))) if cfg!(feature = "memory-provider-host") => {
+                        Some(
+                            retained_codex_source_bound(
+                                cg,
+                                sessions,
+                                profile_identity.as_ref(),
+                                &task_session_id,
+                                &cancellation,
+                            )
+                            .await,
+                        )
+                    }
+                    _ => None,
+                };
                 let ingest_args = json!({
                     "action": "ingest_transcript",
                     "provider": "codex",
@@ -88,7 +103,7 @@ pub(super) fn retain_codex_stop(
                 )
                 .with_profile_identity(Some(std::sync::Arc::clone(&profile_identity)))
                 .with_background_cpu(background_cpu.clone());
-                let ingested = ingest_transcript_with_cancellation(
+                let ingested = ingest_transcript_with_stop_bound(
                     graph.as_deref(),
                     &ingest_args,
                     Some(&profile_root),
@@ -96,6 +111,7 @@ pub(super) fn retain_codex_stop(
                     None,
                     authorities,
                     &cancellation,
+                    stop_bound.as_ref(),
                 )
                 .await
                 .map_err(|error| {
@@ -143,6 +159,101 @@ pub(super) fn retain_codex_stop(
         "status": "accepted",
         "session_id": session_id,
     }))
+}
+
+/// Read only the existing validated live-origin ledger after the retained
+/// project graph is available. This work never runs in the synchronous hook
+/// acknowledgment budget and never derives an authority ceiling from live EOF.
+async fn retained_codex_source_bound(
+    cg: &crate::tracedecay::TraceDecay,
+    sessions: &tracedecay_global_db::RegisteredGlobalDb,
+    profile: &dyn tracedecay_contracts::ProfileIdentityReadPort,
+    session_id: &str,
+    cancellation: &tracedecay_application::observation::ObservationCancellation,
+) -> CodexStopSourceBound {
+    use tracedecay_domain::ObservationScopeV1;
+    use tracedecay_hooks::{HookHostV1, admission_ledger::read_hook_live_origin_boundaries};
+    use tracedecay_store::StoreShardScopeV1;
+    let binding = &sessions.binding().shard_id;
+    let StoreShardScopeV1::ProjectSessions { project_id } = &binding.scope else {
+        return CodexStopSourceBound::Deferred;
+    };
+    if binding.brain_id != *profile.brain_id()
+        || binding.profile_id != *profile.profile_id()
+        || cg.store_layout().identity.project_id.as_deref() != Some(project_id.as_str())
+        || cancellation.is_cancelled()
+    {
+        return CodexStopSourceBound::Deferred;
+    }
+    let Ok(Some(session)) = sessions.get_session_result("codex", session_id).await else {
+        return CodexStopSourceBound::Deferred;
+    };
+    if session.provider != "codex" || session.session_id != session_id {
+        return CodexStopSourceBound::Deferred;
+    }
+    let Some(transcript_path) = session.transcript_path else {
+        return CodexStopSourceBound::Deferred;
+    };
+    let Ok(source) = tracedecay_sessions::runtime::codex::codex_observation_source_v2(session_id)
+    else {
+        return CodexStopSourceBound::Deferred;
+    };
+    let ledger_root = super::admission::hook_v2_admission_ledger_root(
+        &cg.hook_store_layout().data_root,
+        HookHostV1::Codex,
+    );
+    let project_root = cg.project_root().to_path_buf();
+    let project_id = project_id.clone();
+    let brain_id = profile.brain_id().clone();
+    let profile_id = profile.profile_id().clone();
+    let protected_session = tracedecay_agent_hosts::hooks::protected_native_session_id(session_id);
+    let cancellation = cancellation.clone();
+    tokio::task::spawn_blocking(move || {
+        let resolve = || -> Option<CodexStopSourceBound> {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            let canonical_project = std::fs::canonicalize(project_root).ok()?;
+            if std::fs::canonicalize(session.project_path).ok()? != canonical_project {
+                return None;
+            }
+            let canonical_path = std::fs::canonicalize(transcript_path).ok()?;
+            let boundaries = read_hook_live_origin_boundaries(
+                &ledger_root,
+                HookHostV1::Codex,
+                super::envelope::hook_now(),
+            )
+            .ok()?;
+            let mut matching = boundaries.into_iter().filter(|boundary| {
+                let observation = &boundary.observation;
+                boundary.admission.protected_session_id == protected_session
+                    && observation.scope.brain_id == brain_id
+                    && observation.scope.profile_id == profile_id
+                    && observation.scope.repository.project_id() == Some(&project_id)
+                    && observation.source == source
+                    && observation.canonical_source_path == canonical_path
+            });
+            let boundary = matching.next()?;
+            if matching.next().is_some() || cancellation.is_cancelled() {
+                return None;
+            }
+            let checkpoint = boundary.observation.checkpoint;
+            Some(CodexStopSourceBound::Sealed(
+                tracedecay_sessions::runtime::codex::SealedJsonlSourceBound::new(
+                    canonical_path,
+                    source,
+                    ObservationScopeV1::Project { project_id },
+                    checkpoint.generation,
+                    checkpoint.file_identity,
+                    checkpoint.complete_frontier,
+                    checkpoint.complete_prefix_fingerprint,
+                ),
+            ))
+        };
+        resolve().unwrap_or(CodexStopSourceBound::Deferred)
+    })
+    .await
+    .unwrap_or(CodexStopSourceBound::Deferred)
 }
 
 pub(super) async fn await_terminal_operation<T>(

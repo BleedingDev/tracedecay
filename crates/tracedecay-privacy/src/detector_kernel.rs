@@ -245,6 +245,23 @@ pub(crate) fn entropy_bits_per_mille(token: &str) -> Option<u32> {
 }
 
 pub fn looks_high_entropy_token(token: &str) -> bool {
+    // A structural digest adds alphabet diversity without making its prefix a
+    // credential. Peel one exact suffix; the prefix still faces the ordinary
+    // entropy predicate, including any earlier digest-shaped suffix.
+    let token = token
+        .rsplit_once("-sha256-")
+        .filter(|(prefix, digest)| {
+            !prefix.is_empty()
+                && digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+        .map_or(token, |(prefix, _)| prefix);
+    looks_high_entropy_token_core(token)
+}
+
+fn looks_high_entropy_token_core(token: &str) -> bool {
     if token.len() < 36
         || !token.bytes().all(token_byte)
         || token.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -401,6 +418,50 @@ mod tests {
         let above_threshold = "abcdefghij123456789".repeat(2);
         assert!(!looks_high_entropy_token(&below_threshold));
         assert!(looks_high_entropy_token(&above_threshold));
+    }
+
+    #[test]
+    fn entropy_kernel_peels_one_exact_structural_sha256_suffix() {
+        let digest = "1d49a58eb1d460720a46c5afe048e2cb89856ad8a602b7ebb82eac181a0c54a6";
+        let source_id = format!("tracedecay-claude-observation-source-v1-sha256-{digest}");
+        assert!(looks_high_entropy_token_core(&source_id));
+        assert!(!looks_high_entropy_token(&source_id));
+        assert!(high_entropy_ranges(&source_id).is_empty());
+        assert!(
+            looks_high_entropy_token(&format!("{source_id}-sha256-{digest}")),
+            "only one suffix is peeled before the unchanged prefix predicate"
+        );
+    }
+
+    #[test]
+    fn entropy_kernel_keeps_high_entropy_prefixes_with_sha256_suffixes() {
+        let prefix = "Qm9vZ2llV29vZ2llMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A4OTc2NTQzMjE";
+        let token = format!("{prefix}-sha256-{}", "a".repeat(64));
+        assert!(looks_high_entropy_token_core(prefix));
+        assert!(looks_high_entropy_token(&token));
+        assert_eq!(high_entropy_ranges(&token), vec![0..token.len()]);
+    }
+
+    #[test]
+    fn entropy_kernel_keeps_malformed_digest_suffixes_on_the_whole_token_path() {
+        let prefix = "tracedecay-claude-observation-source-v1";
+        let digest = "1d49a58eb1d460720a46c5afe048e2cb89856ad8a602b7ebb82eac181a0c54a6";
+        let malformed = [
+            format!("{prefix}-sha256-{}", &digest[..63]),
+            format!("{prefix}-sha256-{digest}0"),
+            format!("{prefix}-sha256-{}g", &digest[..63]),
+            format!("{prefix}-sha256-{}", digest.to_ascii_uppercase()),
+            format!("{prefix}-sha256-{digest}-tail"),
+            format!("{prefix}-SHA256-{digest}"),
+            format!("-sha256-{digest}"),
+        ];
+        for token in malformed {
+            assert_eq!(
+                looks_high_entropy_token(&token),
+                looks_high_entropy_token_core(&token),
+                "malformed suffix must retain whole-token classification: {token}"
+            );
+        }
     }
 
     #[test]

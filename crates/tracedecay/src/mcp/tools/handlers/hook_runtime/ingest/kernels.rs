@@ -76,6 +76,7 @@ pub(super) struct TranscriptCaptureContext<'a> {
     pub(super) facade: &'a HostAdmissionFacade<'a>,
     pub(super) max_new_bytes: Option<u64>,
     pub(super) cancellation: &'a ObservationCancellation,
+    pub(super) codex_stop_bound: Option<&'a super::CodexStopSourceBound>,
 }
 
 impl<'a> TranscriptCaptureContext<'a> {
@@ -459,22 +460,34 @@ async fn capture_codex_project(
     ctx: TranscriptCaptureContext<'_>,
 ) -> Result<TranscriptCaptureOutcome> {
     let cg = ctx.project()?;
-    let source = tracedecay_sessions::runtime::codex::CodexSource::new()
-        .ok_or_else(|| config_error("Codex transcript source is unavailable"))?;
     let project_id = project_observation_id(cg)?;
     let scope = ObservationScopeV1::Project {
         project_id: project_id.clone(),
     };
-    let source_deferred = admit_codex_project_rollouts(
-        ctx.facade,
-        &source,
-        cg.project_root(),
-        project_id,
-        ctx.args.get("session_id").and_then(Value::as_str),
-        ctx.max_new_bytes,
-        ctx.cancellation,
-    )
-    .await?;
+    let source_deferred = match ctx.codex_stop_bound {
+        Some(super::CodexStopSourceBound::Deferred) => true,
+        Some(super::CodexStopSourceBound::Sealed(bound)) => {
+            let session_id = required_str(ctx.args, "session_id")?;
+            tracedecay_sessions::runtime::codex::try_admit_codex_jsonl_observations_for_project_through_sealed_source(
+                bound, cg.project_root(), project_id, session_id,
+                ctx.facade, ctx.max_new_bytes, ctx.cancellation,
+            ).await.map_err(|error| map_transcript_ingest_error(&error))?.source_deferred
+        }
+        None => {
+            let source = tracedecay_sessions::runtime::codex::CodexSource::new()
+                .ok_or_else(|| config_error("Codex transcript source is unavailable"))?;
+            admit_codex_project_rollouts(
+                ctx.facade,
+                &source,
+                cg.project_root(),
+                project_id,
+                ctx.args.get("session_id").and_then(Value::as_str),
+                ctx.max_new_bytes,
+                ctx.cancellation,
+            )
+            .await?
+        }
+    };
     let messages_upserted =
         drain_host_observation_projections(ctx.facade, &scope, ctx.cancellation).await?;
     Ok(TranscriptCaptureOutcome {

@@ -104,7 +104,7 @@ const PROJECT_RECALL_BUDGETS: RecallBudgetsV1 = RecallBudgetsV1 {
 
 /// Content-free diagnostics for the isolated CLI journey, never a product API.
 #[cfg(feature = "test-helpers")]
-fn emit_host_history_recall_test_diagnostic(build: impl FnOnce() -> Value) {
+pub(super) fn emit_host_history_recall_test_diagnostic(build: impl FnOnce() -> Value) {
     if std::env::var_os("TRACEDECAY_TEST_HOST_HISTORY_RECALL_DIAGNOSTICS").as_deref()
         != Some(std::ffi::OsStr::new("1"))
     {

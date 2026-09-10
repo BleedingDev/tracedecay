@@ -268,6 +268,10 @@ fn hook_v2_catchup_response_propagates_transport_disposition() {
     let response = hook_v2_catchup_response("hook_v2_admit");
     assert_eq!(response["status"], "rejected");
     assert_eq!(response["disposition"], "catchup_required");
+    assert!(
+        response.get("reason").is_none(),
+        "shared catch-up is not a binding refresh grant"
+    );
 }
 
 #[test]

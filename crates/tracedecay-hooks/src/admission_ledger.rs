@@ -184,6 +184,10 @@ pub struct HookLiveOriginObservationV1 {
     /// floor lives on `HookLiveOriginBoundaryV1::start` and never advances
     /// across a continuously verified interval.
     pub physical_eof: u64,
+    /// Stable native identity and birth timestamp captured from the open
+    /// source handle. Required for continuity from an empty source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_birth_witness: Option<[u8; 32]>,
     pub validated_checkpoint: Option<HookLiveOriginCheckpointV1>,
     pub frames: Vec<HookLiveOriginFrameV1>,
 }
@@ -490,10 +494,11 @@ impl HookAdmissionLedgerV1 {
         });
         let mut outcome = HookLiveOriginOutcomeV1::Unavailable;
         if let Some(mut observation) = observation.filter(valid_origin_observation) {
-            let continuous = previous
-                .as_ref()
-                .filter(|baseline| continuous_origin_interval(baseline, &admission, &observation))
-                .cloned();
+            let continuous = previous.as_ref().and_then(|baseline| {
+                let mut baseline = baseline.clone();
+                normalize_empty_origin_checkpoint(&mut baseline, &mut observation);
+                continuous_origin_interval(&baseline, &admission, &observation).then_some(baseline)
+            });
             let start = continuous.as_ref().map_or_else(
                 || HookLiveOriginStartV1 {
                     admission: admission.clone(),
@@ -786,6 +791,38 @@ fn same_origin_scope(left: &HookLiveOriginScopeV1, right: &HookLiveOriginScopeV1
         && left.repository.evidence().head_commit() == right.repository.evidence().head_commit()
 }
 
+/// The source scanner can verify that an empty native file acquired its first
+/// complete frame. Normalize only the candidate boundary, retaining its exact
+/// original admission and zero exclusion floor; ordinary continuity still
+/// checks every authority, repository, branch and source constraint.
+fn normalize_empty_origin_checkpoint(
+    baseline: &mut HookLiveOriginBoundaryV1,
+    next: &mut HookLiveOriginObservationV1,
+) {
+    let previous = &baseline.observation;
+    if baseline.start.physical_eof != 0
+        || previous.physical_eof != 0
+        || baseline.start.checkpoint != previous.checkpoint
+        || previous.checkpoint.complete_frontier != 0
+        || previous.checkpoint.generation != previous.checkpoint.file_identity
+        || next.checkpoint.generation != next.checkpoint.file_identity
+        || previous.checkpoint.file_identity == next.checkpoint.file_identity
+        || previous.native_birth_witness.is_none()
+        || previous.native_birth_witness != next.native_birth_witness
+        || next.checkpoint.complete_frontier == 0
+        || next.frames.first().is_none_or(|frame| frame.start != 0)
+        || next.validated_checkpoint != Some(previous.checkpoint)
+    {
+        return;
+    }
+    let mut checkpoint = previous.checkpoint;
+    checkpoint.generation = next.checkpoint.generation;
+    checkpoint.file_identity = next.checkpoint.file_identity;
+    baseline.start.checkpoint = checkpoint;
+    baseline.observation.checkpoint = checkpoint;
+    next.validated_checkpoint = Some(checkpoint);
+}
+
 fn continuous_origin_interval(
     baseline: &HookLiveOriginBoundaryV1,
     seal: &HookLiveOriginAdmissionV1,
@@ -802,6 +839,9 @@ fn continuous_origin_interval(
         && next.validated_checkpoint == Some(previous.checkpoint)
         && previous.checkpoint.generation == next.checkpoint.generation
         && previous.checkpoint.file_identity == next.checkpoint.file_identity
+        && (previous.physical_eof != 0
+            || (previous.native_birth_witness.is_some()
+                && previous.native_birth_witness == next.native_birth_witness))
         && previous.physical_eof <= next.physical_eof
         && next.frames.first().map_or_else(
             || next.checkpoint == previous.checkpoint,
@@ -1229,6 +1269,7 @@ mod tests {
                 complete_prefix_fingerprint: frontier + 1000,
             },
             physical_eof: eof,
+            native_birth_witness: None,
             validated_checkpoint: None,
             frames: Vec::new(),
         }
@@ -1271,6 +1312,211 @@ mod tests {
         ledger
             .record_live_origin(&envelope, receipt, observation, now)
             .unwrap()
+    }
+
+    #[test]
+    fn empty_live_origin_first_seal_preserves_start_and_canonical_identity_across_reopen() {
+        let root = TestDir::new("origin-empty-first-append");
+        let mut empty = origin_observation(0, 0);
+        empty.native_birth_witness = Some([8; 32]);
+        let original;
+        let first_proofs;
+        {
+            let mut ledger = open(root.path(), UtcMicros(1));
+            assert_eq!(
+                record_origin(&mut ledger, 9, Some(empty.clone())),
+                HookLiveOriginOutcomeV1::Baseline
+            );
+            original = ledger.live_origin_baseline([7; 32], UtcMicros(9)).unwrap();
+            let mut first = origin_append(&empty, &[25, 50]);
+            first.checkpoint.generation = 20;
+            first.checkpoint.file_identity = 20;
+            assert_eq!(
+                record_origin(&mut ledger, 10, Some(first)),
+                HookLiveOriginOutcomeV1::Sealed
+            );
+            first_proofs =
+                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                    .unwrap();
+            assert_eq!(first_proofs.len(), 1);
+            let proof = &first_proofs[0];
+            let mut normalized = original.clone();
+            normalized.start.checkpoint.generation = 20;
+            normalized.start.checkpoint.file_identity = 20;
+            normalized.observation.checkpoint = normalized.start.checkpoint;
+            assert_eq!(proof.baseline, normalized);
+            assert_eq!(proof.frames[0].start, 0);
+            assert_eq!(proof.frames.len(), 2);
+            assert_eq!(proof.seal.event_id, [10; 16]);
+            let retained = ledger.live_origin_baseline([7; 32], UtcMicros(10)).unwrap();
+            assert_eq!(retained.start, normalized.start);
+            assert_eq!(retained.observation.checkpoint.complete_frontier, 50);
+            assert_eq!(retained.observation.checkpoint.generation, 20);
+        }
+        let mut ledger = open(root.path(), UtcMicros(11));
+        assert_eq!(
+            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+                .unwrap(),
+            first_proofs
+        );
+        let retained = ledger.live_origin_baseline([7; 32], UtcMicros(11)).unwrap();
+        assert_eq!(
+            record_origin(
+                &mut ledger,
+                11,
+                Some(origin_append(&retained.observation, &[75]))
+            ),
+            HookLiveOriginOutcomeV1::Sealed
+        );
+        let proofs =
+            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+                .unwrap();
+        assert_eq!(proofs.len(), 2);
+        assert_eq!(proofs[0], first_proofs[0], "retained proof is immutable");
+        assert_eq!(proofs[1].baseline.start.admission, original.start.admission);
+        assert_eq!(proofs[1].baseline.start.physical_eof, 0);
+        assert_eq!(proofs[1].baseline.start.checkpoint.complete_frontier, 0);
+        assert_eq!(proofs[1].baseline.start.checkpoint.generation, 20);
+        assert_eq!(proofs[1].frames[0].start, 50);
+    }
+
+    #[test]
+    fn empty_live_origin_transition_keeps_checkpoint_scope_and_branch_guards() {
+        for change in [
+            "missing_validation",
+            "wrong_validation",
+            "missing_previous_birth",
+            "missing_next_birth",
+            "different_birth",
+            "partial_baseline",
+            "wrong_generation",
+            "frame_gap",
+            "other_profile",
+            "other_source_path",
+            "branch_aba",
+        ] {
+            let root = TestDir::new(change);
+            let mut ledger = open(root.path(), UtcMicros(1));
+            let mut empty = origin_observation(0, u64::from(change == "partial_baseline"));
+            empty.native_birth_witness = (change != "missing_previous_birth").then_some([8; 32]);
+            record_origin(&mut ledger, 9, Some(empty.clone()));
+            let mut next = origin_append(&empty, &[25]);
+            next.checkpoint.generation = 20;
+            next.checkpoint.file_identity = 20;
+            match change {
+                "missing_validation" => next.validated_checkpoint = None,
+                "wrong_validation" => {
+                    next.validated_checkpoint
+                        .as_mut()
+                        .unwrap()
+                        .complete_prefix_fingerprint ^= 1;
+                }
+                "missing_previous_birth" => {}
+                "missing_next_birth" => next.native_birth_witness = None,
+                "different_birth" => next.native_birth_witness = Some([9; 32]),
+                "partial_baseline" => {}
+                "wrong_generation" => next.checkpoint.generation = 21,
+                "frame_gap" => next.frames[0].start = 1,
+                "other_profile" => {
+                    next.scope.profile_id = UserProfileId::new("profile.other").unwrap();
+                }
+                "other_source_path" => {
+                    next.canonical_source_path = std::env::temp_dir().join("other.jsonl");
+                }
+                "branch_aba" => next.branch_evidence.frontier += 1,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                record_origin(&mut ledger, 10, Some(next)),
+                HookLiveOriginOutcomeV1::Baseline,
+                "{change}"
+            );
+            assert!(
+                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                    .unwrap()
+                    .is_empty(),
+                "{change}"
+            );
+            let retained = ledger.live_origin_baseline([7; 32], UtcMicros(10)).unwrap();
+            assert_eq!(retained.start.admission.event_id, [10; 16], "{change}");
+            assert_eq!(retained.start.physical_eof, 25, "{change}");
+        }
+    }
+
+    #[test]
+    fn empty_live_origin_birth_refresh_starts_a_new_admission_before_first_seal() {
+        for old_birth in [None, Some([8; 32])] {
+            let root = TestDir::new("origin-empty-birth-refresh");
+            let mut ledger = open(root.path(), UtcMicros(1));
+            let mut old = origin_observation(0, 0);
+            old.native_birth_witness = old_birth;
+            record_origin(&mut ledger, 9, Some(old.clone()));
+            let mut fresh = old.clone();
+            fresh.native_birth_witness = Some([9; 32]);
+            fresh.validated_checkpoint = Some(old.checkpoint);
+            assert_eq!(
+                record_origin(&mut ledger, 10, Some(fresh.clone())),
+                HookLiveOriginOutcomeV1::Baseline
+            );
+            let retained = ledger.live_origin_baseline([7; 32], UtcMicros(10)).unwrap();
+            assert_eq!(retained.start.admission.event_id, [10; 16]);
+            assert_eq!(retained.start.physical_eof, 0);
+            let mut first = origin_append(&fresh, &[25]);
+            first.checkpoint.generation = 20;
+            first.checkpoint.file_identity = 20;
+            assert_eq!(
+                record_origin(&mut ledger, 11, Some(first)),
+                HookLiveOriginOutcomeV1::Sealed
+            );
+            let proofs =
+                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+                    .unwrap();
+            assert_eq!(proofs.len(), 1);
+            assert_eq!(proofs[0].baseline.start.admission.event_id, [10; 16]);
+            assert_eq!(proofs[0].baseline.start.physical_eof, 0);
+            assert_eq!(proofs[0].frames[0].start, 0);
+        }
+    }
+
+    #[test]
+    fn live_origin_legacy_observations_without_birth_witness_keep_proof_references() {
+        let root = TestDir::new("origin-legacy-without-birth");
+        let baseline = origin_observation(100, 100);
+        let legacy = serde_json::to_value(&baseline).unwrap();
+        assert!(legacy.get("native_birth_witness").is_none());
+        assert_eq!(
+            serde_json::from_value::<HookLiveOriginObservationV1>(legacy).unwrap(),
+            baseline
+        );
+        let proofs;
+        {
+            let mut ledger = open(root.path(), UtcMicros(1));
+            record_origin(&mut ledger, 9, Some(baseline.clone()));
+            assert_eq!(
+                record_origin(&mut ledger, 10, Some(origin_append(&baseline, &[125]))),
+                HookLiveOriginOutcomeV1::Sealed
+            );
+            proofs =
+                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                    .unwrap();
+            assert_eq!(proofs.len(), 1);
+            assert!(
+                !serde_json::to_string(&proofs)
+                    .unwrap()
+                    .contains("native_birth_witness")
+            );
+        }
+        let ledger = open(root.path(), UtcMicros(11));
+        assert_eq!(
+            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+                .unwrap(),
+            proofs
+        );
+        assert!(
+            ledger
+                .live_origin_baseline([7; 32], UtcMicros(11))
+                .is_some()
+        );
     }
 
     #[test]

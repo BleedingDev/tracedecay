@@ -1739,3 +1739,237 @@ async fn exact_hook_prepares_an_in_scope_window_concurrently() {
         );
     }
 }
+
+fn live_codex_bound(path: &Path, project_id: &ProjectId) -> super::SealedJsonlSourceBound {
+    let capture = crate::runtime::source::capture_live_jsonl_origin(
+        path,
+        None,
+        16 * 1024 * 1024,
+        256,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .unwrap();
+    super::SealedJsonlSourceBound::new(
+        std::fs::canonicalize(path).unwrap(),
+        crate::runtime::codex::codex_observation_source_v2(SESSION_ID).unwrap(),
+        ObservationScopeV1::Project {
+            project_id: project_id.clone(),
+        },
+        capture.generation,
+        capture.file_identity,
+        capture.complete_frontier,
+        capture.complete_prefix_fingerprint,
+    )
+}
+
+#[tokio::test]
+async fn sealed_codex_source_admits_only_the_live_checkpoint_then_the_later_checkpoint() {
+    use crate::runtime::codex::try_admit_codex_jsonl_observations_for_project_through_sealed_source;
+    let (temp, path, first_end) = rollout_fixture();
+    let project = temp.path().join("workspace");
+    let project_id = ProjectId::new("project.sealed-stop").unwrap();
+    let first_bound = live_codex_bound(&path, &project_id);
+    let second_turn = json!({
+        "timestamp": "2026-01-01T00:00:02.000Z",
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": "second unsealed turn"}
+    })
+    .to_string()
+        + "\n";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(second_turn.as_bytes())
+        .unwrap();
+    let spy = SeamSpyAdmission::default();
+    let cancellation = ObservationCancellation::default();
+    let first = try_admit_codex_jsonl_observations_for_project_through_sealed_source(
+        &first_bound,
+        &project,
+        project_id.clone(),
+        SESSION_ID,
+        &spy,
+        None,
+        &cancellation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.frames_persisted, 2);
+    assert_eq!(spy.inner.observations().len(), 2);
+    let scope = ObservationScopeV1::Project {
+        project_id: project_id.clone(),
+    };
+    let source = crate::runtime::codex::codex_observation_source_v2(SESSION_ID).unwrap();
+    let cursor = spy
+        .get_source_cursor(&source, &scope)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor.position(), first_end);
+    let same_bound = try_admit_codex_jsonl_observations_for_project_through_sealed_source(
+        &first_bound,
+        &project,
+        project_id.clone(),
+        SESSION_ID,
+        &spy,
+        None,
+        &cancellation,
+    )
+    .await
+    .unwrap();
+    assert!(same_bound.source_deferred);
+    assert_eq!(same_bound.bytes_consumed, 0);
+    assert_eq!(
+        spy.get_source_cursor(&source, &scope).await.unwrap(),
+        Some(cursor)
+    );
+    let second_bound = live_codex_bound(&path, &project_id);
+    let later = try_admit_codex_jsonl_observations_for_project_through_sealed_source(
+        &second_bound,
+        &project,
+        project_id,
+        SESSION_ID,
+        &spy,
+        None,
+        &cancellation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(later.frames_persisted, 1);
+    assert_eq!(spy.inner.observations().len(), 3);
+    assert_eq!(
+        spy.get_source_cursor(&source, &scope)
+            .await
+            .unwrap()
+            .unwrap()
+            .position(),
+        first_end + second_turn.len() as u64,
+    );
+}
+
+#[tokio::test]
+async fn sealed_codex_source_refuses_replacement_rewrite_and_mismatched_claims_without_commits() {
+    use crate::runtime::codex::try_admit_codex_jsonl_observations_for_project_through_sealed_source;
+    for refusal in [
+        "replacement",
+        "rewrite",
+        "generation",
+        "fingerprint",
+        "source",
+        "scope",
+        "session",
+        "cancelled",
+    ] {
+        let (temp, path, _) = rollout_fixture();
+        let project = temp.path().join("workspace");
+        let project_id = ProjectId::new("project.sealed-refusal").unwrap();
+        let mut bound = live_codex_bound(&path, &project_id);
+        match refusal {
+            "replacement" => {
+                std::fs::rename(&path, path.with_extension("retained")).unwrap();
+                write_rollout(&path, &project);
+            }
+            "rewrite" => {
+                let before = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(
+                    &path,
+                    before.replace("seam contract message", "same contract message"),
+                )
+                .unwrap();
+            }
+            "generation" => bound.generation ^= 1,
+            "fingerprint" => bound.complete_prefix_fingerprint ^= 1,
+            "source" => {
+                bound.source =
+                    crate::runtime::codex::codex_observation_source_v2("another-session").unwrap()
+            }
+            "scope" => bound.scope = ObservationScopeV1::Profile,
+            "session" | "cancelled" => {}
+            _ => unreachable!(),
+        }
+        let spy = SeamSpyAdmission::default();
+        let cancellation = ObservationCancellation::default();
+        if refusal == "cancelled" {
+            cancellation.cancel();
+        }
+        let progress = try_admit_codex_jsonl_observations_for_project_through_sealed_source(
+            &bound,
+            &project,
+            project_id.clone(),
+            if refusal == "session" {
+                "another-session"
+            } else {
+                SESSION_ID
+            },
+            &spy,
+            None,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert!(progress.source_deferred, "{refusal}");
+        assert_eq!(progress.bytes_consumed, 0, "{refusal}");
+        assert!(spy.inner.observations().is_empty(), "{refusal}");
+        assert!(spy.cover_past_advances().is_empty(), "{refusal}");
+        let source = crate::runtime::codex::codex_observation_source_v2(SESSION_ID).unwrap();
+        assert!(
+            spy.get_source_cursor(&source, &ObservationScopeV1::Project { project_id },)
+                .await
+                .unwrap()
+                .is_none(),
+            "{refusal}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn absolute_jsonl_endpoint_refuses_crossing_frames_and_skips_before_any_cursor_write() {
+    super::install_test_shared_jsonl_preparation_authority();
+    // Both a complete first record and a whitespace skip can exceed the
+    // scanner's byte budget. Neither may cross an authority endpoint.
+    for contents in [
+        b"{\"crossing\":true}\n".as_slice(),
+        b"                \n".as_slice(),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("crossing.jsonl");
+        std::fs::write(&path, contents).unwrap();
+        let spy = SeamSpyAdmission::default();
+        let source = crate::runtime::codex::codex_observation_source_v2(SESSION_ID).unwrap();
+        let scope = ObservationScopeV1::Profile;
+        let result = super::admit_jsonl_observations(
+            super::JsonlObservationAdmissionRequest::new(
+                "codex",
+                &path,
+                &spy,
+                source.clone(),
+                scope.clone(),
+                RetentionClass::new("retention.sealed-test").unwrap(),
+            )
+            .with_max_end_offset(3),
+            |_| panic!("crossing page must be refused before initialization"),
+            |_: &mut (),
+             _,
+             _,
+             _,
+             _,
+             _|
+             -> Result<super::JsonlFrameAdmission, TranscriptIngestError> {
+                panic!("crossing frame must never reach normalization")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.source_deferred);
+        assert_eq!(result.bytes_consumed, 0);
+        assert!(spy.inner.observations().is_empty());
+        assert!(spy.cover_past_advances().is_empty());
+        assert!(
+            spy.get_source_cursor(&source, &scope)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}

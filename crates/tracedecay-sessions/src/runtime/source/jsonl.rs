@@ -16,9 +16,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    StoredCursor, TranscriptIngestError, TranscriptIngestResult, file_mtime_secs,
-    log_jsonl_decode_skip, log_jsonl_oversized_skip, log_source_skip, should_resume_jsonl,
-    stable_jsonl_file_id,
+    StoredCursor, TranscriptIngestError, TranscriptIngestResult, empty_jsonl_file_id,
+    file_mtime_secs, log_jsonl_decode_skip, log_jsonl_oversized_skip, log_source_skip,
+    should_resume_jsonl, stable_jsonl_file_id,
 };
 
 pub struct JsonlLine {
@@ -152,6 +152,48 @@ pub(in crate::runtime) fn jsonl_native_file_identity(
         .ok()?
         .as_nanos();
     Some(JsonlNativeFileIdentity { created_nanos })
+}
+
+/// A retained birth witness distinguishes reuse of a native file identifier.
+/// Its metadata comes from the opened handle. Unsupported birth timestamps
+/// cannot establish an empty-file transition.
+fn jsonl_native_birth_witness(
+    file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+) -> Option<[u8; 32]> {
+    #[cfg(any(unix, windows))]
+    {
+        let native = jsonl_native_file_identity(file, metadata)?;
+        let created = metadata
+            .created()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        if created.is_zero() {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"tracedecay-jsonl-native-birth-v1");
+        #[cfg(unix)]
+        {
+            hasher.update(b"unix");
+            hasher.update(native.device.to_le_bytes());
+            hasher.update(native.inode.to_le_bytes());
+        }
+        #[cfg(windows)]
+        {
+            hasher.update(b"windows");
+            hasher.update(native.volume_serial_number.to_le_bytes());
+            hasher.update(native.file_index.to_le_bytes());
+        }
+        hasher.update(created.as_nanos().to_le_bytes());
+        Some(hasher.finalize().into())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, metadata);
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -540,6 +582,16 @@ pub struct JsonlResumeState {
     pub fingerprint: u64,
 }
 
+/// A previous live boundary includes the physical extent so an empty complete
+/// prefix cannot disguise a partial frame that predates the boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveJsonlOriginPrevious {
+    pub cursor: StoredCursor,
+    pub resume: JsonlResumeState,
+    pub physical_eof: u64,
+    pub native_birth_witness: Option<[u8; 32]>,
+}
+
 /// Content-free frame witness captured between admitted live hook boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveJsonlOriginFrame {
@@ -556,6 +608,7 @@ pub struct LiveJsonlOriginCapture {
     pub complete_frontier: u64,
     pub complete_prefix_fingerprint: u64,
     pub physical_eof: u64,
+    pub native_birth_witness: Option<[u8; 32]>,
     pub validated_previous: bool,
     pub frames: Vec<LiveJsonlOriginFrame>,
 }
@@ -565,7 +618,7 @@ pub struct LiveJsonlOriginCapture {
 /// and both deadline and generation are checked before returning evidence.
 pub fn capture_live_jsonl_origin(
     path: &Path,
-    previous: Option<(StoredCursor, JsonlResumeState)>,
+    previous: Option<LiveJsonlOriginPrevious>,
     max_source_bytes: u64,
     max_new_frames: usize,
     deadline: std::time::Instant,
@@ -598,16 +651,41 @@ pub fn capture_live_jsonl_origin(
     let file_identity = stable_jsonl_file_id(&mut file, &initial)
         .map_err(|error| TranscriptIngestError::scan_io("fingerprint", path, error))?
         .0;
+    let native_birth_witness = jsonl_native_birth_witness(&file, &initial);
     file.seek(SeekFrom::Start(0))
         .map_err(|error| TranscriptIngestError::scan_io("seek", path, error))?;
     let mut digest = ResumeDigest::new();
     let mut snapshot = Sha256::new();
     snapshot.update(b"tracedecay-jsonl-snapshot-v2");
     snapshot.update(extent.to_le_bytes());
-    let previous_end = previous.map(|(cursor, _)| cursor.position);
-    let mut prefix_matches = previous.is_some_and(|(cursor, resume)| {
-        cursor.position == 0 && resume.fingerprint == digest.fingerprint(0)
+    let previous_end = previous.map(|previous| previous.cursor.position);
+    let mut prefix_matches = previous.is_some_and(|previous| {
+        previous.cursor.position == 0 && previous.resume.fingerprint == digest.fingerprint(0)
     });
+    // Even an empty-to-empty checkpoint must retain the same known birth.
+    // Otherwise it could refresh a legacy or recycled identity's witness
+    // while keeping an older admission as the origin of a future append.
+    let previous_birth_matches = previous.is_none_or(|previous| {
+        previous.physical_eof != 0
+            || (previous.native_birth_witness.is_some()
+                && previous.native_birth_witness == native_birth_witness)
+    });
+    let empty_transition_candidate = if let Some(previous) = previous
+        && extent > 0
+        && previous.physical_eof == 0
+        && previous.cursor.position == 0
+        && previous.cursor.file_id == previous.resume.generation
+        && previous.resume.generation == previous.resume.file_identity
+        && previous.resume.file_identity != file_identity
+        && previous_birth_matches
+        && prefix_matches
+    {
+        empty_jsonl_file_id(&file, &initial)
+            .map_err(|error| TranscriptIngestError::scan_io("fingerprint", path, error))?
+            == Some(previous.resume.file_identity)
+    } else {
+        false
+    };
     let mut position = 0_u64;
     let mut complete_frontier = 0_u64;
     let mut complete_prefix_fingerprint = digest.fingerprint(0);
@@ -632,11 +710,12 @@ pub fn capture_live_jsonl_origin(
         }
         let chunk = &buffer[..read];
         snapshot.update(chunk);
-        if previous.is_some_and(|(cursor, resume)| {
-            position >= cursor.position
+        if previous.is_some_and(|previous| {
+            position >= previous.cursor.position
                 && prefix_matches
-                && cursor.file_id == resume.generation
-                && resume.file_identity == file_identity
+                && previous_birth_matches
+                && previous.cursor.file_id == previous.resume.generation
+                && (previous.resume.file_identity == file_identity || empty_transition_candidate)
         }) {
             let mut consumed = 0;
             for (index, _) in chunk.iter().enumerate().filter(|(_, byte)| **byte == b'\n') {
@@ -668,11 +747,11 @@ pub fn capture_live_jsonl_origin(
             digest.extend(chunk);
         }
         position += read as u64;
-        if let Some((cursor, resume)) = previous
-            && position == cursor.position
+        if let Some(previous) = previous
+            && position == previous.cursor.position
         {
-            prefix_matches = complete_frontier == cursor.position
-                && digest.fingerprint(position) == resume.fingerprint;
+            prefix_matches = complete_frontier == previous.cursor.position
+                && digest.fingerprint(position) == previous.resume.fingerprint;
         }
     }
     check_deadline()?;
@@ -683,26 +762,37 @@ pub fn capture_live_jsonl_origin(
         || jsonl_file_change_token(&initial) != jsonl_file_change_token(&final_metadata)
         || jsonl_native_file_identity(&file, &initial)
             != jsonl_native_file_identity(&file, &final_metadata)
+        || native_birth_witness != jsonl_native_birth_witness(&file, &final_metadata)
     {
         return Err(TranscriptIngestError::ScanGenerationChanged {
             path: path.to_owned(),
         });
     }
-    let validated_previous = previous.is_some_and(|(cursor, resume)| {
-        cursor.file_id == resume.generation
-            && resume.file_identity == file_identity
-            && cursor.position <= extent
+    // A partial-only first write cannot establish the canonical first-frame
+    // identity. It starts a conservative new boundary instead.
+    let empty_transition = empty_transition_candidate && complete_frontier > 0;
+    let validated_previous = previous.is_some_and(|previous| {
+        previous.cursor.file_id == previous.resume.generation
+            && (previous.resume.file_identity == file_identity || empty_transition)
+            && previous.cursor.position <= extent
             && prefix_matches
+            && previous_birth_matches
     });
     let generation = match previous {
-        Some((_, resume)) if validated_previous => resume.generation,
-        Some((_, resume)) if resume.file_identity == file_identity => rewritten_jsonl_generation(
-            resume,
-            file_identity,
-            digest_prefix_u64(snapshot.finalize()),
-            extent,
-            file_mtime_secs(&initial),
-        ),
+        // A rejected empty birth starts a new canonical boundary. It is not
+        // evidence of a content rewrite and must not mint a rewrite marker.
+        _ if !previous_birth_matches => file_identity,
+        _ if empty_transition => file_identity,
+        Some(previous) if validated_previous => previous.resume.generation,
+        Some(previous) if previous.resume.file_identity == file_identity => {
+            rewritten_jsonl_generation(
+                previous.resume,
+                file_identity,
+                digest_prefix_u64(snapshot.finalize()),
+                extent,
+                file_mtime_secs(&initial),
+            )
+        }
         _ => file_identity,
     };
     if !validated_previous {
@@ -715,6 +805,7 @@ pub fn capture_live_jsonl_origin(
         complete_frontier,
         complete_prefix_fingerprint,
         physical_eof: extent,
+        native_birth_witness,
         validated_previous,
         frames,
     })
@@ -2033,6 +2124,244 @@ fn try_stream_new_jsonl_raw_from_file(
 mod tests {
     use std::io::Write;
 
+    fn live_origin_previous(capture: &LiveJsonlOriginCapture) -> LiveJsonlOriginPrevious {
+        LiveJsonlOriginPrevious {
+            cursor: StoredCursor {
+                position: capture.complete_frontier,
+                mtime: 0,
+                file_id: capture.generation,
+            },
+            resume: JsonlResumeState {
+                generation: capture.generation,
+                file_identity: capture.file_identity,
+                fingerprint: capture.complete_prefix_fingerprint,
+            },
+            physical_eof: capture.physical_eof,
+            native_birth_witness: capture.native_birth_witness,
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn live_origin_empty_first_append_matches_canonical_generation_and_frames() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let baseline = capture_live_jsonl_origin(&path, None, 1_000, 2, deadline).unwrap();
+        assert_eq!(baseline.physical_eof, 0);
+        assert_eq!(baseline.complete_frontier, 0);
+        let previous = live_origin_previous(&baseline);
+        let first = b"{\"first\":true}\n{\"second\":true}\npartial";
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(first)
+            .unwrap();
+        let live = capture_live_jsonl_origin(&path, Some(previous), 1_000, 2, deadline).unwrap();
+        let handle = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            empty_jsonl_file_id(&handle, &handle.metadata().unwrap()).unwrap(),
+            Some(baseline.file_identity)
+        );
+        assert_eq!(live.native_birth_witness, baseline.native_birth_witness);
+        if baseline.native_birth_witness.is_none() {
+            assert!(!live.validated_previous);
+            assert!(live.frames.is_empty());
+            return;
+        }
+        assert!(live.validated_previous);
+        assert_ne!(live.file_identity, baseline.file_identity);
+        assert_eq!(live.generation, live.file_identity);
+        assert_eq!(live.frames.len(), 2);
+        assert_eq!(live.frames[0].offset, 0);
+        assert_eq!(live.physical_eof, first.len() as u64);
+        assert!(live.physical_eof > live.complete_frontier);
+        let canonical = try_stream_new_jsonl_raw_strict_with_resume(
+            &path,
+            previous.cursor,
+            Some(1_000),
+            MAX_JSONL_RECORD_BYTES,
+            Some(previous.resume),
+        )
+        .unwrap();
+        assert_eq!(canonical.new_cursor.file_id, live.generation);
+        assert_eq!(canonical.file_identity, live.file_identity);
+        assert_eq!(canonical.new_cursor.position, live.complete_frontier);
+        assert_eq!(canonical.frames.len(), live.frames.len());
+        for (canonical, live) in canonical.frames.iter().zip(&live.frames) {
+            assert_eq!(canonical.offset, live.offset);
+            assert_eq!(
+                canonical.offset + canonical.bytes.len() as u64,
+                live.end_offset
+            );
+            assert_eq!(canonical.resume_fingerprint, live.resume_fingerprint);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn live_origin_empty_first_append_rejects_same_path_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let original = std::fs::File::open(&path).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let baseline = capture_live_jsonl_origin(&path, None, 1_000, 2, deadline).unwrap();
+        std::fs::rename(&path, directory.path().join("original.jsonl")).unwrap();
+        std::fs::write(&path, b"{\"replacement\":true}\n").unwrap();
+        let live = capture_live_jsonl_origin(
+            &path,
+            Some(live_origin_previous(&baseline)),
+            1_000,
+            2,
+            deadline,
+        )
+        .unwrap();
+        assert!(!live.validated_previous);
+        assert!(live.frames.is_empty());
+        // Keep the original native file alive through capture to exclude
+        // inode reuse from the replacement fixture.
+        assert_eq!(original.metadata().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn live_origin_partial_zero_frontier_cannot_bridge_empty_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("partial.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let empty = capture_live_jsonl_origin(&path, None, 1_000, 2, deadline).unwrap();
+        std::fs::write(&path, b"{\"partial\":").unwrap();
+        let partial = capture_live_jsonl_origin(
+            &path,
+            Some(live_origin_previous(&empty)),
+            1_000,
+            2,
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(partial.complete_frontier, 0);
+        assert!(partial.physical_eof > 0);
+        assert!(!partial.validated_previous);
+        assert!(partial.frames.is_empty());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"true}\n")
+            .unwrap();
+        let completed = capture_live_jsonl_origin(
+            &path,
+            Some(live_origin_previous(&partial)),
+            1_000,
+            2,
+            deadline,
+        )
+        .unwrap();
+        assert!(!completed.validated_previous);
+        assert!(completed.frames.is_empty());
+    }
+
+    #[test]
+    fn live_origin_empty_birth_refresh_rebaselines_before_first_append() {
+        for missing in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("empty.jsonl");
+            std::fs::write(&path, b"").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let baseline = capture_live_jsonl_origin(&path, None, 1_000, 2, deadline).unwrap();
+            let mut previous = live_origin_previous(&baseline);
+            if missing {
+                previous.native_birth_witness = None;
+            } else if let Some(witness) = previous.native_birth_witness.as_mut() {
+                witness[0] ^= 1;
+            }
+            let fresh =
+                capture_live_jsonl_origin(&path, Some(previous), 1_000, 2, deadline).unwrap();
+            assert!(!fresh.validated_previous);
+            assert!(fresh.frames.is_empty());
+            assert_eq!(fresh.physical_eof, 0);
+            assert_eq!(fresh.generation, fresh.file_identity);
+            std::fs::write(&path, b"first\n").unwrap();
+            let live = capture_live_jsonl_origin(
+                &path,
+                Some(live_origin_previous(&fresh)),
+                1_000,
+                2,
+                deadline,
+            )
+            .unwrap();
+            assert_eq!(
+                live.validated_previous,
+                fresh.native_birth_witness.is_some()
+            );
+            if live.validated_previous {
+                assert_eq!(live.frames.len(), 1);
+                assert_eq!(live.frames[0].offset, 0);
+            } else {
+                assert!(live.frames.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn live_origin_empty_first_append_requires_exact_previous_and_scan_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let empty = capture_live_jsonl_origin(&path, None, 1_000, 2, deadline).unwrap();
+        let previous = live_origin_previous(&empty);
+        std::fs::write(&path, b"first\nsecond\n").unwrap();
+        for change in [
+            "eof",
+            "position",
+            "cursor_id",
+            "generation",
+            "file_id",
+            "fingerprint",
+            "missing_birth",
+            "different_birth",
+        ] {
+            let mut malformed = previous;
+            match change {
+                "eof" => malformed.physical_eof = 1,
+                "position" => malformed.cursor.position = 1,
+                "cursor_id" => malformed.cursor.file_id ^= 1,
+                "generation" => malformed.resume.generation ^= 1,
+                "file_id" => malformed.resume.file_identity ^= 1,
+                "fingerprint" => malformed.resume.fingerprint ^= 1,
+                "missing_birth" => malformed.native_birth_witness = None,
+                "different_birth" => {
+                    if let Some(witness) = malformed.native_birth_witness.as_mut() {
+                        witness[0] ^= 1;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let live =
+                capture_live_jsonl_origin(&path, Some(malformed), 1_000, 2, deadline).unwrap();
+            assert!(!live.validated_previous, "{change}");
+            assert!(live.frames.is_empty(), "{change}");
+        }
+        for (bytes, frames, deadline) in [
+            (0, 2, deadline),
+            (1, 2, deadline),
+            (1_000, 0, deadline),
+            (1_000, 257, deadline),
+            (1_000, 2, std::time::Instant::now()),
+        ] {
+            assert!(
+                capture_live_jsonl_origin(&path, Some(previous), bytes, frames, deadline).is_err()
+            );
+        }
+        if previous.native_birth_witness.is_some() {
+            assert!(capture_live_jsonl_origin(&path, Some(previous), 1_000, 1, deadline).is_err());
+        }
+    }
+
     #[test]
     fn live_origin_baseline_does_not_materialize_old_frames_and_matches_canonical_resume() {
         use super::*;
@@ -2044,18 +2373,7 @@ mod tests {
         let baseline = capture_live_jsonl_origin(&path, None, 1_000_000, 2, deadline).unwrap();
         assert!(baseline.frames.is_empty());
         assert_eq!(baseline.complete_frontier, old.len() as u64);
-        let previous = (
-            StoredCursor {
-                position: baseline.complete_frontier,
-                mtime: 0,
-                file_id: baseline.generation,
-            },
-            JsonlResumeState {
-                generation: baseline.generation,
-                file_identity: baseline.file_identity,
-                fingerprint: baseline.complete_prefix_fingerprint,
-            },
-        );
+        let previous = live_origin_previous(&baseline);
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -2070,10 +2388,10 @@ mod tests {
         assert!(live.physical_eof > live.complete_frontier);
         let canonical = try_stream_new_jsonl_raw_strict_with_resume(
             &path,
-            previous.0,
+            previous.cursor,
             Some(1_000_000),
             MAX_JSONL_RECORD_BYTES,
-            Some(previous.1),
+            Some(previous.resume),
         )
         .unwrap();
         assert_eq!(canonical.new_cursor.position, live.complete_frontier);
@@ -2094,18 +2412,7 @@ mod tests {
         assert!(capture_live_jsonl_origin(&path, None, 2, 1, deadline).is_err());
         assert!(capture_live_jsonl_origin(&path, None, 100, 1, std::time::Instant::now()).is_err());
         let baseline = capture_live_jsonl_origin(&path, None, 100, 1, deadline).unwrap();
-        let previous = (
-            StoredCursor {
-                position: 4,
-                mtime: 0,
-                file_id: baseline.generation,
-            },
-            JsonlResumeState {
-                generation: baseline.generation,
-                file_identity: baseline.file_identity,
-                fingerprint: baseline.complete_prefix_fingerprint,
-            },
-        );
+        let previous = live_origin_previous(&baseline);
         std::fs::write(&path, b"old\nnew1\nnew2\n").unwrap();
         assert!(capture_live_jsonl_origin(&path, Some(previous), 100, 1, deadline).is_err());
         std::fs::write(&path, b"changed\nnew1\nnew2\n").unwrap();

@@ -103,11 +103,12 @@ pub(crate) use meta::session_meta_read_count_for_test;
 pub use meta::{CodexMeta, session_meta_from_record, turn_context_from_record};
 pub use observation::codex_observation_source_v2;
 pub use observation::{
-    CODEX_HOOK_MAX_NEW_BYTES, CodexJsonlAdmissionProgress,
+    CODEX_HOOK_MAX_NEW_BYTES, CodexJsonlAdmissionProgress, SealedJsonlSourceBound,
     try_admit_codex_jsonl_observations_for_profile,
     try_admit_codex_jsonl_observations_for_profile_with_admission,
     try_admit_codex_jsonl_observations_for_profile_with_admission_and_cancellation,
     try_admit_codex_jsonl_observations_for_project,
+    try_admit_codex_jsonl_observations_for_project_through_sealed_source,
     try_admit_codex_jsonl_observations_for_project_with_admission,
     try_admit_codex_jsonl_observations_for_project_with_admission_and_cancellation,
 };

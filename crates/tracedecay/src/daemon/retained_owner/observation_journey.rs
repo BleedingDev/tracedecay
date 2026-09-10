@@ -1209,6 +1209,16 @@ impl CanonicalObservationAdmissionAdapterV1 {
                 finding_count,
                 findings_digest,
             } => {
+                #[cfg(feature = "test-helpers")]
+                if history.is_some() {
+                    super::cognitive_recall::emit_host_history_recall_test_diagnostic(|| {
+                        serde_json::json!({
+                            "phase": "history_withheld",
+                            "source_sequence": record.source_sequence.0,
+                            "reason": reason.as_str(),
+                        })
+                    });
+                }
                 // Digests and a typed reason only. The canonical evidence the
                 // host settled is not touched; the withheld row advances the
                 // replay cursor so a refused event is not re-emitted forever,
@@ -1472,6 +1482,13 @@ pub(crate) fn validate_history_delivery_evidence(
         }
         let (admitted, state, receipt) = match evidence {
             SourceDeliveryEvidenceV1::Missing => {
+                #[cfg(feature = "test-helpers")]
+                super::cognitive_recall::emit_host_history_recall_test_diagnostic(|| {
+                    serde_json::json!({
+                        "phase": "history_delivery_missing",
+                        "source_sequence": source.attribution.source_sequence,
+                    })
+                });
                 return Err(
                     ProviderHistoryErrorV1::Ineligible("history source not admitted").into(),
                 );
@@ -3495,6 +3512,15 @@ impl ProjectObservationJourneyV1 {
                 source_event_revision: 1,
                 record: stored,
             };
+            #[cfg(feature = "test-helpers")]
+            let (source_sequence, granted) = (
+                record.source_sequence.0,
+                adapter.grant.as_ref().is_some_and(|grant| {
+                    grant.sources.iter().any(|source| {
+                        source.attribution.source.observation_id == record.source_event_id
+                    })
+                }),
+            );
             let report = match self
                 .ingest_record_with_adapter(record, Arc::clone(&adapter), bounds)
                 .await?
@@ -3504,6 +3530,19 @@ impl ProjectObservationJourneyV1 {
                     return Err(ObservationJourneyError::DeadlineExceeded { admitted });
                 }
             };
+            #[cfg(feature = "test-helpers")]
+            super::cognitive_recall::emit_host_history_recall_test_diagnostic(|| {
+                serde_json::json!({
+                    "phase": "history_ingress",
+                    "source_sequence": source_sequence,
+                    "granted": granted,
+                    "appended": report.appended,
+                    "duplicates": report.duplicates,
+                    "withheld": report.withheld,
+                    "non_messages": report.non_messages,
+                    "already_processed": report.already_processed,
+                })
+            });
             admitted += u64::from(report.appended);
             if let Some(stop) = report.stopped_on {
                 return Err(match stop.reason {

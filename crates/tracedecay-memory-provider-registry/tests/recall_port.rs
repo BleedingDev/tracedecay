@@ -9,6 +9,7 @@
 
 mod recall_fixture;
 
+use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -23,8 +24,8 @@ use tracedecay_domain::{ProjectId, RefId, RepositoryId, UtcMicros, WorktreeId};
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
     CommittedEffectEvidence, FallbackDirective, HandshakeRequest, HandshakeResponse,
-    OwnedExactScope, OwnedProviderId, PinnedFallbackPolicy, ProviderCall, ProviderDescriptor,
-    ProviderOperation, ProviderReply, TerminalRecord,
+    OwnedExactScope, OwnedProviderId, OwnedVersionedId, PinnedFallbackPolicy, ProviderCall,
+    ProviderDescriptor, ProviderOperation, ProviderReply, TerminalRecord,
 };
 use tracedecay_memory_provider_native::{NativeMemoryApplicationPort, NativeObservation};
 use tracedecay_memory_provider_registry::{
@@ -2306,13 +2307,96 @@ async fn native_and_ncm_declared_observation_formats_bind_to_their_actual_source
     }
 }
 
+/// Record dispatch envelopes and encoded capabilities without changing fixture behavior.
+struct ProfileRecordingFixture {
+    inner: RecallFixturePort,
+    required_capabilities: Mutex<Vec<(ProviderOperation, BTreeSet<OwnedVersionedId>)>>,
+    payload_capabilities: Mutex<Vec<BTreeSet<OwnedVersionedId>>>,
+}
+
+impl NativeMemoryApplicationPort for ProfileRecordingFixture {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        self.required_capabilities.lock().unwrap().push((
+            ProviderOperation::Handshake,
+            request.required_capabilities.clone(),
+        ));
+        self.inner.handshake(request)
+    }
+
+    fn recall(&self, call: &ProviderCall) -> ProviderReply {
+        self.required_capabilities.lock().unwrap().push((
+            ProviderOperation::Recall,
+            call.required_capabilities.clone(),
+        ));
+        let payload: serde_json::Value = serde_json::from_slice(&call.payload.bytes).unwrap();
+        let encoded = payload["required_capabilities"].as_array().unwrap();
+        let capabilities = encoded
+            .iter()
+            .map(|value| OwnedVersionedId::new(value.as_str().unwrap()).unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            capabilities.len(),
+            encoded.len(),
+            "capabilities must be unique"
+        );
+        self.payload_capabilities.lock().unwrap().push(capabilities);
+        self.inner.recall(call)
+    }
+
+    fn health(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.health(call)
+    }
+
+    fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
+        self.inner.observe(observation)
+    }
+
+    fn feedback(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.feedback(call)
+    }
+
+    fn maintenance(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.maintenance(call)
+    }
+
+    fn inspection(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.inspection(call)
+    }
+
+    fn correction(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.correction(call)
+    }
+
+    fn delete_by_source(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.delete_by_source(call)
+    }
+
+    fn snapshot_export(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.snapshot_export(call)
+    }
+
+    fn snapshot_restore(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.snapshot_restore(call)
+    }
+
+    fn replay(&self, call: &ProviderCall) -> ProviderReply {
+        self.inner.replay(call)
+    }
+}
+
 /// Both paths use the exact same provider identity and capability declaration.
 /// Only the actual host registration path decides the common-profile policy.
 fn compose_profile_fixture(
     mut fixture: RecallFixturePort,
     common_profile: bool,
-) -> Arc<ProjectMemoryProviderComposition> {
-    use tracedecay_memory_provider_api::OwnedVersionedId;
+) -> (
+    Arc<ProjectMemoryProviderComposition>,
+    Arc<ProfileRecordingFixture>,
+) {
     use tracedecay_memory_provider_native::NativeProvider;
     use tracedecay_memory_provider_registry::{
         COMMON_ADVISORY_PROFILE_ID, COMMON_ADVISORY_REQUIRED_CAPABILITIES,
@@ -2327,7 +2411,11 @@ fn compose_profile_fixture(
             .capabilities
             .insert(OwnedVersionedId::new(capability).unwrap());
     }
-    let fixture = Arc::new(fixture);
+    let fixture = Arc::new(ProfileRecordingFixture {
+        inner: fixture,
+        required_capabilities: Mutex::new(Vec::new()),
+        payload_capabilities: Mutex::new(Vec::new()),
+    });
     let composition = if common_profile {
         Arc::new(
             ProjectMemoryProviderComposition::compose_registered(
@@ -2337,7 +2425,7 @@ fn compose_profile_fixture(
                         max_in_flight: 2,
                     },
                     registration: ProviderRegistrationV1 {
-                        provider: Arc::new(NativeProvider::new(fixture).unwrap()),
+                        provider: Arc::new(NativeProvider::new(fixture.clone()).unwrap()),
                         provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).unwrap(),
                         registration_revision: 31,
                         mode: EnabledProviderMode::Active,
@@ -2351,7 +2439,7 @@ fn compose_profile_fixture(
             .unwrap(),
         )
     } else {
-        compose_mode(fixture, EnabledProviderMode::Active)
+        compose_mode(fixture.clone(), EnabledProviderMode::Active)
     };
     assert_eq!(
         composition
@@ -2362,7 +2450,7 @@ fn compose_profile_fixture(
             .requires_common_advisory_profile,
         common_profile
     );
-    composition
+    (composition, fixture)
 }
 
 /// Host-dispatched canonical history fixture. The registry checks membership;
@@ -2443,7 +2531,7 @@ async fn common_profile_denies_fact_projection_and_ungranted_sources_before_sele
             observation_candidate_fields(&source, &exact),
         );
         let port = mount(
-            compose_profile_fixture(fixture, true),
+            compose_profile_fixture(fixture, true).0,
             Arc::new(LedgerObserver::default()),
         )
         .unwrap()
@@ -2543,8 +2631,9 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
         "observation".to_owned(),
         observation_candidate_fields(&source, &exact),
     );
+    let (common_composition, common_recording) = compose_profile_fixture(common, true);
     let port = mount(
-        compose_profile_fixture(common, true),
+        common_composition,
         Arc::new(LedgerObserver::default()),
     )
     .unwrap();
@@ -2564,8 +2653,10 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
         "legacy-fact".to_owned(),
         "retained canonical fact extension".to_owned(),
     )]);
+    let (legacy_composition, legacy_recording) = compose_profile_fixture(legacy, false);
+    assert_eq!(common_recording.descriptor(), legacy_recording.descriptor());
     let port = mount(
-        compose_profile_fixture(legacy, false),
+        legacy_composition,
         Arc::new(LedgerObserver::default()),
     )
     .unwrap();
@@ -2591,4 +2682,40 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
             .authorizes(ScopeBinding::ProfileFacts)
     );
     assert!(outcome.original_sources.is_empty());
+    let recall_capability = OwnedVersionedId::new(
+        tracedecay_memory_provider_registry::RECALL_QUERY_CAPABILITY_ID,
+    )
+    .unwrap();
+    let common_capabilities = BTreeSet::from([
+        recall_capability.clone(),
+        OwnedVersionedId::new(tracedecay_memory_provider_registry::COMMON_ADVISORY_PROFILE_ID)
+            .unwrap(),
+    ]);
+    assert_eq!(
+        *common_recording.required_capabilities.lock().unwrap(),
+        vec![
+            (ProviderOperation::Handshake, common_capabilities.clone()),
+            (ProviderOperation::Recall, common_capabilities.clone()),
+        ],
+        "the pinned common profile must reach both dispatch envelopes even without a grant"
+    );
+    assert_eq!(
+        *common_recording.payload_capabilities.lock().unwrap(),
+        vec![common_capabilities],
+        "the canonical payload must bind the same common capabilities as call and handshake"
+    );
+    let legacy_capabilities = BTreeSet::from([recall_capability]);
+    assert_eq!(
+        *legacy_recording.required_capabilities.lock().unwrap(),
+        vec![
+            (ProviderOperation::Handshake, legacy_capabilities.clone()),
+            (ProviderOperation::Recall, legacy_capabilities.clone()),
+        ],
+        "a legacy registration with the same descriptor and a grant remains recall-only"
+    );
+    assert_eq!(
+        *legacy_recording.payload_capabilities.lock().unwrap(),
+        vec![legacy_capabilities],
+        "the legacy canonical payload must remain identical to call and handshake capabilities"
+    );
 }

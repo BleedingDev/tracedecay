@@ -22,6 +22,8 @@ use tracedecay_domain::{
 };
 use tracedecay_store::observation::ObservationCoverageReason;
 
+pub use crate::runtime::jsonl_observation_admission::SealedJsonlSourceBound;
+
 use super::PROVIDER;
 use super::context::CodexContextState;
 use super::meta::{CodexMetaWithProvenance, session_meta_with_provenance};
@@ -473,6 +475,7 @@ struct CodexAdmissionContext<'a> {
     meta: &'a super::meta::CodexMeta,
     native_thread_id: Option<&'a str>,
     cancellation: &'a ObservationCancellation,
+    sealed_source: Option<&'a SealedJsonlSourceBound>,
 }
 
 fn replay_identity(session_id: &str, domain: &[u8]) -> String {
@@ -643,6 +646,50 @@ async fn try_admit_codex_jsonl_observations(
     max_new_bytes: Option<u64>,
     cancellation: &ObservationCancellation,
 ) -> TranscriptIngestResult<CodexJsonlAdmissionProgress> {
+    try_admit_codex_jsonl_observations_bounded(
+        path,
+        admission_scope,
+        admission,
+        max_new_bytes,
+        cancellation,
+        None,
+    )
+    .await
+}
+
+/// Retained project Stop admission through a validated live checkpoint only.
+pub async fn try_admit_codex_jsonl_observations_for_project_through_sealed_source(
+    bound: &SealedJsonlSourceBound,
+    project_root: &Path,
+    project_id: ProjectId,
+    session_id: &str,
+    admission: &dyn HostAdmission,
+    max_new_bytes: Option<u64>,
+    cancellation: &ObservationCancellation,
+) -> TranscriptIngestResult<CodexJsonlAdmissionProgress> {
+    try_admit_codex_jsonl_observations_bounded(
+        bound.canonical_path(),
+        CodexObservationAdmission::Project {
+            root: project_root,
+            project_id,
+            session_id: Some(session_id),
+        },
+        admission,
+        max_new_bytes,
+        cancellation,
+        Some(bound),
+    )
+    .await
+}
+
+async fn try_admit_codex_jsonl_observations_bounded(
+    path: &Path,
+    admission_scope: CodexObservationAdmission<'_>,
+    admission: &dyn HostAdmission,
+    max_new_bytes: Option<u64>,
+    cancellation: &ObservationCancellation,
+    sealed_source: Option<&SealedJsonlSourceBound>,
+) -> TranscriptIngestResult<CodexJsonlAdmissionProgress> {
     if cancellation.is_cancelled() {
         return Ok(CodexJsonlAdmissionProgress {
             bytes_consumed: 0,
@@ -654,7 +701,10 @@ async fn try_admit_codex_jsonl_observations(
     let native_thread_id = parsed_meta.native_thread_id.clone();
     let meta = parsed_meta.meta.clone();
     if !admission_scope.accepts_session(&meta.session_id) {
-        return Ok(CodexJsonlAdmissionProgress::default());
+        return Ok(CodexJsonlAdmissionProgress {
+            source_deferred: sealed_source.is_some(),
+            ..CodexJsonlAdmissionProgress::default()
+        });
     }
     let ordinary_source = ObservationSourceIdentityV1::for_provider(
         ProviderId::new(PROVIDER)?,
@@ -668,6 +718,7 @@ async fn try_admit_codex_jsonl_observations(
         meta: &meta,
         native_thread_id: native_thread_id.as_deref(),
         cancellation,
+        sealed_source,
     };
     let scope = admission_scope.scope();
     if let Some(target) = admission
@@ -724,6 +775,7 @@ async fn admit_codex_jsonl_page(
         meta,
         native_thread_id,
         cancellation,
+        sealed_source,
     } = context;
     let scope = admission_scope.scope();
     let scope_matcher = admission_scope.scope_matcher();
@@ -748,6 +800,9 @@ async fn admit_codex_jsonl_page(
         request = request
             .with_required_start_cursor(expected_start_cursor)
             .with_max_end_offset(through);
+    }
+    if let Some(bound) = sealed_source {
+        request = request.with_sealed_source(bound);
     }
     let progress = admit_jsonl_observations(
         request,
@@ -994,6 +1049,7 @@ mod replay_boundary_tests {
             meta: &parsed_meta.meta,
             native_thread_id: parsed_meta.native_thread_id.as_deref(),
             cancellation: &cancellation,
+            sealed_source: None,
         };
         let old_writer = admit_codex_jsonl_page(
             context,
@@ -1047,5 +1103,126 @@ mod replay_boundary_tests {
         .unwrap();
         assert!(refreshed.source_deferred);
         assert_eq!(usage_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn sealed_checkpoint_caps_legacy_current_user_message_replay() {
+        crate::runtime::jsonl_observation_admission::install_test_shared_jsonl_preparation_authority();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = std::fs::canonicalize(temp.path())
+            .unwrap()
+            .join("rollout.jsonl");
+        let session_id = "sealed-legacy-session";
+        let header = json!({
+            "timestamp": "2026-09-04T12:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"id": session_id, "cwd": project}
+        })
+        .to_string()
+            + "\n";
+        let turn = |id: &str| {
+            json!({
+                "timestamp": "2026-09-04T12:00:01.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {"type": "UserMessage", "id": id,
+                        "content": [{"type": "text", "text": id}]}
+                }
+            })
+            .to_string()
+                + "\n"
+        };
+        std::fs::write(&path, header + &turn("first-legacy-turn")).unwrap();
+        let first = crate::runtime::source::capture_live_jsonl_origin(
+            &path,
+            None,
+            16 * 1024 * 1024,
+            256,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let project_id = ProjectId::new("project.sealed-legacy").unwrap();
+        let scope = ObservationScopeV1::Project {
+            project_id: project_id.clone(),
+        };
+        let canonical_source = codex_observation_source_v2(session_id).unwrap();
+        let bound = SealedJsonlSourceBound::new(
+            path.clone(),
+            canonical_source.clone(),
+            scope.clone(),
+            first.generation,
+            first.file_identity,
+            first.complete_frontier,
+            first.complete_prefix_fingerprint,
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(turn("second-legacy-turn").as_bytes())
+            .unwrap();
+        let admission = MemoryHostAdmission::default();
+        let cancellation = ObservationCancellation::default();
+        let parsed_meta = shared_session_meta_with_provenance(&path, &cancellation)
+            .await
+            .unwrap();
+        let admission_scope = CodexObservationAdmission::Project {
+            root: &project,
+            project_id: project_id.clone(),
+            session_id: Some(session_id),
+        };
+        let ordinary_source = ObservationSourceIdentityV1::for_provider(
+            ProviderId::new(PROVIDER).unwrap(),
+            SessionId::new(session_id).unwrap(),
+        )
+        .unwrap();
+        // An old writer has already advanced through both turns. The canonical
+        // replay must still stop at the first independently sealed checkpoint.
+        admit_codex_jsonl_page(
+            CodexAdmissionContext {
+                path: &path,
+                scope: &admission_scope,
+                admission: &admission,
+                meta: &parsed_meta.meta,
+                native_thread_id: parsed_meta.native_thread_id.as_deref(),
+                cancellation: &cancellation,
+                sealed_source: None,
+            },
+            ordinary_source,
+            None,
+            None,
+            CodexAdmissionMode::Ordinary,
+        )
+        .await
+        .unwrap();
+        try_admit_codex_jsonl_observations_for_project_through_sealed_source(
+            &bound,
+            &project,
+            project_id,
+            session_id,
+            &admission,
+            None,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        let cursor = admission
+            .get_source_cursor(&canonical_source, &scope)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.position(), first.complete_frontier);
+        let second = crate::runtime::source::capture_live_jsonl_origin(
+            &path,
+            None,
+            16 * 1024 * 1024,
+            256,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(cursor.position() < second.complete_frontier);
     }
 }

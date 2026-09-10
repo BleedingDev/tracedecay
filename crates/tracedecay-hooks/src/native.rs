@@ -346,17 +346,17 @@ struct ClaudeStopEvent {
     #[serde(rename = "cwd")]
     _cwd: IgnoredAny,
     #[serde(rename = "prompt_id")]
-    _prompt_id: IgnoredAny,
+    _prompt_id: Option<IgnoredAny>,
     #[serde(rename = "permission_mode")]
-    _permission_mode: IgnoredAny,
+    _permission_mode: Option<IgnoredAny>,
     #[serde(rename = "stop_hook_active")]
     _stop_hook_active: IgnoredAny,
     #[serde(rename = "last_assistant_message")]
-    _last_assistant_message: IgnoredAny,
+    _last_assistant_message: Option<IgnoredAny>,
     #[serde(rename = "background_tasks")]
-    _background_tasks: IgnoredAny,
+    _background_tasks: Option<IgnoredAny>,
     #[serde(rename = "session_crons")]
-    _session_crons: IgnoredAny,
+    _session_crons: Option<IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -842,6 +842,85 @@ mod tests {
         assert!(object.contains_key("host"));
         assert!(object.contains_key("signal"));
         assert!(object.contains_key("ordering"));
+    }
+
+    #[test]
+    fn claude_stop_decodes_minimal_native_and_full_captured_payloads() {
+        // The Agent SDK Stop input requires the common identity fields and
+        // stop_hook_active; newer CLI payloads add optional prompt/task data.
+        let minimal = serde_json::json!({
+            "session_id": "session-one",
+            "transcript_path": "/native/session-one.jsonl",
+            "cwd": "/workspace",
+            "hook_event_name": "Stop",
+            "stop_hook_active": false,
+        });
+        let full: Value =
+            serde_json::from_slice(include_bytes!("../fixtures/host_events/claude/stop.json"))
+                .unwrap();
+        let expected = DecodedNativeHookEventV1 {
+            host: NativeHostIdentityV1::ClaudeCode,
+            signal: NativeHookSignalV1::SessionBoundary(HookBoundaryV1::TurnComplete),
+            ordering: HookOrderingV1::Unknown,
+        };
+        for payload in [&minimal, &full] {
+            assert_eq!(
+                decode_native_hook_event(
+                    NativeHostIdentityV1::ClaudeCode,
+                    &serde_json::to_vec(payload).unwrap()
+                ),
+                Ok(expected),
+            );
+        }
+        for optional in [
+            "prompt_id",
+            "permission_mode",
+            "last_assistant_message",
+            "background_tasks",
+            "session_crons",
+        ] {
+            let mut without_optional = full.clone();
+            assert!(
+                without_optional
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(optional)
+                    .is_some()
+            );
+            assert_eq!(
+                decode_native_hook_event(
+                    NativeHostIdentityV1::ClaudeCode,
+                    &serde_json::to_vec(&without_optional).unwrap()
+                ),
+                Ok(expected),
+                "optional payload field {optional} must not prevent native Stop admission",
+            );
+        }
+    }
+
+    #[test]
+    fn claude_stop_still_rejects_missing_required_native_fields() {
+        let full: Value =
+            serde_json::from_slice(include_bytes!("../fixtures/host_events/claude/stop.json"))
+                .unwrap();
+        for required in [
+            "session_id",
+            "transcript_path",
+            "cwd",
+            "hook_event_name",
+            "stop_hook_active",
+        ] {
+            let mut invalid = full.clone();
+            assert!(invalid.as_object_mut().unwrap().remove(required).is_some());
+            assert_eq!(
+                decode_native_hook_event(
+                    NativeHostIdentityV1::ClaudeCode,
+                    &serde_json::to_vec(&invalid).unwrap()
+                ),
+                Err(NativeHookDecodeError::MalformedPayload),
+                "required native field {required} must remain required",
+            );
+        }
     }
 
     #[test]

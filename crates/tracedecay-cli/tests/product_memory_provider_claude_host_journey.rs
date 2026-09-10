@@ -1731,10 +1731,32 @@ fn recall_diagnostic_summary(line: &str) -> Option<Value> {
             &["has_older", "has_more", "partial_coverage"],
             &[],
         ),
+        "history_ingress" => (
+            &[
+                "source_sequence",
+                "appended",
+                "duplicates",
+                "withheld",
+                "non_messages",
+                "already_processed",
+            ],
+            &["granted"],
+            &[],
+        ),
+        "history_delivery_missing" | "history_withheld" => (&["source_sequence"], &[], &[]),
         _ => return None,
     };
     let mut summary = serde_json::Map::new();
     summary.insert("phase".into(), json!(phase));
+    if phase == "history_withheld" {
+        let reason = match value["reason"].as_str()? {
+            "secret_rejected" => "secret_rejected",
+            "quarantined" => "quarantined",
+            "unclassifiable_payload" => "unclassifiable_payload",
+            _ => return None,
+        };
+        summary.insert("reason".into(), json!(reason));
+    }
     for field in numbers {
         summary.insert((*field).into(), json!(value[*field].as_u64()?));
     }
@@ -1942,32 +1964,13 @@ fn assert_host_memory_journey_with_provider(
 
     let observer_replayed = journey.assert_observer_settled(&replayed, &observer_rows);
 
-    // 6. The session keeps running and writes a second turn. Claude must wait
-    //    for its next hook. Codex Stop acknowledges retained daemon work, so
-    //    the first Stop's follow-up may already ingest the appended bytes.
+    // 6. The next turn remains outside the previous hook's sealed source
+    //    checkpoint until a later live hook admits that turn's boundary.
     journey.append_mid_session_claude_turn();
-    if codex {
-        let deadline = Instant::now() + QUIESCENCE_WINDOW;
-        while Instant::now() < deadline {
-            let progressed = journey.journal_rows();
-            assert!(
-                (ROWS_PER_TURN..=2 * ROWS_PER_TURN).contains(&progressed.len()),
-                "Codex follow-up may only add the second turn: {:?}",
-                journal_digest(&progressed)
-            );
-            let identities = journal_row_identities(&progressed);
-            assert!(
-                settled.iter().all(|identity| identities.contains(identity)),
-                "Codex follow-up must retain every settled first-turn identity"
-            );
-            std::thread::sleep(JOURNAL_POLL_INTERVAL);
-        }
-    } else {
-        journey.assert_journal_unchanged_without_a_hook(&replayed);
-    }
+    journey.assert_journal_unchanged_without_a_hook(&replayed);
 
-    // 7. The next Stop must converge to exactly both turns, whether Codex's
-    //    retained follow-up already captured the second one or not.
+    // 7. The next Stop advances the sealed source frontier and converges to
+    //    exactly four deliveries covering both turns.
     let stop = journey.run_stop_hook();
     assert!(
         stop.status.success(),
@@ -2053,7 +2056,11 @@ fn assert_host_memory_journey_with_provider(
     let recalled = assert_recalled_session_messages(&journey, next_session, &original_sources);
     assert_eq!(
         recalled.0, original.0,
-        "restart and session change must preserve the same four messages and their provenance"
+        "restart and session change must preserve the same four messages and their canonical source evidence"
+    );
+    assert_ne!(
+        original.2, recalled.2,
+        "each session's recall must have a fresh recall trace"
     );
     if active_provider == ActiveProvider::Native && !ncm_observer {
         assert_canonical_fact_feedback_journey(&mut journey, next_session);
@@ -2181,7 +2188,7 @@ fn assert_canonical_fact_feedback_journey(journey: &mut ClaudeHostJourney, sessi
         .to_owned();
     assert_eq!(created["result"]["commit"]["fact_id"], fact_id);
 
-    let recalled_provenance = |journey: &ClaudeHostJourney| {
+    let assert_common_lane_excludes_fact = |journey: &ClaudeHostJourney| {
         let answer = journey.tool(
             "tracedecay_context",
             &json!({
@@ -2190,43 +2197,38 @@ fn assert_canonical_fact_feedback_journey(journey: &mut ClaudeHostJourney, sessi
                 "_meta": { "session_id": session_id },
             }),
         );
-        let lane = advisory_lane(&answer).expect("Native canonical fact recall lane");
+        let lane = advisory_lane(&answer).expect("Native common history recall lane");
         assert_eq!(lane["state"], "answered", "{lane}");
         assert_eq!(lane["provider_id"], CONFIGURED_PROVIDER_ID);
         assert_history_degradation(&lane);
         let expected = format!("cited source record:{fact_id}");
-        let selected = lane["candidates"]
+        let candidates = lane["candidates"]
             .as_array()
-            .expect("canonical recall candidates")
-            .iter()
-            .filter(|candidate| candidate["provenance"] == expected)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            selected.len(),
-            1,
-            "the host must confirm this exact fact once: {lane}; bounded Native diagnostics: {}",
-            journey.native_recall_failure_diagnostics()
-        );
-        assert!(
-            selected[0]["content"]
-                .as_str()
-                .is_some_and(|text| text.contains(&content)),
-            "the selected canonical record must carry its created content: {lane}"
-        );
-        selected[0]["provenance"].clone()
+            .expect("common history recall candidates");
+        for candidate in candidates {
+            assert_eq!(
+                candidate["provenance_evidence"]["kind"], "canonical_observations",
+                "the common history lane must carry only canonical observation evidence: {lane}"
+            );
+            assert!(
+                candidate["provenance"] != expected
+                    && !candidate["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(&content)),
+                "the common history lane must exclude the created canonical fact: {lane}; bounded Native diagnostics: {}",
+                journey.native_recall_failure_diagnostics()
+            );
+        }
     };
-    let selected_provenance = recalled_provenance(journey);
-    let selected_fact_id = selected_provenance
-        .as_str()
-        .and_then(|source| source.strip_prefix("cited source record:"))
-        .expect("host-confirmed canonical fact identity");
+    assert_common_lane_excludes_fact(journey);
     let before = canonical_payload(
         journey,
         "tracedecay_fact_store_get",
-        json!({ "fact_id": selected_fact_id, "format": "json" }),
+        json!({ "fact_id": fact_id, "format": "json" }),
     );
     assert_eq!(before["fact"]["kind"], "available");
     assert_eq!(before["fact"]["fact"]["fact_id"], fact_id);
+    assert_eq!(before["fact"]["fact"]["content"], content);
     let previous_event = before["fact"]["fact"]["last_event_id"]
         .as_str()
         .expect("current canonical event");
@@ -2234,12 +2236,12 @@ fn assert_canonical_fact_feedback_journey(journey: &mut ClaudeHostJourney, sessi
         .as_u64()
         .expect("current canonical trust");
     let source_label = format!("native-canonical-feedback-{session_id}");
-    let reason = "The recalled canonical fact supplied the retry budget.";
+    let reason = "The canonical fact read supplied the retry budget.";
     let feedback = canonical_payload(
         journey,
         "tracedecay_fact_feedback",
         json!({
-            "fact_id": selected_fact_id,
+            "fact_id": fact_id,
             "expected_last_event_id": previous_event,
             "action": "helpful",
             "source_label": source_label,
@@ -2298,10 +2300,11 @@ fn assert_canonical_fact_feedback_journey(journey: &mut ClaudeHostJourney, sessi
     let persisted = canonical_payload(
         journey,
         "tracedecay_fact_store_get",
-        json!({ "fact_id": selected_fact_id, "format": "json" }),
+        json!({ "fact_id": fact_id, "format": "json" }),
     );
     assert_eq!(persisted["fact"]["kind"], "available");
     assert_eq!(persisted["fact"]["fact"]["fact_id"], fact_id);
+    assert_eq!(persisted["fact"]["fact"]["content"], content);
     assert_eq!(persisted["fact"]["fact"]["last_event_id"], feedback_event);
     assert_eq!(
         persisted["fact"]["fact"]["trust_score_millionths"],
@@ -2321,7 +2324,7 @@ fn assert_canonical_fact_feedback_journey(journey: &mut ClaudeHostJourney, sessi
     assert_eq!(history[0]["reason"], reason);
     assert_eq!(history[0]["old_trust_millionths"], old_trust);
     assert_eq!(history[0]["new_trust_millionths"], new_trust);
-    assert_eq!(recalled_provenance(journey), selected_provenance);
+    assert_common_lane_excludes_fact(journey);
 }
 
 /// Exact scope read from an admitted host envelope; session encoding belongs
@@ -2584,12 +2587,12 @@ fn assert_recalled_history_deliveries(
 }
 
 /// The existing complete recall assertions, shared by origin and next session.
-/// Returns content/provenance identities; request-bound candidate IDs may differ.
+/// Returns canonical content/provenance identities, raw result bytes, and this request's trace.
 fn assert_recalled_session_messages(
     journey: &ClaudeHostJourney,
     recalled_session_id: &str,
     original_sources: &BTreeMap<String, Value>,
-) -> (Vec<(String, String)>, Vec<u8>) {
+) -> (Vec<(String, String)>, Vec<u8>, String) {
     let previous_history: BTreeSet<_> = journey
         .all_journal_rows_for(journey.active_provider.is_ncm())
         .into_iter()
@@ -2611,7 +2614,9 @@ fn assert_recalled_session_messages(
         .unwrap_or_else(|| panic!("an active provider must contribute an advisory lane: {answer}"));
     assert_eq!(
         lane["state"], "answered",
-        "the advisory lane must answer rather than report a refusal: {lane}"
+        "the advisory lane must answer rather than report a refusal (origin_session={}): {lane}; bounded Native diagnostics: {}",
+        recalled_session_id == journey.session_id(),
+        journey.native_recall_failure_diagnostics()
     );
     assert_history_degradation(&lane);
     assert_eq!(
@@ -2619,11 +2624,20 @@ fn assert_recalled_session_messages(
         journey.active_provider.id(),
         "the lane must name the provider the routing policy pinned: {lane}"
     );
+    let trace_ref = lane["recall_trace"]["trace_ref"]
+        .as_str()
+        .expect("the lane must identify its recall trace");
+    assert!(!trace_ref.is_empty(), "recall trace must be nonempty");
+    let request_id = lane["recall_trace"]["request_id"]
+        .as_str()
+        .expect("the lane must identify its recall request");
+    assert!(!request_id.is_empty(), "recall request must be nonempty");
     let candidates = lane["candidates"].as_array().cloned().unwrap_or_default();
     assert_eq!(
         candidates.len(),
         2 * ROWS_PER_TURN,
-        "the healthy journey must recall every admitted Claude message exactly once: {lane}; bounded Native diagnostics: {}",
+        "the healthy journey must recall every admitted Claude message exactly once (origin_session={}): {lane}; bounded Native diagnostics: {}",
+        recalled_session_id == journey.session_id(),
         journey.native_recall_failure_diagnostics()
     );
     let retained_sources = assert_recalled_history_deliveries(
@@ -2633,8 +2647,25 @@ fn assert_recalled_session_messages(
         recalled_session_id == journey.session_id(),
     );
     let mut recalled_originals = BTreeSet::new();
+    let mut recall_item_refs = BTreeSet::new();
     for candidate in &candidates {
         let evidence = &candidate["provenance_evidence"];
+        assert_eq!(
+            evidence["recall"]["trace_ref"].as_str(),
+            Some(trace_ref),
+            "candidate audit evidence must refer to this lane's recall trace"
+        );
+        let item_ref = evidence["recall"]["item_ref"]
+            .as_str()
+            .expect("candidate audit evidence must identify its recall item");
+        assert!(
+            !item_ref.is_empty(),
+            "recall item reference must be nonempty"
+        );
+        assert!(
+            recall_item_refs.insert(item_ref),
+            "recall item references must be unique within this reply"
+        );
         assert_eq!(
             evidence["kind"], "canonical_observations",
             "final candidates require host-confirmed original evidence"
@@ -2705,6 +2736,11 @@ fn assert_recalled_session_messages(
     let mut identities = candidates
         .iter()
         .map(|candidate| {
+            let mut evidence = candidate["provenance_evidence"].clone();
+            evidence
+                .as_object_mut()
+                .expect("verified canonical provenance evidence")
+                .remove("recall");
             (
                 candidate["content"]
                     .as_str()
@@ -2712,14 +2748,14 @@ fn assert_recalled_session_messages(
                     .to_owned(),
                 json!({
                     "label": candidate["provenance"],
-                    "evidence": candidate["provenance_evidence"],
+                    "evidence": evidence,
                 })
                 .to_string(),
             )
         })
         .collect::<Vec<_>>();
     identities.sort();
-    (identities, result_bytes)
+    (identities, result_bytes, trace_ref.to_owned())
 }
 
 #[test]

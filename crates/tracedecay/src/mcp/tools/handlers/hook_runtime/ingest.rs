@@ -608,7 +608,13 @@ pub(super) async fn ingest_transcript(
     .await
 }
 
-#[hotpath::measure(future = true, label = "mcp.hook_runtime.ingest")]
+/// Absence of a retained checkpoint is distinct from an ordinary source scan.
+#[derive(Clone, Debug)]
+pub(super) enum CodexStopSourceBound {
+    Deferred,
+    Sealed(tracedecay_sessions::runtime::codex::SealedJsonlSourceBound),
+}
+
 pub(crate) async fn ingest_transcript_with_cancellation(
     cg: Option<&TraceDecay>,
     args: &Value,
@@ -617,6 +623,30 @@ pub(crate) async fn ingest_transcript_with_cancellation(
     accounting_db: Option<&RegisteredGlobalDb>,
     session_authorities: SessionAuthorities<'_>,
     cancellation: &ObservationCancellation,
+) -> Result<Value> {
+    ingest_transcript_with_stop_bound(
+        cg,
+        args,
+        profile_root,
+        global_db,
+        accounting_db,
+        session_authorities,
+        cancellation,
+        None,
+    )
+    .await
+}
+
+#[hotpath::measure(future = true, label = "mcp.hook_runtime.ingest")]
+pub(super) async fn ingest_transcript_with_stop_bound(
+    cg: Option<&TraceDecay>,
+    args: &Value,
+    profile_root: Option<&Path>,
+    global_db: Option<&RegisteredGlobalDb>,
+    accounting_db: Option<&RegisteredGlobalDb>,
+    session_authorities: SessionAuthorities<'_>,
+    cancellation: &ObservationCancellation,
+    codex_stop_bound: Option<&CodexStopSourceBound>,
 ) -> Result<Value> {
     let provider = required_str(args, "provider")?;
     let user_scope = args
@@ -660,7 +690,8 @@ pub(crate) async fn ingest_transcript_with_cancellation(
             session_authorities: session_authorities.clone(),
             facade: &facade,
             max_new_bytes,
-            cancellation
+            cancellation,
+            codex_stop_bound
         }),
         label = "mcp.hook_runtime.capture"
     )

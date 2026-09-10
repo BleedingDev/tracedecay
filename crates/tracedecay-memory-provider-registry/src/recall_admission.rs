@@ -785,6 +785,22 @@ pub fn build_recall_request_payload_with_context(
     exclusions: Option<&tracedecay_contracts::memory::CognitiveRecallExclusions>,
     history_grant: Option<&Value>,
 ) -> Result<CanonicalPayload, RecallAdmissionError> {
+    build_recall_request_payload_with_capabilities(
+        parts,
+        exclusions,
+        history_grant,
+        &[OwnedVersionedId::new(RECALL_QUERY_CAPABILITY_ID)?],
+    )
+}
+
+/// Bind the exact unique capabilities already selected by the host recall plan.
+/// Public legacy builders retain their recall-only capability requirement.
+pub(crate) fn build_recall_request_payload_with_capabilities(
+    parts: &RecallRequestParts,
+    exclusions: Option<&tracedecay_contracts::memory::CognitiveRecallExclusions>,
+    history_grant: Option<&Value>,
+    required_capabilities: &[OwnedVersionedId],
+) -> Result<CanonicalPayload, RecallAdmissionError> {
     parts.exact_scope.validate()?;
     parts.budgets.validate()?;
     if let Some(exclusions) = exclusions {
@@ -830,7 +846,7 @@ pub fn build_recall_request_payload_with_context(
             "observation_ids": [],
             "content_sha256": [],
         },
-        "required_capabilities": [RECALL_QUERY_CAPABILITY_ID],
+        "required_capabilities": required_capabilities.iter().map(OwnedVersionedId::as_str).collect::<Vec<_>>(),
         "policy_revision": parts.policy_revision,
         "extensions": [],
         "deadline": {
@@ -2367,6 +2383,40 @@ mod request_context_tests {
         );
         assert_eq!(wire["history_grant"], grant);
         assert_eq!(first.sha256, hex::encode(Sha256::digest(&first.bytes)));
+        assert_eq!(
+            wire["required_capabilities"],
+            serde_json::json!([RECALL_QUERY_CAPABILITY_ID])
+        );
+        let mut capabilities = vec![OwnedVersionedId::new(RECALL_QUERY_CAPABILITY_ID).unwrap()];
+        let legacy = build_recall_request_payload_with_capabilities(
+            &parts,
+            Some(&exclusions),
+            Some(&grant),
+            &capabilities,
+        )
+        .unwrap();
+        assert_eq!(legacy.bytes, first.bytes);
+        assert_eq!(legacy.sha256, first.sha256);
+        capabilities.push(OwnedVersionedId::new(crate::COMMON_ADVISORY_PROFILE_ID).unwrap());
+        let common = build_recall_request_payload_with_capabilities(
+            &parts,
+            Some(&exclusions),
+            Some(&grant),
+            &capabilities,
+        )
+        .unwrap();
+        let mut common_wire: Value = serde_json::from_slice(&common.bytes).unwrap();
+        assert_eq!(
+            common_wire["required_capabilities"],
+            serde_json::json!([
+                RECALL_QUERY_CAPABILITY_ID,
+                crate::COMMON_ADVISORY_PROFILE_ID
+            ])
+        );
+        assert_eq!(common.sha256, hex::encode(Sha256::digest(&common.bytes)));
+        assert_ne!(first.sha256, common.sha256);
+        common_wire["required_capabilities"] = wire["required_capabilities"].clone();
+        assert_eq!(common_wire, wire, "only the selected capabilities changed");
         grant["authorization_ref"] = Value::String("host.second".to_owned());
         let changed =
             build_recall_request_payload_with_context(&parts, Some(&exclusions), Some(&grant))
