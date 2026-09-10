@@ -73,8 +73,8 @@ async fn project_quiescence_denies_semantic_and_git_cached_routes() {
                 surface_operation: ApplicationSurfaceOperation::GitStatus,
                 request: GitReadSurfaceRequest {
                     request: tracedecay_contracts::git::GitReadRequestV1::Status,
-                    max_entries: tracedecay_application::git_query::GIT_QUERY_DEFAULT_MAX_ENTRIES,
-                    max_bytes: tracedecay_application::git_query::GIT_QUERY_DEFAULT_MAX_BYTES,
+                    max_entries: tracedecay_contracts::GIT_QUERY_DEFAULT_MAX_ENTRIES,
+                    max_bytes: tracedecay_contracts::GIT_QUERY_DEFAULT_MAX_BYTES,
                 },
                 observed_at: now,
                 deadline,
@@ -253,6 +253,167 @@ async fn storage_status_admits_an_owner_registered_under_a_windows_verbatim_root
     );
 }
 
+fn memory_status_request(request_id: &str) -> DaemonInvocationRequest {
+    DaemonInvocationRequest::retained_application(
+        request_id,
+        tracedecay_contracts::retained_surfaces::RetainedSurfaceRequestV1::MemoryStatus(
+            tracedecay_contracts::retained_surfaces::MemoryStatusRequestV1 {
+                memory_scope: None,
+                project_selector: None,
+            },
+        ),
+        UtcMicros(1),
+        Deadline::new(UtcMicros(30_000_000)).expect("deadline"),
+        CancellationContext::active(format!("cancel.{request_id}")).expect("cancellation"),
+    )
+}
+
+/// Admits `project_root` the way core-route activation does: a project
+/// runtime exists, so requests pass the front door, but the retained runtime
+/// that the full server's owner phase registers is not there yet.
+async fn admit_project_without_retained_runtime(
+    service: &DaemonInvocationService,
+    project_root: &Path,
+    name: &str,
+) -> crate::project_runtime::ProjectRuntimePublicationAttemptV1 {
+    DaemonLspOwnerRegistrar::new(service)
+        .register_factory_for_project(
+            project_root.to_path_buf(),
+            UserProfileId::new(format!("profile.test.{name}")).expect("test LSP profile"),
+            ProjectId::new(format!("project.test.{name}")).expect("test LSP project"),
+            unavailable_lsp_session_factory(),
+        )
+        .await
+        .expect("register project runtime without a retained owner");
+    service
+        .project_runtimes
+        .begin_publication(project_root)
+        .expect("begin owner publication")
+}
+
+/// The retained runtime registers in the full server's owner phase, after the
+/// core route is already admitted. A retained request that lands in that
+/// window must read as the owner still mounting — retryable — never as a scope
+/// with no retained runtime.
+#[tokio::test]
+async fn retained_request_stays_retryable_while_owners_are_warming() {
+    let service = DaemonInvocationService::default();
+    let project_root = PathBuf::from("/projects/retained-warming");
+    let _publication =
+        admit_project_without_retained_runtime(&service, &project_root, "retained-warming").await;
+    let registry = Arc::new(Mutex::new(LspSessionRegistry::default()));
+
+    let problem = application_problem_from(
+        service
+            .invoke(
+                &registry,
+                Some(&project_root),
+                None,
+                None,
+                None,
+                memory_status_request("request.retained.warming"),
+            )
+            .await,
+    );
+
+    assert_eq!(problem.kind(), ApplicationProblemKind::Unavailable);
+    assert_eq!(problem.terminality(), ProblemTerminality::PreAdmission);
+    assert_eq!(problem.retry(), RetryDirective::AfterDelay);
+    let diagnostic = problem
+        .diagnostic()
+        .expect("a mounting retained owner carries a diagnostic");
+    assert_eq!(diagnostic.code, "application.surface.unavailable");
+    assert!(
+        !diagnostic
+            .message
+            .contains("no retained runtime is registered"),
+        "a warming route must not claim its scope has no retained runtime: {}",
+        diagnostic.message
+    );
+}
+
+#[tokio::test]
+async fn retained_request_is_terminal_after_publication_failure() {
+    let service = DaemonInvocationService::default();
+    let project_root = PathBuf::from("/projects/retained-failed");
+    let publication =
+        admit_project_without_retained_runtime(&service, &project_root, "retained-failed").await;
+    assert!(
+        service
+            .project_runtimes
+            .mark_publication_failed(&publication)
+    );
+    let registry = Arc::new(Mutex::new(LspSessionRegistry::default()));
+
+    let problem = application_problem_from(
+        service
+            .invoke(
+                &registry,
+                Some(&project_root),
+                None,
+                None,
+                None,
+                memory_status_request("request.retained.failed"),
+            )
+            .await,
+    );
+
+    assert_eq!(problem.kind(), ApplicationProblemKind::ExecutionFailed);
+    assert_eq!(problem.retry(), RetryDirective::Never);
+    assert_eq!(
+        problem
+            .diagnostic()
+            .map(|diagnostic| diagnostic.code.as_str()),
+        Some("application.runtime.owner_failed")
+    );
+}
+
+/// A published route that mounted no retained runtime (a read-only project
+/// database mounts none) is the one case where "no retained runtime is
+/// registered for this scope" is the truthful answer.
+#[tokio::test]
+async fn retained_request_on_a_published_route_without_a_retained_owner_is_unavailable() {
+    let service = DaemonInvocationService::default();
+    let project_root = PathBuf::from("/projects/retained-unmounted");
+    let publication =
+        admit_project_without_retained_runtime(&service, &project_root, "retained-unmounted").await;
+    assert!(
+        service
+            .project_runtimes
+            .mark_publication_ready(&publication)
+    );
+    let registry = Arc::new(Mutex::new(LspSessionRegistry::default()));
+
+    let problem = application_problem_from(
+        service
+            .invoke(
+                &registry,
+                Some(&project_root),
+                None,
+                None,
+                None,
+                memory_status_request("request.retained.unmounted"),
+            )
+            .await,
+    );
+
+    assert_eq!(problem.kind(), ApplicationProblemKind::Unavailable);
+    let diagnostic = problem
+        .diagnostic()
+        .expect("an unmounted retained owner carries a diagnostic");
+    assert_eq!(
+        diagnostic.code,
+        "application.retained.authority-unavailable"
+    );
+    assert!(
+        diagnostic
+            .message
+            .contains("no retained runtime is registered for this scope"),
+        "a settled route without a retained owner must say so: {}",
+        diagnostic.message
+    );
+}
+
 fn retained_scope(project: &str) -> ResolvedScope {
     ResolvedScope::new(
         ProjectId::new(project).expect("retained project"),
@@ -345,5 +506,166 @@ async fn same_authority_routes_alias_one_retained_runtime() {
         matches!(foreign, Err(TraceDecayError::Config { ref message })
             if message == "a different retained runtime is already registered for this project"),
         "a foreign authorized scope must still be refused, not aliased: {foreign:?}"
+    );
+}
+
+struct FixtureSourceEditRuntime {
+    project_root: PathBuf,
+    store_layout: tracedecay_runtime_core::storage::StoreLayout,
+}
+
+impl tracedecay_source_edit::SourceEditRuntimePort for FixtureSourceEditRuntime {
+    fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    fn store_layout(&self) -> &tracedecay_runtime_core::storage::StoreLayout {
+        &self.store_layout
+    }
+
+    fn run_diagnostics<'a>(
+        &'a self,
+        _file: &'a str,
+    ) -> tracedecay_source_edit::SourceEditFuture<
+        'a,
+        Vec<tracedecay_source_edit::EditDiagnosticRecord>,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+struct UnavailableCodeGraph;
+
+impl tracedecay_graph_query::CodeGraphProjectionReadPort for UnavailableCodeGraph {
+    fn open<'a>(
+        &'a self,
+        _request: tracedecay_graph_query::CodeGraphReadRequest<'a>,
+    ) -> tracedecay_graph_query::CodeGraphReadFuture<'a> {
+        Box::pin(async { Err(tracedecay_graph_query::CodeGraphReadError::MissingRegistry) })
+    }
+}
+
+/// Two routes of one project — a linked worktree, or a reopen through the
+/// retained canonical runtime — each build their own source-edit owner. The
+/// registration is keyed on the authorized scope, as the retained runtime is:
+/// the same scope aliases the incumbent, a foreign scope is refused, and
+/// neither replaces what is registered.
+#[tokio::test]
+async fn same_authority_source_edit_owners_alias_one_incumbent() {
+    let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
+    let directory = tempfile::TempDir::new().expect("project directory");
+    let project_root = directory.path().to_path_buf();
+    let profile_root =
+        tracedecay_runtime_core::storage::default_profile_root().expect("profile root");
+    let project_id = ProjectId::new("project.source-edit.alias").expect("project id");
+    let runtime = tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::project(
+        &profile_root,
+        &project_root,
+        project_id.clone(),
+    )
+    .await
+    .expect("registered runtime");
+    let resolution = tracedecay_global_db::configuration::resolver::resolve_configuration(
+        &tracedecay_global_db::configuration::registry::ConfigurationRegistry::core()
+            .expect("configuration registry"),
+        &[],
+    )
+    .expect("configuration resolution");
+    let pinned = tracedecay_configuration::config::PinnedRuntimeConfiguration::new(
+        tracedecay_configuration::config::RuntimeConfigurationTarget {
+            project_id: project_id.clone(),
+            project_root: project_root.clone(),
+        },
+        ConfigurationRevisionId::new("configuration-revision.source-edit.alias")
+            .expect("revision id"),
+        resolution.snapshot,
+    )
+    .expect("pinned configuration");
+    let (configuration, _) = ProjectConfigurationRuntime::open(
+        tracedecay_configuration::config::OpenedRuntimeConfiguration::new(
+            pinned,
+            runtime.project_database_arc().expect("project database"),
+        ),
+    )
+    .expect("configuration runtime");
+    let configuration = Arc::new(configuration);
+    let catalog = Arc::new(
+        tracedecay_contracts::catalog_composition::build_application_catalog_snapshot()
+            .expect("catalog"),
+    );
+    let access: Arc<
+        dyn tracedecay_application::source_authorization::ProjectSourceAccessSnapshotPort,
+    > = Arc::new(
+        tracedecay_application::project_open_authorization::ProjectOpenSourceAccessAuthorityV1::new(
+            ActorId::new("actor.source-edit.alias").expect("actor"),
+            std::collections::BTreeSet::new(),
+            Duration::from_mins(1),
+        ),
+    );
+    let store_layout = tracedecay_runtime_core::storage::default_profile_sharded_layout(
+        &project_root,
+        &profile_root,
+    )
+    .expect("store layout");
+    let owner = |scope: ResolvedScope| {
+        Arc::new(
+            crate::project_owner_registration::ProjectSourceEditOwnerV1::new(
+                Arc::new(FixtureSourceEditRuntime {
+                    project_root: project_root.clone(),
+                    store_layout: store_layout.clone(),
+                }),
+                Arc::new(UnavailableCodeGraph),
+                crate::project_owner_registration::ProjectSourceEditAuthorizationV1::new(
+                    project_root.clone(),
+                    scope,
+                    Arc::clone(&configuration),
+                    Arc::clone(&catalog),
+                    Arc::clone(&access),
+                ),
+                crate::project_owner_registration::SourceEditMutationGate::warming(),
+            ),
+        )
+    };
+
+    let service = DaemonInvocationService::default();
+    let scope = retained_scope("project.source-edit.alias");
+    let incumbent = owner(scope.clone());
+    let (first, second) = tokio::join!(
+        service.register_source_edit_owner(project_root.clone(), Arc::clone(&incumbent)),
+        service.register_source_edit_owner(project_root.clone(), owner(scope.clone())),
+    );
+    first.expect("first same-authority route must register");
+    second.expect("second same-authority route must alias the incumbent");
+    let registered = service
+        .project_runtimes
+        .get::<Arc<crate::project_owner_registration::ProjectSourceEditOwnerV1>>(&project_root)
+        .await
+        .expect("aliased source-edit owner");
+    assert!(
+        Arc::ptr_eq(&registered, &incumbent),
+        "both routes must be served by the one incumbent source-edit owner"
+    );
+
+    let foreign = service
+        .register_source_edit_owner(
+            project_root.clone(),
+            owner(retained_scope("project.source-edit.foreign")),
+        )
+        .await;
+    assert_eq!(
+        foreign,
+        Err(DaemonSourceEditOwnerRegistrationError::ForeignAuthority),
+        "a foreign authorized scope must be refused, not aliased or replaced"
+    );
+    assert!(
+        service
+            .project_runtimes
+            .read::<Arc<crate::project_owner_registration::ProjectSourceEditOwnerV1>, _, _>(
+                &project_root,
+                |served| Arc::ptr_eq(served, &incumbent),
+            )
+            .await
+            .unwrap_or(false),
+        "a refused foreign route must leave the incumbent in place"
     );
 }

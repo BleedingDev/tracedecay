@@ -844,7 +844,7 @@ async fn cold_registered_project_hook_ack_preserves_route_and_terminal_receipt()
         .expect("acknowledged terminal receipt must reach durable project state");
     let receipt_state = fs::read_to_string(&receipt_path).expect("read durable host receipt state");
     for raw in [&session_id, &tool_call_id, &turn_id, &watermark] {
-        let protected = tracedecay_runtime_core::privacy::protect_sensitive_structural_id(raw)
+        let protected = tracedecay_privacy::protect_sensitive_structural_id(raw)
             .expect("protect expected receipt identity");
         assert!(
             receipt_state.contains(&protected),

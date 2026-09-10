@@ -40,19 +40,21 @@ use tracedecay_memory_provider_registry::{
     ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply, TerminalCode,
     TerminalRecord, rfc3339_utc_micros,
 };
+use tracedecay_session_memory::fact_store::DatabaseFactStore;
+use tracedecay_session_memory::memory::MemoryApplication;
 use tracedecay_store::{
     FactReadControl, ProjectMemoryFactHistoryQueryV1, ProjectMemoryFactHistoryV1,
     ProjectMemoryFactIdV1, ProjectMemoryFactSearchKindV1, ProjectMemoryFactSearchPageV1,
     ProjectMemoryFactSearchQuery,
 };
+use tracedecay_store_runtime::retained_memory::MemoryTargetAccessV1;
 
-use super::memory::memory_application;
 use super::memory_mapping;
-use super::memory_target::{MemoryTargetAccessV1, open_project_retained_memory_target};
 use super::native_staged_observations::{
     StagedControlOutcome, StagedEffectEvidence, StagedObservationRecord, StagedObservationStore,
     StagedOutcome, StagedRow, StagedStoreError, recorded_validity,
 };
+use super::open_project_retained_memory_target;
 use crate::tracedecay::TraceDecay;
 
 #[cfg(test)]
@@ -2093,7 +2095,8 @@ async fn recall_project_memory(
     if owner != expected_owner {
         return NativeRecallOutcome::Failed(NativeReadFailure::RecallScopeMismatch);
     }
-    let memory = match memory_application(target.database(), owner.clone()) {
+    let memory = match MemoryApplication::new(owner.clone(), DatabaseFactStore::new(target.database()))
+    {
         Ok(memory) => memory,
         Err(_) => return NativeRecallOutcome::Failed(NativeReadFailure::ProviderUnavailable),
     };
@@ -2717,6 +2720,13 @@ fn native_staged_recall_candidate(
     if truncated {
         limitations.push("content truncated to the staged candidate byte cap".to_owned());
     }
+    let exact_scope_identity = if common_recall(request) {
+        let mut scope = exact_scope_value(call);
+        scope["scope_binding"] = serde_json::json!("exact_coding_scope");
+        scope
+    } else {
+        staged_scope_attestation(row)
+    };
     let mut candidate = serde_json::json!({
         "candidate_id": format!("{}:{}", call.request_id, row.provider_reference),
         "stable_memory_ref": row.provider_reference,
@@ -2739,7 +2749,7 @@ fn native_staged_recall_candidate(
             },
         },
         "confidence": Value::Null,
-        "exact_scope_identity": if common_recall(request) { exact_scope_value(call) } else { staged_scope_attestation(row) },
+        "exact_scope_identity": exact_scope_identity,
         "validity": {
             "observed_at": observed_at,
             "valid_from": row.validity.valid_from_utc_nanos.and_then(format_rfc3339_nanos),
@@ -3067,7 +3077,10 @@ async fn verify_current_fact(
         Ok(target) => target,
         Err(error) => return NativeReadOutcome::Failed(map_retained_error(error)),
     };
-    let memory = match memory_application(target.database(), target.owner().clone()) {
+    let memory = match MemoryApplication::new(
+        target.owner().clone(),
+        DatabaseFactStore::new(target.database()),
+    ) {
         Ok(memory) => memory,
         Err(_) => return NativeReadOutcome::Failed(NativeReadFailure::ProviderUnavailable),
     };

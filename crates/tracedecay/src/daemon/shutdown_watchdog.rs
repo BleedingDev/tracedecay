@@ -32,8 +32,8 @@ use std::time::Duration;
 #[cfg(feature = "hotpath")]
 use std::sync::{Mutex, mpsc};
 
-use super::log_daemon_event;
 use tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE;
+use tracedecay_runtime_core::logging::log_daemon_event;
 
 /// Wall clock past the graceful drain deadline reserved for receipt logging,
 /// endpoint cleanup, profiling finalization, and bounded CLI runtime teardown.
@@ -108,7 +108,7 @@ fn finalize_hotpath_report_within(bound: Duration) {
 fn watchdog_fire_after() -> Duration {
     #[cfg(feature = "hotpath")]
     {
-        return shutdown_exit_bound().saturating_sub(HOTPATH_FINALIZE_BOUND);
+        shutdown_exit_bound().saturating_sub(HOTPATH_FINALIZE_BOUND)
     }
     #[cfg(not(feature = "hotpath"))]
     shutdown_exit_bound()

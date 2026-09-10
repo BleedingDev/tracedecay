@@ -222,7 +222,7 @@ class DeliveryTests(unittest.TestCase):
             with self.assertRaises(ValueError): validate_tool_result(d, 'provider:development.provider')
 
     def test_full_block_and_advisory_budgets_have_fixed_ceilings(self):
-        for token_field, block_field, limit in (('final_tokens','text_blocks',128000), ('advisory_tokens','advisory_blocks',1024)):
+        for token_field, block_field, limit in (('final_tokens','text_blocks',128000), ('advisory_tokens','advisory_blocks',8192)):
             d = fixture(); delta = limit + 1 - d[token_field]
             d[token_field] += delta; d[block_field][0]['tokens'] += delta
             with self.subTest(field=token_field), self.assertRaisesRegex(ValueError, 'quota'):

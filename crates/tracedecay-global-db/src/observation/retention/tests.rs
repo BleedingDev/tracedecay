@@ -132,14 +132,15 @@ async fn seed_evidence(
     .map_err(|err| format!("insert binding: {err}"))?;
     conn.execute(
         "INSERT INTO observation_repository_provenance(observation_id,
-             availability_json, capture_json, retrieval_anchor_id, owner_json)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+             availability_json, capture_json, retrieval_anchor_id, owner_json, origin_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             observation_id.as_str(),
             payload("avail", size),
             payload("capture", size),
             anchor_id,
-            OWNER
+            OWNER,
+            payload("retained_origin", size)
         ],
     )
     .await
@@ -395,6 +396,14 @@ async fn superseded_and_deleted_dispositions_release_storage() -> Result<(), Str
         assert!(is_released(
             &fetch_str(&conn, "SELECT availability_json FROM observation_repository_provenance WHERE observation_id = 'obs-anchor-1'").await?
         ));
+        assert_eq!(
+            fetch_str(
+                &conn,
+                "SELECT COALESCE(origin_json, 'released') FROM observation_repository_provenance WHERE observation_id = 'obs-anchor-1'"
+            ).await?,
+            "released",
+            "{state}: original event proof is released with provenance"
+        );
     }
     Ok(())
 }

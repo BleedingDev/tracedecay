@@ -9,22 +9,11 @@ repository = "https://github.com/BleedingDev/tracedecay"
 
 [features]
 # Opt-in profiling (never in `default`). This crate instruments nothing itself;
-# the triple exists only so a profiled build can forward through to the shared
-# detector corpus in `tracedecay-runtime-core`.
-hotpath = [
-    "tracedecay-domain/hotpath",
-    "tracedecay-runtime-core/hotpath",
-]
-hotpath-alloc = [
-    "hotpath",
-    "tracedecay-domain/hotpath-alloc",
-    "tracedecay-runtime-core/hotpath-alloc",
-]
-hotpath-cpu = [
-    "hotpath",
-    "tracedecay-domain/hotpath-cpu",
-    "tracedecay-runtime-core/hotpath-cpu",
-]
+# existing feature names forward to the shared detector owner. The binary
+# selects the allocation or CPU profiler backend, following upstream policy.
+hotpath = ["tracedecay-session-memory/hotpath"]
+hotpath-alloc = ["hotpath"]
+hotpath-cpu = ["hotpath"]
 default = []
 
 [dependencies]
@@ -34,8 +23,9 @@ tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
 tracedecay-domain = { path = "../tracedecay-domain", version = "0.1.0" }
 # The single vendored credential corpus. Duplicating it here is precisely the
 # failure this bead exists to prevent, so the detectors are reused through
-# runtime-core's public surface rather than re-derived.
-tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0" }
+# the current upstream public owners rather than re-derived.
+tracedecay-session-memory = { path = "../tracedecay-session-memory", version = "0.1.0" }
+tracedecay-privacy = { path = "../tracedecay-privacy", version = "0.1.0" }
 
 regex = "1.12.3"
 serde = { version = "1", features = ["derive"] }

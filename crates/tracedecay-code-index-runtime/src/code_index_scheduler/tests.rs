@@ -31,24 +31,24 @@ use tracedecay_domain::{
     SensitivityLevelV1, SingleRootScopeV1, TemporalModeV1, UtcMicros, VectorWatermark, WorktreeId,
 };
 
-#[cfg(feature = "semantic-fastembed")]
+#[cfg(all(feature = "semantic-fastembed", not(windows)))]
 use crate::semantic_code::{
     CatalogedFastEmbedModelV1, DaemonSemanticRuntimeHandleV1, FastEmbedModelCatalogV1,
     ModelLifecycleErrorV1, ModelMemberSourceV1, SemanticModelLifecycleOwnerV1,
     production_fastembed_catalog,
 };
-#[cfg(feature = "semantic-fastembed")]
+#[cfg(all(feature = "semantic-fastembed", not(windows)))]
 use tracedecay_application::semantic_runtime::{
     ProductionSemanticRuntimeV1, RetainedSemanticVectorGraphV1, SemanticRuntimeFuture,
     SemanticVectorGraphErrorV1, SemanticVectorGraphProviderV1,
 };
-#[cfg(feature = "semantic-fastembed")]
+#[cfg(all(feature = "semantic-fastembed", not(windows)))]
 use tracedecay_graph_db::NeverCancelled;
-#[cfg(feature = "semantic-fastembed")]
+#[cfg(all(feature = "semantic-fastembed", not(windows)))]
 use tracedecay_runtime_core::db::{Database, DatabaseAuthority, TestDatabaseRuntimeMode};
-use tracedecay_semantic_contracts::SemanticFallbackReasonV1;
-#[cfg(feature = "semantic-fastembed")]
+#[cfg(all(feature = "semantic-fastembed", not(windows)))]
 use tracedecay_semantic_contracts::{DEFAULT_FASTEMBED_MODEL_ID, SemanticResourceCeilings};
+use tracedecay_semantic_contracts::{RerankCompatibilityPinsV1, SemanticFallbackReasonV1};
 
 use super::registry::{
     ColdMountOpenEventV1, ServingGenerationInstallationOutcomeV1,
@@ -65,7 +65,9 @@ use crate::code_index::production::{
     CodeIndexProductionErrorV1, CodeIndexPublicationStoreErrorV1,
     UninterruptibleCodeIndexControlV1, VerifiedSealedLexicalPageReadV1,
 };
-use crate::semantic_code::rerank_adapter::GenerationBoundCodeRerankViewsV1;
+use crate::semantic_code::rerank_adapter::{
+    GenerationBoundCodeRerankViewsV1, ProductionCodeRerankAuthorityV1,
+};
 use tracedecay_query::retrieval::QueryAuthorityV1;
 use tracedecay_query::retrieval::exact::{
     CentralExactAdmissionAuthorityV1, ExactAdmissionAuthority, ExactLaneRequest,
@@ -77,9 +79,10 @@ use tracedecay_query::retrieval::lexical::{
     LexicalRouteKindV1, LexicalRoutingV1,
 };
 use tracedecay_query::retrieval::rerank::{
-    BoundedRerankRuntimeV1, DeterministicLocalRerankExecutorV1, LocalRerankFailureV1,
-    LocalRerankInputV1, LocalRerankPermitV1, RerankExecutionControlV1,
+    AdmittedNativeRerankExecutorV1, BoundedRerankRuntimeV1, DeterministicLocalRerankExecutorV1,
+    LocalRerankFailureV1, LocalRerankInputV1, LocalRerankPermitV1, RerankExecutionControlV1,
 };
+use tracedecay_query::retrieval::semantic::apply_bounded_rerank_outcome;
 use tracedecay_query::retrieval::semantic::{
     SemanticAbstentionV1, SemanticExecutionControl, SemanticQueryModeV1,
 };
@@ -92,6 +95,7 @@ use tracedecay_runtime_core::resident_memory::{
 #[global_allocator]
 static HOTPATH_ALLOCATOR: hotpath::CountingAllocator = hotpath::CountingAllocator::new();
 
+mod branch_publication_tests;
 mod noop_reconcile_tests;
 mod search_permit_release;
 mod semantic_schedule_order_tests;
@@ -1420,7 +1424,7 @@ fn multi_page_evidence_uses_one_durable_pack_and_survives_restart() {
     let reopened = super::DaemonCodeIndexPublicationStoreV1::new(
         store.path(),
         fixture.path(),
-        SanitizerRevision::new(tracedecay_runtime_core::privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+        SanitizerRevision::new(tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
             .expect("sanitizer revision"),
     )
     .expect("reopen publication store");
@@ -1445,7 +1449,7 @@ fn multi_page_evidence_uses_one_durable_pack_and_survives_restart() {
     let corrupted = super::DaemonCodeIndexPublicationStoreV1::new(
         store.path(),
         fixture.path(),
-        SanitizerRevision::new(tracedecay_runtime_core::privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+        SanitizerRevision::new(tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
             .expect("sanitizer revision"),
     )
     .expect("reopen corrupted publication store");
@@ -1482,13 +1486,104 @@ fn failed_and_crashed_evidence_pack_temporaries_are_removed() {
     let _reopened = super::DaemonCodeIndexPublicationStoreV1::new(
         store.path(),
         fixture.path(),
-        SanitizerRevision::new(tracedecay_runtime_core::privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+        SanitizerRevision::new(tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
             .expect("sanitizer revision"),
     )
     .expect("restart publication store");
     assert!(
         !temporary_path.exists(),
         "restart must durably clean an abandoned evidence pack"
+    );
+}
+
+#[test]
+fn retired_fence_cancels_a_generation_seal_between_segments() {
+    // One segment per file: shutdown is signalled after the first durable
+    // segment, exactly where a TERM lands on a large worktree's first build.
+    let sources = (0..8)
+        .map(|file| {
+            (
+                format!("src/module_{file}.rs"),
+                format!("pub fn sealed_{file}() -> u32 {{ {file} }}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let fixture = GitFixture::new(
+        &sources
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let source_store = TempDir::new().expect("source store root");
+    let generation = {
+        let mut scheduler = scheduler(
+            &fixture,
+            source_store.path().to_path_buf(),
+            Arc::new(SharedCodeIndexBytePoolV1::default()),
+        );
+        published(
+            scheduler
+                .reconcile_now()
+                .expect("build multi-file generation"),
+        );
+        Arc::clone(
+            &scheduler
+                .latest_complete_already_decoded()
+                .expect("multi-file generation remains decoded")
+                .generation,
+        )
+    };
+    assert!(
+        generation.snapshot().files.len() >= 8,
+        "fixture must seal one segment per file"
+    );
+
+    let target_store = TempDir::new().expect("target publication store root");
+    let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let published_segments = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observer_segments = Arc::clone(&published_segments);
+    let observer_shutting_down = Arc::clone(&shutting_down);
+    let mut publication = super::DaemonCodeIndexPublicationStoreV1::new(
+        target_store.path(),
+        fixture.path(),
+        SanitizerRevision::new(tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+            .expect("sanitizer revision"),
+    )
+    .expect("open target publication store")
+    .with_shutdown_signal(Arc::clone(&shutting_down))
+    .with_seal_segment_observer_for_test(Arc::new(move || {
+        observer_segments.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        observer_shutting_down.store(true, std::sync::atomic::Ordering::Release);
+    }));
+
+    let error = publication
+        .publish_atomically(&generation.sealed_scope(), None, Arc::clone(&generation))
+        .expect_err("shutdown signalled mid-seal must stop the publication");
+    assert!(
+        matches!(
+            error,
+            super::CodeIndexPublicationStoreErrorV1::CompareAndSwap
+        ),
+        "a cancelled seal is the same typed outcome as a retired fence: {error}"
+    );
+    assert_eq!(
+        published_segments.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the seal must stop at the first checkpoint after shutdown was signalled"
+    );
+    assert!(
+        !target_store
+            .path()
+            .join("active-code-generation-v1.json")
+            .exists(),
+        "a cancelled seal must not publish a pointer"
+    );
+    let generations_root = target_store.path().join("code-generations-v1");
+    let leftover = std::fs::read_dir(&generations_root)
+        .map_or(0, |entries| entries.filter_map(Result::ok).count());
+    assert_eq!(
+        leftover, 0,
+        "a cancelled seal must leave no manifest behind"
     );
 }
 
@@ -1564,7 +1659,7 @@ fn evidence_pack_failure_after_pages_never_publishes_manifest_or_pointer() {
     let mut publication = super::DaemonCodeIndexPublicationStoreV1::new(
         failed_store.path(),
         fixture.path(),
-        SanitizerRevision::new(tracedecay_runtime_core::privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+        SanitizerRevision::new(tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
             .expect("sanitizer revision"),
     )
     .expect("open failed publication store");
@@ -1665,7 +1760,7 @@ fn evidence_pack_failure_after_pages_never_publishes_manifest_or_pointer() {
     let _reopened = super::DaemonCodeIndexPublicationStoreV1::new(
         failed_store.path(),
         fixture.path(),
-        SanitizerRevision::new(tracedecay_runtime_core::privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+        SanitizerRevision::new(tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
             .expect("sanitizer revision"),
     )
     .expect("reopen after committed-pack crash");
@@ -2496,6 +2591,15 @@ fn oversized_generations_still_produce_a_complete_retention_finding() {
 
 struct MixedAnchorReverseRerankExecutorV1;
 
+impl AdmittedNativeRerankExecutorV1 for MixedAnchorReverseRerankExecutorV1 {
+    fn artifact_manifest_digest(&self) -> &ManifestDigest {
+        static DIGEST: OnceLock<ManifestDigest> = OnceLock::new();
+        DIGEST.get_or_init(|| {
+            ManifestDigest::new(format!("sha256:{}", "a".repeat(64))).expect("artifact digest")
+        })
+    }
+}
+
 impl DeterministicLocalRerankExecutorV1 for MixedAnchorReverseRerankExecutorV1 {
     fn planned_model_invocations(
         &self,
@@ -2527,6 +2631,18 @@ impl RerankExecutionControlV1 for ReadyRerankControlV1 {
 
     fn is_cancelled(&self) -> bool {
         false
+    }
+}
+
+struct CancelledRerankControlV1;
+
+impl RerankExecutionControlV1 for CancelledRerankControlV1 {
+    fn elapsed_micros(&self) -> u64 {
+        0
+    }
+
+    fn is_cancelled(&self) -> bool {
+        true
     }
 }
 
@@ -2787,7 +2903,7 @@ fn capture_sanitizes_code_and_propagates_scan_evidence() {
 
     assert_eq!(
         snapshot.sanitizer_revision.as_str(),
-        tracedecay_runtime_core::privacy::CODE_SOURCE_SANITIZER_VERSION_V1
+        tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1
     );
     assert!(
         snapshot
@@ -3803,18 +3919,74 @@ fn generation_bound_rerank_authorizes_mixed_symbol_and_chunk_anchors() {
         deadline_micros: None,
     };
     let mut views = GenerationBoundCodeRerankViewsV1::new(&latest.generation, &query);
-    let outcome = BoundedRerankRuntimeV1::new(&mut views, &MixedAnchorReverseRerankExecutorV1)
-        .rerank(&request, &policy, &candidates, &ReadyRerankControlV1);
+    let runtime_outcome = BoundedRerankRuntimeV1::new(
+        &mut views,
+        &MixedAnchorReverseRerankExecutorV1,
+    )
+    .rerank(&request, &policy, &candidates, &ReadyRerankControlV1);
+    let pins = RerankCompatibilityPinsV1 {
+        implementation_revision: ComponentRevision::new("rerank.fastembed.production.v1")
+            .expect("implementation revision"),
+        artifact_manifest_digest: MixedAnchorReverseRerankExecutorV1
+            .artifact_manifest_digest()
+            .clone(),
+        runtime_compatibility_digest: ManifestDigest::new(format!("sha256:{}", "b".repeat(64)))
+            .expect("runtime digest"),
+    };
+    let authority = ProductionCodeRerankAuthorityV1::from_executor_for_test(
+        pins,
+        Arc::new(MixedAnchorReverseRerankExecutorV1),
+    );
+    let execute_outcome = authority.execute(
+        &latest.generation,
+        &query,
+        &request,
+        &policy,
+        &candidates,
+        &ReadyRerankControlV1,
+    );
 
-    assert_eq!(outcome.public_status, OptionalStagePublicStatus::Complete);
+    assert_eq!(execute_outcome, runtime_outcome);
     assert_eq!(
-        outcome
+        execute_outcome.public_status,
+        OptionalStagePublicStatus::Complete
+    );
+    assert_eq!(
+        execute_outcome
             .ordered_candidates
             .iter()
             .map(|candidate| candidate.candidate.anchor_id.clone())
             .collect::<Vec<_>>(),
         anchors.into_iter().rev().collect::<Vec<_>>()
     );
+
+    let cancelled = authority.execute(
+        &latest.generation,
+        &query,
+        &request,
+        &policy,
+        &candidates,
+        &CancelledRerankControlV1,
+    );
+    assert_eq!(
+        cancelled.public_status,
+        OptionalStagePublicStatus::Cancelled
+    );
+    assert_eq!(cancelled.ordered_candidates, candidates);
+    let mut composition = tracedecay_query::retrieval::fusion::CompositionOutputV1 {
+        profile_id: request.profile_id.clone(),
+        ranked_candidates: candidates.clone(),
+        comparator_records: Vec::new(),
+        internal_lane_outcomes: BTreeMap::new(),
+        public_lane_statuses: BTreeMap::new(),
+        freshness: Vec::new(),
+        lane_checkpoints: Vec::new(),
+        dedupe_decisions: Vec::new(),
+        diversity_decisions: Vec::new(),
+    };
+    let status = apply_bounded_rerank_outcome(&mut composition, cancelled);
+    assert_eq!(status, OptionalStagePublicStatus::Cancelled);
+    assert_eq!(composition.ranked_candidates, candidates);
 }
 
 #[test]
@@ -5339,14 +5511,10 @@ fn published_text_artifact_with_stale_search_revision_is_rebuilt() {
             .take_preopened_source_or_open(&sealed_identity, &control)
             .expect("verified source");
         let mut metadata = latest.text_projection_metadata().expect("current metadata");
-        // Any revision other than `QUERY_LEXICAL_RETRIEVER_REVISION_V1` stands in
-        // for an artifact built by an earlier retriever. `8ecc5da76` meant to
-        // retire `retriever.lexical.daemon.v1` itself when it published the
-        // qualified-name fields, but that bump also re-pins the search-quality
-        // workload and the packaged native qualification (#1070), so the
-        // current constant still carries that label.
+        // Pre-qualified-name artifacts must be withdrawn before serving even
+        // when the source generation itself has not changed.
         metadata.lexical_retriever_revision =
-            ComponentRevision::new("retriever.lexical.daemon.v0").expect("previous revision");
+            ComponentRevision::new("retriever.lexical.daemon.v1").expect("previous revision");
         assert_ne!(
             metadata.lexical_retriever_revision.as_str(),
             tracedecay_query::retrieval::QUERY_LEXICAL_RETRIEVER_REVISION_V1,
@@ -5666,6 +5834,50 @@ fn reader_reservation_refusal_precedes_missing_artifact_access() {
         "reservation refusal must not touch or recreate the missing path"
     );
     assert!(latest.text_serving_needs_work());
+}
+
+#[test]
+fn overlapping_text_builds_share_one_admission_watermark_headroom() {
+    let limit_bytes = 1_000_u64;
+    let watermark_headroom = 100_u64;
+    let requested = NonZeroU64::new(200).expect("nonzero build request");
+    let mut used_bytes = 0_u64;
+
+    for observed_bytes in [300_u64, 500, 700] {
+        let unmodeled_live_bytes = observed_bytes.saturating_sub(used_bytes);
+        let (accounted, retained) = super::text_artifact_resident_memory_charges(
+            requested,
+            unmodeled_live_bytes,
+            watermark_headroom,
+        )
+        .expect("bounded admission accounting");
+        assert!(
+            used_bytes + accounted.get() <= limit_bytes,
+            "each overlapping build fits beneath the same 900-byte high watermark"
+        );
+        used_bytes += retained.get();
+    }
+
+    assert_eq!(
+        used_bytes, 900,
+        "the retained ledger owns one observed baseline plus three build ceilings"
+    );
+    for overflow in [
+        super::text_artifact_resident_memory_charges(
+            NonZeroU64::new(u64::MAX).expect("maximum nonzero request"),
+            1,
+            0,
+        ),
+        super::text_artifact_resident_memory_charges(requested, 0, u64::MAX),
+    ] {
+        assert!(
+            matches!(
+                overflow,
+                Err(tracedecay_query::retrieval::RetrievalPortError::Contract(_))
+            ),
+            "overflow must remain a typed contract refusal: {overflow:?}"
+        );
+    }
 }
 
 /// The artifact build and reader ceilings must reserve through the process
@@ -10581,7 +10793,7 @@ fn durable_publication_writes_partitioned_manifest_and_reuses_immutable_targets(
     let mut reopened = super::DaemonCodeIndexPublicationStoreV1::new(
         store.path(),
         fixture.path(),
-        SanitizerRevision::new(tracedecay_runtime_core::privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+        SanitizerRevision::new(tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
             .expect("sanitizer revision"),
     )
     .expect("reopen publication store");
@@ -10837,6 +11049,66 @@ async fn busy_worktree_serves_last_complete_generation_without_waiting() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_releases_indexed_generation_and_scheduler_owners() {
+    #[cfg(feature = "hotpath")]
+    let _measurement = hotpath::HotpathGuardBuilder::new("indexed-registry-shutdown").build();
+    let sources = (0..128)
+        .map(|file| {
+            let source = (0..16).fold(String::new(), |mut source, symbol| {
+                let _ = writeln!(
+                    source,
+                    "pub fn item_{file}_{symbol}() -> u32 {{ {symbol} }}"
+                );
+                source
+            });
+            (format!("src/module_{file}.rs"), source)
+        })
+        .collect::<Vec<_>>();
+    let files = sources
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = GitFixture::new(&files);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::new(2);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("mount worktree");
+    let latest = wait_for_live_complete_generation(&registry, fixture.path()).await;
+    assert!(latest.generation.symbols().symbols.len() >= 128 * 16);
+    let generation = Arc::downgrade(&latest.generation);
+    drop(latest);
+    let scheduler = registry
+        .scheduler_handle(fixture.path())
+        .await
+        .expect("mounted scheduler");
+    let scheduler_owner = Arc::downgrade(&scheduler);
+    drop(scheduler);
+
+    let started = Instant::now();
+    registry.shutdown().await;
+    println!(
+        "indexed_registry_shutdown_elapsed_us={}",
+        started.elapsed().as_micros()
+    );
+    assert!(
+        scheduler_owner.upgrade().is_none(),
+        "scheduler was not released"
+    );
+    assert!(
+        generation.upgrade().is_none(),
+        "decoded generation was not released"
+    );
+    assert!(registry.scheduler_handle(fixture.path()).await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_signals_code_index_worker_without_taking_busy_scheduler_lock() {
     let fixture = GitFixture::new(&[("src/lib.rs", "pub fn busy() -> u32 { 1 }\n")]);
     let store = TempDir::new().expect("store root");
@@ -10879,6 +11151,64 @@ async fn shutdown_signals_code_index_worker_without_taking_busy_scheduler_lock()
         elapsed < Duration::from_millis(250),
         "shutdown waited {elapsed:?} for a synchronous scheduler lock instead of signalling its cooperative cancellation token"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_timeout_retains_blocked_worker_owner_until_retry_joins_it() {
+    let fixture = GitFixture::new(&[("src/lib.rs", "pub fn busy() -> u32 { 1 }\n")]);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+        )
+        .await
+        .expect("mount worktree");
+    wait_for_initial_generation(&registry, fixture.path()).await;
+    let scheduler = registry
+        .scheduler_handle(fixture.path())
+        .await
+        .expect("scheduler handle");
+    struct ResumeOnDrop(Arc<super::reconcile_panic_guard::ReconcileFaultInjectionV1>);
+    impl Drop for ResumeOnDrop {
+        fn drop(&mut self) {
+            self.0.resume();
+        }
+    }
+
+    let admitted = Arc::new(super::reconcile_panic_guard::ReconcileFaultInjectionV1::paused());
+    let release = ResumeOnDrop(Arc::clone(&admitted));
+    let wake = {
+        let mut scheduler = scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        scheduler.install_reconcile_fault_for_test(Arc::clone(&admitted));
+        Arc::clone(&scheduler.wake)
+    };
+    fixture.edit("src/lib.rs", "pub fn busy() -> u32 { 2 }\n");
+    wake.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while admitted.attempts() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker admits a reconcile pass before retirement");
+    let drained = tokio::time::timeout(Duration::from_millis(25), registry.shutdown()).await;
+    let retained = registry.retiring_owner_count().await;
+    drop(release);
+    assert!(drained.is_err(), "blocked writer must report settling");
+    assert_eq!(retained, 1);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), registry.shutdown())
+            .await
+            .is_ok(),
+        "retry must join the retained owner"
+    );
+    assert_eq!(registry.retiring_owner_count().await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11742,7 +12072,7 @@ async fn poisoned_scheduler_lock_does_not_retire_the_background_worker() {
 /// evaluation graph stands in for the daemon-retained code-graph runtime, so
 /// publish/restore flows exercise the same verified staging/publication
 /// machinery the production provider resolves.
-#[cfg(feature = "semantic-fastembed")]
+#[cfg(all(feature = "semantic-fastembed", not(windows)))]
 struct IsolatedSemanticVectorGraphProviderV1 {
     graph:
         Arc<tracedecay_application::store::vector_generations::IsolatedSemanticEvaluationGraphV1>,
@@ -11750,7 +12080,7 @@ struct IsolatedSemanticVectorGraphProviderV1 {
     generation_reads: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(feature = "semantic-fastembed")]
+#[cfg(all(feature = "semantic-fastembed", not(windows)))]
 impl IsolatedSemanticVectorGraphProviderV1 {
     fn new(
         generation: &tracedecay_code_index::production::CodeIndexPublishedGenerationV1,
@@ -11774,7 +12104,7 @@ impl IsolatedSemanticVectorGraphProviderV1 {
     }
 }
 
-#[cfg(feature = "semantic-fastembed")]
+#[cfg(all(feature = "semantic-fastembed", not(windows)))]
 impl SemanticVectorGraphProviderV1 for IsolatedSemanticVectorGraphProviderV1 {
     fn graph_for_generation<'a>(
         &'a self,
@@ -11802,7 +12132,7 @@ impl SemanticVectorGraphProviderV1 for IsolatedSemanticVectorGraphProviderV1 {
     }
 }
 
-#[cfg(feature = "semantic-fastembed")]
+#[cfg(all(feature = "semantic-fastembed", not(windows)))]
 #[tokio::test(flavor = "multi_thread")]
 async fn configured_jina_lifecycle_publishes_and_restores_semantic_generation() {
     struct PreparedJinaFixture {
@@ -15593,7 +15923,7 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
         "an explicit overflow keeps the currently served text generation stale until reconcile settles"
     );
     let overflow_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
+    let dashboard = loop {
         let overflow_settled = {
             let scheduler = scheduler
                 .lock()
@@ -15605,15 +15935,19 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
             && !registry
                 .reconcile_in_progress_for_test(fixture.path())
                 .await
+            && let Some(freshness) = registry.dashboard_freshness(fixture.path()).await
+            && freshness.staleness_state.as_deref() == Some("fresh")
         {
-            break;
+            // A completed owner pass can have another queued wake. Capture the
+            // settled public snapshot instead of racing a later status read.
+            break freshness;
         }
         assert!(
             std::time::Instant::now() <= overflow_deadline,
             "graph-off overflow did not settle through a real no-op reconcile"
         );
         tokio::time::sleep(Duration::from_millis(2)).await;
-    }
+    };
     let (owner_epoch_after_overflow, progress_after_overflow, decode_count) = {
         let scheduler = scheduler
             .lock()
@@ -15700,10 +16034,6 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
         Some(&PublicRetrieverStatus::Unavailable)
     );
 
-    let dashboard = registry
-        .dashboard_freshness(fixture.path())
-        .await
-        .expect("graph-off dashboard freshness");
     assert_eq!(dashboard.staleness_state.as_deref(), Some("fresh"));
     assert_eq!(dashboard.coverage, "complete");
     assert_eq!(
@@ -15932,6 +16262,91 @@ fn graph_off_stale_witness_reconciles_unchanged_source_without_full_decode() {
     assert!(
         reopened.verified_against_source(),
         "successful text-only capture establishes current source truth"
+    );
+}
+
+/// A query freshness probe against a restored owner that no pass has verified
+/// yet must report "not current" — the restart's first pass is still the
+/// remedy — without minting an observed source change: no overflow hint and no
+/// cancellation epoch, because nothing was observed to move. The fabricated
+/// overflow made the graph-on restart's own verifying pass skip the
+/// sealed-digest witness a quiet tree satisfies and fall into the full sealed
+/// replay (`sealed_decode_count` 1) that the revision-7 verified-head recovery
+/// exists to avoid. Proven movement still posts the observed change.
+#[test]
+fn unverified_restart_probe_requests_a_pass_without_fabricating_an_observed_change() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let bytes = Arc::new(SharedCodeIndexBytePoolV1::default());
+    {
+        let mut scheduler = scheduler(&fixture, store.path().to_path_buf(), Arc::clone(&bytes));
+        published(scheduler.reconcile_now().expect("seed retained generation"));
+    }
+
+    let mut reopened = scheduler(&fixture, store.path().to_path_buf(), bytes);
+    let metadata = reopened
+        .servable_retained_text_generation()
+        .expect("authenticated retained text generation")
+        .metadata()
+        .clone();
+    let epoch_before = reopened.epoch.load(std::sync::atomic::Ordering::Acquire);
+    assert!(
+        reopened.request_fresh_for_query_background(),
+        "an owner nothing has verified yet is not current"
+    );
+    assert_eq!(
+        reopened.pending_hint_count(),
+        Some(0),
+        "an unverified probe observed no source change and must not post an overflow hint"
+    );
+    assert_eq!(
+        reopened.epoch.load(std::sync::atomic::Ordering::Acquire),
+        epoch_before,
+        "an unverified probe must not mint a cancellation epoch"
+    );
+
+    let outcome = reopened
+        .reconcile_retained_text_generation_with(&metadata, false)
+        .expect("graph-on retained reconcile")
+        .expect("a quiet tree must be proven by the sealed-digest witness, not replayed");
+    assert!(
+        matches!(outcome, CodeIndexReconcileOutcomeV1::Noop(_)),
+        "the unchanged restart must reconcile as a Noop: {outcome:?}"
+    );
+    assert_eq!(
+        reopened.sealed_decode_count(),
+        0,
+        "the witness path must not decode the sealed generation"
+    );
+    assert!(
+        !reopened.request_fresh_for_query_background(),
+        "the verified owner is current"
+    );
+
+    // Proven movement is still an observed source change.
+    let index_path = fixture.path().join(".git/index");
+    let index_mtime = std::fs::metadata(&index_path)
+        .expect("git index metadata")
+        .modified()
+        .expect("git index mtime");
+    filetime::set_file_mtime(
+        &index_path,
+        filetime::FileTime::from_system_time(index_mtime + Duration::from_secs(2)),
+    )
+    .expect("advance only the git index mtime");
+    assert!(
+        reopened.request_fresh_for_query_background(),
+        "moved git metadata must request a reconcile"
+    );
+    assert_eq!(
+        reopened.pending_hint_count(),
+        None,
+        "proven movement posts the overflow hint"
+    );
+    assert_ne!(
+        reopened.epoch.load(std::sync::atomic::Ordering::Acquire),
+        epoch_before,
+        "proven movement mints the observed-change epoch"
     );
 }
 

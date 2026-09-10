@@ -55,10 +55,12 @@ pub use scope_roots::{
     RefusedCodeIndexScopeV1, ScopeRootAuthorityReceiptV1, ScopeRootBindingCleanupReplayV1,
     ScopeRootCandidateBindingV1, ScopeRootLivenessProofV1, ScopeRootRetentionPlanV1,
     ScopeRootRetentionReceiptV1, ScopeRootRetentionReportV1, StrandedCodeIndexScopeV1,
-    StrandedScopeRefusalV1, complete_scope_root_binding_cleanup, execute_scope_root_retention,
-    plan_scope_root_retention, plan_scope_root_retention_with_liveness_proof,
-    prepare_scope_root_binding_cleanup, recover_scope_root_binding_cleanup,
-    recover_scope_root_retention,
+    StrandedScopeRefusalV1, code_index_scope_store_root, code_index_store_root,
+    complete_scope_root_binding_cleanup, execute_scope_root_retention,
+    git_worktree_scope_root_inventory, insert_live_root_variants, plan_scope_root_retention,
+    plan_scope_root_retention_with_liveness_proof, prepare_scope_root_binding_cleanup,
+    recover_scope_root_binding_cleanup, recover_scope_root_retention,
+    resolve_live_code_index_roots,
 };
 pub use text_artifacts::{
     attach_verified_text_artifact_under_lock, withdraw_verified_text_artifact_under_lock,
@@ -1113,22 +1115,19 @@ fn plan_code_generation_retention_with_verification_cancellable(
             }
         }
     };
-    #[cfg(feature = "hotpath")]
-    {
-        let planned_bytes = total_bytes(&collectable_generations).saturating_add(
-            text_artifact_inventory
-                .candidates
-                .iter()
-                .map(|candidate| candidate.size_bytes)
-                .sum::<u64>(),
-        );
-        crate::hotpath_observe::retention_plan(
-            collectable_generations
-                .len()
-                .saturating_add(text_artifact_inventory.candidates.len()),
-            planned_bytes,
-        );
-    }
+    let planned_bytes = total_bytes(&collectable_generations).saturating_add(
+        text_artifact_inventory
+            .candidates
+            .iter()
+            .map(|candidate| candidate.size_bytes)
+            .sum::<u64>(),
+    );
+    crate::hotpath_observe::retention_plan(
+        collectable_generations
+            .len()
+            .saturating_add(text_artifact_inventory.candidates.len()),
+        planned_bytes,
+    );
 
     Ok(CodeGenerationRetentionPlanV1 {
         active_generation_id,

@@ -23,14 +23,15 @@ use tracedecay_domain::{FactOwnerV1, ObservationScopeV1, ProjectId};
 use tracedecay_session_memory::memory::MemoryApplication;
 use tracedecay_store::{FactReadControl, StoreShardScopeV1};
 
-use crate::daemon::retained_owner::{MemoryTargetAccessV1, open_project_retained_memory_target};
+use crate::daemon::retained_owner::open_project_retained_memory_target;
 use crate::tracedecay::TraceDecay;
 use crate::tracedecay::current_timestamp;
 use tracedecay_automation_runtime::automation::run_ledger::load_run_records;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::{AnalyticsToolCounts, RegisteredGlobalDb};
-use tracedecay_runtime_core::store::memory::DatabaseFactStore;
 use tracedecay_runtime_core::timeutil::parse_rfc3339_timestamp;
+use tracedecay_session_memory::fact_store::DatabaseFactStore;
+use tracedecay_store_runtime::retained_memory::MemoryTargetAccessV1;
 
 use super::support::tool_json_with_md;
 use tracedecay_mcp::ToolResult;
@@ -95,7 +96,6 @@ const ANALYSIS_TOOLS: &[&str] = &[
     "module_api",
     "circular",
     "hotspots",
-    "unused_imports",
     "unmounted_files",
     "rank",
     "largest",
@@ -356,7 +356,7 @@ struct ResolvedScope {
     project_id: ProjectId,
 }
 
-async fn resolve_scope(cg: &TraceDecay, all_projects: bool) -> Result<ResolvedScope> {
+fn resolve_scope(cg: &TraceDecay, all_projects: bool) -> Result<ResolvedScope> {
     let FactOwnerV1::Project { project_id } = cg.project_memory_owner().map_err(config_error)?
     else {
         return Err(config_error("active analytics target is not a project"));
@@ -396,7 +396,7 @@ pub(super) async fn handle_analytics(
         config_error("registered global analytics store is unavailable for tracedecay_analytics")
     })?;
 
-    let scope = resolve_scope(cg, all_projects).await?;
+    let scope = resolve_scope(cg, all_projects)?;
 
     let since = current_timestamp().saturating_sub(window_days.saturating_mul(86_400));
     let event_count = hotpath::future!(

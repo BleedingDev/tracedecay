@@ -5,8 +5,8 @@ use super::contracts::{
     ComponentConfigurationState, ConfigurationAuditPage, ConfigurationAuditQuery,
     ConfigurationControlStore, ConfigurationCurrentStateV1, ConfigurationError,
     ConfigurationMutationAuthority, ConfigurationMutationReceipt, ConfigurationOperationFuture,
-    ConfigurationRollbackRequest, ConfigurationSettlementAuthorityV1, CredentialWritePort,
-    DirectConfigurationMutation, ScopeRevalidationEvidenceV1, WriteOnlyCredentialMutation,
+    ConfigurationRollbackRequest, ConfigurationSettlementAuthorityV1, DirectConfigurationMutation,
+    ScopeRevalidationEvidenceV1,
 };
 use super::registry::ConfigurationRegistry;
 use super::resolver::{ConfigurationResolutionV1, registry_default_candidate};
@@ -20,8 +20,7 @@ use tracedecay_domain::configuration::{
     CodeIndexWorkerSelectionV1, ConfigurationAuditEvent, ConfigurationAuditEventId,
     ConfigurationAuditEventKindV1, ConfigurationCandidateV1, ConfigurationIdempotencyKey,
     ConfigurationLayerIdV1, ConfigurationReceiptId, ConfigurationRevisionId,
-    ConfigurationSnapshotV1, ConfigurationValueV1, CredentialKindV1, CredentialReferenceId,
-    CredentialReferenceMetadataV1, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
+    ConfigurationSnapshotV1, ConfigurationValueV1, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
     MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
     MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, ProtectedChange, ProtectedChangePlan,
     ProtectedChangeSnapshotError, RedactedConfigurationChangeV1, RollbackModeV1, RuleEffect,
@@ -44,7 +43,6 @@ mod activation;
 mod audit;
 mod codec;
 mod control;
-mod credential;
 mod mutation;
 mod read;
 mod revision;
@@ -1173,22 +1171,6 @@ impl ConfigurationControlStore for OwnedGlobalDbConfigurationControlStore {
         actor: &AuthorizedActor,
     ) -> ConfigurationOperationFuture<'_, Vec<ComponentConfigurationState>> {
         forward_to_registered!(self, [actor], |store| store.observed_state(&actor))
-    }
-}
-
-impl CredentialWritePort for OwnedGlobalDbConfigurationControlStore {
-    fn write_reference(
-        &self,
-        authority: &ConfigurationMutationAuthority,
-        write: &WriteOnlyCredentialMutation,
-        expected_revision: &ConfigurationRevisionId,
-    ) -> ConfigurationOperationFuture<'_, CredentialReferenceMetadataV1> {
-        forward_to_registered!(
-            self,
-            [authority, write, expected_revision],
-            mutating,
-            |store| store.write_reference(&authority, &write, &expected_revision)
-        )
     }
 }
 

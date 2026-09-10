@@ -253,7 +253,7 @@ def validate_tool_result(delivery, lane):
         per_block.append({"content_index": block["content_index"], "text": text, "sha256": sha(text)})
     check(same(per_block, [{k: b[k] for k in ("content_index", "text", "sha256")}
                           for b in delivery["advisory_blocks"]]), "advisory per-block projection mismatch")
-    check(count(delivery["advisory_tokens"]) == sum(count(b["tokens"]) for b in delivery["advisory_blocks"]) <= 1024,
+    check(count(delivery["advisory_tokens"]) == sum(count(b["tokens"]) for b in delivery["advisory_blocks"]) <= 8192,
           "advisory per-block token sum exceeds quota or disagrees")
     # Length-prefixing binds the ordered block boundaries of a review document.
     review = b"".join(len(b["text"].encode()).to_bytes(8, "big") + b["text"].encode() for b in per_block)

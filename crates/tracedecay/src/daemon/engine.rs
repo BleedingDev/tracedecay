@@ -15,7 +15,10 @@ use tracedecay_daemon_protocol::{client_version_skew, version_skew_action};
 use tracedecay_hooks::core_events::HOOK_EVENT_METHOD;
 
 #[cfg(unix)]
-fn git_watch_sync_config(config: &crate::config::SyncConfig) -> GitWatchSyncConfigV1 {
+use tracedecay_runtime_core::logging::log_daemon_event;
+
+#[cfg(unix)]
+fn git_watch_sync_config(config: &tracedecay_configuration::SyncConfig) -> GitWatchSyncConfigV1 {
     GitWatchSyncConfigV1 {
         auto_watch: config.auto_watch,
         watch_linked_worktrees: config.watch_linked_worktrees,
@@ -173,11 +176,19 @@ pub(super) fn ensure_context_scout_owner_before_advertising(
     if project.store_layout().identity.project_id.is_none() {
         return Ok(());
     }
-    let owner = project
-        .context_scout_owner()
-        .ok_or_else(|| TraceDecayError::Config {
-            message: "project Context Scout owner did not start".to_owned(),
-        })?;
+    let owner = match project.context_scout_owner_lookup() {
+        crate::tracedecay::ContextScoutOwnerLookupV1::Ready(owner) => owner,
+        crate::tracedecay::ContextScoutOwnerLookupV1::ReadOnly => {
+            return Err(TraceDecayError::Config {
+                message: "read-only project has no Context Scout owner".to_owned(),
+            });
+        }
+        crate::tracedecay::ContextScoutOwnerLookupV1::Unregistered => {
+            return Err(TraceDecayError::Config {
+                message: "project Context Scout owner did not start".to_owned(),
+            });
+        }
+    };
     if matches!(
         owner.startup_outcome(),
         tracedecay_agent_hosts::agents::context_scout_v2::ContextScoutDurableStartupOutcomeV1::Unavailable
@@ -747,7 +758,7 @@ impl DaemonEngine {
     ) -> Result<Option<ProjectOpenFailure>> {
         let (_, route) = Self::project_route(handshake)?;
         let tasks = project_open_tasks(&self.project_open_gates).await;
-        Ok(tasks.cached_failure(&route).await)
+        Ok(tasks.cached_failure(&route))
     }
 
     #[cfg(test)]

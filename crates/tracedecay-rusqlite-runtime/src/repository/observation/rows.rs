@@ -29,6 +29,7 @@ pub(super) type EncodedObservationRow = (
     Option<String>,
     Option<String>,
     i64,
+    Option<String>,
 );
 
 /// The single projection every observation read decodes through.
@@ -48,7 +49,7 @@ pub(super) const OBSERVATION_ROW_PROJECTION: &str =
                 SELECT 1 FROM projection_queue
                 WHERE projection_queue.observation_id =
                       observation.observation_id
-            )
+            ), repository.origin_json
      FROM observations AS observation
      LEFT JOIN observation_retrieval_anchors AS binding
        ON binding.observation_id = observation.observation_id
@@ -74,6 +75,7 @@ pub(super) fn encoded_observation_row(
         row.get::<_, Option<String>>(7)?,
         row.get::<_, Option<String>>(8)?,
         row.get::<_, i64>(9)?,
+        row.get::<_, Option<String>>(10)?,
     ))
 }
 
@@ -89,6 +91,7 @@ pub(super) fn decode_observation_row(
         repository_anchor,
         repository_owner,
         projection_queued,
+        repository_origin,
     ): EncodedObservationRow,
 ) -> rusqlite::Result<StoredObservationRowV1> {
     let repository_availability: EvidenceAvailabilityV1<GenerationBoundRepositoryProvenanceV1> =
@@ -131,8 +134,12 @@ pub(super) fn decode_observation_row(
     if repository_owner != expected_repository_owner {
         return Err(invalid("observation repository owner binding mismatch"));
     }
+    let repository_origin = repository_origin
+        .map(decode::<tracedecay_store::observation::ObservationOriginV1>)
+        .transpose()?;
     let repository_provenance =
         RepositoryProvenanceAttachmentV1::new(repository_availability, repository_anchor)
+            .and_then(|attachment| attachment.with_retained_origin(repository_origin))
             .map_err(invalid)?;
     ObservationCommitReceipt::new(
         sequence,

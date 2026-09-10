@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tracedecay_memory_hygiene::{
     HygieneClass, ObservationAdmission, ObservationSanitizer, WithheldReason,
 };
-use tracedecay_runtime_core::memory::hygiene::detect_secret_like;
+use tracedecay_session_memory::memory::hygiene::detect_secret_like;
 
 fn sanitizer() -> ObservationSanitizer {
     ObservationSanitizer::new().expect("canonical hygiene policy")

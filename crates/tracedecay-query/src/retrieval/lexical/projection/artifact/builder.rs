@@ -1,5 +1,5 @@
 use std::cmp::{Ordering as CmpOrdering, Reverse};
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use rayon::prelude::*;
 use rusqlite::functions::FunctionFlags;
-use rusqlite::types::ValueRef;
+use rusqlite::types::{ToSqlOutput, Value, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -40,9 +40,9 @@ use super::prepared::{
     PreparedCodeLexicalArtifactPageV1, PreparedTermPostingV1, prepare_page as prepare_page_values,
 };
 use super::schema::{
-    CodeLexicalArtifactWriterRevisionV1, LexicalArtifactLayoutV1, exact_field_code_from_encoded,
-    field_code, field_code_from_encoded, intern_exact_terms, intern_terms, stable_exact_term_id,
-    stable_term_id,
+    CodeLexicalArtifactWriterRevisionV1, LexicalArtifactLayoutV1, derive_row_dictionary,
+    exact_field_code_from_encoded, field_code, field_code_from_encoded, intern_exact_terms,
+    intern_terms, stable_exact_term_id, stable_term_id, stage_row_dictionary,
 };
 use super::{
     ARTIFACT_SQLITE_CACHE_BYTES, CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
@@ -75,6 +75,14 @@ const TERM_INSERT_SORT_RUN_ROWS: usize = 4_096;
 const EXACT_INSERT_PLAN_BYTES_PER_REF: usize = 8 * std::mem::size_of::<usize>();
 const EXACT_INSERT_CONTROL_INTERVAL: usize = TERM_INSERT_CONTROL_INTERVAL;
 const EXACT_INSERT_SORT_RUN_ROWS: usize = TERM_INSERT_SORT_RUN_ROWS;
+/// Rows per multi-row `INSERT ... VALUES (...), (...)` statement in the
+/// append phase. The per-row cost of the base-table inserts is statement
+/// overhead plus the per-row builder-gate trigger, not I/O: on the
+/// `term_postings` shape at production pragmas (120k sorted rows in one
+/// transaction) one row per statement costs 1.47 µs/row and 32 rows per
+/// statement 0.86 µs/row, the trigger still firing for every row. Five
+/// columns × 32 rows stays under SQLite's 999-parameter floor.
+const INSERT_ROWS_PER_STATEMENT: usize = 32;
 // This gate serializes mutation within the private-profile/stable-handle
 // authority. It denies ordinary second-connection DML, but is not a
 // cryptographic defense against malicious same-UID code that deliberately
@@ -200,13 +208,13 @@ impl PreparedExactInsertRefV1<'_> {
                     document_id: self.document_id,
                 }
             }
-            LexicalArtifactLayoutV1::V12 | LexicalArtifactLayoutV1::V13 => {
-                PreparedExactInsertKeyV1::V12 {
-                    term_id: self.term_id,
-                    field: self.field_code,
-                    document_id: self.document_id,
-                }
-            }
+            LexicalArtifactLayoutV1::V12
+            | LexicalArtifactLayoutV1::V13
+            | LexicalArtifactLayoutV1::V14 => PreparedExactInsertKeyV1::V12 {
+                term_id: self.term_id,
+                field: self.field_code,
+                document_id: self.document_id,
+            },
         }
     }
 }
@@ -398,6 +406,60 @@ const EXACT_VOCABULARY_IMMUTABLE_TRIGGER_LAYOUT: [(&str, &str, &str, &str); 2] =
         "immutable lexical exact vocabulary",
     ),
 ];
+/// Revision 14 stages row dictionary entries per page during the append
+/// phase (`row_dictionary_pages`) under the same private-builder gate and
+/// immutability guards as the exact vocabulary; finalization derives the
+/// sealed `row_dictionary` from it and drops the staging table.
+const ROW_DICTIONARY_PAGES_BUILDER_GATE_TRIGGER_LAYOUT: [(&str, &str, &str); 3] = [
+    (
+        "builder_gate_row_dictionary_pages_insert",
+        "row_dictionary_pages",
+        "INSERT",
+    ),
+    (
+        "builder_gate_row_dictionary_pages_update",
+        "row_dictionary_pages",
+        "UPDATE",
+    ),
+    (
+        "builder_gate_row_dictionary_pages_delete",
+        "row_dictionary_pages",
+        "DELETE",
+    ),
+];
+const ROW_DICTIONARY_PAGES_IMMUTABLE_TRIGGER_LAYOUT: [(&str, &str, &str, &str); 2] = [
+    (
+        "immutable_row_dictionary_pages_update",
+        "row_dictionary_pages",
+        "UPDATE",
+        "immutable lexical row dictionary pages",
+    ),
+    (
+        "immutable_row_dictionary_pages_delete",
+        "row_dictionary_pages",
+        "DELETE",
+        "immutable lexical row dictionary pages",
+    ),
+];
+/// Per-field posting-length totals folded in by every committed batch and
+/// sealed into `field_stats` (which drops this table) at finalization.
+const FIELD_STATS_STAGING_BUILDER_GATE_TRIGGER_LAYOUT: [(&str, &str, &str); 3] = [
+    (
+        "builder_gate_field_stats_staging_insert",
+        "field_stats_staging",
+        "INSERT",
+    ),
+    (
+        "builder_gate_field_stats_staging_update",
+        "field_stats_staging",
+        "UPDATE",
+    ),
+    (
+        "builder_gate_field_stats_staging_delete",
+        "field_stats_staging",
+        "DELETE",
+    ),
+];
 
 struct BuilderMutationGuardV1 {
     gate: Arc<AtomicU8>,
@@ -519,6 +581,9 @@ impl FinalizationSectionV1 {
             (Self::SourcePages, _) => {
                 "SELECT page_ordinal, page_digest, cumulative_digest, chunk_count, payload_bytes, import_count, import_payload_bytes, import_dictionary_digest, ngram_digest, base_sections_receipt, next_cursor FROM source_pages ORDER BY page_ordinal"
             }
+            (Self::DocumentIntegrity, LexicalArtifactLayoutV1::V14) => {
+                "SELECT document_id, digest FROM document_integrity ORDER BY document_id"
+            }
             (Self::DocumentIntegrity, _) => {
                 "SELECT document_id, chunk_id, digest FROM document_integrity ORDER BY document_id"
             }
@@ -536,7 +601,8 @@ impl FinalizationSectionV1 {
                 Self::TermPostings,
                 LexicalArtifactLayoutV1::V11
                 | LexicalArtifactLayoutV1::V12
-                | LexicalArtifactLayoutV1::V13,
+                | LexicalArtifactLayoutV1::V13
+                | LexicalArtifactLayoutV1::V14,
             ) => {
                 "SELECT term_id, field, document_id, frequency FROM term_postings ORDER BY term_id, field, document_id"
             }
@@ -556,7 +622,8 @@ impl FinalizationSectionV1 {
                 Self::TermStatistics,
                 LexicalArtifactLayoutV1::V11
                 | LexicalArtifactLayoutV1::V12
-                | LexicalArtifactLayoutV1::V13,
+                | LexicalArtifactLayoutV1::V13
+                | LexicalArtifactLayoutV1::V14,
             ) => {
                 "SELECT term_id, field, document_frequency FROM term_stats ORDER BY term_id, field"
             }
@@ -567,15 +634,22 @@ impl FinalizationSectionV1 {
                 Self::Vocabulary,
                 LexicalArtifactLayoutV1::V11
                 | LexicalArtifactLayoutV1::V12
-                | LexicalArtifactLayoutV1::V13,
+                | LexicalArtifactLayoutV1::V13
+                | LexicalArtifactLayoutV1::V14,
             ) => "SELECT term_id, term, in_fuzzy FROM vocabulary ORDER BY term_id",
         }
     }
 
     /// Bounded resumes seek a native table key, never a computed cursor.
     #[hotpath::skip]
-    const fn seek_query(self, after: bool) -> &'static str {
+    const fn seek_query(self, layout: LexicalArtifactLayoutV1, after: bool) -> &'static str {
         match (self, after) {
+            (Self::DocumentIntegrity, false) if matches!(layout, LexicalArtifactLayoutV1::V14) => {
+                "SELECT document_id, digest FROM document_integrity ORDER BY document_id LIMIT ?1"
+            }
+            (Self::DocumentIntegrity, true) if matches!(layout, LexicalArtifactLayoutV1::V14) => {
+                "SELECT document_id, digest FROM document_integrity WHERE document_id > ?1 ORDER BY document_id LIMIT ?2"
+            }
             (Self::SourcePages, false) => {
                 "SELECT page_ordinal, page_digest, cumulative_digest, chunk_count, payload_bytes, import_count, import_payload_bytes, import_dictionary_digest, ngram_digest, base_sections_receipt, next_cursor FROM source_pages ORDER BY page_ordinal LIMIT ?1"
             }
@@ -1112,6 +1186,17 @@ impl CodeLexicalArtifactBuilderV1 {
         {
             verify_required_artifact_indexes(&connection, layout)?;
         }
+        // A staging file still accepting pages must carry the per-batch field
+        // totals; one staged without them (an older builder) cannot seal
+        // correct statistics and is not resumed.
+        if receipt.is_none()
+            && finalization.is_none()
+            && !table_exists(&connection, "field_stats_staging")?
+        {
+            return Err(CodeLexicalArtifactErrorV1::Incompatible(
+                "lexical artifact was staged without incremental field statistics".to_owned(),
+            ));
+        }
         validate_contiguous_pages(&connection, control)?;
         checkpoint(control)?;
         crate::hotpath_metrics::Residency::Rebuilding.record("query.artifact.residency");
@@ -1513,9 +1598,15 @@ impl CodeLexicalArtifactBuilderV1 {
                     Ok::<(), CodeLexicalArtifactErrorV1>(())
                 })?;
                 record_batch_import_metrics(pages);
+                if self.layout.interns_row_dictionary() {
+                    hotpath::measure_block!(
+                        "query.artifact.batch.rows.stage_dictionary",
+                        stage_row_dictionary(&transaction, pages, control)
+                    )?;
+                }
                 hotpath::measure_block!(
                     "query.artifact.batch.rows",
-                    append_prepared_rows(&transaction, pages, control)
+                    append_prepared_rows(&transaction, self.layout, pages, control)
                 )?;
                 record_batch_row_metrics(pages);
                 hotpath::measure_block!(
@@ -1677,8 +1768,14 @@ impl CodeLexicalArtifactBuilderV1 {
             let section_name = section.name();
             wake_metrics.phase(section);
             wake_metrics.probe();
-            let rows =
-                advance_section_rows(&transaction, section, &mut state, remaining_work, control)?;
+            let rows = advance_section_rows(
+                &transaction,
+                section,
+                self.layout,
+                &mut state,
+                remaining_work,
+                control,
+            )?;
             wake_metrics.add_rows(rows)?;
             if rows > 0 {
                 remaining_work = remaining_work.checked_sub(rows).ok_or_else(|| {
@@ -2366,21 +2463,28 @@ fn prepare_term_insert_plan<'a>(
             "bounded lexical term insert plan allocation failed: {error}"
         ))
     })?;
+    // One digest per distinct term rather than per posting: the fixture's
+    // batches carry ~15 postings per distinct term.
+    let mut term_ids: HashMap<&str, i64> = HashMap::new();
     for page in pages {
         checkpoint(control)?;
         for document in &page.documents {
             checkpoint(control)?;
             for posting in &document.term_postings {
+                let term_id = *term_ids
+                    .entry(posting.term.as_str())
+                    .or_insert_with(|| stable_term_id(&posting.term));
                 entries.push(PreparedTermInsertRefV1::new(
                     layout,
                     document.document_id,
-                    stable_term_id(&posting.term),
+                    term_id,
                     field_code_from_encoded(&posting.field)?,
                     posting,
                 ));
             }
         }
     }
+    drop(term_ids);
     for run in entries.chunks_mut(TERM_INSERT_SORT_RUN_ROWS) {
         checkpoint(control)?;
         run.sort_unstable_by_key(PreparedTermInsertRefV1::key);
@@ -3070,6 +3174,111 @@ fn validate_prepared_page_batch(
     Ok(())
 }
 
+/// Buffers rows for one base table and flushes them as multi-row `INSERT`
+/// statements: full statements of [`INSERT_ROWS_PER_STATEMENT`] rows while
+/// rows keep arriving, one shorter statement for the remainder at `finish`.
+/// Row order is preserved, so the clustered-key insert plans still append
+/// at the tail of their trees.
+struct MultiRowInsertV1<'transaction, 'row> {
+    transaction: &'transaction Transaction<'transaction>,
+    table_columns: &'static str,
+    columns: usize,
+    full_statement: rusqlite::CachedStatement<'transaction>,
+    buffer: Vec<ToSqlOutput<'row>>,
+    map_error: fn(rusqlite::Error) -> CodeLexicalArtifactErrorV1,
+}
+
+impl<'transaction, 'row> MultiRowInsertV1<'transaction, 'row> {
+    fn new(
+        transaction: &'transaction Transaction<'transaction>,
+        table_columns: &'static str,
+        columns: usize,
+        map_error: fn(rusqlite::Error) -> CodeLexicalArtifactErrorV1,
+    ) -> Result<Self, CodeLexicalArtifactErrorV1> {
+        let full_statement = transaction
+            .prepare_cached(&multi_row_insert_sql(
+                table_columns,
+                columns,
+                INSERT_ROWS_PER_STATEMENT,
+            ))
+            .map_err(map_error)?;
+        Ok(Self {
+            transaction,
+            table_columns,
+            columns,
+            full_statement,
+            buffer: Vec::with_capacity(columns * INSERT_ROWS_PER_STATEMENT),
+            map_error,
+        })
+    }
+
+    fn push(
+        &mut self,
+        values: impl IntoIterator<Item = ToSqlOutput<'row>>,
+    ) -> Result<(), CodeLexicalArtifactErrorV1> {
+        let before = self.buffer.len();
+        self.buffer.extend(values);
+        if self.buffer.len() != before + self.columns {
+            return Err(CodeLexicalArtifactErrorV1::Contract(
+                "lexical artifact multi-row insert received the wrong column count".to_owned(),
+            ));
+        }
+        if self.buffer.len() == self.columns * INSERT_ROWS_PER_STATEMENT {
+            self.full_statement
+                .execute(rusqlite::params_from_iter(self.buffer.iter()))
+                .map_err(self.map_error)?;
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), CodeLexicalArtifactErrorV1> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let rows = self.buffer.len() / self.columns;
+        let mut tail = self
+            .transaction
+            .prepare_cached(&multi_row_insert_sql(
+                self.table_columns,
+                self.columns,
+                rows,
+            ))
+            .map_err(self.map_error)?;
+        tail.execute(rusqlite::params_from_iter(self.buffer.iter()))
+            .map_err(self.map_error)?;
+        self.buffer.clear();
+        Ok(())
+    }
+}
+
+fn multi_row_insert_sql(table_columns: &str, columns: usize, rows: usize) -> String {
+    let tuple = format!(
+        "({})",
+        std::iter::repeat_n("?", columns)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    format!(
+        "INSERT INTO {table_columns} VALUES {}",
+        std::iter::repeat_n(tuple.as_str(), rows)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn sql_integer<'row>(value: i64) -> ToSqlOutput<'row> {
+    ToSqlOutput::Owned(Value::Integer(value))
+}
+
+fn sql_text(value: &str) -> ToSqlOutput<'_> {
+    ToSqlOutput::Borrowed(ValueRef::Text(value.as_bytes()))
+}
+
+fn sql_blob(value: &[u8]) -> ToSqlOutput<'_> {
+    ToSqlOutput::Borrowed(ValueRef::Blob(value))
+}
+
 fn append_prepared_imports(
     transaction: &Transaction<'_>,
     page: &PreparedCodeLexicalArtifactPageV1,
@@ -3114,11 +3323,12 @@ fn append_prepared_postings(
             intern_exact_terms(transaction, pages, control)
         )?;
     }
-    let mut term_statement = transaction
-        .prepare_cached(
-            "INSERT INTO term_postings(term_id, field, document_id, frequency) VALUES (?1, ?2, ?3, ?4)",
-        )
-        .map_err(sqlite_error)?;
+    let mut term_insert = MultiRowInsertV1::new(
+        transaction,
+        "term_postings(term_id, field, document_id, frequency)",
+        4,
+        sqlite_error,
+    )?;
     // Plain INSERT, not `INSERT OR IGNORE`: `exact_postings` is
     // `PRIMARY KEY(field, term, document_id) WITHOUT ROWID`. Every prepared
     // document's `exact_postings` is deduplicated into a `BTreeSet<(field,
@@ -3134,54 +3344,63 @@ fn append_prepared_postings(
     // unique, both within the batch and against every already-committed
     // row, so `OR IGNORE` could only mask a real corruption bug. A plain
     // INSERT lets that surface as a constraint failure instead of vanishing.
-    let exact_insert_sql = match layout {
-        LexicalArtifactLayoutV1::V12 | LexicalArtifactLayoutV1::V13 => {
-            "INSERT INTO exact_postings(term_id, field, document_id) VALUES (?1, ?2, ?3)"
-        }
+    let exact_table_columns = match layout {
+        LexicalArtifactLayoutV1::V12
+        | LexicalArtifactLayoutV1::V13
+        | LexicalArtifactLayoutV1::V14 => "exact_postings(term_id, field, document_id)",
         LexicalArtifactLayoutV1::V10 | LexicalArtifactLayoutV1::V11 => {
-            "INSERT INTO exact_postings(field, term, document_id) VALUES (?1, ?2, ?3)"
+            "exact_postings(field, term, document_id)"
         }
     };
-    let mut exact_statement = transaction
-        .prepare_cached(exact_insert_sql)
-        .map_err(sqlite_error)?;
-    let mut ngram_statement = transaction
-        .prepare_cached(
-            "INSERT INTO ngram_postings(page_ordinal, kind, ngram, documents, cardinality) VALUES (?1, ?2, ?3, ?4, ?5)",
-        )
-        .map_err(sqlite_error)?;
+    let mut exact_insert =
+        MultiRowInsertV1::new(transaction, exact_table_columns, 3, sqlite_error)?;
+    let mut ngram_insert = MultiRowInsertV1::new(
+        transaction,
+        "ngram_postings(page_ordinal, kind, ngram, documents, cardinality)",
+        5,
+        sqlite_error,
+    )?;
     let expected_term_rows = term_insert_plan.entries.len();
     let mut inserted_term_rows = 0usize;
+    let mut field_totals = BTreeMap::new();
     hotpath::measure_block!("query.artifact.batch.postings.term_rows", {
         while let Some(entry) = next_term_insert(term_insert_plan)? {
             if inserted_term_rows.is_multiple_of(TERM_INSERT_CONTROL_INTERVAL) {
                 checkpoint(control)?;
             }
             let (term_id, field, document_id) = entry.columns(layout);
-            if term_ids.get(entry.posting.term.as_str()) != Some(&term_id) {
+            if !term_ids.contains(&term_id) {
                 return Err(CodeLexicalArtifactErrorV1::Contract(
                     "lexical artifact term intern omitted a planned posting".to_owned(),
                 ));
             }
-            term_statement
-                .execute(params![
-                    term_id,
-                    field,
-                    document_id,
-                    entry.posting.frequency
-                ])
-                .map_err(sqlite_error)?;
+            term_insert.push([
+                sql_integer(term_id),
+                sql_integer(field),
+                sql_integer(document_id),
+                sql_integer(entry.posting.frequency),
+            ])?;
+            let total: &mut i64 = field_totals.entry(field).or_default();
+            *total = total.checked_add(entry.posting.frequency).ok_or_else(|| {
+                CodeLexicalArtifactErrorV1::Contract(
+                    "lexical artifact field total overflowed".to_owned(),
+                )
+            })?;
             inserted_term_rows = inserted_term_rows
                 .checked_add(1)
                 .ok_or_else(batch_ledger_overflow)?;
         }
-        Ok::<(), CodeLexicalArtifactErrorV1>(())
+        term_insert.finish()
     })?;
     if inserted_term_rows != expected_term_rows {
         return Err(CodeLexicalArtifactErrorV1::Contract(
             "lexical term merge omitted planned postings".to_owned(),
         ));
     }
+    hotpath::measure_block!(
+        "query.artifact.batch.postings.field_totals",
+        stage_field_totals(transaction, &field_totals)
+    )?;
     let expected_exact_rows = exact_insert_plan.entries.len();
     let mut inserted_exact_rows = 0usize;
     hotpath::measure_block!("query.artifact.batch.postings.exact_rows", {
@@ -3191,21 +3410,27 @@ fn append_prepared_postings(
             }
             match entry.layout {
                 LexicalArtifactLayoutV1::V10 | LexicalArtifactLayoutV1::V11 => {
-                    exact_statement
-                        .execute(params![entry.field, entry.term, entry.document_id])
-                        .map_err(sqlite_error)?;
+                    exact_insert.push([
+                        sql_text(entry.field),
+                        sql_blob(entry.term),
+                        sql_integer(entry.document_id),
+                    ])?;
                 }
-                LexicalArtifactLayoutV1::V12 | LexicalArtifactLayoutV1::V13 => {
-                    exact_statement
-                        .execute(params![entry.term_id, entry.field_code, entry.document_id])
-                        .map_err(sqlite_error)?;
+                LexicalArtifactLayoutV1::V12
+                | LexicalArtifactLayoutV1::V13
+                | LexicalArtifactLayoutV1::V14 => {
+                    exact_insert.push([
+                        sql_integer(entry.term_id),
+                        sql_integer(entry.field_code),
+                        sql_integer(entry.document_id),
+                    ])?;
                 }
             }
             inserted_exact_rows = inserted_exact_rows
                 .checked_add(1)
                 .ok_or_else(batch_ledger_overflow)?;
         }
-        Ok::<(), CodeLexicalArtifactErrorV1>(())
+        exact_insert.finish()
     })?;
     if inserted_exact_rows != expected_exact_rows {
         return Err(CodeLexicalArtifactErrorV1::Contract(
@@ -3214,56 +3439,69 @@ fn append_prepared_postings(
     }
     hotpath::measure_block!("query.artifact.batch.postings.ngram_rows", {
         for page in pages {
+            let page_ordinal = i64::try_from(page.page_ordinal).map_err(contract_number)?;
             for shard in &page.ngram_shards {
                 checkpoint(control)?;
-                ngram_statement
-                    .execute(params![
-                        i64::try_from(page.page_ordinal).map_err(contract_number)?,
-                        shard.kind,
-                        shard.ngram,
-                        shard.documents.as_slice(),
-                        i64::try_from(shard.cardinality).map_err(contract_number)?,
-                    ])
-                    .map_err(sqlite_error)?;
+                ngram_insert.push([
+                    sql_integer(page_ordinal),
+                    sql_integer(shard.kind),
+                    sql_integer(shard.ngram),
+                    sql_blob(shard.documents.as_slice()),
+                    sql_integer(i64::try_from(shard.cardinality).map_err(contract_number)?),
+                ])?;
             }
         }
-        Ok::<(), CodeLexicalArtifactErrorV1>(())
+        ngram_insert.finish()
     })
 }
 
 fn append_prepared_rows(
     transaction: &Transaction<'_>,
+    layout: LexicalArtifactLayoutV1,
     pages: &[PreparedCodeLexicalArtifactPageV1],
     control: &dyn CodeIndexExecutionControlV1,
 ) -> Result<(), CodeLexicalArtifactErrorV1> {
-    let mut row_statement = transaction
-        .prepare_cached("INSERT INTO rows(document_id, chunk_id, row) VALUES (?1, ?2, ?3)")
-        .map_err(sqlite_error)?;
-    let mut integrity_statement = transaction
-        .prepare_cached(
-            "INSERT INTO document_integrity(document_id, chunk_id, digest) VALUES (?1, ?2, ?3)",
-        )
-        .map_err(sqlite_error)?;
+    let mut row_insert = MultiRowInsertV1::new(
+        transaction,
+        "rows(document_id, chunk_id, row)",
+        3,
+        |error| CodeLexicalArtifactErrorV1::Contract(error.to_string()),
+    )?;
+    let (integrity_columns, integrity_width) = if layout.stores_document_integrity_bytes() {
+        ("document_integrity(document_id, digest)", 2)
+    } else {
+        ("document_integrity(document_id, chunk_id, digest)", 3)
+    };
+    let mut integrity_insert = MultiRowInsertV1::new(
+        transaction,
+        integrity_columns,
+        integrity_width,
+        sqlite_error,
+    )?;
     for page in pages {
         for document in &page.documents {
             checkpoint(control)?;
-            row_statement
-                .execute(params![
-                    document.document_id,
-                    document.chunk_id.as_str(),
-                    document.row.as_slice()
-                ])
-                .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?;
-            integrity_statement
-                .execute(params![
-                    document.document_id,
-                    document.chunk_id.as_str(),
-                    document.integrity_digest.as_str()
-                ])
-                .map_err(sqlite_error)?;
+            row_insert.push([
+                sql_integer(document.document_id),
+                sql_text(&document.chunk_id),
+                sql_blob(&document.row),
+            ])?;
+            if layout.stores_document_integrity_bytes() {
+                integrity_insert.push([
+                    sql_integer(document.document_id),
+                    sql_blob(&document.integrity_digest_bytes),
+                ])?;
+            } else {
+                integrity_insert.push([
+                    sql_integer(document.document_id),
+                    sql_text(&document.chunk_id),
+                    sql_text(document.integrity_digest.as_str()),
+                ])?;
+            }
         }
     }
-    Ok(())
+    row_insert.finish()?;
+    integrity_insert.finish()
 }
 
 fn insert_prepared_source_page(
@@ -3396,6 +3634,10 @@ fn create_schema(
                 field INTEGER PRIMARY KEY,
                 total_length INTEGER NOT NULL
             ) WITHOUT ROWID;
+            CREATE TABLE field_stats_staging (
+                field INTEGER PRIMARY KEY,
+                total_length INTEGER NOT NULL
+            ) WITHOUT ROWID;
             CREATE TABLE exact_postings (
                 field TEXT NOT NULL,
                 term BLOB NOT NULL,
@@ -3449,6 +3691,9 @@ fn create_schema(
             CREATE TRIGGER builder_gate_exact_postings_update BEFORE UPDATE ON exact_postings WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
             CREATE TRIGGER builder_gate_exact_postings_delete BEFORE DELETE ON exact_postings WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
             CREATE TRIGGER builder_gate_ngram_postings_insert BEFORE INSERT ON ngram_postings WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+            CREATE TRIGGER builder_gate_field_stats_staging_insert BEFORE INSERT ON field_stats_staging WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+            CREATE TRIGGER builder_gate_field_stats_staging_update BEFORE UPDATE ON field_stats_staging WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+            CREATE TRIGGER builder_gate_field_stats_staging_delete BEFORE DELETE ON field_stats_staging WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
             "
         ))
         .map_err(sqlite_error)?;
@@ -3482,7 +3727,65 @@ fn create_schema(
             )
             .map_err(sqlite_error)?;
     }
+    if layout.stores_document_integrity_bytes() {
+        // Same triggers as the base table, recreated on the narrower shape.
+        connection
+            .execute_batch(
+                "
+                DROP TRIGGER content_epoch_document_integrity_insert;
+                DROP TRIGGER immutable_document_integrity_update;
+                DROP TRIGGER immutable_document_integrity_delete;
+                DROP TRIGGER builder_gate_document_integrity_insert;
+                DROP TABLE document_integrity;
+                CREATE TABLE document_integrity (
+                    document_id INTEGER PRIMARY KEY,
+                    digest BLOB NOT NULL
+                );
+                CREATE TRIGGER content_epoch_document_integrity_insert AFTER INSERT ON document_integrity BEGIN UPDATE content_epoch SET epoch = epoch + 1 WHERE singleton = 1; END;
+                CREATE TRIGGER immutable_document_integrity_update BEFORE UPDATE ON document_integrity BEGIN SELECT RAISE(ABORT, 'immutable lexical document integrity'); END;
+                CREATE TRIGGER immutable_document_integrity_delete BEFORE DELETE ON document_integrity BEGIN SELECT RAISE(ABORT, 'immutable lexical document integrity'); END;
+                CREATE TRIGGER builder_gate_document_integrity_insert BEFORE INSERT ON document_integrity WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+                ",
+            )
+            .map_err(sqlite_error)?;
+    }
+    if layout.interns_row_dictionary() {
+        // `row_dictionary` stays empty until finalization derives it; the
+        // append phase only stages `(page_ordinal, entry_id, entry)` rows,
+        // which are sequential in page order.
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE row_dictionary (
+                    entry_id INTEGER PRIMARY KEY,
+                    entry BLOB NOT NULL
+                );
+                CREATE TABLE row_dictionary_pages (
+                    page_ordinal INTEGER NOT NULL,
+                    entry_id INTEGER NOT NULL,
+                    entry BLOB NOT NULL,
+                    PRIMARY KEY(page_ordinal, entry_id)
+                ) WITHOUT ROWID;
+                CREATE TRIGGER builder_gate_row_dictionary_pages_insert BEFORE INSERT ON row_dictionary_pages WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+                CREATE TRIGGER builder_gate_row_dictionary_pages_update BEFORE UPDATE ON row_dictionary_pages WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+                CREATE TRIGGER builder_gate_row_dictionary_pages_delete BEFORE DELETE ON row_dictionary_pages WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+                CREATE TRIGGER immutable_row_dictionary_pages_update BEFORE UPDATE ON row_dictionary_pages BEGIN SELECT RAISE(ABORT, 'immutable lexical row dictionary pages'); END;
+                CREATE TRIGGER immutable_row_dictionary_pages_delete BEFORE DELETE ON row_dictionary_pages BEGIN SELECT RAISE(ABORT, 'immutable lexical row dictionary pages'); END;
+                ",
+            )
+            .map_err(sqlite_error)?;
+    }
     Ok(())
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, CodeLexicalArtifactErrorV1> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)
 }
 
 fn verify_builder_mutation_gate_schema(
@@ -3494,37 +3797,65 @@ fn verify_builder_mutation_gate_schema(
         );
         verify_trigger_schema(connection, name, table, &expected)?;
     }
-    let has_exact_vocabulary: bool = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'exact_vocabulary')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(sqlite_error)?;
-    if has_exact_vocabulary {
-        for (name, table, operation) in EXACT_VOCABULARY_BUILDER_GATE_TRIGGER_LAYOUT {
-            let expected = format!(
-                "CREATE TRIGGER {name} BEFORE {operation} ON {table} WHEN {BUILDER_MUTATION_GATE_FUNCTION}() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END"
-            );
-            verify_trigger_schema(connection, name, table, &expected)?;
-        }
+    // Layout-dependent tables are verified only when present: `exact_vocabulary`
+    // from revision 12, and the staging tables (revision-14 dictionary, field
+    // statistics) that finalization drops once their sealed table is derived.
+    let has_exact_vocabulary = table_exists(connection, "exact_vocabulary")?;
+    let has_row_dictionary_pages = table_exists(connection, "row_dictionary_pages")?;
+    let has_field_stats_staging = table_exists(connection, "field_stats_staging")?;
+    let gated_layouts: [(bool, &[GateTriggerLayoutV1]); 3] = [
+        (
+            has_exact_vocabulary,
+            &EXACT_VOCABULARY_BUILDER_GATE_TRIGGER_LAYOUT,
+        ),
+        (
+            has_row_dictionary_pages,
+            &ROW_DICTIONARY_PAGES_BUILDER_GATE_TRIGGER_LAYOUT,
+        ),
+        (
+            has_field_stats_staging,
+            &FIELD_STATS_STAGING_BUILDER_GATE_TRIGGER_LAYOUT,
+        ),
+    ];
+    for (name, table, operation) in gated_layouts
+        .into_iter()
+        .filter(|(present, _)| *present)
+        .flat_map(|(_, layout)| layout.iter().copied())
+    {
+        let expected = format!(
+            "CREATE TRIGGER {name} BEFORE {operation} ON {table} WHEN {BUILDER_MUTATION_GATE_FUNCTION}() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END"
+        );
+        verify_trigger_schema(connection, name, table, &expected)?;
     }
-    for (name, table, operation, message) in IMMUTABLE_TRIGGER_LAYOUT {
+    let immutable_layouts: [(bool, &[ImmutableTriggerLayoutV1]); 3] = [
+        (true, &IMMUTABLE_TRIGGER_LAYOUT),
+        (
+            has_exact_vocabulary,
+            &EXACT_VOCABULARY_IMMUTABLE_TRIGGER_LAYOUT,
+        ),
+        (
+            has_row_dictionary_pages,
+            &ROW_DICTIONARY_PAGES_IMMUTABLE_TRIGGER_LAYOUT,
+        ),
+    ];
+    for (name, table, operation, message) in immutable_layouts
+        .into_iter()
+        .filter(|(present, _)| *present)
+        .flat_map(|(_, layout)| layout.iter().copied())
+    {
         let expected = format!(
             "CREATE TRIGGER {name} BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT, '{message}'); END"
         );
         verify_trigger_schema(connection, name, table, &expected)?;
     }
-    if has_exact_vocabulary {
-        for (name, table, operation, message) in EXACT_VOCABULARY_IMMUTABLE_TRIGGER_LAYOUT {
-            let expected = format!(
-                "CREATE TRIGGER {name} BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT, '{message}'); END"
-            );
-            verify_trigger_schema(connection, name, table, &expected)?;
-        }
-    }
     Ok(())
 }
+
+/// `(trigger name, table, operation)` of one private-builder gate trigger.
+type GateTriggerLayoutV1 = (&'static str, &'static str, &'static str);
+/// `(trigger name, table, operation, abort message)` of one immutability
+/// trigger.
+type ImmutableTriggerLayoutV1 = (&'static str, &'static str, &'static str, &'static str);
 
 fn verify_trigger_schema(
     connection: &Connection,
@@ -3585,6 +3916,17 @@ fn install_base_freeze(
                 CREATE TRIGGER frozen_exact_vocabulary_insert BEFORE INSERT ON exact_vocabulary BEGIN SELECT RAISE(ABORT, 'frozen lexical exact vocabulary'); END;
                 CREATE TRIGGER frozen_exact_vocabulary_update BEFORE UPDATE ON exact_vocabulary BEGIN SELECT RAISE(ABORT, 'frozen lexical exact vocabulary'); END;
                 CREATE TRIGGER frozen_exact_vocabulary_delete BEFORE DELETE ON exact_vocabulary BEGIN SELECT RAISE(ABORT, 'frozen lexical exact vocabulary'); END;
+                ",
+            )
+            .map_err(sqlite_error)?;
+    }
+    if layout.interns_row_dictionary() {
+        transaction
+            .execute_batch(
+                "
+                CREATE TRIGGER frozen_row_dictionary_pages_insert BEFORE INSERT ON row_dictionary_pages BEGIN SELECT RAISE(ABORT, 'frozen lexical row dictionary pages'); END;
+                CREATE TRIGGER frozen_row_dictionary_pages_update BEFORE UPDATE ON row_dictionary_pages BEGIN SELECT RAISE(ABORT, 'frozen lexical row dictionary pages'); END;
+                CREATE TRIGGER frozen_row_dictionary_pages_delete BEFORE DELETE ON row_dictionary_pages BEGIN SELECT RAISE(ABORT, 'frozen lexical row dictionary pages'); END;
                 ",
             )
             .map_err(sqlite_error)?;
@@ -3813,14 +4155,37 @@ where
         .spawn_scoped(scope, monitor)
 }
 
+/// Fold one committed batch's per-field posting lengths into
+/// `field_stats_staging`, inside that batch's transaction, so sealing
+/// `field_stats` never rescans `term_postings`.
+fn stage_field_totals(
+    transaction: &Transaction<'_>,
+    totals: &BTreeMap<i64, i64>,
+) -> Result<(), CodeLexicalArtifactErrorV1> {
+    let mut upsert = transaction
+        .prepare_cached(
+            "INSERT INTO field_stats_staging(field, total_length) VALUES (?1, ?2)
+             ON CONFLICT(field) DO UPDATE SET total_length = total_length + excluded.total_length",
+        )
+        .map_err(sqlite_error)?;
+    for (field, total) in totals {
+        upsert.execute([*field, *total]).map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
 fn derive_statistics_step(
     transaction: &Transaction<'_>,
     ordinal: u64,
 ) -> Result<(), CodeLexicalArtifactErrorV1> {
     match ordinal {
         0 => hotpath::measure_block!("query.artifact.finalization.derive_field_stats", {
+            // Every committed batch already folded its posting lengths into
+            // the staging totals (`stage_field_totals`): sealing copies at
+            // most seven rows and drops the staging table with its gates.
             transaction.execute_batch(
-                "INSERT INTO field_stats(field, total_length) SELECT field, SUM(frequency) FROM term_postings GROUP BY field;
+                "INSERT INTO field_stats(field, total_length) SELECT field, total_length FROM field_stats_staging ORDER BY field;
+                 DROP TABLE field_stats_staging;
                  CREATE TRIGGER frozen_field_stats_insert BEFORE INSERT ON field_stats BEGIN SELECT RAISE(ABORT, 'frozen lexical field statistics'); END;
                  CREATE TRIGGER frozen_field_stats_update BEFORE UPDATE ON field_stats BEGIN SELECT RAISE(ABORT, 'frozen lexical field statistics'); END;
                  CREATE TRIGGER frozen_field_stats_delete BEFORE DELETE ON field_stats BEGIN SELECT RAISE(ABORT, 'frozen lexical field statistics'); END;",
@@ -3835,10 +4200,13 @@ fn derive_statistics_step(
             )
         }),
         2 => hotpath::measure_block!("query.artifact.finalization.derive_vocabulary", {
+            // The preceding statistics step already grouped every posting
+            // by (term_id, field). Reuse that frozen membership instead of
+            // scanning the larger posting table again.
             let subtoken = field_code(LexicalFieldV1::Subtoken);
             transaction
                 .execute(
-                    "UPDATE vocabulary SET in_fuzzy = 1 WHERE term_id IN (SELECT DISTINCT term_id FROM term_postings WHERE field != ?1)",
+                    "UPDATE vocabulary SET in_fuzzy = 1 WHERE term_id IN (SELECT DISTINCT term_id FROM term_stats WHERE field != ?1)",
                     [subtoken],
                 )
                 .and_then(|_| {
@@ -3864,6 +4232,15 @@ fn build_serving_index_step(
     ordinal: u64,
     layout: LexicalArtifactLayoutV1,
 ) -> Result<(), CodeLexicalArtifactErrorV1> {
+    // Revision 14 derives the sealed row dictionary before the first serving
+    // index: dropping the staging table frees its pages for the
+    // `rows_by_chunk` index built in the same wake.
+    if ordinal == 0 && layout.interns_row_dictionary() {
+        hotpath::measure_block!(
+            "query.artifact.finalization.derive_row_dictionary",
+            derive_row_dictionary(transaction)
+        )?;
+    }
     match ordinal {
         0 => hotpath::measure_block!(
             "query.artifact.finalization.index.rows_by_chunk",
@@ -3886,7 +4263,9 @@ fn build_serving_index_step(
                 LexicalArtifactLayoutV1::V10 | LexicalArtifactLayoutV1::V11 => {
                     "CREATE INDEX exact_postings_by_document ON exact_postings(document_id, field, term)"
                 }
-                LexicalArtifactLayoutV1::V12 | LexicalArtifactLayoutV1::V13 => {
+                LexicalArtifactLayoutV1::V12
+            | LexicalArtifactLayoutV1::V13
+            | LexicalArtifactLayoutV1::V14 => {
                     "CREATE INDEX exact_postings_by_document ON exact_postings(document_id, field, term_id)"
                 }
             };
@@ -4026,7 +4405,8 @@ fn read_staged_artifact_layout(
         )),
         layout @ (LexicalArtifactLayoutV1::V11
         | LexicalArtifactLayoutV1::V12
-        | LexicalArtifactLayoutV1::V13) => Ok(layout),
+        | LexicalArtifactLayoutV1::V13
+        | LexicalArtifactLayoutV1::V14) => Ok(layout),
     }
 }
 
@@ -4177,6 +4557,7 @@ fn validate_finalization_state(
 fn advance_section_rows(
     transaction: &Transaction<'_>,
     section: FinalizationSectionV1,
+    layout: LexicalArtifactLayoutV1,
     state: &mut PersistedFinalizationStateV1,
     maximum_rows: usize,
     control: &dyn CodeIndexExecutionControlV1,
@@ -4197,7 +4578,7 @@ fn advance_section_rows(
         | (FinalizationSectionV1::Vocabulary, None) => advance_native_section_rows(
             transaction,
             section,
-            section.seek_query(false),
+            section.seek_query(layout, false),
             params![limit],
             state,
             control,
@@ -4212,7 +4593,7 @@ fn advance_section_rows(
         ) => advance_native_section_rows(
             transaction,
             section,
-            section.seek_query(true),
+            section.seek_query(layout, true),
             params![value, limit],
             state,
             control,
@@ -4223,7 +4604,7 @@ fn advance_section_rows(
         ) => advance_native_section_rows(
             transaction,
             section,
-            section.seek_query(true),
+            section.seek_query(layout, true),
             params![value, limit],
             state,
             control,
@@ -4238,7 +4619,7 @@ fn advance_section_rows(
         ) => advance_native_section_rows(
             transaction,
             section,
-            section.seek_query(true),
+            section.seek_query(layout, true),
             params![page_ordinal, kind, ngram, limit],
             state,
             control,
@@ -4253,7 +4634,7 @@ fn advance_section_rows(
         ) => advance_native_section_rows(
             transaction,
             section,
-            section.seek_query(true),
+            section.seek_query(layout, true),
             params![field, term, document_id, limit],
             state,
             control,
@@ -4268,7 +4649,7 @@ fn advance_section_rows(
         ) => advance_native_section_rows(
             transaction,
             section,
-            section.seek_query(true),
+            section.seek_query(layout, true),
             params![page_ordinal, kind, ngram, limit],
             state,
             control,
@@ -4279,7 +4660,7 @@ fn advance_section_rows(
         ) => advance_native_section_rows(
             transaction,
             section,
-            section.seek_query(true),
+            section.seek_query(layout, true),
             params![first, second, limit],
             state,
             control,
@@ -5303,6 +5684,129 @@ mod tests {
     }
 
     #[test]
+    fn field_statistics_preserve_posting_sums_and_omit_absent_fields() {
+        for empty in [false, true] {
+            let mut connection = Connection::open_in_memory().expect("statistics database");
+            let _authority = create_mutable_test_schema(&connection);
+            if !empty {
+                // Two committed batches: the staged totals must accumulate
+                // across them exactly as a scan over every posting would.
+                let batches: [&[(i64, i64, i64, i64)]; 2] = [
+                    &[(1, 1, 1, 2), (2, 1, 1, 3), (1, 3, 1, 7)],
+                    &[(1, 1, 2, 4), (2, 7, 2, 11)],
+                ];
+                for batch in batches {
+                    let transaction = connection.transaction().expect("batch transaction");
+                    let mut totals = BTreeMap::new();
+                    for (term_id, field, document_id, frequency) in batch {
+                        transaction
+                            .execute(
+                                "INSERT INTO term_postings(term_id, field, document_id, frequency) VALUES (?1, ?2, ?3, ?4)",
+                                [term_id, field, document_id, frequency],
+                            )
+                            .expect("posting fixture");
+                        *totals.entry(*field).or_insert(0) += frequency;
+                    }
+                    stage_field_totals(&transaction, &totals).expect("stage field totals");
+                    transaction.commit().expect("commit batch");
+                }
+            }
+            let expected = connection
+                .prepare(
+                    "SELECT field, SUM(frequency) FROM term_postings GROUP BY field ORDER BY field",
+                )
+                .expect("reference sums")
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                .expect("reference rows")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("reference totals");
+            let transaction = connection.transaction().expect("statistics transaction");
+            derive_statistics_step(&transaction, 0).expect("derive statistics");
+            let actual = transaction
+                .prepare("SELECT field, total_length FROM field_stats ORDER BY field")
+                .expect("derived sums")
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                .expect("derived rows")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("derived totals");
+            assert_eq!(actual, expected);
+            assert!(
+                transaction
+                    .execute("INSERT INTO field_stats VALUES (2, 5)", [])
+                    .is_err()
+            );
+            assert!(
+                !table_exists(&transaction, "field_stats_staging").expect("staging lookup"),
+                "sealing the statistics must drop the staging totals"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_refuses_staging_without_incremental_field_statistics() {
+        let directory = tempfile::tempdir().expect("artifact tempdir");
+        let path = directory.path().join("no-field-stats-staging.sqlite");
+        let metadata = test_metadata();
+        drop(
+            CodeLexicalArtifactBuilderV1::create(&path, metadata.clone())
+                .expect("create current staging artifact"),
+        );
+        let connection = Connection::open(&path).expect("open staging artifact for fixture setup");
+        connection
+            .execute_batch("DROP TABLE field_stats_staging;")
+            .expect("install pre-incremental staging layout");
+        drop(connection);
+
+        let error =
+            match CodeLexicalArtifactBuilderV1::open_or_resume_with_memory_budget_and_control(
+                &path,
+                metadata,
+                CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
+                &ActiveControl,
+            ) {
+                Ok(_) => panic!("resume must not seal statistics without staged totals"),
+                Err(error) => error,
+            };
+        assert!(matches!(error, CodeLexicalArtifactErrorV1::Incompatible(_)));
+    }
+
+    #[test]
+    fn fuzzy_vocabulary_requires_a_non_subtoken_posting() {
+        let mut connection = Connection::open_in_memory().expect("vocabulary database");
+        let _authority = create_mutable_test_schema(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO vocabulary(term_id, term, in_fuzzy) VALUES
+                 (1, 'subtoken_only', 0), (2, 'body_only', 0),
+                 (3, 'both_fields', 0), (4, 'unreferenced', 0);
+                 INSERT INTO term_postings(term_id, field, document_id, frequency) VALUES
+                 (1, 7, 1, 3), (1, 7, 2, 5),
+                 (2, 4, 1, 2), (2, 4, 2, 7),
+                 (3, 7, 1, 1), (3, 4, 2, 1);",
+            )
+            .expect("vocabulary fixture");
+        let transaction = connection.transaction().expect("statistics transaction");
+        derive_statistics_step(&transaction, 1).expect("derive term statistics");
+        derive_statistics_step(&transaction, 2).expect("derive fuzzy vocabulary");
+        let actual = transaction
+            .prepare("SELECT term_id, in_fuzzy FROM vocabulary ORDER BY term_id")
+            .expect("fuzzy membership")
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+            })
+            .expect("vocabulary rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("vocabulary membership");
+        assert_eq!(actual, [(1, false), (2, true), (3, true), (4, false)]);
+        assert!(
+            transaction
+                .execute("UPDATE vocabulary SET in_fuzzy = 0 WHERE term_id = 2", [])
+                .is_err(),
+            "derived membership must remain frozen"
+        );
+    }
+
+    #[test]
     fn canonical_batch_limits_select_a_multi_page_prefix_without_stalling() {
         let page_bounds = [
             (700_000usize, 80 * 1024 * 1024usize),
@@ -5812,7 +6316,10 @@ mod tests {
         connection: &Connection,
         section: FinalizationSectionV1,
     ) -> Result<Vec<String>, CodeLexicalArtifactErrorV1> {
-        let query = format!("EXPLAIN QUERY PLAN {}", section.seek_query(true));
+        let query = format!(
+            "EXPLAIN QUERY PLAN {}",
+            section.seek_query(LexicalArtifactLayoutV1::V11, true)
+        );
         let mut statement = connection.prepare(&query).map_err(sqlite_error)?;
         let mut rows = match section {
             FinalizationSectionV1::SourcePages

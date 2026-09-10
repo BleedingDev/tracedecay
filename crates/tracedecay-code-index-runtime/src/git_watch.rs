@@ -55,11 +55,7 @@ use crate::ports::{
 };
 
 pub type ProfiledStdMutex<T> = hotpath::mutexes::Mutex<T>;
-
-#[cfg(feature = "hotpath")]
 pub type ProfiledTokioMutex<T> = hotpath::wrap::tokio::sync::Mutex<T>;
-#[cfg(not(feature = "hotpath"))]
-pub type ProfiledTokioMutex<T> = tokio::sync::Mutex<T>;
 
 mod admission;
 mod backstop;
@@ -616,6 +612,9 @@ async fn repository_task(inner: Arc<GitWatcherInner>, state: Arc<WatchState>) {
 /// state — it only records *what kind of path changed* so the debounce drain
 /// can resolve the actual git state once, after quiescence.
 fn classify_and_mark(state: &Arc<WatchState>, event: &notify::Event) {
+    if state.is_retired() {
+        return;
+    }
     let event_roots = state.event_roots(&event.paths);
     state.clear_retry();
     // Cheap synchronous classification into the dirty set. We use `try_lock` to
@@ -660,6 +659,9 @@ fn is_notify_capacity_error(error: &notify::Error) -> bool {
 }
 
 fn mark_notify_failure(state: &WatchState, error: &notify::Error) {
+    if state.is_retired() {
+        return;
+    }
     let status = if is_notify_capacity_error(error) {
         ProjectWatchStatus::NotifyCapacity
     } else {
@@ -680,7 +682,7 @@ fn mark_notify_failure(state: &WatchState, error: &notify::Error) {
 /// Converts any callback event that could not record detailed path evidence
 /// into one conservative reconciliation plan.
 async fn materialize_pending_reconciliation(state: &WatchState) {
-    if !state.reconciliation_pending.load(Ordering::Acquire) {
+    if state.is_retired() || !state.reconciliation_pending.load(Ordering::Acquire) {
         return;
     }
     let mut dirty = state.dirty.lock().await;

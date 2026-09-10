@@ -2499,7 +2499,7 @@ fn validate_invocation(invocation: &Value) -> FixtureResult<()> {
     // after seeing a response. Actual effective limits require host evidence.
     if invocation["budgets"]
         != json!({"requested_candidates": 8, "effective_candidates": 5,
-        "advisory_tokens": 1024, "total_context_tokens": 128000,
+        "advisory_tokens": 8192, "total_context_tokens": 128000,
         "provider_deadline_ms": 5000, "advisory_slice_ms": 2000})
         || invocation["tokenizer"]
             != json!({"identity": "tiktoken.o200k_base", "revision": "tiktoken-rs-0.12"})

@@ -458,7 +458,7 @@ pub(super) fn warn_transcript_catch_up_failure(
             source,
             ..
         }) => {
-            tracedecay_runtime_core::privacy::sanitize_provider_metadata_text(&source.to_string())
+            tracedecay_privacy::sanitize_provider_metadata_text(&source.to_string())
                 .filter(|detail| detail.len() <= 1024)
         }
         _ => None,

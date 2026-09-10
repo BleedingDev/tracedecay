@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::io::{Read, Write};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracedecay_domain::UtcMicros;
 use tracedecay_hooks::{HookHostV1, NativeHookCaptureOutcomeV1, NativeHookCaptureSourceV1};
@@ -125,7 +125,7 @@ pub(crate) fn try_run(args: &[OsString]) -> Option<i32> {
     // admitted the observation.
     if command == "hook-pre-tool-use" {
         if args.len() != 2 {
-            return Some(1);
+            return Some(refused("hook callbacks take no arguments"));
         }
         // Claude's pre-tool callback has no replay-safe native observation.
         // An empty successful response preserves the host's normal allow path
@@ -154,9 +154,11 @@ pub(crate) fn try_run(args: &[OsString]) -> Option<i32> {
             tracedecay::daemon::StderrTracingDefault::Silent,
         );
     }
-    (args.len() == 2)
-        .then(|| run_native_capture(source))
-        .or(Some(1))
+    Some(if args.len() == 2 {
+        run_native_capture(source)
+    } else {
+        refused("hook callbacks take no arguments")
+    })
 }
 
 #[cfg(any(feature = "hotpath", test))]
@@ -234,20 +236,13 @@ fn capture_command_name(command: &Commands) -> Option<&'static str> {
 }
 
 pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
-    let Some(deadline) = Instant::now().checked_add(Duration::from_micros(
-        tracedecay_hooks::HookSynchronousDeadlineV1::start().remaining_micros(),
-    )) else {
-        return 1;
-    };
     let payload = match read_bounded_stdin() {
         Ok(payload) => payload,
-        Err(()) => {
-            eprintln!("tracedecay hook: stdin was unreadable or exceeded the payload bound");
-            return 1;
-        }
+        Err(()) => return refused("stdin was unreadable or exceeded the payload bound"),
     };
     let mut delivery_writer = None;
     let mut delivery_material = None;
+    let mut rejection = None;
     let working_directory = std::env::current_dir();
     // The invocation is analytics-visible whatever the capture outcome: an
     // unbound, unsupported, or rejected callback still proves the host fired
@@ -259,20 +254,24 @@ pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
         None,
         &String::from_utf8_lossy(&payload),
     );
-    let outcome =
-        match working_directory {
-            Ok(project_root) => {
-                match tracedecay_runtime_core::storage::resolve_enrolled_layout_for_current_profile(
-                    &project_root,
-                ) {
-                    Ok(Some(layout)) => match current_time() {
-                        Some(now) => {
-                            match tracedecay_agent_hosts::hooks::native_capture_material(
+    let outcome = match working_directory {
+        Ok(project_root) => {
+            match tracedecay_runtime_core::storage::resolve_enrolled_layout_for_current_profile(
+                &project_root,
+            ) {
+                Ok(Some(layout)) => match current_time() {
+                    Some(now) => {
+                        match tracedecay_agent_hosts::hooks::native_capture_material(
                             source, &payload, now,
                         ) {
                             Ok(material) => {
                                 match tracedecay_hooks::capture_native_event_with_delivery_writer(
-                                    &layout.data_root, source, &payload, material, now, deadline,
+                                    &layout.data_root,
+                                    source,
+                                    &payload,
+                                    material,
+                                    now,
+                                    tracedecay_hooks::HOOK_SYNCHRONOUS_BUDGET,
                                 ) {
                                     Ok(writer) => {
                                         delivery_writer = Some(writer);
@@ -286,17 +285,20 @@ pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
                                 tracedecay_hooks::NativeHookDecodeError::UnsupportedNativeEvent
                                 | tracedecay_hooks::NativeHookDecodeError::UnsupportedNativeFamily,
                             ) => NativeHookCaptureOutcomeV1::Unsupported,
-                            Err(_) => NativeHookCaptureOutcomeV1::Rejected,
+                            Err(error) => {
+                                rejection = Some(error.to_string());
+                                NativeHookCaptureOutcomeV1::Rejected
+                            }
                         }
-                        }
-                        None => NativeHookCaptureOutcomeV1::Unavailable,
-                    },
-                    Ok(None) => NativeHookCaptureOutcomeV1::Unbound,
-                    Err(_) => NativeHookCaptureOutcomeV1::Unavailable,
-                }
+                    }
+                    None => NativeHookCaptureOutcomeV1::Unavailable,
+                },
+                Ok(None) => NativeHookCaptureOutcomeV1::Unbound,
+                Err(_) => NativeHookCaptureOutcomeV1::Unavailable,
             }
-            Err(_) => NativeHookCaptureOutcomeV1::Unavailable,
-        };
+        }
+        Err(_) => NativeHookCaptureOutcomeV1::Unavailable,
+    };
 
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
@@ -305,36 +307,30 @@ pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
         .and_then(|()| stdout.flush())
         .is_err()
     {
-        return 1;
+        return refused("hook response could not be written to stdout");
     }
     drop(stdout);
     if outcome == NativeHookCaptureOutcomeV1::Captured {
         let Some(writer) = delivery_writer else {
-            tracing::warn!("native delivery receipt writer unavailable");
-            return 1;
+            return refused("native delivery receipt writer unavailable");
         };
         let (Some(material), Some(delivered_at)) = (delivery_material, current_time()) else {
-            tracing::warn!("native delivery receipt material unavailable");
-            return 1;
+            return refused("native delivery receipt material unavailable");
         };
         let Some(settlement) =
             tracedecay_hooks::native_hook_delivery_settlement(source, material, delivered_at)
         else {
-            tracing::warn!("native delivery settlement identity could not be derived");
-            return 1;
+            return refused("native delivery settlement identity could not be derived");
         };
         let Ok(receipt) = tracedecay_hooks::HookDeliverySourceReceiptV1::new(settlement) else {
-            tracing::warn!("native delivery receipt is invalid");
-            return 1;
+            return refused("native delivery receipt is invalid");
         };
         if let Err(error) = writer.append(&receipt) {
-            tracing::warn!(%error, "native delivery receipt could not be retained");
-            return 1;
+            return refused(format!(
+                "native delivery receipt could not be retained: {error}"
+            ));
         }
     }
-    // Hooks are silent on stderr by contract (the host shows every byte to
-    // the user), so the outcome goes to tracing, which the hook lane keeps
-    // off unless the operator opts in.
     match outcome {
         NativeHookCaptureOutcomeV1::Captured
         | NativeHookCaptureOutcomeV1::Unsupported
@@ -343,11 +339,21 @@ pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
         | NativeHookCaptureOutcomeV1::Full
         | NativeHookCaptureOutcomeV1::ResetRequired
         | NativeHookCaptureOutcomeV1::Unavailable
-        | NativeHookCaptureOutcomeV1::AdmissionTimedOut => {
-            tracing::warn!(?outcome, "native capture did not land");
-            1
-        }
+        | NativeHookCaptureOutcomeV1::AdmissionTimedOut => refused(match rejection {
+            Some(reason) => format!("native capture did not land: {outcome:?} ({reason})"),
+            None => format!("native capture did not land: {outcome:?}"),
+        }),
     }
+}
+
+/// The one exit-1 site of the capture fast path. A successful hook is silent
+/// on stderr (the host shows every byte to the user), but a refused one must
+/// name its reason there: this path runs before the tracing subscriber is
+/// installed, so a `tracing::warn!` here was dropped and every refusal
+/// surfaced as a bare exit 1 with `{}` and empty stderr.
+fn refused(reason: impl std::fmt::Display) -> i32 {
+    eprintln!("tracedecay hook: {reason}");
+    1
 }
 
 fn read_bounded_stdin() -> Result<Vec<u8>, ()> {
@@ -371,6 +377,15 @@ fn current_time() -> Option<UtcMicros> {
 #[test]
 fn codex_stop_selects_native_response_instead_of_capture_only() {
     assert!(native_response_command_from_name("hook-codex-stop"));
-    assert_eq!(capture_command_name(&Commands::HookCodexStop), Some("hook-codex-stop"));
-    assert_eq!(try_run(&[OsString::from("tracedecay"), OsString::from("hook-codex-stop")]), None);
+    assert_eq!(
+        capture_command_name(&Commands::HookCodexStop),
+        Some("hook-codex-stop")
+    );
+    assert_eq!(
+        try_run(&[
+            OsString::from("tracedecay"),
+            OsString::from("hook-codex-stop")
+        ]),
+        None
+    );
 }

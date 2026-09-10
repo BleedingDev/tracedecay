@@ -15,7 +15,7 @@ use tracedecay_memory_hygiene::{
     HygieneAction, HygieneClass, ObservationAdmission, ObservationSanitizer,
     SanitizationDisposition, canonical_payload_bytes, transient_matches,
 };
-use tracedecay_runtime_core::memory::hygiene::detect_transient;
+use tracedecay_session_memory::memory::hygiene::detect_transient;
 
 const TRANSIENT_FACTS: &str = include_str!("fixtures/transient_facts.json");
 

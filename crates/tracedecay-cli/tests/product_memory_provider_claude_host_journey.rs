@@ -39,6 +39,7 @@
 //!   provider-memory lane, bounded and de-duplicated, naming the provider the
 //!   project's own routing policy pinned.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
@@ -177,6 +178,7 @@ struct ClaudeHostJourney {
     /// handle and keeps it.
     journal: OnceLock<SqliteObservationJournal>,
     ncm_journal: OnceLock<SqliteObservationJournal>,
+    live_origin_diagnostics: RefCell<Vec<Value>>,
 }
 
 impl ClaudeHostJourney {
@@ -227,6 +229,7 @@ impl ClaudeHostJourney {
             bin_dir,
             journal: OnceLock::new(),
             ncm_journal: OnceLock::new(),
+            live_origin_diagnostics: RefCell::new(Vec::new()),
         }
     }
 
@@ -260,6 +263,10 @@ impl ClaudeHostJourney {
         let mut daemon = self
             .cli(&["daemon", "run"])
             .env("TRACEDECAY_TEST_HOST_HISTORY_RECALL_DIAGNOSTICS", "1")
+            .env(
+                "RUST_LOG",
+                "warn,tracedecay::mcp::tools::handlers::hook_runtime::admission=debug",
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::from(log))
             .spawn()
@@ -271,10 +278,12 @@ impl ClaudeHostJourney {
     /// Invoked only while formatting a failed populated-recall assertion.
     /// Reads opt-in host counters, never ledger tables or raw log content.
     fn native_recall_failure_diagnostics(&self) -> Value {
-        if self.active_provider != ActiveProvider::Native {
-            return Value::Null;
-        }
-        let missing = || json!({"availability":"no_readable_opt_in_diagnostics"});
+        let missing = || {
+            json!({
+                "availability":"no_readable_opt_in_diagnostics",
+                "live_origin_checkpoints": *self.live_origin_diagnostics.borrow(),
+            })
+        };
         let Ok(mut log) = fs::File::open(self.home.path().join("daemon.stderr.log")) else {
             return missing();
         };
@@ -289,16 +298,120 @@ impl ClaudeHostJourney {
         if log.take(64 * 1024).read_to_end(&mut tail).is_err() {
             return missing();
         }
-        let summaries = String::from_utf8_lossy(&tail)
+        let text = String::from_utf8_lossy(&tail);
+        let summaries = text
             .lines()
             .rev()
             .filter_map(recall_diagnostic_summary)
             .take(12)
             .collect::<Vec<_>>();
-        if summaries.is_empty() {
-            missing()
+        let origin_outcomes = text
+            .lines()
+            .rev()
+            .filter_map(|line| {
+                let message = if line.contains("live hook origin ledger unavailable") {
+                    "ledger_unavailable"
+                } else if line.contains("live hook transcript origin unavailable") {
+                    "origin_unavailable"
+                } else if line.contains("live hook transcript origin") {
+                    "origin_recorded"
+                } else {
+                    return None;
+                };
+                let outcome = [
+                    "Baseline",
+                    "Checkpoint",
+                    "Sealed",
+                    "Unavailable",
+                    "Deadline",
+                    "Duplicate",
+                ]
+                .into_iter()
+                .find(|label| line.contains(label))
+                .unwrap_or("unclassified");
+                Some(json!({"message":message, "outcome":outcome}))
+            })
+            .take(16)
+            .collect::<Vec<_>>();
+        json!({"order":"newest_first", "events":summaries, "live_origin_outcomes":origin_outcomes,
+            "live_origin_checkpoints": *self.live_origin_diagnostics.borrow()})
+    }
+
+    /// Read only the existing bounded origin authority; retain no transcript text or paths.
+    fn record_live_origin_diagnostic(&self, command: &str, session_id: Option<&str>) {
+        use tracedecay_hooks::admission_ledger::{
+            read_hook_live_origin_boundaries, read_hook_live_origin_proofs,
+        };
+        if !matches!(
+            command,
+            "hook-claude-session-start"
+                | "hook-codex-session-start"
+                | "hook-stop"
+                | "hook-codex-stop"
+        ) {
+            return;
+        }
+        let Some(session_id) = session_id else {
+            return;
+        };
+        let host = if self.codex {
+            tracedecay_hooks::HookHostV1::Codex
         } else {
-            json!({"order":"newest_first", "events":summaries})
+            tracedecay_hooks::HookHostV1::ClaudeCode
+        };
+        let expected_path = fs::canonicalize(self.transcript_path_for_session(session_id)).ok();
+        let expected_source_key = if self.codex {
+            tracedecay_sessions::runtime::codex::codex_observation_source_v2(session_id)
+                .ok()
+                .map(|source| source.source_key().as_str().to_owned())
+        } else {
+            tracedecay_sessions::runtime::claude::identify_claude_source(
+                &self.transcript_path_for_session(session_id),
+            )
+            .map(|source| source.source_id)
+        };
+        let boundary_summary =
+            |boundary: &tracedecay_hooks::admission_ledger::HookLiveOriginBoundaryV1| {
+                let observed = &boundary.observation;
+                json!({
+                    "session_matches": observed.source.session_id().as_str() == session_id,
+                    "path_matches": expected_path.as_ref() == Some(&observed.canonical_source_path),
+                    "source_key_matches": expected_source_key.as_deref() == Some(observed.source.source_key().as_str()),
+                    "start_order": boundary.start.admission.order, "checkpoint_order": boundary.admission.order,
+                    "generation": observed.checkpoint.generation, "file_identity": observed.checkpoint.file_identity,
+                    "start_eof": boundary.start.physical_eof, "frontier": observed.checkpoint.complete_frontier,
+                    "physical_eof": observed.physical_eof,
+                })
+            };
+        let summary = if let Some(path) = find_file(&self.profile, "admission-live-origins.json") {
+            let root = path.parent().expect("origin metadata parent");
+            let now = tracedecay_contracts::now_micros();
+            let boundaries = read_hook_live_origin_boundaries(root, host, now);
+            let proofs = read_hook_live_origin_proofs(root, host, now);
+            match (boundaries, proofs) {
+                (Ok(boundaries), Ok(proofs)) => json!({
+                    "command":command, "availability":"read", "ledger_host_matches":root.file_name().is_some_and(|name| name == host.hook_key()),
+                    "boundary_count":boundaries.len(), "proof_count":proofs.len(),
+                    "boundaries":boundaries.iter().take(4).map(&boundary_summary).collect::<Vec<_>>(),
+                    "proofs":proofs.iter().take(4).map(|proof| json!({
+                        "baseline":boundary_summary(&proof.baseline), "seal_order":proof.seal.order,
+                        "frame_count":proof.frames.len(), "frames":proof.frames.iter().take(4).map(|frame| json!({
+                            "start":frame.start, "end":frame.end, "resume_fingerprint":frame.resume_fingerprint,
+                        })).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                }),
+                _ => json!({"command":command, "availability":"reader_refused"}),
+            }
+        } else {
+            json!({"command":command, "availability":"metadata_absent"})
+        };
+        let mut retained = self.live_origin_diagnostics.borrow_mut();
+        if retained.len() < 8
+            && serde_json::to_vec(&*retained).map_or(false, |bytes| {
+                bytes.len() + summary.to_string().len() < 12 * 1024
+            })
+        {
+            retained.push(summary);
         }
     }
 
@@ -754,6 +867,7 @@ impl ClaudeHostJourney {
     /// Runs one shipped Claude lifecycle hook process, handing it the bytes
     /// Claude Code itself writes on stdin.
     fn run_hook(&self, subcommand: &str, payload: &Value) -> Output {
+        let session_id = payload["session_id"].as_str().map(str::to_owned);
         let payload = payload.to_string();
         let mut command = self.cli(&[subcommand]);
         command.stdin(Stdio::piped());
@@ -766,7 +880,9 @@ impl ClaudeHostJourney {
             .expect("hook stdin")
             .write_all(payload.as_bytes())
             .expect("hook payload delivery");
-        child.wait_with_output().expect("hook completes")
+        let output = child.wait_with_output().expect("hook completes");
+        self.record_live_origin_diagnostic(subcommand, session_id.as_deref());
+        output
     }
 
     /// Captures the first completed turn after the live SessionStart baseline.
@@ -1133,7 +1249,7 @@ impl ClaudeHostJourney {
                     log.take(16 * 1024)
                         .read_to_end(&mut tail)
                         .expect("read diagnostic tail");
-                    tracedecay_runtime_core::privacy::sanitize_provider_metadata_text(
+                    tracedecay_privacy::sanitize_provider_metadata_text(
                         &String::from_utf8_lossy(&tail),
                     )
                     .unwrap_or_else(|| "[daemon diagnostics withheld by privacy policy]".to_owned())

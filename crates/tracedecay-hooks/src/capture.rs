@@ -9,7 +9,7 @@
 mod tests;
 
 use std::path::Path;
-use std::time::Instant;
+use std::time::Duration;
 
 use tracedecay_domain::UtcMicros;
 
@@ -71,9 +71,10 @@ fn record_capture_outcome(outcome: NativeHookCaptureOutcomeV1) {
     }
 }
 
-/// Captures only after admitting the receipt writer under the same invocation
-/// deadline. Success transfers that lease to the caller, which must retain it
-/// through stdout flush and receipt append; no post-publication admission occurs.
+/// Captures only after admitting the receipt writer and its capacity. Each
+/// spool lock gets its wait budget from the lock attempt itself. Success
+/// transfers the receipt lease to the caller, which must retain it through
+/// stdout flush and receipt append; no post-publication admission occurs.
 #[hotpath::measure(label = "hooks.capture.native_event")]
 pub fn capture_native_event_with_delivery_writer(
     data_root: &Path,
@@ -81,10 +82,16 @@ pub fn capture_native_event_with_delivery_writer(
     payload: &[u8],
     material: NativeEnvelopeMaterialV1,
     now: UtcMicros,
-    deadline: Instant,
+    wait_budget: Duration,
 ) -> Result<HookDeliveryReceiptSpoolV1, NativeHookCaptureOutcomeV1> {
-    let result =
-        capture_native_event_for_replay_inner(data_root, source, payload, material, now, deadline);
+    let result = capture_native_event_for_replay_inner(
+        data_root,
+        source,
+        payload,
+        material,
+        now,
+        wait_budget,
+    );
     record_capture_outcome(
         result
             .as_ref()
@@ -99,7 +106,7 @@ fn capture_native_event_for_replay_inner(
     payload: &[u8],
     material: NativeEnvelopeMaterialV1,
     now: UtcMicros,
-    deadline: Instant,
+    wait_budget: Duration,
 ) -> Result<HookDeliveryReceiptSpoolV1, NativeHookCaptureOutcomeV1> {
     let host = source.host();
     let decoded_result = match source {
@@ -127,9 +134,9 @@ fn capture_native_event_for_replay_inner(
         Err(_) => return Err(NativeHookCaptureOutcomeV1::Rejected),
     };
     // Decode and binding validation are complete before any receipt writes.
-    let delivery_writer = HookDeliveryReceiptSpoolV1::open_until(
+    let delivery_writer = HookDeliveryReceiptSpoolV1::open_within(
         hook_delivery_receipt_spool_root(data_root, host),
-        deadline,
+        wait_budget,
     )
     .map_err(delivery_admission_outcome)?;
     // This candidate supplies only the stable identity for capacity admission.
@@ -142,18 +149,22 @@ fn capture_native_event_for_replay_inner(
         .admit_capacity(&candidate)
         .map_err(delivery_admission_outcome)?;
     let spool_root = data_root.join("hook-v2-spool").join(host.hook_key());
-    let mut spool =
-        match HookSpoolV1::open_until(spool_root, HookSpoolConfigV1::stock(host), now, deadline) {
-            Ok((spool, _)) => spool,
-            Err(HookSpoolError::AdmissionTimedOut) => {
-                return Err(NativeHookCaptureOutcomeV1::AdmissionTimedOut);
-            }
-            Err(HookSpoolError::SpoolFull) => return Err(NativeHookCaptureOutcomeV1::Full),
-            Err(HookSpoolError::ResetRequired { .. }) => {
-                return Err(NativeHookCaptureOutcomeV1::ResetRequired);
-            }
-            Err(_) => return Err(NativeHookCaptureOutcomeV1::Unavailable),
-        };
+    let mut spool = match HookSpoolV1::open_within(
+        spool_root,
+        HookSpoolConfigV1::stock(host),
+        now,
+        wait_budget,
+    ) {
+        Ok((spool, _)) => spool,
+        Err(HookSpoolError::AdmissionTimedOut) => {
+            return Err(NativeHookCaptureOutcomeV1::AdmissionTimedOut);
+        }
+        Err(HookSpoolError::SpoolFull) => return Err(NativeHookCaptureOutcomeV1::Full),
+        Err(HookSpoolError::ResetRequired { .. }) => {
+            return Err(NativeHookCaptureOutcomeV1::ResetRequired);
+        }
+        Err(_) => return Err(NativeHookCaptureOutcomeV1::Unavailable),
+    };
     let envelope = redelivered_envelope(&mut spool, &snapshot.binding, envelope);
     match spool.append(envelope, &snapshot.binding, now) {
         Ok(_) => Ok(delivery_writer),

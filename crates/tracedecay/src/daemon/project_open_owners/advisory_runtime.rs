@@ -10,7 +10,8 @@ use tracedecay_application::advisory::github_runtime::{
     ConfiguredGitHubSourceAccessAuthorityV1, GitHubDiscoveryControlV1,
     GitHubExactCommitDiscoveryOutcomeV1, GitHubProviderLifecycleV1, GitHubSourceAccessAuthorityV1,
     ProfileGitHubReadOnlyCredentialMountOutcomeV1, RegisteredGitHubReadOnlyCredentialV1,
-    discover_exact_commit_pull_request_v1, resolve_registered_github_read_only_credential_v1,
+    discover_exact_commit_pull_request_v1, public_repository_read_credential_v1,
+    resolve_registered_github_read_only_credential_v1,
 };
 use tracedecay_application::advisory::{
     AdvisoryCycleControl, AdvisoryCycleOutcome, AdvisoryCycleRequest, AdvisoryHookDeliveryV1,
@@ -70,10 +71,7 @@ use tracedecay_lsp::{
 };
 use tracedecay_session_memory::context::MonotonicDeadline;
 
-use super::{
-    DaemonInvocationState, POLICY_REVISION_V1, daemon_owned_project_source_access_at,
-    register_semantic_configuration_owners,
-};
+use super::{DaemonInvocationState, POLICY_REVISION_V1, register_semantic_configuration_owners};
 use crate::daemon::context_scout_lifecycle::{
     AuthorityRegistrationV1, register_context_scout_lifecycle_authority,
     unregister_context_scout_lifecycle_authority,
@@ -95,7 +93,8 @@ use tracedecay_daemon_service::{
     DaemonAdvisoryCycleInvocationOwner, DaemonAdvisoryCycleInvocationPort,
     DaemonAdvisoryCycleInvocationRequest, HookOrchestrationRequestV1, HookOrchestrationTriggerV1,
     HookOrchestrationWorkOutcomeV1, advisory_cycle_invocation_result,
-    daemon_operation_event_authority, register_hook_orchestration_runtime,
+    daemon_operation_event_authority, daemon_owned_project_source_access_at,
+    project_open_source_access_authority, register_hook_orchestration_runtime,
     unregister_hook_orchestration_runtime,
 };
 use tracedecay_domain::errors::{Result, TraceDecayError};
@@ -1157,14 +1156,12 @@ async fn register_production_advisory_owner(
     feedback_scope: FeedbackScopeV1,
     lsp_session_factory: Arc<DaemonLspSessionFactory>,
 ) -> Result<()> {
-    let scout_owner =
-        state
-            .graph
-            .context_scout_owner()
-            .cloned()
-            .ok_or_else(|| TraceDecayError::Config {
-                message: "project-open Context Scout owner is unavailable".to_owned(),
-            })?;
+    let scout_owner = state
+        .graph
+        .context_scout_owner()
+        .ok_or_else(|| TraceDecayError::Config {
+            message: "project-open Context Scout owner is unavailable".to_owned(),
+        })?;
     let configuration = state
         .graph
         .configuration_runtime()
@@ -1454,6 +1451,10 @@ async fn register_project_delivery_read_authority(
             gated_project_delivery_read_handle_v1(feedback_scope, gate)
         }
     };
+    let source_access =
+        project_open_source_access_authority().map_err(|error| TraceDecayError::Config {
+            message: format!("project-open delivery source access is invalid: {error}"),
+        })?;
     invocation
         .advisory_runtime_registrar()
         .publish_delivery_read(
@@ -1463,7 +1464,7 @@ async fn register_project_delivery_read_authority(
                 state.scope.clone(),
                 Arc::clone(state.graph.configuration_runtime()),
                 handle,
-                Arc::new(super::DaemonOwnedProjectSourceAccess),
+                Arc::new(source_access),
             ),
         )
         .await
@@ -1497,7 +1498,7 @@ fn resolve_production_github_provider_access(
     project_root: &Path,
     state: &ProjectOpenDependentOwnerState,
 ) -> std::result::Result<ProductionGitHubProviderAccessV1, ProjectDeliveryProviderMountGateV1> {
-    let Some(remote_url) = crate::tracedecay::git_remote_url(project_root) else {
+    let Some(remote_url) = tracedecay_runtime_core::git::git_remote_url(project_root) else {
         return Err(ProjectDeliveryProviderMountGateV1::NoGitRemote);
     };
     let Some((owner, repository)) = super::github_repository_from_remote(&remote_url) else {
@@ -1510,7 +1511,7 @@ fn resolve_production_github_provider_access(
         &repository,
     ) {
         ProfileGitHubReadOnlyCredentialMountOutcomeV1::Public => {
-            GitHubReadOnlyCredentialV1::anonymous()
+            public_repository_read_credential_v1(&owner, &repository)
         }
         ProfileGitHubReadOnlyCredentialMountOutcomeV1::NotConfigured => {
             return Err(ProjectDeliveryProviderMountGateV1::GitHubCredentialNotConfigured);

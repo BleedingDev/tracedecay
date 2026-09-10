@@ -12,6 +12,8 @@
 //! callers use the bounded CLI fallback here for native Git writes, signing,
 //! recovery, and reads where exact porcelain semantics remain the authority.
 
+pub mod churn;
+
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -463,6 +465,26 @@ pub fn git_capture(repo_root: &Path, args: &[&str]) -> Option<String> {
     let text = String::from_utf8(output.stdout).ok()?;
     let trimmed = text.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Reads `remote.origin.url` from the repository at `project_root`.
+///
+/// Prefers an in-process gix config snapshot (repo-local + global) and
+/// falls back to a bounded `git config --get` when gix cannot discover
+/// the repository but git still may.
+pub fn git_remote_url(project_root: &Path) -> Option<String> {
+    if let Ok(repo) = gix::discover(project_root) {
+        let url = repo
+            .config_snapshot()
+            .string("remote.origin.url")?
+            .to_string();
+        let url = url.trim();
+        return (!url.is_empty()).then(|| url.to_string());
+    }
+    if !crate::worktree::git_may_resolve_repo(project_root) {
+        return None;
+    }
+    git_capture(project_root, &["config", "--get", "remote.origin.url"])
 }
 
 /// Outcome of the bounded `git -C` capture used by repository identity lookup.

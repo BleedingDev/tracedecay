@@ -66,7 +66,7 @@
 //! # Where the rules come from
 //!
 //! The credential corpus has exactly one owner. This crate reuses
-//! `tracedecay_runtime_core`'s public detectors rather than re-deriving them,
+//! `tracedecay_session_memory`'s public detectors rather than re-deriving them,
 //! because two divergent gitleaks catalogues is precisely the failure this
 //! pipeline exists to prevent. What that public surface cannot do is enumerate
 //! *every* class one string carries — `detect_secret_like` answers with the
@@ -92,7 +92,7 @@ pub use tracedecay_memory_provider_api::{
     PayloadSanitizationReceiptParts, SanitizationDisposition, WithheldReason,
     derive_withheld_receipt_id,
 };
-use tracedecay_runtime_core::privacy::{MemoryFactSanitizationV1, sanitize_memory_fact_payload};
+use tracedecay_privacy::{MemoryFactSanitizationV1, sanitize_memory_fact_payload};
 
 mod credentials;
 pub mod findings;
@@ -142,7 +142,7 @@ const _: () = assert!(
     "hygiene depth ceiling must clear the canonical store depth ceiling"
 );
 
-/// The exact replacement `tracedecay_runtime_core` writes over a value whose
+/// The exact replacement `tracedecay_privacy` writes over a value whose
 /// object key proved it is a credential.
 ///
 /// It heads [`REDACTION_MARKERS`], the table that attributes a canonical
@@ -772,7 +772,7 @@ pub fn attribute_sanitizer_output(
     Ok(found)
 }
 
-/// The fixed replacement markers `tracedecay_runtime_core`'s redactor writes,
+/// The fixed replacement markers `tracedecay_privacy`'s redactor writes,
 /// paired with the class each one proves.
 ///
 /// These are shared constants in effect but not in scope: the upstream

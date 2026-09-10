@@ -187,6 +187,8 @@ impl DaemonInvocationService {
         admitted_cancellation: Option<CancellationToken>,
         project_admission: Option<&crate::project_runtime::ProjectRuntimeRequestLeaseV1>,
     ) -> DaemonInvocationResponse {
+        // Keep the admitted dispatch frame behind one allocation for every invocation entry point.
+        Box::pin(async move {
         let _dispatch_gauges = InvocationDispatchGaugeGuard::enter();
         let request_id = request.request_id.clone();
         let cancellation_lease = if admitted_cancellation.is_none() {
@@ -318,6 +320,7 @@ impl DaemonInvocationService {
         let work_runtime = runtimes.work;
         let retained_runtime = runtimes.retained;
         let lsp_owner = runtimes.lsp_owner;
+        let source_edit_owner = runtimes.source_edit;
 
         let response = match request.payload {
             DaemonInvocationPayload::GitRead {
@@ -783,6 +786,9 @@ impl DaemonInvocationService {
                 deadline,
                 cancellation,
             } => {
+                let Some(retained_runtime) = retained_runtime else {
+                    return missing_retained_runtime_problem(publication, request_id);
+                };
                 Box::pin(execute_retained_application(
                     request_id,
                     retained_runtime,
@@ -1015,6 +1021,54 @@ impl DaemonInvocationService {
                 }
                 Err(response) => *response,
             },
+            DaemonInvocationPayload::SourceEdit {
+                request,
+                observed_at,
+                deadline,
+                cancellation,
+            } => {
+                execute_source_edit(
+                    request_id,
+                    source_edit_owner,
+                    request,
+                    observed_at,
+                    deadline,
+                    cancellation,
+                )
+                .await
+            }
+            DaemonInvocationPayload::SourceEditReconcile {
+                request,
+                observed_at,
+                deadline,
+                cancellation,
+            } => {
+                execute_source_edit_reconcile(
+                    request_id,
+                    source_edit_owner,
+                    request,
+                    observed_at,
+                    deadline,
+                    cancellation,
+                )
+                .await
+            }
+            DaemonInvocationPayload::SourceEditRollback {
+                request,
+                observed_at,
+                deadline,
+                cancellation,
+            } => {
+                execute_source_edit_rollback(
+                    request_id,
+                    source_edit_owner,
+                    request,
+                    observed_at,
+                    deadline,
+                    cancellation,
+                )
+                .await
+            }
         };
         if is_observable_operation(operation) {
             hotpath::measure_block!(
@@ -1030,6 +1084,7 @@ impl DaemonInvocationService {
             );
         }
         response
+        }).await
     }
 }
 

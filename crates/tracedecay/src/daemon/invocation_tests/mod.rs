@@ -8,6 +8,9 @@ use std::sync::Arc;
 use tracedecay_agent_hosts::agents::context_scout_ports::ContextScoutLifecycleAddressV1;
 use tracedecay_application::feedback::observations::FeedbackObservationEmitterV1;
 use tracedecay_application::lsp_runtime::DaemonLspSessionFactory;
+use tracedecay_application::work::{
+    WorkTaskSessionAdmittedRetrievalPortV1, WorkTaskSessionEvidenceRetrievalV1,
+};
 use tracedecay_contracts::ResolvedScope;
 use tracedecay_contracts::feedback::observations::FeedbackSourceEventV1;
 use tracedecay_daemon_service::{
@@ -26,26 +29,10 @@ use tracedecay_lsp::{
 
 struct DeniedWorkEvidenceRetrieval;
 
-impl tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1
-    for DeniedWorkEvidenceRetrieval
-{
-    fn retrieve_admitted<'a>(
-        &'a self,
-        _context: &'a tracedecay_contracts::RequestContext,
-        _query: tracedecay_session_memory::session::SessionTemporalQuery,
-    ) -> tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalFutureV1<'a>
-    {
-        Box::pin(async {
-            tracedecay_session_runtime::session_retrieval::SessionRetrievalServiceOutcome::Denied
-        })
-    }
-}
+impl WorkTaskSessionAdmittedRetrievalPortV1 for DeniedWorkEvidenceRetrieval {}
 
-pub(super) fn denied_work_evidence_retrieval()
--> crate::daemon::work_evidence_retrieval::DaemonWorkEvidenceRetrievalV1 {
-    crate::daemon::work_evidence_retrieval::DaemonWorkEvidenceRetrievalV1::new(Arc::new(
-        DeniedWorkEvidenceRetrieval,
-    ))
+pub(super) fn denied_work_evidence_retrieval() -> WorkTaskSessionEvidenceRetrievalV1 {
+    WorkTaskSessionEvidenceRetrievalV1::new(Arc::new(DeniedWorkEvidenceRetrieval))
 }
 
 pub(super) fn empty_work_proposal_routing(
@@ -282,8 +269,6 @@ pub(super) fn admitted_root_fixture(name: &str) -> (std::path::PathBuf, String) 
 mod configuration_registrars_tests;
 mod lsp_lease_tests;
 mod lsp_tests;
-mod observability_tests;
-mod primitive_tests;
 mod project_lifecycle_tests;
 mod types_tests;
 mod work_evidence_journey_tests;

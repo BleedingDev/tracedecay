@@ -1,9 +1,5 @@
 #![allow(clippy::too_many_arguments, clippy::collapsible_if)]
 // binary crate: match lib allow policy for CLI dispatch
-// Required for the hotpath feature: layout computation for the boxed
-// `_inner` async body chain reachable from `run()` overflows the default
-// query depth ("query depth increased by 130").
-#![recursion_limit = "256"]
 #[cfg(any(feature = "hotpath", test))]
 use clap::ArgMatches;
 use clap::{CommandFactory, FromArgMatches};
@@ -43,6 +39,7 @@ mod agent_cmd;
 mod analytics_cmd;
 mod automation_cli;
 mod cli;
+mod cloud;
 mod commands;
 mod cost_cmd;
 mod display;
@@ -399,6 +396,18 @@ fn process_exit_code(code: i32) -> ExitCode {
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
+#[cfg(unix)]
+fn restore_sigpipe_default() -> std::io::Result<()> {
+    // SAFETY: `async_main` calls this only after selecting the one-shot tool
+    // client mode, before that mode starts worker threads or writes output.
+    let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    if previous == libc::SIG_ERR {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(any(feature = "hotpath", test))]
 fn hotpath_output_format_is_valid(output_format: Option<&OsStr>) -> bool {
     output_format.is_none_or(|value| {
@@ -621,6 +630,7 @@ fn async_main() -> tracedecay_domain::errors::Result<CommandOutcome> {
     // dashboard bundle; the composition library reads both through this
     // set-once registration.
     tracedecay::register_product_runtime(crate::product_runtime::provider())?;
+    crate::cloud::admit_sync_probes();
     // Every process-global runtime port the extracted crates invert back into
     // the composition root. Must precede argument parsing: hook, install, and
     // ingest paths all read these slots, and an unregistered slot fails quietly
@@ -658,6 +668,14 @@ fn async_main() -> tracedecay_domain::errors::Result<CommandOutcome> {
         }
     };
     normalize_tool_reserved_global_flags(&mut cli);
+    #[cfg(unix)]
+    if matches!(cli.command.as_ref(), Some(Commands::Tool { .. })) {
+        restore_sigpipe_default().map_err(|error| {
+            tracedecay_domain::errors::TraceDecayError::Config {
+                message: format!("failed to configure tool pipeline output: {error}"),
+            }
+        })?;
+    }
     if let Some(Commands::Daemon {
         action:
             DaemonAction::Run {
@@ -728,6 +746,12 @@ fn async_main() -> tracedecay_domain::errors::Result<CommandOutcome> {
         hotpath::val!("cli.command.name").set(&command_name.as_str());
         hotpath::gauge!("process_in_command").set(1);
     }
+    let foreground_daemon = matches!(
+        cli.command.as_ref(),
+        Some(Commands::Daemon {
+            action: DaemonAction::Run { .. }
+        })
+    );
     #[cfg(feature = "hotpath")]
     let result = hotpath::measure_block!(
         "process_command",
@@ -740,7 +764,16 @@ fn async_main() -> tracedecay_domain::errors::Result<CommandOutcome> {
     // Runtime drop waits indefinitely for blocking tasks. Daemon integrations
     // can leave OS-backed watcher work behind after their async handles abort,
     // so bound teardown after the command's own graceful shutdown completes.
-    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    //
+    // The foreground daemon already coordinated every owner with typed
+    // receipts; a blocking task still running here is one its shutdown owner
+    // reported as pending and abandoned at the task-abort deadline. Waiting
+    // for it a second time only spends the supervisor's TERM grace.
+    if foreground_daemon {
+        runtime.shutdown_background();
+    } else {
+        runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    }
     result
 }
 
@@ -912,7 +945,7 @@ pub(crate) async fn resolve_cli_project_root(
     if let Some(root) = resolve_registered_project_root(project_id, project_path).await? {
         return Ok(root);
     }
-    Ok(tracedecay::config::resolve_path_with_discovery(path))
+    Ok(tracedecay_configuration::resolve_path_with_discovery(path))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1292,7 +1325,7 @@ async fn dispatch_runtime_command(command: Commands) -> tracedecay_domain::error
             port,
             open,
         } => {
-            let project_path = tracedecay::config::resolve_path_with_discovery(path);
+            let project_path = tracedecay_configuration::resolve_path_with_discovery(path);
             let result = hotpath::future!(
                 commands::daemon_tool_json(
                     Some(&project_path),
@@ -1373,7 +1406,7 @@ async fn dispatch_runtime_command(command: Commands) -> tracedecay_domain::error
             // The MCP server is long-lived, so it may run the detached
             // structured-row backfill sweep; one-shot CLI/hook processes never
             // do (they would drop the sweep mid-parse on exit).
-            tracedecay::daemon::mark_process_long_lived_for_session_maintenance();
+            tracedecay_store_runtime::mark_process_long_lived_for_session_maintenance();
             hotpath::future!(serve_cmd::run_serve(path, timings), label = "cli.serve.run").await?;
         }
         Commands::Daemon { action } => {
@@ -1394,7 +1427,7 @@ async fn dispatch_daemon_command(action: DaemonAction) -> tracedecay_domain::err
             remote_tls_key,
         } => {
             // Long-lived host: allowed to run the structured-row sweep.
-            tracedecay::daemon::mark_process_long_lived_for_session_maintenance();
+            tracedecay_store_runtime::mark_process_long_lived_for_session_maintenance();
             let socket_path = tracedecay_daemon_control::socket_path_or_default(socket)?;
             let remote_tls = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
                 remote_listen,
@@ -1787,7 +1820,7 @@ async fn dispatch_configuration_command(
 ) -> tracedecay_domain::errors::Result<()> {
     match command {
         Commands::CurrentCounter { path } => {
-            let project_path = tracedecay::config::resolve_path(path);
+            let project_path = tracedecay_configuration::resolve_path(path);
             let result = hotpath::future!(
                 commands::daemon_tool_json(
                     Some(&project_path),
@@ -1806,7 +1839,7 @@ async fn dispatch_configuration_command(
             println!("{value}");
         }
         Commands::ResetCounter { path } => {
-            let project_path = tracedecay::config::resolve_path(path);
+            let project_path = tracedecay_configuration::resolve_path(path);
             let result = commands::daemon_tool_json(
                 Some(&project_path),
                 "tracedecay_admin_project",
@@ -1847,7 +1880,11 @@ async fn dispatch_configuration_command(
 async fn dispatch_diagnostics_command(command: Commands) -> tracedecay_domain::errors::Result<()> {
     match command {
         Commands::Doctor => {
-            hotpath::future!(tracedecay::doctor::run_doctor(), label = "cli.doctor.run").await?;
+            hotpath::future!(
+                tracedecay::doctor::run_doctor(crate::cloud::doctor_network_probes()),
+                label = "cli.doctor.run"
+            )
+            .await?;
         }
         Commands::Cost {
             range,

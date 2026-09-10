@@ -4,11 +4,14 @@
 //! portable broker path. Each entry point owns framing, project-owner routing,
 //! and connection teardown for exactly one client.
 
-use super::profile_host_admission_replay::ProfileHostAdmissionBootstrapStatus;
 use super::projectless::projectless_registered_project_reader_server;
 use super::*;
 use tracedecay_daemon_protocol::DaemonInvocationPayload;
+use tracedecay_daemon_service::ProfileHostAdmissionBootstrapStatus;
 use tracedecay_daemon_service::{DaemonInvocationService, Lease};
+use tracedecay_mcp::BrokerSelectedResponseLease;
+use tracedecay_runtime_core::logging::log_daemon_event;
+use tracedecay_session_memory::context::CancellationToken;
 
 /// Hermetic production-route benchmark support for the typed RMCP transport.
 ///
@@ -16,7 +19,14 @@ use tracedecay_daemon_service::{DaemonInvocationService, Lease};
 /// routing, selected-project response, delivery-settlement, and RMCP adapter
 /// path as the daemon without adding a shipped benchmark API.
 #[cfg(feature = "rmcp-benchmark")]
+#[path = "../../benches/rmcp/benchmark.rs"]
 pub mod rmcp_benchmark;
+
+impl BrokerSelectedResponseLease for crate::mcp::server::SelectedProjectResponseLease {
+    fn response_revoked(&self) -> &CancellationToken {
+        self.revoked()
+    }
+}
 
 type ProjectOwnerAwaitFutureV1<'a, T> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Option<(T, VecDeque<String>)>>> + Send + 'a>,
@@ -151,8 +161,13 @@ fn serve_routed_rmcp_connection_inner(
         for line in pending_lines {
             transport.push_replay(line)?;
         }
-        let adapter =
-            RmcpConnectionAdapter::new(server, timings_enabled, initialize_response_decorator)?;
+        let delivery_settlement_recorder = server.delivery_settlement_recorder.clone();
+        let adapter = RmcpConnectionAdapter::new(
+            ProductionMcpConnectionContext::new(server),
+            timings_enabled,
+            initialize_response_decorator,
+            delivery_settlement_recorder,
+        )?;
         let transport = transport
             .with_rmcp_selected_project_responses(adapter.selected_project_responses())
             .with_rmcp_work_delivery_settlement(adapter.work_delivery_settlement());

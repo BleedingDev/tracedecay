@@ -513,7 +513,7 @@ fn transport_context(
 #[hotpath::measure(label = "usecases.primitives.open_runtime")]
 pub fn open_primitive_project_runtime(
     database: Database,
-    source_runtime: Arc<tracedecay_graph_query::SourceReadRuntime>,
+    source_runtime: Arc<tracedecay_graph_query::SourceReadContext>,
     code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
     symbol_graph_cursors: Arc<dyn SymbolGraphCursorPort>,
     ignored_dependency_admission: Option<Arc<dyn CodeIndexIgnoredDependencyAdmissionPortV1>>,
@@ -559,9 +559,7 @@ pub fn open_primitive_project_runtime(
             Arc::clone(&source_runtime),
             Arc::clone(&code_graph),
         )),
-        Arc::new(TraceDecayComplexityAuthorityV1::new(Arc::clone(
-            &code_graph,
-        ))),
+        Arc::new(TraceDecayComplexityAuthorityV1),
         redundancy,
         Arc::new(TraceDecayDependencyDepthAuthorityV1::new(Arc::clone(
             &code_graph,
@@ -916,7 +914,8 @@ async fn dispatch_admitted(
             let outcome = runtime
                 .project_runtime
                 .source_lines
-                .source_lines(&retrieval_context(&context, &operation), &request);
+                .source_lines(retrieval_context(&context, &operation), &request)
+                .await;
             retrieval_outcome(&runtime.access, &context, &operation, outcome, observed_at)
         }
         PrimitiveRequest::SourceBody(request) => dispatch_extended!(

@@ -1,26 +1,30 @@
 use schemars::JsonSchema;
 use tracedecay_tool_catalog::{
-    AuthorityRequirement, AvailabilityContract, BindingId, BindingStatus, BindingSurface,
-    CancellationContract, CancellationPoint, CapabilityId, CapabilityManifestInputV1,
-    CapabilityManifestV1, CatalogContributionInputV1, CatalogContributionV1, ContributionId,
-    DeadlineBehavior, DeadlineContract, DeniedDisclosurePolicy, EffectClass,
-    ExecutableSchemaAuthority, IdempotencyContract, LifecycleClass, PaginationContract,
-    PrivacyClass, ProfileId, ProtocolRevisionRange, ReceiptContract, ReconciliationContract,
-    RevalidationContract, RevalidationPoint, RoutingContractV1, SchemaId, SchemaRef,
-    ScopeDimension, ScopeRequirement, StreamingContract, SurfaceBindingInputV1, SurfaceBindingV1,
-    SurfaceOperationName, TerminalState, TerminalStateContract, UseCaseId,
+    ApplicationSurfaceOperation, AuthorityRequirement, AvailabilityContract, BindingId,
+    BindingStatus, BindingSurface, CancellationContract, CancellationPoint, CapabilityId,
+    CapabilityManifestInputV1, CapabilityManifestV1, CatalogContributionInputV1,
+    CatalogContributionV1, ContributionId, DeadlineBehavior, DeadlineContract,
+    DeniedDisclosurePolicy, EffectClass, ExecutableSchemaAuthority, IdempotencyContract,
+    LifecycleClass, PaginationContract, PrivacyClass, ProfileId, ProtocolRevisionRange,
+    ReceiptContract, ReconciliationContract, RevalidationContract, RevalidationPoint,
+    RoutingContractV1, SchemaId, SchemaRef, ScopeDimension, ScopeRequirement, StreamingContract,
+    SurfaceBindingInputV1, SurfaceBindingV1, SurfaceOperationName, TerminalState,
+    TerminalStateContract, UseCaseId,
 };
 
-use crate::current_bindings;
+use crate::current_application_bindings;
 use crate::error::ApplicationContractError;
 use crate::handlers::{ApplicationHandlerDescriptor, ApplicationOperation};
 use crate::result::ResultContractRef;
+use crate::surface_contracts::{
+    CodeCalleesSurfaceRequest, CodeExactOccurrenceSurfaceRequest, CodeFacetSurfaceRequest,
+    CodeNavigationSurfaceRequest, CodePhraseSearchSurfaceRequest, CodeTimelineSurfaceRequest,
+};
 
 use super::callable_code::{
     CALLABLE_CODE_OPERATION_COUNT, CallableCodeOperationKind, CallableCodeOperations,
-    CodeFacetRecord, CodeFacetRequest, CodeNavigationRequest, CodeQueryPage, CodeRelationRequest,
-    CodeTimelineRecord, CodeTimelineRequest, ExactOccurrenceRecord, ExactOccurrenceRequest,
-    LexicalOccurrenceRecord, PhraseSearchSurfaceRequest,
+    CodeFacetRecord, CodeQueryPage, CodeTimelineRecord, ExactOccurrenceRecord,
+    LexicalOccurrenceRecord,
 };
 use super::catalog::APPLICATION_DEFAULT_PROFILE_ID;
 use super::symbol_graph::{SymbolPrimitiveRecord, SymbolRelationRecord};
@@ -79,7 +83,14 @@ pub fn callable_code_handler_descriptors()
         .into_iter()
         .filter(|kind| canonical_surface_equivalent(*kind).is_none())
         .map(|kind| {
-            ApplicationHandlerDescriptor::new(
+            let surface_operation = reachable_surface_operation(kind).ok_or(
+                ApplicationContractError::Inconsistent {
+                    field: "callable code surface handler",
+                },
+            )?;
+            ApplicationHandlerDescriptor::for_catalog_operation(
+                surface_operation,
+                "service.application.callable-code",
                 callable_code_operation(kind)?,
                 callable_code_request_schema(kind)?,
                 callable_code_result_schema(kind)?,
@@ -103,9 +114,14 @@ pub fn callable_code_catalog_contribution()
             reachable_surface_operation(kind).ok_or(ApplicationContractError::Inconsistent {
                 field: "callable code surface operation binding",
             })?;
-        let (surface_bindings, mut binding_ids) = current_bindings(
+        let surface_operation = ApplicationSurfaceOperation::from_catalog_name(operation).ok_or(
+            ApplicationContractError::Inconsistent {
+                field: "callable code surface operation identity",
+            },
+        )?;
+        let (surface_bindings, mut binding_ids) = current_application_bindings(
             &code_query_capability_id(kind)?,
-            operation,
+            surface_operation,
             [
                 BindingSurface::Cli,
                 BindingSurface::Mcp,
@@ -148,12 +164,9 @@ pub fn callable_code_catalog_contribution()
 /// Rust-owned request/result schema bodies for every advertised callable-code
 /// query.
 ///
-/// The pairs mirror `CallableCodeQueryService` exactly: each service method
-/// names the request type it validates and the `CodeQueryPage` item type it
-/// returns, so the generated SDKs cannot describe a shape the service does not
-/// produce. Only `code_phrase_search` differs, because its service request
-/// holds a non-serializable sanitized query view and its admitted wire form is
-/// [`PhraseSearchSurfaceRequest`].
+/// Requests use the DTOs consumed by the transport adapter. The application
+/// adds temporal and page controls after parsing; advertising its internal
+/// request instead makes valid catalog-generated calls fail deserialization.
 fn callable_code_executable_schemas(
     contribution: &CatalogContributionV1,
 ) -> Result<Vec<ExecutableSchemaAuthority>, ApplicationContractError> {
@@ -166,7 +179,7 @@ fn callable_code_executable_schemas(
             >(
                 contribution,
                 CallableCodeOperationKind::$kind,
-                concat!("tracedecay_contracts::retrieval::", stringify!($request)),
+                concat!("tracedecay_contracts::surface_contracts::", stringify!($request)),
                 concat!(
                     "tracedecay_contracts::retrieval::CodeQueryPage<tracedecay_contracts::retrieval::",
                     stringify!($item),
@@ -177,21 +190,37 @@ fn callable_code_executable_schemas(
     }
     add!(
         ExactOccurrence,
-        ExactOccurrenceRequest,
+        CodeExactOccurrenceSurfaceRequest,
         ExactOccurrenceRecord
     );
     add!(
         PhraseSearch,
-        PhraseSearchSurfaceRequest,
+        CodePhraseSearchSurfaceRequest,
         LexicalOccurrenceRecord
     );
-    add!(Callees, CodeRelationRequest, SymbolRelationRecord);
-    add!(Facets, CodeFacetRequest, CodeFacetRecord);
-    add!(Timeline, CodeTimelineRequest, CodeTimelineRecord);
-    add!(Declaration, CodeNavigationRequest, SymbolPrimitiveRecord);
-    add!(Definition, CodeNavigationRequest, SymbolPrimitiveRecord);
-    add!(TypeDefinition, CodeNavigationRequest, SymbolPrimitiveRecord);
-    add!(References, CodeNavigationRequest, SymbolRelationRecord);
+    add!(Callees, CodeCalleesSurfaceRequest, SymbolRelationRecord);
+    add!(Facets, CodeFacetSurfaceRequest, CodeFacetRecord);
+    add!(Timeline, CodeTimelineSurfaceRequest, CodeTimelineRecord);
+    add!(
+        Declaration,
+        CodeNavigationSurfaceRequest,
+        SymbolPrimitiveRecord
+    );
+    add!(
+        Definition,
+        CodeNavigationSurfaceRequest,
+        SymbolPrimitiveRecord
+    );
+    add!(
+        TypeDefinition,
+        CodeNavigationSurfaceRequest,
+        SymbolPrimitiveRecord
+    );
+    add!(
+        References,
+        CodeNavigationSurfaceRequest,
+        SymbolRelationRecord
+    );
     Ok(schemas)
 }
 

@@ -759,7 +759,7 @@ impl StoreAdministration {
                 },
             ));
         }
-        crate::daemon::hook_v2_replay::shutdown_hook_v2_replay_consumer(&data_root).await;
+        crate::daemon::hook_v2_replay_consumer::shutdown_hook_v2_replay_consumer(&data_root).await;
         self.project_routes
             .forget_project(identity.profile_id(), project_id)
             .map_err(|error| {
@@ -770,6 +770,10 @@ impl StoreAdministration {
                     error,
                 )
             })?;
+        super::retire_registered_context_scout_owner(
+            &typed_project_id,
+            &data_root.join(crate::config::db_filename(&data_root)),
+        );
         self.git_index_transaction_services
             .retire_project_database(&typed_project_id, &project_sessions_path)
             .await

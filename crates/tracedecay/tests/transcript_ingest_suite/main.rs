@@ -5,10 +5,6 @@
 //! binaries: each integration test binary links the full `tracedecay` crate
 //! separately, and link time dominates Windows CI.
 
-// Full-journey Hotpath builds compose measured provider-ingest futures in each
-// test body; keep the expanded query budget local to this test crate.
-#![recursion_limit = "256"]
-
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -28,5 +24,7 @@ mod hermes;
 mod kiro;
 mod provider_contract;
 mod restart_atomicity;
+mod session_ingest;
 mod source_identity;
 mod vibe;
+mod workflow_ingest;

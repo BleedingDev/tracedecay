@@ -11,7 +11,7 @@ use crate::common::host_sources;
 use tempfile::TempDir;
 use tracedecay_agent_hosts::agents::host_bundle_registry::verified_embedded_host_component_set_with_tracedecay_bin;
 use tracedecay_agent_hosts::agents::host_bundle_v2::{HostBundleComponentV1, HostKindV1};
-use tracedecay_mcp::host_cli::ast_grep_command;
+use tracedecay_runtime_core::ast_grep::ast_grep_command;
 
 // Compiles the generated plugin sources with py_compile (argv[1] is the
 // plugin dir). Only `generated_python_sources_compile` runs this: loading the
@@ -1995,7 +1995,9 @@ fn generated_skill_install_preserves_its_template() {
         "needs_synthesis",
         "tracedecay_sessions_for",
         "tracedecay_workflows",
-        "tracedecay_session_refresh",
+        "tracedecay_session_refresh_begin",
+        "tracedecay_session_refresh_status",
+        "tracedecay_session_refresh_cancel",
     ];
     // Argument defaults and worked guidance belong to the Hermes manual only;
     // the repository skill defers them to the registered tool schemas.

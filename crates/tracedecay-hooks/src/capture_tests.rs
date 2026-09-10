@@ -59,7 +59,7 @@ fn bind(root: &Path) {
 fn capture(
     root: &Path,
     payload: &[u8],
-    deadline: Instant,
+    wait_budget: Duration,
 ) -> Result<HookDeliveryReceiptSpoolV1, NativeHookCaptureOutcomeV1> {
     capture_native_event_with_delivery_writer(
         root,
@@ -67,7 +67,7 @@ fn capture(
         payload,
         material(10),
         UtcMicros(10),
-        deadline,
+        wait_budget,
     )
 }
 #[test]
@@ -77,7 +77,7 @@ fn held_receipt_writer_refuses_before_capture_publication() {
     let owner =
         HookDeliveryReceiptSpoolV1::open(hook_delivery_receipt_spool_root(&root.0, HOST)).unwrap();
     assert_eq!(
-        capture(&root.0, PAYLOAD, Instant::now() + Duration::from_millis(20)).unwrap_err(),
+        capture(&root.0, PAYLOAD, Duration::from_millis(20)).unwrap_err(),
         NativeHookCaptureOutcomeV1::AdmissionTimedOut
     );
     assert!(!root.0.join("hook-v2-spool").exists());
@@ -90,8 +90,7 @@ fn capture_retains_receipt_writer_through_commit() {
     let writer = capture(
         &root.0,
         PAYLOAD,
-        Instant::now()
-            + Duration::from_micros(HookSynchronousDeadlineV1::start().remaining_micros()),
+        Duration::from_micros(HookSynchronousDeadlineV1::start().remaining_micros()),
     )
     .unwrap();
     let receipt_root = hook_delivery_receipt_spool_root(&root.0, HOST);
@@ -143,7 +142,7 @@ fn unbound_unsupported_and_invalid_capture_do_not_create_writers() {
     ] {
         let root = TestDir::new();
         assert_eq!(
-            capture(&root.0, payload, Instant::now()).unwrap_err(),
+            capture(&root.0, payload, Duration::ZERO).unwrap_err(),
             outcome
         );
         assert!(!root.0.exists());
@@ -151,7 +150,7 @@ fn unbound_unsupported_and_invalid_capture_do_not_create_writers() {
     let root = TestDir::new();
     bind(&root.0);
     assert_eq!(
-        capture(&root.0, b"not json", Instant::now()).unwrap_err(),
+        capture(&root.0, b"not json", Duration::ZERO).unwrap_err(),
         NativeHookCaptureOutcomeV1::Rejected
     );
     assert!(!hook_delivery_receipt_spool_root(&root.0, HOST).exists());
@@ -215,8 +214,7 @@ fn full_receipt_queue_refuses_new_event_before_capture() {
         capture(
             &root.0,
             PAYLOAD,
-            Instant::now()
-                + Duration::from_micros(HookSynchronousDeadlineV1::start().remaining_micros())
+            Duration::from_micros(HookSynchronousDeadlineV1::start().remaining_micros())
         )
         .unwrap_err(),
         NativeHookCaptureOutcomeV1::Full
@@ -243,8 +241,7 @@ fn full_receipt_queue_admits_same_identity_retry_without_replacing_evidence() {
         PAYLOAD,
         material(20),
         UtcMicros(20),
-        Instant::now()
-            + Duration::from_micros(HookSynchronousDeadlineV1::start().remaining_micros()),
+        Duration::from_micros(HookSynchronousDeadlineV1::start().remaining_micros()),
     )
     .unwrap();
     assert!(root.0.join("hook-v2-spool").exists());

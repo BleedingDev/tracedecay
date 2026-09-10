@@ -113,7 +113,6 @@ async fn seed_fixture(fixture: &StoreFixture) {
     let memory = fixture
         .graph
         .project_memory_application()
-        .await
         .expect("project memory application");
     for (content, source_label) in [
         (
@@ -165,7 +164,6 @@ async fn direct_search(fixture: &StoreFixture) -> FactStoreSearchResultV1 {
     let memory = fixture
         .graph
         .project_memory_application()
-        .await
         .expect("project memory application");
     let query = ProjectMemoryFactSearchQuery::new(
         fixture.owner.clone(),

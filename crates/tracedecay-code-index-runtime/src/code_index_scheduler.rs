@@ -113,7 +113,7 @@ use tracedecay_code_index_retention::code_index_generations::{
     durable_generation_index_digest, retain_bounded_generation_index,
     try_acquire_code_generation_store_lock, withdraw_verified_text_artifact_under_lock,
 };
-use tracedecay_runtime_core::privacy::CODE_SOURCE_SANITIZER_VERSION_V1;
+use tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1;
 
 /// Std mutex wrapped for Hotpath lock-contention accounting. Condvar-paired
 /// mutexes (the generation-decode barrier and the text-projection slot)
@@ -654,6 +654,13 @@ pub struct DaemonCodeIndexPublicationStoreV1 {
     /// The canonical source-hint authority plus the exact pre-capture epoch
     /// used by a retained rebuild. Ordinary publication leaves this absent.
     reconcile_publication_fence: Option<(Arc<Mutex<PendingHintsV1>>, DaemonCodeIndexControlV1)>,
+    /// The owning worktree's shutdown flag. An initial build has no fence, so
+    /// this is the only cancellation a first seal can observe.
+    shutdown_signal: Option<Arc<AtomicBool>>,
+    /// Test-only: observes every durably published file segment so a test can
+    /// retire the shutdown signal between two segments of one seal.
+    #[cfg(test)]
+    seal_segment_observer: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Last generation handed to `publish_atomically`. A transient store
     /// failure must not drop it: the next undecoded retry republishes this
     /// candidate instead of extracting the whole worktree again.
@@ -941,6 +948,9 @@ impl DaemonCodeIndexPublicationStoreV1 {
             )),
             undecoded_active_expectation: None,
             reconcile_publication_fence: None,
+            shutdown_signal: None,
+            #[cfg(test)]
+            seal_segment_observer: None,
             unpublished_candidate: Arc::new(Mutex::new(None)),
         })
     }
@@ -962,6 +972,44 @@ impl DaemonCodeIndexPublicationStoreV1 {
     ) -> Self {
         self.reconcile_publication_fence = Some((hints, control));
         self
+    }
+
+    fn with_shutdown_signal(mut self, shutting_down: Arc<AtomicBool>) -> Self {
+        self.shutdown_signal = Some(shutting_down);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_seal_segment_observer_for_test(
+        mut self,
+        observer: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.seal_segment_observer = Some(observer);
+        self
+    }
+
+    /// The seal encodes and durably writes one segment per file, so a
+    /// generation-sized worktree spends seconds here with no other
+    /// cancellation point. Daemon shutdown retires the worktree's shutdown
+    /// signal and a retained rebuild's supersession retires its fence;
+    /// checking both before every segment keeps the blocking reconcile pass
+    /// joinable inside the shutdown budget instead of forcing the coordinator
+    /// to abandon it and the runtime teardown to wait for it again.
+    fn seal_checkpoint(&self) -> Result<(), CodeIndexProductionErrorV1> {
+        if self
+            .shutdown_signal
+            .as_ref()
+            .is_some_and(|shutting_down| shutting_down.load(Ordering::Acquire))
+            || self
+                .reconcile_publication_fence
+                .as_ref()
+                .is_some_and(|(_, control)| control.is_cancelled())
+        {
+            return Err(CodeIndexProductionErrorV1::Interrupted(
+                crate::code_index::production::CodeIndexInterruptionV1::Cancelled,
+            ));
+        }
+        Ok(())
     }
 
     fn retained_history(&self) -> Self {
@@ -1636,6 +1684,14 @@ impl DaemonCodeIndexPublicationStoreV1 {
                 );
                 return Ok(None);
             }
+            Err(error @ CodeIndexProductionErrorV1::SealedRowContractRefused { revision, .. }) => {
+                tracing::warn!(
+                    target: "tracedecay::code_index",
+                    sealed_format_revision = revision,
+                    "{error}"
+                );
+                return Ok(None);
+            }
             Err(CodeIndexProductionErrorV1::SourceCommitmentsUnavailable) => return Ok(None),
             Err(error) => return Err(error),
         };
@@ -2293,6 +2349,7 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
             generation.encode_partitioned_sealed_with_parent(
                 parent_manifest_bytes.as_deref(),
                 |publication| {
+                    self.seal_checkpoint()?;
                     match publication {
                         SealedGenerationSegmentPublicationV1::File { digest, bytes } => {
                             let segment_size = u64::try_from(bytes.len()).map_err(|_| {
@@ -2300,10 +2357,17 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
                                     "sealed segment length exceeds u64".to_owned(),
                                 )
                             })?;
-                            self.publish_segment_durable(digest, bytes)
-                                .map_err(|error| {
-                                    CodeIndexProductionErrorV1::Contract(error.to_string())
-                                })?;
+                            hotpath::measure_block!(
+                                "code_index.generation.publish.segment_durable",
+                                self.publish_segment_durable(digest, bytes)
+                            )
+                            .map_err(|error| {
+                                CodeIndexProductionErrorV1::Contract(error.to_string())
+                            })?;
+                            #[cfg(test)]
+                            if let Some(observer) = self.seal_segment_observer.as_ref() {
+                                observer();
+                            }
                             referenced_segment_bytes =
                                 referenced_segment_bytes.saturating_add(segment_size);
                             self.seal_encoded_segment_bytes
@@ -2314,11 +2378,13 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
                             page_digest,
                             bytes,
                         } => {
-                            evidence_pack
-                                .append_page(page_ordinal, page_digest, bytes)
-                                .map_err(|error| {
-                                    CodeIndexProductionErrorV1::Contract(error.to_string())
-                                })?;
+                            hotpath::measure_block!(
+                                "code_index.generation.publish.evidence_page_append",
+                                evidence_pack.append_page(page_ordinal, page_digest, bytes)
+                            )
+                            .map_err(|error| {
+                                CodeIndexProductionErrorV1::Contract(error.to_string())
+                            })?;
                             self.seal_evidence_page_count
                                 .fetch_add(1, Ordering::Relaxed);
                         }
@@ -2327,17 +2393,18 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
                             segment_size_bytes,
                             page_count,
                         } => {
-                            if evidence_pack
-                                .commit(
+                            if hotpath::measure_block!(
+                                "code_index.generation.publish.evidence_commit",
+                                evidence_pack.commit(
                                     &self.segments_root,
                                     segment_digest,
                                     segment_size_bytes,
                                     page_count,
                                 )
-                                .map_err(|error| {
-                                    CodeIndexProductionErrorV1::Contract(error.to_string())
-                                })?
-                            {
+                            )
+                            .map_err(|error| {
+                                CodeIndexProductionErrorV1::Contract(error.to_string())
+                            })? {
                                 self.seal_evidence_durable_transaction_count
                                     .fetch_add(1, Ordering::Relaxed);
                             }
@@ -2351,6 +2418,12 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
         );
         let manifest_bytes = match manifest_bytes {
             Ok(bytes) => bytes,
+            Err(CodeIndexProductionErrorV1::Interrupted(
+                crate::code_index::production::CodeIndexInterruptionV1::Cancelled,
+            )) => {
+                evidence_pack.rollback_unattached(&self.segments_root)?;
+                return Err(CodeIndexPublicationStoreErrorV1::CompareAndSwap);
+            }
             Err(error) => {
                 evidence_pack.rollback_unattached(&self.segments_root)?;
                 return Err(Self::unavailable(error));
@@ -3416,6 +3489,35 @@ pub struct DaemonCodeTextArtifactStoreV1 {
     worktree_id: WorktreeId,
 }
 
+fn text_artifact_resident_memory_charges(
+    requested: NonZeroU64,
+    unmodeled_live_bytes: u64,
+    watermark_headroom: u64,
+) -> Result<(NonZeroU64, NonZeroU64), RetrievalPortError> {
+    let retained = requested
+        .get()
+        .checked_add(unmodeled_live_bytes)
+        .and_then(NonZeroU64::new)
+        .ok_or_else(|| {
+            RetrievalPortError::Contract(
+                "text-artifact resident-memory accounting overflowed".to_owned(),
+            )
+        })?;
+    // Headroom makes the reserve call enforce the lower admission watermark,
+    // but it is not memory owned by this artifact. Retaining it in every
+    // overlapping build charges the same process-wide margin repeatedly.
+    let accounted = retained
+        .get()
+        .checked_add(watermark_headroom)
+        .and_then(NonZeroU64::new)
+        .ok_or_else(|| {
+            RetrievalPortError::Contract(
+                "text-artifact resident-memory accounting overflowed".to_owned(),
+            )
+        })?;
+    Ok((accounted, retained))
+}
+
 impl DaemonCodeTextArtifactStoreV1 {
     fn bind(
         store_root: &Path,
@@ -3439,9 +3541,9 @@ impl DaemonCodeTextArtifactStoreV1 {
 
     /// Reserve one artifact memory ceiling plus the freshly observed process
     /// live set not already represented by reservations for this admission.
-    /// This closes the gap between the modeled ledger and decoded generations
-    /// before the artifact allocates; the retained guard is shrunk back to the
-    /// component's own ceiling once admission-time growth has completed.
+    /// The atomic reserve also includes the process-wide high-watermark
+    /// headroom, then releases that check-only margin before returning while
+    /// the component ceiling and unmodeled live baseline remain charged.
     fn reserve_resident_memory(
         &self,
         generation_id: &CodeGenerationId,
@@ -3473,16 +3575,11 @@ impl DaemonCodeTextArtifactStoreV1 {
             .high_watermark_bytes()
             .min(snapshot.limit_bytes);
         let watermark_headroom = snapshot.limit_bytes.saturating_sub(admission_watermark);
-        let accounted = requested
-            .get()
-            .checked_add(unmodeled_live_bytes)
-            .and_then(|bytes| bytes.checked_add(watermark_headroom))
-            .and_then(NonZeroU64::new)
-            .ok_or_else(|| {
-                RetrievalPortError::Contract(
-                    "text-artifact resident-memory accounting overflowed".to_owned(),
-                )
-            })?;
+        let (accounted, retained) = text_artifact_resident_memory_charges(
+            requested,
+            unmodeled_live_bytes,
+            watermark_headroom,
+        )?;
         hotpath::gauge!("query.artifact.admission.observed_resident_bytes")
             .set(observed_bytes as f64);
         hotpath::gauge!("query.artifact.admission.unmodeled_live_bytes")
@@ -3490,7 +3587,9 @@ impl DaemonCodeTextArtifactStoreV1 {
         hotpath::gauge!("query.artifact.admission.requested_growth_bytes")
             .set(requested.get() as f64);
         hotpath::gauge!("query.artifact.admission.accounted_bytes").set(accounted.get() as f64);
-        self.resident_memory
+        hotpath::gauge!("query.artifact.admission.retained_bytes").set(retained.get() as f64);
+        let mut reservation = self
+            .resident_memory
             .reserve(
                 ResidentMemoryKeyV1 {
                     project_id: self.project_id.clone(),
@@ -3500,7 +3599,13 @@ impl DaemonCodeTextArtifactStoreV1 {
                 },
                 accounted,
             )
-            .map_err(|_| RetrievalPortError::BudgetExceeded)
+            .map_err(|_| RetrievalPortError::BudgetExceeded)?;
+        reservation.shrink_to(retained.get()).map_err(|error| {
+            RetrievalPortError::Contract(format!(
+                "text-artifact resident-memory headroom release failed: {error}"
+            ))
+        })?;
+        Ok(reservation)
     }
 
     /// The durably attached artifact descriptor for one retained generation,
@@ -5679,6 +5784,22 @@ impl SourceFreshnessFenceV1 {
     }
 }
 
+/// What the cheap Git/stat freshness ladder concluded about the retained
+/// owner's source. `Unverified` and `Moved` both require a reconcile, but only
+/// `Moved` is evidence: an owner no pass has verified yet has not been observed
+/// to change, so nothing may be minted from it as an observed source change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshnessProbeVerdictV1 {
+    /// The last reconcile's proof still describes the live worktree.
+    Current,
+    /// No reconcile has verified this owner against source truth yet; the
+    /// worker's pending pass is the remedy.
+    Unverified,
+    /// Git metadata or the sealed-digest witness proves the worktree moved
+    /// since the last reconcile.
+    Moved,
+}
+
 pub struct CodeIndexWorktreeSchedulerV1 {
     project_id: ProjectId,
     project_root: PathBuf,
@@ -5922,11 +6043,13 @@ impl CodeIndexWorktreeSchedulerV1 {
         // freshness probes and sealed-generation decoding belong to the
         // retained background owner after the route is mounted.
         let sanitizer_revision = id::<SanitizerRevision>(CODE_SOURCE_SANITIZER_VERSION_V1)?;
+        let shutting_down = Arc::new(AtomicBool::new(false));
         let publication = DaemonCodeIndexPublicationStoreV1::new(
             &store_root,
             &project_root,
             sanitizer_revision.clone(),
-        )?;
+        )?
+        .with_shutdown_signal(Arc::clone(&shutting_down));
         let production_config = CodeIndexProductionConfigV1 {
             project_id: project_id.clone(),
             repository: repository_id.clone(),
@@ -5981,7 +6104,7 @@ impl CodeIndexWorktreeSchedulerV1 {
             active_snapshot_changed_paths: Mutex::new(None),
             wake,
             epoch,
-            shutting_down: Arc::new(AtomicBool::new(false)),
+            shutting_down,
             reconcile_in_progress: Arc::new(AtomicUsize::new(0)),
             generation_recovery: Arc::new(RwLock::new(None)),
             latest_content_identity,
@@ -7869,6 +7992,45 @@ impl CodeIndexWorktreeSchedulerV1 {
         gix::open(&self.project_root).is_ok()
     }
 
+    /// Run the cheap Git/stat ladder — unverified restore, tier-1 git
+    /// metadata, tier-2 bounded staleness with the source witness — without
+    /// posting a worker wake.
+    ///
+    /// The ladder judges movement from source truth only: Git metadata and the
+    /// stat witness. It deliberately does not compare the cancellation epoch
+    /// against the last reconciled epoch — every epoch advance is paired with
+    /// its own worker wake (a hook hint, an overflow, an observed change), so
+    /// that pending pass is already the remedy. Treating a hint-advanced epoch
+    /// as movement here made a concurrent query escalate the targeted hint
+    /// pass into an overflow rescan and relabel the arrival as its own.
+    fn freshness_probe_verdict(&mut self) -> FreshnessProbeVerdictV1 {
+        let freshness = self.freshness_fence.snapshot();
+        if !freshness.verified_against_source {
+            return FreshnessProbeVerdictV1::Unverified;
+        }
+        if identity::GitMetadataFingerprintV1::capture(&self.project_root)
+            .differs_from(&freshness.git_metadata)
+        {
+            return FreshnessProbeVerdictV1::Moved;
+        }
+        if freshness.last_reconciled_at.elapsed() < self.policy.staleness_threshold {
+            return FreshnessProbeVerdictV1::Current;
+        }
+        if self.source_witness_matches_worktree(&freshness) {
+            self.freshness_fence.refresh_monotonic_clock(true);
+            return FreshnessProbeVerdictV1::Current;
+        }
+        FreshnessProbeVerdictV1::Moved
+    }
+
+    /// Decide whether the cheap Git/stat ladder requires an authoritative
+    /// reconcile, without posting a worker wake. Callers that own a separate
+    /// cadence authority use this split form so they can record the arrival
+    /// before making the worker runnable.
+    pub fn freshness_probe_requires_reconcile(&mut self) -> bool {
+        self.freshness_probe_verdict() != FreshnessProbeVerdictV1::Current
+    }
+
     /// [`Self::ensure_fresh_for_query`] with the O(store) rebuild moved off the
     /// request path.
     ///
@@ -7886,44 +8048,28 @@ impl CodeIndexWorktreeSchedulerV1 {
     /// must answer `false` and wake nothing: the ladder suppressing work is the
     /// common case, and waking the worker on every read would turn each query
     /// into a rebuild trigger — exactly the coupling this change removes.
-    /// Decide whether the cheap Git/stat ladder requires an authoritative
-    /// reconcile, without posting a worker wake. Callers that own a separate
-    /// cadence authority use this split form so they can record the arrival
-    /// before making the worker runnable.
     ///
-    /// The ladder judges movement from source truth only: Git metadata and the
-    /// stat witness. It deliberately does not compare the cancellation epoch
-    /// against the last reconciled epoch — every epoch advance is paired with
-    /// its own worker wake (a hook hint, an overflow, an observed change), so
-    /// that pending pass is already the remedy. Treating a hint-advanced epoch
-    /// as movement here made a concurrent query escalate the targeted hint
-    /// pass into an overflow rescan and relabel the arrival as its own.
-    pub fn freshness_probe_requires_reconcile(&mut self) -> bool {
-        let freshness = self.freshness_fence.snapshot();
-        if !freshness.verified_against_source
-            || identity::GitMetadataFingerprintV1::capture(&self.project_root)
-                .differs_from(&freshness.git_metadata)
-        {
-            return true;
-        }
-        if freshness.last_reconciled_at.elapsed() < self.policy.staleness_threshold {
-            return false;
-        }
-        if self.source_witness_matches_worktree(&freshness) {
-            self.freshness_fence.refresh_monotonic_clock(true);
-            return false;
-        }
-        true
-    }
-
+    /// Only proven movement is recorded as an observed source change. An owner
+    /// nothing has verified yet — a fresh mount or restart whose first pass is
+    /// still pending — answers "not current" so the caller posts its plain
+    /// query-admission wake, but nothing was observed to move, so no overflow
+    /// hint, observed-change marker, or cancellation epoch is minted for it.
+    /// Fabricating that overflow made the restart's own verifying pass skip
+    /// the sealed-digest witness a quiet tree would have satisfied and fall
+    /// into the full sealed-generation replay the revision-7 verified-head
+    /// recovery exists to avoid.
     pub fn request_fresh_for_query_background(&mut self) -> bool {
-        if !self.freshness_probe_requires_reconcile() {
-            return false;
+        match self.freshness_probe_verdict() {
+            FreshnessProbeVerdictV1::Current => false,
+            FreshnessProbeVerdictV1::Unverified => true,
+            FreshnessProbeVerdictV1::Moved => {
+                // The ladder proved this worktree moved, so this is the wake
+                // that may advance the canonical change generation and
+                // supersede index work.
+                self.request_background_reconcile_for_observed_change();
+                true
+            }
         }
-        // The ladder proved this worktree moved, so this is the wake that may
-        // advance the canonical change generation and supersede index work.
-        self.request_background_reconcile_for_observed_change();
-        true
     }
 
     /// The exact identity this scheduler is currently bound to.
@@ -8950,6 +9096,7 @@ mod tests;
 
 mod activation;
 pub mod branch_generations;
+pub mod branch_publication;
 mod cadence;
 mod classification;
 mod freshness_witness;

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::path::Path;
 
 use tracedecay_code_index_runtime::code_index_scheduler;
@@ -49,6 +51,7 @@ async fn files_for_session(
         .expect("files response")
 }
 
+#[cfg(unix)]
 async fn wait_for_exact_interactive_graph_ready(
     engine: &DaemonEngine,
     scope: &tracedecay_contracts::ResolvedScope,
@@ -75,7 +78,6 @@ async fn wait_for_exact_interactive_graph_ready(
 /// `<root>/linked` whose checkout differs from the primary's: the primary
 /// owns `README.md` and `primary.rs`, the linked worktree owns `linked.rs`,
 /// so a listing that leaks across routes is observable.
-#[cfg(unix)]
 fn create_linked_worktree_fixture(root: &Path) -> (PathBuf, PathBuf) {
     let primary = root.join("primary");
     let linked = root.join("linked");
@@ -109,7 +111,6 @@ fn create_linked_worktree_fixture(root: &Path) -> (PathBuf, PathBuf) {
     (primary, linked)
 }
 
-#[cfg(unix)]
 fn files_listing_text(response: &tracedecay_mcp::JsonRpcResponse) -> &str {
     assert!(
         response.error.is_none(),
@@ -124,7 +125,6 @@ fn files_listing_text(response: &tracedecay_mcp::JsonRpcResponse) -> &str {
         .unwrap_or_else(|| panic!("files response must contain text: {response:?}"))
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn concurrent_same_identity_worktrees_keep_exact_server_and_scheduler_bindings() {
     let home = TempDir::new().expect("isolated home");
@@ -470,6 +470,22 @@ async fn concurrent_same_identity_worktrees_keep_exact_server_and_scheduler_bind
             .is_some_and(|marker| marker.project_id == stale_project_id),
         "routing must ignore, not rewrite or delete, a stale legacy worktree-local marker"
     );
+    // Every whole-worktree demand the daemon raised for the linked route on
+    // its own — both full servers' startup catch-up and the `workspaceOpen`
+    // hook above — is automatic and stays behind the watch opt-in, so the
+    // route never mounts a scheduler, let alone publishes a generation. The
+    // refusal asserted earlier is therefore a property of the route, not of
+    // whether the follow-up read raced an index the daemon should never have
+    // started.
+    assert!(
+        engine
+            .invocation
+            .code_index_schedulers
+            .scheduler_handle(&linked)
+            .await
+            .is_none(),
+        "a linked worktree without the watch opt-in must never mount a code-index scheduler"
+    );
     tokio::time::timeout(std::time::Duration::from_secs(5), engine.shutdown_all())
         .await
         .expect("linked-worktree shutdown must remain bounded");
@@ -481,7 +497,6 @@ async fn concurrent_same_identity_worktrees_keep_exact_server_and_scheduler_bind
 /// automatic indexing, seats its own generation, serves its own census (never
 /// the primary's), reopens through the retained canonical runtime, and shuts
 /// down within the same bound — all concurrently with the primary route.
-#[cfg(unix)]
 #[tokio::test]
 async fn opted_in_linked_worktree_indexes_reopens_and_shuts_down_beside_primary() {
     let home = TempDir::new().expect("isolated home");

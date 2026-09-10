@@ -1,3 +1,5 @@
+// Its own test binary, not a core_cli_suite module: the conformance run sets and
+// restores process environment variables in-process.
 //! Conformance contract for every `RouteExposureV1::Public` executable binding.
 //!
 //! Each available executable binding advertises a public route path to clients.
@@ -55,13 +57,13 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Map, Value};
 use tempfile::TempDir;
 use tower::ServiceExt;
-use tracedecay::application_surface::http_application_router;
 use tracedecay::config::USER_DATA_DIR_ENV;
 use tracedecay_application::operation_stream::OperationEventAuthority;
 use tracedecay_contracts::{
     EXECUTION_TOPOLOGY_DESCRIPTOR_REVISION_V1, EXECUTION_TOPOLOGY_METRIC_DESCRIPTORS_V1,
     work_executable_binding_registry,
 };
+use tracedecay_daemon_service::application_surface::http_application_router;
 use tracedecay_domain::ProjectId;
 use tracedecay_runtime_core::storage::PrivateStoreIo;
 use tracedecay_tool_catalog::RouteExposureV1;

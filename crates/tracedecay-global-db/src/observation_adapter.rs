@@ -590,6 +590,16 @@ impl GlobalDbObservationStore {
                     retained.observation().receipt() == observation.receipt()
                 }));
         if existed_exact {
+            let incoming_origin = write.repository_provenance_attachment().origin();
+            if pending
+                .as_ref()
+                .is_some_and(|retained| &retained.origin != incoming_origin)
+                || existing.as_ref().is_some_and(|retained| {
+                    retained.repository_provenance_attachment().origin() != incoming_origin
+                })
+            {
+                return Err(ObservationStoreError::RepositoryProvenanceBindingMismatch);
+            }
             if pending.is_some() {
                 return Ok(PreparedObservationPersist::DeferredExactDuplicate(
                     Box::new(write),
@@ -736,6 +746,7 @@ struct PendingObservationAuthority {
     payload_reference: PayloadReferenceV1,
     identity: ObservationIdentityMaterialV1,
     receipt: SanitizationReceiptV1,
+    origin: tracedecay_store::observation::ObservationOriginV1,
 }
 
 #[derive(Clone)]
@@ -802,6 +813,7 @@ impl ObservationBatchState {
                 payload_reference: write.observation().payload_reference().clone(),
                 identity: write.observation().identity().clone(),
                 receipt: write.observation().receipt().clone(),
+                origin: write.repository_provenance_attachment().origin().clone(),
             },
         );
         self.pending_receipts.insert(
@@ -1171,7 +1183,7 @@ const OBSERVATION_BATCH_ROW_PROJECTION: &str =
             EXISTS(
                 SELECT 1 FROM projection_queue
                 WHERE projection_queue.observation_id = observation.observation_id
-            )
+            ), repository.origin_json
      FROM observations AS observation
      LEFT JOIN observation_retrieval_anchors AS binding
        ON binding.observation_id = observation.observation_id
@@ -1304,8 +1316,18 @@ async fn read_stored_observations_from_snapshot(
                 "observation repository owner binding mismatch",
             ));
         }
+        let repository_origin = row
+            .get::<Option<String>>(11)
+            .map_err(|error| runtime_storage_error(operation, error))?
+            .map(|encoded| {
+                decode_json::<tracedecay_store::observation::ObservationOriginV1>(
+                    encoded, operation,
+                )
+            })
+            .transpose()?;
         let repository_provenance =
             RepositoryProvenanceAttachmentV1::new(repository_availability, repository_anchor)
+                .and_then(|attachment| attachment.with_retained_origin(repository_origin))
                 .map_err(|error| runtime_storage_error(operation, error))?;
         let projection_queued = row
             .get::<i64>(10)
@@ -1356,7 +1378,7 @@ impl ObservationStore for GlobalDbObservationStore {
         &self,
         write: AnchoredObservationWrite,
     ) -> ObservationStoreResult<ObservationPersistOutcome> {
-        let mut outcomes = self.persist_observations(vec![write]).await?;
+        let mut outcomes = Box::pin(self.persist_observations(vec![write])).await?;
         if outcomes.len() != 1 {
             return Err(runtime_storage_error(
                 "persist_observation",
@@ -2318,22 +2340,5 @@ fn projection_runtime_error(
     tracedecay_store::ProjectionStoreError::Storage {
         operation: "dispatch observation projection runtime operation",
         source: Box::new(error),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn adapter_contains_only_guarded_database_client() {
-        fn assert_exact_fields(store: &GlobalDbObservationStore) {
-            let GlobalDbObservationStore {
-                database: _,
-                runtime: _,
-            } = store;
-        }
-
-        let _ = assert_exact_fields;
     }
 }

@@ -11,7 +11,7 @@ use super::super::git_correlation::{
 use super::super::registered_db::{
     SessionExec, SessionRegisteredDb, SessionStoreAccess, SessionWriteTxn,
 };
-use super::super::shared::path_identity_key;
+use super::super::shared::{durable_project_path_key, path_identity_key};
 use super::codex_goal_reconciliation::find_preceding_codex_goal_response;
 use super::types::{TranscriptBatch, TranscriptPersistenceError};
 
@@ -358,7 +358,7 @@ impl<D: SessionRegisteredDb + Sync> SessionStoreAccess<'_, D> {
                 ),
             ));
         }
-        let canonical_project_path = path_identity_key(project_path);
+        let canonical_project_path = durable_project_path_key(project_path);
         let transaction = self.begin_transcript_transaction().await?;
         // The conflict predicate and NULL-only fill share the writer lease
         // with insertion, so competing sources cannot replace the winner.
@@ -432,7 +432,7 @@ impl<D: SessionRegisteredDb + Sync> SessionStoreAccess<'_, D> {
                 session.provider.clone(),
                 session.session_id.clone(),
                 session.project_key.clone(),
-                path_identity_key(&session.project_path),
+                durable_project_path_key(&session.project_path),
                 session.title.clone(),
                 session.started_at,
                 session.ended_at,

@@ -29,7 +29,7 @@ ORDER = ((0, 1, 2, 3), (1, 3, 0, 2), (3, 2, 1, 0), (2, 0, 3, 1))
 TOKENIZER = {"identity": "tiktoken.o200k_base", "revision": "tiktoken-rs-0.12"}
 LABELS = {"useful", "harmful", "stale", "irrelevant", "unverifiable", "indeterminate", "missing"}
 BUDGETS = {"requested_candidates": 8, "effective_candidates": 5,
-           "advisory_tokens": 1024, "total_context_tokens": 128000,
+           "advisory_tokens": 8192, "total_context_tokens": 128000,
            "provider_deadline_ms": 5000, "advisory_slice_ms": 2000}
 
 
@@ -240,7 +240,7 @@ def validate_delivery(delivery, lane):
     for field in ("final_tokens", "canonical_tokens", "advisory_tokens", "candidate_body_tokens"):
         require(isinstance(delivery.get(field), int) and not isinstance(delivery[field], bool)
                 and delivery[field] >= 0, f"missing exact tokenizer count: {field}")
-    require(delivery["final_tokens"] <= 128000 and delivery["advisory_tokens"] <= 1024,
+    require(delivery["final_tokens"] <= 128000 and delivery["advisory_tokens"] <= 8192,
             "delivered context exceeds frozen quota")
     ledger = delivery["candidates"]
     require(len({c["candidate_ref"] for c in ledger}) == len(ledger), "duplicate candidate ledger entry")

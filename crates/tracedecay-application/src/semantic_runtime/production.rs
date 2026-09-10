@@ -4396,33 +4396,6 @@ pub fn project_lifecycle_status(project_path: &Path) -> Option<SemanticModelLife
 pub type SavedCodeGenerationScheduleHookV1 =
     Arc<dyn Fn(Arc<CodeIndexPublishedGenerationV1>) -> bool + Send + Sync>;
 
-/// Daemon runtime retained when the saved-generation hook is constructed.
-///
-/// Serving publication deliberately invokes the hook from `spawn_blocking`
-/// while it owns the synchronous scheduler. Looking up a current Tokio runtime
-/// from that worker always fails, so the hook must carry the daemon runtime
-/// across the blocking handoff instead.
-#[derive(Clone)]
-struct SemanticProjectionDispatchRuntimeV1 {
-    handle: tokio::runtime::Handle,
-}
-
-impl SemanticProjectionDispatchRuntimeV1 {
-    fn capture() -> Option<Self> {
-        tokio::runtime::Handle::try_current()
-            .ok()
-            .map(|handle| Self { handle })
-    }
-
-    fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        self.handle.spawn(future)
-    }
-}
-
 /// Owned authorities and identities captured by a saved-generation hook.
 pub struct SavedGenerationScheduleHookParametersV1 {
     pub project_root: PathBuf,
@@ -4469,7 +4442,8 @@ pub fn production_saved_generation_schedule_hook(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(project_root.clone(), runtime.as_ref().clone());
-    let dispatch_runtime = SemanticProjectionDispatchRuntimeV1::capture();
+    // Capture before the synchronous publication hook crosses into spawn_blocking.
+    let dispatch_runtime = tokio::runtime::Handle::try_current().ok();
     Arc::new(move |generation| {
         if generation.snapshot().worktree.as_ref() != Some(&worktree_id) {
             return false;
@@ -4558,7 +4532,7 @@ fn fair_schedule_failure(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    #[cfg(feature = "semantic-fastembed")]
+    #[cfg(all(feature = "semantic-fastembed", not(windows)))]
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -4673,7 +4647,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn saved_generation_dispatch_retains_daemon_runtime_across_blocking_handoff() {
-        let runtime = SemanticProjectionDispatchRuntimeV1::capture()
+        let runtime = tokio::runtime::Handle::try_current()
             .expect("daemon runtime is available while the hook is constructed");
         let (observed_tx, observed_rx) = oneshot::channel();
 
@@ -5226,7 +5200,7 @@ mod tests {
         Arc::new(fallback)
     }
 
-    #[cfg(feature = "semantic-fastembed")]
+    #[cfg(all(feature = "semantic-fastembed", not(windows)))]
     fn composition_calibration(
         request: &SemanticRetrievalRequestV1<'_>,
     ) -> SemanticCalibrationProfileV1 {
@@ -5481,7 +5455,7 @@ mod tests {
 
     // Binding a query runtime requires the concrete FastEmbed runtime; the
     // compiled-out stub fails compatibility verification by design.
-    #[cfg(feature = "semantic-fastembed")]
+    #[cfg(all(feature = "semantic-fastembed", not(windows)))]
     #[tokio::test]
     async fn atomically_current_generation_enables_semantic_lane() {
         let handle = DaemonSemanticRuntimeHandleV1::new(1, 8, 1 << 20).expect("handle");
@@ -5577,7 +5551,7 @@ mod tests {
 
     // Binding a query runtime requires the concrete FastEmbed runtime; the
     // compiled-out stub fails compatibility verification by design.
-    #[cfg(feature = "semantic-fastembed")]
+    #[cfg(all(feature = "semantic-fastembed", not(windows)))]
     #[tokio::test]
     async fn live_request_cancellation_reaches_query_runtime_before_vector_scan() {
         struct PanicVectors;

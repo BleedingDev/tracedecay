@@ -1,15 +1,20 @@
 use rusqlite::Connection;
 use serde_json::json;
 use tracedecay_domain::{
-    CanonicalObservationEnvelopeV1, CanonicalObservationEvidenceV1, CanonicalObservationFactV1,
-    CanonicalObservationRelationsV1, ComponentVersion, FactOwnerV1, ObservationId,
-    ObservationIdentityMaterialV1, ObservationOrderingDomainV1, ObservationScopeV1,
-    ObservationSourceCursorV1, ObservationSourceGenerationV1, ObservationSourceIdentityV1,
-    ObservationSourceRangeV1, PayloadReferenceV1, ProjectId, ProjectionGenerationId, ProviderId,
-    ProviderUsageContractDimensionV1, RetentionClass, SanitizationReceiptId,
-    SanitizationReceiptRefV1, SanitizationReceiptV1, SanitizerDispositionV1, SensitivityV1,
-    SessionId, UtcMicros,
+    AnchorDurabilityClass, AnchorSourceGenerationV2, CanonicalObservationEnvelopeV1,
+    CanonicalObservationEvidenceV1, CanonicalObservationFactV1, CanonicalObservationRelationsV1,
+    ComponentVersion, CoverageReportV1, EvidenceAvailabilityV1, EvidenceClass, FactOwnerV1,
+    GenerationBoundRepositoryProvenanceV1, ObservationId, ObservationIdentityMaterialV1,
+    ObservationOrderingDomainV1, ObservationScopeV1, ObservationSourceCursorV1,
+    ObservationSourceGenerationV1, ObservationSourceIdentityV1, ObservationSourceRangeV1,
+    PayloadAccessState, PayloadReferenceV1, PrivacyDomainBoundLocatorDigest, ProjectId,
+    ProjectionGenerationId, ProviderId, ProviderUsageContractDimensionV1, RefId,
+    RepositoryEvidenceV1, RepositoryId, RepositoryProvenanceV1, RepositoryRemoteIdentityV1,
+    RetentionClass, RetrievalAnchorRecordV2, RetrievalAnchorRecordV2Parts, RetrievalAnchorTargetV2,
+    SanitizationReceiptId, SanitizationReceiptRefV1, SanitizationReceiptV1, SanitizerDispositionV1,
+    SensitivityV1, SessionId, UtcMicros, VectorWatermark,
 };
+use tracedecay_store::observation::ObservationOriginV1;
 use tracedecay_store::{
     AnchorDispositionReasonClassV1, AnchorDispositionStateV1, AnchoredObservationWrite,
     CursorAdvanceLedgerReasonV1, CursorAdvanceLedgerReceiptIdV1, ObservationCoverageReason,
@@ -145,8 +150,245 @@ fn semantic_anchor_replay_ignores_local_ingest_clock() {
     );
 }
 
+fn repository_write(
+    clock: i64,
+    branch: &str,
+    evidence_class: EvidenceClass,
+) -> AnchoredObservationWrite {
+    let write = anchored_at(
+        observation_write("repository replay", "receipt.repository-replay"),
+        UtcMicros(clock),
+    );
+    let capture = RepositoryProvenanceV1::new(
+        RepositoryId::new("repository.fixture").unwrap(),
+        Some(ProjectId::new("project.fixture").unwrap()),
+        None,
+        PrivacyDomainBoundLocatorDigest::new(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap(),
+        RepositoryEvidenceV1::new(
+            EvidenceAvailabilityV1::Known(RefId::new(branch).unwrap()),
+            EvidenceAvailabilityV1::Unborn,
+            EvidenceAvailabilityV1::Unavailable,
+            EvidenceAvailabilityV1::Unknown,
+            RepositoryRemoteIdentityV1::Unknown,
+            EvidenceAvailabilityV1::Unknown,
+        )
+        .unwrap(),
+        UtcMicros(clock),
+    )
+    .unwrap();
+    let binding = GenerationBoundRepositoryProvenanceV1::new(
+        write.projection_generation().clone(),
+        capture,
+        Some(write.observation().observation_id().clone()),
+    )
+    .unwrap();
+    let anchor = RetrievalAnchorRecordV2::new(RetrievalAnchorRecordV2Parts {
+        target: RetrievalAnchorTargetV2::RepositoryCapture {
+            repository_id: binding.capture().repository_id().clone(),
+            capture_id: binding.capture_id().clone(),
+            receipt: write.observation().receipt().receipt().clone(),
+        },
+        owner: write.observation().scope().clone(),
+        aliases: vec![],
+        occurred_at: None,
+        ingested_at: UtcMicros(clock),
+        evidence_class,
+        source_generation: AnchorSourceGenerationV2::RepositoryCapture(
+            binding.capture_id().clone(),
+        ),
+        projection_generation: write.projection_generation().clone(),
+        projection_watermark: VectorWatermark::default(),
+        coverage: CoverageReportV1::default(),
+        source_observations: vec![write.observation().observation_id().clone()],
+        source_anchors: vec![],
+        authorization: write.retrieval_anchor().authorization().clone(),
+        payload_access: PayloadAccessState::Eligible,
+        retention_class: write.observation().retention_class().clone(),
+        durability: AnchorDurabilityClass::DurableEvidence,
+    })
+    .unwrap();
+    write
+        .with_repository_provenance_attachment(EvidenceAvailabilityV1::Known(binding), Some(anchor))
+        .unwrap()
+}
+
+#[test]
+fn repository_capture_replay_preserves_first_receipt_and_refuses_changed_evidence() {
+    let mut connection = connection();
+    let first = repository_write(1, "refs/heads/main", EvidenceClass::Observed);
+    let replay = repository_write(2, "refs/heads/main", EvidenceClass::Observed);
+    assert_eq!(first.observation(), replay.observation());
+    assert_ne!(
+        first.repository_provenance_attachment(),
+        replay.repository_provenance_attachment()
+    );
+    execute(&mut connection, &first).unwrap();
+    let request = ObservationReadOperationV1::Observation {
+        observation_id: first.observation().observation_id().clone(),
+    };
+    let retained = read(&mut connection, &request).unwrap();
+    execute(&mut connection, &replay).expect("same evidence with a new capture clock must replay");
+    assert_eq!(read(&mut connection, &request).unwrap(), retained);
+    let changed = repository_write(3, "refs/heads/other", EvidenceClass::Observed);
+    assert!(
+        execute(&mut connection, &changed).is_err(),
+        "different repository evidence must remain a conflict"
+    );
+    assert_eq!(read(&mut connection, &request).unwrap(), retained);
+    let changed_authority = repository_write(4, "refs/heads/main", EvidenceClass::Inferred);
+    assert!(
+        execute(&mut connection, &changed_authority).is_err(),
+        "same repository evidence with changed anchor authority must remain a conflict"
+    );
+    assert_eq!(read(&mut connection, &request).unwrap(), retained);
+}
+
+fn recorded_repository_write(clock: i64, authority_ref: &str) -> AnchoredObservationWrite {
+    let write = repository_write(clock, "refs/heads/main", EvidenceClass::Observed);
+    let attachment = write
+        .repository_provenance_attachment()
+        .clone()
+        .with_recorded_origin(
+            authority_ref.to_owned(),
+            write.observation().identity().clone(),
+        )
+        .unwrap();
+    write
+        .with_original_repository_provenance_attachment(attachment)
+        .unwrap()
+}
+
+#[test]
+fn recorded_origin_survives_reopen_and_replay_without_accepting_changed_proof() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let path = directory.path().join("observations.sqlite3");
+    let first = recorded_repository_write(1, "live-event:original");
+    let request = ObservationReadOperationV1::Observation {
+        observation_id: first.observation().observation_id().clone(),
+    };
+    let mut connection = initialize_connection(Connection::open(&path).unwrap());
+    execute(&mut connection, &first).unwrap();
+    drop(connection);
+
+    let mut connection = Connection::open(&path).unwrap();
+    let point = read(&mut connection, &request).unwrap();
+    let ObservationReadResultV1::Observation(row) = &point else {
+        panic!("expected a point read");
+    };
+    assert_eq!(
+        &row.as_ref().as_ref().unwrap().repository_provenance,
+        first.repository_provenance_attachment()
+    );
+    let ObservationReadResultV1::Replay(rows) = read(
+        &mut connection,
+        &ObservationReadOperationV1::Replay {
+            after_sequence: 0,
+            limit: 10,
+        },
+    )
+    .unwrap() else {
+        panic!("expected replay rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        &rows[0].repository_provenance,
+        first.repository_provenance_attachment()
+    );
+
+    execute(
+        &mut connection,
+        &recorded_repository_write(2, "live-event:original"),
+    )
+    .expect("capture clock normalization must preserve the same retained proof");
+    assert!(
+        execute(
+            &mut connection,
+            &recorded_repository_write(3, "live-event:changed"),
+        )
+        .is_err(),
+        "capture clock normalization must not accept a different proof"
+    );
+    assert_eq!(read(&mut connection, &request).unwrap(), point);
+
+    let foreign_identity = observation_write_at("foreign", "receipt.foreign", 2, 0, 1, None)
+        .observation()
+        .identity()
+        .clone();
+    let tampered = ObservationOriginV1::Recorded {
+        authority_ref: "live-event:original".to_owned(),
+        source_identity: foreign_identity,
+    };
+    connection
+        .execute(
+            "UPDATE observation_repository_provenance SET origin_json = ?1",
+            [serde_json::to_string(&tampered).unwrap()],
+        )
+        .unwrap();
+    assert!(
+        read(&mut connection, &request).is_err(),
+        "a retained proof for another source generation must fail read validation"
+    );
+}
+
+#[test]
+fn null_legacy_origin_keeps_constructor_default_and_cannot_gain_a_proof_on_replay() {
+    for write in [
+        repository_write(1, "refs/heads/main", EvidenceClass::Observed),
+        anchored_observation_write("legacy unavailable", "receipt.legacy-unavailable"),
+    ] {
+        let mut connection = connection();
+        execute(&mut connection, &write).unwrap();
+        connection
+            .execute(
+                "UPDATE observation_repository_provenance SET origin_json = NULL",
+                [],
+            )
+            .unwrap();
+        let request = ObservationReadOperationV1::Observation {
+            observation_id: write.observation().observation_id().clone(),
+        };
+        let ObservationReadResultV1::Observation(row) = read(&mut connection, &request).unwrap()
+        else {
+            panic!("expected a legacy point read");
+        };
+        assert_eq!(
+            row.unwrap().repository_provenance.origin(),
+            write.repository_provenance_attachment().origin()
+        );
+        execute(&mut connection, &write).expect("unchanged legacy evidence can replay");
+        if write
+            .repository_provenance_attachment()
+            .provenance()
+            .is_some()
+        {
+            assert!(
+                execute(
+                    &mut connection,
+                    &recorded_repository_write(2, "live-event:new"),
+                )
+                .is_err(),
+                "a duplicate cannot invent recorded origin for an old row"
+            );
+        }
+        let origin: Option<String> = connection
+            .query_row(
+                "SELECT origin_json FROM observation_repository_provenance",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(origin.is_none());
+    }
+}
+
 fn connection() -> Connection {
-    let connection = Connection::open_in_memory().unwrap();
+    initialize_connection(Connection::open_in_memory().unwrap())
+}
+
+fn initialize_connection(connection: Connection) -> Connection {
     connection
         .execute_batch(
             "CREATE TABLE sanitization_receipts (
@@ -207,7 +449,8 @@ fn connection() -> Connection {
                     availability_json TEXT NOT NULL,
                     capture_json TEXT,
                     retrieval_anchor_id TEXT UNIQUE,
-                    owner_json TEXT
+                    owner_json TEXT,
+                    origin_json TEXT CHECK(origin_json IS NULL OR json_valid(origin_json))
                  );
                  CREATE TABLE observation_projection_checkpoints (
                     projector_version TEXT PRIMARY KEY,

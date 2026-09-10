@@ -595,7 +595,7 @@ pub(super) fn validate(
         data["advisory_review_sha256"] == review_sha256
             && advisory_tokens == delivery.advisory_tokens
             && number(&data["advisory_tokens"])? == advisory_tokens
-            && advisory_tokens <= 1_024,
+            && advisory_tokens <= 8_192,
         "advisory review digest/count/quota mismatch",
     )?;
     let emitted = match advisory_value.and_then(|v| v.get("candidates")) {

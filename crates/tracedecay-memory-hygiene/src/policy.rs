@@ -228,7 +228,7 @@ impl HygieneClass {
     /// Maps a reason string from the canonical credential detector onto a class.
     ///
     /// The reasons are the exact strings
-    /// `tracedecay_runtime_core::memory::hygiene::detect_secret_like` returns;
+    /// `tracedecay_session_memory::memory::hygiene::detect_secret_like` returns;
     /// an unrecognised reason means the shared corpus grew a class this policy
     /// has not yet ruled on, which is treated as detector unavailability so the
     /// pipeline fails closed rather than silently admitting it.

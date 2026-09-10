@@ -191,7 +191,7 @@ fn delivered_candidates(
             .collect::<String>()
             != delivery.final_text
         || delivery.final_tokens > 128_000
-        || delivery.advisory_tokens > 1_024
+        || delivery.advisory_tokens > 8_192
         || exact_tokens(&delivery.final_text)? != delivery.final_tokens
         || exact_tokens(&section_text("canonical"))? != delivery.canonical_tokens
         || exact_tokens(&section_text("advisory"))? != delivery.advisory_tokens

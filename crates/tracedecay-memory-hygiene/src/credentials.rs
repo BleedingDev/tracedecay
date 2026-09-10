@@ -1,6 +1,6 @@
 //! Every credential class one string carries, not just the first one.
 //!
-//! `tracedecay_runtime_core::memory::hygiene::detect_secret_like` is the single
+//! `tracedecay_session_memory::memory::hygiene::detect_secret_like` is the single
 //! owner of the credential corpus, and this crate keeps it that way. Its public
 //! answer, however, is `Option<String>`: the reason of the **first** pattern
 //! that matched. A string such as an assignment whose value is a live issuer
@@ -35,7 +35,7 @@ use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use regex::Regex;
-use tracedecay_runtime_core::memory::hygiene::detect_secret_like;
+use tracedecay_session_memory::memory::hygiene::detect_secret_like;
 
 use crate::policy::{HygieneClass, ObservationHygienePolicyV1, RejectFloorSignals};
 

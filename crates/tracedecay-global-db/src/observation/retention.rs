@@ -800,7 +800,8 @@ async fn run_provenance_pass(
     // IS NULL)` satisfied.
     let sql = format!(
         "SELECT p.observation_id,
-                LENGTH(p.availability_json) + LENGTH(COALESCE(p.capture_json, '')) AS len,
+                LENGTH(p.availability_json) + LENGTH(COALESCE(p.capture_json, ''))
+                    + LENGTH(COALESCE(p.origin_json, '')) AS len,
                 (
                     SELECT d.effective_at
                     FROM retrieval_anchor_dispositions d
@@ -871,7 +872,7 @@ async fn run_provenance_pass(
             .join(",");
         let sql = format!(
             "UPDATE observation_repository_provenance
-             SET availability_json = ?1, capture_json = ?1
+             SET availability_json = ?1, capture_json = ?1, origin_json = NULL
              WHERE observation_id IN ({placeholders})"
         );
         let mut values = Vec::with_capacity(chunk.len() + 1);

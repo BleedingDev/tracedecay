@@ -60,7 +60,8 @@ pub fn replay_current_release_state_for_restore(
                      SELECT current.capture_json
                      FROM current_authority.observation_repository_provenance AS current
                      WHERE current.observation_id = staging.observation_id
-                 )
+                 ),
+                 origin_json = NULL
              WHERE EXISTS(
                  SELECT 1
                  FROM current_authority.observation_repository_provenance AS current
@@ -96,7 +97,8 @@ mod tests {
         CREATE TABLE observation_repository_provenance (
             observation_id TEXT PRIMARY KEY,
             availability_json TEXT NOT NULL,
-            capture_json TEXT
+            capture_json TEXT,
+            origin_json TEXT
         );";
 
     fn seed(path: &std::path::Path, released: bool) {
@@ -130,7 +132,7 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO observation_repository_provenance
-                 VALUES ('observation.1', ?1, ?1)",
+                 VALUES ('observation.1', ?1, ?1, '{\"retained_origin\":true}')",
                 [provenance],
             )
             .unwrap();
@@ -168,7 +170,8 @@ mod tests {
                     (SELECT anchor_json FROM retrieval_anchors),
                     (SELECT observation_json FROM observations),
                     (SELECT availability_json FROM observation_repository_provenance),
-                    (SELECT capture_json FROM observation_repository_provenance)",
+                    (SELECT capture_json FROM observation_repository_provenance),
+                    (SELECT origin_json FROM observation_repository_provenance)",
                 (),
                 |row| {
                     Ok((
@@ -176,6 +179,7 @@ mod tests {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
@@ -187,6 +191,7 @@ mod tests {
                 OBSERVATION_RELEASED_MARKER.to_owned(),
                 PROVENANCE_RELEASED_MARKER.to_owned(),
                 PROVENANCE_RELEASED_MARKER.to_owned(),
+                None,
             )
         );
         for mutation in [

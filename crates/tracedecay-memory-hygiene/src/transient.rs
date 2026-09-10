@@ -1,6 +1,6 @@
 //! Transient-noise detection with byte spans.
 //!
-//! `tracedecay_runtime_core::memory::hygiene::detect_transient` answers whether
+//! `tracedecay_session_memory::memory::hygiene::detect_transient` answers whether
 //! a string looks transient, which is all the curation planner needs. Redacting
 //! a span needs the span, and the upstream span finder is crate-internal, so
 //! this module owns the four transient patterns.
@@ -9,7 +9,7 @@
 //! here rather than reached for upstream because reaching for it would mean
 //! moving roughly two thousand lines of the shared privacy corpus across a
 //! crate boundary. FOLLOW-UP: unify the two transient corpora behind one public
-//! span-returning surface in `tracedecay-runtime-core` once the upstream patch
+//! span-returning surface in `tracedecay-session-memory` once the upstream patch
 //! budget allows the extraction; `transient_corpus_matches_runtime_core` in
 //! `tests/transient_evidence.rs` keeps the two in agreement until then.
 //!

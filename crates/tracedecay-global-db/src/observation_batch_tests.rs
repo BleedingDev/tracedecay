@@ -295,6 +295,197 @@ fn with_retrieval_alias(
     .unwrap()
 }
 
+fn recorded_origin_write(session_id: &str, authority_ref: &str) -> AnchoredObservationWrite {
+    use tracedecay_domain::{
+        AnchorSourceGenerationV2, EvidenceAvailabilityV1, GenerationBoundRepositoryProvenanceV1,
+        PrivacyDomainBoundLocatorDigest, ProjectId, RefId, RepositoryEvidenceV1, RepositoryId,
+        RepositoryProvenanceV1, RepositoryRemoteIdentityV1, RetrievalAnchorTargetV2,
+    };
+
+    let project = ProjectId::new("project.observation-origin").unwrap();
+    let observation = sequential_observation(&SessionId::new(session_id).unwrap(), 0, "origin");
+    let identity = observation.identity();
+    let observation = DurableObservationV1::new(
+        ObservationIdentityMaterialV1::for_native_record(
+            observation.source().clone(),
+            ObservationScopeV1::Project {
+                project_id: project.clone(),
+            },
+            identity.generation(),
+            identity.position(),
+            identity.ordering_domain(),
+            identity.native_record_id().unwrap().clone(),
+        )
+        .unwrap(),
+        observation.receipt().clone(),
+        observation.retention_class().clone(),
+        observation.payload().clone(),
+    )
+    .unwrap();
+    let write = anchored_write(observation, None);
+    let capture = RepositoryProvenanceV1::new(
+        RepositoryId::new("repository.observation-origin").unwrap(),
+        Some(project),
+        None,
+        PrivacyDomainBoundLocatorDigest::new(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap(),
+        RepositoryEvidenceV1::new(
+            EvidenceAvailabilityV1::Known(RefId::new("refs/heads/main").unwrap()),
+            EvidenceAvailabilityV1::Unborn,
+            EvidenceAvailabilityV1::Unavailable,
+            EvidenceAvailabilityV1::Unknown,
+            RepositoryRemoteIdentityV1::Unknown,
+            EvidenceAvailabilityV1::Unknown,
+        )
+        .unwrap(),
+        UtcMicros(1),
+    )
+    .unwrap();
+    let binding = GenerationBoundRepositoryProvenanceV1::new(
+        write.projection_generation().clone(),
+        capture,
+        Some(write.observation().observation_id().clone()),
+    )
+    .unwrap();
+    let retained = write.retrieval_anchor();
+    let anchor = RetrievalAnchorRecordV2::new(RetrievalAnchorRecordV2Parts {
+        target: RetrievalAnchorTargetV2::RepositoryCapture {
+            repository_id: binding.capture().repository_id().clone(),
+            capture_id: binding.capture_id().clone(),
+            receipt: write.observation().receipt().receipt().clone(),
+        },
+        owner: retained.owner().clone(),
+        aliases: vec![],
+        occurred_at: retained.occurred_at(),
+        ingested_at: retained.ingested_at(),
+        evidence_class: retained.evidence_class(),
+        source_generation: AnchorSourceGenerationV2::RepositoryCapture(
+            binding.capture_id().clone(),
+        ),
+        projection_generation: retained.projection_generation().clone(),
+        projection_watermark: retained.projection_watermark().clone(),
+        coverage: retained.coverage().clone(),
+        source_observations: retained.source_observations().to_vec(),
+        source_anchors: vec![],
+        authorization: retained.authorization().clone(),
+        payload_access: retained.payload_access(),
+        retention_class: retained.retention_class().clone(),
+        durability: retained.durability().clone(),
+    })
+    .unwrap();
+    let attachment = tracedecay_store::RepositoryProvenanceAttachmentV1::new(
+        EvidenceAvailabilityV1::Known(binding),
+        Some(anchor),
+    )
+    .unwrap()
+    .with_recorded_origin(
+        authority_ref.to_owned(),
+        write.observation().identity().clone(),
+    )
+    .unwrap();
+    write
+        .with_original_repository_provenance_attachment(attachment)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn recorded_origin_batch_hydration_and_exact_duplicates_preserve_proof() {
+    let tmp = TempDir::new().unwrap();
+    let runtime = HostAdmissionTestRuntimeV1::project(
+        tmp.path().join("profile"),
+        tmp.path().join("project"),
+        tracedecay_domain::ProjectId::new("project.observation-origin").unwrap(),
+    )
+    .await
+    .unwrap();
+    let store = runtime
+        .observation_store(HostAdmissionScope::Project)
+        .unwrap();
+    let write = recorded_origin_write("session.origin.batch", "live-event:original");
+    let expected = write.repository_provenance_attachment();
+    let outcomes = store
+        .persist_observations(vec![write.clone(), write.clone()])
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcomes[0].outcome(),
+        ObservationPersistOutcome::Committed(_)
+    ));
+    assert!(matches!(
+        outcomes[1].outcome(),
+        ObservationPersistOutcome::ExactDuplicate(_)
+    ));
+    for outcome in &outcomes {
+        assert_eq!(
+            outcome.stored().unwrap().repository_provenance_attachment(),
+            expected
+        );
+        assert_eq!(
+            outcome
+                .outcome()
+                .receipt()
+                .repository_provenance_attachment(),
+            expected
+        );
+    }
+    let stored = store
+        .get_observation(write.observation().observation_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.repository_provenance_attachment(), expected);
+    let duplicate = store.persist_observation(write.clone()).await.unwrap();
+    assert!(matches!(
+        duplicate,
+        ObservationPersistOutcome::ExactDuplicate(_)
+    ));
+    assert_eq!(
+        duplicate.receipt().repository_provenance_attachment(),
+        expected
+    );
+
+    let changed = recorded_origin_write("session.origin.batch", "live-event:changed");
+    assert!(matches!(
+        store.persist_observation(changed).await,
+        Err(ObservationStoreError::RepositoryProvenanceBindingMismatch)
+    ));
+    let pending = recorded_origin_write("session.origin.pending", "live-event:original");
+    let changed = recorded_origin_write("session.origin.pending", "live-event:changed");
+    assert!(matches!(
+        store
+            .persist_observations(vec![pending.clone(), changed])
+            .await,
+        Err(ObservationStoreError::RepositoryProvenanceBindingMismatch)
+    ));
+    assert!(
+        store
+            .get_observation(pending.observation().observation_id())
+            .await
+            .unwrap()
+            .is_none(),
+        "a changed pending proof must not commit the valid prefix"
+    );
+    let recorded = recorded_origin_write("session.origin.legacy", "live-event:new");
+    let attachment = recorded.repository_provenance_attachment();
+    let legacy = recorded
+        .clone()
+        .with_original_repository_provenance_attachment(
+            tracedecay_store::RepositoryProvenanceAttachmentV1::new(
+                attachment.availability().clone(),
+                attachment.anchor().cloned(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    store.persist_observation(legacy).await.unwrap();
+    assert!(matches!(
+        store.persist_observation(recorded).await,
+        Err(ObservationStoreError::RepositoryProvenanceBindingMismatch)
+    ));
+}
+
 fn colliding_rewrite(
     session_id: &SessionId,
     expected_cursor: Option<ObservationSourceCursorV1>,

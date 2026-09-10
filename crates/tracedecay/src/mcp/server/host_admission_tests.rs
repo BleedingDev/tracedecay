@@ -11,8 +11,8 @@ use super::writer_test_support::{
     WriterTestFixtureAuthority, init_indexed_repo, registered_context, registered_runtime,
 };
 use super::{CodeIndexReconcileSink, McpServer, McpServerConstructionContext};
-use crate::host_admission::HostAdmissionTestRuntimeV1;
 use crate::mcp::project_route::HookProjectRouteCache;
+use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_hooks::core_events::{
     DaemonHookEvent, HookAgent, HookRouteMetadata, HookTerminalReceipt,
 };
@@ -128,7 +128,40 @@ fn sync_current_branch_payload(branch: &str) -> Vec<u8> {
 }
 
 fn success_reconcile_sink() -> CodeIndexReconcileSink {
-    Arc::new(|_root| Box::pin(async { true }))
+    Arc::new(|_root, _demand| Box::pin(async { true.into() }))
+}
+
+#[tokio::test]
+async fn hook_watch_policy_refusal_is_not_scheduler_unavailable() {
+    let (cg, project, authority) = init_indexed_repo().await;
+    let context = registered_context(cg, &authority)
+        .with_code_index_reconcile_sink(Arc::new(|_, _| {
+            Box::pin(async { super::CodeIndexAdmission::LinkedWorktreeDisabled })
+        }))
+        .with_code_index_hook_sink(Arc::new(|_, _| {
+            Box::pin(async { super::CodeIndexAdmission::LinkedWorktreeDisabled })
+        }));
+    let server = McpServer::new_with_registered_test_context(context, Vec::new())
+        .await
+        .unwrap();
+    let cg = server.cg_snapshot().await;
+    for plan in [
+        tracedecay_mcp::hook_events::HookEventPlan::SyncFiles(vec!["src/a.rs".to_owned()]),
+        tracedecay_mcp::hook_events::HookEventPlan::SyncCurrentBranch {
+            branch: cg.active_branch().unwrap().to_owned(),
+            agent: HookAgent::Codex,
+        },
+    ] {
+        let outcome = server
+            .run_hook_event_plan(Arc::clone(&cg), project.path(), plan)
+            .await;
+        assert_eq!(outcome.status, HostAdmissionStatus::Degraded);
+        assert_eq!(outcome.reason_code, Some("linked_worktree_disabled"));
+        assert!(!outcome.retryable);
+    }
+    server.run_startup_catch_up_sync().await;
+    assert!(server.startup_catch_up_done());
+    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -143,13 +176,13 @@ async fn hook_event_is_durable_before_attempt_and_retained_on_failure() {
     let reconcile_sink: CodeIndexReconcileSink = {
         let broker = Arc::clone(&broker);
         let attempted_after_append = Arc::clone(&attempted_after_append);
-        Arc::new(move |_request: PathBuf| {
+        Arc::new(move |_request: PathBuf, _demand| {
             let broker = Arc::clone(&broker);
             let attempted_after_append = Arc::clone(&attempted_after_append);
             Box::pin(async move {
                 assert_eq!(broker.pending_count().await, 1);
                 *attempted_after_append.lock().unwrap() = true;
-                false
+                false.into()
             })
         })
     };
@@ -183,11 +216,11 @@ async fn commit_before_ack_replays_once_and_acknowledges_exact_duplicate() {
     let authoritative_commit = Arc::new(Mutex::new(false));
     let failing_reconcile_sink: CodeIndexReconcileSink = {
         let authoritative_commit = Arc::clone(&authoritative_commit);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let authoritative_commit = Arc::clone(&authoritative_commit);
             Box::pin(async move {
                 *authoritative_commit.lock().unwrap() = true;
-                false
+                false.into()
             })
         })
     };
@@ -213,13 +246,13 @@ async fn commit_before_ack_replays_once_and_acknowledges_exact_duplicate() {
     let duplicate_reconcile_sink: CodeIndexReconcileSink = {
         let attempts = Arc::clone(&attempts);
         let authoritative_commit = Arc::clone(&authoritative_commit);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempts = Arc::clone(&attempts);
             let authoritative_commit = Arc::clone(&authoritative_commit);
             Box::pin(async move {
                 assert!(*authoritative_commit.lock().unwrap());
                 *attempts.lock().unwrap() += 1;
-                true
+                true.into()
             })
         })
     };
@@ -249,7 +282,8 @@ async fn authoritative_commit_deletes_the_durable_hook_event() {
         .unwrap()
         .0;
     let broker = Arc::new(HostAdmissionBroker::new(runtime));
-    let reconcile_sink: CodeIndexReconcileSink = Arc::new(|_request| Box::pin(async { true }));
+    let reconcile_sink: CodeIndexReconcileSink =
+        Arc::new(|_request, _demand| Box::pin(async { true.into() }));
     let server = server_with_broker(cg, &authority, Arc::clone(&broker), reconcile_sink).await;
     let mut routes = HookProjectRouteCache::default();
 
@@ -275,11 +309,11 @@ async fn oversized_event_is_rejected_before_canonical_attempt() {
     let attempted = Arc::new(Mutex::new(false));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempted = Arc::clone(&attempted);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempted = Arc::clone(&attempted);
             Box::pin(async move {
                 *attempted.lock().unwrap() = true;
-                true
+                true.into()
             })
         })
     };
@@ -310,11 +344,11 @@ async fn malformed_semantic_payload_is_explicit_and_quarantined_across_reopen() 
     let attempted = Arc::new(Mutex::new(false));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempted = Arc::clone(&attempted);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempted = Arc::clone(&attempted);
             Box::pin(async move {
                 *attempted.lock().unwrap() = true;
-                true
+                true.into()
             })
         })
     };
@@ -378,11 +412,11 @@ async fn unsupported_payload_version_is_retryable_and_retained_across_reopen() {
     let attempted = Arc::new(Mutex::new(false));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempted = Arc::clone(&attempted);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempted = Arc::clone(&attempted);
             Box::pin(async move {
                 *attempted.lock().unwrap() = true;
-                true
+                true.into()
             })
         })
     };
@@ -432,11 +466,11 @@ async fn quarantine_releases_active_capacity_then_full_fails_closed() {
     let attempted = Arc::new(AtomicUsize::new(0));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempted = Arc::clone(&attempted);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempted = Arc::clone(&attempted);
             Box::pin(async move {
                 attempted.fetch_add(1, Ordering::SeqCst);
-                true
+                true.into()
             })
         })
     };
@@ -496,11 +530,11 @@ async fn malformed_source_does_not_starve_valid_sibling_source() {
     let attempts = Arc::new(Mutex::new(0usize));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempts = Arc::clone(&attempts);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempts = Arc::clone(&attempts);
             Box::pin(async move {
                 *attempts.lock().unwrap() += 1;
-                true
+                true.into()
             })
         })
     };
@@ -556,15 +590,15 @@ async fn cancelled_canonical_attempt_is_recovered_and_replayed() {
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempts = Arc::clone(&attempts);
         let started = Arc::clone(&started);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempt = attempts.fetch_add(1, Ordering::SeqCst);
             let started = Arc::clone(&started);
             Box::pin(async move {
                 if attempt == 0 {
                     started.notify_one();
-                    return std::future::pending::<bool>().await;
+                    return std::future::pending::<super::CodeIndexAdmission>().await;
                 }
-                true
+                true.into()
             })
         })
     };
@@ -652,11 +686,11 @@ async fn add_branch_at_replay_rejects_stale_root_after_adversarial_replace() {
     let attempted = Arc::new(Mutex::new(false));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempted = Arc::clone(&attempted);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempted = Arc::clone(&attempted);
             Box::pin(async move {
                 *attempted.lock().unwrap() = true;
-                true
+                true.into()
             })
         })
     };
@@ -705,11 +739,11 @@ async fn add_branch_at_replay_rejects_stale_branch_after_switch() {
     let attempted = Arc::new(AtomicUsize::new(0));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempted = Arc::clone(&attempted);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempted = Arc::clone(&attempted);
             Box::pin(async move {
                 attempted.fetch_add(1, Ordering::SeqCst);
-                true
+                true.into()
             })
         })
     };
@@ -741,11 +775,11 @@ async fn add_branch_replay_rejects_stale_branch_after_delayed_switch() {
     let attempted = Arc::new(AtomicUsize::new(0));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempted = Arc::clone(&attempted);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempted = Arc::clone(&attempted);
             Box::pin(async move {
                 attempted.fetch_add(1, Ordering::SeqCst);
-                true
+                true.into()
             })
         })
     };
@@ -798,11 +832,11 @@ async fn add_branch_restart_replay_rejects_stale_branch_after_switch() {
     let attempted = Arc::new(AtomicUsize::new(0));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempted = Arc::clone(&attempted);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempted = Arc::clone(&attempted);
             Box::pin(async move {
                 attempted.fetch_add(1, Ordering::SeqCst);
-                true
+                true.into()
             })
         })
     };
@@ -838,11 +872,11 @@ async fn sync_current_branch_replay_rejects_stale_branch_after_delayed_switch() 
     let attempted = Arc::new(AtomicUsize::new(0));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempted = Arc::clone(&attempted);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempted = Arc::clone(&attempted);
             Box::pin(async move {
                 attempted.fetch_add(1, Ordering::SeqCst);
-                true
+                true.into()
             })
         })
     };
@@ -894,11 +928,11 @@ async fn sync_current_branch_restart_replay_rejects_stale_branch_after_switch() 
     let attempted = Arc::new(AtomicUsize::new(0));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempted = Arc::clone(&attempted);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempted = Arc::clone(&attempted);
             Box::pin(async move {
                 attempted.fetch_add(1, Ordering::SeqCst);
-                true
+                true.into()
             })
         })
     };
@@ -963,11 +997,11 @@ async fn add_branch_at_restart_replay_rejects_common_dir_drift() {
     let attempted = Arc::new(AtomicUsize::new(0));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempted = Arc::clone(&attempted);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempted = Arc::clone(&attempted);
             Box::pin(async move {
                 attempted.fetch_add(1, Ordering::SeqCst);
-                true
+                true.into()
             })
         })
     };
@@ -1027,11 +1061,11 @@ async fn add_branch_at_restart_replay_rejects_symlink_swap() {
     let attempted = Arc::new(AtomicUsize::new(0));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempted = Arc::clone(&attempted);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempted = Arc::clone(&attempted);
             Box::pin(async move {
                 attempted.fetch_add(1, Ordering::SeqCst);
-                true
+                true.into()
             })
         })
     };
@@ -1203,7 +1237,8 @@ async fn failed_admission_does_not_emit_hook_route_analytics() {
         .unwrap()
         .0;
     let broker = Arc::new(HostAdmissionBroker::new(runtime));
-    let reconcile_sink: CodeIndexReconcileSink = Arc::new(|_request| Box::pin(async { false }));
+    let reconcile_sink: CodeIndexReconcileSink =
+        Arc::new(|_request, _demand| Box::pin(async { false.into() }));
     let server =
         server_with_broker_and_runtime(cg, Arc::clone(&broker), reconcile_sink, test_runtime).await;
     let mut routes = HookProjectRouteCache::default();
@@ -1266,13 +1301,13 @@ async fn durable_route_survives_unavailable_effect_for_same_connection_retry() {
     let first_attempt = Arc::new(AtomicBool::new(true));
     let reconcile_sink: CodeIndexReconcileSink = {
         let first_attempt = Arc::clone(&first_attempt);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let first_attempt = Arc::clone(&first_attempt);
             Box::pin(async move {
                 if first_attempt.swap(false, Ordering::SeqCst) {
-                    return false;
+                    return false.into();
                 }
-                true
+                true.into()
             })
         })
     };
@@ -1319,7 +1354,7 @@ async fn durable_route_survives_unavailable_effect_for_same_connection_retry() {
     );
     assert_eq!(
         routed["session_id"],
-        tracedecay_runtime_core::privacy::protect_sensitive_structural_id(
+        tracedecay_privacy::protect_sensitive_structural_id(
             event["route"]["session_id"].as_str().expect("raw session")
         )
         .unwrap()
@@ -1387,7 +1422,8 @@ async fn committed_admissions_emit_post_commit_private_route_analytics() {
         .unwrap()
         .0;
     let broker = Arc::new(HostAdmissionBroker::new(runtime));
-    let reconcile_sink: CodeIndexReconcileSink = Arc::new(|_request| Box::pin(async { true }));
+    let reconcile_sink: CodeIndexReconcileSink =
+        Arc::new(|_request, _demand| Box::pin(async { true.into() }));
     let server =
         server_with_broker_and_runtime(cg, Arc::clone(&broker), reconcile_sink, test_runtime).await;
     let mut routes = HookProjectRouteCache::default();
@@ -1484,8 +1520,7 @@ async fn credential_canary_receipt_analytics_and_git_span_survive_database_reope
     )
     .await;
     let raw = ["AKIA", "SYNTHETIC", "CANARY", "4"].concat();
-    let protected =
-        tracedecay_runtime_core::privacy::protect_sensitive_structural_id(&raw).unwrap();
+    let protected = tracedecay_privacy::protect_sensitive_structural_id(&raw).unwrap();
     let session = SessionRecord {
         provider: "hermes".to_string(),
         session_id: protected.clone(),
@@ -1696,11 +1731,11 @@ async fn owned_project_replay_worker_backoffs_on_retryable_failure() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let reconcile_sink: CodeIndexReconcileSink = {
         let attempts = Arc::clone(&attempts);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let attempts = Arc::clone(&attempts);
             Box::pin(async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                false
+                false.into()
             })
         })
     };
@@ -1745,7 +1780,7 @@ async fn owned_project_replay_worker_is_cancelled_and_joined_on_shutdown() {
     let reconcile_sink: CodeIndexReconcileSink = {
         let entered = Arc::clone(&entered);
         let release = Arc::clone(&release);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let entered = Arc::clone(&entered);
             let release = Arc::clone(&release);
             Box::pin(async move {
@@ -1754,7 +1789,7 @@ async fn owned_project_replay_worker_is_cancelled_and_joined_on_shutdown() {
                 // worker reaches the sink before the test starts awaiting.
                 entered.notify_one();
                 release.notified().await;
-                true
+                true.into()
             })
         })
     };

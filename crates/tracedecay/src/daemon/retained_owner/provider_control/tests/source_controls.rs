@@ -53,7 +53,7 @@ use crate::daemon::retained_owner::provider_history::{
     ProviderHistoryAuthorityV1, ProviderHistoryReaderV1, history_grant_json,
     source_attribution_json,
 };
-use crate::host_admission::HostAdmissionTestRuntimeV1;
+use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use crate::mcp::tools::handlers::hook_runtime::capture_live_origin_for_control_test;
 
 const SESSION: &str = "offline-source-control-session";

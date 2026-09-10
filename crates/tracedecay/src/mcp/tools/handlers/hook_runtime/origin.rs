@@ -1056,7 +1056,7 @@ mod tests {
         use super::super::super::SessionAuthorities;
         use super::super::admission::hook_v2_admit;
         use super::super::ingest::ingest_transcript;
-        use crate::host_admission::HostAdmissionTestRuntimeV1;
+        use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
         use crate::tracedecay::TraceDecayOpenOptions;
         use std::io::Write;
         use std::sync::Arc;

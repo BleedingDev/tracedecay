@@ -33,7 +33,7 @@ pub use access::{
 };
 pub use connection::Database;
 pub use connection::MemoryGraphReconciliationTaskOwnerV1;
-pub(crate) use connection::MemoryGraphReconciliationTaskScheduleV1;
+pub use connection::MemoryGraphReconciliationTaskScheduleV1;
 pub use connection::{
     DatabaseAccessMode, DatabaseClientGuardV1, DatabaseEngineReadConnection,
     DatabaseEngineReadSnapshot, DatabaseMemoryTransaction, DatabaseRuntimeClientV1,
@@ -45,7 +45,8 @@ pub use connection::{
     DatabaseOwnerWeakLeaseIssuerV1,
 };
 pub use connection::{
-    MemoryGraphReconciliationCancelErrorV1, MemoryGraphReconciliationRetirementReservationV1,
+    MemoryGraphReconciliationCancelErrorV1, MemoryGraphReconciliationInlinePassV1,
+    MemoryGraphReconciliationRetirementReservationV1,
     MemoryGraphReconciliationRetirementStartErrorV1, MemoryGraphReconciliationRetirementTerminalV1,
     MemoryGraphRuntimeOperationErrorV1, MemoryGraphRuntimeOperationV1,
 };
@@ -64,7 +65,7 @@ pub use file_identity::{
 };
 pub use memory_connection::MemoryConnection;
 pub use metadata::BoundedMetadataValue;
-pub(crate) use retrieval_anchor_authority::{
+pub use retrieval_anchor_authority::{
     publish_fact_feedback_finding_tx, tombstone_fact_derivatives_tx,
 };
 pub use sql::{

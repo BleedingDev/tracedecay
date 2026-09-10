@@ -13,7 +13,6 @@ use super::{
     DaemonInvocationState, ProjectOpenDependentOwnerState, register_production_advisory_owner,
     register_production_feedback_and_advisory, register_production_feedback_cycle,
 };
-use crate::daemon::log_daemon_event;
 use tracedecay_contracts::doctor::{
     SemanticOwnerDegradedReasonV1, SemanticOwnerPrerequisiteV1, SemanticOwnerStateV1,
 };
@@ -21,6 +20,7 @@ use tracedecay_contracts::now_micros;
 use tracedecay_daemon_service::ProjectRuntimePublicationAttemptV1;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_runtime_core::cancellation::CancellationToken;
+use tracedecay_runtime_core::logging::log_daemon_event;
 
 /// The deferred advisory owner is a detached background task: when it gives up
 /// (or never sees a publication) nothing in the request path reports it, and a
@@ -208,7 +208,10 @@ pub(super) fn spawn(
     // Nothing user-facing may wait on a layer this route disables by contract.
     // With no code index there is no generation to defer to, so the wait below
     // has no terminal state of its own: name it here instead.
-    if super::super::code_index_disabled_for_scope(&invocation, &state.scope) {
+    if tracedecay_code_index_runtime::project_reads::code_index_disabled_for_scope(
+        &invocation.code_index_schedulers,
+        &state.scope,
+    ) {
         log_deferred_attempt(&project_root, "code_index_disabled", "terminal");
         return false;
     }

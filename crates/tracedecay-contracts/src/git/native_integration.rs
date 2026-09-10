@@ -4,6 +4,8 @@
 //! Filesystem paths, free-form object IDs, Git arguments, commit messages,
 //! remotes, and provider mutations are intentionally unrepresentable.
 
+use std::sync::Arc;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -12,7 +14,7 @@ use tracedecay_domain::{
     NativeIntegrationApprovalV1, NativeIntegrationDirectionV1, NativeIntegrationPreviewId,
     NativeIntegrationPreviewV1, NativeIntegrationReceiptV1, NativeIntegrationSelectionV1,
     NativeIntegrationTerminalOutcomeV1, NativeIntegrationTransactionId,
-    NativeIntegrationTransactionStatusV1, StackNodeId, UtcMicros, WorktreeInventoryEpoch,
+    NativeIntegrationTransactionStatusV1, RefId, StackNodeId, UtcMicros, WorktreeInventoryEpoch,
     WorktreeInventorySnapshotId,
 };
 
@@ -37,6 +39,8 @@ pub enum NativeIntegrationSelectionBindingV1 {
     },
     IndependentBranch {
         proposal_digest: ManifestDigest,
+        source_ref: RefId,
+        destination_ref: RefId,
     },
 }
 
@@ -69,7 +73,20 @@ impl NativeIntegrationSelectionBindingV1 {
                     });
                 }
             }
-            Self::IndependentBranch { proposal_digest } => proposal_digest.validate()?,
+            Self::IndependentBranch {
+                proposal_digest,
+                source_ref,
+                destination_ref,
+            } => {
+                proposal_digest.validate()?;
+                source_ref.validate()?;
+                destination_ref.validate()?;
+                if source_ref == destination_ref {
+                    return Err(ApplicationContractError::Inconsistent {
+                        field: "native integration independent refs",
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -106,10 +123,18 @@ impl NativeIntegrationStackResolutionRequestV1 {
         self.policy_digest.validate()?;
         if self.source.project_id != self.destination.project_id
             || self.source.repository_id != self.destination.repository_id
-            || self.source.worktree_id == self.destination.worktree_id
+        {
+            return Err(ApplicationContractError::Inconsistent {
+                field: "native integration exact root pair",
+            });
+        }
+        if matches!(
+            self.selection,
+            NativeIntegrationSelectionBindingV1::DeclaredStackEdge { .. }
+        ) && (self.source.worktree_id == self.destination.worktree_id
             || self.source.reference.is_none()
             || self.destination.reference.is_none()
-            || self.source.reference == self.destination.reference
+            || self.source.reference == self.destination.reference)
         {
             return Err(ApplicationContractError::Inconsistent {
                 field: "native integration exact root pair",
@@ -188,6 +213,18 @@ pub trait NativeIntegrationStackResolutionPort: Send + Sync {
         request: &NativeIntegrationStackResolutionRequestV1,
         cancellation: &CancellationSignal,
     ) -> Result<NativeIntegrationStackResolutionOutcomeV1, NativeIntegrationPortError>;
+}
+
+impl<T: NativeIntegrationStackResolutionPort + ?Sized> NativeIntegrationStackResolutionPort
+    for Arc<T>
+{
+    fn resolve(
+        &self,
+        request: &NativeIntegrationStackResolutionRequestV1,
+        cancellation: &CancellationSignal,
+    ) -> Result<NativeIntegrationStackResolutionOutcomeV1, NativeIntegrationPortError> {
+        self.as_ref().resolve(request, cancellation)
+    }
 }
 
 /// Exact semantic evidence revisions joined to native conflict evidence.
@@ -288,8 +325,6 @@ impl NativeIntegrationApplyRequestV1 {
             || self.context.actor() != &self.approval.principal
             || self.context.scope().project_id != self.preview.repository_snapshot.project_id
             || self.context.scope().repository_id != self.preview.repository_snapshot.repository_id
-            || self.context.scope().reference.as_ref()
-                != Some(&self.preview.repository_snapshot.destination_ref)
             || self.preview.expires_at.0 <= self.observed_at.0
             || self.approval.expires_at.0 <= self.observed_at.0
             || !matches!(

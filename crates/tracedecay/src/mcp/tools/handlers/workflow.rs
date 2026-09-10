@@ -21,7 +21,6 @@ use tracedecay_domain::{CommitId, UtcMicros};
 use tracedecay_domain::{RelationEdgeKindV1, SymbolOccurrenceId};
 use url::Url;
 
-use crate::graph::redundancy_scan::{RedundancyOptions, RedundancyScanV1, redundancy_scan};
 use crate::tracedecay::{TraceDecay, is_test_file};
 use tracedecay_application::diagnose::{Severity, parse_cargo_output};
 use tracedecay_application::diagnostics_publication::CodeIndexPublicationIdentityPortV1;
@@ -30,8 +29,12 @@ use tracedecay_application::diagnostics_store::DiagnosticsStore;
 use tracedecay_application::operation_stream::{
     OperationEmitter, OperationEventError, operation_event_authority,
 };
+use tracedecay_application::semantic_runtime::project_semantic_redundancy_generation;
 use tracedecay_contracts::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_graph_query::redundancy_scan::{
+    RedundancyOptions, RedundancyScanV1, redundancy_scan,
+};
 
 use super::support::{generic_tool_result, rendered_tool_result, unique_file_paths};
 use tracedecay_mcp::ToolResult;
@@ -477,7 +480,8 @@ async fn diagnose_redundancy_index(
         include_naming: false,
         include_generated: false,
     };
-    let scan = redundancy_scan(cg, graph, &options).await?;
+    let semantic = project_semantic_redundancy_generation(cg.project_root()).await;
+    let scan = redundancy_scan(graph, &options, semantic.as_ref()).await?;
     Ok(near_duplicate_index(&scan))
 }
 
@@ -710,13 +714,11 @@ where
     let body = hotpath::measure_block!(
         "mcp.workflow.affected_tests.assemble",
         run_affected_tests_body(
-            output.exit_code,
+            &output,
             &results,
             &test_names,
             truncated,
             &selected_targets,
-            &output.stderr,
-            &output.stdout,
             managed_test_terminal(&emitter, &receipt)
         )
     );
@@ -1180,20 +1182,18 @@ fn missing_requested_test<'a>(
 }
 
 fn run_affected_tests_body(
-    exit_code: Option<i32>,
+    output: &tracedecay_mcp::TestRunOutput,
     results: &[(String, bool)],
     test_names: &[String],
     truncated: bool,
     selected_targets: &[TestTarget],
-    stderr: &str,
-    stdout: &str,
     terminal: Value,
 ) -> Value {
     let passed = results.iter().filter(|(_, ok)| *ok).count();
     let failed = results.iter().filter(|(_, ok)| !*ok).count();
 
     json!({
-        "exit_code": exit_code,
+        "exit_code": output.exit_code,
         "passed": passed,
         "failed": failed,
         "total_observed": results.len(),
@@ -1209,8 +1209,8 @@ fn run_affected_tests_body(
                 })
             })
             .collect::<Vec<_>>(),
-        "stderr_tail": tail(stderr, 2000),
-        "stdout_tail": tail(stdout, 2000),
+        "stderr_tail": tail(&output.stderr, 2000),
+        "stdout_tail": tail(&output.stdout, 2000),
         "terminal": terminal,
     })
 }

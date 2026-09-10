@@ -34,7 +34,6 @@ fn graph_handlers_that_await_query() -> &'static [&'static str] {
         "tracedecay_dead_code",
         "tracedecay_circular",
         "tracedecay_hotspots",
-        "tracedecay_unused_imports",
         "tracedecay_rank",
         "tracedecay_largest",
         "tracedecay_coupling",
@@ -47,7 +46,8 @@ fn graph_handlers_that_await_query() -> &'static [&'static str] {
         "tracedecay_unsafe_patterns",
         "tracedecay_constructors",
         "tracedecay_field_sites",
-        "tracedecay_diagnostics",
+        // `tracedecay_diagnostics` is owned by the application surface; it
+        // reaches the daemon transport, never the in-process graph query.
         "tracedecay_affected",
         "tracedecay_diff_context",
         "tracedecay_changelog",

@@ -343,7 +343,6 @@ async fn read_store_snapshot(
 ) -> (FactProjectionV1, ProjectMemoryFactHistoryV1) {
     let memory = graph
         .project_memory_application()
-        .await
         .expect("project memory application");
     let target = ProjectMemoryFactIdV1::new(owner.clone(), fact_id.clone())
         .expect("owner-bound project fact target");
@@ -407,7 +406,6 @@ async fn real_project_fixture() -> (
 async fn add_real_project_fact(graph: &TraceDecay, content: &str, source_label: &str) -> FactV1 {
     let memory = graph
         .project_memory_application()
-        .await
         .expect("project memory application");
     let preflight = memory
         .preflight_project_memory_fact_add(
@@ -590,7 +588,6 @@ async fn direct_search_scores(
 ) -> Vec<(String, [u32; 5])> {
     let memory = graph
         .project_memory_application()
-        .await
         .expect("project memory application");
     let search = ProjectMemoryFactSearchQuery::new(
         owner.clone(),
@@ -1499,7 +1496,6 @@ async fn native_observe_verifies_real_store_without_writing() {
     };
     let memory = graph
         .project_memory_application()
-        .await
         .expect("project memory application");
     let preflight = memory
         .preflight_project_memory_fact_add(
@@ -2462,7 +2458,6 @@ async fn staged_recall_trims_to_a_valid_partial_reply_without_losing_the_top_who
     let parsed = parse_native_recall_request(&call).expect("parse recall request");
     let memory = graph
         .project_memory_application()
-        .await
         .expect("project memory application");
     let search = ProjectMemoryFactSearchQuery::new(
         owner,
@@ -2570,7 +2565,6 @@ async fn fact_promotion_and_unaccepted_kinds_write_no_staged_row() {
     let provider_state_root = test_provider_state_root(&project_root);
     let memory = graph
         .project_memory_application()
-        .await
         .expect("project memory application");
     let preflight = memory
         .preflight_project_memory_fact_add(

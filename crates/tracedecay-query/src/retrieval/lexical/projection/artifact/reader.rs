@@ -30,7 +30,7 @@ use super::format::{
     encode_exact_field, encode_field, metadata_digest, verify_required_artifact_indexes,
 };
 use super::postings::{NGRAM_NORMALIZED, NGRAM_RAW_OVERRIDE, query_ngrams};
-use super::row_codec::decode_artifact_row;
+use super::row_codec::{ConnectionRowDictionaryV1, decode_artifact_row};
 use super::schema::{
     LexicalArtifactLayoutV1, exact_field_code, field_code, field_from_code, lookup_term_id,
     lookup_term_ids, stable_exact_term_id,
@@ -57,7 +57,7 @@ use super::super::{
 use crate::retrieval::lexical::{
     LexicalFieldFilterV1, LexicalFieldV1, LexicalLaneEvidence, LexicalLaneRequest,
     MAX_FUZZY_TERM_EXPANSIONS_V1, MAX_LEXICAL_QUERY_TERM_BYTES_V1, admit_candidate_sources,
-    field_admitted, lexical_checkpoint,
+    candidate_admission_outcome, field_admitted, lexical_checkpoint,
 };
 
 #[derive(Clone)]
@@ -462,6 +462,7 @@ impl CodeLexicalArtifactReaderV1 {
                 self.receipt.generation(),
                 chunk.as_str(),
                 &bytes,
+                &ConnectionRowDictionaryV1::new(&connection),
             )
             .map(row_occurrence)
         })
@@ -572,7 +573,7 @@ impl LexicalPostingReadPort for CodeLexicalArtifactReaderV1 {
             return Ok(RetrieverOutcome::Stale(self.receipt.freshness().clone()));
         }
         let connection = self.lock_connection().map_err(map_query_artifact_error)?;
-        let batch = ArtifactQueryV1::new(
+        let outcome = ArtifactQueryV1::new(
             &connection,
             &self.metadata,
             &self.receipt,
@@ -580,7 +581,6 @@ impl LexicalPostingReadPort for CodeLexicalArtifactReaderV1 {
             &self.fuzzy_vocabulary,
         )?
         .lexical_batch(request)?;
-        let outcome = RetrieverOutcome::Complete(batch);
         crate::hotpath_metrics::record_lane(
             "query.lane.lexical.candidates",
             "query.lane.lexical.examined",
@@ -647,6 +647,8 @@ struct ArtifactQueryV1<'a> {
     document_count: usize,
     metrics: ArtifactQueryMetricsV1,
     fuzzy_vocabulary: &'a OnceLock<Arc<Vec<String>>>,
+    /// Revision-14 dictionary entries resolved during this query.
+    row_dictionary: ConnectionRowDictionaryV1<'a>,
 }
 
 #[derive(Default)]
@@ -959,7 +961,8 @@ fn visit_lexical_rows(
             LexicalArtifactLayoutV1::V10 => BTreeMap::new(),
             LexicalArtifactLayoutV1::V11
             | LexicalArtifactLayoutV1::V12
-            | LexicalArtifactLayoutV1::V13 => {
+            | LexicalArtifactLayoutV1::V13
+            | LexicalArtifactLayoutV1::V14 => {
                 lookup_term_ids(connection, terms).map_err(map_query_artifact_error)?
             }
         };
@@ -968,7 +971,8 @@ fn visit_lexical_rows(
             LexicalArtifactLayoutV1::V10 => terms.len(),
             LexicalArtifactLayoutV1::V11
             | LexicalArtifactLayoutV1::V12
-            | LexicalArtifactLayoutV1::V13 => v11_ids.len(),
+            | LexicalArtifactLayoutV1::V13
+            | LexicalArtifactLayoutV1::V14 => v11_ids.len(),
         };
         ensure_sqlite_bind_capacity(documents.parameters.len(), dynamic_binds)?;
         ensure_sqlite_bound_value_bytes(
@@ -983,6 +987,7 @@ fn visit_lexical_rows(
             LexicalArtifactLayoutV1::V11
             | LexicalArtifactLayoutV1::V12
             | LexicalArtifactLayoutV1::V13
+            | LexicalArtifactLayoutV1::V14
                 if v11_ids.is_empty() =>
             {
                 "'[]'".to_owned()
@@ -1001,7 +1006,8 @@ fn visit_lexical_rows(
             }
             LexicalArtifactLayoutV1::V11
             | LexicalArtifactLayoutV1::V12
-            | LexicalArtifactLayoutV1::V13 => {
+            | LexicalArtifactLayoutV1::V13
+            | LexicalArtifactLayoutV1::V14 => {
                 let placeholders = std::iter::repeat_n("?", v11_ids.len())
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -1061,7 +1067,8 @@ fn visit_lexical_rows(
                 }
                 LexicalArtifactLayoutV1::V11
                 | LexicalArtifactLayoutV1::V12
-                | LexicalArtifactLayoutV1::V13 => {
+                | LexicalArtifactLayoutV1::V13
+                | LexicalArtifactLayoutV1::V14 => {
                     let encoded: Vec<(i64, String, i64)> =
                         serde_json::from_str(&encoded_frequencies).map_err(contract_error)?;
                     entries.reserve(encoded.len());
@@ -1492,13 +1499,14 @@ impl<'a> ArtifactQueryV1<'a> {
             document_count: usize::try_from(receipt.total_chunks()).map_err(contract_error)?,
             metrics: ArtifactQueryMetricsV1::default(),
             fuzzy_vocabulary,
+            row_dictionary: ConnectionRowDictionaryV1::new(connection),
         })
     }
 
     fn lexical_batch(
         &self,
         request: &LexicalLaneRequest<'_>,
-    ) -> Result<RetrieverBatch<LexicalLaneEvidence>, RetrievalPortError> {
+    ) -> Result<RetrieverOutcome<RetrieverBatch<LexicalLaneEvidence>>, RetrievalPortError> {
         let control = request.control;
         let fuzzy = self.fuzzy_expansions(request)?;
         let prepared = PreparedLexicalQueryV1::new(request);
@@ -1530,9 +1538,9 @@ impl<'a> ArtifactQueryV1<'a> {
             self.layout,
             control,
             |_, chunk_id, bytes, _| {
-                let row =
-                    decode_artifact_row(self.layout, self.receipt.generation(), &chunk_id, &bytes)
-                        .map_err(map_query_artifact_error)?;
+                let row = self
+                    .decode_row(&chunk_id, &bytes)
+                    .map_err(map_query_artifact_error)?;
                 for (phrase, frequency) in &mut phrase_frequencies {
                     if substring_count(&row.normalized_text, phrase) > 0 {
                         *frequency += 1;
@@ -1541,7 +1549,9 @@ impl<'a> ArtifactQueryV1<'a> {
                 Ok(())
             },
         )?;
-        let documents = self.lexical_documents(request, &fuzzy, &stats, &phrase_queries)?;
+        let mut pruned = Vec::new();
+        let documents =
+            self.lexical_documents(request, &fuzzy, &stats, &phrase_queries, &mut pruned)?;
         // The scan holds one transient row and retains complete rows only for
         // the cap-bounded winners. That avoids a second winner hydration pass
         // while preserving the same strict materialization ceiling.
@@ -1557,9 +1567,9 @@ impl<'a> ArtifactQueryV1<'a> {
             self.layout,
             control,
             |document, chunk_id, bytes, frequencies| {
-                let row =
-                    decode_artifact_row(self.layout, self.receipt.generation(), &chunk_id, &bytes)
-                        .map_err(map_query_artifact_error)?;
+                let row = self
+                    .decode_row(&chunk_id, &bytes)
+                    .map_err(map_query_artifact_error)?;
                 let score = self.score_row(
                     &row,
                     &prepared,
@@ -1616,13 +1626,16 @@ impl<'a> ArtifactQueryV1<'a> {
             evidence_by_occurrence.insert(candidate.source_occurrence_id.clone(), evidence);
             candidates.push(candidate);
         }
-        Ok(capped_batch(
-            self.document_count,
-            eligible,
-            excluded,
-            truncated,
-            candidates,
-            evidence_by_occurrence,
+        Ok(candidate_admission_outcome(
+            capped_batch(
+                self.document_count,
+                eligible,
+                excluded,
+                truncated,
+                candidates,
+                evidence_by_occurrence,
+            ),
+            pruned,
         ))
     }
 
@@ -1728,8 +1741,22 @@ impl<'a> ArtifactQueryV1<'a> {
         let (chunk_id, bytes): (String, Vec<u8>) = statement
             .query_row([i64::from(document)], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(map_query_sql_error)?;
-        decode_artifact_row(self.layout, self.receipt.generation(), &chunk_id, &bytes)
+        self.decode_row(&chunk_id, &bytes)
             .map_err(map_query_artifact_error)
+    }
+
+    fn decode_row(
+        &self,
+        chunk_id: &str,
+        bytes: &[u8],
+    ) -> Result<ArtifactRowV1, CodeLexicalArtifactErrorV1> {
+        decode_artifact_row(
+            self.layout,
+            self.receipt.generation(),
+            chunk_id,
+            bytes,
+            &self.row_dictionary,
+        )
     }
 
     /// The candidate document set for one lexical request: every phrase
@@ -1741,6 +1768,7 @@ impl<'a> ArtifactQueryV1<'a> {
         fuzzy: &FuzzyExpansionsV1,
         stats: &LexicalStatsCacheV1,
         phrase_queries: &BTreeMap<String, DocumentQueryV1>,
+        pruned: &mut Vec<(String, u64)>,
     ) -> Result<DocumentQueryV1, RetrievalPortError> {
         let mut whole_terms = Vec::new();
         for term in &request.whole_terms {
@@ -1763,20 +1791,27 @@ impl<'a> ArtifactQueryV1<'a> {
                     let frequency = stats.whole_term_documents(&term);
                     sources.push((
                         frequency,
-                        DocumentQueryV1::term_except(term, subtoken_field.clone()),
+                        (
+                            term.clone(),
+                            DocumentQueryV1::term_except(term, subtoken_field.clone()),
+                        ),
                     ));
                 }
                 for subtoken in subtokens {
                     let frequency = stats.document_frequency(LexicalFieldV1::Subtoken, &subtoken);
                     sources.push((
                         frequency,
-                        DocumentQueryV1::term(subtoken_field.clone(), subtoken),
+                        (
+                            subtoken.clone(),
+                            DocumentQueryV1::term(subtoken_field.clone(), subtoken),
+                        ),
                     ));
                 }
             }
             LexicalArtifactLayoutV1::V11
             | LexicalArtifactLayoutV1::V12
-            | LexicalArtifactLayoutV1::V13 => {
+            | LexicalArtifactLayoutV1::V13
+            | LexicalArtifactLayoutV1::V14 => {
                 let subtoken_field = field_code(LexicalFieldV1::Subtoken);
                 for term in whole_terms {
                     if let Some(term_id) =
@@ -1784,7 +1819,10 @@ impl<'a> ArtifactQueryV1<'a> {
                     {
                         sources.push((
                             stats.whole_term_documents(&term),
-                            DocumentQueryV1::term_except_id(term_id, subtoken_field),
+                            (
+                                term,
+                                DocumentQueryV1::term_except_id(term_id, subtoken_field),
+                            ),
                         ));
                     }
                 }
@@ -1794,14 +1832,20 @@ impl<'a> ArtifactQueryV1<'a> {
                     {
                         sources.push((
                             stats.document_frequency(LexicalFieldV1::Subtoken, &subtoken),
-                            DocumentQueryV1::term_id(subtoken_field, term_id),
+                            (subtoken, DocumentQueryV1::term_id(subtoken_field, term_id)),
                         ));
                     }
                 }
             }
         }
         let mut admitted = phrase_queries.values().cloned().collect::<Vec<_>>();
-        admitted.extend(admit_candidate_sources(sources));
+        admitted.extend(
+            admit_candidate_sources(sources, |frequency, (term, _)| {
+                pruned.push((term.clone(), frequency as u64));
+            })
+            .into_iter()
+            .map(|(_, source)| source),
+        );
         union_document_queries(admitted)
     }
 
@@ -1841,7 +1885,9 @@ impl<'a> ArtifactQueryV1<'a> {
                         literal.canonical_bytes.clone(),
                     ));
                 }
-                LexicalArtifactLayoutV1::V12 | LexicalArtifactLayoutV1::V13 => {
+                LexicalArtifactLayoutV1::V12
+                | LexicalArtifactLayoutV1::V13
+                | LexicalArtifactLayoutV1::V14 => {
                     sources.push(DocumentQueryV1::exact_id(
                         literal.field,
                         &literal.canonical_bytes,
@@ -1956,7 +2002,8 @@ impl<'a> ArtifactQueryV1<'a> {
             LexicalArtifactLayoutV1::V10 => "SELECT term FROM vocabulary",
             LexicalArtifactLayoutV1::V11
             | LexicalArtifactLayoutV1::V12
-            | LexicalArtifactLayoutV1::V13 => "SELECT term FROM vocabulary WHERE in_fuzzy = 1",
+            | LexicalArtifactLayoutV1::V13
+            | LexicalArtifactLayoutV1::V14 => "SELECT term FROM vocabulary WHERE in_fuzzy = 1",
         }
     }
 
@@ -2010,7 +2057,8 @@ impl<'a> ArtifactQueryV1<'a> {
                 }
                 LexicalArtifactLayoutV1::V11
                 | LexicalArtifactLayoutV1::V12
-                | LexicalArtifactLayoutV1::V13 => {
+                | LexicalArtifactLayoutV1::V13
+                | LexicalArtifactLayoutV1::V14 => {
                     field_from_code(row.get::<_, i64>(0).map_err(map_query_sql_error)?)
                         .map_err(map_query_artifact_error)?
                 }
@@ -2057,7 +2105,8 @@ impl<'a> ArtifactQueryV1<'a> {
                 }
                 LexicalArtifactLayoutV1::V11
                 | LexicalArtifactLayoutV1::V12
-                | LexicalArtifactLayoutV1::V13 => {
+                | LexicalArtifactLayoutV1::V13
+                | LexicalArtifactLayoutV1::V14 => {
                     let assigned = lookup_term_ids(self.connection, terms)
                         .map_err(map_query_artifact_error)?;
                     let term_ids = assigned.values().copied().collect::<Vec<_>>();

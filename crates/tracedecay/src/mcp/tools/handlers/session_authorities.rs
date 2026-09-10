@@ -21,11 +21,15 @@ pub struct SessionAuthorities<'a> {
     /// under; absent on direct servers, where capture fails closed.
     pub(crate) background_cpu: Option<std::sync::Arc<ProcessBackgroundCpuV1>>,
     pub(crate) profile_retained_authority:
-        Option<&'a crate::daemon::retained_owner::ProfileRetainedConnectionAuthorityV1>,
+        Option<&'a tracedecay_session_runtime::retained::ProfileRetainedConnectionAuthorityV1>,
     pub(crate) project_lcm:
         Option<&'a dyn tracedecay_session_runtime::lcm_authority::MountedLcmAuthorityPort>,
     pub(crate) profile_lcm:
         Option<&'a dyn tracedecay_session_runtime::lcm_authority::MountedLcmAuthorityPort>,
+    /// Daemon-wide profile session refresh service serving profile-scoped
+    /// `tracedecay_session_refresh_*` calls on this connection.
+    pub(crate) profile_session_refresh:
+        Option<&'a dyn tracedecay_session_runtime::retained::RetainedSessionRefreshPortV1>,
 }
 
 impl<'a> SessionAuthorities<'a> {
@@ -42,6 +46,7 @@ impl<'a> SessionAuthorities<'a> {
             profile_retained_authority: None,
             project_lcm: None,
             profile_lcm: None,
+            profile_session_refresh: None,
         }
     }
 
@@ -64,7 +69,9 @@ impl<'a> SessionAuthorities<'a> {
     #[hotpath::skip]
     pub(crate) const fn with_profile_retained_authority(
         mut self,
-        authority: Option<&'a crate::daemon::retained_owner::ProfileRetainedConnectionAuthorityV1>,
+        authority: Option<
+            &'a tracedecay_session_runtime::retained::ProfileRetainedConnectionAuthorityV1,
+        >,
     ) -> Self {
         self.profile_retained_authority = authority;
         self
@@ -78,6 +85,15 @@ impl<'a> SessionAuthorities<'a> {
     ) -> Self {
         self.project_lcm = project;
         self.profile_lcm = profile;
+        self
+    }
+
+    #[hotpath::skip]
+    pub(crate) const fn with_profile_session_refresh(
+        mut self,
+        refresh: Option<&'a dyn tracedecay_session_runtime::retained::RetainedSessionRefreshPortV1>,
+    ) -> Self {
+        self.profile_session_refresh = refresh;
         self
     }
 }

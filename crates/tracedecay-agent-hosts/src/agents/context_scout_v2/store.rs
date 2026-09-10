@@ -282,6 +282,10 @@ pub struct ProjectContextScoutDurableStoreV1 {
 }
 
 impl ProjectContextScoutDurableStoreV1 {
+    pub fn database(&self) -> &Database {
+        &self.database
+    }
+
     /// Builds an owned store from the daemon's retained project database.
     pub fn from_project_database(database: Database, project_id: [u8; 16]) -> Option<Arc<Self>> {
         (project_id != [0; 16]).then(|| {
@@ -687,10 +691,10 @@ impl ProjectContextScoutDurableStoreV1 {
                 return ContextScoutDurableClaimOutcomeV1::Empty;
             };
             match stored.lease {
-                Some(existing) if existing == lease => {
+                Some(existing) if existing.lease_id == lease.lease_id => {
                     ContextScoutDurableClaimOutcomeV1::Claimed(ContextScoutDurableClaimV1 {
                         entry: stored.entry.clone(),
-                        lease,
+                        lease: existing,
                     })
                 }
                 Some(_) => ContextScoutDurableClaimOutcomeV1::Empty,

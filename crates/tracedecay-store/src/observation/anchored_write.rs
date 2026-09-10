@@ -135,6 +135,26 @@ impl RepositoryProvenanceAttachmentV1 {
         &self.origin
     }
 
+    /// Restores the origin retained beside the repository capture. Legacy rows
+    /// without an origin keep the ingestion-only or unavailable constructor
+    /// result. This restores evidence; the host must still validate its receipt.
+    pub fn with_retained_origin(
+        mut self,
+        origin: Option<ObservationOriginV1>,
+    ) -> ObservationStoreResult<Self> {
+        match origin {
+            Some(ObservationOriginV1::Recorded {
+                authority_ref,
+                source_identity,
+            }) => self.with_recorded_origin(authority_ref, source_identity),
+            Some(origin) => {
+                self.origin = origin;
+                Ok(self)
+            }
+            None => Ok(self),
+        }
+    }
+
     /// Retains the live-event proof already checked by the host producer. A caller
     /// must revalidate the referenced receipt before granting cross-session reuse.
     pub fn with_recorded_origin(

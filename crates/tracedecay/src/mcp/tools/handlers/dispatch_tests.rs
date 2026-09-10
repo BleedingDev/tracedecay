@@ -137,32 +137,24 @@ async fn multi_root_tools_invoke_the_closed_daemon_routes() {
     );
 }
 
-/// `DiagnosticsRead` answers to two tool names, and the classifier only
-/// declines the surface for one of them. The deferred name must land on a
-/// group that owns a concrete handler; it previously resolved to nothing,
-/// so every executor-less server answered `unknown tool`.
+/// Diagnostics has one production owner regardless of whether the MCP server
+/// could attach a daemon executor; the canonical owner reports typed
+/// application transport unavailability when none is attached.
 #[test]
-fn diagnostics_without_an_executor_reaches_the_analysis_handler() {
+fn diagnostics_always_reaches_the_application_surface_owner() {
     assert_eq!(
-        classify_mcp_tool_dispatch_group("tracedecay_diagnostics", true),
+        classify_mcp_tool_dispatch_group("tracedecay_diagnostics"),
         Some(McpToolDispatchGroup::ApplicationSurface),
     );
     assert_eq!(
-        classify_mcp_tool_dispatch_group("tracedecay_diagnostics", false),
-        Some(McpToolDispatchGroup::Analysis),
+        dispatch_group_for_tool("tracedecay_diagnostics"),
+        Some(McpToolDispatchGroup::ApplicationSurface),
+        "diagnostics must not retain a second analysis owner",
     );
     assert_eq!(
-        dispatch_group_for_tool("tracedecay_diagnostics"),
-        Some(McpToolDispatchGroup::Analysis),
-        "the deferred lookup has no other table to resolve against",
+        classify_mcp_tool_dispatch_group("tracedecay_diagnostics_read"),
+        None,
     );
-    for executor_available in [true, false] {
-        assert_eq!(
-            classify_mcp_tool_dispatch_group("tracedecay_diagnostics_read", executor_available),
-            Some(McpToolDispatchGroup::ApplicationSurface),
-            "the reviewed request shape has no in-process handler to fall back to",
-        );
-    }
 }
 
 #[tokio::test]
@@ -224,17 +216,14 @@ async fn unmounted_files_root_dispatch_reports_a_real_orphaned_rust_source() {
 #[test]
 fn hotpath_tool_identity_preserves_catalog_names_and_bounds_unknown_values() {
     assert_eq!(
-        mcp_tool_hotpath_identity("tracedecay_search", false),
+        mcp_tool_hotpath_identity("tracedecay_search"),
         "tracedecay_search"
     );
     assert_eq!(
-        mcp_tool_hotpath_identity("attacker-controlled-unknown-name", false),
+        mcp_tool_hotpath_identity("attacker-controlled-unknown-name"),
         "unknown"
     );
-    assert_eq!(
-        mcp_tool_hotpath_identity("another-unknown-name", true),
-        "unknown"
-    );
+    assert_eq!(mcp_tool_hotpath_identity("another-unknown-name"), "unknown");
 }
 
 /// The MCP deadline horizon asks this predicate which reads walk git, so it
@@ -280,107 +269,92 @@ async fn advertised_tools_resolve_one_concrete_dispatch_entry() {
             "{} is advertised more than once",
             definition.name
         );
-        // Both executor states, because the classifier defers a tool to a
-        // different group when no application invocation executor is
-        // attached. Probing only the attached state let the deferred group
-        // resolve to nothing at all without failing this test.
-        for executor_available in [true, false] {
-            assert_eq!(
-                mcp_tool_hotpath_identity(&definition.name, executor_available),
-                definition.name,
-                "{} must retain exact bounded Hotpath identity",
-                definition.name
-            );
-            let group = classify_mcp_tool_dispatch_group(&definition.name, executor_available)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{} has no production dispatch entry with executor_available={executor_available}",
-                        definition.name
-                    )
-                });
+        assert_eq!(
+            mcp_tool_hotpath_identity(&definition.name),
+            definition.name,
+            "{} must retain exact bounded Hotpath identity",
+            definition.name
+        );
+        let group = classify_mcp_tool_dispatch_group(&definition.name)
+            .unwrap_or_else(|| panic!("{} has no production dispatch entry", definition.name));
 
-            match group {
-                McpToolDispatchGroup::ApplicationSurface => assert!(
-                    ApplicationSurfaceOperation::from_tool_name(&definition.name).is_some(),
-                    "{} has no application-surface handler entry",
-                    definition.name
+        match group {
+            McpToolDispatchGroup::ApplicationSurface => assert!(
+                ApplicationSurfaceOperation::from_tool_name(&definition.name).is_some(),
+                "{} has no application-surface handler entry",
+                definition.name
+            ),
+            McpToolDispatchGroup::MultiRoot => assert!(
+                matches!(
+                    definition.name.as_str(),
+                    "tracedecay_multi_root_scope_set_read"
+                        | "tracedecay_multi_root_scope_set_compare_and_swap"
+                        | "tracedecay_multi_root_execute"
                 ),
-                McpToolDispatchGroup::MultiRoot => assert!(
-                    matches!(
-                        definition.name.as_str(),
-                        "tracedecay_multi_root_scope_set_read"
-                            | "tracedecay_multi_root_scope_set_compare_and_swap"
-                            | "tracedecay_multi_root_execute"
-                    ),
-                    "{} has no multi-root daemon handler entry",
-                    definition.name
-                ),
-                McpToolDispatchGroup::Work => assert!(
-                    crate::mcp::tools::binding::work_operation_for_tool(&definition.name).is_some(),
-                    "{} has no canonical Work operation entry",
-                    definition.name
-                ),
-                McpToolDispatchGroup::Workflow => assert!(
-                    crate::mcp::tools::binding::workflow_operation_for_tool(&definition.name)
-                        .is_some(),
-                    "{} has no canonical Workflow operation entry",
-                    definition.name
-                ),
-                McpToolDispatchGroup::RetainedApplication => {
-                    let composition = retained_mcp_composition().unwrap_or_else(|error| {
-                        panic!("{} catalog composition failed: {error}", definition.name)
+                "{} has no multi-root daemon handler entry",
+                definition.name
+            ),
+            McpToolDispatchGroup::Work => assert!(
+                crate::mcp::tools::binding::work_operation_for_tool(&definition.name).is_some(),
+                "{} has no canonical Work operation entry",
+                definition.name
+            ),
+            McpToolDispatchGroup::Workflow => assert!(
+                crate::mcp::tools::binding::workflow_operation_for_tool(&definition.name).is_some(),
+                "{} has no canonical Workflow operation entry",
+                definition.name
+            ),
+            McpToolDispatchGroup::RetainedApplication => {
+                let composition = retained_mcp_composition().unwrap_or_else(|error| {
+                    panic!("{} catalog composition failed: {error}", definition.name)
+                });
+                let profile = ProfileId::new(APPLICATION_DEFAULT_PROFILE_ID).unwrap();
+                let operation = RetainedSurfaceOperation::from_tool_name(&definition.name)
+                    .unwrap_or_else(|| {
+                        panic!("{} has no retained-surface handler entry", definition.name)
                     });
-                    let profile = ProfileId::new(APPLICATION_DEFAULT_PROFILE_ID).unwrap();
-                    for operation in retained_operations_for_advertised_tool(&definition.name) {
-                        let operation_name = SurfaceOperationName::new(operation.as_str()).unwrap();
-                        let capability = composition
-                            .snapshot()
-                            .resolve_binding(
-                                &profile,
-                                BindingSurface::Mcp,
-                                &operation_name,
-                                1,
-                                &BTreeSet::new(),
-                            )
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "{} action {} catalog binding is not callable",
-                                    definition.name,
-                                    operation.as_str()
-                                )
-                            });
-                        let expected = retained_surface_application_operation(operation).unwrap();
-                        assert_eq!(capability.capability_id(), expected.capability_id());
-                        assert_eq!(capability.use_case_id(), expected.use_case_id());
-                        assert!(
-                            composition
-                                .bind_handler(capability.use_case_id(), &())
-                                .is_some(),
-                            "{} action {} application handler is not registered",
+                let operation_name = SurfaceOperationName::new(operation.as_str()).unwrap();
+                let capability = composition
+                    .snapshot()
+                    .resolve_binding(
+                        &profile,
+                        BindingSurface::Mcp,
+                        &operation_name,
+                        1,
+                        &BTreeSet::new(),
+                    )
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{} action {} catalog binding is not callable",
                             definition.name,
                             operation.as_str()
-                        );
-                    }
-                }
-                group => {
-                    assert_eq!(
-                        dispatch_group_for_tool(&definition.name),
-                        Some(group),
-                        "{} does not resolve through the canonical MCP binding registry",
-                        definition.name
-                    );
-                    assert!(
-                        concrete_dispatch_group_accepts(
-                            group,
-                            &definition.name,
-                            &cg,
-                            options.clone()
                         )
+                    });
+                let expected = retained_surface_application_operation(operation).unwrap();
+                assert_eq!(capability.capability_id(), expected.capability_id());
+                assert_eq!(capability.use_case_id(), expected.use_case_id());
+                assert!(
+                    composition
+                        .bind_handler(capability.use_case_id(), &())
+                        .is_some(),
+                    "{} action {} application handler is not registered",
+                    definition.name,
+                    operation.as_str()
+                );
+            }
+            group => {
+                assert_eq!(
+                    dispatch_group_for_tool(&definition.name),
+                    Some(group),
+                    "{} does not resolve through the canonical MCP binding registry",
+                    definition.name
+                );
+                assert!(
+                    concrete_dispatch_group_accepts(group, &definition.name, &cg, options.clone())
                         .await,
-                        "{} has no concrete handler-family entry",
-                        definition.name
-                    );
-                }
+                    "{} has no concrete handler-family entry",
+                    definition.name
+                );
             }
         }
     }
@@ -391,13 +365,11 @@ async fn advertised_tools_resolve_one_concrete_dispatch_entry() {
         "tracedecay_fact_store",
     ] {
         assert!(!advertised.contains(tool_name));
-        for executor_available in [true, false] {
-            assert_eq!(
-                classify_mcp_tool_dispatch_group(tool_name, executor_available),
-                None,
-                "{tool_name} must fail closed with executor_available={executor_available}"
-            );
-        }
+        assert_eq!(
+            classify_mcp_tool_dispatch_group(tool_name),
+            None,
+            "{tool_name} must fail closed"
+        );
         let rejected = handle_tool_call_with_registry_options(
             &cg,
             tool_name,
@@ -411,20 +383,6 @@ async fn advertised_tools_resolve_one_concrete_dispatch_entry() {
             rejected.is_err(),
             "{tool_name} must reject handler dispatch"
         );
-    }
-}
-
-fn retained_operations_for_advertised_tool(tool_name: &str) -> Vec<RetainedSurfaceOperation> {
-    match tool_name {
-        "tracedecay_session_refresh" => vec![
-            RetainedSurfaceOperation::SessionRefreshStatus,
-            RetainedSurfaceOperation::SessionRefreshCancel,
-            RetainedSurfaceOperation::SessionRefreshBegin,
-        ],
-        _ => vec![
-            RetainedSurfaceOperation::from_tool_name(tool_name)
-                .unwrap_or_else(|| panic!("{tool_name} has no retained-surface handler entry")),
-        ],
     }
 }
 
@@ -567,10 +525,15 @@ async fn status_and_runtime_share_cursor_session_ingest_authority() {
         )
         .await
         .unwrap();
-    let options = || ToolCallRegistryOptions {
-        registered_project_session_db: runtime
-            .registered_database_arc(tracedecay_sessions::admission::HostAdmissionScope::Project),
-        ..Default::default()
+    let options = || {
+        ToolCallRegistryOptions {
+            registered_project_session_db: runtime.registered_database_arc(
+                tracedecay_sessions::admission::HostAdmissionScope::Project,
+            ),
+            ..Default::default()
+        }
+        .admit_opened_project(&cg)
+        .expect("opened fixture admits")
     };
     let status = handle_tool_call_with_registry_options(
         &cg,
@@ -704,7 +667,9 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
         ToolCallRegistryOptions {
             code_index_freshness_reader: Some(freshness_reader(None, Some("indexing"), true)),
             ..Default::default()
-        },
+        }
+        .admit_opened_project(&cg)
+        .expect("opened fixture admits"),
     )
     .await
     .expect("status answers while nothing serves");
@@ -733,7 +698,9 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
                 false,
             )),
             ..Default::default()
-        },
+        }
+        .admit_opened_project(&cg)
+        .expect("opened fixture admits"),
     )
     .await
     .expect("status answers while serving");
@@ -761,7 +728,9 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
                 true,
             )),
             ..Default::default()
-        },
+        }
+        .admit_opened_project(&cg)
+        .expect("opened fixture admits"),
     )
     .await
     .expect("status answers while a stale seat is rebuilding");
@@ -805,7 +774,9 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
         ToolCallRegistryOptions {
             code_index_freshness_reader: Some(aged_reader),
             ..Default::default()
-        },
+        }
+        .admit_opened_project(&cg)
+        .expect("opened fixture admits"),
     )
     .await
     .expect("status answers for an aged seat");
@@ -964,7 +935,7 @@ async fn selected_project_retrieve_finds_selected_project_response_handle() {
     let target_server = crate::mcp::McpServer::new_with_host_admission_test_runtime_for_test(
         target,
         None,
-        crate::host_admission::ProjectScopedTestRuntimeV1::new(target_runtime)
+        crate::test_support::host_admission::ProjectScopedTestRuntimeV1::new(target_runtime)
             .expect("target project-scoped runtime"),
     )
     .await
@@ -972,7 +943,7 @@ async fn selected_project_retrieve_finds_selected_project_response_handle() {
     let server = crate::mcp::McpServer::new_with_retained_test_servers_for_test(
         active,
         None,
-        crate::host_admission::ProjectScopedTestRuntimeV1::new(active_runtime)
+        crate::test_support::host_admission::ProjectScopedTestRuntimeV1::new(active_runtime)
             .expect("active project-scoped runtime"),
         vec![target_server],
     )
@@ -1209,7 +1180,9 @@ async fn git_dispatch_rejects_an_already_elapsed_deadline_without_running_the_ha
                 tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(1)).unwrap(),
             ),
             ..ToolCallRegistryOptions::default()
-        };
+        }
+        .admit_opened_project(&cg)
+        .expect("opened fixture admits");
         let started = std::time::Instant::now();
         let result = dispatch_git_tools(
             tool_name,
@@ -1375,79 +1348,6 @@ async fn pr_context_returns_git_evidence_while_verified_graph_is_unavailable() {
             expected_reason
         );
         assert_eq!(payload["verified_graph_evidence"]["status"], "unavailable");
-    }
-
-    cg.close();
-}
-
-#[tokio::test]
-async fn pr_context_propagates_terminal_graph_failures_without_a_cursor() {
-    let _env_lock = lock_user_data_dir_test_env();
-    let dir = TempDir::new().unwrap();
-    let _env = SelectorEnv::new(dir.path());
-    let project = dir.path().join("git-pr-context-terminal-graph");
-    fs::create_dir_all(project.join("src")).unwrap();
-    run_git_in(&project, &["init", "-b", "main"]);
-    fs::write(project.join("src/lib.rs"), "pub fn before() {}\n").unwrap();
-    run_git_in(&project, &["add", "."]);
-    run_git_in(&project, &["commit", "-m", "initial"]);
-    run_git_in(&project, &["switch", "-c", "feature"]);
-    fs::write(
-        project.join("src/lib.rs"),
-        "pub fn before() {}\npub fn after() {}\n",
-    )
-    .unwrap();
-    run_git_in(&project, &["add", "."]);
-    run_git_in(&project, &["commit", "-m", "change source"]);
-
-    let (cg, _runtime) = TraceDecay::init_test_fixture_with_registered_runtime(
-        &project,
-        "project.mcp-git-pr-context-terminal-graph",
-    )
-    .await
-    .unwrap();
-    let terminal_errors = [
-        tracedecay_graph_query::map_code_graph_read_runtime_error(
-            tracedecay_graph_query::CodeGraphReadError::Cancelled,
-        ),
-        tracedecay_graph_query::map_code_graph_read_runtime_error(
-            tracedecay_graph_query::CodeGraphReadError::Denied,
-        ),
-        tracedecay_graph_query::map_code_graph_read_runtime_error(
-            tracedecay_graph_query::CodeGraphReadError::Corrupt {
-                detail: "corrupt projection".to_owned(),
-            },
-        ),
-        tracedecay_graph_query::map_code_graph_read_runtime_error(
-            tracedecay_graph_query::CodeGraphReadError::ResetRequired {
-                detail: "generation reset required".to_owned(),
-            },
-        ),
-        tracedecay_graph_query::map_code_graph_read_runtime_error(
-            tracedecay_graph_query::CodeGraphReadError::InvalidRequest {
-                detail: "invalid graph request".to_owned(),
-            },
-        ),
-        TraceDecayError::Config {
-            message: "graph configuration is invalid".to_owned(),
-        },
-    ];
-
-    for error in terminal_errors {
-        let detail = error.to_string();
-        let result = git::handle_pr_context(
-            &cg,
-            async move { Err::<tracedecay_graph_query::VerifiedGraphQuery, _>(error) },
-            json!({"base_ref": "main", "head_ref": "HEAD", "format": "json"}),
-            None,
-            None,
-            None,
-        )
-        .await;
-        assert!(
-            result.is_err(),
-            "terminal graph failure must not become partial success: {detail}"
-        );
     }
 
     cg.close();
@@ -1842,7 +1742,7 @@ async fn user_lcm_doctor_reports_a_missing_store_without_opening_it() {
             .expect("profile root identity"),
     );
     let profile_retained_authority =
-        crate::daemon::retained_owner::profile_retained_connection_authority(
+        tracedecay_session_runtime::retained::profile_retained_connection_authority(
             &profile_identity,
             &session_identity,
         )
@@ -1878,6 +1778,169 @@ async fn user_lcm_doctor_reports_a_missing_store_without_opening_it() {
         !sessions_db.exists(),
         "read-only LCM Doctor must not open a missing profile store"
     );
+    cg.close();
+}
+
+/// The MCP root handler routes a canonical `scope.kind=profile` refresh to
+/// the profile session authority (never the active project's store): begin
+/// issues a handle bound to the profile store, status reads it back through
+/// the same daemon-wide refresh service, and an unmounted refresh service is
+/// a typed unavailable terminal rather than a project fallback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_scoped_session_refresh_dispatches_to_the_profile_authority() {
+    let _env_lock = lock_user_data_dir_test_env();
+    let dir = TempDir::new().unwrap();
+    let _env = SelectorEnv::new(dir.path());
+    let project = dir.path().join("profile-refresh-project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.rs"), "pub fn probe() {}\n").unwrap();
+    let (cg, _runtime) = TraceDecay::init_test_fixture_with_registered_runtime(
+        &project,
+        "project.mcp-profile-session-refresh",
+    )
+    .await
+    .unwrap();
+    let profile_root = tracedecay_runtime_core::storage::default_profile_root().unwrap();
+    let profile_identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+            .expect("fixture profile identity");
+    let profile_id = profile_identity.profile_id().as_str().to_owned();
+    let suffix = profile_id
+        .strip_prefix("profile.")
+        .expect("canonical profile identity prefix");
+    let store_id = format!("store.profile.{suffix}");
+    let root_id = format!("root.profile.{suffix}");
+    let session_identity = tracedecay_session_memory::context::ResolvedSessionIdentity::for_profile(
+        tracedecay_session_memory::context::ProfileId::new(profile_id.clone())
+            .expect("profile session identity"),
+        tracedecay_session_memory::context::SessionStoreId::new(store_id.clone())
+            .expect("profile store identity"),
+        tracedecay_session_memory::context::SessionRootId::new(root_id.clone())
+            .expect("profile root identity"),
+    );
+    let profile_retained_authority =
+        tracedecay_session_runtime::retained::profile_retained_connection_authority(
+            &profile_identity,
+            &session_identity,
+        )
+        .expect("canonical profile retained authority");
+    let profile_database = cg
+        .store_runtime_registry()
+        .profile_sessions()
+        .await
+        .expect("profile session database");
+    let schedulers =
+        tracedecay_session_runtime::session_temporal_refresh_scheduler::SessionTemporalRefreshSchedulerRegistry::default();
+    let wake = schedulers
+        .ensure_profile(
+            profile_database.db_path().to_path_buf(),
+            profile_database.clone(),
+        )
+        .await;
+    let refresh = crate::mcp::server::DaemonSessionRefreshService::new(
+        profile_database,
+        std::sync::Arc::new(wake),
+        None,
+    );
+    let selectors = json!({
+        "scope": { "kind": "profile", "profile_id": profile_id },
+        "session": {
+            "id": "session.mcp.profile-refresh",
+            "store_id": store_id,
+            "root_id": root_id
+        },
+        "source": { "scope": "codex" },
+        "target": {
+            "temporal_mode": { "kind": "current" },
+            "grain": "logical_message",
+            "frontier": { "observed_through": 0, "committed_through": 0 }
+        },
+        "format": "json"
+    });
+    let call = |tool_name: &'static str, arguments: Value, mounted: bool| {
+        let cg = &cg;
+        let profile_root = &profile_root;
+        let profile_retained_authority = &profile_retained_authority;
+        let refresh = &refresh;
+        async move {
+            let result = handle_tool_call_with_registry_options(
+                cg,
+                tool_name,
+                arguments,
+                None,
+                None,
+                ToolCallRegistryOptions {
+                    profile_root: Some(profile_root),
+                    session_authorities: SessionAuthorities::default()
+                        .with_profile_retained_authority(Some(profile_retained_authority))
+                        .with_profile_session_refresh(mounted.then_some(
+                            refresh
+                                as &dyn tracedecay_session_runtime::retained::RetainedSessionRefreshPortV1,
+                        )),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            serde_json::from_str::<Value>(
+                result.value["content"][0]["text"]
+                    .as_str()
+                    .expect("retained text response"),
+            )
+            .expect("retained JSON envelope")
+        }
+    };
+
+    let begun = call("tracedecay_session_refresh_begin", selectors.clone(), true).await;
+    let envelope: tracedecay_contracts::ApplicationEnvelope<Value> =
+        serde_json::from_value(begun.clone()).unwrap_or_else(|error| {
+            panic!("begin must answer an application envelope: {error}\n{begun}")
+        });
+    let tracedecay_contracts::ApplicationOutcome::Effect(effect) = envelope.outcome else {
+        panic!("begin must be an effect: {begun}");
+    };
+    let begin = effect.payload.expect("begin payload");
+    assert!(
+        matches!(begin["outcome"].as_str(), Some("started" | "joined")),
+        "{begin}"
+    );
+    assert_eq!(begin["scope"], "profile");
+    assert_eq!(begin["tool"], "tracedecay_session_refresh_begin");
+    let handle = begin["handle"]
+        .as_str()
+        .expect("opaque refresh handle")
+        .to_owned();
+    assert!(handle.starts_with("srh_"), "{handle}");
+
+    let mut status_arguments = selectors.clone();
+    status_arguments["handle"] = json!(handle);
+    let observed = call("tracedecay_session_refresh_status", status_arguments, true).await;
+    let envelope: tracedecay_contracts::ApplicationEnvelope<Value> =
+        serde_json::from_value(observed.clone()).unwrap_or_else(|error| {
+            panic!("status must answer an application envelope: {error}\n{observed}")
+        });
+    let tracedecay_contracts::ApplicationOutcome::Evidence(packet) = envelope.outcome else {
+        panic!("status must be evidence: {observed}");
+    };
+    let status = packet.payload.expect("status payload");
+    assert!(
+        matches!(status["outcome"].as_str(), Some("running" | "complete")),
+        "{status}"
+    );
+    assert_eq!(status["scope"], "profile");
+
+    let unmounted = call("tracedecay_session_refresh_begin", selectors, false).await;
+    assert_eq!(
+        unmounted["problem"]["kind"], "unavailable",
+        "an unmounted profile refresh service must be a typed terminal, got {unmounted}"
+    );
+    assert!(
+        unmounted["problem"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("profile session refresh authority")),
+        "{unmounted}"
+    );
+    schedulers.shutdown().await;
     cg.close();
 }
 

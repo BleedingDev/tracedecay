@@ -1739,7 +1739,7 @@ impl ProjectCognitiveRecallMountV1 {
                 return MountedCanonicalRecordStoreV1 { outcomes };
             }
         }
-        let memory = match self.graph.project_memory_application().await {
+        let memory = match self.graph.project_memory_application() {
             Ok(memory) => memory,
             Err(_) => {
                 for record_id in claimed {
@@ -3175,8 +3175,10 @@ const ADVISORY_CONTEXT_PACK_TOTAL_TOKEN_BUDGET: u64 = 128_000;
 /// The quota bounds the advisory lane as the agent *sees* it: its heading,
 /// its provider attribution, and every rendered candidate with its identity,
 /// provenance label and explanation. Metadata is agent-visible text exactly
-/// like content is, and is budgeted as such.
-const ADVISORY_CONTEXT_PACK_PROVIDER_TOKEN_QUOTA: u64 = 1_024;
+/// like content is, and is budgeted as such. Full canonical source evidence
+/// and retained recall controls share the quota, including for ordinary
+/// multi-message session recalls.
+const ADVISORY_CONTEXT_PACK_PROVIDER_TOKEN_QUOTA: u64 = 8_192;
 
 /// Longest human-readable detail retained beside a typed code. Detail is
 /// diagnostic prose; the code is the terminal outcome, and it is never
@@ -5373,7 +5375,6 @@ mod tests {
         let memory = fixture
             .graph
             .project_memory_application()
-            .await
             .expect("project memory application");
         let preflight = memory
             .preflight_project_memory_fact_add(
@@ -6550,7 +6551,6 @@ mod tests {
         let memory = fixture
             .graph
             .project_memory_application()
-            .await
             .expect("memory application");
         let owner = fixture.graph.project_memory_owner().expect("project owner");
         let fact_query = || {

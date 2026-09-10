@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
 use tracedecay_domain::{Confidence, FactCategoryV1, PayloadAccessState};
-use tracedecay_session_memory::memory::ProjectMemoryFactAddRequest;
+use tracedecay_session_memory::memory::{
+    MemoryApplicationError, ProjectMemoryFactAddRequest, memory_application_error,
+};
 use tracedecay_store::{
     ProjectMemoryFactProjectionV1, ProjectMemoryFactSearchFilterV1, ProjectMemoryFactSearchKindV1,
     ProjectMemoryFactSearchQuery, ProjectMemoryFactStore,
@@ -10,10 +12,20 @@ use tracedecay_store::{
 
 use crate::automation::lifecycle::AutomationRunControl;
 use tracedecay_domain::errors::{Result, TraceDecayError};
-use tracedecay_runtime_core::memory::trust::{
+use tracedecay_session_memory::memory::MemoryApplication;
+use tracedecay_session_memory::memory::trust::{
     DEFAULT_TRUST, HIGH_TRUST_REPRESENTATIVE, LOW_TRUST_REPRESENTATIVE,
 };
-use tracedecay_session_memory::memory::MemoryApplication;
+
+fn map_session_reflector_memory_error(
+    operation: &'static str,
+    error: MemoryApplicationError,
+) -> TraceDecayError {
+    if error.is_cancellation() {
+        return memory_application_error(error);
+    }
+    TraceDecayError::database_operation(operation, error)
+}
 
 pub(crate) async fn validate_fact_candidates<A: ProjectMemoryFactStore>(
     memory: &MemoryApplication<A>,
@@ -283,7 +295,7 @@ async fn validate_fact_candidate<A: ProjectMemoryFactStore>(
         .find_exact_fact_by_content(&content, run_control.read_control())
         .await
         .map_err(|error| {
-            TraceDecayError::database_operation(
+            map_session_reflector_memory_error(
                 "validate session reflector exact duplicate through memory authority",
                 error,
             )
@@ -339,7 +351,7 @@ async fn validate_fact_candidate<A: ProjectMemoryFactStore>(
         .search_project_memory_facts(query, run_control.read_control())
         .await
         .map_err(|error| {
-            TraceDecayError::database_operation(
+            map_session_reflector_memory_error(
                 "validate session reflector near duplicate through memory authority",
                 error,
             )
@@ -435,7 +447,7 @@ fn session_fact_category(category: &str) -> Option<FactCategoryV1> {
 /// Accepts numeric trust in `[0, 1]` plus the `low`/`medium`/`high` bucket
 /// labels models frequently emit despite the numeric prompt instruction.
 /// Buckets map to the representative scores defined next to
-/// [`tracedecay_runtime_core::memory::trust::trust_bucket`], so they cannot drift out of their
+/// [`tracedecay_session_memory::memory::trust::trust_bucket`], so they cannot drift out of their
 /// documented ranges.
 ///
 /// Deliberate decision: the prompt forbids string labels, but they are

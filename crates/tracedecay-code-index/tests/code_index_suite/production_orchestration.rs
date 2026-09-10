@@ -2,7 +2,7 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
     io::Cursor,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -660,16 +660,11 @@ fn physical_artifact_reuse_preserves_byte_exact_sealed_generation() {
     drop(source);
 }
 
-/// One file exceeding the bounded per-file parse budget must never fail the
-/// whole build: the generation still completes, publishes, and serves, with
-/// the slow file recorded as a typed unsupported document (with a reason) and
-/// truthful coverage accounting.
+/// Expired parse quanta resume while the operation remains admitted; scheduling
+/// does not turn a valid source file into a durable unsupported document.
 #[test]
-fn slow_parse_file_publishes_a_completed_generation_with_a_typed_omission() {
-    // The retained parser's deadline is only observed every ~100 Tree-sitter
-    // parse operations, so the tiny file completes before the first progress
-    // check while the generated file reliably crosses many of them. A 1ns
-    // budget therefore deterministically times out exactly the large file.
+fn resumed_parse_quanta_publish_the_same_complete_generation() {
+    // One nanosecond forces every Tree-sitter progress checkpoint to suspend.
     let pool = SharedRetainedParsePool::new(RetainedParsePoolLimits {
         document: ParseLimits {
             max_parse_time: Duration::from_nanos(1),
@@ -736,45 +731,111 @@ fn slow_parse_file_publishes_a_completed_generation_with_a_typed_omission() {
         target_projection_key: projection_key(),
     };
 
+    let cold_request = request.clone();
     let generation = owner
         .build_and_publish(request, &ActiveControl)
-        .expect("a slow-parse file must not fail the whole generation");
-
-    // Truthful coverage: both files eligible, exactly the slow one omitted.
+        .expect("admitted parsing resumes to completion");
     assert_eq!(generation.coverage().files_eligible, 2);
-    assert_eq!(generation.coverage().files_unsupported, 1);
-
-    // The generation serves: the fast file's chunks are admitted, and no
-    // chunk was invented for the timed-out file.
-    let admitted = generation
-        .admitted_chunks()
-        .expect("published generation admits exact chunks");
-    assert!(!admitted.is_empty());
+    assert_eq!(generation.coverage().files_unsupported, 0);
+    let admitted = generation.admitted_chunks().expect("published chunks");
     assert!(
         admitted
             .iter()
-            .all(|chunk| chunk.chunk().anchor.file_occurrence_id.as_str() == "file.fast")
+            .any(|chunk| chunk.chunk().anchor.file_occurrence_id.as_str() == "file.slow")
     );
+    let mut cold_owner = CodeIndexProductionOwnerV1::new(
+        config(),
+        SharedPublicationStore::default(),
+        ApplyingProjectionSink,
+    )
+    .expect("cold production owner");
+    let cold = cold_owner
+        .build_and_publish(cold_request, &ActiveControl)
+        .expect("cold generation");
+    assert_eq!(
+        generation.encode_sealed().expect("resumed seal"),
+        cold.encode_sealed().expect("cold seal")
+    );
+}
 
-    // The omission is a typed per-file document state with a reason, durable
-    // through sealing.
-    let sealed = generation.encode_sealed().expect("generation seals");
-    let value: serde_json::Value = serde_json::from_slice(&sealed).expect("sealed JSON");
-    let slow_document = value["generation"]["files"]
-        .as_array()
-        .expect("sealed files")
-        .iter()
-        .map(|file| &file["artifacts"]["chunks"]["document"])
-        .find(|document| document["file_occurrence_id"] == "file.slow")
-        .expect("slow file document is retained in the generation");
-    assert_eq!(slow_document["eligibility"]["eligibility"], "unsupported");
-    let reason = slow_document["eligibility"]["reason"]["reason"]
-        .as_str()
-        .expect("typed omission carries a reason");
-    assert!(
-        reason.contains("parse budget"),
-        "unexpected omission reason: {reason}"
-    );
+#[test]
+fn resumed_parse_aborts_without_publication_when_operation_control_expires() {
+    struct DuringParseControl {
+        checks: AtomicUsize,
+        deadline: bool,
+    }
+    impl CodeIndexExecutionControlV1 for DuringParseControl {
+        fn is_cancelled(&self) -> bool {
+            !self.deadline && self.checks.fetch_add(1, Ordering::Relaxed) >= 100
+        }
+        fn is_deadline_exceeded(&self) -> bool {
+            self.deadline && self.checks.fetch_add(1, Ordering::Relaxed) >= 100
+        }
+    }
+    let source = (0..2_000)
+        .map(|n| format!("fn item_{n}() -> u64 {{ {n} }}\n"))
+        .collect::<String>();
+    for deadline in [false, true] {
+        let pool = SharedRetainedParsePool::new(RetainedParsePoolLimits {
+            document: ParseLimits {
+                max_parse_time: Duration::from_nanos(1),
+                ..ParseLimits::default()
+            },
+            ..RetainedParsePoolLimits::default()
+        })
+        .expect("parse pool");
+        let store = SharedPublicationStore::default();
+        let mut owner =
+            CodeIndexProductionOwnerV1::new(config(), store.clone(), ApplyingProjectionSink)
+                .expect("owner")
+                .with_retained_parse_pool(pool.clone());
+        let request = request_with_source(
+            "file.interrupted-parse",
+            1_100_000,
+            "commit.parse",
+            "tree.parse",
+            &source,
+        );
+        let scope = CodeIndexGenerationScopeV1::for_snapshot(&request.snapshot);
+        let error = owner
+            .build_and_publish(
+                request.clone(),
+                &DuringParseControl {
+                    checks: AtomicUsize::new(0),
+                    deadline,
+                },
+            )
+            .expect_err("interrupted parse cannot publish");
+        let expected = if deadline {
+            CodeIndexInterruptionV1::DeadlineExceeded
+        } else {
+            CodeIndexInterruptionV1::Cancelled
+        };
+        assert!(
+            matches!(error, CodeIndexProductionErrorV1::Interrupted(reason) if reason == expected)
+        );
+        assert_eq!(
+            pool.stats().failed_parses,
+            1,
+            "control expires inside the retained parser"
+        );
+        assert!(
+            store
+                .load_active(&scope)
+                .expect("publication state")
+                .is_none()
+        );
+        let recovered = owner
+            .build_and_publish(request, &ActiveControl)
+            .expect("retry after cancellation resets parser");
+        assert_eq!(recovered.coverage().files_unsupported, 0);
+        assert!(
+            !recovered
+                .admitted_chunks()
+                .expect("admitted chunks")
+                .is_empty()
+        );
+    }
 }
 
 #[test]
@@ -988,11 +1049,13 @@ fn published_graph_manifest_projects_files_chunks_symbols_and_replays_byte_ident
             .count()
     };
     assert_eq!(label_count("CodeFile"), generation.snapshot().files.len());
-    assert_eq!(label_count("CodeChunk"), generation.chunks().chunks().len());
     assert_eq!(
         label_count("CodeSymbol"),
         generation.symbols().symbols.len()
     );
+    // Chunks bind symbols but are not graph rows: no reader addresses one
+    // through the graph, and a symbol's binding already names its chunk.
+    assert_eq!(label_count("CodeChunk"), 0);
     assert!(
         manifest
             .relations
@@ -1003,7 +1066,11 @@ fn published_graph_manifest_projects_files_chunks_symbols_and_replays_byte_ident
         manifest
             .relations
             .iter()
-            .any(|relation| { relation.kind.as_str() == "CodeChunkDescribesSymbol" })
+            .all(|relation| { relation.kind.as_str() != "CodeChunkDescribesSymbol" })
+    );
+    assert!(
+        manifest.entities.len() < generation.chunks().chunks().len(),
+        "the graph must not scale with the chunk count"
     );
 
     let sealed = generation.encode_sealed().expect("generation seals");
@@ -1515,24 +1582,9 @@ fn verified_lexical_source_pages_a_large_file_and_resumes_after_cancellation() {
             "pub fn bounded_item_{ordinal}() -> u32 {{ {ordinal} }}\n"
         ));
     }
-    // This test is about paging and cancellation resume, not about the parse
-    // budget, so the fixture must parse completely every time. A 1.5 MB file
-    // sits close enough to the 250ms default budget that a busy machine can
-    // time it out, publish a typed unsupported document, and fail this test
-    // for a reason it does not test. Pin a generous budget the same way the
-    // sibling budget test pins a 1ns one — deterministic in both directions.
-    let pool = SharedRetainedParsePool::new(RetainedParsePoolLimits {
-        document: ParseLimits {
-            max_parse_time: Duration::from_secs(60),
-            ..ParseLimits::default()
-        },
-        ..RetainedParsePoolLimits::default()
-    })
-    .expect("retained parse pool");
     let store = SharedPublicationStore::default();
     let mut owner = CodeIndexProductionOwnerV1::new(config(), store, ApplyingProjectionSink)
-        .expect("production owner")
-        .with_retained_parse_pool(pool);
+        .expect("production owner");
     let generation = owner
         .build_and_publish(
             request_with_source(
@@ -2855,23 +2907,23 @@ fn partitioned_codec_fixture() -> (
 }
 
 const PARTITIONED_FORMAT_STATE_DIGEST: &str =
-    "sha256:0fda032076514b19c25a9269ddd31b14d46644f47fc6771fb7674f085da0b06a";
+    "sha256:f1741f8ee5b4fec3dfc723e6de9ab9794de3a016f837ef7d1186306e09526abf";
 const PARTITIONED_FORMAT_SEGMENTS: &[(&str, u64)] = &[
     (
-        "sha256:cab25e8fe73ca0ae8552f61f402dc163ba4ef8f592855d6421e07f3662466a7c",
-        12_312,
+        "sha256:0ae42f3ae5844c46e7fea6cfb07f91e09d6634e8f9c2f1df053d62cc7d7c1f24",
+        8_584,
     ),
     (
-        "sha256:5cea7a47c6160776faa037dc1a530e5cecd38440d4833f8ebaf60a86e7535ea7",
-        4_923,
+        "sha256:21d54dff99989ad1b91b8254ad1a7c1310fe866755e0c3157153c2ab18951b19",
+        3_856,
     ),
     (
-        "sha256:cc82022dad2a1bfc50f483df6a1433962ffd454b70d63a73b6ddd7ebaee2cf12",
-        5_123,
+        "sha256:4f03e051764f885e2eb5f3537a2f7d26741f72f936fd6e4dc5ec1fd53a0751da",
+        3_964,
     ),
     (
-        "sha256:dfda6de857678869b0896614cbfb89a6160a179c9bf55e239ffa8db76c4cc2f6",
-        22_960,
+        "sha256:1bfa6399cd1a9f5d06ec697add39064ac1cc4f51dcfc866ba903c62ac3cad476",
+        11_830,
     ),
 ];
 
@@ -2896,16 +2948,34 @@ fn partitioned_codec_has_stable_bytes_and_round_trips() {
         "a file or evidence segment changed bytes"
     );
 
-    let file_buffer_address = Cell::new(None);
+    // Decode at width two with three file segments: the third file read must
+    // reuse a slot from the first window, so the bound below covers cross-window
+    // buffer reuse and not just a single window. Width is sizing policy only.
+    struct ForcedDecodeWidth;
+    impl Drop for ForcedDecodeWidth {
+        fn drop(&mut self) {
+            tracedecay_code_index::parallelism::clear_forced_indexing_workers_for_test();
+        }
+    }
+    tracedecay_code_index::parallelism::force_indexing_workers_for_test(2);
+    let _forced_width = ForcedDecodeWidth;
+    let window = CodeIndexPublishedGenerationV1::partitioned_decode_window_files();
+    let file_segment_count = PARTITIONED_FORMAT_SEGMENTS.len() - 1;
+    assert!(
+        window == 2 && file_segment_count > window,
+        "the fixture must span more file segments than one decode window"
+    );
+
+    // Buffer address -> its capacity after the last read it served.
+    let mut file_buffers = BTreeMap::new();
     let evidence_buffer_address = Cell::new(None);
     let segment_reads = Cell::new(0_usize);
     let largest_file_segment = Cell::new(0_usize);
     let largest_evidence_page = Cell::new(0_usize);
-    let file_buffer_capacity = Cell::new(0_usize);
     let evidence_buffer_capacity = Cell::new(0_usize);
     let restored =
         CodeIndexPublishedGenerationV1::decode_partitioned_sealed(&manifest, |request, buffer| {
-            let address = buffer as *const Vec<u8>;
+            let address = buffer as *const Vec<u8> as usize;
             let (digest, offset, length, reading_file) = match request {
                 SealedGenerationSegmentReadV1::Whole { digest, size_bytes } => {
                     (digest, 0, size_bytes, true)
@@ -2917,16 +2987,6 @@ fn partitioned_codec_has_stable_bytes_and_round_trips() {
                     ..
                 } => (digest, offset, length, false),
             };
-            let phase_address = if reading_file {
-                &file_buffer_address
-            } else {
-                &evidence_buffer_address
-            };
-            if let Some(first_address) = phase_address.get() {
-                assert_eq!(address, first_address, "each phase must reuse one Vec");
-            } else {
-                phase_address.set(Some(address));
-            }
             let bytes = segments.get(digest.as_str()).ok_or_else(|| {
                 CodeIndexProductionErrorV1::Contract("golden segment is missing".to_owned())
             })?;
@@ -2936,8 +2996,16 @@ fn partitioned_codec_has_stable_bytes_and_round_trips() {
             buffer.extend_from_slice(&bytes[start..end]);
             if reading_file {
                 largest_file_segment.set(largest_file_segment.get().max(bytes.len()));
-                file_buffer_capacity.set(buffer.capacity());
+                file_buffers.insert(address, buffer.capacity());
             } else {
+                if let Some(first_address) = evidence_buffer_address.get() {
+                    assert_eq!(
+                        address, first_address,
+                        "the evidence phase must reuse one Vec"
+                    );
+                } else {
+                    evidence_buffer_address.set(Some(address));
+                }
                 largest_evidence_page.set(largest_evidence_page.get().max(end - start));
                 evidence_buffer_capacity.set(buffer.capacity());
             }
@@ -2947,10 +3015,22 @@ fn partitioned_codec_has_stable_bytes_and_round_trips() {
         .expect("partitioned bytes decode")
         .expect("revision seven partitioned manifest");
     assert_eq!(segment_reads.get(), PARTITIONED_FORMAT_SEGMENTS.len());
+    let largest_file_segment = largest_file_segment.get();
+    assert_eq!(
+        file_buffers.len(),
+        window,
+        "file reads must cycle through exactly one buffer per decode window slot"
+    );
     assert!(
-        file_buffer_capacity.get() >= largest_file_segment.get()
-            && file_buffer_capacity.get() <= largest_file_segment.get().next_power_of_two(),
-        "the file allocation must be bounded by the largest file segment"
+        file_buffers.values().max() >= Some(&largest_file_segment)
+            && file_buffers
+                .values()
+                .all(|&capacity| capacity <= largest_file_segment.next_power_of_two()),
+        "each file buffer must be bounded by the largest file segment"
+    );
+    assert!(
+        file_buffers.values().sum::<usize>() <= window * largest_file_segment.next_power_of_two(),
+        "the file allocation must be bounded by {window} decode slots x the largest file segment"
     );
     assert!(
         evidence_buffer_capacity.get() >= largest_evidence_page.get()
@@ -3107,8 +3187,11 @@ fn partitioned_codec_reads_pre_paging_evidence_descriptor() {
 
 /// Bytes the unmodified pre-paging writer emitted (see the fixture README and
 /// `provenance.json`). Descriptor readers can still inventory its retained
-/// segments, but serving refuses the generation with typed rebuild-required
-/// unavailability because those bytes predate source commitments.
+/// segments, but serving refuses the generation: text metadata reports typed
+/// rebuild-required unavailability because those bytes predate source
+/// commitments, and a complete restore refuses the first file segment with
+/// the contract failure naming the symbol evidence (`docstring`) its rows
+/// predate rather than defaulting it.
 #[test]
 fn historical_writer_bytes_read_through_both_partitioned_readers() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3194,10 +3277,16 @@ fn historical_writer_bytes_read_through_both_partitioned_readers() {
         CodeIndexPublishedGenerationV1::partitioned_text_metadata(&manifest),
         Err(CodeIndexProductionErrorV1::SourceCommitmentsUnavailable)
     ));
-    assert!(matches!(
-        CodeIndexPublishedGenerationV1::decode_partitioned_sealed(&manifest, read),
-        Err(CodeIndexProductionErrorV1::SourceCommitmentsUnavailable)
-    ));
+    let refused = CodeIndexPublishedGenerationV1::decode_partitioned_sealed(&manifest, read)
+        .expect_err("historical rows without documentation evidence must be refused");
+    assert!(
+        matches!(
+            &refused,
+            CodeIndexProductionErrorV1::SealedRowContractRefused { message, .. }
+                if message.contains("missing field `docstring`")
+        ),
+        "unexpected error: {refused}"
+    );
 
     let corrupted = &identities[0].digest;
     let corrupt = |request: SealedGenerationSegmentReadV1<'_>, buffer: &mut Vec<u8>| {

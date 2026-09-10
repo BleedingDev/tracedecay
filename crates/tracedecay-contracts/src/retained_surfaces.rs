@@ -66,8 +66,6 @@ pub enum RetainedSurfaceOperation {
     ProviderSnapshotExport,
     ProviderSnapshotRestore,
     ProviderReplay,
-    /// Legacy broad MCP translator; never a current catalog capability.
-    SessionRefresh,
     SessionRefreshStatus,
     SessionRefreshCancel,
     SessionRefreshBegin,
@@ -115,8 +113,7 @@ impl RetainedSdkOperationContractV1 {
 }
 
 impl RetainedSurfaceOperation {
-    /// Canonical catalog operations. The broad `session_refresh` translator is
-    /// intentionally not a catalog operation.
+    /// Canonical catalog operations.
     pub const ALL: [Self; 36] = [
         Self::FactStoreCurate,
         Self::FactStoreAdd,
@@ -164,11 +161,6 @@ impl RetainedSurfaceOperation {
     /// Every current retained action has an exact project-open production
     /// adapter. SDK clients invoke the operation-selected routes.
     pub const SDK_EXECUTABLE: [Self; 36] = Self::ALL;
-
-    #[hotpath::skip]
-    pub const fn is_callable(self) -> bool {
-        !matches!(self, Self::SessionRefresh)
-    }
 
     /// Additional SDK controls that cannot live in the bounds-only operation body.
     #[hotpath::skip]
@@ -244,7 +236,6 @@ impl RetainedSurfaceOperation {
             Self::ProviderSnapshotExport => "provider_snapshot_export",
             Self::ProviderSnapshotRestore => "provider_snapshot_restore",
             Self::ProviderReplay => "provider_replay",
-            Self::SessionRefresh => "session_refresh",
             Self::SessionRefreshStatus => "session_refresh_status",
             Self::SessionRefreshCancel => "session_refresh_cancel",
             Self::SessionRefreshBegin => "session_refresh_begin",
@@ -263,9 +254,6 @@ impl RetainedSurfaceOperation {
 
     /// Parse an exact catalog/HTTP operation segment without a tool prefix.
     pub fn from_operation_name(name: &str) -> Option<Self> {
-        if name == "session_refresh" {
-            return Some(Self::SessionRefresh);
-        }
         surface_specs()
             .into_iter()
             .find(|spec| !spec.surfaces.is_empty() && spec.operation.as_str() == name)
@@ -289,6 +277,18 @@ pub(super) struct RetainedSurfaceSpec {
     pub(super) surfaces: &'static [BindingSurface],
 }
 
+const DEFAULT_RETAINED_DEADLINE_MILLIS: u64 = 30_000;
+// A real Codex app-server turn is allowed 80 seconds by the curator owner.
+// Keep ten seconds after that bound for validation, apply, and settlement.
+const FACT_STORE_CURATE_DEADLINE_MILLIS: u64 = 90_000;
+
+const fn retained_deadline_millis(operation: RetainedSurfaceOperation) -> u64 {
+    match operation {
+        RetainedSurfaceOperation::FactStoreCurate => FACT_STORE_CURATE_DEADLINE_MILLIS,
+        _ => DEFAULT_RETAINED_DEADLINE_MILLIS,
+    }
+}
+
 fn surface_specs() -> Vec<&'static RetainedSurfaceSpec> {
     automation::SPECS
         .iter()
@@ -300,9 +300,9 @@ fn surface_specs() -> Vec<&'static RetainedSurfaceSpec> {
 }
 
 /// Every callable retained operation reaches the same typed application owner
-/// from HTTP, MCP, and the dynamic `tracedecay tool` CLI. Broad fact-store and
-/// session-refresh tools translate their action to one of these exact bindings
-/// before dispatch; the catalog does not fabricate separate public tools.
+/// from HTTP, MCP, and the dynamic `tracedecay tool` CLI. The broad fact-store
+/// tool translates its action to one of these exact bindings before dispatch;
+/// the catalog does not fabricate separate public tools.
 pub(super) const CURRENT_SURFACES: &[BindingSurface] = &[
     BindingSurface::Http,
     BindingSurface::Cli,
@@ -805,7 +805,7 @@ fn capability(
             ]
         })?,
         deadline: DeadlineContract::new(
-            30_000,
+            retained_deadline_millis(spec.operation),
             if is_effect {
                 DeadlineBehavior::ReturnEffectReceipt
             } else {
@@ -965,23 +965,24 @@ mod tests {
             RetainedSurfaceOperation::ALL
         );
         assert_eq!(
-            surface_specs()
-                .into_iter()
-                .map(|spec| spec.operation)
-                .filter(|operation| operation.is_callable())
-                .collect::<Vec<_>>(),
-            RetainedSurfaceOperation::CALLABLE
+            RetainedSurfaceOperation::CALLABLE,
+            RetainedSurfaceOperation::ALL
         );
     }
 
     #[test]
-    fn duplicate_session_refresh_aliases_are_not_v2_operations() {
+    fn combined_session_refresh_and_its_aliases_are_not_v2_operations() {
         for name in [
+            "session_refresh",
             "session_refresh_start",
             "session_refresh_join",
             "session_refresh_resume",
         ] {
             assert_eq!(RetainedSurfaceOperation::from_operation_name(name), None);
+            assert_eq!(
+                RetainedSurfaceOperation::from_tool_name(&format!("tracedecay_{name}")),
+                None
+            );
         }
     }
 
@@ -1032,6 +1033,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(catalog_launchers.len(), 1);
         assert_eq!(catalog_launchers[0].capability_id(), &capability);
+        let curator_capability = contribution
+            .capabilities()
+            .iter()
+            .find(|candidate| candidate.capability_id() == &capability)
+            .expect("curator capability");
+        assert_eq!(curator_capability.deadline().maximum_millis(), 90_000);
         assert_eq!(
             catalog_launchers[0].request_schema().rust_type_path(),
             request_type

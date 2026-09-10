@@ -5379,7 +5379,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::host_admission::HostAdmissionTestRuntimeV1;
+    use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
     use tracedecay_global_db::GlobalDbObservationStore;
 
     const READY_RECEIPT: &str = "1111111111111111111111111111111111111111111111111111111111111111";

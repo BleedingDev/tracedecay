@@ -30,9 +30,10 @@ mod runtime_lifecycle;
 mod test_runtime;
 
 pub use graph_binding::{MemoryGraphRuntimeOperationErrorV1, MemoryGraphRuntimeOperationV1};
-pub(crate) use memory_graph_reconciliation::MemoryGraphReconciliationTaskScheduleV1;
+pub use memory_graph_reconciliation::MemoryGraphReconciliationTaskScheduleV1;
 pub use memory_graph_reconciliation::{
-    MemoryGraphReconciliationCancelErrorV1, MemoryGraphReconciliationRetirementReservationV1,
+    MemoryGraphReconciliationCancelErrorV1, MemoryGraphReconciliationInlinePassV1,
+    MemoryGraphReconciliationRetirementReservationV1,
     MemoryGraphReconciliationRetirementStartErrorV1, MemoryGraphReconciliationRetirementTerminalV1,
     MemoryGraphReconciliationTaskOwnerV1, ProjectMemoryReconciliationTelemetryObserverV1,
     ProjectMemoryReconciliationTelemetrySnapshotV1,
@@ -66,13 +67,13 @@ pub struct Database {
 }
 
 #[derive(Clone)]
-pub(crate) struct WeakDatabase {
+pub struct WeakDatabase {
     inner: Weak<DatabaseInner>,
     client: Weak<DatabaseClientLeaseV1>,
 }
 
 impl WeakDatabase {
-    pub(crate) fn upgrade(&self) -> Option<Database> {
+    pub fn upgrade(&self) -> Option<Database> {
         let inner = self.inner.upgrade()?;
         let client = self.client.upgrade()?;
         Some(Database { inner, client })
